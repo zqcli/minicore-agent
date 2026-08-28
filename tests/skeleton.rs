@@ -1,6 +1,5 @@
-use std::path::PathBuf;
-
 use minicore_agent::{Agent, AgentConfig, AgentError};
+use minicore_runtime::SessionId;
 
 #[test]
 fn config_parses_and_rejects_out_of_bound_capacity() {
@@ -20,7 +19,11 @@ event_capacity = 8
 
 #[tokio::test]
 async fn agent_exposes_ping_and_a_single_event_stream() {
-    let config = AgentConfig::new(PathBuf::from("./.minicore-agent")).unwrap();
+    let data_dir = std::env::temp_dir().join(format!(
+        "minicore-agent-skeleton-{}",
+        SessionId::new().unwrap()
+    ));
+    let config = AgentConfig::new(data_dir.clone()).unwrap();
     let mut agent = Agent::open(config).await.unwrap();
     assert_eq!(agent.ping().version, "0.1.0");
 
@@ -30,4 +33,5 @@ async fn agent_exposes_ping_and_a_single_event_stream() {
         Err(AgentError::EventStreamTaken)
     ));
     agent.shutdown().await.unwrap();
+    tokio::fs::remove_dir_all(data_dir).await.unwrap();
 }

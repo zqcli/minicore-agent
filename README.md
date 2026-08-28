@@ -1,7 +1,8 @@
 # MiniCore Agent
 
-This repository is the Phase 1 RPC-first skeleton: one Rust package with a
-library API and the `minicore-agent` stdio binary. It is verified against the
+This repository is the Phase 2 RPC-first agent core: one Rust package with a
+library API, a local Store, multiple loaded `SessionRuntime` owners, and an
+offline Fake Model/Tool test seam. It is verified against the
 `minicore-runtime` `dev` HEAD
 `7e85eaab18e273e43e03c50040b460f1b13f0ac9` through
 `tests/runtime_api_compile.rs`. The runtime dependency is pinned to that exact
@@ -39,30 +40,33 @@ limit. An oversized frame returns a parse error and ends the stdin loop. EOF
 performs the same graceful shutdown path. For an explicit shutdown request, the
 agent shutdown completes before its success response is written.
 
-The library currently exposes `AgentConfig`, `AgentError`, `Agent`, the
-single-consumer `AgentEventStream`, and `run_stdio`. The event stream has no
-events yet by design. `data_dir` is parsed and validated but is not opened;
-the Store implementation is crate-internal and uses
+The library exposes `AgentConfig`, `AgentError`, `Agent`, the session/turn DTOs,
+the single-consumer `AgentEventStream`, `AgentEvent`, and `run_stdio`. `Agent`
+opens the local Store, manages multiple loaded SessionRuntime owners, and
+forwards typed live events while durable turn completion is obtained from a
+cloned `TurnHandle`. The Store uses
 `<data_dir>/sessions/<session-id>/` with `session.json`, `manifest.json`, and
-`conversation.log`. Each append is one durable JSON line containing one batch.
+`conversation.log`; each append is one durable JSON line containing one batch.
+
 Metadata uses a unique `create_new` temp file, syncs the temp file, atomically
 renames it, and syncs its parent directory. Session and conversation directory
 entries are also synced before successful return where the platform supports
 it. On Unix/macOS this uses an opened directory and `sync_all`; non-Unix builds
 compile and sync file contents, but Tokio has no portable directory-fsync
-contract there.
+contract there. `manifest.json` is the initialization commit marker: the empty
+conversation file is durable before the marker is published. Direct symlinks in
+the session tree, including metadata, manifest, conversation, and temp entries,
+are rejected.
 
-`manifest.json` is the initialization commit marker: the empty conversation
-file is durable before the marker is published. A missing marker plus an empty
-log is retryable as uninitialized; a missing marker plus non-empty log, or a
-marker without a regular log, is corrupt. Direct symlinks in the session tree,
-including metadata, manifest, conversation, and temp entries, are rejected.
-Store assumes one process per data directory and does not implement file locks.
-Unknown append or post-rename directory-sync outcomes make that log object
-unusable. Loading currently reads the complete log into memory; v0.1 defines no
-production log-size limit, so very large logs may consume substantial memory.
-Agent Loop, Workspace, Tools, Context, Policy, and Provider adapters belong to
-later phases. No workspace, unsafe code, Factory/Repository layer, EventHub,
-plugin system, or multi-client coordination is introduced. The offline process
-coverage is in `tests/rpc_stdio.rs`; Store coverage is in the internal unit
-tests of `src/store.rs`.
+The production TOML shape retains the OpenAI Responses model configuration, but
+that provider is intentionally not implemented in this Phase and `Agent::open`
+returns a stable not-implemented error instead of claiming availability.
+Offline loop tests use a crate-private injected Fake Model/Tool/Policy seam;
+Fake provider and tool implementations are not part of production TOML. Store
+assumes one process per data directory and does not implement file locks.
+Loading currently reads the complete log into memory; v0.1 defines no production
+log-size limit, so very large logs may consume substantial memory. Workspace,
+real Tools, Context, Policy, OpenAI HTTP, and RPC method extensions remain
+outside this Phase. The offline process coverage is in `tests/rpc_stdio.rs`,
+Agent loop coverage is in `src/agent/tests.rs`, and Store coverage is in the
+internal unit tests of `src/store.rs`.
