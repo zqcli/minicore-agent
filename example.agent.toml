@@ -1,0 +1,2 @@
+data_dir = "./.minicore-agent"
+event_capacity = 256

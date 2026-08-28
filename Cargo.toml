@@ -1,0 +1,37 @@
+[package]
+name = "minicore-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "RPC-first MiniCore Agent skeleton"
+
+[lib]
+name = "minicore_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minicore-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Public API verified against runtime commit 7e85eaab18e273e43e03c50040b460f1b13f0ac9.
+minicore-runtime = { path = "../minicore-runtime", version = "0.3.0" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+tokio = { version = "1.53.1", default-features = false, features = [
+  "io-std",
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+  "sync",
+] }
+toml = "0.8.23"
+
+[dev-dependencies]
+futures-util = "0.3.33"
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
