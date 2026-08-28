@@ -3,11 +3,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 
 use minicore_runtime::config::{SessionManifest, Timestamp};
 use minicore_runtime::conversation::{ConversationEntry, ConversationSeq};
@@ -47,6 +49,29 @@ static DELETE_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
 static CLEANUP_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct TouchGate {
+    session_id: SessionId,
+    pub(crate) started: Arc<Semaphore>,
+    pub(crate) release: Arc<Semaphore>,
+    pub(crate) finished: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl TouchGate {
+    pub(crate) fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            finished: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+static TOUCH_GATES: OnceLock<Mutex<Vec<Arc<TouchGate>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +136,7 @@ enum InitializationState {
     Corrupt,
 }
 
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
 }
@@ -269,11 +295,34 @@ impl Store {
             .map_err(StoreError::Log)
     }
 
-    pub async fn touch(&self, session_id: SessionId) -> Result<String, StoreError> {
-        let mut record = self.load_record(session_id).await?;
-        record.updated_at = utc_timestamp()?;
-        self.write_record(&record).await?;
-        Ok(record.updated_at)
+    pub async fn touch(&self, session_id: SessionId) -> Result<(), StoreError> {
+        let updated_at = utc_timestamp()?;
+        self.touch_at(session_id, updated_at).await
+    }
+
+    pub(crate) async fn touch_at(
+        &self,
+        session_id: SessionId,
+        updated_at: String,
+    ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        let touch_gate = take_touch_gate(session_id);
+        #[cfg(test)]
+        if let Some(gate) = &touch_gate {
+            gate.started.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+        }
+        let result = async {
+            let mut record = self.load_record(session_id).await?;
+            record.updated_at = updated_at;
+            self.write_record(&record).await
+        }
+        .await;
+        #[cfg(test)]
+        if let Some(gate) = touch_gate {
+            gate.finished.add_permits(1);
+        }
+        result
     }
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
@@ -1056,6 +1105,27 @@ fn fail_next_cleanup(path: &Path) {
         .lock()
         .unwrap()
         .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn block_next_touch(gate: Arc<TouchGate>) {
+    TOUCH_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(gate);
+}
+
+#[cfg(test)]
+fn take_touch_gate(session_id: SessionId) -> Option<Arc<TouchGate>> {
+    let mut gates = TOUCH_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|gate| gate.session_id == session_id)
+        .map(|position| gates.remove(position))
 }
 
 #[cfg(test)]

@@ -20,12 +20,12 @@ use minicore_runtime::tools::{ToolPolicy, ToolSet};
 use crate::config::{AgentConfig, ProfileCompaction};
 use crate::error::{AgentError, StoreError};
 use crate::event::{
-    AgentEvent, AgentEventSink, AgentEventStream, CompletionCancellation, EventMeta,
-    map_session_event,
+    AgentEvent, AgentEventSink, AgentEventStream, CompletionCancellation, CoordinatorReady,
+    EventMeta, map_session_event,
 };
 use crate::models::{ModelConfigError, Models};
 use crate::profiles::{Profile, Profiles};
-use crate::sessions::{LoadedSession, Sessions};
+use crate::sessions::{CompletionSlot, CompletionTask, LoadedSession, Sessions};
 use crate::store::{SessionRecord, Store};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -343,6 +343,7 @@ impl Agent {
 
     pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
         let session_id = request.session_id;
+        self.cleanup_finished_completion(session_id).await?;
         let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
         let handle = {
             let loaded = self
@@ -366,19 +367,30 @@ impl Agent {
         if let Some(loaded) = self.sessions.get_mut(session_id) {
             loaded.active_turn = Some(turn.clone());
         }
-        let completion_cancel = self
-            .sessions
-            .get(session_id)
-            .expect("submitted turn belongs to loaded session")
-            .completion_cancel
-            .clone();
-        self.spawn_turn_waiter(turn, completion_cancel);
-        // The turn is already accepted by Core; metadata freshness is best effort here.
-        if let Ok(updated_at) = self.store.touch(session_id).await {
-            if let Some(loaded) = self.sessions.get_mut(session_id) {
-                loaded.record.updated_at = updated_at;
-            }
+        let (event_sink, completion_slot) = {
+            let loaded = self
+                .sessions
+                .get(session_id)
+                .expect("submitted turn belongs to loaded session");
+            (loaded.event_sink.clone(), loaded.completion_slot.clone())
+        };
+        let coordinator = completion_slot.register(turn_ref);
+        let cancellation = CompletionCancellation::new();
+        let completion_task = self.spawn_turn_waiter(
+            turn,
+            coordinator.clone(),
+            cancellation.clone(),
+            event_sink.clone(),
+        );
+        if let Some(loaded) = self.sessions.get_mut(session_id) {
+            loaded.completion = Some(CompletionTask {
+                coordinator,
+                cancellation,
+                event_sink,
+                task: completion_task,
+            });
         }
+        self.schedule_touch(session_id);
         Ok(turn_ref)
     }
 
@@ -508,13 +520,18 @@ impl Agent {
         let handle = runtime.handle();
         let state = handle.watch_state();
         let event_sink = AgentEventSink::new(self.events_tx.clone());
-        let completion_cancel = CompletionCancellation::new();
-        let event_task = self
-            .task_runtime
-            .spawn(event_pump(event_stream, event_sink.clone()));
-        let state_task = self
-            .task_runtime
-            .spawn(state_pump(state, event_sink.clone()));
+        let completion_slot = CompletionSlot::new(event_sink.clone());
+        let metadata_cancel = CompletionCancellation::new();
+        let event_task = self.task_runtime.spawn(event_pump(
+            event_stream,
+            event_sink.clone(),
+            completion_slot.clone(),
+        ));
+        let state_task = self.task_runtime.spawn(state_pump(
+            state,
+            event_sink.clone(),
+            completion_slot.clone(),
+        ));
         Ok(LoadedSession {
             record,
             runtime,
@@ -523,7 +540,9 @@ impl Agent {
             event_task,
             state_task,
             event_sink,
-            completion_cancel,
+            completion_slot,
+            completion: None,
+            metadata_cancel,
         })
     }
 
@@ -540,72 +559,182 @@ impl Agent {
         }
     }
 
-    fn spawn_turn_waiter(&self, turn: TurnHandle, completion_cancel: CompletionCancellation) {
-        let event_sink = self
-            .sessions
-            .get(turn.session_id())
-            .expect("turn belongs to loaded session")
-            .event_sink
-            .clone();
-        let turn_ref = TurnRef::from_handle(&turn);
+    async fn cleanup_finished_completion(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), AgentError> {
+        let completion = {
+            let loaded = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or(AgentError::SessionNotLoaded)?;
+            if loaded
+                .active_turn
+                .as_ref()
+                .is_some_and(TurnHandle::is_finished)
+            {
+                loaded.active_turn = None;
+                loaded.completion.take()
+            } else {
+                None
+            }
+        };
+        if let Some(completion) = completion {
+            let coordinator = Arc::clone(&completion.coordinator);
+            let result = completion.cancel_and_join().await;
+            if let Some(loaded) = self.sessions.get(session_id) {
+                loaded.completion_slot.clear(&coordinator);
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    fn schedule_touch(&mut self, session_id: SessionId) {
+        let Ok(updated_at) = current_timestamp() else {
+            return;
+        };
+        let Some(loaded) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        loaded.record.updated_at = updated_at.clone();
+        let store = self.store.clone();
+        let cancellation = loaded.metadata_cancel.clone();
         self.task_runtime.spawn(async move {
             tokio::select! {
                 biased;
-                result = turn.wait() => {
-                    if let Ok(outcome) = result {
-                        let _ = event_sink
-                            .send_durable(AgentEvent::TurnFinished {
-                                turn: turn_ref,
-                                outcome,
-                                meta: EventMeta {
-                                    session_id: turn_ref.session_id,
-                                    instance_id: turn_ref.instance_id,
-                                    dropped_before: 0,
-                                },
-                            }, completion_cancel.clone())
-                            .await;
-                    }
-                }
-                _ = completion_cancel.cancelled() => {}
+                _ = cancellation.cancelled() => {}
+                _ = store.touch_at(session_id, updated_at) => {}
             }
         });
     }
+
+    fn spawn_turn_waiter(
+        &self,
+        turn: TurnHandle,
+        coordinator: Arc<crate::event::TurnCoordinator>,
+        cancellation: CompletionCancellation,
+        event_sink: AgentEventSink,
+    ) -> tokio::task::JoinHandle<()> {
+        let turn_ref = TurnRef::from_handle(&turn);
+        self.task_runtime.spawn(async move {
+            let outcome = tokio::select! {
+                biased;
+                result = turn.wait() => result,
+                _ = cancellation.cancelled() => return,
+            };
+            coordinator.set_outcome(outcome);
+            let Some(CoordinatorReady::Finish {
+                outcome,
+                terminal_meta,
+            }) = coordinator.wait_ready(&cancellation).await
+            else {
+                return;
+            };
+            let _ = event_sink
+                .send_durable(
+                    AgentEvent::TurnFinished {
+                        turn: turn_ref,
+                        outcome,
+                        meta: EventMeta {
+                            session_id: turn_ref.session_id,
+                            instance_id: turn_ref.instance_id,
+                            dropped_before: terminal_meta.dropped_before,
+                        },
+                    },
+                    cancellation,
+                )
+                .await;
+        })
+    }
 }
 
-async fn event_pump(mut stream: SessionEventStream, event_sink: AgentEventSink) {
-    while let Some(envelope) = stream.recv().await {
-        let dropped_before = envelope.dropped_before;
-        if let Some(event) = map_session_event(envelope) {
-            if event_sink.try_send(event) == crate::event::AgentSendResult::Closed {
-                break;
+async fn event_pump(
+    mut stream: SessionEventStream,
+    event_sink: AgentEventSink,
+    completion_slot: CompletionSlot,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            envelope = stream.recv() => {
+                let Some(envelope) = envelope else { break };
+                if !process_core_envelope(envelope, &event_sink, &completion_slot) {
+                    break;
+                }
             }
-        } else {
-            event_sink.record_core_drops(dropped_before);
-            if event_sink.is_closed() {
-                break;
+            _ = completion_slot.drain_requested() => {
+                tokio::task::yield_now().await;
+                let mut closed = false;
+                while let Ok(envelope) = stream.try_recv() {
+                    if !process_core_envelope(envelope, &event_sink, &completion_slot) {
+                        closed = true;
+                        break;
+                    }
+                }
+                if closed {
+                    break;
+                }
+                completion_slot.observe_quiescence();
             }
         }
+    }
+    completion_slot.observe_core_closed();
+}
+
+fn process_core_envelope(
+    envelope: minicore_runtime::session::SessionEventEnvelope,
+    event_sink: &AgentEventSink,
+    completion_slot: &CompletionSlot,
+) -> bool {
+    if let minicore_runtime::session::SessionEvent::TurnFinished { turn_id, .. } = &envelope.event {
+        completion_slot.observe_terminal(
+            *turn_id,
+            EventMeta {
+                session_id: envelope.session_id,
+                instance_id: envelope.instance_id,
+                dropped_before: envelope.dropped_before,
+            },
+        );
+        return !event_sink.is_closed();
+    }
+    let dropped_before = envelope.dropped_before;
+    if let Some(event) = map_session_event(envelope) {
+        event_sink.try_send(event) != crate::event::AgentSendResult::Closed
+    } else {
+        event_sink.record_core_drops(dropped_before);
+        !event_sink.is_closed()
     }
 }
 
 async fn state_pump(
     mut state: tokio::sync::watch::Receiver<minicore_runtime::SessionState>,
     event_sink: AgentEventSink,
+    completion_slot: CompletionSlot,
 ) {
-    if !emit_state(&event_sink, state.borrow().clone()) {
+    if !emit_state(&event_sink, &completion_slot, state.borrow().clone()) {
         return;
     }
     loop {
         if state.changed().await.is_err() {
             break;
         }
-        if !emit_state(&event_sink, state.borrow().clone()) {
+        if !emit_state(&event_sink, &completion_slot, state.borrow().clone()) {
             break;
         }
     }
 }
 
-fn emit_state(event_sink: &AgentEventSink, state: minicore_runtime::SessionState) -> bool {
+fn emit_state(
+    event_sink: &AgentEventSink,
+    completion_slot: &CompletionSlot,
+    state: minicore_runtime::SessionState,
+) -> bool {
+    if state.active_turn.is_none() {
+        if let Some(terminal) = state.last_terminal.as_ref() {
+            completion_slot.observe_state_terminal(terminal.turn_id);
+        }
+    }
     event_sink.try_send(AgentEvent::SessionState {
         meta: EventMeta {
             session_id: state.session_id,
