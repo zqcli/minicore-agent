@@ -1,5 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+
+use minicore_runtime::SessionId;
 
 use serde_json::{Value, json};
 
@@ -9,6 +12,7 @@ struct RpcProcess {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    temp_dir: PathBuf,
 }
 
 impl RpcProcess {
@@ -31,17 +35,27 @@ impl RpcProcess {
 
     fn finish(mut self) -> ExitStatus {
         drop(self.input);
-        self.child.wait().unwrap()
+        let status = self.child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+        status
     }
 }
 
 fn spawn_server() -> RpcProcess {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-test-{}",
+        SessionId::new().unwrap()
+    ));
+    let data_dir = temp_dir.join("data");
+    let config_path = temp_dir.join("agent.toml");
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(
+        &config_path,
+        format!("data_dir = {:?}\nevent_capacity = 256\n", data_dir),
+    )
+    .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
-        .args([
-            "--config",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/example.agent.toml"),
-            "--stdio",
-        ])
+        .args(["--config", config_path.to_str().unwrap(), "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -51,6 +65,7 @@ fn spawn_server() -> RpcProcess {
         input: child.stdin.take().unwrap(),
         output: BufReader::new(child.stdout.take().unwrap()),
         child,
+        temp_dir,
     }
 }
 
@@ -155,11 +170,13 @@ fn eof_shuts_down_without_an_extra_frame() {
         "method": "agent.ping"
     }));
     assert_ping(process.response(), json!("before-eof"));
+    let temp_dir = process.temp_dir.clone();
     drop(process.input);
 
     let mut trailing = String::new();
     assert_eq!(process.output.read_line(&mut trailing).unwrap(), 0);
     assert!(process.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[test]
