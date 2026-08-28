@@ -45,10 +45,24 @@ events yet by design. `data_dir` is parsed and validated but is not opened;
 the Store implementation is crate-internal and uses
 `<data_dir>/sessions/<session-id>/` with `session.json`, `manifest.json`, and
 `conversation.log`. Each append is one durable JSON line containing one batch.
+Metadata uses a unique `create_new` temp file, syncs the temp file, atomically
+renames it, and syncs its parent directory. Session and conversation directory
+entries are also synced before successful return where the platform supports
+it. On Unix/macOS this uses an opened directory and `sync_all`; non-Unix builds
+compile and sync file contents, but Tokio has no portable directory-fsync
+contract there.
+
+`manifest.json` is the initialization commit marker: the empty conversation
+file is durable before the marker is published. A missing marker plus an empty
+log is retryable as uninitialized; a missing marker plus non-empty log, or a
+marker without a regular log, is corrupt. Direct symlinks in the session tree,
+including metadata, manifest, conversation, and temp entries, are rejected.
 Store assumes one process per data directory and does not implement file locks.
-Unknown append outcomes make that log object unusable. Agent Loop, Workspace,
-Tools, Context, Policy, and Provider adapters belong to later phases. No
-workspace, unsafe code, Factory/Repository layer, EventHub, plugin system, or
-multi-client coordination is introduced. The offline process coverage is in
-`tests/rpc_stdio.rs`; Store coverage is in the internal unit tests of
-`src/store.rs`.
+Unknown append or post-rename directory-sync outcomes make that log object
+unusable. Loading currently reads the complete log into memory; v0.1 defines no
+production log-size limit, so very large logs may consume substantial memory.
+Agent Loop, Workspace, Tools, Context, Policy, and Provider adapters belong to
+later phases. No workspace, unsafe code, Factory/Repository layer, EventHub,
+plugin system, or multi-client coordination is introduced. The offline process
+coverage is in `tests/rpc_stdio.rs`; Store coverage is in the internal unit
+tests of `src/store.rs`.
