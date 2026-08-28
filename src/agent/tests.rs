@@ -10,6 +10,7 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 
 use minicore_runtime::conversation::TurnTerminal;
+use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, SessionShutdownError};
 use minicore_runtime::ids::{SessionId, ToolCallId};
 use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason, ModelRef,
@@ -20,8 +21,10 @@ use minicore_runtime::tools::{
     Tool, ToolContext, ToolDecision, ToolError, ToolExecutionOutcome, ToolFuture, ToolInvocation,
     ToolOutput, ToolPolicy, ToolPolicyFuture, ToolPolicyRequest, ToolSet, ToolSpec,
 };
+use minicore_runtime::value::BoundedText;
 
 use crate::config::{AgentConfig, KernelOverrides, Profile};
+use crate::error::{AgentError, CoreErrorView};
 use crate::event::AgentEvent;
 use crate::models::Models;
 use crate::profiles::{ApprovalMode, ProfileCompaction};
@@ -38,6 +41,8 @@ enum ModelScript {
 struct FakeModel {
     descriptor: ModelDescriptor,
     scripts: Arc<Mutex<VecDeque<ModelScript>>>,
+    routed_scripts: Arc<Mutex<BTreeMap<SessionId, ModelScript>>>,
+    started_sessions: Arc<Mutex<Vec<SessionId>>>,
     started: Option<Arc<Semaphore>>,
     calls: Arc<AtomicUsize>,
 }
@@ -62,6 +67,8 @@ impl FakeModel {
         let model = Arc::new(Self {
             descriptor,
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
+            routed_scripts: Arc::new(Mutex::new(BTreeMap::new())),
+            started_sessions: Arc::new(Mutex::new(Vec::new())),
             started: None,
             calls: Arc::clone(&calls),
         });
@@ -71,6 +78,17 @@ impl FakeModel {
     fn with_started(mut self: Arc<Self>, started: Arc<Semaphore>) -> Arc<Self> {
         Arc::get_mut(&mut self).unwrap().started = Some(started);
         self
+    }
+
+    fn started_sessions(&self) -> Arc<Mutex<Vec<SessionId>>> {
+        Arc::clone(&self.started_sessions)
+    }
+
+    fn route(&self, session_id: SessionId, script: ModelScript) {
+        self.routed_scripts
+            .lock()
+            .unwrap()
+            .insert(session_id, script);
     }
 }
 
@@ -82,14 +100,20 @@ impl Model for FakeModel {
     fn start<'a>(
         &'a self,
         _request: minicore_runtime::model::ModelRequest,
-        _context: ModelCallContext,
+        context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let script = self
-            .scripts
+        self.started_sessions
             .lock()
             .unwrap()
-            .pop_front()
+            .push(context.session_id);
+        let script = self
+            .routed_scripts
+            .lock()
+            .unwrap()
+            .get(&context.session_id)
+            .cloned()
+            .or_else(|| self.scripts.lock().unwrap().pop_front())
             .unwrap_or(ModelScript::Text("default"));
         let started = self.started.clone();
         Box::pin(async move {
@@ -300,14 +324,14 @@ async fn agent_lifecycle_text_turn_and_durable_finish_event() {
     assert!(info.loaded);
     assert!(matches!(
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::SessionOpened { session } if session.session_id == info.session_id)
+            matches!(event, AgentEvent::SessionOpened { session, .. } if session.session_id == info.session_id)
         })
         .await,
         AgentEvent::SessionOpened { .. }
     ));
     assert!(matches!(
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::SessionState { state } if state.session_id == info.session_id && matches!(state.status, SessionStatus::Idle))
+            matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && matches!(state.status, SessionStatus::Idle))
         })
         .await,
         AgentEvent::SessionState { .. }
@@ -377,7 +401,7 @@ async fn agent_lifecycle_text_turn_and_durable_finish_event() {
     agent.close_session(info.session_id).await.unwrap();
     assert!(matches!(
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::SessionClosed { session_id } if *session_id == info.session_id)
+            matches!(event, AgentEvent::SessionClosed { session_id, .. } if *session_id == info.session_id)
         })
         .await,
         AgentEvent::SessionClosed { .. }
@@ -581,10 +605,322 @@ async fn exact_cancel_interrupts_a_long_running_tool() {
 }
 
 #[tokio::test]
+async fn loaded_open_is_idempotent_without_reading_session_metadata() {
+    let (mut agent, base, workspace, _) = agent_fixture(
+        "loaded-idempotent",
+        [ModelScript::Text("unused")],
+        Vec::new(),
+        None,
+    )
+    .await;
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let record_path = base
+        .join("data")
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("session.json");
+    tokio::fs::write(&record_path, b"not json").await.unwrap();
+    assert_eq!(agent.open_session(info.session_id).await.unwrap(), info);
+    tokio::fs::remove_file(&record_path).await.unwrap();
+    assert_eq!(agent.open_session(info.session_id).await.unwrap(), info);
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "metadata is unavailable".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    assert_eq!(
+        agent
+            .open_session(info.session_id)
+            .await
+            .unwrap()
+            .updated_at,
+        info.updated_at
+    );
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn old_instance_turn_references_are_rejected_after_reopen() {
+    let (mut agent, base, workspace, _) = agent_fixture(
+        "old-instance",
+        [ModelScript::Text("unused")],
+        Vec::new(),
+        None,
+    )
+    .await;
+    let created = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let old_instance = created.instance_id.unwrap();
+    agent.close_session(created.session_id).await.unwrap();
+    let reopened = agent.open_session(created.session_id).await.unwrap();
+    assert_ne!(reopened.instance_id, Some(old_instance));
+    let stale = TurnRef {
+        session_id: created.session_id,
+        instance_id: old_instance,
+        turn_id: minicore_runtime::TurnId::new().unwrap(),
+    };
+    assert!(matches!(agent.cancel(stale), Err(AgentError::TurnNotFound)));
+    assert!(matches!(
+        agent.turn_handle(stale),
+        Err(AgentError::TurnNotFound)
+    ));
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+async fn assert_profile_drift(label: &str, change: fn(&mut Profile)) {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-profile-drift-{label}-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (old_model, _) = FakeModel::new([ModelScript::Text("old")]);
+    let mut old_agent = Agent::open_with_models(
+        config(base.join("data"), Vec::new()),
+        models(old_model),
+        ToolSet::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let info = old_agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    old_agent.shutdown().await.unwrap();
+    let manifest_path = base
+        .join("data")
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("manifest.json");
+    let manifest_before = tokio::fs::read(&manifest_path).await.unwrap();
+
+    let (new_model, _) = FakeModel::new([ModelScript::Text("new")]);
+    let mut new_config = config(base.join("data"), Vec::new());
+    change(new_config.profiles.get_mut("test").unwrap());
+    let mut new_agent =
+        Agent::open_with_models(new_config, models(new_model), ToolSet::default(), None)
+            .await
+            .unwrap();
+    assert!(matches!(
+        new_agent.open_session(info.session_id).await,
+        Err(AgentError::SessionSpecMismatch)
+    ));
+    assert_eq!(
+        tokio::fs::read(&manifest_path).await.unwrap(),
+        manifest_before
+    );
+    new_agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+fn drift_system_prompt(profile: &mut Profile) {
+    profile.system_prompt = "changed system prompt".to_owned();
+}
+
+fn drift_reasoning(profile: &mut Profile) {
+    profile.reasoning = ReasoningPreference::High;
+}
+
+fn drift_max_rounds(profile: &mut Profile) {
+    profile.max_tool_rounds = 5;
+}
+
+#[tokio::test]
+async fn opening_rejects_each_supported_profile_spec_drift() {
+    assert_profile_drift("system-prompt", drift_system_prompt).await;
+    assert_profile_drift("reasoning", drift_reasoning).await;
+    assert_profile_drift("max-rounds", drift_max_rounds).await;
+}
+
+fn shutdown_diagnostic(retryable: bool) -> minicore_runtime::error::DiagnosticSummary {
+    minicore_runtime::error::DiagnosticSummary::new(
+        DiagnosticCode::Internal,
+        DiagnosticCategory::Internal,
+        BoundedText::new("private shutdown detail").unwrap(),
+        retryable,
+    )
+}
+
+fn assert_shutdown_error(error: SessionShutdownError, kind: &'static str, retryable: bool) {
+    assert!(matches!(
+        crate::sessions::map_session_shutdown_error(error),
+        AgentError::Core(CoreErrorView {
+            kind: value,
+            retryable: actual,
+        }) if value == kind && actual == retryable
+    ));
+}
+
+#[test]
+fn shutdown_errors_preserve_safe_public_categories_without_debug_details() {
+    assert_shutdown_error(
+        SessionShutdownError::Timeout(shutdown_diagnostic(false)),
+        "session shutdown timeout",
+        false,
+    );
+    assert_shutdown_error(
+        SessionShutdownError::Durability(shutdown_diagnostic(false)),
+        "session shutdown durability failed",
+        false,
+    );
+    assert_shutdown_error(
+        SessionShutdownError::LogClose(shutdown_diagnostic(true)),
+        "session log close failed",
+        true,
+    );
+    assert_shutdown_error(
+        SessionShutdownError::ActorTerminated(shutdown_diagnostic(false)),
+        "session actor terminated",
+        false,
+    );
+}
+
+#[tokio::test]
+async fn small_outer_capacity_still_delivers_durable_turn_finished() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-durable-event-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("final")]);
+    let mut config = config(base.join("data"), Vec::new());
+    config.event_capacity = 1;
+    let mut agent = Agent::open_with_models(config, models(model), ToolSet::default(), None)
+        .await
+        .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "hello".to_owned(),
+        })
+        .await
+        .unwrap();
+    let finished = wait_for_event(
+        &mut events,
+        |event| matches!(event, AgentEvent::TurnFinished { turn: value, .. } if *value == turn),
+    )
+    .await;
+    assert!(matches!(finished, AgentEvent::TurnFinished { .. }));
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn dropped_event_receiver_does_not_block_agent_shutdown() {
+    let (mut agent, base, workspace, _) = agent_fixture(
+        "dropped-events",
+        [ModelScript::Text("final")],
+        Vec::new(),
+        None,
+    )
+    .await;
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "hello".to_owned(),
+        })
+        .await
+        .unwrap();
+    turn_handle_wait(&agent, turn).await;
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn shutdown_closes_events_after_cancelling_detached_completion_waiter() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-shutdown-events-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let started = Arc::new(Semaphore::new(0));
+    let (model, _) = FakeModel::new([ModelScript::Block]);
+    let model = model.with_started(Arc::clone(&started));
+    let mut config = config(base.join("data"), Vec::new());
+    config.event_capacity = 1;
+    let mut agent = Agent::open_with_models(config, models(model), ToolSet::default(), None)
+        .await
+        .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "cancel before shutdown".to_owned(),
+        })
+        .await
+        .unwrap();
+    started.acquire().await.unwrap().forget();
+    assert!(agent.cancel(turn).unwrap());
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::CancelledByUser
+    );
+    agent.shutdown().await.unwrap();
+    while tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .is_some()
+    {}
+    remove_base(&base).await;
+}
+
+async fn turn_handle_wait(agent: &Agent, turn: TurnRef) {
+    agent.turn_handle(turn).unwrap().wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn two_loaded_sessions_cancel_independently_and_shutdown_all() {
     let started = Arc::new(Semaphore::new(0));
-    let (model, _) = FakeModel::new([ModelScript::Block, ModelScript::Block]);
+    let (model, _) = FakeModel::new([ModelScript::Text("unrouted")]);
     let model = model.with_started(Arc::clone(&started));
+    let routed_model = Arc::clone(&model);
+    let started_sessions = model.started_sessions();
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-two-sessions-{}",
         SessionId::new().unwrap()
@@ -609,6 +945,8 @@ async fn two_loaded_sessions_cancel_independently_and_shutdown_all() {
         .create_session(create_request(&workspace_b))
         .await
         .unwrap();
+    routed_model.route(a.session_id, ModelScript::Block);
+    routed_model.route(b.session_id, ModelScript::Block);
     let turn_a = agent
         .send(SendMessage {
             session_id: a.session_id,
@@ -625,6 +963,9 @@ async fn two_loaded_sessions_cancel_independently_and_shutdown_all() {
         .unwrap();
     started.acquire().await.unwrap().forget();
     started.acquire().await.unwrap().forget();
+    let started_sessions = started_sessions.lock().unwrap().clone();
+    assert!(started_sessions.contains(&turn_a.session_id));
+    assert!(started_sessions.contains(&turn_b.session_id));
     assert!(agent.cancel(turn_a).unwrap());
     assert!(!agent.turn_handle(turn_b).unwrap().is_finished());
     assert_eq!(
@@ -714,6 +1055,19 @@ async fn restart_repairs_durable_unfinished_turn_then_accepts_new_turn() {
         state.health,
         minicore_runtime::session::SessionHealth::Healthy
     ));
+    let transcript = agent
+        .transcript(GetTranscript {
+            session_id,
+            after: None,
+            limit: 32,
+        })
+        .await
+        .unwrap();
+    assert!(transcript.entries.iter().any(|entry| matches!(
+        entry,
+        minicore_runtime::ConversationEntry::UserMessage(message)
+            if message.input.text.as_str() == "unfinished"
+    )));
     let turn = agent
         .send(SendMessage {
             session_id: info.session_id,

@@ -269,10 +269,11 @@ impl Store {
             .map_err(StoreError::Log)
     }
 
-    pub async fn touch(&self, session_id: SessionId) -> Result<(), StoreError> {
+    pub async fn touch(&self, session_id: SessionId) -> Result<String, StoreError> {
         let mut record = self.load_record(session_id).await?;
         record.updated_at = utc_timestamp()?;
-        self.write_record(&record).await
+        self.write_record(&record).await?;
+        Ok(record.updated_at)
     }
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
