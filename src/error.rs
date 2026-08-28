@@ -36,6 +36,11 @@ pub(crate) enum StoreError {
     Unavailable,
     #[error("store mutation outcome is unknown")]
     UnknownOutcome,
+    #[error("store cleanup failed after a known store error")]
+    CleanupFailed {
+        primary: Box<StoreError>,
+        cleanup: Box<StoreError>,
+    },
     #[error("store operation failed internally")]
     Internal,
     #[error("session log operation failed")]
