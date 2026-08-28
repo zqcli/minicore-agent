@@ -42,6 +42,12 @@ static DIRECTORY_SYNC_FAILURES: OnceLock<Mutex<Vec<DirectorySyncFailure>>> = Onc
 #[cfg(test)]
 static ATOMIC_BEFORE_RENAME_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
+#[cfg(test)]
+static DELETE_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+static CLEANUP_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRecord {
@@ -215,15 +221,20 @@ impl Store {
             }
         }
         if sync_directory(&self.sessions_directory()).await.is_err() {
-            let _ = remove_empty_session_directory(&directory, &self.sessions_directory()).await;
-            return Err(StoreError::Unavailable);
+            let primary = StoreError::Unavailable;
+            return Err(reconcile_cleanup(
+                primary,
+                remove_empty_session_directory(&directory, &self.sessions_directory()).await,
+            ));
         }
-        if let Err(error) = self.write_record(&record).await {
-            if !matches!(error, StoreError::UnknownOutcome) {
-                let _ =
-                    remove_empty_session_directory(&directory, &self.sessions_directory()).await;
+        if let Err(primary) = self.write_record(&record).await {
+            if matches!(&primary, StoreError::UnknownOutcome) {
+                return Err(primary);
             }
-            return Err(error);
+            return Err(reconcile_cleanup(
+                primary,
+                remove_empty_session_directory(&directory, &self.sessions_directory()).await,
+            ));
         }
         Ok(LocalSessionLog::new(directory))
     }
@@ -235,7 +246,7 @@ impl Store {
             .await
             .map_err(|_| StoreError::Unavailable)?
         {
-            PathState::Missing => return Err(StoreError::SessionNotFound),
+            PathState::Missing => return Err(StoreError::Corrupt),
             PathState::RegularFile => fs::read(path).await.map_err(|_| StoreError::Unavailable)?,
             PathState::Directory | PathState::Symlink | PathState::Other => {
                 return Err(StoreError::Corrupt);
@@ -266,13 +277,14 @@ impl Store {
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
         let directory = self.require_session_directory(session_id).await?;
-        fs::remove_dir_all(directory).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                StoreError::SessionNotFound
-            } else {
-                StoreError::Unavailable
-            }
-        })?;
+        #[cfg(test)]
+        if should_fail_delete_after_partial(&directory) {
+            let _ = fs::remove_file(directory.join(SESSION_RECORD_FILE)).await;
+            return Err(StoreError::UnknownOutcome);
+        }
+        fs::remove_dir_all(directory)
+            .await
+            .map_err(|_| StoreError::UnknownOutcome)?;
         if sync_directory(&self.sessions_directory()).await.is_err() {
             return Err(StoreError::UnknownOutcome);
         }
@@ -657,7 +669,16 @@ impl LocalSessionLog {
                 .clone()
                 .ok_or_else(|| log_error(SessionLogErrorKind::Internal));
         }
-        let loaded = Self::load(self.directory.clone()).await?;
+        let loaded = match Self::load(self.directory.clone()).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if error.kind() == SessionLogErrorKind::UnknownOutcome {
+                    self.durability_unknown = true;
+                    self.file.take();
+                }
+                return Err(error);
+            }
+        };
         let manifest = loaded
             .manifest
             .clone()
@@ -904,6 +925,17 @@ fn map_log_directory_error(error: io::Error) -> SessionLogError {
     }
 }
 
+fn reconcile_cleanup(primary: StoreError, cleanup: Result<(), StoreError>) -> StoreError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(StoreError::UnknownOutcome) => StoreError::UnknownOutcome,
+        Err(cleanup) => StoreError::CleanupFailed {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
 fn parent_directory(path: &Path) -> PathBuf {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -991,6 +1023,56 @@ fn fail_next_atomic_write_before_rename(path: &Path) {
         .push(path.to_path_buf());
 }
 
+#[cfg(test)]
+fn fail_next_delete_after_partial(path: &Path) {
+    DELETE_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn should_fail_delete_after_partial(path: &Path) -> bool {
+    let mut failures = DELETE_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    failures
+        .iter()
+        .position(|candidate| candidate == path)
+        .map(|position| {
+            failures.remove(position);
+            true
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn fail_next_cleanup(path: &Path) {
+    CLEANUP_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn should_fail_cleanup(path: &Path) -> bool {
+    let mut failures = CLEANUP_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    failures
+        .iter()
+        .position(|candidate| candidate == path)
+        .map(|position| {
+            failures.remove(position);
+            true
+        })
+        .unwrap_or(false)
+}
+
 async fn ensure_log_directory(directory: &Path) -> Result<(), SessionLogError> {
     match path_state(directory).await {
         Ok(PathState::Directory) => reject_symlink_entries(directory)
@@ -1004,6 +1086,10 @@ async fn ensure_log_directory(directory: &Path) -> Result<(), SessionLogError> {
 }
 
 async fn remove_empty_session_directory(directory: &Path, parent: &Path) -> Result<(), StoreError> {
+    #[cfg(test)]
+    if should_fail_cleanup(directory) {
+        return Err(StoreError::Unavailable);
+    }
     match fs::remove_dir(directory).await {
         Ok(()) => {
             if sync_directory(parent).await.is_err() {
@@ -1289,7 +1375,8 @@ mod tests {
     use super::{
         CONVERSATION_FILE, LocalSessionLog, LogBatch, MANIFEST_FILE, SESSION_RECORD_FILE,
         SessionRecord, Store, StoreError, fail_directory_sync_after,
-        fail_next_atomic_write_before_rename, fail_next_directory_sync,
+        fail_next_atomic_write_before_rename, fail_next_cleanup, fail_next_delete_after_partial,
+        fail_next_directory_sync,
     };
 
     fn session_id(value: u8) -> SessionId {
@@ -1770,6 +1857,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_unknown_poisoned_object_rejects_every_followup_operation() {
+        let (store, root) = test_store("load-fault").await;
+        let id = session_id(30);
+        let (mut initialized, directory) = initialized_log(&store, id).await;
+        initialized.close().await.unwrap();
+        let mut loaded = LocalSessionLog::new(directory.clone());
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(CONVERSATION_FILE))
+            .await
+            .unwrap()
+            .write_all(b"partial")
+            .await
+            .unwrap();
+        fail_next_directory_sync(&directory);
+
+        let first_error = loaded.load_manifest().await.unwrap_err();
+        assert_eq!(first_error.kind(), SessionLogErrorKind::UnknownOutcome);
+        assert_eq!(loaded.load_manifest().await.unwrap_err(), first_error);
+        assert_eq!(
+            loaded.read_page(None, 1).await.unwrap_err().kind(),
+            SessionLogErrorKind::UnknownOutcome
+        );
+        assert_eq!(
+            loaded
+                .append(ConversationSeq::ZERO, vec![entry(1, turn_id(30))])
+                .await
+                .unwrap_err()
+                .kind(),
+            SessionLogErrorKind::UnknownOutcome
+        );
+        assert_eq!(
+            loaded.close().await.unwrap_err().kind(),
+            SessionLogErrorKind::UnknownOutcome
+        );
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn delete_failures_are_unknown_and_missing_is_only_not_found() {
+        let (store, root) = test_store("delete-fault").await;
+
+        assert!(matches!(
+            store.delete_session(session_id(33)).await,
+            Err(StoreError::SessionNotFound)
+        ));
+
+        let partial_id = session_id(34);
+        let (mut partial_log, partial_directory) = initialized_log(&store, partial_id).await;
+        partial_log.close().await.unwrap();
+        fail_next_delete_after_partial(&partial_directory);
+        assert!(matches!(
+            store.delete_session(partial_id).await,
+            Err(StoreError::UnknownOutcome)
+        ));
+        assert!(tokio::fs::try_exists(&partial_directory).await.unwrap());
+        assert!(matches!(
+            store.load_record(partial_id).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(
+            store.list_sessions().await,
+            Err(StoreError::Corrupt)
+        ));
+
+        let synced_id = session_id(35);
+        let (mut synced_log, synced_directory) = initialized_log(&store, synced_id).await;
+        synced_log.close().await.unwrap();
+        fail_next_directory_sync(&store.sessions_directory());
+        assert!(matches!(
+            store.delete_session(synced_id).await,
+            Err(StoreError::UnknownOutcome)
+        ));
+        assert!(!tokio::fs::try_exists(&synced_directory).await.unwrap());
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn existing_session_without_metadata_is_corrupt_not_missing() {
+        let (store, root) = test_store("missing-record").await;
+        let id = session_id(36);
+        let (mut log, directory) = initialized_log(&store, id).await;
+        log.close().await.unwrap();
+        tokio::fs::remove_file(directory.join(SESSION_RECORD_FILE))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.load_record(id).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(
+            store.list_sessions().await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(store.open_log(id).await, Err(StoreError::Corrupt)));
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
     async fn metadata_failures_clean_precommit_and_retain_unknown_commit() {
         let (store, root) = test_store("metadata-faults").await;
 
@@ -1798,6 +1988,38 @@ mod tests {
         assert_eq!(
             store.load_record(after_id).await.unwrap().session_id,
             after_id
+        );
+
+        let cleanup_known_id = session_id(31);
+        let cleanup_known_directory = session_directory(&root, cleanup_known_id);
+        fail_next_atomic_write_before_rename(&cleanup_known_directory.join(SESSION_RECORD_FILE));
+        fail_next_cleanup(&cleanup_known_directory);
+        assert!(matches!(
+            store.create_session(record(cleanup_known_id)).await,
+            Err(StoreError::CleanupFailed { .. })
+        ));
+        assert!(
+            tokio::fs::try_exists(&cleanup_known_directory)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            store.load_record(cleanup_known_id).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        let cleanup_unknown_id = session_id(32);
+        let cleanup_unknown_directory = session_directory(&root, cleanup_unknown_id);
+        fail_next_atomic_write_before_rename(&cleanup_unknown_directory.join(SESSION_RECORD_FILE));
+        fail_directory_sync_after(&store.sessions_directory(), 1);
+        assert!(matches!(
+            store.create_session(record(cleanup_unknown_id)).await,
+            Err(StoreError::UnknownOutcome)
+        ));
+        assert!(
+            !tokio::fs::try_exists(&cleanup_unknown_directory)
+                .await
+                .unwrap()
         );
 
         remove_root(&root).await;
