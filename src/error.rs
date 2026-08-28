@@ -36,6 +36,8 @@ pub enum AgentError {
     SessionNotLoaded,
     #[error("session is already loaded")]
     SessionAlreadyLoaded,
+    #[error("session specification is incompatible with current configuration")]
+    SessionSpecMismatch,
     #[error("session is busy")]
     SessionBusy,
     #[error("session is closed")]

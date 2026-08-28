@@ -14,11 +14,15 @@ use minicore_runtime::session::{
     InteractionAnswer, SessionEventStream, SessionRuntime, SessionRuntimeOptions, SessionState,
     TurnHandle,
 };
+use minicore_runtime::storage::{SessionLog, SessionLogError};
 use minicore_runtime::tools::{ToolPolicy, ToolSet};
 
 use crate::config::{AgentConfig, ProfileCompaction};
 use crate::error::{AgentError, StoreError};
-use crate::event::{AgentEvent, AgentEventStream, map_session_event};
+use crate::event::{
+    AgentEvent, AgentEventSink, AgentEventStream, CompletionCancellation, EventMeta,
+    map_session_event,
+};
 use crate::models::{ModelConfigError, Models};
 use crate::profiles::{Profile, Profiles};
 use crate::sessions::{LoadedSession, Sessions};
@@ -102,7 +106,6 @@ pub struct Agent {
     sessions: Sessions,
     events_tx: mpsc::Sender<AgentEvent>,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
-    completion_tasks: Vec<tokio::task::JoinHandle<()>>,
     task_runtime: Handle,
     kernel: minicore_runtime::KernelConfig,
 }
@@ -162,7 +165,6 @@ impl Agent {
             sessions: Sessions::new(),
             events_tx,
             events_rx: Some(events_rx),
-            completion_tasks: Vec::new(),
             task_runtime,
             kernel,
         })
@@ -229,7 +231,7 @@ impl Agent {
                 return Err(map_session_open_error(error));
             }
         };
-        let loaded = match self.attach_runtime(runtime).await {
+        let loaded = match self.attach_runtime(runtime, record.clone()).await {
             Ok(loaded) => loaded,
             Err(error) => {
                 let _ = self.store.delete_session(session_id).await;
@@ -237,6 +239,7 @@ impl Agent {
             }
         };
         let instance_id = loaded.handle.instance_id();
+        let event_sink = loaded.event_sink.clone();
         let _ = self.sessions.insert(session_id, loaded);
         let info = SessionInfo {
             session_id,
@@ -248,41 +251,57 @@ impl Agent {
             created_at: record.created_at,
             updated_at: record.updated_at,
         };
-        self.emit(AgentEvent::SessionOpened {
+        let _ = event_sink.try_send(AgentEvent::SessionOpened {
             session: info.clone(),
+            meta: EventMeta {
+                session_id,
+                instance_id,
+                dropped_before: 0,
+            },
         });
         Ok(info)
     }
 
     pub async fn open_session(&mut self, session_id: SessionId) -> Result<SessionInfo, AgentError> {
+        if let Some(loaded) = self.sessions.get(session_id) {
+            return Ok(self.session_info(&loaded.record, Some(loaded)));
+        }
         let record = self
             .store
             .load_record(session_id)
             .await
             .map_err(map_store_error)?;
-        if let Some(loaded) = self.sessions.get(session_id) {
-            return Ok(self.session_info(&record, Some(loaded)));
-        }
         validate_workspace(&record.workspace).await?;
         let profile = self
             .profiles
             .get(&record.profile)
             .cloned()
             .ok_or(AgentError::ProfileNotFound)?;
-        let (_, options) = self.session_parts(&profile)?;
-        let log = self
+        let (spec, options) = self.session_parts(&profile)?;
+        let mut log = self
             .store
             .open_log(session_id)
             .await
             .map_err(map_store_error)?;
+        let manifest = log.load_manifest().await.map_err(map_log_error)?;
+        if manifest.session_id != session_id || manifest.spec != spec {
+            log.close().await.map_err(map_log_error)?;
+            return Err(AgentError::SessionSpecMismatch);
+        }
         let runtime = SessionRuntime::load(session_id, Box::new(log), options)
             .await
             .map_err(map_session_open_error)?;
-        let loaded = self.attach_runtime(runtime).await?;
+        let loaded = self.attach_runtime(runtime, record.clone()).await?;
         let info = self.session_info(&record, Some(&loaded));
+        let event_sink = loaded.event_sink.clone();
         let _ = self.sessions.insert(session_id, loaded);
-        self.emit(AgentEvent::SessionOpened {
+        let _ = event_sink.try_send(AgentEvent::SessionOpened {
             session: info.clone(),
+            meta: EventMeta {
+                session_id,
+                instance_id: info.instance_id.expect("loaded session has instance"),
+                dropped_before: 0,
+            },
         });
         Ok(info)
     }
@@ -292,9 +311,15 @@ impl Agent {
             .sessions
             .remove(session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
+        let event_sink = loaded.event_sink.clone();
+        let meta = EventMeta {
+            session_id,
+            instance_id: loaded.handle.instance_id(),
+            dropped_before: 0,
+        };
         let result = loaded.shutdown().await;
         if result.is_ok() {
-            self.emit(AgentEvent::SessionClosed { session_id });
+            let _ = event_sink.try_send(AgentEvent::SessionClosed { session_id, meta });
         }
         result
     }
@@ -341,10 +366,19 @@ impl Agent {
         if let Some(loaded) = self.sessions.get_mut(session_id) {
             loaded.active_turn = Some(turn.clone());
         }
-        self.completion_tasks.retain(|task| !task.is_finished());
-        self.spawn_turn_waiter(turn);
+        let completion_cancel = self
+            .sessions
+            .get(session_id)
+            .expect("submitted turn belongs to loaded session")
+            .completion_cancel
+            .clone();
+        self.spawn_turn_waiter(turn, completion_cancel);
         // The turn is already accepted by Core; metadata freshness is best effort here.
-        let _ = self.store.touch(session_id).await;
+        if let Ok(updated_at) = self.store.touch(session_id).await {
+            if let Some(loaded) = self.sessions.get_mut(session_id) {
+                loaded.record.updated_at = updated_at;
+            }
+        }
         Ok(turn_ref)
     }
 
@@ -402,10 +436,7 @@ impl Agent {
     }
 
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
-        let result = self.sessions.shutdown_all(&self.events_tx).await;
-        for task in self.completion_tasks {
-            let _ = task.await;
-        }
+        let result = self.sessions.shutdown_all().await;
         drop(self.events_tx);
         drop(self.events_rx.take());
         result
@@ -465,6 +496,7 @@ impl Agent {
     async fn attach_runtime(
         &self,
         mut runtime: SessionRuntime,
+        record: SessionRecord,
     ) -> Result<LoadedSession, AgentError> {
         let event_stream = match runtime.take_events() {
             Ok(stream) => stream,
@@ -475,18 +507,23 @@ impl Agent {
         };
         let handle = runtime.handle();
         let state = handle.watch_state();
+        let event_sink = AgentEventSink::new(self.events_tx.clone());
+        let completion_cancel = CompletionCancellation::new();
         let event_task = self
             .task_runtime
-            .spawn(event_pump(event_stream, self.events_tx.clone()));
+            .spawn(event_pump(event_stream, event_sink.clone()));
         let state_task = self
             .task_runtime
-            .spawn(state_pump(state, self.events_tx.clone()));
+            .spawn(state_pump(state, event_sink.clone()));
         Ok(LoadedSession {
+            record,
             runtime,
             handle,
             active_turn: None,
             event_task,
             state_task,
+            event_sink,
+            completion_cancel,
         })
     }
 
@@ -503,55 +540,80 @@ impl Agent {
         }
     }
 
-    fn spawn_turn_waiter(&mut self, turn: TurnHandle) {
-        let sender = self.events_tx.clone();
-        let task = self.task_runtime.spawn(async move {
-            if let Ok(outcome) = turn.wait().await {
-                let event = AgentEvent::TurnFinished {
-                    turn: TurnRef::from_handle(&turn),
-                    outcome,
-                };
-                let _ = sender.try_send(event);
+    fn spawn_turn_waiter(&self, turn: TurnHandle, completion_cancel: CompletionCancellation) {
+        let event_sink = self
+            .sessions
+            .get(turn.session_id())
+            .expect("turn belongs to loaded session")
+            .event_sink
+            .clone();
+        let turn_ref = TurnRef::from_handle(&turn);
+        self.task_runtime.spawn(async move {
+            tokio::select! {
+                biased;
+                result = turn.wait() => {
+                    if let Ok(outcome) = result {
+                        let _ = event_sink
+                            .send_durable(AgentEvent::TurnFinished {
+                                turn: turn_ref,
+                                outcome,
+                                meta: EventMeta {
+                                    session_id: turn_ref.session_id,
+                                    instance_id: turn_ref.instance_id,
+                                    dropped_before: 0,
+                                },
+                            }, completion_cancel.clone())
+                            .await;
+                    }
+                }
+                _ = completion_cancel.cancelled() => {}
             }
         });
-        self.completion_tasks.push(task);
-    }
-
-    fn emit(&self, event: AgentEvent) {
-        let _ = self.events_tx.try_send(event);
     }
 }
 
-async fn event_pump(mut stream: SessionEventStream, sender: mpsc::Sender<AgentEvent>) {
+async fn event_pump(mut stream: SessionEventStream, event_sink: AgentEventSink) {
     while let Some(envelope) = stream.recv().await {
-        let Some(event) = map_session_event(envelope) else {
-            continue;
-        };
-        if sender.try_send(event).is_err() && sender.is_closed() {
-            break;
+        let dropped_before = envelope.dropped_before;
+        if let Some(event) = map_session_event(envelope) {
+            if event_sink.try_send(event) == crate::event::AgentSendResult::Closed {
+                break;
+            }
+        } else {
+            event_sink.record_core_drops(dropped_before);
+            if event_sink.is_closed() {
+                break;
+            }
         }
     }
 }
 
 async fn state_pump(
     mut state: tokio::sync::watch::Receiver<minicore_runtime::SessionState>,
-    sender: mpsc::Sender<AgentEvent>,
+    event_sink: AgentEventSink,
 ) {
-    if !emit_state(&sender, state.borrow().clone()) {
+    if !emit_state(&event_sink, state.borrow().clone()) {
         return;
     }
     loop {
         if state.changed().await.is_err() {
             break;
         }
-        if !emit_state(&sender, state.borrow().clone()) {
+        if !emit_state(&event_sink, state.borrow().clone()) {
             break;
         }
     }
 }
 
-fn emit_state(sender: &mpsc::Sender<AgentEvent>, state: minicore_runtime::SessionState) -> bool {
-    sender.try_send(AgentEvent::SessionState { state }).is_ok() || !sender.is_closed()
+fn emit_state(event_sink: &AgentEventSink, state: minicore_runtime::SessionState) -> bool {
+    event_sink.try_send(AgentEvent::SessionState {
+        meta: EventMeta {
+            session_id: state.session_id,
+            instance_id: state.instance_id,
+            dropped_before: 0,
+        },
+        state,
+    }) != crate::event::AgentSendResult::Closed
 }
 
 fn validate_turn_ref(loaded: &LoadedSession, turn: TurnRef) -> Result<(), AgentError> {
@@ -580,6 +642,10 @@ fn current_timestamp() -> Result<String, AgentError> {
     Timestamp::now_utc()
         .map(|timestamp| timestamp.as_str().to_owned())
         .map_err(|_| AgentError::Internal)
+}
+
+fn map_log_error(error: SessionLogError) -> AgentError {
+    map_store_error(StoreError::Log(error))
 }
 
 fn map_model_config_error(error: ModelConfigError) -> AgentError {

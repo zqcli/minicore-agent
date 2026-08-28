@@ -19,6 +19,8 @@ pub use config::{
     AgentConfig, ApprovalMode, ConfigError, KernelOverrides, Profile, ProfileCompaction,
 };
 pub use error::{AgentError, CoreErrorView};
-pub use event::{AgentEvent, AgentEventStream, OutputChannel, ToolProgressView, ToolResultView};
+pub use event::{
+    AgentEvent, AgentEventStream, EventMeta, OutputChannel, ToolProgressView, ToolResultView,
+};
 pub use models::ModelConfig;
 pub use rpc::run_stdio;

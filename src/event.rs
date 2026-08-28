@@ -1,5 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use serde::{Serialize, Serializer};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use minicore_runtime::error::DiagnosticSummary;
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
@@ -11,56 +14,282 @@ use minicore_runtime::tools::{ApprovalRisk, ToolInputAnswerKind, ToolProgress, T
 
 use crate::agent::{SessionInfo, TurnRef};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct EventMeta {
+    pub session_id: SessionId,
+    pub instance_id: SessionInstanceId,
+    pub dropped_before: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentEvent {
     SessionOpened {
         session: SessionInfo,
+        meta: EventMeta,
     },
     SessionClosed {
         session_id: SessionId,
+        meta: EventMeta,
     },
     SessionState {
         state: SessionState,
+        meta: EventMeta,
     },
     TurnStarted {
         turn: TurnRef,
+        meta: EventMeta,
     },
     OutputDelta {
         turn: TurnRef,
         channel: OutputChannel,
         delta: String,
-        dropped_before: u64,
+        meta: EventMeta,
     },
     ToolStarted {
         turn: TurnRef,
         tool_call_id: ToolCallId,
         tool_name: String,
-        dropped_before: u64,
+        meta: EventMeta,
     },
     ToolProgress {
         turn: TurnRef,
         tool_call_id: ToolCallId,
         progress: ToolProgressView,
-        dropped_before: u64,
+        meta: EventMeta,
     },
     ToolFinished {
         turn: TurnRef,
         tool_call_id: ToolCallId,
         result: ToolResultView,
-        dropped_before: u64,
+        meta: EventMeta,
     },
     InteractionRequested {
         session_id: SessionId,
         interaction: minicore_runtime::PendingInteraction,
+        meta: EventMeta,
     },
     InteractionResolved {
         session_id: SessionId,
         interaction_id: InteractionId,
+        meta: EventMeta,
     },
     TurnFinished {
         turn: TurnRef,
         outcome: minicore_runtime::TurnOutcome,
+        meta: EventMeta,
     },
+}
+
+impl AgentEvent {
+    pub(crate) fn dropped_before(&self) -> u64 {
+        self.meta().dropped_before
+    }
+
+    pub(crate) fn set_dropped_before(&mut self, dropped_before: u64) {
+        self.meta_mut().dropped_before = dropped_before;
+    }
+
+    fn meta(&self) -> &EventMeta {
+        match self {
+            Self::SessionOpened { meta, .. }
+            | Self::SessionClosed { meta, .. }
+            | Self::SessionState { meta, .. }
+            | Self::TurnStarted { meta, .. }
+            | Self::OutputDelta { meta, .. }
+            | Self::ToolStarted { meta, .. }
+            | Self::ToolProgress { meta, .. }
+            | Self::ToolFinished { meta, .. }
+            | Self::InteractionRequested { meta, .. }
+            | Self::InteractionResolved { meta, .. }
+            | Self::TurnFinished { meta, .. } => meta,
+        }
+    }
+
+    fn meta_mut(&mut self) -> &mut EventMeta {
+        match self {
+            Self::SessionOpened { meta, .. }
+            | Self::SessionClosed { meta, .. }
+            | Self::SessionState { meta, .. }
+            | Self::TurnStarted { meta, .. }
+            | Self::OutputDelta { meta, .. }
+            | Self::ToolStarted { meta, .. }
+            | Self::ToolProgress { meta, .. }
+            | Self::ToolFinished { meta, .. }
+            | Self::InteractionRequested { meta, .. }
+            | Self::InteractionResolved { meta, .. }
+            | Self::TurnFinished { meta, .. } => meta,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentSendResult {
+    Sent,
+    Dropped,
+    Closed,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentEventSink {
+    sender: mpsc::Sender<AgentEvent>,
+    drop_state: Arc<Mutex<DropState>>,
+    durable_ready: Arc<Notify>,
+}
+
+struct DropState {
+    pending: u64,
+    durable_in_flight: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompletionCancellation {
+    inner: Arc<CompletionCancellationState>,
+}
+
+struct CompletionCancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl CompletionCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(CompletionCancellationState {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::Release) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.inner.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl AgentEventSink {
+    pub(crate) fn new(sender: mpsc::Sender<AgentEvent>) -> Self {
+        Self {
+            sender,
+            drop_state: Arc::new(Mutex::new(DropState {
+                pending: 0,
+                durable_in_flight: false,
+            })),
+            durable_ready: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn try_send(&self, mut event: AgentEvent) -> AgentSendResult {
+        let mut pending = self
+            .drop_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.sender.is_closed() {
+            return AgentSendResult::Closed;
+        }
+        let core_dropped = event.dropped_before();
+        if pending.durable_in_flight {
+            pending.pending = pending
+                .pending
+                .saturating_add(core_dropped)
+                .saturating_add(1);
+            return AgentSendResult::Dropped;
+        }
+        let reported = pending.pending.saturating_add(core_dropped);
+        event.set_dropped_before(reported);
+        match self.sender.try_send(event) {
+            Ok(()) => {
+                pending.pending = 0;
+                AgentSendResult::Sent
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                pending.pending = pending
+                    .pending
+                    .saturating_add(core_dropped)
+                    .saturating_add(1);
+                AgentSendResult::Dropped
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => AgentSendResult::Closed,
+        }
+    }
+
+    pub(crate) fn record_core_drops(&self, dropped: u64) {
+        let mut pending = self
+            .drop_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.pending = pending.pending.saturating_add(dropped);
+    }
+
+    pub(crate) async fn send_durable(
+        &self,
+        mut event: AgentEvent,
+        cancellation: CompletionCancellation,
+    ) -> bool {
+        loop {
+            let notified = self.durable_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let can_start = {
+                let mut state = self
+                    .drop_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.durable_in_flight {
+                    state.durable_in_flight = true;
+                    let core_dropped = event.dropped_before();
+                    event.set_dropped_before(state.pending.saturating_add(core_dropped));
+                    state.pending = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            if can_start {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return false,
+                _ = notified => {}
+            }
+        }
+
+        let sent = tokio::select! {
+            biased;
+            result = self.sender.send(event) => result.is_ok(),
+            _ = cancellation.cancelled() => false,
+        };
+        {
+            let mut state = self
+                .drop_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.durable_in_flight = false;
+        }
+        self.durable_ready.notify_waiters();
+        sent
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -115,13 +344,20 @@ enum ToolInputAnswerKindView {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum InteractionKindView {
     Approval {
+        prompt: String,
         risk: ApprovalRiskView,
     },
     ToolInput {
-        prompt_bytes: usize,
-        choice_count: usize,
+        prompt: String,
+        choices: Vec<ToolInputChoiceView>,
         answer_kind: ToolInputAnswerKindView,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ToolInputChoiceView {
+    index: usize,
+    text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -215,6 +451,7 @@ impl From<&minicore_runtime::PendingInteraction> for PendingInteractionView {
             tool_name: interaction.tool_name.to_string(),
             kind: match &interaction.kind {
                 InteractionKind::Approval(request) => InteractionKindView::Approval {
+                    prompt: request.prompt.as_str().to_owned(),
                     risk: match request.risk {
                         ApprovalRisk::Low => ApprovalRiskView::Low,
                         ApprovalRisk::Medium => ApprovalRiskView::Medium,
@@ -222,8 +459,16 @@ impl From<&minicore_runtime::PendingInteraction> for PendingInteractionView {
                     },
                 },
                 InteractionKind::ToolInput(request) => InteractionKindView::ToolInput {
-                    prompt_bytes: request.prompt.byte_len(),
-                    choice_count: request.choices.len(),
+                    prompt: request.prompt.as_str().to_owned(),
+                    choices: request
+                        .choices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, text)| ToolInputChoiceView {
+                            index,
+                            text: text.as_str().to_owned(),
+                        })
+                        .collect(),
                     answer_kind: match request.answer_kind {
                         ToolInputAnswerKind::Text => ToolInputAnswerKindView::Text,
                         ToolInputAnswerKind::SingleChoice => ToolInputAnswerKindView::SingleChoice,
@@ -240,31 +485,38 @@ impl Serialize for AgentEvent {
         S: Serializer,
     {
         match self {
-            Self::SessionOpened { session } => {
-                serialize_event(serializer, "session_opened", SessionOpenedData { session })
-            }
-            Self::SessionClosed { session_id } => serialize_event(
+            Self::SessionOpened { session, meta } => serialize_event(
+                serializer,
+                "session_opened",
+                SessionOpenedData {
+                    session,
+                    meta: *meta,
+                },
+            ),
+            Self::SessionClosed { session_id, meta } => serialize_event(
                 serializer,
                 "session_closed",
                 SessionClosedData {
                     session_id: *session_id,
+                    meta: *meta,
                 },
             ),
-            Self::SessionState { state } => serialize_event(
+            Self::SessionState { state, meta } => serialize_event(
                 serializer,
                 "session_state",
                 SessionStateData {
                     state: SessionStateView::from(state),
+                    meta: *meta,
                 },
             ),
-            Self::TurnStarted { turn } => {
-                serialize_event(serializer, "turn_started", TurnData { turn })
+            Self::TurnStarted { turn, meta } => {
+                serialize_event(serializer, "turn_started", TurnData { turn, meta: *meta })
             }
             Self::OutputDelta {
                 turn,
                 channel,
                 delta,
-                dropped_before,
+                meta,
             } => serialize_event(
                 serializer,
                 "output_delta",
@@ -272,14 +524,14 @@ impl Serialize for AgentEvent {
                     turn,
                     channel,
                     delta,
-                    dropped_before: *dropped_before,
+                    meta: *meta,
                 },
             ),
             Self::ToolStarted {
                 turn,
                 tool_call_id,
                 tool_name,
-                dropped_before,
+                meta,
             } => serialize_event(
                 serializer,
                 "tool_started",
@@ -287,14 +539,14 @@ impl Serialize for AgentEvent {
                     turn,
                     tool_call_id,
                     tool_name,
-                    dropped_before: *dropped_before,
+                    meta: *meta,
                 },
             ),
             Self::ToolProgress {
                 turn,
                 tool_call_id,
                 progress,
-                dropped_before,
+                meta,
             } => serialize_event(
                 serializer,
                 "tool_progress",
@@ -302,14 +554,14 @@ impl Serialize for AgentEvent {
                     turn,
                     tool_call_id,
                     progress,
-                    dropped_before: *dropped_before,
+                    meta: *meta,
                 },
             ),
             Self::ToolFinished {
                 turn,
                 tool_call_id,
                 result,
-                dropped_before,
+                meta,
             } => serialize_event(
                 serializer,
                 "tool_finished",
@@ -317,37 +569,46 @@ impl Serialize for AgentEvent {
                     turn,
                     tool_call_id,
                     result,
-                    dropped_before: *dropped_before,
+                    meta: *meta,
                 },
             ),
             Self::InteractionRequested {
                 session_id,
                 interaction,
+                meta,
             } => serialize_event(
                 serializer,
                 "interaction_requested",
                 InteractionRequestedData {
                     session_id: *session_id,
                     interaction: PendingInteractionView::from(interaction),
+                    meta: *meta,
                 },
             ),
             Self::InteractionResolved {
                 session_id,
                 interaction_id,
+                meta,
             } => serialize_event(
                 serializer,
                 "interaction_resolved",
                 InteractionResolvedData {
                     session_id: *session_id,
                     interaction_id: *interaction_id,
+                    meta: *meta,
                 },
             ),
-            Self::TurnFinished { turn, outcome } => serialize_event(
+            Self::TurnFinished {
+                turn,
+                outcome,
+                meta,
+            } => serialize_event(
                 serializer,
                 "turn_finished",
                 TurnFinishedData {
                     turn,
                     outcome: TurnOutcomeView::from(outcome),
+                    meta: *meta,
                 },
             ),
         }
@@ -376,21 +637,25 @@ where
 #[derive(Serialize)]
 struct SessionOpenedData<'a> {
     session: &'a SessionInfo,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
 struct SessionClosedData {
     session_id: SessionId,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
 struct SessionStateData {
     state: SessionStateView,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
 struct TurnData<'a> {
     turn: &'a TurnRef,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
@@ -398,7 +663,7 @@ struct OutputDeltaData<'a> {
     turn: &'a TurnRef,
     channel: &'a OutputChannel,
     delta: &'a str,
-    dropped_before: u64,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
@@ -406,7 +671,7 @@ struct ToolStartedData<'a> {
     turn: &'a TurnRef,
     tool_call_id: &'a ToolCallId,
     tool_name: &'a str,
-    dropped_before: u64,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
@@ -414,7 +679,7 @@ struct ToolProgressData<'a> {
     turn: &'a TurnRef,
     tool_call_id: &'a ToolCallId,
     progress: &'a ToolProgressView,
-    dropped_before: u64,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
@@ -422,25 +687,28 @@ struct ToolFinishedData<'a> {
     turn: &'a TurnRef,
     tool_call_id: &'a ToolCallId,
     result: &'a ToolResultView,
-    dropped_before: u64,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
 struct InteractionRequestedData {
     session_id: SessionId,
     interaction: PendingInteractionView,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
 struct InteractionResolvedData {
     session_id: SessionId,
     interaction_id: InteractionId,
+    meta: EventMeta,
 }
 
 #[derive(Serialize)]
 struct TurnFinishedData<'a> {
     turn: &'a TurnRef,
     outcome: TurnOutcomeView,
+    meta: EventMeta,
 }
 
 pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentEvent> {
@@ -449,10 +717,15 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
         instance_id: envelope.instance_id,
         turn_id,
     };
-    let dropped_before = envelope.dropped_before;
+    let meta = EventMeta {
+        session_id: envelope.session_id,
+        instance_id: envelope.instance_id,
+        dropped_before: envelope.dropped_before,
+    };
     match envelope.event {
         SessionEvent::TurnStarted { turn_id } => Some(AgentEvent::TurnStarted {
             turn: turn(turn_id),
+            meta,
         }),
         SessionEvent::OutputDelta {
             turn_id,
@@ -465,7 +738,7 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
                 minicore_runtime::session::OutputChannel::Reasoning => OutputChannel::Reasoning,
             },
             delta: delta.as_str().to_owned(),
-            dropped_before,
+            meta,
         }),
         SessionEvent::ToolStarted {
             turn_id,
@@ -475,7 +748,7 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
             turn: turn(turn_id),
             tool_call_id,
             tool_name: tool_name.to_string(),
-            dropped_before,
+            meta,
         }),
         SessionEvent::ToolProgress {
             turn_id,
@@ -485,7 +758,7 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
             turn: turn(turn_id),
             tool_call_id,
             progress: ToolProgressView::from(&progress),
-            dropped_before,
+            meta,
         }),
         SessionEvent::ToolFinished {
             turn_id,
@@ -498,18 +771,20 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
                 outcome: result.outcome,
                 content_bytes: result.content_bytes,
             },
-            dropped_before,
+            meta,
         }),
         SessionEvent::InteractionRequested { interaction } => {
             Some(AgentEvent::InteractionRequested {
                 session_id: envelope.session_id,
                 interaction,
+                meta,
             })
         }
         SessionEvent::InteractionResolved { interaction_id, .. } => {
             Some(AgentEvent::InteractionResolved {
                 session_id: envelope.session_id,
                 interaction_id,
+                meta,
             })
         }
         SessionEvent::TurnFinished { .. }
@@ -530,5 +805,297 @@ impl AgentEventStream {
 
     pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.receiver.recv().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use minicore_runtime::ids::{InteractionId, SessionId, ToolCallId, TurnId};
+    use minicore_runtime::session::{InteractionKind, SessionHealth, SessionState, SessionStatus};
+    use minicore_runtime::tools::{
+        ApprovalRequest, ApprovalRisk, ToolInputAnswerKind, ToolInputRequest,
+    };
+    use minicore_runtime::value::BoundedText;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    fn ids() -> (SessionId, SessionInstanceId, TurnId) {
+        (
+            "ses_00000000000000000000000000000001".parse().unwrap(),
+            "ins_00000000000000000000000000000001".parse().unwrap(),
+            "trn_00000000000000000000000000000001".parse().unwrap(),
+        )
+    }
+
+    fn meta(dropped_before: u64) -> EventMeta {
+        let (session_id, instance_id, _) = ids();
+        EventMeta {
+            session_id,
+            instance_id,
+            dropped_before,
+        }
+    }
+
+    fn turn() -> TurnRef {
+        let (session_id, instance_id, turn_id) = ids();
+        TurnRef {
+            session_id,
+            instance_id,
+            turn_id,
+        }
+    }
+
+    fn output(dropped_before: u64) -> AgentEvent {
+        AgentEvent::OutputDelta {
+            turn: turn(),
+            channel: OutputChannel::Text,
+            delta: "text".to_owned(),
+            meta: meta(dropped_before),
+        }
+    }
+
+    fn finish(dropped_before: u64) -> AgentEvent {
+        AgentEvent::TurnFinished {
+            turn: turn(),
+            outcome: minicore_runtime::TurnOutcome {
+                turn_id: ids().2,
+                terminal: minicore_runtime::TurnTerminal::Completed,
+                usage: Usage::default(),
+            },
+            meta: meta(dropped_before),
+        }
+    }
+
+    fn interaction(kind: InteractionKind) -> minicore_runtime::PendingInteraction {
+        let (_, _, turn_id) = ids();
+        minicore_runtime::PendingInteraction {
+            interaction_id: "int_00000000000000000000000000000001"
+                .parse::<InteractionId>()
+                .unwrap(),
+            turn_id,
+            tool_call_id: ToolCallId::new("call-1").unwrap(),
+            tool_name: "write".parse().unwrap(),
+            kind,
+        }
+    }
+
+    fn approval_interaction() -> minicore_runtime::PendingInteraction {
+        interaction(InteractionKind::Approval(
+            ApprovalRequest::new("Allow write?", ApprovalRisk::High).unwrap(),
+        ))
+    }
+
+    fn tool_input_interaction() -> minicore_runtime::PendingInteraction {
+        interaction(InteractionKind::ToolInput(
+            ToolInputRequest::new(
+                "Choose a format",
+                vec![
+                    BoundedText::new("Markdown").unwrap(),
+                    BoundedText::new("Plain text").unwrap(),
+                ],
+                ToolInputAnswerKind::SingleChoice,
+            )
+            .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn approval_interaction_wire_is_bounded_and_answerable() {
+        let (_, instance_id, turn_id) = ids();
+        let pending = approval_interaction();
+        let value = serde_json::to_value(AgentEvent::InteractionRequested {
+            session_id: ids().0,
+            interaction: pending,
+            meta: meta(3),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "interaction_requested",
+                "data": {
+                    "session_id": ids().0,
+                    "interaction": {
+                        "interaction_id": "int_00000000000000000000000000000001",
+                        "turn_id": turn_id,
+                        "tool_call_id": "call-1",
+                        "tool_name": "write",
+                        "kind": {
+                            "type": "approval",
+                            "data": {"prompt": "Allow write?", "risk": "high"}
+                        }
+                    },
+                    "meta": {
+                        "session_id": ids().0,
+                        "instance_id": instance_id,
+                        "dropped_before": 3
+                    }
+                }
+            })
+        );
+        assert!(!value.to_string().contains("arguments"));
+    }
+
+    #[test]
+    fn tool_input_interaction_wire_preserves_choice_shape_and_state_pending() {
+        let (session_id, instance_id, turn_id) = ids();
+        let pending = tool_input_interaction();
+        let event = AgentEvent::InteractionRequested {
+            session_id,
+            interaction: pending.clone(),
+            meta: meta(0),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            value["data"]["interaction"]["kind"],
+            json!({
+                "type": "tool_input",
+                "data": {
+                    "prompt": "Choose a format",
+                    "choices": [
+                        {"index": 0, "text": "Markdown"},
+                        {"index": 1, "text": "Plain text"}
+                    ],
+                    "answer_kind": "single_choice"
+                }
+            })
+        );
+
+        let state = SessionState {
+            session_id,
+            instance_id,
+            status: SessionStatus::WaitingForInput,
+            health: SessionHealth::Healthy,
+            active_turn: Some(turn_id),
+            pending_interaction: Some(pending),
+            conversation_seq: minicore_runtime::ConversationSeq::ZERO,
+            last_terminal: None,
+        };
+        let state_value = serde_json::to_value(AgentEvent::SessionState {
+            state,
+            meta: meta(2),
+        })
+        .unwrap();
+        assert_eq!(
+            state_value["data"]["state"]["pending_interaction"]["kind"],
+            value["data"]["interaction"]["kind"]
+        );
+        assert_eq!(state_value["data"]["meta"]["dropped_before"], 2);
+        assert!(!state_value.to_string().contains("arguments"));
+    }
+
+    #[test]
+    fn core_event_mapping_preserves_complete_event_meta() {
+        let (session_id, instance_id, turn_id) = ids();
+        let mapped = map_session_event(SessionEventEnvelope {
+            session_id,
+            instance_id,
+            dropped_before: 7,
+            event: SessionEvent::TurnStarted { turn_id },
+        })
+        .unwrap();
+        assert!(matches!(
+            mapped,
+            AgentEvent::TurnStarted {
+                meta: EventMeta {
+                    session_id: value_session,
+                    instance_id: value_instance,
+                    dropped_before: 7
+                },
+                ..
+            } if value_session == session_id && value_instance == instance_id
+        ));
+
+        let requested = map_session_event(SessionEventEnvelope {
+            session_id,
+            instance_id,
+            dropped_before: 8,
+            event: SessionEvent::InteractionRequested {
+                interaction: approval_interaction(),
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            requested,
+            AgentEvent::InteractionRequested {
+                meta: EventMeta {
+                    dropped_before: 8,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn outer_drop_accounting_adds_core_drop_and_reaches_durable_finish() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = AgentEventSink::new(sender);
+        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
+        assert_eq!(sink.try_send(output(0)), AgentSendResult::Dropped);
+        assert_eq!(sink.try_send(output(2)), AgentSendResult::Dropped);
+        let _ = receiver.recv().await.unwrap();
+        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
+        let recovered = receiver.recv().await.unwrap();
+        assert!(matches!(
+            recovered,
+            AgentEvent::OutputDelta {
+                meta: EventMeta {
+                    dropped_before: 4,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
+        assert_eq!(sink.try_send(output(0)), AgentSendResult::Dropped);
+        let durable = tokio::spawn({
+            let sink = sink.clone();
+            async move {
+                sink.send_durable(finish(0), CompletionCancellation::new())
+                    .await
+            }
+        });
+        let _ = receiver.recv().await.unwrap();
+        let durable_event = receiver.recv().await.unwrap();
+        assert!(matches!(
+            durable_event,
+            AgentEvent::TurnFinished {
+                meta: EventMeta {
+                    dropped_before: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(durable.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn durable_send_finishes_when_receiver_is_dropped_or_session_is_cancelled() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let sink = AgentEventSink::new(sender);
+        assert!(
+            !sink
+                .send_durable(finish(0), CompletionCancellation::new())
+                .await
+        );
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = AgentEventSink::new(sender);
+        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
+        let cancellation = CompletionCancellation::new();
+        let task = tokio::spawn({
+            let sink = sink.clone();
+            let cancellation = cancellation.clone();
+            async move { sink.send_durable(finish(0), cancellation).await }
+        });
+        cancellation.cancel();
+        assert!(!task.await.unwrap());
+        let _ = receiver.recv().await.unwrap();
     }
 }
