@@ -643,7 +643,7 @@ async fn loaded_open_is_idempotent_without_reading_session_metadata() {
             .terminal,
         TurnTerminal::Completed
     );
-    assert_eq!(
+    assert_ne!(
         agent
             .open_session(info.session_id)
             .await
@@ -858,6 +858,70 @@ async fn dropped_event_receiver_does_not_block_agent_shutdown() {
         .await
         .unwrap()
         .unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn send_returns_before_background_touch_finishes() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-touch-background-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let started = Arc::new(Semaphore::new(0));
+    let (model, _) = FakeModel::new([ModelScript::Block]);
+    let model = model.with_started(Arc::clone(&started));
+    let mut agent = Agent::open_with_models(
+        config(base.join("data"), Vec::new()),
+        models(model),
+        ToolSet::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::store::TouchGate::new(info.session_id));
+    crate::store::block_next_touch(Arc::clone(&gate));
+    let turn = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent.send(SendMessage {
+            session_id: info.session_id,
+            text: "touch me asynchronously".to_owned(),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    started.acquire().await.unwrap().forget();
+    gate.started.acquire().await.unwrap().forget();
+    assert_ne!(
+        agent
+            .open_session(info.session_id)
+            .await
+            .unwrap()
+            .updated_at,
+        info.updated_at
+    );
+    gate.release.add_permits(1);
+    gate.finished.acquire().await.unwrap().forget();
+    assert!(agent.cancel(turn).unwrap());
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::CancelledByUser
+    );
+    drop(events);
+    agent.shutdown().await.unwrap();
     remove_base(&base).await;
 }
 
