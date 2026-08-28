@@ -42,7 +42,13 @@ agent shutdown completes before its success response is written.
 The library currently exposes `AgentConfig`, `AgentError`, `Agent`, the
 single-consumer `AgentEventStream`, and `run_stdio`. The event stream has no
 events yet by design. `data_dir` is parsed and validated but is not opened;
-Store, Agent Loop, Workspace, Tools, Context, Policy, and Provider adapters
-belong to later phases. No workspace, unsafe code, Factory/Repository layer,
-EventHub, plugin system, or multi-client coordination is introduced. The
-offline process coverage is in `tests/rpc_stdio.rs`.
+the Store implementation is crate-internal and uses
+`<data_dir>/sessions/<session-id>/` with `session.json`, `manifest.json`, and
+`conversation.log`. Each append is one durable JSON line containing one batch.
+Store assumes one process per data directory and does not implement file locks.
+Unknown append outcomes make that log object unusable. Agent Loop, Workspace,
+Tools, Context, Policy, and Provider adapters belong to later phases. No
+workspace, unsafe code, Factory/Repository layer, EventHub, plugin system, or
+multi-client coordination is introduced. The offline process coverage is in
+`tests/rpc_stdio.rs`; Store coverage is in the internal unit tests of
+`src/store.rs`.
