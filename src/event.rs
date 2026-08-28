@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Serialize, Serializer};
 use tokio::sync::{Notify, mpsc};
 
-use minicore_runtime::error::{DiagnosticSummary, TurnWaitError};
+use minicore_runtime::error::DiagnosticSummary;
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::Usage;
 use minicore_runtime::session::{
@@ -133,7 +133,6 @@ pub(crate) enum AgentSendResult {
 pub(crate) struct AgentEventSink {
     sender: mpsc::Sender<AgentEvent>,
     drop_state: Arc<Mutex<DropState>>,
-    durable_ready: Arc<Notify>,
 }
 
 struct DropState {
@@ -144,185 +143,6 @@ struct DropState {
 #[derive(Clone)]
 pub(crate) struct CompletionCancellation {
     inner: Arc<CompletionCancellationState>,
-}
-
-pub(crate) struct TurnCoordinator {
-    turn: TurnRef,
-    state: Mutex<TurnCoordinatorState>,
-    notify: Notify,
-}
-
-struct TurnCoordinatorState {
-    outcome: Option<Result<minicore_runtime::TurnOutcome, TurnWaitError>>,
-    terminal_meta: Option<EventMeta>,
-    state_terminal: bool,
-    core_quiescent: bool,
-    core_closed: bool,
-    claimed: bool,
-}
-
-pub(crate) enum CoordinatorReady {
-    Finish {
-        outcome: minicore_runtime::TurnOutcome,
-        terminal_meta: EventMeta,
-    },
-    NoEvent,
-}
-
-impl TurnCoordinator {
-    pub(crate) fn new(turn: TurnRef) -> Self {
-        Self {
-            turn,
-            state: Mutex::new(TurnCoordinatorState {
-                outcome: None,
-                terminal_meta: None,
-                state_terminal: false,
-                core_quiescent: false,
-                core_closed: false,
-                claimed: false,
-            }),
-            notify: Notify::new(),
-        }
-    }
-
-    pub(crate) fn turn_id(&self) -> TurnId {
-        self.turn.turn_id
-    }
-
-    pub(crate) fn set_outcome(
-        &self,
-        outcome: Result<minicore_runtime::TurnOutcome, TurnWaitError>,
-    ) {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .outcome = Some(outcome);
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) fn observe_terminal(&self, meta: EventMeta) -> bool {
-        let accepted = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.claimed {
-                false
-            } else {
-                state.terminal_meta = Some(meta);
-                true
-            }
-        };
-        self.notify.notify_waiters();
-        accepted
-    }
-
-    pub(crate) fn observe_state_terminal(&self) {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !state.claimed {
-                state.state_terminal = true;
-            }
-        }
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) fn observe_core_quiescence(&self) {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !state.claimed {
-                state.core_quiescent = true;
-            }
-        }
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) fn observe_core_closed(&self) {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !state.claimed {
-                state.core_closed = true;
-            }
-        }
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) fn abandon(&self) -> Option<EventMeta> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.claimed {
-            None
-        } else {
-            state.claimed = true;
-            state.terminal_meta
-        }
-    }
-
-    pub(crate) async fn wait_ready(
-        &self,
-        cancellation: &CompletionCancellation,
-    ) -> Option<CoordinatorReady> {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(ready) = self.try_ready() {
-                return Some(ready);
-            }
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return None,
-                _ = notified => {}
-            }
-        }
-    }
-
-    fn try_ready(&self) -> Option<CoordinatorReady> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.claimed {
-            return Some(CoordinatorReady::NoEvent);
-        }
-        let outcome = state.outcome.clone()?;
-        match outcome {
-            // A live Core terminal wins over fallback. If Core dropped the terminal itself,
-            // no envelope exists to carry its count; the state/quiescence boundary is the
-            // explicit end of what this best-effort stream can observe.
-            Ok(outcome)
-                if state.terminal_meta.is_some()
-                    || state.core_closed
-                    || (state.state_terminal && state.core_quiescent) =>
-            {
-                state.claimed = true;
-                Some(CoordinatorReady::Finish {
-                    outcome,
-                    terminal_meta: state.terminal_meta.unwrap_or(EventMeta {
-                        session_id: self.turn.session_id,
-                        instance_id: self.turn.instance_id,
-                        dropped_before: 0,
-                    }),
-                })
-            }
-            Ok(_) => None,
-            Err(_) => {
-                state.claimed = true;
-                Some(CoordinatorReady::NoEvent)
-            }
-        }
-    }
 }
 
 struct CompletionCancellationState {
@@ -370,7 +190,6 @@ impl AgentEventSink {
                 pending: 0,
                 durable_in_flight: false,
             })),
-            durable_ready: Arc::new(Notify::new()),
         }
     }
 
@@ -421,37 +240,21 @@ impl AgentEventSink {
         mut event: AgentEvent,
         cancellation: CompletionCancellation,
     ) -> bool {
-        let mut reserved_drops = 0;
-        loop {
-            let notified = self.durable_ready.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let can_start = {
-                let mut state = self
-                    .drop_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !state.durable_in_flight {
-                    state.durable_in_flight = true;
-                    let core_dropped = event.dropped_before();
-                    reserved_drops = state.pending.saturating_add(core_dropped);
-                    event.set_dropped_before(reserved_drops);
-                    state.pending = 0;
-                    true
-                } else {
-                    false
-                }
-            };
-            if can_start {
-                break;
+        let reserved_drops = {
+            let mut state = self
+                .drop_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.sender.is_closed() {
+                return false;
             }
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return false,
-                _ = notified => {}
-            }
-        }
-
+            state.durable_in_flight = true;
+            let core_dropped = event.dropped_before();
+            let reserved_drops = state.pending.saturating_add(core_dropped);
+            event.set_dropped_before(reserved_drops);
+            state.pending = 0;
+            reserved_drops
+        };
         let sent = tokio::select! {
             biased;
             _ = cancellation.cancelled() => false,
@@ -467,12 +270,15 @@ impl AgentEventSink {
             }
             state.durable_in_flight = false;
         }
-        self.durable_ready.notify_waiters();
         sent
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.sender.is_closed()
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
     }
 }
 
@@ -1259,11 +1065,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_finish_preserves_observed_core_terminal_drop_count() {
+    async fn durable_finish_reports_pending_core_drop_count() {
         let (sender, mut receiver) = mpsc::channel(1);
         let sink = AgentEventSink::new(sender);
+        sink.record_core_drops(11);
         assert!(
-            sink.send_durable(finish(11), CompletionCancellation::new())
+            sink.send_durable(finish(0), CompletionCancellation::new())
                 .await
         );
         assert!(matches!(

@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 
 use minicore_runtime::conversation::TurnTerminal;
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, SessionShutdownError};
-use minicore_runtime::ids::{SessionId, ToolCallId};
+use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason, ModelRef,
     ModelStartFuture, ModelStream, ReasoningPreference, Usage,
@@ -406,6 +406,17 @@ async fn agent_lifecycle_text_turn_and_durable_finish_event() {
         .await,
         AgentEvent::SessionClosed { .. }
     ));
+    let late_finish = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match events.recv().await {
+                Some(AgentEvent::TurnFinished { .. }) => break true,
+                Some(_) => {}
+                None => break false,
+            }
+        }
+    })
+    .await;
+    assert!(late_finish.is_err() || !late_finish.unwrap());
     assert!(!agent.list_sessions().await.unwrap()[0].loaded);
     agent.delete_session(info.session_id).await.unwrap();
     assert!(agent.list_sessions().await.unwrap().is_empty());
@@ -795,15 +806,62 @@ fn shutdown_errors_preserve_safe_public_categories_without_debug_details() {
     );
 }
 
+#[test]
+fn core_turn_finished_is_suppressed_and_its_drop_count_reaches_the_next_event() {
+    let session_id: SessionId = "ses_00000000000000000000000000000001".parse().unwrap();
+    let instance_id: SessionInstanceId = "ins_00000000000000000000000000000001".parse().unwrap();
+    let turn_id: TurnId = "trn_00000000000000000000000000000001".parse().unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let sink = crate::event::AgentEventSink::new(sender);
+    assert!(super::forward_core_event(
+        minicore_runtime::session::SessionEventEnvelope {
+            session_id,
+            instance_id,
+            dropped_before: 5,
+            event: minicore_runtime::session::SessionEvent::TurnFinished {
+                turn_id,
+                outcome: minicore_runtime::TurnOutcome {
+                    turn_id,
+                    terminal: TurnTerminal::Completed,
+                    usage: Usage::default(),
+                },
+            },
+        },
+        &sink,
+    ));
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        sink.try_send(AgentEvent::SessionClosed {
+            session_id,
+            meta: crate::event::EventMeta {
+                session_id,
+                instance_id,
+                dropped_before: 0,
+            },
+        }),
+        crate::event::AgentSendResult::Sent
+    );
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        AgentEvent::SessionClosed {
+            meta: crate::event::EventMeta {
+                dropped_before: 5,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
 #[tokio::test]
-async fn small_outer_capacity_still_delivers_durable_turn_finished() {
+async fn completion_notifier_serializes_ready_turns_without_blocking_send() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-durable-event-{}",
         SessionId::new().unwrap()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (model, _) = FakeModel::new([ModelScript::Text("final")]);
+    let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::Text("second")]);
     let mut config = config(base.join("data"), Vec::new());
     config.event_capacity = 1;
     let mut agent = Agent::open_with_models(config, models(model), ToolSet::default(), None)
@@ -814,45 +872,107 @@ async fn small_outer_capacity_still_delivers_durable_turn_finished() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let turn = agent
+    let sink = agent
+        .sessions
+        .get(info.session_id)
+        .expect("created session is loaded")
+        .event_sink
+        .clone();
+    let filler_state = agent.session_state(info.session_id).unwrap();
+    loop {
+        match sink.try_send(AgentEvent::SessionState {
+            meta: crate::event::EventMeta {
+                session_id: info.session_id,
+                instance_id: filler_state.instance_id,
+                dropped_before: 0,
+            },
+            state: filler_state.clone(),
+        }) {
+            crate::event::AgentSendResult::Sent => break,
+            crate::event::AgentSendResult::Dropped => {
+                let _ = next_event(&mut events).await;
+            }
+            crate::event::AgentSendResult::Closed => panic!("event stream closed too early"),
+        }
+    }
+    drop(sink);
+    let first = agent
         .send(SendMessage {
             session_id: info.session_id,
-            text: "hello".to_owned(),
+            text: "first request".to_owned(),
         })
         .await
         .unwrap();
-    let finished = wait_for_event(
-        &mut events,
-        |event| matches!(event, AgentEvent::TurnFinished { turn: value, .. } if *value == turn),
-    )
+    assert_eq!(
+        agent
+            .turn_handle(first)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    let second = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "second request".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .turn_handle(second)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+
+    assert!(matches!(
+        events.recv().await,
+        Some(AgentEvent::SessionState { .. })
+    ));
+    let mut finished = Vec::new();
+    while finished.len() < 2 {
+        if let AgentEvent::TurnFinished { turn, .. } = next_event(&mut events).await {
+            finished.push(turn);
+        }
+    }
+    assert_eq!(finished, vec![first, second]);
+    let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match events.recv().await {
+                Some(AgentEvent::TurnFinished { .. }) => break true,
+                Some(_) => {}
+                None => break false,
+            }
+        }
+    })
     .await;
-    assert!(matches!(finished, AgentEvent::TurnFinished { .. }));
+    assert!(duplicate.is_err() || !duplicate.unwrap());
     agent.shutdown().await.unwrap();
     remove_base(&base).await;
 }
 
 #[tokio::test]
-async fn dropped_event_receiver_does_not_block_agent_shutdown() {
-    let (mut agent, base, workspace, _) = agent_fixture(
-        "dropped-events",
-        [ModelScript::Text("final")],
-        Vec::new(),
-        None,
-    )
-    .await;
+async fn dropped_event_receiver_stops_completion_worker() {
+    let (mut agent, base, workspace, _) =
+        agent_fixture("dropped-events", [ModelScript::Block], Vec::new(), None).await;
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let turn = agent
+    let _turn = agent
         .send(SendMessage {
             session_id: info.session_id,
             text: "hello".to_owned(),
         })
         .await
         .unwrap();
-    turn_handle_wait(&agent, turn).await;
     drop(events);
     tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
         .await
@@ -926,7 +1046,131 @@ async fn send_returns_before_background_touch_finishes() {
 }
 
 #[tokio::test]
-async fn shutdown_closes_events_after_cancelling_detached_completion_waiter() {
+async fn close_joins_blocked_metadata_worker_before_delete() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-touch-close-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let started = Arc::new(Semaphore::new(0));
+    let (model, _) = FakeModel::new([ModelScript::Block]);
+    let model = model.with_started(Arc::clone(&started));
+    let mut agent = Agent::open_with_models(
+        config(base.join("data"), Vec::new()),
+        models(model),
+        ToolSet::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::store::TouchGate::new(info.session_id));
+    crate::store::block_next_touch(Arc::clone(&gate));
+    let _turn = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent.send(SendMessage {
+            session_id: info.session_id,
+            text: "close while touching".to_owned(),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    started.acquire().await.unwrap().forget();
+    gate.started.acquire().await.unwrap().forget();
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), agent.close_session(info.session_id))
+        .await
+        .unwrap()
+        .unwrap();
+    agent.delete_session(info.session_id).await.unwrap();
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn metadata_worker_serializes_latest_update_before_close_and_delete() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-touch-order-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::Text("second")]);
+    let mut agent = Agent::open_with_models(
+        config(base.join("data"), Vec::new()),
+        models(model),
+        ToolSet::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let first_gate = Arc::new(crate::store::TouchGate::new(info.session_id));
+    let second_gate = Arc::new(crate::store::TouchGate::new(info.session_id));
+    second_gate.release.add_permits(1);
+    crate::store::block_next_touch(Arc::clone(&first_gate));
+    crate::store::block_next_touch(Arc::clone(&second_gate));
+
+    let first = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "first request".to_owned(),
+        })
+        .await
+        .unwrap();
+    first_gate.started.acquire().await.unwrap().forget();
+    agent.turn_handle(first).unwrap().wait().await.unwrap();
+
+    let second = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "second request".to_owned(),
+        })
+        .await
+        .unwrap();
+    let expected = agent
+        .sessions
+        .get(info.session_id)
+        .expect("session is loaded")
+        .record
+        .updated_at
+        .clone();
+    assert_ne!(expected, info.updated_at);
+
+    first_gate.release.add_permits(1);
+    first_gate.finished.acquire().await.unwrap().forget();
+    second_gate.started.acquire().await.unwrap().forget();
+    second_gate.finished.acquire().await.unwrap().forget();
+    agent.turn_handle(second).unwrap().wait().await.unwrap();
+
+    assert_eq!(
+        agent
+            .store
+            .load_record(info.session_id)
+            .await
+            .unwrap()
+            .updated_at,
+        expected
+    );
+    agent.close_session(info.session_id).await.unwrap();
+    agent.delete_session(info.session_id).await.unwrap();
+    drop(events);
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn shutdown_with_full_events_cancels_completion_worker() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-shutdown-events-{}",
         SessionId::new().unwrap()
@@ -946,6 +1190,30 @@ async fn shutdown_closes_events_after_cancelling_detached_completion_waiter() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
+    let sink = agent
+        .sessions
+        .get(info.session_id)
+        .expect("created session is loaded")
+        .event_sink
+        .clone();
+    let filler_state = agent.session_state(info.session_id).unwrap();
+    loop {
+        match sink.try_send(AgentEvent::SessionState {
+            meta: crate::event::EventMeta {
+                session_id: info.session_id,
+                instance_id: filler_state.instance_id,
+                dropped_before: 0,
+            },
+            state: filler_state.clone(),
+        }) {
+            crate::event::AgentSendResult::Sent => break,
+            crate::event::AgentSendResult::Dropped => {
+                let _ = next_event(&mut events).await;
+            }
+            crate::event::AgentSendResult::Closed => panic!("event stream closed too early"),
+        }
+    }
+    drop(sink);
     let turn = agent
         .send(SendMessage {
             session_id: info.session_id,
@@ -965,17 +1233,14 @@ async fn shutdown_closes_events_after_cancelling_detached_completion_waiter() {
             .terminal,
         TurnTerminal::CancelledByUser
     );
-    agent.shutdown().await.unwrap();
-    while tokio::time::timeout(Duration::from_secs(5), events.recv())
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
         .await
         .unwrap()
-        .is_some()
-    {}
+        .unwrap();
+    while let Some(event) = events.recv().await {
+        assert!(!matches!(event, AgentEvent::TurnFinished { .. }));
+    }
     remove_base(&base).await;
-}
-
-async fn turn_handle_wait(agent: &Agent, turn: TurnRef) {
-    agent.turn_handle(turn).unwrap().wait().await.unwrap();
 }
 
 #[tokio::test]
