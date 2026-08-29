@@ -12,6 +12,11 @@ mod sessions;
 pub(crate) mod store;
 #[allow(
     dead_code,
+    reason = "read/write Tools are assembled into Agent capabilities in a later phase"
+)]
+mod tools;
+#[allow(
+    dead_code,
     reason = "Workspace path and I/O methods are consumed by the later Tools phase"
 )]
 mod workspace;

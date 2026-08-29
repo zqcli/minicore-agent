@@ -98,6 +98,21 @@ components between checks and filesystem operations; no `openat`/OS locking
 scheme is implemented. Workspace is not yet assembled into Agent capabilities,
 and the existing temporary Agent workspace validation remains unchanged.
 
+The crate-private Tool module currently implements only the exact `read` and
+`write` tools; they are not yet assembled into Agent sessions. Both use strict
+object schemas and reject unknown input fields. `read` supports one-based line
+offsets, a default 400-line limit (maximum 2000), one-level sorted directory
+listings capped at 1000 entries, and `[truncated]` markers for line, 512 KiB file
+prefix, directory-count, or Runtime output limits. NUL and invalid UTF-8 are
+execution failures; a UTF-8 code point split only by the byte cap is safely
+trimmed. `write` accepts at most 512 KiB of UTF-8 content, including empty
+content, and delegates parent creation and atomic replacement to Workspace.
+Invalid JSON, bounds, and path traversal map to invalid invocation; missing,
+permission, binary, atomic failure, and unknown outcomes map to failed execution.
+Cancellation and deadline are checked before execution and race every awaited
+operation without detached tasks. `edit`, `apply_patch`, and `bash` remain
+unimplemented.
+
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
 returns a stable not-implemented error instead of claiming availability.
@@ -115,9 +130,9 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. Real Tools,
-Context, Policy, OpenAI HTTP, Workspace capability assembly, and RPC method
-extensions remain outside this Phase. The offline process coverage is
-in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and Store
-and Workspace coverage is in the internal unit tests of `src/store.rs` and
-`src/workspace.rs`.
+to completion before joining the worker and allowing deletion. The remaining
+Tools, Context, Policy, OpenAI HTTP, Workspace/Tool capability assembly, and RPC
+method extensions remain outside this Phase. The offline process coverage is
+in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
+Store, Workspace, and Tool coverage is in the internal unit tests of
+`src/store.rs`, `src/workspace.rs`, and `src/tools/`.
