@@ -827,6 +827,13 @@ async fn malformed_usage_fails_the_terminal_without_usage_or_finish() {
             "output_tokens": 1,
             "total_tokens": 2,
             "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        }),
+        json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
             "output_tokens_details": {}
         }),
         json!({
@@ -847,21 +854,21 @@ async fn malformed_usage_fails_the_terminal_without_usage_or_finish() {
             "input_tokens": 0,
             "output_tokens": 3,
             "total_tokens": 3,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
             "output_tokens_details": {"reasoning_tokens": 4}
         }),
         json!({
             "input_tokens": u64::MAX,
             "output_tokens": 1,
             "total_tokens": u64::MAX,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
             "output_tokens_details": {"reasoning_tokens": 0}
         }),
         json!({
             "input_tokens": 2,
             "output_tokens": 3,
             "total_tokens": 4,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
             "output_tokens_details": {"reasoning_tokens": 0}
         }),
     ];
@@ -898,21 +905,17 @@ async fn terminal_status_and_optional_usage_are_strict() {
             "incomplete"
         };
         for status in [
-            None,
-            Some(if valid_status == "completed" {
+            if valid_status == "completed" {
                 "incomplete"
             } else {
                 "completed"
-            }),
-            Some("failed"),
-            Some("cancelled"),
-            Some("queued"),
-            Some("in_progress"),
+            },
+            "failed",
+            "cancelled",
+            "queued",
+            "in_progress",
         ] {
-            let mut response = json!({"usage": usage()});
-            if let Some(status) = status {
-                response["status"] = json!(status);
-            }
+            let response = json!({"status": status, "usage": usage()});
             let event = json!({"type": event_type, "response": response});
             let server = MockServer::spawn([MockResponse::sse(&[event])]).await;
             let (events, error) = run_until_error(
@@ -933,6 +936,40 @@ async fn terminal_status_and_optional_usage_are_strict() {
             );
             server.finish().await;
         }
+    }
+
+    for (event_type, explicit_null, expected_reason) in [
+        ("response.completed", false, ModelFinishReason::Stop),
+        ("response.completed", true, ModelFinishReason::Stop),
+        ("response.incomplete", false, ModelFinishReason::Length),
+        ("response.incomplete", true, ModelFinishReason::Length),
+    ] {
+        let mut response = json!({
+            "usage": usage(),
+            "incomplete_details": {"reason": "max_output_tokens"}
+        });
+        if explicit_null {
+            response["status"] = Value::Null;
+        }
+        let event = json!({"type": event_type, "response": response});
+        let server = MockServer::spawn([MockResponse::sse(&[event])]).await;
+        let events = run_model(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Usage { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ModelEvent::Finish { reason }) if *reason == expected_reason
+        ));
+        server.finish().await;
     }
 
     for (event, expected_reason) in [
@@ -1341,10 +1378,7 @@ fn retry_targets_subtract_body_time_and_reject_clock_anomalies() {
 
 #[tokio::test]
 async fn http_status_connect_timeout_and_non_sse_errors_have_conservative_delivery() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let unavailable = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let unavailable_model = model(&unavailable);
+    let unavailable_model = model("http://127.0.0.1:0");
     let error = start_error(
         &unavailable_model,
         basic_request(ReasoningPreference::Auto),
