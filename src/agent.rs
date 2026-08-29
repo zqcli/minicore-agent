@@ -18,7 +18,7 @@ use minicore_runtime::storage::{SessionLog, SessionLogError};
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
-use crate::config::{AgentConfig, ProfileCompaction};
+use crate::config::AgentConfig;
 use crate::context::ProjectContext;
 use crate::error::{AgentError, StoreError};
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
@@ -133,11 +133,6 @@ impl Agent {
         let task_runtime = Handle::try_current().map_err(|_| AgentError::Internal)?;
         let kernel = config.kernel_config().map_err(AgentError::Config)?;
         let profiles = config.profiles();
-        for profile in config.profiles.values() {
-            if !models.contains(&profile.model) {
-                return Err(AgentError::ModelNotFound);
-            }
-        }
         let store = Store::open(config.data_dir.clone())
             .await
             .map_err(map_store_error)?;
@@ -417,10 +412,6 @@ impl Agent {
             .iter()
             .map(|name| name.parse().map_err(|_| AgentError::InvalidInput))
             .collect::<Result<BTreeSet<_>, _>>()?;
-        let compaction = match &profile.compaction {
-            ProfileCompaction::Disabled => minicore_runtime::CompactionConfig::Disabled,
-            ProfileCompaction::Model { .. } => return Err(AgentError::ModelNotImplemented),
-        };
         let system_prompt = minicore_runtime::BoundedText::new(&profile.system_prompt)
             .map_err(|_| AgentError::InvalidInput)?;
         let spec = SessionSpec::new(
@@ -429,7 +420,7 @@ impl Agent {
             system_prompt,
             enabled_tools,
             profile.max_tool_rounds,
-            compaction,
+            minicore_runtime::CompactionConfig::Disabled,
         )
         .map_err(|_| AgentError::InvalidInput)?;
         let tools =

@@ -86,6 +86,21 @@ impl ModelConfig {
             }
         }
     }
+
+    pub(crate) fn supported_reasoning(&self) -> &BTreeSet<ReasoningPreference> {
+        match self {
+            Self::OpenAiResponses {
+                supported_reasoning,
+                ..
+            } => supported_reasoning,
+        }
+    }
+
+    pub(crate) fn supports_tools(&self) -> bool {
+        match self {
+            Self::OpenAiResponses { supports_tools, .. } => *supports_tools,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -192,10 +207,6 @@ impl Models {
             .get(id)
             .map(Arc::clone)
             .ok_or(ModelConfigError::NotFound)
-    }
-
-    pub(crate) fn contains(&self, id: &str) -> bool {
-        self.values.contains_key(id)
     }
 
     pub(crate) fn list(&self) -> Vec<ModelInfo> {

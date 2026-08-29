@@ -19,10 +19,10 @@ use minicore_runtime::model::{
 use minicore_runtime::session::SessionStatus;
 use minicore_runtime::value::BoundedText;
 
-use crate::config::{AgentConfig, KernelOverrides, Profile};
+use crate::config::{AgentConfig, ConfigError, KernelOverrides, Profile};
 use crate::error::{AgentError, CoreErrorView};
 use crate::event::AgentEvent;
-use crate::models::Models;
+use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, ProfileCompaction};
 
 use super::{Agent, AnswerInteraction, CreateSession, GetTranscript, SendMessage, TurnRef};
@@ -54,6 +54,34 @@ fn scripted_call(name: &'static str, arguments: serde_json::Value) -> ToolCallSc
     ToolCallScript { name, arguments }
 }
 
+fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
+    BTreeSet::from([
+        ReasoningPreference::Auto,
+        ReasoningPreference::Disabled,
+        ReasoningPreference::Low,
+        ReasoningPreference::Medium,
+        ReasoningPreference::High,
+    ])
+}
+
+fn configured_model(
+    supported_reasoning: BTreeSet<ReasoningPreference>,
+    supports_tools: bool,
+    api_key_env: String,
+) -> ModelConfig {
+    ModelConfig::OpenAiResponses {
+        model: "provider-model".to_owned(),
+        base_url: "https://example.invalid/v1".to_owned(),
+        api_key_env,
+        physical_context_window: 10_000,
+        output_budget_tokens: 1_000,
+        safety_margin_tokens: 1_000,
+        supported_reasoning,
+        supports_tools,
+        request_timeout_seconds: Some(30),
+    }
+}
+
 struct FakeModel {
     descriptor: ModelDescriptor,
     scripts: Arc<Mutex<VecDeque<ModelScript>>>,
@@ -68,19 +96,8 @@ impl FakeModel {
     fn new(scripts: impl IntoIterator<Item = ModelScript>) -> (Arc<Self>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_ref: ModelRef = "fake".parse().unwrap();
-        let descriptor = ModelDescriptor::new(
-            model_ref,
-            16_384,
-            BTreeSet::from([
-                ReasoningPreference::Auto,
-                ReasoningPreference::Disabled,
-                ReasoningPreference::Low,
-                ReasoningPreference::Medium,
-                ReasoningPreference::High,
-            ]),
-            true,
-        )
-        .unwrap();
+        let descriptor =
+            ModelDescriptor::new(model_ref, 16_384, fake_supported_reasoning(), true).unwrap();
         let model = Arc::new(Self {
             descriptor,
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
@@ -210,7 +227,14 @@ fn config(data_dir: PathBuf, tools: Vec<&str>) -> AgentConfig {
         event_capacity: 128,
         default_profile: "test".to_owned(),
         profiles: BTreeMap::from([(String::from("test"), profile)]),
-        models: BTreeMap::new(),
+        models: BTreeMap::from([(
+            "fake".to_owned(),
+            configured_model(
+                fake_supported_reasoning(),
+                true,
+                "MINICORE_UNUSED_FAKE_MODEL_KEY".to_owned(),
+            ),
+        )]),
         kernel: KernelOverrides::default(),
     }
 }
@@ -222,6 +246,22 @@ fn config_with_approval(
 ) -> AgentConfig {
     let mut config = config(data_dir, tools);
     config.profiles.get_mut("test").unwrap().approval = approval;
+    config
+}
+
+fn config_with_model_capabilities(
+    data_dir: PathBuf,
+    reasoning: ReasoningPreference,
+    supported_reasoning: BTreeSet<ReasoningPreference>,
+    supports_tools: bool,
+    api_key_env: String,
+) -> AgentConfig {
+    let mut config = config(data_dir, Vec::new());
+    config.profiles.get_mut("test").unwrap().reasoning = reasoning;
+    config.models.insert(
+        "fake".to_owned(),
+        configured_model(supported_reasoning, supports_tools, api_key_env),
+    );
     config
 }
 
@@ -2869,6 +2909,77 @@ async fn restart_repairs_durable_unfinished_turn_then_accepts_new_turn() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     agent.shutdown().await.unwrap();
     remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn complete_config_opens_with_an_injected_model() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-complete-config-{}",
+        SessionId::new().unwrap()
+    ));
+    let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
+    let config = config(base.join("data"), Vec::new());
+
+    let agent = Agent::open_with_models(config, models(model))
+        .await
+        .unwrap();
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn capability_mismatch_precedes_missing_credential_at_agent_open() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-capability-before-credential-{}",
+        SessionId::new().unwrap()
+    ));
+    let key_env = format!(
+        "MINICORE_MISSING_CAPABILITY_KEY_{}",
+        SessionId::new().unwrap()
+    );
+    assert!(std::env::var_os(&key_env).is_none());
+    let config = config_with_model_capabilities(
+        base.join("data"),
+        ReasoningPreference::High,
+        BTreeSet::from([ReasoningPreference::Auto]),
+        false,
+        key_env,
+    );
+
+    let result = Agent::open(config).await;
+    remove_base(&base).await;
+    assert!(matches!(
+        result,
+        Err(AgentError::Config(ConfigError::UnsupportedReasoning))
+    ));
+}
+
+#[tokio::test]
+async fn capability_mismatch_precedes_store_open_at_agent_open() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-capability-before-store-{}",
+        SessionId::new().unwrap()
+    ));
+    tokio::fs::create_dir_all(&base).await.unwrap();
+    let data_dir = base.join("not-a-directory");
+    tokio::fs::write(&data_dir, b"store must not be opened")
+        .await
+        .unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
+    let config = config_with_model_capabilities(
+        data_dir,
+        ReasoningPreference::High,
+        BTreeSet::from([ReasoningPreference::Auto]),
+        false,
+        "MINICORE_UNUSED_STORE_PRIORITY_KEY".to_owned(),
+    );
+
+    let result = Agent::open_with_models(config, models(model)).await;
+    remove_base(&base).await;
+    assert!(matches!(
+        result,
+        Err(AgentError::Config(ConfigError::UnsupportedReasoning))
+    ));
 }
 
 #[tokio::test]
