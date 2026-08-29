@@ -50,6 +50,15 @@ static DELETE_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static CLEANUP_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
+#[derive(Clone, Copy)]
+enum TouchFailure {
+    Unavailable,
+    UnknownOutcome,
+}
+
+#[cfg(test)]
+static TOUCH_FAILURES: OnceLock<Mutex<Vec<(SessionId, TouchFailure)>>> = OnceLock::new();
+
 #[cfg(test)]
 pub(crate) struct TouchGate {
     session_id: SessionId,
@@ -306,18 +315,29 @@ impl Store {
         updated_at: String,
     ) -> Result<(), StoreError> {
         #[cfg(test)]
+        let touch_failure = take_touch_failure(session_id);
+        #[cfg(not(test))]
+        let touch_failure: Option<TouchFailure> = None;
+        #[cfg(test)]
         let touch_gate = take_touch_gate(session_id);
         #[cfg(test)]
         if let Some(gate) = &touch_gate {
             gate.started.add_permits(1);
             gate.release.acquire().await.unwrap().forget();
         }
-        let result = async {
-            let mut record = self.load_record(session_id).await?;
-            record.updated_at = updated_at;
-            self.write_record(&record).await
-        }
-        .await;
+        let result = if let Some(failure) = touch_failure {
+            Err(match failure {
+                TouchFailure::Unavailable => StoreError::Unavailable,
+                TouchFailure::UnknownOutcome => StoreError::UnknownOutcome,
+            })
+        } else {
+            async {
+                let mut record = self.load_record(session_id).await?;
+                record.updated_at = updated_at;
+                self.write_record(&record).await
+            }
+            .await
+        };
         #[cfg(test)]
         if let Some(gate) = touch_gate {
             gate.finished.add_permits(1);
@@ -1105,6 +1125,36 @@ fn fail_next_cleanup(path: &Path) {
         .lock()
         .unwrap()
         .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_touch_unavailable(session_id: SessionId) {
+    TOUCH_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, TouchFailure::Unavailable));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_touch_unknown_outcome(session_id: SessionId) {
+    TOUCH_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, TouchFailure::UnknownOutcome));
+}
+
+#[cfg(test)]
+fn take_touch_failure(session_id: SessionId) -> Option<TouchFailure> {
+    let mut failures = TOUCH_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    failures
+        .iter()
+        .position(|(candidate, _)| *candidate == session_id)
+        .map(|position| failures.remove(position).1)
 }
 
 #[cfg(test)]

@@ -137,7 +137,6 @@ pub(crate) struct AgentEventSink {
 
 struct DropState {
     pending: u64,
-    durable_in_flight: bool,
 }
 
 #[derive(Clone)]
@@ -166,6 +165,10 @@ impl CompletionCancellation {
         }
     }
 
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn cancelled(&self) {
         loop {
             if self.inner.cancelled.load(Ordering::Acquire) {
@@ -186,10 +189,7 @@ impl AgentEventSink {
     pub(crate) fn new(sender: mpsc::Sender<AgentEvent>) -> Self {
         Self {
             sender,
-            drop_state: Arc::new(Mutex::new(DropState {
-                pending: 0,
-                durable_in_flight: false,
-            })),
+            drop_state: Arc::new(Mutex::new(DropState { pending: 0 })),
         }
     }
 
@@ -202,13 +202,6 @@ impl AgentEventSink {
             return AgentSendResult::Closed;
         }
         let core_dropped = event.dropped_before();
-        if pending.durable_in_flight {
-            pending.pending = pending
-                .pending
-                .saturating_add(core_dropped)
-                .saturating_add(1);
-            return AgentSendResult::Dropped;
-        }
         let reported = pending.pending.saturating_add(core_dropped);
         event.set_dropped_before(reported);
         match self.sender.try_send(event) {
@@ -248,7 +241,6 @@ impl AgentEventSink {
             if self.sender.is_closed() {
                 return false;
             }
-            state.durable_in_flight = true;
             let core_dropped = event.dropped_before();
             let reserved_drops = state.pending.saturating_add(core_dropped);
             event.set_dropped_before(reserved_drops);
@@ -268,7 +260,6 @@ impl AgentEventSink {
             if !sent {
                 state.pending = state.pending.saturating_add(reserved_drops);
             }
-            state.durable_in_flight = false;
         }
         sent
     }
@@ -782,6 +773,37 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
         | SessionEvent::ModelFinished { .. }
         | SessionEvent::HealthChanged { .. } => None,
     }
+}
+
+pub(crate) fn forward_core_event(
+    envelope: SessionEventEnvelope,
+    event_sink: &AgentEventSink,
+) -> bool {
+    let dropped_before = envelope.dropped_before;
+    if matches!(&envelope.event, SessionEvent::TurnFinished { .. }) {
+        // SessionEventStream is best-effort. Core TurnFinished is only an observation;
+        // authoritative completion comes from TurnHandle::wait. If Core drops this envelope,
+        // its own unknown dropped_before count cannot be recovered or safely fabricated.
+        event_sink.record_core_drops(dropped_before);
+        return !event_sink.is_closed();
+    }
+    if let Some(event) = map_session_event(envelope) {
+        event_sink.try_send(event) != AgentSendResult::Closed
+    } else {
+        event_sink.record_core_drops(dropped_before);
+        !event_sink.is_closed()
+    }
+}
+
+pub(crate) fn emit_state(event_sink: &AgentEventSink, state: SessionState) -> bool {
+    event_sink.try_send(AgentEvent::SessionState {
+        meta: EventMeta {
+            session_id: state.session_id,
+            instance_id: state.instance_id,
+            dropped_before: 0,
+        },
+        state,
+    }) != AgentSendResult::Closed
 }
 
 pub struct AgentEventStream {

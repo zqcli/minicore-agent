@@ -44,11 +44,14 @@ The library exposes `AgentConfig`, `AgentError`, `Agent`, the session/turn DTOs,
 the single-consumer `AgentEventStream`, `AgentEvent`, and `run_stdio`. `Agent`
 opens the local Store, manages multiple loaded SessionRuntime owners, and
 forwards typed live events while authoritative durable turn completion is obtained
-from a cloned `TurnHandle`; the runtime EventStream remains best-effort and its
-Core `TurnFinished` event is advisory only; if that Core envelope is dropped, its
-`dropped_before` metadata is unavailable and the Agent does not fabricate it. Each
-loaded session serializes its completion notifications in one FIFO worker, so a
-slow event consumer blocks that worker rather than request submission. The Store uses
+from a cloned `TurnHandle`. One outbound sequencer owns each loaded session's
+Core event stream, state watch, outer sink, and completion-ready queue. Before
+emitting a durable Agent `TurnFinished`, it submits a transcript command to the
+same actor, drains already-enqueued Core events, and reads the latest state. Core
+`TurnFinished` is advisory because the runtime EventStream is best-effort; if
+Core drops that envelope, its unknown `dropped_before` metadata is unrecoverable
+and the Agent does not fabricate it. A slow consumer blocks only the sequencer,
+never Runtime or request submission. The Store uses
 `<data_dir>/sessions/<session-id>/` with `session.json`, `manifest.json`, and
 `conversation.log`; each append is one durable JSON line containing one batch.
 
@@ -69,11 +72,15 @@ Offline loop tests use a crate-private injected Fake Model/Tool/Policy seam;
 Fake provider and tool implementations are not part of production TOML. Store
 assumes one process per data directory and does not implement file locks.
 Loading currently reads the complete log into memory; v0.1 defines no production
-log-size limit, so very large logs may consume substantial memory. Session metadata
-`updated_at` is updated in memory immediately and flushed by one owned, serialized
-latest-value worker per loaded session; metadata persistence is best-effort and a
-failed flush does not change the submitted turn. Workspace, real Tools, Context,
-Policy, OpenAI HTTP, and RPC method extensions remain outside this Phase. The
-offline process coverage is in `tests/rpc_stdio.rs`,
-Agent loop coverage is in `src/agent/tests.rs`, and Store coverage is in the
-internal unit tests of `src/store.rs`.
+log-size limit, so very large logs may consume substantial memory. Each loaded
+session retains only its active `TurnHandle`; a `TurnRef` is not a historical
+handle registry key, so callers such as RPC must clone the handle at request time.
+Session metadata `updated_at` is updated in memory immediately and flushed by one
+owned, serialized latest-value worker per loaded session. Temporary unavailable
+errors leave that worker alive for the next update; terminal metadata failures
+stop it, while metadata persistence remains best-effort and never changes a
+submitted turn. Closing explicitly cancels pending metadata work and joins the
+worker before deletion. Workspace, real Tools, Context, Policy, OpenAI HTTP, and
+RPC method extensions remain outside this Phase. The offline process coverage is
+in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and Store
+coverage is in the internal unit tests of `src/store.rs`.

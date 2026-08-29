@@ -11,18 +11,19 @@ use minicore_runtime::conversation::TranscriptPage;
 use minicore_runtime::error::{SessionError, SessionOpenErrorKind};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
 use minicore_runtime::session::{
-    InteractionAnswer, SessionEventStream, SessionRuntime, SessionRuntimeOptions, SessionState,
-    TurnHandle,
+    InteractionAnswer, SessionRuntime, SessionRuntimeOptions, SessionState, TurnHandle,
 };
 use minicore_runtime::storage::{SessionLog, SessionLogError};
 use minicore_runtime::tools::{ToolPolicy, ToolSet};
 
 use crate::config::{AgentConfig, ProfileCompaction};
 use crate::error::{AgentError, StoreError};
-use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta, map_session_event};
+use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
 use crate::models::{ModelConfigError, Models};
 use crate::profiles::{Profile, Profiles};
-use crate::sessions::{CompletionNotifier, LoadedSession, MetadataWorker, Sessions};
+use crate::sessions::{
+    CompletionNotifier, LoadedSession, MetadataWorker, OutboundSequencer, Sessions,
+};
 use crate::store::{SessionRecord, Store};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -235,27 +236,8 @@ impl Agent {
                 return Err(error);
             }
         };
-        let instance_id = loaded.handle.instance_id();
-        let event_sink = loaded.event_sink.clone();
+        let info = self.session_info(&record, Some(&loaded));
         let _ = self.sessions.insert(session_id, loaded);
-        let info = SessionInfo {
-            session_id,
-            title: record.title,
-            profile: record.profile,
-            workspace: record.workspace,
-            loaded: true,
-            instance_id: Some(instance_id),
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-        };
-        let _ = event_sink.try_send(AgentEvent::SessionOpened {
-            session: info.clone(),
-            meta: EventMeta {
-                session_id,
-                instance_id,
-                dropped_before: 0,
-            },
-        });
         Ok(info)
     }
 
@@ -290,16 +272,7 @@ impl Agent {
             .map_err(map_session_open_error)?;
         let loaded = self.attach_runtime(runtime, record.clone()).await?;
         let info = self.session_info(&record, Some(&loaded));
-        let event_sink = loaded.event_sink.clone();
         let _ = self.sessions.insert(session_id, loaded);
-        let _ = event_sink.try_send(AgentEvent::SessionOpened {
-            session: info.clone(),
-            meta: EventMeta {
-                session_id,
-                instance_id: info.instance_id.expect("loaded session has instance"),
-                dropped_before: 0,
-            },
-        });
         Ok(info)
     }
 
@@ -308,17 +281,12 @@ impl Agent {
             .sessions
             .remove(session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        let event_sink = loaded.event_sink.clone();
         let meta = EventMeta {
             session_id,
             instance_id: loaded.handle.instance_id(),
             dropped_before: 0,
         };
-        let result = loaded.shutdown().await;
-        if result.is_ok() {
-            let _ = event_sink.try_send(AgentEvent::SessionClosed { session_id, meta });
-        }
-        result
+        loaded.shutdown(meta).await
     }
 
     pub async fn delete_session(&mut self, session_id: SessionId) -> Result<(), AgentError> {
@@ -381,6 +349,9 @@ impl Agent {
     }
 
     pub fn turn_handle(&self, turn: TurnRef) -> Result<TurnHandle, AgentError> {
+        // The v0.1 contract retains only one active TurnHandle per loaded session. Callers that
+        // need to wait asynchronously (including a future RPC turn.wait method) must clone this
+        // handle at request time; TurnRef is an identity, not a historical handle registry key.
         let loaded = self
             .sessions
             .get(turn.session_id)
@@ -490,13 +461,29 @@ impl Agent {
         let handle = runtime.handle();
         let state = handle.watch_state();
         let event_sink = AgentEventSink::new(self.events_tx.clone());
-        let event_task = self
-            .task_runtime
-            .spawn(event_pump(event_stream, event_sink.clone()));
-        let state_task = self
-            .task_runtime
-            .spawn(state_pump(state, event_sink.clone()));
-        let completion = CompletionNotifier::new(&self.task_runtime, event_sink.clone());
+        let opened = SessionInfo {
+            session_id: record.session_id,
+            title: record.title.clone(),
+            profile: record.profile.clone(),
+            workspace: record.workspace.clone(),
+            loaded: true,
+            instance_id: Some(handle.instance_id()),
+            created_at: record.created_at.clone(),
+            updated_at: record.updated_at.clone(),
+        };
+        let sequencer = OutboundSequencer::new(
+            &self.task_runtime,
+            event_stream,
+            state,
+            handle.clone(),
+            event_sink.clone(),
+            opened,
+        );
+        let completion = CompletionNotifier::new(
+            &self.task_runtime,
+            sequencer.completion_sender(),
+            sequencer.stop_signal(),
+        );
         let metadata =
             MetadataWorker::new(&self.task_runtime, self.store.clone(), runtime.session_id());
         Ok(LoadedSession {
@@ -504,9 +491,7 @@ impl Agent {
             runtime,
             handle,
             active_turn: None,
-            event_task,
-            state_task,
-            event_sink,
+            sequencer,
             completion,
             metadata,
         })
@@ -548,67 +533,11 @@ impl Agent {
             return;
         };
         loaded.record.updated_at = updated_at.clone();
-        loaded.metadata.update(updated_at);
+        // A terminal metadata failure only stops persistence; the in-memory session timestamp and
+        // the already accepted turn remain valid. The worker reports false rather than pretending
+        // that this update was queued.
+        let _ = loaded.metadata.update(updated_at);
     }
-}
-
-async fn event_pump(mut stream: SessionEventStream, event_sink: AgentEventSink) {
-    while let Some(envelope) = stream.recv().await {
-        if !forward_core_event(envelope, &event_sink) {
-            break;
-        }
-    }
-}
-
-fn forward_core_event(
-    envelope: minicore_runtime::session::SessionEventEnvelope,
-    event_sink: &AgentEventSink,
-) -> bool {
-    let dropped_before = envelope.dropped_before;
-    if matches!(
-        &envelope.event,
-        minicore_runtime::session::SessionEvent::TurnFinished { .. }
-    ) {
-        // SessionEventStream is best-effort. Core TurnFinished is only a live observation;
-        // authoritative completion comes from TurnHandle::wait. If this envelope is dropped,
-        // its unknown dropped_before metadata cannot be recovered or safely fabricated.
-        event_sink.record_core_drops(dropped_before);
-        return !event_sink.is_closed();
-    }
-    if let Some(event) = map_session_event(envelope) {
-        event_sink.try_send(event) != crate::event::AgentSendResult::Closed
-    } else {
-        event_sink.record_core_drops(dropped_before);
-        !event_sink.is_closed()
-    }
-}
-
-async fn state_pump(
-    mut state: tokio::sync::watch::Receiver<minicore_runtime::SessionState>,
-    event_sink: AgentEventSink,
-) {
-    if !emit_state(&event_sink, state.borrow().clone()) {
-        return;
-    }
-    loop {
-        if state.changed().await.is_err() {
-            break;
-        }
-        if !emit_state(&event_sink, state.borrow().clone()) {
-            break;
-        }
-    }
-}
-
-fn emit_state(event_sink: &AgentEventSink, state: minicore_runtime::SessionState) -> bool {
-    event_sink.try_send(AgentEvent::SessionState {
-        meta: EventMeta {
-            session_id: state.session_id,
-            instance_id: state.instance_id,
-            dropped_before: 0,
-        },
-        state,
-    }) != crate::event::AgentSendResult::Closed
 }
 
 fn validate_turn_ref(loaded: &LoadedSession, turn: TurnRef) -> Result<(), AgentError> {
