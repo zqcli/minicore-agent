@@ -10,6 +10,11 @@ mod rpc;
 mod sessions;
 #[expect(dead_code, reason = "Store API is consumed by the Sessions phase")]
 pub(crate) mod store;
+#[allow(
+    dead_code,
+    reason = "Workspace path and I/O methods are consumed by the later Tools phase"
+)]
+mod workspace;
 
 pub use agent::{
     Agent, AnswerInteraction, CreateSession, GetTranscript, PingResponse, SendMessage, SessionInfo,
@@ -24,3 +29,4 @@ pub use event::{
 };
 pub use models::ModelConfig;
 pub use rpc::run_stdio;
+pub use workspace::{Workspace, WorkspaceError};
