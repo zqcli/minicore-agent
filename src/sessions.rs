@@ -103,6 +103,27 @@ impl TranscriptBarrierGate {
 static TRANSCRIPT_BARRIER_GATES: OnceLock<Mutex<Vec<Arc<TranscriptBarrierGate>>>> = OnceLock::new();
 
 #[cfg(test)]
+pub(crate) struct CompletionDrainGate {
+    session_id: SessionId,
+    pub(crate) started: Arc<tokio::sync::Semaphore>,
+    pub(crate) release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl CompletionDrainGate {
+    pub(crate) fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+static COMPLETION_DRAIN_GATES: OnceLock<Mutex<Vec<Arc<CompletionDrainGate>>>> = OnceLock::new();
+
+#[cfg(test)]
 pub(crate) struct SessionShutdownGate {
     session_id: SessionId,
     pub(crate) started: Arc<tokio::sync::Semaphore>,
@@ -311,7 +332,15 @@ async fn process_completion(
     if !emit_latest_state(state, event_sink, last_emitted_state) {
         return false;
     }
+    #[cfg(test)]
+    if let Some(gate) = take_completion_drain_gate(handle.session_id()) {
+        gate.started.add_permits(1);
+        gate.release.acquire().await.unwrap().forget();
+    }
     while let Ok(envelope) = event_stream.try_recv() {
+        if !emit_latest_state(state, event_sink, last_emitted_state) {
+            return false;
+        }
         if !forward_core_event(envelope, event_sink) {
             return false;
         }
@@ -686,6 +715,27 @@ pub(crate) fn block_transcript_barrier(gate: Arc<TranscriptBarrierGate>) {
         .lock()
         .unwrap()
         .push(gate);
+}
+
+#[cfg(test)]
+pub(crate) fn block_completion_drain(gate: Arc<CompletionDrainGate>) {
+    COMPLETION_DRAIN_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(gate);
+}
+
+#[cfg(test)]
+fn take_completion_drain_gate(session_id: SessionId) -> Option<Arc<CompletionDrainGate>> {
+    let mut gates = COMPLETION_DRAIN_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|gate| gate.session_id == session_id)
+        .map(|position| gates.remove(position))
 }
 
 #[cfg(test)]
