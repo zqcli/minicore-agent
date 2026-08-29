@@ -24,7 +24,7 @@ use minicore_runtime::model::{
 use minicore_runtime::value::BoundedText;
 
 use crate::agent::Agent;
-use crate::config::{AgentConfig, KernelOverrides, Profile};
+use crate::config::{AgentConfig, ConfigError, KernelOverrides, Profile};
 use crate::error::{AgentError, CoreErrorView};
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, ProfileCompaction};
@@ -53,6 +53,30 @@ impl ModelScript {
     }
 }
 
+fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
+    BTreeSet::from([
+        ReasoningPreference::Auto,
+        ReasoningPreference::Disabled,
+        ReasoningPreference::Low,
+        ReasoningPreference::Medium,
+        ReasoningPreference::High,
+    ])
+}
+
+fn configured_model(model: &str, base_url: &str, api_key_env: &str) -> ModelConfig {
+    ModelConfig::OpenAiResponses {
+        model: model.to_owned(),
+        base_url: base_url.to_owned(),
+        api_key_env: api_key_env.to_owned(),
+        physical_context_window: 32_000,
+        output_budget_tokens: 2_000,
+        safety_margin_tokens: 1_000,
+        supported_reasoning: fake_supported_reasoning(),
+        supports_tools: true,
+        request_timeout_seconds: Some(30),
+    }
+}
+
 struct FakeModel {
     descriptor: ModelDescriptor,
     scripts: Mutex<VecDeque<ModelScript>>,
@@ -65,13 +89,7 @@ impl FakeModel {
             descriptor: ModelDescriptor::new(
                 "fake".parse::<ModelRef>().unwrap(),
                 16_384,
-                BTreeSet::from([
-                    ReasoningPreference::Auto,
-                    ReasoningPreference::Disabled,
-                    ReasoningPreference::Low,
-                    ReasoningPreference::Medium,
-                    ReasoningPreference::High,
-                ]),
+                fake_supported_reasoning(),
                 true,
             )
             .unwrap(),
@@ -176,7 +194,14 @@ fn test_config(data_dir: PathBuf, tools: &[&str], approval: ApprovalMode) -> Age
                 compaction: ProfileCompaction::Disabled,
             },
         )]),
-        models: BTreeMap::new(),
+        models: BTreeMap::from([(
+            "fake".to_owned(),
+            configured_model(
+                "provider-model",
+                "https://example.invalid/v1",
+                "MINICORE_UNUSED_RPC_FAKE_KEY",
+            ),
+        )]),
         kernel: KernelOverrides::default(),
     }
 }
@@ -466,6 +491,22 @@ async fn profile_and_model_lists_are_btree_ordered() {
     config.profiles.insert("zeta".to_owned(), profile.clone());
     config.profiles.insert("alpha".to_owned(), profile);
     config.default_profile = "alpha".to_owned();
+    config.models.insert(
+        "zeta".to_owned(),
+        configured_model(
+            "provider-model",
+            "https://example.invalid/v1",
+            "MINICORE_UNUSED_RPC_ZETA_KEY",
+        ),
+    );
+    config.models.insert(
+        "alpha".to_owned(),
+        configured_model(
+            "provider-model",
+            "https://example.invalid/v1",
+            "MINICORE_UNUSED_RPC_ALPHA_KEY",
+        ),
+    );
     let model: Arc<dyn Model> = model;
     let models = Models::from_values(BTreeMap::from([
         ("zeta".to_owned(), Arc::clone(&model)),
@@ -1044,35 +1085,23 @@ async fn params_methods_ids_and_domain_errors_are_stable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unavailable_model_backed_compaction_maps_to_provider_error() {
+async fn model_backed_compaction_is_rejected_before_rpc_start() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-rpc-provider-{}",
         SessionId::new().unwrap()
     ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
     let model = FakeModel::new([ModelScript::Text("unused")]);
     let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
     config.profiles.get_mut("test").unwrap().compaction = ProfileCompaction::Model {
         trigger_tokens: 1_000,
         target_tokens: 500,
     };
-    let agent = Agent::open_with_models(config, test_models(model))
-        .await
-        .unwrap();
-    let mut rpc = RpcHarness::spawn(agent);
-    rpc.send(
-        json!("create"),
-        "session.create",
-        Some(json!({"workspace": workspace})),
-    )
-    .await;
-    assert_error(
-        &rpc.response(json!("create")).await,
-        -32_012,
-        "provider_error",
-    );
-    rpc.shutdown().await;
+    let result = Agent::open_with_models(config, test_models(model)).await;
+
+    assert!(matches!(
+        result,
+        Err(AgentError::Config(ConfigError::UnsupportedCompaction))
+    ));
     remove_base(&base).await;
 }
 
@@ -1275,17 +1304,7 @@ async fn model_info_errors_and_events_never_serialize_secrets() {
     config.profiles.get_mut("test").unwrap().system_prompt = SYSTEM_SECRET.to_owned();
     config.models.insert(
         "fake".to_owned(),
-        ModelConfig::OpenAiResponses {
-            model: "private-model".to_owned(),
-            base_url: BASE_URL_SECRET.to_owned(),
-            api_key_env: ENV_SECRET.to_owned(),
-            physical_context_window: 32_000,
-            output_budget_tokens: 2_000,
-            safety_margin_tokens: 1_000,
-            supported_reasoning: BTreeSet::from([ReasoningPreference::Auto]),
-            supports_tools: true,
-            request_timeout_seconds: Some(30),
-        },
+        configured_model("private-model", BASE_URL_SECRET, ENV_SECRET),
     );
     let agent = Agent::open_with_models(config, test_models(model))
         .await

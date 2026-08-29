@@ -7,6 +7,7 @@ use minicore_runtime::SessionId;
 use serde_json::{Value, json};
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
+const TEST_CREDENTIAL_ENV: &str = "MINICORE_RPC_STDIO_TEST_KEY";
 
 struct RpcProcess {
     child: Child,
@@ -51,11 +52,38 @@ fn spawn_server() -> RpcProcess {
     std::fs::create_dir_all(&temp_dir).unwrap();
     std::fs::write(
         &config_path,
-        format!("data_dir = {:?}\nevent_capacity = 256\n", data_dir),
+        format!(
+            r#"data_dir = {:?}
+event_capacity = 256
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "auto"
+system_prompt = "RPC framing test system prompt"
+tools = []
+max_tool_rounds = 4
+approval = "ask"
+
+[models.main]
+provider = "open_ai_responses"
+model = "provider-model"
+base_url = "https://example.invalid/v1"
+api_key_env = "{TEST_CREDENTIAL_ENV}"
+physical_context_window = 10000
+output_budget_tokens = 1000
+safety_margin_tokens = 1000
+supported_reasoning = ["auto"]
+supports_tools = false
+request_timeout_seconds = 30
+"#,
+            data_dir
+        ),
     )
     .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
         .args(["--config", config_path.to_str().unwrap(), "--stdio"])
+        .env(TEST_CREDENTIAL_ENV, "dummy-test-credential")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -186,24 +214,45 @@ fn eof_shuts_down_without_an_extra_frame() {
 }
 
 #[test]
-fn empty_config_exposes_stable_profile_model_and_session_lists() {
+fn complete_config_exposes_stable_profile_model_and_session_behavior() {
     let mut process = spawn_server();
 
-    for (id, method, field) in [
-        ("profiles", "profile.list", "profiles"),
-        ("models", "model.list", "models"),
-        ("sessions", "session.list", "sessions"),
-    ] {
-        process.send_json(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": {}
-        }));
-        let response = process.response();
-        assert_eq!(response["id"], json!(id));
-        assert_eq!(response["result"][field], json!([]));
-    }
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "complete-ping",
+        "method": "agent.ping",
+        "params": {}
+    }));
+    assert_ping(process.response(), json!("complete-ping"));
+
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "profiles",
+        "method": "profile.list",
+        "params": {}
+    }));
+    let profiles = process.response();
+    assert_eq!(profiles["result"]["profiles"][0]["id"], "test");
+    assert_eq!(profiles["result"]["profiles"][0]["model"], "main");
+
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "models",
+        "method": "model.list",
+        "params": {}
+    }));
+    let models = process.response();
+    assert_eq!(models["result"]["models"][0]["id"], "main");
+    assert_eq!(models["result"]["models"][0]["context_window"], 8_000);
+    assert_eq!(models["result"]["models"][0]["supports_tools"], false);
+
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "sessions",
+        "method": "session.list",
+        "params": {}
+    }));
+    assert_eq!(process.response()["result"]["sessions"], json!([]));
 
     let missing = SessionId::new().unwrap();
     process.send_json(json!({
@@ -238,7 +287,7 @@ fn empty_config_exposes_stable_profile_model_and_session_lists() {
         "jsonrpc": "2.0",
         "id": "profile-missing",
         "method": "session.create",
-        "params": {"workspace": workspace}
+        "params": {"workspace": workspace, "profile": "missing"}
     }));
     assert_domain_error(
         process.response(),

@@ -15,7 +15,7 @@ use minicore_runtime::tools::{ToolOutput, ToolResultOutcome, ToolSpec};
 
 use crate::agent::{Agent, CreateSession, GetTranscript, SendMessage};
 use crate::config::{AgentConfig, KernelOverrides, Profile};
-use crate::models::Models;
+use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, ProfileCompaction};
 
 use super::*;
@@ -46,6 +46,26 @@ fn settings(base_url: &str) -> OpenAiResponsesSettings {
 
 fn model(base_url: &str) -> OpenAiResponsesModel {
     OpenAiResponsesModel::new(settings(base_url)).unwrap()
+}
+
+fn agent_model_config(base_url: &str) -> ModelConfig {
+    ModelConfig::OpenAiResponses {
+        model: "provider-model".to_owned(),
+        base_url: base_url.to_owned(),
+        api_key_env: "MINICORE_UNUSED_OPENAI_AGENT_KEY".to_owned(),
+        physical_context_window: 18_408,
+        output_budget_tokens: 1_024,
+        safety_margin_tokens: 1_000,
+        supported_reasoning: BTreeSet::from([
+            ReasoningPreference::Auto,
+            ReasoningPreference::Disabled,
+            ReasoningPreference::Low,
+            ReasoningPreference::Medium,
+            ReasoningPreference::High,
+        ]),
+        supports_tools: true,
+        request_timeout_seconds: Some(5),
+    }
 }
 
 fn context(cancellation: CancellationToken, deadline: Duration) -> ModelCallContext {
@@ -1793,7 +1813,7 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
                 compaction: ProfileCompaction::Disabled,
             },
         )]),
-        models: BTreeMap::new(),
+        models: BTreeMap::from([("main".to_owned(), agent_model_config(server.base_url()))]),
         kernel: KernelOverrides::default(),
     };
     let mut agent = Agent::open_with_models(config, models).await.unwrap();
