@@ -3,7 +3,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -373,7 +373,7 @@ async fn terminate_and_reap(child: &mut Child) -> Result<(), ToolError> {
 }
 
 fn start_kill(child: &mut Child) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if take_termination_failure(child, TerminationFailure::StartKill) {
         return Err(io::Error::other("injected start_kill failure"));
     }
@@ -381,24 +381,24 @@ fn start_kill(child: &mut Child) -> io::Result<()> {
 }
 
 async fn wait_after_kill(child: &mut Child) -> io::Result<ExitStatus> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if take_termination_failure(child, TerminationFailure::Wait) {
         return Err(io::Error::other("injected wait failure"));
     }
     child.wait().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminationFailure {
     StartKill,
     Wait,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static TERMINATION_FAILURES: OnceLock<Mutex<Vec<(u32, TerminationFailure)>>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn inject_termination_failure(pid: u32, failure: TerminationFailure) {
     TERMINATION_FAILURES
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -407,7 +407,7 @@ fn inject_termination_failure(pid: u32, failure: TerminationFailure) {
         .push((pid, failure));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn take_termination_failure(child: &Child, failure: TerminationFailure) -> bool {
     let Some(pid) = child.id() else {
         return false;
@@ -592,6 +592,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn execute_with_context(
         tool: &BashTool,
         arguments: Value,

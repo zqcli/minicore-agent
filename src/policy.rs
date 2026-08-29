@@ -1,5 +1,9 @@
+#[cfg(test)]
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+#[cfg(test)]
+use minicore_runtime::ids::{SessionId, ToolCallId};
 use minicore_runtime::tools::{
     ApprovalRequest, ApprovalRisk, ToolDecision, ToolPolicy, ToolPolicyError, ToolPolicyFuture,
     ToolPolicyRequest,
@@ -56,6 +60,18 @@ impl Policy {
 
 impl ToolPolicy for Policy {
     fn decide<'a>(&'a self, request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
+        #[cfg(test)]
+        if let Some(gate) = take_decision_gate(
+            request.invocation.session_id(),
+            request.invocation.tool_call_id(),
+        ) {
+            let mode = self.mode;
+            return Box::pin(async move {
+                gate.started.add_permits(1);
+                gate.release.acquire().await.unwrap().forget();
+                Policy::new(mode).decide_now(&request)
+            });
+        }
         Box::pin(std::future::ready(self.decide_now(&request)))
     }
 }
@@ -70,6 +86,53 @@ fn classify(name: &str) -> Option<ToolClass> {
 
 fn deny(reason: &str) -> Result<ToolDecision, ToolPolicyError> {
     ToolDecision::deny(reason).map_err(|_| ToolPolicyError::Internal)
+}
+
+#[cfg(test)]
+pub(crate) struct PolicyDecisionGate {
+    session_id: SessionId,
+    tool_call_id: ToolCallId,
+    pub(crate) started: Arc<tokio::sync::Semaphore>,
+    pub(crate) release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl PolicyDecisionGate {
+    pub(crate) fn new(session_id: SessionId, tool_call_id: ToolCallId) -> Self {
+        Self {
+            session_id,
+            tool_call_id,
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+static DECISION_GATES: OnceLock<Mutex<Vec<Arc<PolicyDecisionGate>>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn block_decision(gate: Arc<PolicyDecisionGate>) {
+    DECISION_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(gate);
+}
+
+#[cfg(test)]
+fn take_decision_gate(
+    session_id: SessionId,
+    tool_call_id: &ToolCallId,
+) -> Option<Arc<PolicyDecisionGate>> {
+    let mut gates = DECISION_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|gate| gate.session_id == session_id && &gate.tool_call_id == tool_call_id)
+        .map(|position| gates.remove(position))
 }
 
 #[cfg(test)]

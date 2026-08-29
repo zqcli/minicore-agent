@@ -14,14 +14,9 @@ use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, SessionShutdow
 use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason, ModelRef,
-    ModelStartFuture, ModelStream, ReasoningPreference, Usage,
+    ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference, Usage,
 };
 use minicore_runtime::session::SessionStatus;
-use minicore_runtime::tools::{
-    ApprovalRequest, ApprovalRisk, Tool, ToolContext, ToolDecision, ToolError,
-    ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput, ToolPolicy, ToolPolicyFuture,
-    ToolPolicyRequest, ToolSet, ToolSpec,
-};
 use minicore_runtime::value::BoundedText;
 
 use crate::config::{AgentConfig, KernelOverrides, Profile};
@@ -35,8 +30,28 @@ use super::{Agent, AnswerInteraction, CreateSession, GetTranscript, SendMessage,
 #[derive(Clone)]
 enum ModelScript {
     Text(&'static str),
-    ReadCalls(usize),
+    ToolCalls(Vec<ToolCallScript>),
     Block,
+}
+
+#[derive(Clone)]
+struct ToolCallScript {
+    name: &'static str,
+    arguments: serde_json::Value,
+}
+
+impl ModelScript {
+    fn tool_call(name: &'static str, arguments: serde_json::Value) -> Self {
+        Self::ToolCalls(vec![ToolCallScript { name, arguments }])
+    }
+
+    fn tool_calls(calls: Vec<ToolCallScript>) -> Self {
+        Self::ToolCalls(calls)
+    }
+}
+
+fn scripted_call(name: &'static str, arguments: serde_json::Value) -> ToolCallScript {
+    ToolCallScript { name, arguments }
 }
 
 struct FakeModel {
@@ -44,6 +59,7 @@ struct FakeModel {
     scripts: Arc<Mutex<VecDeque<ModelScript>>>,
     routed_scripts: Arc<Mutex<BTreeMap<SessionId, ModelScript>>>,
     started_sessions: Arc<Mutex<Vec<SessionId>>>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
     started: Option<Arc<Semaphore>>,
     calls: Arc<AtomicUsize>,
 }
@@ -70,6 +86,7 @@ impl FakeModel {
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
             routed_scripts: Arc::new(Mutex::new(BTreeMap::new())),
             started_sessions: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
             started: None,
             calls: Arc::clone(&calls),
         });
@@ -83,6 +100,10 @@ impl FakeModel {
 
     fn started_sessions(&self) -> Arc<Mutex<Vec<SessionId>>> {
         Arc::clone(&self.started_sessions)
+    }
+
+    fn requests(&self) -> Arc<Mutex<Vec<ModelRequest>>> {
+        Arc::clone(&self.requests)
     }
 
     fn route(&self, session_id: SessionId, script: ModelScript) {
@@ -100,10 +121,11 @@ impl Model for FakeModel {
 
     fn start<'a>(
         &'a self,
-        _request: minicore_runtime::model::ModelRequest,
+        request: minicore_runtime::model::ModelRequest,
         context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let model_call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push(request);
         self.started_sessions
             .lock()
             .unwrap()
@@ -135,17 +157,24 @@ impl Model for FakeModel {
                         reason: ModelFinishReason::Stop,
                     },
                 ])),
-                ModelScript::ReadCalls(count) => {
-                    let mut values = Vec::with_capacity(count.saturating_mul(3) + 2);
-                    for index in 0..count {
-                        let tool_call_id = ToolCallId::new(format!("read-call-{index}")).unwrap();
+                ModelScript::ToolCalls(calls) => {
+                    let mut values = Vec::with_capacity(calls.len().saturating_mul(3) + 2);
+                    for (index, call) in calls.into_iter().enumerate() {
+                        let tool_call_id = ToolCallId::new(format!(
+                            "{}-call-{model_call_index}-{index}",
+                            call.name
+                        ))
+                        .unwrap();
                         values.push(ModelEvent::ToolCallStart {
                             tool_call_id: tool_call_id.clone(),
-                            tool_name: "read".parse().unwrap(),
+                            tool_name: call.name.parse().unwrap(),
                         });
                         values.push(
-                            ModelEvent::tool_call_arguments_delta(tool_call_id.clone(), "{}")
-                                .unwrap(),
+                            ModelEvent::tool_call_arguments_delta(
+                                tool_call_id.clone(),
+                                serde_json::to_string(&call.arguments).unwrap(),
+                            )
+                            .unwrap(),
                         );
                         values.push(ModelEvent::ToolCallEnd { tool_call_id });
                     }
@@ -164,105 +193,6 @@ impl Model for FakeModel {
 
 fn events(values: Vec<ModelEvent>) -> ModelStream {
     Box::pin(stream::iter(values.into_iter().map(Ok)))
-}
-
-struct FakeTool {
-    spec: ToolSpec,
-    started: Option<Arc<Semaphore>>,
-    block: bool,
-}
-
-impl FakeTool {
-    fn read() -> Self {
-        Self {
-            spec: ToolSpec::new(
-                "read".parse().unwrap(),
-                "read-like test tool",
-                json!({"type": "object"}),
-            )
-            .unwrap(),
-            started: None,
-            block: false,
-        }
-    }
-
-    fn blocking(mut self, started: Arc<Semaphore>) -> Self {
-        self.started = Some(started);
-        self.block = true;
-        self
-    }
-}
-
-impl Tool for FakeTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    fn execute<'a>(&'a self, _invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
-        let started = self.started.clone();
-        let block = self.block;
-        Box::pin(async move {
-            if let Some(started) = started {
-                started.add_permits(1);
-            }
-            if block {
-                context.cancellation.cancelled().await;
-                return Err(ToolError::Cancelled);
-            }
-            Ok(ToolExecutionOutcome::Completed(
-                ToolOutput::new("tool result").unwrap(),
-            ))
-        })
-    }
-}
-
-struct AllowPolicy;
-
-impl ToolPolicy for AllowPolicy {
-    fn decide<'a>(&'a self, _request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
-        Box::pin(async { Ok(ToolDecision::Allow) })
-    }
-}
-
-struct RequireApprovalPolicy;
-
-impl ToolPolicy for RequireApprovalPolicy {
-    fn decide<'a>(&'a self, _request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
-        Box::pin(async {
-            Ok(ToolDecision::require_approval(
-                ApprovalRequest::new("approve read", ApprovalRisk::Low).unwrap(),
-            )
-            .unwrap())
-        })
-    }
-}
-
-struct GatedApprovalPolicy {
-    started: Arc<Semaphore>,
-    release: Arc<Semaphore>,
-}
-
-impl ToolPolicy for GatedApprovalPolicy {
-    fn decide<'a>(&'a self, _request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
-        let started = Arc::clone(&self.started);
-        let release = Arc::clone(&self.release);
-        Box::pin(async move {
-            started.add_permits(1);
-            release.acquire().await.unwrap().forget();
-            Ok(ToolDecision::require_approval(
-                ApprovalRequest::new("approve read", ApprovalRisk::Low).unwrap(),
-            )
-            .unwrap())
-        })
-    }
-}
-
-fn tool_set(tool: Option<FakeTool>) -> ToolSet {
-    let mut builder = ToolSet::builder();
-    if let Some(tool) = tool {
-        builder.register(tool);
-    }
-    builder.build().unwrap()
 }
 
 fn config(data_dir: PathBuf, tools: Vec<&str>) -> AgentConfig {
@@ -285,6 +215,16 @@ fn config(data_dir: PathBuf, tools: Vec<&str>) -> AgentConfig {
     }
 }
 
+fn config_with_approval(
+    data_dir: PathBuf,
+    tools: Vec<&str>,
+    approval: ApprovalMode,
+) -> AgentConfig {
+    let mut config = config(data_dir, tools);
+    config.profiles.get_mut("test").unwrap().approval = approval;
+    config
+}
+
 fn models(model: Arc<FakeModel>) -> Models {
     let model: Arc<dyn Model> = model;
     Models::from_values(BTreeMap::from([(String::from("fake"), model)]))
@@ -294,7 +234,6 @@ async fn agent_fixture(
     label: &str,
     scripts: impl IntoIterator<Item = ModelScript>,
     tools: Vec<&str>,
-    tool: Option<FakeTool>,
 ) -> (Agent, PathBuf, PathBuf, Arc<AtomicUsize>) {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-loop-{label}-{}",
@@ -304,14 +243,9 @@ async fn agent_fixture(
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (model, calls) = FakeModel::new(scripts);
-    let agent = Agent::open_with_models(
-        config(data_dir, tools),
-        models(model),
-        tool_set(tool),
-        Some(Arc::new(AllowPolicy)),
-    )
-    .await
-    .unwrap();
+    let agent = Agent::open_with_models(config(data_dir, tools), models(model))
+        .await
+        .unwrap();
     (agent, base, workspace, calls)
 }
 
@@ -338,6 +272,67 @@ async fn remove_base(base: &Path) {
     let _ = tokio::fs::remove_dir_all(base).await;
 }
 
+#[cfg(unix)]
+async fn read_test_pid(path: &Path) -> u32 {
+    for _ in 0..200 {
+        if let Ok(value) = tokio::fs::read_to_string(path).await {
+            if let Ok(pid) = value.trim().parse() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("bash child did not publish its PID");
+}
+
+#[cfg(unix)]
+async fn wait_for_test_process_exit(pid: u32) {
+    for _ in 0..200 {
+        if !test_process_exists(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("bash child PID {pid} remained alive");
+}
+
+#[cfg(unix)]
+fn test_process_exists(pid: u32) -> bool {
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+struct TestProcessGuard {
+    pid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl TestProcessGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestProcessGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            let _ = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("kill -KILL {pid} 2>/dev/null"))
+                .status();
+        }
+    }
+}
+
 fn create_request(workspace: &Path) -> CreateSession {
     CreateSession {
         workspace: workspace.to_path_buf(),
@@ -359,7 +354,7 @@ fn session_record_path(base: &Path, session_id: SessionId) -> PathBuf {
 #[tokio::test]
 async fn agent_lifecycle_text_turn_and_durable_finish_event() {
     let (mut agent, base, workspace, calls) =
-        agent_fixture("lifecycle", [ModelScript::Text("final")], Vec::new(), None).await;
+        agent_fixture("lifecycle", [ModelScript::Text("final")], Vec::new()).await;
     let mut events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -470,14 +465,24 @@ async fn agent_lifecycle_text_turn_and_durable_finish_event() {
 }
 
 #[tokio::test]
-async fn fake_read_tool_runs_through_runtime_model_tool_model_loop() {
+async fn real_read_tool_runs_through_runtime_model_tool_model_loop() {
     let (mut agent, base, workspace, calls) = agent_fixture(
         "tool-loop",
-        [ModelScript::ReadCalls(2), ModelScript::Text("tool final")],
+        [
+            ModelScript::tool_calls(vec![
+                scripted_call("read", json!({"path": "input.txt"})),
+                scripted_call("read", json!({"path": "input.txt"})),
+            ]),
+            ModelScript::Text("tool final"),
+            ModelScript::tool_call("read", json!({"path": "input.txt"})),
+            ModelScript::Text("reopened tool final"),
+        ],
         vec!["read"],
-        Some(FakeTool::read()),
     )
     .await;
+    tokio::fs::write(workspace.join("input.txt"), "real workspace content\n")
+        .await
+        .unwrap();
     let mut events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -537,6 +542,654 @@ async fn fake_read_tool_runs_through_runtime_model_tool_model_loop() {
             .count(),
         2
     );
+    assert!(page.entries.iter().any(|entry| matches!(
+        entry,
+        minicore_runtime::ConversationEntry::ToolResult(result)
+            if result.content.as_str().contains("real workspace content")
+    )));
+    agent.close_session(info.session_id).await.unwrap();
+    let reopened = agent.open_session(info.session_id).await.unwrap();
+    assert_ne!(reopened.instance_id, info.instance_id);
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "read after reopen".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    let page = agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 64,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                minicore_runtime::ConversationEntry::ToolResult(result)
+                    if result.outcome == minicore_runtime::tools::ToolResultOutcome::Success
+            ))
+            .count(),
+        3
+    );
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn real_write_ask_allow_once_writes_after_safe_approval() {
+    const SECRET: &str = "CAPABILITY-SECRET-CONTENT";
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-write-allow-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, calls) = FakeModel::new([
+        ModelScript::tool_call("write", json!({"path": "approved.txt", "content": SECRET})),
+        ModelScript::Text("write approved final"),
+    ]);
+    let mut agent = Agent::open_with_models(
+        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
+        models(model),
+    )
+    .await
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "write with approval".to_owned(),
+        })
+        .await
+        .unwrap();
+    let event = wait_for_event(&mut events, |event| {
+        matches!(event, AgentEvent::InteractionRequested { interaction, .. } if interaction.turn_id == turn.turn_id)
+    })
+    .await;
+    let serialized = serde_json::to_string(&event).unwrap();
+    assert!(!serialized.contains(SECRET));
+    assert!(!serialized.contains("arguments"));
+    let AgentEvent::InteractionRequested { interaction, .. } = event else {
+        unreachable!();
+    };
+    let minicore_runtime::InteractionKind::Approval(approval) = &interaction.kind else {
+        panic!("write did not request approval");
+    };
+    assert_eq!(
+        approval.prompt.as_str(),
+        "Allow tool `write` for this call?"
+    );
+    assert_eq!(approval.risk, minicore_runtime::tools::ApprovalRisk::Medium);
+    agent
+        .answer(AnswerInteraction {
+            session_id: info.session_id,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::AllowOnce,
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(workspace.join("approved.txt"))
+            .await
+            .unwrap(),
+        SECRET
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn real_write_ask_deny_records_denied_and_continues_model_loop() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-write-deny-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, calls) = FakeModel::new([
+        ModelScript::tool_call(
+            "write",
+            json!({"path": "denied.txt", "content": "must-not-exist"}),
+        ),
+        ModelScript::Text("write denied final"),
+    ]);
+    let mut agent = Agent::open_with_models(
+        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
+        models(model),
+    )
+    .await
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "deny write".to_owned(),
+        })
+        .await
+        .unwrap();
+    let event = wait_for_event(&mut events, |event| {
+        matches!(event, AgentEvent::InteractionRequested { interaction, .. } if interaction.turn_id == turn.turn_id)
+    })
+    .await;
+    let AgentEvent::InteractionRequested { interaction, .. } = event else {
+        unreachable!();
+    };
+    agent
+        .answer(AnswerInteraction {
+            session_id: info.session_id,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::Deny,
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    assert!(
+        !tokio::fs::try_exists(workspace.join("denied.txt"))
+            .await
+            .unwrap()
+    );
+    let page = agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 32,
+        })
+        .await
+        .unwrap();
+    assert!(page.entries.iter().any(|entry| matches!(
+        entry,
+        minicore_runtime::ConversationEntry::ToolResult(result)
+            if result.tool_name.as_str() == "write"
+                && result.outcome == minicore_runtime::tools::ToolResultOutcome::Denied
+    )));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn read_only_allows_read_and_denies_every_mutating_tool_without_side_effects() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-read-only-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::write(workspace.join("target.txt"), "before\n")
+        .await
+        .unwrap();
+    let scripts = vec![
+        ModelScript::tool_call("read", json!({"path": "target.txt"})),
+        ModelScript::Text("read final"),
+        ModelScript::tool_call(
+            "write",
+            json!({"path": "write-denied.txt", "content": "bad"}),
+        ),
+        ModelScript::Text("write denied final"),
+        ModelScript::tool_call(
+            "edit",
+            json!({"path": "target.txt", "old_text": "before", "new_text": "edited"}),
+        ),
+        ModelScript::Text("edit denied final"),
+        ModelScript::tool_call(
+            "apply_patch",
+            json!({
+                "path": "target.txt",
+                "patch": "@@ -1 +1 @@\n-before\n+patched\n"
+            }),
+        ),
+        ModelScript::Text("patch denied final"),
+        ModelScript::tool_call("bash", json!({"command": "printf bad > bash-denied.txt"})),
+        ModelScript::Text("bash denied final"),
+    ];
+    let (model, _) = FakeModel::new(scripts);
+    let mut agent = Agent::open_with_models(
+        config_with_approval(
+            base.join("data"),
+            vec!["read", "write", "edit", "apply_patch", "bash"],
+            ApprovalMode::ReadOnly,
+        ),
+        models(model),
+    )
+    .await
+    .unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    for tool in ["read", "write", "edit", "apply_patch", "bash"] {
+        let turn = agent
+            .send(SendMessage {
+                session_id: info.session_id,
+                text: format!("run {tool}"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            agent
+                .turn_handle(turn)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .terminal,
+            TurnTerminal::Completed
+        );
+    }
+    let page = agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    let results = page
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            minicore_runtime::ConversationEntry::ToolResult(result) => {
+                Some((result.tool_name.as_str(), result.outcome))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![
+            ("read", minicore_runtime::tools::ToolResultOutcome::Success),
+            ("write", minicore_runtime::tools::ToolResultOutcome::Denied),
+            ("edit", minicore_runtime::tools::ToolResultOutcome::Denied),
+            (
+                "apply_patch",
+                minicore_runtime::tools::ToolResultOutcome::Denied,
+            ),
+            ("bash", minicore_runtime::tools::ToolResultOutcome::Denied),
+        ]
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(workspace.join("target.txt"))
+            .await
+            .unwrap(),
+        "before\n"
+    );
+    assert!(
+        !tokio::fs::try_exists(workspace.join("write-denied.txt"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !tokio::fs::try_exists(workspace.join("bash-denied.txt"))
+            .await
+            .unwrap()
+    );
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn auto_executes_real_write_edit_and_patch_sequentially_without_approval() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-auto-mutations-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, calls) = FakeModel::new([
+        ModelScript::tool_calls(vec![
+            scripted_call("write", json!({"path": "chain.txt", "content": "one\n"})),
+            scripted_call(
+                "edit",
+                json!({"path": "chain.txt", "old_text": "one", "new_text": "two"}),
+            ),
+            scripted_call(
+                "apply_patch",
+                json!({
+                    "path": "chain.txt",
+                    "patch": "@@ -1 +1 @@\n-two\n+three\n"
+                }),
+            ),
+        ]),
+        ModelScript::Text("mutation chain final"),
+    ]);
+    let mut agent = Agent::open_with_models(
+        config_with_approval(
+            base.join("data"),
+            vec!["write", "edit", "apply_patch"],
+            ApprovalMode::Auto,
+        ),
+        models(model),
+    )
+    .await
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "mutate in order".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(workspace.join("chain.txt"))
+            .await
+            .unwrap(),
+        "three\n"
+    );
+    let page = agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 64,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                minicore_runtime::ConversationEntry::ToolResult(result)
+                    if result.outcome == minicore_runtime::tools::ToolResultOutcome::Success
+            ))
+            .count(),
+        3
+    );
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(10), events.recv()).await
+    {
+        assert!(!matches!(event, AgentEvent::InteractionRequested { .. }));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn project_context_is_injected_per_workspace_and_missing_file_adds_no_block() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-context-assembly-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace_with = base.join("with-context");
+    let workspace_without = base.join("without-context");
+    tokio::fs::create_dir_all(&workspace_with).await.unwrap();
+    tokio::fs::create_dir_all(&workspace_without).await.unwrap();
+    tokio::fs::write(
+        workspace_with.join("AGENTS.md"),
+        "Use real project instructions.",
+    )
+    .await
+    .unwrap();
+    let (model, _) = FakeModel::new([
+        ModelScript::Text("context final"),
+        ModelScript::Text("no context final"),
+    ]);
+    let requests = model.requests();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
+    let with = agent
+        .create_session(create_request(&workspace_with.join(".")))
+        .await
+        .unwrap();
+    assert_eq!(
+        with.workspace,
+        tokio::fs::canonicalize(&workspace_with).await.unwrap()
+    );
+    let turn = agent
+        .send(SendMessage {
+            session_id: with.session_id,
+            text: "inspect context".to_owned(),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(turn).unwrap().wait().await.unwrap();
+
+    let without = agent
+        .create_session(create_request(&workspace_without))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: without.session_id,
+            text: "inspect missing context".to_owned(),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(turn).unwrap().wait().await.unwrap();
+
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_context = requests[0]
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                minicore_runtime::model::ModelMessage::System(text)
+                    if text.starts_with("[minicore-context ") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_context.len(), 1);
+        assert!(first_context[0].contains("slot=project_instructions"));
+        assert!(first_context[0].contains("source=agents-md"));
+        assert!(first_context[0].contains("Use real project instructions."));
+        assert!(!requests[1].messages().iter().any(|message| matches!(
+            message,
+            minicore_runtime::model::ModelMessage::System(text)
+                if text.starts_with("[minicore-context ")
+        )));
+    }
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn real_tools_are_isolated_by_each_loaded_sessions_workspace() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-session-workspaces-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace_a = base.join("workspace-a");
+    let workspace_b = base.join("workspace-b");
+    tokio::fs::create_dir_all(&workspace_a).await.unwrap();
+    tokio::fs::create_dir_all(&workspace_b).await.unwrap();
+    tokio::fs::write(workspace_a.join("same.txt"), "session-a\n")
+        .await
+        .unwrap();
+    tokio::fs::write(workspace_b.join("same.txt"), "session-b\n")
+        .await
+        .unwrap();
+    let (model, _) = FakeModel::new([
+        ModelScript::tool_call("read", json!({"path": "same.txt"})),
+        ModelScript::Text("a final"),
+        ModelScript::tool_call("read", json!({"path": "same.txt"})),
+        ModelScript::Text("b final"),
+    ]);
+    let mut agent = Agent::open_with_models(config(base.join("data"), vec!["read"]), models(model))
+        .await
+        .unwrap();
+    let a = agent
+        .create_session(create_request(&workspace_a))
+        .await
+        .unwrap();
+    let b = agent
+        .create_session(create_request(&workspace_b))
+        .await
+        .unwrap();
+    for session_id in [a.session_id, b.session_id] {
+        let turn = agent
+            .send(SendMessage {
+                session_id,
+                text: "read isolated file".to_owned(),
+            })
+            .await
+            .unwrap();
+        agent.turn_handle(turn).unwrap().wait().await.unwrap();
+    }
+    for (session_id, own, other) in [
+        (a.session_id, "session-a", "session-b"),
+        (b.session_id, "session-b", "session-a"),
+    ] {
+        let page = agent
+            .transcript(GetTranscript {
+                session_id,
+                after: None,
+                limit: 32,
+            })
+            .await
+            .unwrap();
+        let output = page
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                minicore_runtime::ConversationEntry::ToolResult(result) => {
+                    Some(result.content.as_str())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(output.contains(own));
+        assert!(!output.contains(other));
+    }
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_traversal_and_escape_symlink_fail_through_real_read_tool() {
+    use std::os::unix::fs::symlink;
+
+    const OUTSIDE_SECRET: &str = "OUTSIDE-SECRET-MUST-NOT-LEAK";
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-workspace-escape-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::write(base.join("outside.txt"), OUTSIDE_SECRET)
+        .await
+        .unwrap();
+    symlink(base.join("outside.txt"), workspace.join("escape-link")).unwrap();
+    let (model, _) = FakeModel::new([
+        ModelScript::tool_call("read", json!({"path": "../outside.txt"})),
+        ModelScript::Text("traversal failed final"),
+        ModelScript::tool_call("read", json!({"path": "escape-link"})),
+        ModelScript::Text("symlink failed final"),
+    ]);
+    let mut agent = Agent::open_with_models(config(base.join("data"), vec!["read"]), models(model))
+        .await
+        .unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    for text in ["try traversal", "try symlink"] {
+        let turn = agent
+            .send(SendMessage {
+                session_id: info.session_id,
+                text: text.to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            agent
+                .turn_handle(turn)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .terminal,
+            TurnTerminal::Completed
+        );
+    }
+    let page = agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 64,
+        })
+        .await
+        .unwrap();
+    let results = page
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            minicore_runtime::ConversationEntry::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| {
+        result.outcome == minicore_runtime::tools::ToolResultOutcome::Failed
+            && !result.content.as_str().contains(OUTSIDE_SECRET)
+    }));
     agent.shutdown().await.unwrap();
     remove_base(&base).await;
 }
@@ -552,14 +1205,9 @@ async fn exact_cancel_and_busy_are_scoped_to_one_session() {
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let info = agent
         .create_session(create_request(&workspace))
         .await
@@ -621,14 +1269,19 @@ async fn exact_cancel_and_busy_are_scoped_to_one_session() {
     remove_base(&base).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn exact_cancel_interrupts_a_long_running_tool() {
-    let started = Arc::new(Semaphore::new(0));
     let (mut agent, base, workspace, _) = agent_fixture(
         "tool-cancel",
-        [ModelScript::ReadCalls(1)],
-        vec!["read"],
-        Some(FakeTool::read().blocking(Arc::clone(&started))),
+        [ModelScript::tool_call(
+            "bash",
+            json!({
+                "command": "echo $$ > bash.pid; exec sleep 30",
+                "timeout_seconds": 30
+            }),
+        )],
+        vec!["bash"],
     )
     .await;
     let info = agent
@@ -642,7 +1295,8 @@ async fn exact_cancel_interrupts_a_long_running_tool() {
         })
         .await
         .unwrap();
-    started.acquire().await.unwrap().forget();
+    let pid = read_test_pid(&workspace.join("bash.pid")).await;
+    let mut guard = TestProcessGuard::new(pid);
     assert!(agent.cancel(turn).unwrap());
     assert_eq!(
         agent
@@ -654,6 +1308,12 @@ async fn exact_cancel_interrupts_a_long_running_tool() {
             .terminal,
         TurnTerminal::CancelledByUser
     );
+    wait_for_test_process_exit(pid).await;
+    guard.disarm();
+    assert_eq!(
+        agent.session_state(info.session_id).unwrap().status,
+        SessionStatus::Idle
+    );
     agent.shutdown().await.unwrap();
     remove_base(&base).await;
 }
@@ -664,7 +1324,6 @@ async fn loaded_open_is_idempotent_without_reading_session_metadata() {
         "loaded-idempotent",
         [ModelScript::Text("unused")],
         Vec::new(),
-        None,
     )
     .await;
     let info = agent
@@ -709,15 +1368,63 @@ async fn loaded_open_is_idempotent_without_reading_session_metadata() {
     remove_base(&base).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unloaded_open_revalidates_deleted_and_symlinked_workspace_roots() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-workspace-reopen-{}",
+        SessionId::new().unwrap()
+    ));
+    let deleted_workspace = base.join("deleted-workspace");
+    let symlink_workspace = base.join("symlink-workspace");
+    tokio::fs::create_dir_all(&deleted_workspace).await.unwrap();
+    tokio::fs::create_dir_all(&symlink_workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
+
+    let deleted = agent
+        .create_session(create_request(&deleted_workspace.join(".")))
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.workspace,
+        tokio::fs::canonicalize(&deleted_workspace).await.unwrap()
+    );
+    tokio::fs::remove_dir_all(&deleted_workspace).await.unwrap();
+    assert_eq!(
+        agent.open_session(deleted.session_id).await.unwrap(),
+        deleted
+    );
+    agent.close_session(deleted.session_id).await.unwrap();
+    assert!(matches!(
+        agent.open_session(deleted.session_id).await,
+        Err(AgentError::Workspace)
+    ));
+
+    let symlinked = agent
+        .create_session(create_request(&symlink_workspace))
+        .await
+        .unwrap();
+    agent.close_session(symlinked.session_id).await.unwrap();
+    let moved = base.join("moved-workspace");
+    tokio::fs::rename(&symlink_workspace, &moved).await.unwrap();
+    symlink(&moved, &symlink_workspace).unwrap();
+    assert!(matches!(
+        agent.open_session(symlinked.session_id).await,
+        Err(AgentError::Workspace)
+    ));
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
 #[tokio::test]
 async fn old_instance_turn_references_are_rejected_after_reopen() {
-    let (mut agent, base, workspace, _) = agent_fixture(
-        "old-instance",
-        [ModelScript::Text("unused")],
-        Vec::new(),
-        None,
-    )
-    .await;
+    let (mut agent, base, workspace, _) =
+        agent_fixture("old-instance", [ModelScript::Text("unused")], Vec::new()).await;
     let created = agent
         .create_session(create_request(&workspace))
         .await
@@ -748,14 +1455,10 @@ async fn assert_profile_drift(label: &str, change: fn(&mut Profile)) {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (old_model, _) = FakeModel::new([ModelScript::Text("old")]);
-    let mut old_agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(old_model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut old_agent =
+        Agent::open_with_models(config(base.join("data"), Vec::new()), models(old_model))
+            .await
+            .unwrap();
     let info = old_agent
         .create_session(create_request(&workspace))
         .await
@@ -771,10 +1474,9 @@ async fn assert_profile_drift(label: &str, change: fn(&mut Profile)) {
     let (new_model, _) = FakeModel::new([ModelScript::Text("new")]);
     let mut new_config = config(base.join("data"), Vec::new());
     change(new_config.profiles.get_mut("test").unwrap());
-    let mut new_agent =
-        Agent::open_with_models(new_config, models(new_model), ToolSet::default(), None)
-            .await
-            .unwrap();
+    let mut new_agent = Agent::open_with_models(new_config, models(new_model))
+        .await
+        .unwrap();
     assert!(matches!(
         new_agent.open_session(info.session_id).await,
         Err(AgentError::SessionSpecMismatch)
@@ -799,11 +1501,16 @@ fn drift_max_rounds(profile: &mut Profile) {
     profile.max_tool_rounds = 5;
 }
 
+fn drift_tools(profile: &mut Profile) {
+    profile.tools = vec!["read".to_owned()];
+}
+
 #[tokio::test]
 async fn opening_rejects_each_supported_profile_spec_drift() {
     assert_profile_drift("system-prompt", drift_system_prompt).await;
     assert_profile_drift("reasoning", drift_reasoning).await;
     assert_profile_drift("max-rounds", drift_max_rounds).await;
+    assert_profile_drift("tools", drift_tools).await;
 }
 
 fn shutdown_diagnostic(retryable: bool) -> minicore_runtime::error::DiagnosticSummary {
@@ -898,13 +1605,8 @@ fn core_turn_finished_is_suppressed_and_its_drop_count_reaches_the_next_event() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_turn_close_emits_session_closed_after_closed_transcript_barrier() {
-    let (mut agent, base, workspace, _) = agent_fixture(
-        "active-close",
-        [ModelScript::Text("final")],
-        Vec::new(),
-        None,
-    )
-    .await;
+    let (mut agent, base, workspace, _) =
+        agent_fixture("active-close", [ModelScript::Text("final")], Vec::new()).await;
     let mut events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -987,12 +1689,13 @@ async fn waiting_for_input_state_precedes_interaction_requested() {
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (model, _) = FakeModel::new([ModelScript::ReadCalls(1)]);
+    let (model, _) = FakeModel::new([ModelScript::tool_call(
+        "write",
+        json!({"path": "approval.txt", "content": "approved"}),
+    )]);
     let mut agent = Agent::open_with_models(
-        config(base.join("data"), vec!["read"]),
+        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
         models(model),
-        tool_set(Some(FakeTool::read())),
-        Some(Arc::new(RequireApprovalPolicy)),
     )
     .await
     .unwrap();
@@ -1082,12 +1785,16 @@ async fn completion_boundary_preserves_cross_turn_interaction_state_order() {
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::ReadCalls(1)]);
+    let (model, _) = FakeModel::new([
+        ModelScript::Text("first"),
+        ModelScript::tool_call(
+            "write",
+            json!({"path": "approval.txt", "content": "approved"}),
+        ),
+    ]);
     let mut agent = Agent::open_with_models(
-        config(base.join("data"), vec!["read"]),
+        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
         models(model),
-        tool_set(Some(FakeTool::read())),
-        Some(Arc::new(RequireApprovalPolicy)),
     )
     .await
     .unwrap();
@@ -1209,17 +1916,16 @@ async fn drained_event_refreshes_state_published_after_initial_completion_emit()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let policy_started = Arc::new(Semaphore::new(0));
-    let policy_release = Arc::new(Semaphore::new(0));
-    let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::ReadCalls(1)]);
+    let (model, _) = FakeModel::new([
+        ModelScript::Text("first"),
+        ModelScript::tool_call(
+            "write",
+            json!({"path": "approval.txt", "content": "approved"}),
+        ),
+    ]);
     let mut agent = Agent::open_with_models(
-        config(base.join("data"), vec!["read"]),
+        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
         models(model),
-        tool_set(Some(FakeTool::read())),
-        Some(Arc::new(GatedApprovalPolicy {
-            started: Arc::clone(&policy_started),
-            release: Arc::clone(&policy_release),
-        })),
     )
     .await
     .unwrap();
@@ -1228,6 +1934,13 @@ async fn drained_event_refreshes_state_published_after_initial_completion_emit()
         .create_session(create_request(&workspace))
         .await
         .unwrap();
+    let policy_gate = Arc::new(crate::policy::PolicyDecisionGate::new(
+        info.session_id,
+        ToolCallId::new("write-call-1-0").unwrap(),
+    ));
+    let policy_started = Arc::clone(&policy_gate.started);
+    let policy_release = Arc::clone(&policy_gate.release);
+    crate::policy::block_decision(policy_gate);
     wait_for_event(&mut events, |event| {
         matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
     })
@@ -1326,11 +2039,16 @@ async fn drained_event_refreshes_state_published_after_initial_completion_emit()
 async fn sequencer_barrier_orders_successful_live_events_before_finish() {
     let (mut agent, base, workspace, _) = agent_fixture(
         "sequencer-order",
-        [ModelScript::ReadCalls(1), ModelScript::Text("after tool")],
+        [
+            ModelScript::tool_call("read", json!({"path": "input.txt"})),
+            ModelScript::Text("after tool"),
+        ],
         vec!["read"],
-        Some(FakeTool::read()),
     )
     .await;
+    tokio::fs::write(workspace.join("input.txt"), "sequenced read\n")
+        .await
+        .unwrap();
     let gate = Arc::new(crate::sessions::SequencerGate::new());
     crate::sessions::block_sequencer(workspace.clone(), Arc::clone(&gate));
     let mut events = agent.take_events().unwrap();
@@ -1412,7 +2130,7 @@ async fn sequencer_does_not_wait_for_a_dropped_core_terminal_event() {
     let (model, _) = FakeModel::new([ModelScript::Text("final")]);
     let mut agent_config = config(base.join("data"), Vec::new());
     agent_config.kernel.event_capacity = Some(1);
-    let mut agent = Agent::open_with_models(agent_config, models(model), ToolSet::default(), None)
+    let mut agent = Agent::open_with_models(agent_config, models(model))
         .await
         .unwrap();
     let gate = Arc::new(crate::sessions::SequencerGate::new());
@@ -1453,7 +2171,7 @@ async fn completion_notifier_serializes_ready_turns_without_blocking_send() {
     let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::Text("second")]);
     let mut config = config(base.join("data"), Vec::new());
     config.event_capacity = 1;
-    let mut agent = Agent::open_with_models(config, models(model), ToolSet::default(), None)
+    let mut agent = Agent::open_with_models(config, models(model))
         .await
         .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -1525,7 +2243,7 @@ async fn completion_notifier_serializes_ready_turns_without_blocking_send() {
 #[tokio::test]
 async fn dropped_event_receiver_stops_completion_worker() {
     let (mut agent, base, workspace, _) =
-        agent_fixture("dropped-events", [ModelScript::Block], Vec::new(), None).await;
+        agent_fixture("dropped-events", [ModelScript::Block], Vec::new()).await;
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -1557,14 +2275,9 @@ async fn send_returns_before_background_touch_finishes() {
     let started = Arc::new(Semaphore::new(0));
     let (model, _) = FakeModel::new([ModelScript::Block]);
     let model = model.with_started(Arc::clone(&started));
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -1624,14 +2337,9 @@ async fn close_joins_blocked_metadata_worker_before_delete() {
     let started = Arc::new(Semaphore::new(0));
     let (model, _) = FakeModel::new([ModelScript::Block]);
     let model = model.with_started(Arc::clone(&started));
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -1691,14 +2399,9 @@ async fn metadata_worker_serializes_latest_update_before_close_and_delete() {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::Text("second")]);
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -1768,14 +2471,9 @@ async fn metadata_unavailable_retry_waits_for_a_new_latest_value() {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -1844,14 +2542,9 @@ async fn metadata_unknown_outcome_stops_future_updates_after_uncertain_write() {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
@@ -1918,7 +2611,7 @@ async fn shutdown_with_full_events_cancels_completion_worker() {
     let model = model.with_started(Arc::clone(&started));
     let mut config = config(base.join("data"), Vec::new());
     config.event_capacity = 1;
-    let mut agent = Agent::open_with_models(config, models(model), ToolSet::default(), None)
+    let mut agent = Agent::open_with_models(config, models(model))
         .await
         .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -1970,14 +2663,9 @@ async fn two_loaded_sessions_cancel_independently_and_shutdown_all() {
     let workspace_b = base.join("b");
     tokio::fs::create_dir_all(&workspace_a).await.unwrap();
     tokio::fs::create_dir_all(&workspace_b).await.unwrap();
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
     let a = agent
         .create_session(create_request(&workspace_a))
         .await
@@ -2053,10 +2741,9 @@ async fn restart_repairs_durable_unfinished_turn_then_accepts_new_turn() {
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let mut agent =
-                Agent::open_with_models(old_config, models(old_model), ToolSet::default(), None)
-                    .await
-                    .unwrap();
+            let mut agent = Agent::open_with_models(old_config, models(old_model))
+                .await
+                .unwrap();
             let info = agent
                 .create_session(create_request(&old_workspace))
                 .await
@@ -2076,14 +2763,10 @@ async fn restart_repairs_durable_unfinished_turn_then_accepts_new_turn() {
     let session_id = old_thread.join().unwrap();
 
     let (new_model, calls) = FakeModel::new([ModelScript::Text("restarted")]);
-    let mut agent = Agent::open_with_models(
-        config(base.join("data"), Vec::new()),
-        models(new_model),
-        ToolSet::default(),
-        None,
-    )
-    .await
-    .unwrap();
+    let mut agent =
+        Agent::open_with_models(config(base.join("data"), Vec::new()), models(new_model))
+            .await
+            .unwrap();
     let info = agent.open_session(session_id).await.unwrap();
     let state = agent.session_state(session_id).unwrap();
     assert_eq!(state.status, SessionStatus::Idle);
@@ -2129,6 +2812,27 @@ async fn restart_repairs_durable_unfinished_turn_then_accepts_new_turn() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     agent.shutdown().await.unwrap();
     remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn startup_rejects_unknown_and_duplicate_profile_tools() {
+    for (label, tools) in [
+        ("unknown", vec!["read", "unknown"]),
+        ("duplicate", vec!["read", "read"]),
+    ] {
+        let base = std::env::temp_dir().join(format!(
+            "minicore-agent-invalid-tools-{label}-{}",
+            SessionId::new().unwrap()
+        ));
+        let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
+        assert!(matches!(
+            Agent::open_with_models(config(base.join("data"), tools), models(model)).await,
+            Err(AgentError::Config(
+                crate::config::ConfigError::InvalidProfile
+            ))
+        ));
+        remove_base(&base).await;
+    }
 }
 
 #[tokio::test]

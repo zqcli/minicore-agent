@@ -166,6 +166,7 @@ struct ApplyStats {
     patch_content_visits: usize,
 }
 
+#[cfg(test)]
 impl ApplyStats {
     fn total_steps(&self) -> usize {
         self.source_line_visits
