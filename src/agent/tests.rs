@@ -2893,11 +2893,12 @@ async fn startup_rejects_unknown_and_duplicate_profile_tools() {
 }
 
 #[tokio::test]
-async fn open_rejects_real_openai_config_instead_of_claiming_provider_support() {
+async fn open_rejects_openai_config_when_its_key_environment_is_missing() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-model-config-{}",
         SessionId::new().unwrap()
     ));
+    let key_env = format!("MINICORE_MISSING_KEY_{}", SessionId::new().unwrap());
     let text = format!(
         r#"
 data_dir = "{}"
@@ -2911,7 +2912,7 @@ system_prompt = "test"
 provider = "open_ai_responses"
 model = "gpt-test"
 base_url = "https://example.invalid/v1"
-api_key_env = "TEST_KEY"
+api_key_env = "{key_env}"
 physical_context_window = 1000
 output_budget_tokens = 100
 safety_margin_tokens = 100
@@ -2923,7 +2924,9 @@ supports_tools = false
     let config = AgentConfig::from_toml(&text).unwrap();
     assert!(matches!(
         Agent::open(config).await,
-        Err(crate::error::AgentError::ModelNotImplemented)
+        Err(crate::error::AgentError::Config(
+            crate::config::ConfigError::InvalidModel
+        ))
     ));
     remove_base(&base).await;
 }

@@ -284,9 +284,48 @@ synchronous compute: once such compute starts it completes in the same poll and
 is not interruptible midway. After the synchronous Workspace commit boundary,
 the real commit result wins even if cancellation or the deadline becomes ready.
 
-The production TOML shape retains the OpenAI Responses model configuration, but
-that provider is intentionally not implemented in this Phase and `Agent::open`
-returns a stable not-implemented error instead of claiming availability.
+`Models` eagerly constructs every configured OpenAI Responses adapter during
+`Agent::open`. The API key is read from `api_key_env` and kept only inside the
+private adapter; missing or empty values fail startup. Base URLs must be HTTP(S)
+without credentials, query, or fragment, and resolve to `<base>/responses`.
+The descriptor uses the Agent model-profile ID as `ModelRef`; its exposed
+context window is `physical - output budget - safety margin`, while the provider
+request uses the configured output budget as `max_output_tokens`.
+
+The private reqwest adapter sends `stream:true`, `store:false`, and
+`truncation:"disabled"`. System messages become developer `input_text`, user
+messages become user `input_text`, assistant text becomes completed assistant
+output, Tool calls preserve their Core call ID and JSON arguments, Tool results
+become completed `function_call_output`, and Tool schemas become flat function
+tools. `Auto` omits reasoning, `Disabled` sends effort `none`, and low/medium/high
+send the exact effort plus summary `auto`. MiniCore's public `ReasoningContent`
+does not retain the complete provider reasoning-item identity required for safe
+Responses replay, so historical reasoning parts are omitted rather than
+fabricated. Historical assistant text uses deterministic local message IDs;
+provider message phase and original message identity are not available through
+the Runtime public history. Text and Tool history remain replayable.
+
+The Model stream directly owns reqwest's body stream, cancellation token,
+deadline, bounded incremental SSE parser, and pending typed events; no parser
+task is spawned. It accepts arbitrary chunks, CR/LF/CRLF, comments, and multi-line
+`data:` frames, with 1 MiB line/frame and queued-frame bounds. Provider text is
+UTF-8/control validated and split on UTF-8 boundaries into MiniCore's 64 KiB
+event limit. Tool calls support split arguments, done-only items, and multiple
+calls with exactly one start/end. Only `response.completed` or
+`response.incomplete` can produce Usage/Finish; early EOF never synthesizes
+success. Usage separates direct input/output from cache-read, cache-write, and
+reasoning tokens while retaining the provider total; the Agent does not compute
+prices or costs.
+
+Delivery mapping is conservative: local build/preflight/context failures are
+permanent `NotStarted`; connect failures and HTTP 429 are the only retryable
+`NotStarted` paths; send/response timeouts, 5xx, and uncertain transport outcomes
+are `Unknown`; stream failures after any typed semantic event are `Started`.
+HTTP error bodies are capped at 64 KiB and only machine-readable code/type fields
+are inspected privately. API keys, base URLs, raw bodies, and provider messages
+never enter diagnostics, Debug output, RPC, events, transcripts, or stderr.
+Redirects are disabled and default tests use only test-owned loopback servers.
+
 For every successful create or unloaded open, Agent opens a fresh concrete
 Workspace, builds the profile's concrete ToolSet, conditionally creates the
 concrete Policy, always creates ProjectContext, and supplies those ports through one
@@ -311,13 +350,23 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. OpenAI HTTP
-remains outside this Phase. The RPC protocol and offline duplex loop are complete,
-but a full binary process session loop requires a constructible production Model;
-the current OpenAI configuration remains rejected until the following adapter
-Phase. Empty-config process tests cover ping, framing, lists, domain errors, EOF,
-oversize, and shutdown without pretending provider support. The offline process coverage is
-in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
-Store, Workspace, Tool, Context, and Policy coverage is in the internal unit
-tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and
+to completion before joining the worker and allowing deletion. Default tests are
+offline: unit and Agent-loop suites use Tokio loopback HTTP, and
+`tests/openai_rpc_process.rs` runs the real stdio binary through a two-request
+OpenAI→read Tool→OpenAI completion plus a provider-secret error case. Empty-config
+framing tests remain in `tests/rpc_stdio.rs`.
+
+The ignored live text smoke runs only when both required variables are present:
+
+```bash
+OPENAI_API_KEY=... \
+MINICORE_AGENT_LIVE_MODEL=... \
+cargo test --locked openai_live_smoke -- --ignored --nocapture
+```
+
+`MINICORE_AGENT_LIVE_BASE_URL` optionally overrides
+`https://api.openai.com/v1`. The offline process coverage is in
+`tests/rpc_stdio.rs` and `tests/openai_rpc_process.rs`; Agent loop coverage is in
+`src/agent/tests.rs`. Store, Workspace, Tool, Context, and Policy coverage is in
+the internal unit tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and
 `src/policy.rs`.

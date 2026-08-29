@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use minicore_runtime::model::{Model, ModelRef, ReasoningPreference};
+
+mod openai;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
@@ -37,13 +40,16 @@ impl ModelConfig {
                 request_timeout_seconds,
                 ..
             } => {
-                if model.is_empty()
-                    || base_url.is_empty()
-                    || api_key_env.is_empty()
+                if model.trim().is_empty()
+                    || base_url.trim().is_empty()
+                    || api_key_env.trim().is_empty()
+                    || *output_budget_tokens == 0
                     || supported_reasoning.is_empty()
-                    || *physical_context_window
-                        <= output_budget_tokens.saturating_add(*safety_margin_tokens)
+                    || output_budget_tokens
+                        .checked_add(*safety_margin_tokens)
+                        .is_none_or(|reserved| *physical_context_window <= reserved)
                     || request_timeout_seconds.is_some_and(|seconds| seconds == 0)
+                    || openai::endpoint(base_url).is_err()
                 {
                     return Err(ModelConfigError::InvalidConfiguration);
                 }
@@ -59,8 +65,10 @@ pub(crate) enum ModelConfigError {
     InvalidConfiguration,
     #[error("model is not configured")]
     NotFound,
-    #[error("OpenAI Responses models are not implemented in this phase")]
-    NotImplemented,
+    #[error("model API key environment variable is missing or empty")]
+    MissingApiKey,
+    #[error("model HTTP client could not be constructed")]
+    ClientBuild,
     #[error("model reference is invalid")]
     InvalidReference,
 }
@@ -94,15 +102,55 @@ impl Models {
     pub(crate) async fn from_config(
         config: &BTreeMap<String, ModelConfig>,
     ) -> Result<Self, ModelConfigError> {
-        for value in config.values() {
+        Self::from_config_with_env(config, |name| std::env::var(name).ok())
+    }
+
+    fn from_config_with_env(
+        config: &BTreeMap<String, ModelConfig>,
+        mut read_env: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, ModelConfigError> {
+        let mut values = BTreeMap::new();
+        for (id, value) in config {
             value.validate()?;
+            let model: Arc<dyn Model> = match value {
+                ModelConfig::OpenAiResponses {
+                    model,
+                    base_url,
+                    api_key_env,
+                    physical_context_window,
+                    output_budget_tokens,
+                    safety_margin_tokens,
+                    supported_reasoning,
+                    supports_tools,
+                    request_timeout_seconds,
+                } => {
+                    let api_key = read_env(api_key_env)
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or(ModelConfigError::MissingApiKey)?;
+                    let reserved = output_budget_tokens
+                        .checked_add(*safety_margin_tokens)
+                        .ok_or(ModelConfigError::InvalidConfiguration)?;
+                    let settings = openai::OpenAiResponsesSettings {
+                        model_ref: Self::model_ref(id)?,
+                        provider_model: model.clone(),
+                        endpoint: openai::endpoint(base_url)?,
+                        api_key,
+                        effective_context_window: u64::from(
+                            physical_context_window
+                                .checked_sub(reserved)
+                                .ok_or(ModelConfigError::InvalidConfiguration)?,
+                        ),
+                        output_budget_tokens: *output_budget_tokens,
+                        supported_reasoning: supported_reasoning.clone(),
+                        supports_tools: *supports_tools,
+                        request_timeout: request_timeout_seconds.map(Duration::from_secs),
+                    };
+                    Arc::new(openai::OpenAiResponsesModel::new(settings)?)
+                }
+            };
+            values.insert(id.clone(), model);
         }
-        if !config.is_empty() {
-            return Err(ModelConfigError::NotImplemented);
-        }
-        Ok(Self {
-            values: BTreeMap::new(),
-        })
+        Ok(Self { values })
     }
 
     #[cfg(test)]
@@ -139,5 +187,106 @@ impl Models {
 
     pub(crate) fn model_ref(id: &str) -> Result<ModelRef, ModelConfigError> {
         id.parse().map_err(|_| ModelConfigError::InvalidReference)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(base_url: &str, output_budget_tokens: u32) -> ModelConfig {
+        ModelConfig::OpenAiResponses {
+            model: "provider-model".to_owned(),
+            base_url: base_url.to_owned(),
+            api_key_env: "TEST_OPENAI_API_KEY".to_owned(),
+            physical_context_window: 10_000,
+            output_budget_tokens,
+            safety_margin_tokens: 1_000,
+            supported_reasoning: BTreeSet::from([ReasoningPreference::Auto]),
+            supports_tools: true,
+            request_timeout_seconds: Some(30),
+        }
+    }
+
+    #[test]
+    fn config_rejects_unsafe_base_urls_and_zero_output_budget() {
+        for base_url in [
+            "ftp://example.invalid/v1",
+            "https://user:pass@example.invalid/v1",
+            "https://example.invalid/v1?secret=value",
+            "https://example.invalid/v1#fragment",
+        ] {
+            assert_eq!(
+                config(base_url, 1_000).validate(),
+                Err(ModelConfigError::InvalidConfiguration)
+            );
+        }
+        assert_eq!(
+            config("https://example.invalid/v1", 0).validate(),
+            Err(ModelConfigError::InvalidConfiguration)
+        );
+        assert_eq!(
+            openai::endpoint("https://example.invalid/v1/")
+                .unwrap()
+                .as_str(),
+            "https://example.invalid/v1/responses"
+        );
+
+        let mut reserved_equals_physical = config("https://example.invalid/v1", 9_000);
+        assert_eq!(
+            reserved_equals_physical.validate(),
+            Err(ModelConfigError::InvalidConfiguration)
+        );
+        let ModelConfig::OpenAiResponses {
+            output_budget_tokens,
+            request_timeout_seconds,
+            ..
+        } = &mut reserved_equals_physical;
+        *output_budget_tokens = 1_000;
+        *request_timeout_seconds = Some(0);
+        assert_eq!(
+            reserved_equals_physical.validate(),
+            Err(ModelConfigError::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn models_require_a_nonempty_key_and_build_exact_descriptors() {
+        let values = BTreeMap::from([(
+            "profile-model".to_owned(),
+            ModelConfig::OpenAiResponses {
+                model: "provider-model".to_owned(),
+                base_url: "https://example.invalid/v1/".to_owned(),
+                api_key_env: "TEST_OPENAI_API_KEY".to_owned(),
+                physical_context_window: 20_000,
+                output_budget_tokens: 3_000,
+                safety_margin_tokens: 2_000,
+                supported_reasoning: BTreeSet::from([
+                    ReasoningPreference::Auto,
+                    ReasoningPreference::High,
+                ]),
+                supports_tools: false,
+                request_timeout_seconds: Some(30),
+            },
+        )]);
+        assert!(matches!(
+            Models::from_config_with_env(&values, |_| None),
+            Err(ModelConfigError::MissingApiKey)
+        ));
+        assert!(matches!(
+            Models::from_config_with_env(&values, |_| Some("  ".to_owned())),
+            Err(ModelConfigError::MissingApiKey)
+        ));
+
+        let models =
+            Models::from_config_with_env(&values, |_| Some("test-key".to_owned())).unwrap();
+        let descriptor = models.get("profile-model").unwrap().descriptor().clone();
+        assert_eq!(descriptor.model_ref.as_str(), "profile-model");
+        assert_eq!(descriptor.context_window, 15_000);
+        assert!(!descriptor.supports_tools);
+        assert_eq!(
+            descriptor.supported_reasoning,
+            BTreeSet::from([ReasoningPreference::Auto, ReasoningPreference::High])
+        );
     }
 }

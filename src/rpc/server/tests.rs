@@ -1044,7 +1044,7 @@ async fn params_methods_ids_and_domain_errors_are_stable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unavailable_provider_phase_maps_to_provider_error() {
+async fn unavailable_model_backed_compaction_maps_to_provider_error() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-rpc-provider-{}",
         SessionId::new().unwrap()
