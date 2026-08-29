@@ -315,13 +315,19 @@ task is spawned. It accepts arbitrary chunks, CR/LF/CRLF, comments, and multi-li
 UTF-8/control validated and split on UTF-8 boundaries into MiniCore's 64 KiB
 event limit. Tool calls support split arguments, done-only items, and multiple
 calls with exactly one start/end. Provider call IDs must satisfy Runtime's
-printable ASCII grammar and the OpenAI boundary of 1..=64 bytes before any Tool
-event is queued. Only `response.completed` or `response.incomplete` can produce
-Usage/Finish; early EOF never synthesizes success. Usage is accepted only when
-detail totals are present, cache and reasoning subsets do not exceed their
-totals, all additions fit, and a reported provider total exactly equals input
-plus output. Valid usage separates direct input/output from cache-read,
-cache-write, and reasoning tokens; the Agent does not compute prices or costs.
+printable ASCII grammar and the OpenAI boundary of 1..=64 bytes before any
+stream Tool event is queued or any assistant ToolCall/Tool-result history is
+sent; invalid replay is a permanent `NotStarted` request error and performs no
+HTTP request. Only `response.completed` with status `completed` or
+`response.incomplete` with status `incomplete` can produce Finish; missing or
+conflicting statuses are malformed. Usage is optional and absent usage produces
+no Usage event. When present, totals and both detail objects are required, as are
+cached and reasoning counts; cache-write remains optional. Cache and reasoning
+subsets may not exceed their totals, all additions must fit, and provider total
+must exactly equal input plus output. Unknown provider fields remain tolerated.
+Valid usage separates direct input/output from cache-read, cache-write, and
+reasoning tokens; the Agent does not compute prices or costs. Early EOF never
+synthesizes success.
 
 Delivery mapping is conservative: local build/preflight/context failures are
 permanent `NotStarted`; connect failures and non-quota HTTP 429 are the only
@@ -333,9 +339,12 @@ stream errors are therefore `Started`. Without such evidence they are `Unknown`.
 `[DONE]` is not provider event evidence and is never a successful terminal.
 HTTP 429 quota, billing, credit, usage, and bounded organization/project/spend
 limit codes are permanent `QuotaExceeded`; other 429 responses are retryable
-`RateLimited`. Retry delay prefers a valid positive `retry-after-ms`, then a
-positive floating-point `Retry-After` in seconds, then a future HTTP date. HTTP
-error bodies are capped at 64 KiB and only machine-readable code/type fields are
+`RateLimited`. At header receipt, retry delay becomes an absolute monotonic
+target for valid positive `retry-after-ms` or floating-point `Retry-After`, or an
+absolute wall-clock target for an HTTP date. After the bounded error body is
+read, only the remaining positive delay is returned; expired targets and clock
+anomalies produce no provider delay. HTTP error bodies are capped at 64 KiB and
+only machine-readable code/type fields are
 inspected privately. API keys, base URLs, raw bodies, and provider messages
 never enter diagnostics, Debug output, RPC, events, transcripts, or stderr.
 Redirects are disabled and default tests use only test-owned loopback servers.

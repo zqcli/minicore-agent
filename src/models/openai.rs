@@ -146,7 +146,14 @@ impl OpenAiResponsesModel {
         };
 
         if !response.status().is_success() {
-            return Err(classify_http_error(response, cancellation, deadline).await);
+            return Err(classify_http_error(
+                response,
+                cancellation,
+                deadline,
+                Instant::now(),
+                SystemTime::now(),
+            )
+            .await);
         }
         let is_sse = response
             .headers()
@@ -260,15 +267,9 @@ impl<'a> ResponsesRequest<'a> {
                                 // provider item identity needed for safe Responses replay.
                             }
                             AssistantPart::ToolCall(call) => {
-                                let arguments = serde_json::to_string(call.arguments())
-                                    .map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
-                                input.push(InputItem::FunctionCall(FunctionCallInput {
-                                    item_type: "function_call",
-                                    call_id: call.tool_call_id().to_string(),
-                                    name: call.name().as_str().to_owned(),
-                                    arguments,
-                                    status: "completed",
-                                }));
+                                input.push(InputItem::FunctionCall(
+                                    FunctionCallInput::from_runtime(call)?,
+                                ));
                             }
                         }
                     }
@@ -277,12 +278,9 @@ impl<'a> ResponsesRequest<'a> {
                     tool_call_id,
                     output,
                     ..
-                } => input.push(InputItem::FunctionCallOutput(FunctionCallOutputInput {
-                    item_type: "function_call_output",
-                    call_id: tool_call_id.to_string(),
-                    output: output.content().as_str().to_owned(),
-                    status: "completed",
-                })),
+                } => input.push(InputItem::FunctionCallOutput(
+                    FunctionCallOutputInput::from_runtime(tool_call_id, output)?,
+                )),
             }
         }
         let tools = request
@@ -366,6 +364,21 @@ struct FunctionCallInput {
     status: &'static str,
 }
 
+impl FunctionCallInput {
+    fn from_runtime(call: &minicore_runtime::model::ToolCall) -> Result<Self, ModelError> {
+        let call_id = openai_request_call_id(call.tool_call_id())?;
+        let arguments = serde_json::to_string(call.arguments())
+            .map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
+        Ok(Self {
+            item_type: "function_call",
+            call_id,
+            name: call.name().as_str().to_owned(),
+            arguments,
+            status: "completed",
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct FunctionCallOutputInput {
     #[serde(rename = "type")]
@@ -373,6 +386,20 @@ struct FunctionCallOutputInput {
     call_id: String,
     output: String,
     status: &'static str,
+}
+
+impl FunctionCallOutputInput {
+    fn from_runtime(
+        tool_call_id: &ToolCallId,
+        output: &minicore_runtime::tools::ToolOutput,
+    ) -> Result<Self, ModelError> {
+        Ok(Self {
+            item_type: "function_call_output",
+            call_id: openai_request_call_id(tool_call_id)?,
+            output: output.content().as_str().to_owned(),
+            status: "completed",
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -409,9 +436,11 @@ async fn classify_http_error(
     response: reqwest::Response,
     cancellation: tokio_util::sync::CancellationToken,
     deadline: TokioInstant,
+    received_monotonic: Instant,
+    received_system: SystemTime,
 ) -> ModelError {
     let status = response.status();
-    let retry_after = retry_after(response.headers(), SystemTime::now());
+    let retry_target = retry_target(response.headers(), received_monotonic, received_system);
     let body = match collect_error_body(response, cancellation, deadline).await {
         Ok(body) => body,
         Err(error) => return error,
@@ -440,7 +469,10 @@ async fn classify_http_error(
         408 => unknown_error(ModelErrorKind::Timeout),
         413 => local_error(ModelErrorKind::ContextOverflow),
         429 if quota_exceeded => local_error(ModelErrorKind::QuotaExceeded),
-        429 => retryable_error(ModelErrorKind::RateLimited, retry_after),
+        429 => retryable_error(
+            ModelErrorKind::RateLimited,
+            retry_target.and_then(|target| target.remaining(Instant::now(), SystemTime::now())),
+        ),
         500..=599 => unknown_error(ModelErrorKind::ProviderUnavailable),
         400..=499 => local_error(ModelErrorKind::InvalidRequest),
         _ => unknown_error(ModelErrorKind::ProviderUnavailable),
@@ -480,19 +512,64 @@ fn is_quota_code(value: &str) -> bool {
     )
 }
 
-fn retry_after(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<Duration> {
+#[derive(Clone, Copy)]
+enum RetryTarget {
+    Monotonic {
+        received_at: Instant,
+        retry_at: Instant,
+    },
+    System {
+        received_at: SystemTime,
+        retry_at: SystemTime,
+    },
+}
+
+impl RetryTarget {
+    fn remaining(self, current_monotonic: Instant, current_system: SystemTime) -> Option<Duration> {
+        let remaining = match self {
+            Self::Monotonic {
+                received_at,
+                retry_at,
+            } => {
+                current_monotonic.checked_duration_since(received_at)?;
+                retry_at.checked_duration_since(current_monotonic)?
+            }
+            Self::System {
+                received_at,
+                retry_at,
+            } => {
+                current_system.duration_since(received_at).ok()?;
+                retry_at.duration_since(current_system).ok()?
+            }
+        };
+        (!remaining.is_zero()).then_some(remaining)
+    }
+}
+
+fn retry_target(
+    headers: &reqwest::header::HeaderMap,
+    received_monotonic: Instant,
+    received_system: SystemTime,
+) -> Option<RetryTarget> {
+    let monotonic_target = |duration: Duration| {
+        Some(RetryTarget::Monotonic {
+            received_at: received_monotonic,
+            retry_at: received_monotonic.checked_add(duration)?,
+        })
+    };
     headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| positive_duration(value, 1_000.0))
+        .and_then(monotonic_target)
         .or_else(|| {
             let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
-            positive_duration(value, 1.0).or_else(|| {
-                httpdate::parse_http_date(value)
-                    .ok()?
-                    .duration_since(now)
-                    .ok()
-                    .filter(|duration| !duration.is_zero())
+            if let Some(duration) = positive_duration(value, 1.0) {
+                return monotonic_target(duration);
+            }
+            Some(RetryTarget::System {
+                received_at: received_system,
+                retry_at: httpdate::parse_http_date(value).ok()?,
             })
         })
 }
@@ -827,11 +904,11 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         }
         "response.completed" => {
             let event: TerminalEvent = from_value(value)?;
-            finish_response(state, event.response, false)?;
+            finish_response(state, event.response, TerminalKind::Completed)?;
         }
         "response.incomplete" => {
             let event: TerminalEvent = from_value(value)?;
-            finish_response(state, event.response, true)?;
+            finish_response(state, event.response, TerminalKind::Incomplete)?;
         }
         "response.failed" | "error" => {
             state.terminal_seen = true;
@@ -886,42 +963,34 @@ struct TerminalEvent {
     response: ProviderResponse,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct ProviderResponse {
-    #[serde(default)]
-    status: Option<String>,
+    status: String,
     #[serde(default)]
     usage: Option<ProviderUsage>,
     #[serde(default)]
     incomplete_details: Option<IncompleteDetails>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct ProviderUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-    #[serde(default)]
-    input_tokens_details: Option<InputTokenDetails>,
-    #[serde(default)]
-    output_tokens_details: Option<OutputTokenDetails>,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    input_tokens_details: InputTokenDetails,
+    output_tokens_details: OutputTokenDetails,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct InputTokenDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
+    cached_tokens: u64,
     #[serde(default)]
     cache_write_tokens: Option<u64>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct OutputTokenDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
+    reasoning_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -1086,10 +1155,21 @@ fn finish_tool_item(
 }
 
 fn openai_tool_call_id(value: &str) -> Result<ToolCallId, ()> {
+    validate_openai_call_id(value)?;
+    ToolCallId::new(value).map_err(|_| ())
+}
+
+fn openai_request_call_id(value: &ToolCallId) -> Result<String, ModelError> {
+    validate_openai_call_id(value.as_str())
+        .map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
+    Ok(value.to_string())
+}
+
+fn validate_openai_call_id(value: &str) -> Result<(), ()> {
     if value.is_empty() || value.len() > MAX_OPENAI_CALL_ID_BYTES {
         return Err(());
     }
-    ToolCallId::new(value).map_err(|_| ())
+    ToolCallId::new(value).map(|_| ()).map_err(|_| ())
 }
 
 fn end_tool_once(state: &mut StreamState, output_index: u32) -> Result<(), ()> {
@@ -1106,18 +1186,33 @@ fn end_tool_once(state: &mut StreamState, output_index: u32) -> Result<(), ()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum TerminalKind {
+    Completed,
+    Incomplete,
+}
+
 fn finish_response(
     state: &mut StreamState,
     response: ProviderResponse,
-    incomplete: bool,
+    kind: TerminalKind,
 ) -> Result<(), ()> {
     if state.terminal_seen || state.tools.values().any(|tool| !tool.ended) {
         return Err(());
     }
-    let usage = provider_usage(response.usage.unwrap_or_default())?;
+    let expected_status = match kind {
+        TerminalKind::Completed => "completed",
+        TerminalKind::Incomplete => "incomplete",
+    };
+    if response.status != expected_status {
+        return Err(());
+    }
+    let usage = response.usage.map(provider_usage).transpose()?;
     state.terminal_seen = true;
-    state.queue(ModelEvent::Usage { usage });
-    let reason = if incomplete {
+    if let Some(usage) = usage {
+        state.queue(ModelEvent::Usage { usage });
+    }
+    let reason = if matches!(kind, TerminalKind::Incomplete) {
         match response
             .incomplete_details
             .and_then(|details| details.reason)
@@ -1133,8 +1228,6 @@ fn finish_response(
         ModelFinishReason::Refused
     } else if !state.tools.is_empty() {
         ModelFinishReason::ToolCalls
-    } else if response.status.as_deref() == Some("incomplete") {
-        ModelFinishReason::Unknown
     } else {
         ModelFinishReason::Stop
     };
@@ -1144,47 +1237,28 @@ fn finish_response(
 }
 
 fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
-    if usage.input_tokens_details.is_some() && usage.input_tokens.is_none()
-        || usage.output_tokens_details.is_some() && usage.output_tokens.is_none()
-        || usage.total_tokens.is_some()
-            && (usage.input_tokens.is_none() || usage.output_tokens.is_none())
-    {
-        return Err(());
-    }
-    let cached = usage
-        .input_tokens_details
-        .as_ref()
-        .and_then(|details| details.cached_tokens);
-    let cache_write = usage
-        .input_tokens_details
-        .as_ref()
-        .and_then(|details| details.cache_write_tokens);
-    let cached_and_written = cached
-        .unwrap_or(0)
-        .checked_add(cache_write.unwrap_or(0))
-        .ok_or(())?;
-    let reasoning = usage
-        .output_tokens_details
-        .as_ref()
-        .and_then(|details| details.reasoning_tokens);
+    let cached = usage.input_tokens_details.cached_tokens;
+    let cache_write = usage.input_tokens_details.cache_write_tokens;
+    let cached_and_written = cached.checked_add(cache_write.unwrap_or(0)).ok_or(())?;
+    let reasoning = usage.output_tokens_details.reasoning_tokens;
     let input = usage
         .input_tokens
-        .map(|total| total.checked_sub(cached_and_written).ok_or(()))
-        .transpose()?;
-    let output = usage
-        .output_tokens
-        .map(|total| total.checked_sub(reasoning.unwrap_or(0)).ok_or(()))
-        .transpose()?;
-    if let (Some(input_total), Some(output_total)) = (usage.input_tokens, usage.output_tokens) {
-        let combined = input_total.checked_add(output_total).ok_or(())?;
-        if usage.total_tokens.is_some_and(|total| total != combined) {
-            return Err(());
-        }
+        .checked_sub(cached_and_written)
+        .ok_or(())?;
+    let output = usage.output_tokens.checked_sub(reasoning).ok_or(())?;
+    let combined = usage
+        .input_tokens
+        .checked_add(usage.output_tokens)
+        .ok_or(())?;
+    if usage.total_tokens != combined {
+        return Err(());
     }
-    Ok(Usage::from_optional(input, output, reasoning)
-        .with_cache_read_tokens(cached)
-        .with_cache_write_tokens(cache_write)
-        .with_provider_total_tokens(usage.total_tokens))
+    Ok(
+        Usage::from_optional(Some(input), Some(output), Some(reasoning))
+            .with_cache_read_tokens(Some(cached))
+            .with_cache_write_tokens(cache_write)
+            .with_provider_total_tokens(Some(usage.total_tokens)),
+    )
 }
 
 fn local_error(kind: ModelErrorKind) -> ModelError {
