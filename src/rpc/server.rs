@@ -23,8 +23,8 @@ use super::protocol::{
     PROVIDER_ERROR, ProfilesResult, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BUSY,
     SESSION_CLOSED, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STORE_ERROR, SessionCreateParams,
     SessionParams, SessionResult, SessionTranscriptParams, SessionsResult, TURN_NOT_FOUND,
-    TurnParams, TurnResult, TurnSendParams, WORKSPACE_ERROR, decode_params, parse_request,
-    request_id,
+    TranscriptPageView, TurnParams, TurnResult, TurnSendParams, WORKSPACE_ERROR, decode_params,
+    parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -308,7 +308,8 @@ impl RpcServer {
                         after: params.after,
                         limit: params.limit,
                     })
-                    .await;
+                    .await
+                    .map(TranscriptPageView::from);
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.send" => {

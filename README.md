@@ -57,6 +57,16 @@ messages; it never serializes an error source, raw provider response, Tool
 arguments, API key, or panic payload. Session-state and Turn-outcome diagnostics
 likewise expose only code, category, and retryability, not diagnostic text.
 
+`session.transcript` never serializes Runtime's `TranscriptPage` or
+`ConversationEntry` types directly. An RPC-owned projection preserves entry
+order, sequence numbers, canonical timestamps, paging fields, user text and safe
+execution settings, assistant model/text/reasoning/usage/finish reason, Tool
+results including durable content, summaries, and terminal outcomes. Assistant
+Tool calls expose only `tool_call_id`, name, and `call_index`; their `arguments`
+field and value do not exist in the wire view. Failed terminal diagnostics use
+the same safe code/category/retryability projection and omit diagnostic message
+text.
+
 Frames are read incrementally with a 1 MiB limit. Oversize, stdin EOF, Ctrl-C,
 explicit `agent.shutdown`, and writer failure all enter the same explicit Agent
 shutdown path. Shutdown waits for the Agent durability barrier, joins every
