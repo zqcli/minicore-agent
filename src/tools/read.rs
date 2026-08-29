@@ -10,6 +10,7 @@ use minicore_runtime::value::MAX_TEXT_BYTES;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::workspace::ReadPrefix;
 use crate::{Workspace, WorkspaceError};
 
 use super::{
@@ -114,7 +115,11 @@ async fn list_directory(directory: PathBuf) -> Result<String, ToolError> {
     let mut count = 0usize;
     while let Some(entry) = reader.next_entry().await.map_err(|_| ToolError::Failed)? {
         count = count.saturating_add(1);
-        let mut name = safe_entry_name(entry.file_name().to_string_lossy().as_ref());
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ToolError::Failed)?;
+        let mut name = safe_entry_name(&name);
         let file_type = entry.file_type().await.map_err(|_| ToolError::Failed)?;
         if file_type.is_dir() {
             name.push('/');
@@ -157,12 +162,12 @@ fn safe_entry_name(name: &str) -> String {
 }
 
 async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, ToolError> {
-    let (bytes, byte_truncated) = workspace
+    let prefix = workspace
         .read_prefix(&input.path, MAX_READ_BYTES)
         .await
         .map_err(map_workspace_error)?;
-    let text = decode_text_prefix(bytes, byte_truncated)?;
-    let text = text.replace("\r\n", "\n");
+    let byte_truncated = prefix.has_more;
+    let text = decode_text_prefix(prefix)?;
     if text
         .chars()
         .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
@@ -170,7 +175,11 @@ async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, T
         return Err(ToolError::Failed);
     }
     if text.is_empty() {
-        return Ok("[empty file]".to_owned());
+        let mut output = "[empty file]".to_owned();
+        if byte_truncated {
+            append_truncated(&mut output);
+        }
+        return Ok(output);
     }
 
     let mut lines = text.lines().enumerate().skip(input.offset - 1);
@@ -199,19 +208,50 @@ async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, T
     Ok(output)
 }
 
-fn decode_text_prefix(mut bytes: Vec<u8>, truncated: bool) -> Result<String, ToolError> {
-    if bytes.contains(&0) {
-        return Err(ToolError::Failed);
-    }
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(text),
-        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
-            let valid_up_to = error.utf8_error().valid_up_to();
-            bytes = error.into_bytes();
-            bytes.truncate(valid_up_to);
-            String::from_utf8(bytes).map_err(|_| ToolError::Failed)
+fn decode_text_prefix(prefix: ReadPrefix) -> Result<String, ToolError> {
+    let visible = &prefix.bytes[..prefix.visible_len];
+    let visible_end = match std::str::from_utf8(visible) {
+        Ok(_) => prefix.visible_len,
+        Err(error) if error.error_len().is_none() => {
+            let start = error.valid_up_to();
+            let width = prefix
+                .bytes
+                .get(start)
+                .copied()
+                .and_then(utf8_sequence_width)
+                .ok_or(ToolError::Failed)?;
+            let end = start.checked_add(width).ok_or(ToolError::Failed)?;
+            if end > prefix.bytes.len()
+                || end <= prefix.visible_len
+                || std::str::from_utf8(&prefix.bytes[start..end]).is_err()
+            {
+                return Err(ToolError::Failed);
+            }
+            start
         }
-        Err(_) => Err(ToolError::Failed),
+        Err(_) => return Err(ToolError::Failed),
+    };
+
+    for index in 0..visible_end {
+        if prefix.bytes[index] == b'\r' && prefix.bytes.get(index + 1) != Some(&b'\n') {
+            return Err(ToolError::Failed);
+        }
+    }
+    let mut text = std::str::from_utf8(&prefix.bytes[..visible_end])
+        .map_err(|_| ToolError::Failed)?
+        .replace("\r\n", "\n");
+    if text.ends_with('\r') {
+        text.pop();
+    }
+    Ok(text)
+}
+
+fn utf8_sequence_width(first: u8) -> Option<usize> {
+    match first {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
     }
 }
 
@@ -423,6 +463,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn byte_cap_lookahead_validates_utf8_crlf_and_true_eof() {
+        let (base, _, tool) = fixture("lookahead").await;
+        let root = base.join("root");
+
+        for (name, character) in [("two", "¢"), ("three", "€"), ("four", "😀")] {
+            let encoded = character.as_bytes();
+            let mut content = vec![b'a'; MAX_READ_BYTES - (encoded.len() - 1)];
+            content.extend_from_slice(encoded);
+            tokio::fs::write(root.join(name), content).await.unwrap();
+            let output = execute(&tool, json!({"path": name})).await.unwrap();
+            assert!(output.ends_with(TRUNCATED));
+            assert!(!output.contains('�'));
+        }
+
+        let mut invalid = vec![b'a'; MAX_READ_BYTES - 1];
+        invalid.extend_from_slice(&[0xe2, b'X']);
+        tokio::fs::write(root.join("invalid-continuation"), invalid)
+            .await
+            .unwrap();
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "invalid-continuation"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+
+        let mut crlf = vec![b'a'; MAX_READ_BYTES - 1];
+        crlf.extend_from_slice(b"\r\nmore");
+        tokio::fs::write(root.join("crlf-split"), crlf)
+            .await
+            .unwrap();
+        let output = execute(&tool, json!({"path": "crlf-split"})).await.unwrap();
+        assert!(output.ends_with(TRUNCATED));
+        assert!(!output.contains('\r'));
+
+        tokio::fs::write(root.join("eof-incomplete"), b"text\xe2\x82")
+            .await
+            .unwrap();
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "eof-incomplete"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+
+        tokio::fs::write(root.join("bare-cr"), b"before\rafter")
+            .await
+            .unwrap();
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "bare-cr"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        cleanup(&base).await;
+    }
+
+    #[test]
+    fn decoder_excludes_lookahead_and_strips_split_crlf() {
+        for (bytes, visible_len, expected) in [
+            (b"aaa\xc2\xa2".as_slice(), 4, "aaa"),
+            (b"aa\xe2\x82\xac".as_slice(), 4, "aa"),
+            (b"a\xf0\x9f\x98\x80".as_slice(), 4, "a"),
+            (b"abc\r\n".as_slice(), 4, "abc"),
+        ] {
+            assert_eq!(
+                decode_text_prefix(ReadPrefix {
+                    bytes: bytes.to_vec(),
+                    visible_len,
+                    has_more: true,
+                })
+                .unwrap(),
+                expected
+            );
+        }
+        for bytes in [b"abc\xe2X".as_slice(), b"abc\xe2".as_slice()] {
+            assert_eq!(
+                decode_text_prefix(ReadPrefix {
+                    bytes: bytes.to_vec(),
+                    visible_len: 4,
+                    has_more: bytes.len() > 4,
+                }),
+                Err(ToolError::Failed)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn binary_nul_and_invalid_utf8_fail_without_output_bytes() {
         let (base, _, tool) = fixture("binary").await;
         let root = base.join("root");
@@ -432,10 +575,24 @@ mod tests {
         tokio::fs::write(root.join("invalid"), [0xff, 0xfe])
             .await
             .unwrap();
+        tokio::fs::write(root.join("escape-control"), b"text\x1bmore")
+            .await
+            .unwrap();
 
         assert_eq!(
             tool.execute(
                 invocation(json!({"path": "nul"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "escape-control"})),
                 context(
                     CancellationToken::new(),
                     Instant::now() + Duration::from_secs(5)
@@ -536,6 +693,36 @@ mod tests {
         assert_eq!(
             execute(&tool, json!({"path": "listing"})).await.unwrap(),
             "link"
+        );
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_listing_rejects_non_utf8_names_without_lossy_merging() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let (base, _, tool) = fixture("directory-non-utf8").await;
+        let root = base.join("root/non-utf8");
+        tokio::fs::create_dir(&root).await.unwrap();
+        for name in [
+            OsString::from_vec(vec![b'n', 0xff]),
+            OsString::from_vec(vec![b'n', 0xfe]),
+            OsString::from("n�"),
+        ] {
+            tokio::fs::write(root.join(name), b"").await.unwrap();
+        }
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "non-utf8"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
         );
         cleanup(&base).await;
     }
