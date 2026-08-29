@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use minicore_runtime::model::ReasoningPreference;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     Auto,
