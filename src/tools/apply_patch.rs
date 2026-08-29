@@ -544,10 +544,15 @@ fn mark_no_newline(content: &mut PatchContent<'_>) -> Result<(), ToolError> {
 }
 
 fn parse_hunk_header(header: &str) -> Result<(HunkRange, HunkRange), ToolError> {
-    let ranges = header
+    let header = header
         .strip_prefix("@@ ")
-        .and_then(|header| header.strip_suffix(" @@"))
         .ok_or(ToolError::InvalidInvocation)?;
+    let closing = header.find(" @@").ok_or(ToolError::InvalidInvocation)?;
+    let ranges = &header[..closing];
+    let suffix = &header[closing + 3..];
+    if suffix.contains('\0') || (!suffix.is_empty() && !suffix.starts_with(' ')) {
+        return Err(ToolError::InvalidInvocation);
+    }
     let (old, new) = ranges.split_once(' ').ok_or(ToolError::InvalidInvocation)?;
     if old.contains(' ') || new.contains(' ') {
         return Err(ToolError::InvalidInvocation);
@@ -871,6 +876,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn headerless_and_standard_hunks_accept_section_headings() {
+        let (base, _, tool) = fixture("section-headings").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("headerless.txt"), "old\n")
+            .await
+            .unwrap();
+        let headerless = "@@ -1 +1 @@ fn execute() @@ nested\n-old\n+new\n";
+        execute(
+            &tool,
+            json!({"path": "headerless.txt", "patch": headerless}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("headerless.txt"))
+                .await
+                .unwrap(),
+            "new\n"
+        );
+
+        tokio::fs::write(root.join("standard.txt"), "old\n")
+            .await
+            .unwrap();
+        let standard =
+            "--- a/standard.txt\n+++ b/standard.txt\n@@ -1 +1 @@   fn execute()\n-old\n+new\n";
+        execute(&tool, json!({"path": "standard.txt", "patch": standard}))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("standard.txt"))
+                .await
+                .unwrap(),
+            "new\n"
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
     async fn context_failure_and_partial_second_hunk_leave_the_source_unchanged() {
         let (base, _, tool) = fixture("hunk-failure").await;
         let root = base.join("root");
@@ -945,7 +988,11 @@ mod tests {
         let invalid = [
             "@@ -0 +1 @@\n-tail\n+TAIL\n",
             "@@ -1,2 +1 @@\n-tail\n+TAIL\n",
-            "@@ -1 +1 @@ function\n-tail\n+TAIL\n",
+            "@@ -1 +1\n-tail\n+TAIL\n",
+            "@@@ -1 +1 @@\n-tail\n+TAIL\n",
+            "@@ -x +1 @@ fn execute()\n-tail\n+TAIL\n",
+            "@@ -1 +1 @@fn execute()\n-tail\n+TAIL\n",
+            "@@ -1 +1 @@@\n-tail\n+TAIL\n",
             "@@ -1,0 +1,0 @@\n",
             "@@ -184467440737095516160,0 +1,0 @@\n+x\n",
             "@@ -2 +2 @@\n-b\n+B\n@@ -1 +1 @@\n-a\n+A\n",
