@@ -16,6 +16,28 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 static BEFORE_RENAME_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static DIRECTORY_SYNC_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEMP_ID_OVERRIDES: OnceLock<Mutex<Vec<(PathBuf, u64)>>> = OnceLock::new();
+#[cfg(test)]
+static BEFORE_RENAME_GATES: OnceLock<Mutex<Vec<Arc<BeforeRenameGate>>>> = OnceLock::new();
+
+#[cfg(test)]
+struct BeforeRenameGate {
+    target: PathBuf,
+    started: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl BeforeRenameGate {
+    fn new(target: PathBuf) -> Self {
+        Self {
+            target,
+            started: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Workspace {
@@ -308,6 +330,11 @@ async fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), WorkspaceError>
     }
     drop(file);
     #[cfg(test)]
+    if let Some(gate) = take_before_rename_gate(target) {
+        gate.started.add_permits(1);
+        gate.release.acquire().await.unwrap().forget();
+    }
+    #[cfg(test)]
     if should_fail_before_rename(target) {
         let _ = fs::remove_file(&temp_path).await;
         return Err(WorkspaceError::Unavailable);
@@ -328,6 +355,9 @@ async fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), WorkspaceError>
 async fn create_unique_temp(target: &Path) -> Result<(PathBuf, File), WorkspaceError> {
     for _ in 0..128 {
         let temp_path = unique_temp_path(target);
+        if temp_path_aliases_target(&temp_path, target) {
+            continue;
+        }
         match fs::symlink_metadata(&temp_path).await {
             Ok(_) => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -347,12 +377,44 @@ async fn create_unique_temp(target: &Path) -> Result<(PathBuf, File), WorkspaceE
     Err(WorkspaceError::Unavailable)
 }
 
+fn temp_path_aliases_target(candidate: &Path, target: &Path) -> bool {
+    let (Some(candidate), Some(target)) = (candidate.file_name(), target.file_name()) else {
+        return false;
+    };
+    candidate == target
+        || candidate
+            .to_str()
+            .zip(target.to_str())
+            .is_some_and(|(candidate, target)| candidate.eq_ignore_ascii_case(target))
+}
+
 fn unique_temp_path(target: &Path) -> PathBuf {
-    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let id = next_temp_id(target);
     target
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(".minicore-write-{}-{id}.tmp", std::process::id()))
+        .join(temp_basename(id))
+}
+
+fn temp_basename(id: u64) -> String {
+    format!(".minicore-write-{}-{id}.tmp", std::process::id())
+}
+
+fn next_temp_id(_target: &Path) -> u64 {
+    #[cfg(test)]
+    {
+        let mut overrides = TEMP_ID_OVERRIDES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap();
+        if let Some(position) = overrides
+            .iter()
+            .position(|(candidate, _)| candidate == _target)
+        {
+            return overrides.remove(position).1;
+        }
+    }
+    NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 async fn sync_directory(path: &Path) -> io::Result<()> {
@@ -433,6 +495,36 @@ fn should_fail_directory_sync(path: &Path) -> bool {
         .position(|candidate| candidate == path)
         .map(|position| failures.remove(position))
         .is_some()
+}
+
+#[cfg(test)]
+fn override_temp_ids(target: PathBuf, ids: impl IntoIterator<Item = u64>) {
+    TEMP_ID_OVERRIDES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .extend(ids.into_iter().map(|id| (target.clone(), id)));
+}
+
+#[cfg(test)]
+fn block_before_rename(gate: Arc<BeforeRenameGate>) {
+    BEFORE_RENAME_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(gate);
+}
+
+#[cfg(test)]
+fn take_before_rename_gate(target: &Path) -> Option<Arc<BeforeRenameGate>> {
+    let mut gates = BEFORE_RENAME_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|gate| gate.target == target)
+        .map(|position| gates.remove(position))
 }
 
 #[cfg(test)]
@@ -782,6 +874,100 @@ mod tests {
 
         workspace.write_atomic(&name, b"long-name").await.unwrap();
         assert_eq!(workspace.read_bytes(&name, 32).await.unwrap(), b"long-name");
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn temporary_path_skips_exact_target_alias_across_counter_wrap() {
+        let (base, workspace) = fixture("temp-target-alias").await;
+        let root = base.join("root");
+        let target_name = temp_basename(u64::MAX);
+        let target = workspace.resolve_for_write(&target_name).await.unwrap();
+        override_temp_ids(target.clone(), [u64::MAX, 0]);
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+
+        let writer = workspace.clone();
+        let path = target_name.clone();
+        let task = tokio::spawn(async move { writer.write_atomic(&path, b"target").await });
+        gate.started.acquire().await.unwrap().forget();
+        let target_existed_before_rename = fs::symlink_metadata(&target).await.is_ok();
+        let actual_temp = root.join(temp_basename(0));
+        let next_candidate_exists = fs::symlink_metadata(&actual_temp).await.is_ok();
+        gate.release.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        assert!(!target_existed_before_rename);
+        assert!(next_candidate_exists);
+        assert_eq!(fs::read(&target).await.unwrap(), b"target");
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn temporary_path_skips_ascii_case_insensitive_target_alias() {
+        let (base, workspace) = fixture("temp-target-case-alias").await;
+        let root = base.join("root");
+        let target_name = temp_basename(41).to_ascii_uppercase();
+        let target = workspace.resolve_for_write(&target_name).await.unwrap();
+        override_temp_ids(target.clone(), [41, 42]);
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+
+        let writer = workspace.clone();
+        let path = target_name.clone();
+        let task = tokio::spawn(async move { writer.write_atomic(&path, b"case").await });
+        gate.started.acquire().await.unwrap().forget();
+        let aliased_candidate = root.join(temp_basename(41));
+        let alias_candidate_exists = fs::symlink_metadata(&aliased_candidate).await.is_ok();
+        let actual_temp = root.join(temp_basename(42));
+        let next_candidate_exists = fs::symlink_metadata(&actual_temp).await.is_ok();
+        gate.release.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        assert!(!alias_candidate_exists);
+        assert!(next_candidate_exists);
+        assert_eq!(fs::read(&target).await.unwrap(), b"case");
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn temporary_path_skips_real_symlink_after_target_alias() {
+        use std::os::unix::fs::symlink;
+
+        let (base, workspace) = fixture("temp-target-symlink").await;
+        let root = base.join("root");
+        let target_name = temp_basename(51);
+        let target = workspace.resolve_for_write(&target_name).await.unwrap();
+        let outside = base.join("outside.txt");
+        fs::write(&outside, b"outside").await.unwrap();
+        let symlink_candidate = root.join(temp_basename(52));
+        symlink(&outside, &symlink_candidate).unwrap();
+        override_temp_ids(target.clone(), [51, 52, 53]);
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+
+        let writer = workspace.clone();
+        let path = target_name.clone();
+        let task = tokio::spawn(async move { writer.write_atomic(&path, b"inside").await });
+        gate.started.acquire().await.unwrap().forget();
+        let target_existed_before_rename = fs::symlink_metadata(&target).await.is_ok();
+        let actual_temp = root.join(temp_basename(53));
+        let third_candidate_exists = fs::symlink_metadata(&actual_temp).await.is_ok();
+        gate.release.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        assert!(!target_existed_before_rename);
+        assert!(third_candidate_exists);
+        assert!(
+            fs::symlink_metadata(&symlink_candidate)
+                .await
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside).await.unwrap(), b"outside");
+        assert_eq!(fs::read(&target).await.unwrap(), b"inside");
         cleanup(&base).await;
     }
 
