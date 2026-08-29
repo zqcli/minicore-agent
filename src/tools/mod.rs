@@ -18,6 +18,7 @@ use crate::{Workspace, WorkspaceError};
 
 use apply_patch::ApplyPatchTool;
 use bash::BashTool;
+pub(crate) use bash::CommandEnvironment;
 use edit::EditTool;
 use read::ReadTool;
 use write::WriteTool;
@@ -45,6 +46,7 @@ pub(crate) enum BuildToolsError {
 pub(crate) fn build_tools(
     names: &[String],
     workspace: Arc<Workspace>,
+    command_environment: CommandEnvironment,
 ) -> Result<ToolSet, BuildToolsError> {
     let mut builder = ToolSet::builder();
     let mut seen = BTreeSet::new();
@@ -57,7 +59,10 @@ pub(crate) fn build_tools(
                 builder.register(ApplyPatchTool::new(Arc::clone(&workspace)));
             }
             "bash" => {
-                builder.register(BashTool::new(Arc::clone(&workspace)));
+                builder.register(BashTool::new(
+                    Arc::clone(&workspace),
+                    command_environment.clone(),
+                ));
             }
             "edit" => {
                 builder.register(EditTool::new(Arc::clone(&workspace)));
@@ -185,6 +190,7 @@ pub(super) async fn wait_for_test_io(tool_name: &'static str, path: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
     use super::*;
@@ -207,8 +213,9 @@ mod tests {
         let edit = "edit".parse().unwrap();
         let read = "read".parse().unwrap();
         let write = "write".parse().unwrap();
+        let command_environment = CommandEnvironment::new(std::iter::empty::<OsString>());
 
-        let empty = build_tools(&[], Arc::clone(&workspace)).unwrap();
+        let empty = build_tools(&[], Arc::clone(&workspace), command_environment.clone()).unwrap();
         assert!(!empty.contains(&apply_patch));
         assert!(!empty.contains(&bash));
         assert!(!empty.contains(&edit));
@@ -227,7 +234,8 @@ mod tests {
                 .filter(|(index, _)| mask & (1usize << index) != 0)
                 .map(|(_, name)| (*name).to_owned())
                 .collect::<Vec<_>>();
-            let tools = build_tools(&names, Arc::clone(&workspace)).unwrap();
+            let tools =
+                build_tools(&names, Arc::clone(&workspace), command_environment.clone()).unwrap();
             for (index, name) in KNOWN_TOOL_NAMES.iter().enumerate() {
                 let name = name.parse().unwrap();
                 assert_eq!(tools.contains(&name), mask & (1usize << index) != 0);
@@ -235,14 +243,20 @@ mod tests {
         }
 
         assert_eq!(
-            build_tools(&["unknown".to_owned()], Arc::clone(&workspace)).err(),
+            build_tools(
+                &["unknown".to_owned()],
+                Arc::clone(&workspace),
+                command_environment.clone(),
+            )
+            .err(),
             Some(BuildToolsError::InvalidConfiguration)
         );
         for name in KNOWN_TOOL_NAMES {
             assert_eq!(
                 build_tools(
                     &[(*name).to_owned(), (*name).to_owned()],
-                    Arc::clone(&workspace)
+                    Arc::clone(&workspace),
+                    command_environment.clone(),
                 )
                 .err(),
                 Some(BuildToolsError::InvalidConfiguration)

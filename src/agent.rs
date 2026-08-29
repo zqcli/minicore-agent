@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,14 +23,14 @@ use crate::config::AgentConfig;
 use crate::context::ProjectContext;
 use crate::error::{AgentError, StoreError};
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
-use crate::models::{ModelConfigError, Models};
+use crate::models::{ModelConfig, ModelConfigError, Models};
 use crate::policy::Policy;
 use crate::profiles::{Profile, Profiles};
 use crate::sessions::{
     CompletionNotifier, LoadedSession, MetadataWorker, OutboundSequencer, Sessions,
 };
 use crate::store::{SessionRecord, Store};
-use crate::tools::{BuildToolsError, build_tools};
+use crate::tools::{BuildToolsError, CommandEnvironment, build_tools};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -104,6 +105,7 @@ pub struct Agent {
     store: Store,
     profiles: Profiles,
     models: Models,
+    command_environment: CommandEnvironment,
     sessions: Sessions,
     events_tx: mpsc::Sender<AgentEvent>,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -130,6 +132,13 @@ impl Agent {
     }
 
     async fn open_parts(config: AgentConfig, models: Models) -> Result<Self, AgentError> {
+        let command_environment = CommandEnvironment::new(
+            config
+                .models
+                .values()
+                .map(ModelConfig::credential_env_name)
+                .map(OsString::from),
+        );
         let task_runtime = Handle::try_current().map_err(|_| AgentError::Internal)?;
         let kernel = config.kernel_config().map_err(AgentError::Config)?;
         let profiles = config.profiles();
@@ -142,6 +151,7 @@ impl Agent {
             store,
             profiles,
             models,
+            command_environment,
             sessions: Sessions::new(),
             events_tx,
             events_rx: Some(events_rx),
@@ -423,8 +433,12 @@ impl Agent {
             minicore_runtime::CompactionConfig::Disabled,
         )
         .map_err(|_| AgentError::InvalidInput)?;
-        let tools =
-            build_tools(&profile.tools, Arc::clone(&workspace)).map_err(map_build_tools_error)?;
+        let tools = build_tools(
+            &profile.tools,
+            Arc::clone(&workspace),
+            self.command_environment.clone(),
+        )
+        .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if spec.enabled_tools.is_empty() {
             None
         } else {

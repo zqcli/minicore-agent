@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -41,8 +42,35 @@ struct SpawnedCommand {
     stderr: OutputReader,
 }
 
+#[derive(Clone)]
+pub(crate) struct CommandEnvironment {
+    removed: Arc<[OsString]>,
+}
+
+impl CommandEnvironment {
+    pub(crate) fn new(names: impl IntoIterator<Item = OsString>) -> Self {
+        let mut removed = names
+            .into_iter()
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        removed.sort();
+        removed.dedup();
+        Self {
+            removed: removed.into(),
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        for name in self.removed.iter() {
+            command.env_remove(name);
+        }
+        command.env("MINICORE_AGENT", "1");
+    }
+}
+
 pub(super) struct BashTool {
     workspace: Arc<Workspace>,
+    environment: CommandEnvironment,
     spec: ToolSpec,
 }
 
@@ -57,7 +85,7 @@ struct BashInput {
 }
 
 impl BashTool {
-    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
+    pub(super) fn new(workspace: Arc<Workspace>, environment: CommandEnvironment) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("bash is a valid tool name"),
             "Run one bounded shell command in a workspace directory.",
@@ -87,7 +115,11 @@ impl BashTool {
             }),
         )
         .expect("static bash tool specification is valid");
-        Self { workspace, spec }
+        Self {
+            workspace,
+            environment,
+            spec,
+        }
     }
 }
 
@@ -115,7 +147,15 @@ impl Tool for BashTool {
                 .ok_or(ToolError::InvalidInvocation)?;
             let deadline = context.deadline.min(input_deadline);
             let cwd = resolve_cwd(&self.workspace, &input.cwd, &context, deadline).await?;
-            let output = run_command(&input.command, &cwd, &invocation, &context, deadline).await?;
+            let output = run_command(
+                &input.command,
+                &cwd,
+                &invocation,
+                &context,
+                deadline,
+                &self.environment,
+            )
+            .await?;
             let output = ToolOutput::new(output).map_err(|_| ToolError::Internal)?;
             Ok(ToolExecutionOutcome::Completed(output))
         })
@@ -146,6 +186,7 @@ async fn run_command(
     invocation: &ToolInvocation,
     context: &ToolContext,
     deadline: Instant,
+    environment: &CommandEnvironment,
 ) -> Result<String, ToolError> {
     if context.cancellation.is_cancelled() {
         return Err(ToolError::Cancelled);
@@ -154,7 +195,7 @@ async fn run_command(
         return Err(ToolError::TimedOut);
     }
 
-    let spawned = spawn_with_output_capture(command, cwd, invocation).await?;
+    let spawned = spawn_with_output_capture(command, cwd, invocation, environment).await?;
     let mut child = spawned.child;
     let stdout = spawned.stdout;
     let stderr = spawned.stderr;
@@ -207,11 +248,12 @@ async fn spawn_with_output_capture(
     command: &str,
     cwd: &std::path::Path,
     _invocation: &ToolInvocation,
+    environment: &CommandEnvironment,
 ) -> Result<SpawnedCommand, ToolError> {
     let mut process = shell_command(command);
+    environment.apply(&mut process);
     process
         .current_dir(cwd)
-        .env("MINICORE_AGENT", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -244,6 +286,7 @@ async fn spawn_with_output_capture(
     command: &str,
     cwd: &std::path::Path,
     invocation: &ToolInvocation,
+    environment: &CommandEnvironment,
 ) -> Result<SpawnedCommand, ToolError> {
     let (stdout_server, stdout_client) =
         create_capture_pipe(invocation, "stdout").map_err(|_| ToolError::Failed)?;
@@ -253,9 +296,9 @@ async fn spawn_with_output_capture(
         .map_err(|_| ToolError::Failed)?;
 
     let mut process = shell_command(command);
+    environment.apply(&mut process);
     process
         .current_dir(cwd)
-        .env("MINICORE_AGENT", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_client))
         .stderr(Stdio::from(stderr_client))
@@ -528,6 +571,7 @@ const fn default_timeout() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -541,6 +585,104 @@ mod tests {
 
     use super::*;
 
+    const TEST_MODEL_KEY: &str = "MINICORE_TEST_MODEL_KEY";
+    const TEST_MODEL_SECRET: &str = "MINICORE-TEST-MODEL-SECRET";
+    const TEST_PUBLIC_KEY: &str = "MINICORE_TEST_PUBLIC";
+    const TEST_PUBLIC_VALUE: &str = "minicore-test-public-value";
+
+    fn empty_command_environment() -> CommandEnvironment {
+        CommandEnvironment::new(std::iter::empty::<OsString>())
+    }
+
+    #[cfg(unix)]
+    fn environment_test_command(name: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-lc").arg(format!("printf '%s' \"${name}\""));
+        command
+    }
+
+    #[cfg(windows)]
+    fn environment_test_command(name: &str) -> Command {
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(format!("[Console]::Out.Write([string]$env:{name})"));
+        command
+    }
+
+    async fn command_stdout(command: &mut Command) -> String {
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn command_environment_filters_sorts_and_deduplicates_removed_names() {
+        let environment = CommandEnvironment::new([
+            OsString::from("MINICORE_ZETA_MODEL_KEY"),
+            OsString::new(),
+            OsString::from("MINICORE_ALPHA_MODEL_KEY"),
+            OsString::from("MINICORE_ZETA_MODEL_KEY"),
+            OsString::from("MINICORE_ALPHA_MODEL_KEY"),
+        ]);
+        let expected = [
+            OsString::from("MINICORE_ALPHA_MODEL_KEY"),
+            OsString::from("MINICORE_ZETA_MODEL_KEY"),
+        ];
+
+        assert_eq!(environment.removed.as_ref(), expected.as_slice());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_command_environment_removes_configured_credentials() {
+        let environment = CommandEnvironment::new([OsString::from(TEST_MODEL_KEY)]);
+        let mut command = environment_test_command(TEST_MODEL_KEY);
+        command.env(TEST_MODEL_KEY, TEST_MODEL_SECRET);
+        environment.apply(&mut command);
+
+        let stdout = command_stdout(&mut command).await;
+        assert!(stdout.is_empty());
+        assert!(!stdout.contains(TEST_MODEL_SECRET));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_command_environment_removes_configured_credentials() {
+        let environment = CommandEnvironment::new([OsString::from(TEST_MODEL_KEY)]);
+        let mut command = environment_test_command(TEST_MODEL_KEY);
+        command.env(TEST_MODEL_KEY, TEST_MODEL_SECRET);
+        environment.apply(&mut command);
+
+        let stdout = command_stdout(&mut command).await;
+        assert!(stdout.is_empty());
+        assert!(!stdout.contains(TEST_MODEL_SECRET));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn command_environment_preserves_unremoved_public_environment() {
+        let environment = CommandEnvironment::new([OsString::from(TEST_MODEL_KEY)]);
+        let mut command = environment_test_command(TEST_PUBLIC_KEY);
+        command.env(TEST_PUBLIC_KEY, TEST_PUBLIC_VALUE);
+        environment.apply(&mut command);
+
+        assert_eq!(command_stdout(&mut command).await, TEST_PUBLIC_VALUE);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn command_environment_sets_the_agent_marker() {
+        let environment = CommandEnvironment::new(std::iter::empty::<OsString>());
+        let mut command = environment_test_command("MINICORE_AGENT");
+        environment.apply(&mut command);
+
+        assert_eq!(command_stdout(&mut command).await, "1");
+    }
+
     async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, BashTool) {
         let base = std::env::temp_dir().join(format!(
             "minicore-agent-bash-tool-{label}-{}",
@@ -549,7 +691,7 @@ mod tests {
         let root = base.join("root");
         tokio::fs::create_dir_all(&root).await.unwrap();
         let workspace = Arc::new(Workspace::open(root).await.unwrap());
-        let tool = BashTool::new(Arc::clone(&workspace));
+        let tool = BashTool::new(Arc::clone(&workspace), empty_command_environment());
         (base, workspace, tool)
     }
 
@@ -899,7 +1041,7 @@ mod tests {
     #[tokio::test]
     async fn windows_timeout_drops_named_pipe_readers_held_by_grandchild() {
         let (base, workspace, tool) = fixture("windows-held-pipe-timeout").await;
-        let follow_up = BashTool::new(workspace);
+        let follow_up = BashTool::new(workspace, empty_command_environment());
         let pid_file = base.join("root/grandchild.pid");
         let started = Instant::now();
         let task = tokio::spawn(async move {
@@ -935,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn windows_cancellation_drops_named_pipe_readers_held_by_grandchild() {
         let (base, workspace, tool) = fixture("windows-held-pipe-cancel").await;
-        let follow_up = BashTool::new(workspace);
+        let follow_up = BashTool::new(workspace, empty_command_environment());
         let pid_file = base.join("root/grandchild.pid");
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
@@ -974,7 +1116,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let (base, workspace, tool) = fixture("windows-held-pipe-drop").await;
-            let follow_up = BashTool::new(workspace);
+            let follow_up = BashTool::new(workspace, empty_command_environment());
             let pid_file = base.join("root/grandchild.pid");
             let task = tokio::spawn(async move {
                 tool.execute(

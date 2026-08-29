@@ -108,6 +108,10 @@ impl CapturedRequest {
             .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
     }
 
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     pub fn body(&self) -> &[u8] {
         &self.body
     }
