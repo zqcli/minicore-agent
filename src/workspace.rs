@@ -14,6 +14,8 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 static BEFORE_RENAME_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static DIRECTORY_SYNC_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct Workspace {
@@ -34,6 +36,8 @@ pub enum WorkspaceError {
     NotDirectory,
     #[error("workspace is unavailable")]
     Unavailable,
+    #[error("workspace mutation outcome is unknown")]
+    UnknownOutcome,
     #[error("workspace file is too large")]
     TooLarge,
     #[error("workspace file is not valid UTF-8 text")]
@@ -131,8 +135,11 @@ impl Workspace {
         path: &str,
         max_bytes: usize,
     ) -> Result<String, WorkspaceError> {
-        String::from_utf8(self.read_bytes(path, max_bytes).await?)
-            .map_err(|_| WorkspaceError::Binary)
+        let bytes = self.read_bytes(path, max_bytes).await?;
+        if bytes.contains(&0) {
+            return Err(WorkspaceError::Binary);
+        }
+        String::from_utf8(bytes).map_err(|_| WorkspaceError::Binary)
     }
 
     pub(crate) async fn write_atomic(
@@ -315,7 +322,7 @@ async fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), WorkspaceError>
     }
     sync_directory(parent)
         .await
-        .map_err(|_| WorkspaceError::Unavailable)
+        .map_err(|_| WorkspaceError::UnknownOutcome)
 }
 
 async fn create_unique_temp(target: &Path) -> Result<(PathBuf, File), WorkspaceError> {
@@ -341,18 +348,20 @@ async fn create_unique_temp(target: &Path) -> Result<(PathBuf, File), WorkspaceE
 }
 
 fn unique_temp_path(target: &Path) -> PathBuf {
-    let name = target
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("workspace");
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     target
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(".{name}.tmp-{}-{id}", std::process::id()))
+        .join(format!(".minicore-write-{}-{id}.tmp", std::process::id()))
 }
 
 async fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if should_fail_directory_sync(path) {
+        return Err(io::Error::other(
+            "injected workspace directory sync failure",
+        ));
+    }
     #[cfg(unix)]
     {
         let directory = File::open(path).await?;
@@ -400,6 +409,28 @@ fn should_fail_before_rename(target: &Path) -> bool {
     failures
         .iter()
         .position(|candidate| candidate == target)
+        .map(|position| failures.remove(position))
+        .is_some()
+}
+
+#[cfg(test)]
+fn fail_next_directory_sync(path: PathBuf) {
+    DIRECTORY_SYNC_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(path);
+}
+
+#[cfg(test)]
+fn should_fail_directory_sync(path: &Path) -> bool {
+    let mut failures = DIRECTORY_SYNC_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    failures
+        .iter()
+        .position(|candidate| candidate == path)
         .map(|position| failures.remove(position))
         .is_some()
 }
@@ -581,6 +612,29 @@ mod tests {
         cleanup(&base).await;
     }
 
+    #[tokio::test]
+    async fn text_reads_reject_nul_but_allow_unicode_newlines_and_tabs() {
+        let (base, workspace) = fixture("text-boundary").await;
+        let root = base.join("root");
+        fs::write(root.join("nul.txt"), b"valid\0utf8")
+            .await
+            .unwrap();
+        let unicode = "你好\nline\tvalue";
+        fs::write(root.join("unicode.txt"), unicode.as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            workspace.read_text("nul.txt", 32).await,
+            Err(WorkspaceError::Binary)
+        );
+        assert_eq!(
+            workspace.read_text("unicode.txt", 64).await.unwrap(),
+            unicode
+        );
+        cleanup(&base).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinks_inside_root_are_readable_and_root_is_canonical() {
@@ -690,12 +744,44 @@ mod tests {
                 !entry
                     .file_name()
                     .to_string_lossy()
-                    .contains(".value.txt.tmp-")
+                    .starts_with(".minicore-write-")
             );
         }
 
         workspace.write_atomic("value.txt", b"new").await.unwrap();
         assert_eq!(fs::read(root.join("value.txt")).await.unwrap(), b"new");
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn directory_sync_failure_after_rename_is_unknown_with_complete_target() {
+        let (base, workspace) = fixture("atomic-unknown").await;
+        let root = base.join("root");
+        fs::write(root.join("value.txt"), b"old").await.unwrap();
+        fail_next_directory_sync(workspace.root.as_ref().clone());
+
+        assert_eq!(
+            workspace.write_atomic("value.txt", b"complete-new").await,
+            Err(WorkspaceError::UnknownOutcome)
+        );
+        assert_eq!(
+            fs::read(root.join("value.txt")).await.unwrap(),
+            b"complete-new"
+        );
+        let mut entries = fs::read_dir(&root).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(!entry.file_name().to_string_lossy().contains(".tmp"));
+        }
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_write_supports_long_valid_target_basename() {
+        let (base, workspace) = fixture("long-basename").await;
+        let name = "a".repeat(245);
+
+        workspace.write_atomic(&name, b"long-name").await.unwrap();
+        assert_eq!(workspace.read_bytes(&name, 32).await.unwrap(), b"long-name");
         cleanup(&base).await;
     }
 
