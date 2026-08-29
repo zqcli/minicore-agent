@@ -100,7 +100,10 @@ pub(crate) struct ReadPrefix {
 
 impl Workspace {
     pub async fn open(root: PathBuf) -> Result<Self, WorkspaceError> {
-        let metadata = fs::metadata(&root).await.map_err(map_io_error)?;
+        let metadata = fs::symlink_metadata(&root).await.map_err(map_io_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::Escape);
+        }
         if !metadata.is_dir() {
             return Err(WorkspaceError::NotDirectory);
         }
@@ -112,6 +115,10 @@ impl Workspace {
         Ok(Self {
             root: Arc::new(root),
         })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.root.as_path()
     }
 
     pub(crate) async fn resolve_existing(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
@@ -802,7 +809,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlinks_inside_root_are_readable_and_root_is_canonical() {
+    async fn symlinks_inside_root_are_readable_and_root_symlink_is_rejected() {
         use std::os::unix::fs::symlink;
 
         let (base, workspace) = fixture("inside-symlink").await;
@@ -813,7 +820,6 @@ mod tests {
         symlink("real-dir", root.join("dir-link")).unwrap();
         let root_link = base.join("root-link");
         symlink(&root, &root_link).unwrap();
-        let linked_workspace = Workspace::open(root_link).await.unwrap();
 
         assert_eq!(
             workspace.read_text("file-link", 32).await.unwrap(),
@@ -832,8 +838,8 @@ mod tests {
             b"through-link"
         );
         assert_eq!(
-            *linked_workspace.root,
-            fs::canonicalize(&root).await.unwrap()
+            Workspace::open(root_link).await.err(),
+            Some(WorkspaceError::Escape)
         );
         cleanup(&base).await;
     }

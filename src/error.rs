@@ -58,8 +58,6 @@ pub enum AgentError {
     ModelNotFound,
     #[error("model provider is not implemented in this phase")]
     ModelNotImplemented,
-    #[error("tools are not implemented in this phase")]
-    ToolsNotImplemented,
     #[error("workspace is unavailable")]
     Workspace,
     #[error("store error")]

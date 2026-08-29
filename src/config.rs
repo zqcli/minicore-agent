@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -6,12 +6,12 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use minicore_runtime::config::KernelConfig;
-use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::BoundedText;
 
 use crate::models::{ModelConfig, Models};
 use crate::profiles::Profiles;
 pub use crate::profiles::{ApprovalMode, Profile, ProfileCompaction};
+use crate::tools::KNOWN_TOOL_NAMES;
 
 const MAX_EVENT_CAPACITY: usize = 4_096;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -72,15 +72,15 @@ impl AgentConfig {
             return Err(ConfigError::InvalidDefaultProfile);
         }
         for (id, profile) in &self.profiles {
+            let mut tools = BTreeSet::new();
             if id.is_empty()
                 || profile.model.is_empty()
                 || profile.system_prompt.is_empty()
                 || BoundedText::new(&profile.system_prompt).is_err()
                 || !(1..=MAX_TOOL_ROUNDS).contains(&profile.max_tool_rounds)
-                || profile
-                    .tools
-                    .iter()
-                    .any(|name| name.parse::<ToolName>().is_err())
+                || profile.tools.iter().any(|name| {
+                    !KNOWN_TOOL_NAMES.contains(&name.as_str()) || !tools.insert(name.as_str())
+                })
                 || !valid_compaction(&profile.compaction)
             {
                 return Err(ConfigError::InvalidProfile);

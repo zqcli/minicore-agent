@@ -75,11 +75,12 @@ conversation file is durable before the marker is published. Direct symlinks in
 the session tree, including metadata, manifest, conversation, and temp entries,
 are rejected.
 
-`Workspace::open` stores a canonical directory root. Tool-style paths are UTF-8
-relative strings; absolute paths, parent traversal, NUL, and empty file paths are
-rejected. Existing files and directories are canonicalized and must remain under
-the root. Symlinks that resolve inside the root may be read, while escape
-symlinks are rejected; atomic writes also reject a symlink as the final target.
+`Workspace::open` stores a canonical directory root and rejects a symlink as the
+root itself. Tool-style paths are UTF-8 relative strings; absolute paths, parent
+traversal, NUL, and empty file paths are rejected. Existing files and directories
+are canonicalized and must remain under the root. Symlinks that resolve inside
+the root may be read, while escape symlinks are rejected; atomic writes also
+reject a symlink as the final target.
 Write parents are rechecked while missing directories are created. Atomic writes
 use short opaque `.minicore-write-<pid>-<counter>.tmp` `create_new` files. A
 temp candidate whose basename is exactly or ASCII-case-insensitively equal to
@@ -103,11 +104,10 @@ UTF-8 as `Binary`. Non-Unix platforms have no portable directory-fsync
 contract. These checks prevent ordinary traversal and symlink mistakes but do
 not fully defend against a same-user process concurrently swapping path
 components between checks and filesystem operations; no `openat`/OS locking
-scheme is implemented. Workspace is not yet assembled into Agent capabilities,
-and the existing temporary Agent workspace validation remains unchanged.
+scheme is implemented.
 
 The crate-private concrete `ProjectContext` implements MiniCore's
-`ContextProvider` but is not yet assembled into Agent sessions. Every provider
+`ContextProvider` and is bound to every production Agent session. Every provider
 call rereads only `<workspace>/AGENTS.md`; there is no cache, recursive
 `AGENTS.md` search, source-composition trait, RAG, or other context source. A
 missing root file returns an empty bundle. A present file returns one
@@ -140,10 +140,11 @@ Cancellation and deadlines are biased ahead of the asynchronous Workspace read,
 and dropping the provider future drops that read without mutation or a detached
 task.
 
-The crate-private concrete `Policy` implements MiniCore's `ToolPolicy` but is
-not yet assembled into production Agent sessions. Classification is an exact
-five-name match: `read` is read-only, while `write`, `edit`, `apply_patch`, and
-`bash` are mutating. `Auto` allows every known Tool. `Ask` allows `read` and
+The crate-private concrete `Policy` implements MiniCore's `ToolPolicy` and is
+bound whenever a profile enables at least one Tool; an empty Tool profile binds
+no policy. Classification is an exact five-name match: `read` is read-only,
+while `write`, `edit`, `apply_patch`, and `bash` are mutating. `Auto` allows every
+known Tool. `Ask` allows `read` and
 returns a `Medium` risk approval request for each mutating call with the prompt
 ``Allow tool `<name>` for this call?``. `ReadOnly` allows `read` and denies every
 mutating Tool with a short stable reason. Unknown names and mismatched
@@ -155,9 +156,10 @@ with no external await, spawned task, approval cache, session/project grant, or
 persistence; repeated and newly constructed `Ask` policies always request a new
 per-call approval, leaving `AllowOnce`/`Deny` handling to Core.
 
-The crate-private Tool module currently implements the exact `read`, `write`,
-`edit`, `apply_patch`, and `bash` tools; they are not yet assembled into Agent
-sessions. All five use strict object schemas and reject unknown input fields. `read`
+The crate-private Tool module implements the exact `read`, `write`, `edit`,
+`apply_patch`, and `bash` tools. Each production session receives a new ToolSet
+containing exactly its profile list and sharing only that session's Workspace.
+All five use strict object schemas and reject unknown input fields. `read`
 supports one-based line offsets, a default 400-line limit (maximum 2000),
 one-level sorted directory listings capped at 1000 entries, and `[truncated]`
 markers for line, 512 KiB file prefix, directory-count, or Runtime output limits.
@@ -249,8 +251,15 @@ the real commit result wins even if cancellation or the deadline becomes ready.
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
 returns a stable not-implemented error instead of claiming availability.
-Offline loop tests use a crate-private injected Fake Model/Tool/Policy seam;
-Fake provider and tool implementations are not part of production TOML. Store
+For every create or unloaded open, Agent opens a fresh concrete Workspace,
+builds the profile's concrete ToolSet, conditionally creates the concrete
+Policy, always creates ProjectContext, and supplies those ports through one
+`SessionBindings::new` call; compaction remains disabled with no strategy bound.
+Session records persist the canonical Workspace root; unloaded open revalidates
+it, while an already loaded open remains
+idempotent. Unknown or duplicate profile Tool names fail configuration before
+Store/session startup. Offline loop tests inject only a Fake Model: Workspace,
+Tools, Policy, and Context are the production implementations. Store
 assumes one process per data directory and does not implement file locks.
 Loading currently reads the complete log into memory; v0.1 defines no production
 log-size limit, so very large logs may consume substantial memory. Each loaded
@@ -263,9 +272,8 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. OpenAI HTTP,
-Workspace/Tool/Context/Policy capability assembly, and RPC method extensions
-remain outside this Phase. The offline process coverage is
+to completion before joining the worker and allowing deletion. OpenAI HTTP and
+RPC method extensions remain outside this Phase. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
 Store, Workspace, Tool, Context, and Policy coverage is in the internal unit
 tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and

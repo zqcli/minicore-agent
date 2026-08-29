@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use minicore_runtime::config::{SessionSpec, Timestamp, TurnOptions, UserInput};
+use minicore_runtime::context::ContextProvider;
 use minicore_runtime::conversation::TranscriptPage;
 use minicore_runtime::error::{SessionError, SessionOpenErrorKind};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
@@ -14,17 +15,21 @@ use minicore_runtime::session::{
     InteractionAnswer, SessionRuntime, SessionRuntimeOptions, SessionState, TurnHandle,
 };
 use minicore_runtime::storage::{SessionLog, SessionLogError};
-use minicore_runtime::tools::{ToolPolicy, ToolSet};
+use minicore_runtime::tools::ToolPolicy;
 
+use crate::Workspace;
 use crate::config::{AgentConfig, ProfileCompaction};
+use crate::context::ProjectContext;
 use crate::error::{AgentError, StoreError};
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
 use crate::models::{ModelConfigError, Models};
+use crate::policy::Policy;
 use crate::profiles::{Profile, Profiles};
 use crate::sessions::{
     CompletionNotifier, LoadedSession, MetadataWorker, OutboundSequencer, Sessions,
 };
 use crate::store::{SessionRecord, Store};
+use crate::tools::{BuildToolsError, build_tools};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -99,8 +104,6 @@ pub struct Agent {
     store: Store,
     profiles: Profiles,
     models: Models,
-    tools: ToolSet,
-    tool_policy: Option<Arc<dyn ToolPolicy>>,
     sessions: Sessions,
     events_tx: mpsc::Sender<AgentEvent>,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -111,36 +114,22 @@ pub struct Agent {
 impl Agent {
     pub async fn open(config: AgentConfig) -> Result<Self, AgentError> {
         config.validate().map_err(AgentError::Config)?;
-        if config
-            .profiles
-            .values()
-            .any(|profile| !profile.tools.is_empty())
-        {
-            return Err(AgentError::ToolsNotImplemented);
-        }
         let models = Models::from_config(&config.models)
             .await
             .map_err(map_model_config_error)?;
-        Self::open_parts(config, models, ToolSet::default(), None).await
+        Self::open_parts(config, models).await
     }
 
     #[cfg(test)]
     pub(crate) async fn open_with_models(
         config: AgentConfig,
         models: Models,
-        tools: ToolSet,
-        tool_policy: Option<Arc<dyn ToolPolicy>>,
     ) -> Result<Self, AgentError> {
         config.validate().map_err(AgentError::Config)?;
-        Self::open_parts(config, models, tools, tool_policy).await
+        Self::open_parts(config, models).await
     }
 
-    async fn open_parts(
-        config: AgentConfig,
-        models: Models,
-        tools: ToolSet,
-        tool_policy: Option<Arc<dyn ToolPolicy>>,
-    ) -> Result<Self, AgentError> {
+    async fn open_parts(config: AgentConfig, models: Models) -> Result<Self, AgentError> {
         let task_runtime = Handle::try_current().map_err(|_| AgentError::Internal)?;
         let kernel = config.kernel_config().map_err(AgentError::Config)?;
         let profiles = config.profiles();
@@ -158,8 +147,6 @@ impl Agent {
             store,
             profiles,
             models,
-            tools,
-            tool_policy,
             sessions: Sessions::new(),
             events_tx,
             events_rx: Some(events_rx),
@@ -205,15 +192,20 @@ impl Agent {
             .get(&profile_id)
             .cloned()
             .ok_or(AgentError::ProfileNotFound)?;
-        let workspace = validate_workspace(&request.workspace).await?;
-        let (spec, options) = self.session_parts(&profile)?;
+        let workspace = Arc::new(
+            Workspace::open(request.workspace)
+                .await
+                .map_err(|_| AgentError::Workspace)?,
+        );
+        let canonical_workspace = workspace.root().to_path_buf();
+        let (spec, options) = self.session_parts(&profile, workspace)?;
         let session_id = SessionId::new().map_err(|_| AgentError::Internal)?;
         let timestamp = current_timestamp()?;
         let record = SessionRecord {
             session_id,
             title: request.title,
             profile: profile_id,
-            workspace,
+            workspace: canonical_workspace,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
@@ -250,13 +242,17 @@ impl Agent {
             .load_record(session_id)
             .await
             .map_err(map_store_error)?;
-        validate_workspace(&record.workspace).await?;
+        let workspace = Arc::new(
+            Workspace::open(record.workspace.clone())
+                .await
+                .map_err(|_| AgentError::Workspace)?,
+        );
         let profile = self
             .profiles
             .get(&record.profile)
             .cloned()
             .ok_or(AgentError::ProfileNotFound)?;
-        let (spec, options) = self.session_parts(&profile)?;
+        let (spec, options) = self.session_parts(&profile, workspace)?;
         let mut log = self
             .store
             .open_log(session_id)
@@ -398,6 +394,7 @@ impl Agent {
     fn session_parts(
         &self,
         profile: &Profile,
+        workspace: Arc<Workspace>,
     ) -> Result<(SessionSpec, SessionRuntimeOptions), AgentError> {
         let model = self
             .models
@@ -424,17 +421,16 @@ impl Agent {
             compaction,
         )
         .map_err(|_| AgentError::InvalidInput)?;
-        let policy = if spec.enabled_tools.is_empty() {
+        let tools =
+            build_tools(&profile.tools, Arc::clone(&workspace)).map_err(map_build_tools_error)?;
+        let policy: Option<Arc<dyn ToolPolicy>> = if spec.enabled_tools.is_empty() {
             None
         } else {
-            Some(
-                self.tool_policy
-                    .clone()
-                    .ok_or(AgentError::ToolsNotImplemented)?,
-            )
+            Some(Arc::new(Policy::new(profile.approval)))
         };
+        let context: Arc<dyn ContextProvider> = Arc::new(ProjectContext::new(workspace));
         let bindings =
-            minicore_runtime::SessionBindings::new(model, self.tools.clone(), policy, None, None);
+            minicore_runtime::SessionBindings::new(model, tools, policy, Some(context), None);
         let options =
             SessionRuntimeOptions::new(self.kernel.clone(), bindings, self.task_runtime.clone())
                 .map_err(|_| {
@@ -551,22 +547,19 @@ fn validate_turn_ref(loaded: &LoadedSession, turn: TurnRef) -> Result<(), AgentE
     Ok(())
 }
 
-async fn validate_workspace(path: &Path) -> Result<PathBuf, AgentError> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|_| AgentError::Workspace)?;
-    if !metadata.is_dir() {
-        return Err(AgentError::Workspace);
-    }
-    tokio::fs::canonicalize(path)
-        .await
-        .map_err(|_| AgentError::Workspace)
-}
-
 fn current_timestamp() -> Result<String, AgentError> {
     Timestamp::now_utc()
         .map(|timestamp| timestamp.as_str().to_owned())
         .map_err(|_| AgentError::Internal)
+}
+
+fn map_build_tools_error(error: BuildToolsError) -> AgentError {
+    match error {
+        BuildToolsError::InvalidConfiguration => {
+            AgentError::Config(crate::config::ConfigError::InvalidProfile)
+        }
+        BuildToolsError::Internal => AgentError::Internal,
+    }
 }
 
 fn map_log_error(error: SessionLogError) -> AgentError {
