@@ -237,6 +237,26 @@ impl ToolPolicy for RequireApprovalPolicy {
     }
 }
 
+struct GatedApprovalPolicy {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl ToolPolicy for GatedApprovalPolicy {
+    fn decide<'a>(&'a self, _request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            started.add_permits(1);
+            release.acquire().await.unwrap().forget();
+            Ok(ToolDecision::require_approval(
+                ApprovalRequest::new("approve read", ApprovalRisk::Low).unwrap(),
+            )
+            .unwrap())
+        })
+    }
+}
+
 fn tool_set(tool: Option<FakeTool>) -> ToolSet {
     let mut builder = ToolSet::builder();
     if let Some(tool) = tool {
@@ -1165,6 +1185,127 @@ async fn completion_boundary_preserves_cross_turn_interaction_state_order() {
         }
     }
     assert_eq!(waiting_state_count, 1);
+
+    agent
+        .answer(AnswerInteraction {
+            session_id: info.session_id,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::Deny,
+            ),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(second).unwrap().wait().await.unwrap();
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drained_event_refreshes_state_published_after_initial_completion_emit() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-drain-state-race-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let policy_started = Arc::new(Semaphore::new(0));
+    let policy_release = Arc::new(Semaphore::new(0));
+    let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::ReadCalls(1)]);
+    let mut agent = Agent::open_with_models(
+        config(base.join("data"), vec!["read"]),
+        models(model),
+        tool_set(Some(FakeTool::read())),
+        Some(Arc::new(GatedApprovalPolicy {
+            started: Arc::clone(&policy_started),
+            release: Arc::clone(&policy_release),
+        })),
+    )
+    .await
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
+    })
+    .await;
+
+    let barrier_gate = Arc::new(crate::sessions::TranscriptBarrierGate::new(info.session_id));
+    crate::sessions::block_transcript_barrier(Arc::clone(&barrier_gate));
+    let first = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "first turn".to_owned(),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(first).unwrap().wait().await.unwrap();
+    barrier_gate.started.acquire().await.unwrap().forget();
+
+    let second = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "second turn races drain".to_owned(),
+        })
+        .await
+        .unwrap();
+    policy_started.acquire().await.unwrap().forget();
+    assert_eq!(
+        agent.session_state(info.session_id).unwrap().status,
+        SessionStatus::Running
+    );
+    let drain_gate = Arc::new(crate::sessions::CompletionDrainGate::new(info.session_id));
+    crate::sessions::block_completion_drain(Arc::clone(&drain_gate));
+    barrier_gate.release.add_permits(1);
+    drain_gate.started.acquire().await.unwrap().forget();
+
+    policy_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if agent.session_state(info.session_id).unwrap().status
+                == SessionStatus::WaitingForInput
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drain_gate.release.add_permits(1);
+
+    let mut running_seen = false;
+    let mut waiting_interaction = None;
+    let interaction = loop {
+        match next_event(&mut events).await {
+            AgentEvent::SessionState { state, .. }
+                if state.status == SessionStatus::Running
+                    && state.active_turn == Some(second.turn_id) =>
+            {
+                running_seen = true;
+            }
+            AgentEvent::SessionState { state, .. }
+                if state.status == SessionStatus::WaitingForInput
+                    && state.active_turn == Some(second.turn_id) =>
+            {
+                waiting_interaction = state
+                    .pending_interaction
+                    .as_ref()
+                    .map(|pending| pending.interaction_id);
+            }
+            AgentEvent::InteractionRequested { interaction, .. }
+                if interaction.turn_id == second.turn_id =>
+            {
+                assert!(running_seen);
+                assert_eq!(waiting_interaction, Some(interaction.interaction_id));
+                break interaction;
+            }
+            _ => {}
+        }
+    };
 
     agent
         .answer(AnswerInteraction {
