@@ -247,6 +247,9 @@ impl Agent {
                 .await
                 .map_err(|_| AgentError::Workspace)?,
         );
+        if workspace.root() != record.workspace.as_path() {
+            return Err(AgentError::Workspace);
+        }
         let profile = self
             .profiles
             .get(&record.profile)
