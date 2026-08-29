@@ -101,11 +101,16 @@ fn decode_text_prefix(prefix: ReadPrefix) -> Result<(String, bool), ContextError
             return Err(ContextError::Unavailable);
         }
     }
+    let split_crlf_at_cap = visible_end > 0
+        && prefix.bytes[visible_end - 1] == b'\r'
+        && prefix.bytes.get(visible_end) == Some(&b'\n');
     let mut content = std::str::from_utf8(&prefix.bytes[..visible_end])
         .map_err(|_| ContextError::Unavailable)?
         .replace("\r\n", "\n");
-    if content.ends_with('\r') {
+    if split_crlf_at_cap {
+        debug_assert!(content.ends_with('\r'));
         content.pop();
+        content.push('\n');
     }
     if content
         .chars()
@@ -123,7 +128,7 @@ fn build_bundle(
 ) -> Result<ContextBundle, ContextError> {
     if !read_truncated
         && content.len() <= MAX_CONTEXT_CONTENT_BYTES
-        && serialized_context_tokens(content)? <= remaining_context_budget
+        && context_budget_tokens(content)? <= remaining_context_budget
     {
         return one_block(content);
     }
@@ -159,7 +164,7 @@ fn truncated_content_fits(body: &str, remaining_context_budget: u64) -> Result<b
     if content.len() > MAX_CONTEXT_CONTENT_BYTES {
         return Ok(false);
     }
-    Ok(serialized_context_tokens(&content)? <= remaining_context_budget)
+    Ok(context_budget_tokens(&content)? <= remaining_context_budget)
 }
 
 fn with_truncated_marker(body: &str) -> Result<String, ContextError> {
@@ -195,14 +200,20 @@ fn empty_bundle() -> ContextBundle {
     ContextBundle { blocks: Vec::new() }
 }
 
-fn serialized_context_tokens(content: &str) -> Result<u64, ContextError> {
+fn context_budget_tokens(content: &str) -> Result<u64, ContextError> {
     let message = context_message(content)?;
     let mut writer = ByteCountingWriter::default();
     serde_json::to_writer(&mut writer, &message).map_err(|_| ContextError::Internal)?;
-    let rounded = writer
+    // ModelRequest always has at least one fixed message. Inserting this context
+    // message therefore adds exactly its serialized bytes plus one array comma.
+    // For fixed bytes F and delta D,
+    // ceil((F + D) / 4) - ceil(F / 4) <= ceil(D / 4),
+    // with equality when F is divisible by four.
+    let delta = writer
         .written
-        .checked_add(3)
+        .checked_add(1)
         .ok_or(ContextError::Internal)?;
+    let rounded = delta.checked_add(3).ok_or(ContextError::Internal)?;
     u64::try_from(rounded / 4).map_err(|_| ContextError::Internal)
 }
 
@@ -316,6 +327,7 @@ mod tests {
     use minicore_runtime::context::{ContextProvider, ContextRequest, ContextSlot};
     use minicore_runtime::conversation::ConversationView;
     use minicore_runtime::ids::{SessionId, SessionInstanceId, TurnId};
+    use minicore_runtime::model::{ModelLimits, ModelRequest, ReasoningPreference};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -383,16 +395,64 @@ mod tests {
         bundle.blocks[0].content.as_str()
     }
 
-    fn direct_serialized_tokens(content: &str) -> u64 {
-        let bytes = serde_json::to_vec(&context_message(content).unwrap())
+    fn serialized_model_message_bytes(content: &str) -> usize {
+        serde_json::to_vec(&context_message(content).unwrap())
             .unwrap()
-            .len();
-        u64::try_from(bytes.div_ceil(4)).unwrap()
+            .len()
     }
 
-    fn assert_fits_budget(bundle: &ContextBundle, budget: u64) {
-        for block in &bundle.blocks {
-            assert!(direct_serialized_tokens(block.content.as_str()) <= budget);
+    fn conservative_context_tokens(content: &str) -> u64 {
+        u64::try_from(
+            serialized_model_message_bytes(content)
+                .checked_add(1)
+                .unwrap()
+                .div_ceil(4),
+        )
+        .unwrap()
+    }
+
+    fn request_tokens(request: &ModelRequest) -> u64 {
+        u64::try_from(serde_json::to_vec(request).unwrap().len().div_ceil(4)).unwrap()
+    }
+
+    fn fixed_request_with_byte_residue(residue: usize) -> ModelRequest {
+        for length in 1..=64 {
+            let request = ModelRequest::new(
+                vec![ModelMessage::system("f".repeat(length)).unwrap()],
+                Vec::new(),
+                ModelLimits::default(),
+                ReasoningPreference::Auto,
+            )
+            .unwrap();
+            if serde_json::to_vec(&request).unwrap().len() % 4 == residue {
+                return request;
+            }
+        }
+        panic!("could not construct fixed request byte residue {residue}");
+    }
+
+    fn request_with_context(fixed: &ModelRequest, content: &str) -> ModelRequest {
+        let mut messages = fixed.messages().to_vec();
+        messages.push(context_message(content).unwrap());
+        ModelRequest::new(
+            messages,
+            fixed.tools().to_vec(),
+            *fixed.limits(),
+            fixed.reasoning(),
+        )
+        .unwrap()
+    }
+
+    fn assert_bundle_fits_full_request_budget(bundle: &ContextBundle, budget: u64) {
+        for residue in 0..4 {
+            let fixed = fixed_request_with_byte_residue(residue);
+            let fixed_tokens = request_tokens(&fixed);
+            let final_request = match bundle.blocks.as_slice() {
+                [] => fixed.clone(),
+                [block] => request_with_context(&fixed, block.content.as_str()),
+                _ => panic!("ProjectContext returned more than one block"),
+            };
+            assert!(request_tokens(&final_request) <= fixed_tokens + budget);
         }
     }
 
@@ -408,7 +468,7 @@ mod tests {
         );
 
         write_agents(&base, "").await;
-        let empty = provide(&provider, serialized_context_tokens("").unwrap())
+        let empty = provide(&provider, context_budget_tokens("").unwrap())
             .await
             .unwrap();
         assert_eq!(only_content(&empty), "");
@@ -484,7 +544,7 @@ mod tests {
         let (base, _, provider) = fixture("tiny-budget").await;
         write_agents(&base, "content that requires truncation").await;
         assert!(provide(&provider, 0).await.unwrap().blocks.is_empty());
-        let marker_budget = serialized_context_tokens(TRUNCATED).unwrap();
+        let marker_budget = context_budget_tokens(TRUNCATED).unwrap();
         assert!(
             provide(&provider, marker_budget - 1)
                 .await
@@ -494,7 +554,7 @@ mod tests {
         );
 
         write_agents(&base, "").await;
-        let empty_budget = serialized_context_tokens("").unwrap();
+        let empty_budget = context_budget_tokens("").unwrap();
         assert_eq!(
             only_content(&provide(&provider, empty_budget).await.unwrap()),
             ""
@@ -510,11 +570,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_serialized_budget_keeps_full_content_and_budget_minus_one_truncates() {
+    async fn empty_full_marker_and_unicode_candidates_fit_every_fixed_request_residue() {
+        let (base, _, provider) = fixture("full-request-residues").await;
+
+        write_agents(&base, "").await;
+        let budget = conservative_context_tokens("");
+        let bundle = provide(&provider, budget).await.unwrap();
+        assert_eq!(only_content(&bundle), "");
+        assert_bundle_fits_full_request_budget(&bundle, budget);
+
+        let full = "full project instructions";
+        write_agents(&base, full).await;
+        let budget = conservative_context_tokens(full);
+        let bundle = provide(&provider, budget).await.unwrap();
+        assert_eq!(only_content(&bundle), full);
+        assert_bundle_fits_full_request_budget(&bundle, budget);
+
+        let marker_source = "m".repeat(2_000);
+        write_agents(&base, &marker_source).await;
+        let marker_target = with_truncated_marker(&"m".repeat(24)).unwrap();
+        let budget = conservative_context_tokens(&marker_target);
+        let bundle = provide(&provider, budget).await.unwrap();
+        assert!(only_content(&bundle).ends_with(TRUNCATED));
+        assert_bundle_fits_full_request_budget(&bundle, budget);
+
+        let unicode_source = "🙂".repeat(200);
+        write_agents(&base, &unicode_source).await;
+        let unicode_target = with_truncated_marker(&"🙂".repeat(20)).unwrap();
+        let budget = conservative_context_tokens(&unicode_target);
+        let bundle = provide(&provider, budget).await.unwrap();
+        assert!(only_content(&bundle).ends_with(TRUNCATED));
+        assert!(!only_content(&bundle).contains('�'));
+        assert_bundle_fits_full_request_budget(&bundle, budget);
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn exact_conservative_budget_keeps_full_content_and_minus_one_truncates() {
         let (base, _, provider) = fixture("exact-budget").await;
         let content = "a".repeat(2_000);
         write_agents(&base, &content).await;
-        let exact = serialized_context_tokens(&content).unwrap();
+        let exact = context_budget_tokens(&content).unwrap();
         assert_eq!(
             only_content(&provide(&provider, exact).await.unwrap()),
             content
@@ -525,20 +621,47 @@ mod tests {
         let returned = only_content(&truncated);
         assert!(returned.ends_with(TRUNCATED));
         assert_ne!(returned, content);
-        assert_fits_budget(&truncated, below);
+        assert_bundle_fits_full_request_budget(&truncated, below);
         let body_len = returned.len() - "\n[truncated]".len();
         let next = with_truncated_marker(&content[..body_len + 1]).unwrap();
-        assert!(serialized_context_tokens(&next).unwrap() > below);
+        assert!(context_budget_tokens(&next).unwrap() > below);
+        let fixed = fixed_request_with_byte_residue(0);
+        assert!(
+            request_tokens(&request_with_context(&fixed, &next)) > request_tokens(&fixed) + below
+        );
         cleanup(&base).await;
     }
 
     #[tokio::test]
-    async fn quotes_backslashes_and_newlines_use_exact_model_message_serialization() {
+    async fn comma_is_reserved_at_the_fixed_request_mod_four_zero_boundary() {
+        let (base, _, provider) = fixture("comma-boundary").await;
+        let content = (1..=64)
+            .map(|length| "x".repeat(length))
+            .find(|candidate| serialized_model_message_bytes(candidate) % 4 == 0)
+            .unwrap();
+        write_agents(&base, &content).await;
+
+        let message_bytes = serialized_model_message_bytes(&content);
+        let old_budget = u64::try_from(message_bytes / 4).unwrap();
+        let fixed = fixed_request_with_byte_residue(0);
+        assert!(
+            request_tokens(&request_with_context(&fixed, &content))
+                > request_tokens(&fixed) + old_budget
+        );
+
+        let bundle = provide(&provider, old_budget).await.unwrap();
+        assert!(bundle.blocks.is_empty() || only_content(&bundle).ends_with(TRUNCATED));
+        assert_bundle_fits_full_request_budget(&bundle, old_budget);
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn quotes_backslashes_and_newlines_use_conservative_full_request_budget() {
         let (base, _, provider) = fixture("serialized-budget").await;
         let content = "quote=\"value\" path=C:\\tmp\nnext\n".repeat(80);
         write_agents(&base, &content).await;
-        let exact = direct_serialized_tokens(&content);
-        assert_eq!(serialized_context_tokens(&content).unwrap(), exact);
+        let exact = conservative_context_tokens(&content);
+        assert_eq!(context_budget_tokens(&content).unwrap(), exact);
         assert!(
             exact > u64::try_from((CONTEXT_ENVELOPE.len() + content.len()).div_ceil(4)).unwrap()
         );
@@ -548,7 +671,7 @@ mod tests {
         );
         let below = provide(&provider, exact - 1).await.unwrap();
         assert!(only_content(&below).ends_with(TRUNCATED));
-        assert_fits_budget(&below, exact - 1);
+        assert_bundle_fits_full_request_budget(&below, exact - 1);
         cleanup(&base).await;
     }
 
@@ -558,7 +681,7 @@ mod tests {
         let content = "🙂".repeat(200);
         write_agents(&base, &content).await;
         let target = with_truncated_marker(&"🙂".repeat(20)).unwrap();
-        let budget = serialized_context_tokens(&target).unwrap();
+        let budget = context_budget_tokens(&target).unwrap();
         let bundle = provide(&provider, budget).await.unwrap();
         let returned = only_content(&bundle);
         assert!(returned.ends_with(TRUNCATED));
@@ -571,7 +694,7 @@ mod tests {
                 .chars()
                 .all(|character| character == '🙂')
         );
-        assert_fits_budget(&bundle, budget);
+        assert_bundle_fits_full_request_budget(&bundle, budget);
         cleanup(&base).await;
     }
 
@@ -597,6 +720,29 @@ mod tests {
             );
         }
         cleanup(&base).await;
+    }
+
+    #[test]
+    fn crlf_split_at_visible_cap_preserves_the_logical_lf() {
+        for (bytes, visible_len, expected) in [
+            (b"\n\r\n".as_slice(), 2, "\n\n"),
+            (b"text\r\n".as_slice(), 5, "text\n"),
+            ("🙂\r\n".as_bytes(), "🙂\r".len(), "🙂\n"),
+            (
+                "🙂\r\nnext\r\n".as_bytes(),
+                "🙂\r\nnext\r".len(),
+                "🙂\nnext\n",
+            ),
+        ] {
+            let (content, truncated) = decode_text_prefix(ReadPrefix {
+                bytes: bytes.to_vec(),
+                visible_len,
+                has_more: true,
+            })
+            .unwrap();
+            assert_eq!(content, expected);
+            assert!(truncated);
+        }
     }
 
     #[tokio::test]
