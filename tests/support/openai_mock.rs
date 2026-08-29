@@ -9,10 +9,10 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct MockResponse {
@@ -126,6 +126,71 @@ pub struct MockServer {
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     captured_notify: Arc<Notify>,
     task: JoinHandle<io::Result<()>>,
+}
+
+pub struct ConcurrentMockServer {
+    base_url: String,
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    task: JoinHandle<io::Result<()>>,
+}
+
+impl ConcurrentMockServer {
+    pub async fn spawn(responses: impl IntoIterator<Item = MockResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("concurrent mock server must bind loopback");
+        let address = listener.local_addr().expect("concurrent mock address");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let task_captured = Arc::clone(&captured);
+        let mut responses: VecDeque<_> = responses.into_iter().collect();
+        let task = tokio::spawn(async move {
+            let mut handlers = JoinSet::new();
+            while !responses.is_empty() {
+                let (stream, _) = listener.accept().await?;
+                let response = responses
+                    .pop_front()
+                    .expect("checked concurrent response queue must not be empty");
+                let handler_captured = Arc::clone(&task_captured);
+                handlers.spawn(async move {
+                    handle_connection(stream, response, handler_captured).await
+                });
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.map_err(|_| io::Error::other("concurrent mock handler panicked"))??;
+            }
+            Ok(())
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            captured,
+            task,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn finish(self) -> Vec<CapturedRequest> {
+        self.task
+            .await
+            .expect("concurrent mock server task must not panic")
+            .expect("concurrent mock server I/O must succeed");
+        Arc::try_unwrap(self.captured)
+            .expect("concurrent captured requests must have one owner")
+            .into_inner()
+            .expect("concurrent captured request mutex must not be poisoned")
+    }
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    response: MockResponse,
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+) -> io::Result<()> {
+    let request = read_request(&mut stream).await?;
+    captured.lock().unwrap().push(request);
+    write_response(&mut stream, response).await
 }
 
 impl MockServer {

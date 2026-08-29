@@ -147,6 +147,18 @@ fn write_config(temp_dir: &Path, base_url: &str, key_env: &str, tools: &[&str]) 
     write_config_with_additional_models(temp_dir, base_url, key_env, tools, "")
 }
 
+fn write_config_with_reasoning(
+    temp_dir: &Path,
+    base_url: &str,
+    key_env: &str,
+    tools: &[&str],
+    reasoning: &str,
+) -> PathBuf {
+    write_config_with_reasoning_and_additional_models(
+        temp_dir, base_url, key_env, tools, reasoning, "",
+    )
+}
+
 fn write_two_model_config(
     temp_dir: &Path,
     base_url: &str,
@@ -185,6 +197,24 @@ fn write_config_with_additional_models(
     tools: &[&str],
     additional_models: &str,
 ) -> PathBuf {
+    write_config_with_reasoning_and_additional_models(
+        temp_dir,
+        base_url,
+        key_env,
+        tools,
+        "auto",
+        additional_models,
+    )
+}
+
+fn write_config_with_reasoning_and_additional_models(
+    temp_dir: &Path,
+    base_url: &str,
+    key_env: &str,
+    tools: &[&str],
+    reasoning: &str,
+    additional_models: &str,
+) -> PathBuf {
     let config_path = temp_dir.join("agent.toml");
     let tools = tools
         .iter()
@@ -200,7 +230,7 @@ default_profile = "test"
 
 [profiles.test]
 model = "main"
-reasoning = "auto"
+reasoning = "{reasoning}"
 system_prompt = "Use configured tools and finish the task."
 tools = [{tools}]
 max_tool_rounds = 4
@@ -413,6 +443,246 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_transcript() {
             .iter()
             .any(|item| item["type"] == "function_call_output")
     );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_else() {
+    const KEY_ENV: &str = "MINICORE_PROCESS_REASONING_KEY";
+    const KEY: &str = "PROCESS-REASONING-API-KEY-SECRET";
+    const CALL_ID: &str = "process-reasoning-read-call";
+    const FUNCTION_ARGUMENTS: &str = r#"{ "path": "phase4-process.txt" }"#;
+    const ENCRYPTED_MARKER: &str = "enc::PROCESS-A4-T09-T11::AAECAwQFBgcICQ==";
+    const OPAQUE_MARKER: &str = "PROCESS-PROVIDER-OPAQUE-A4-T09-T11";
+
+    let reasoning_item = json!({
+        "type": "reasoning",
+        "id": "rs_process_a4_t09_t11",
+        "encrypted_content": ENCRYPTED_MARKER,
+        "summary": [{"type": "summary_text", "text": "inspect the process fixture"}],
+        "status": "completed",
+        "provider": {
+            "opaque": OPAQUE_MARKER,
+            "trace": [1, true, "preserve only in next HTTP request"]
+        }
+    });
+    let function_call_item = json!({
+        "type": "function_call",
+        "id": "fc_process_a4_t09_t11",
+        "call_id": CALL_ID,
+        "name": "read",
+        "arguments": FUNCTION_ARGUMENTS,
+        "status": "completed",
+        "provider": {
+            "opaque": OPAQUE_MARKER,
+            "future": {"preserve": "exactly"}
+        }
+    });
+    let first = MockResponse::sse(&[
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "inspect the process fixture"
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": reasoning_item.clone()
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": function_call_item.clone()
+        }),
+        completed(),
+    ]);
+    let second = MockResponse::sse(&[
+        json!({"type": "response.output_text.delta", "delta": "reasoning process final"}),
+        completed(),
+    ]);
+    let server = MockServer::spawn([first, second]).await;
+    let temp_dir = std::env::temp_dir().join(format!(
+        "minicore-agent-openai-reasoning-process-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = temp_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("phase4-process.txt"),
+        "PROCESS-REASONING-READ-CONTENT",
+    )
+    .unwrap();
+    let config =
+        write_config_with_reasoning(&temp_dir, server.base_url(), KEY_ENV, &["read"], "high");
+    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+
+    process
+        .send("create", "session.create", json!({"workspace": workspace}))
+        .await;
+    let session_id = process.response("create").await["result"]["session"]["session_id"].clone();
+    let session_id_text = session_id
+        .as_str()
+        .expect("created session ID must be text")
+        .to_owned();
+    process
+        .send(
+            "send",
+            "turn.send",
+            json!({"session_id": session_id, "text": "read the phase4 process fixture"}),
+        )
+        .await;
+    let turn = process.response("send").await["result"]["turn"].clone();
+    let reasoning_output = process.event("output_delta").await;
+    assert_eq!(reasoning_output["params"]["data"]["channel"], "reasoning");
+    assert_eq!(
+        reasoning_output["params"]["data"]["delta"],
+        "inspect the process fixture"
+    );
+    process.event("tool_started").await;
+    process.event("tool_finished").await;
+    let final_output = process.event("output_delta").await;
+    assert_eq!(final_output["params"]["data"]["channel"], "text");
+    assert_eq!(
+        final_output["params"]["data"]["delta"],
+        "reasoning process final"
+    );
+    process.event("turn_finished").await;
+    process
+        .send(
+            "wait",
+            "turn.wait",
+            json!({
+                "session_id": turn["session_id"],
+                "instance_id": turn["instance_id"],
+                "turn_id": turn["turn_id"],
+            }),
+        )
+        .await;
+    assert_eq!(
+        process.response("wait").await["result"]["terminal"],
+        "completed"
+    );
+    process
+        .send(
+            "transcript",
+            "session.transcript",
+            json!({"session_id": session_id, "limit": 100}),
+        )
+        .await;
+    let transcript = process.response("transcript").await;
+    let transcript_text = transcript.to_string();
+    assert!(transcript_text.contains("PROCESS-REASONING-READ-CONTENT"));
+    assert!(transcript_text.contains("reasoning process final"));
+    assert!(!transcript_text.contains(ENCRYPTED_MARKER));
+    assert!(!transcript_text.contains(OPAQUE_MARKER));
+    process
+        .send("close", "session.close", json!({"session_id": session_id}))
+        .await;
+    process.response("close").await;
+    let (observed, stderr) = process.shutdown().await;
+
+    for frame in &observed {
+        assert_eq!(frame["jsonrpc"], "2.0");
+        let notification = frame["method"] == "agent.event" && frame.get("id").is_none();
+        let response = frame.get("id").is_some()
+            && (frame.get("result").is_some() ^ frame.get("error").is_some());
+        assert!(
+            notification || response,
+            "every process stdout line must be a valid JSON-RPC notification or response"
+        );
+    }
+    let rpc_text = serde_json::to_string(&observed).unwrap();
+    for private in [ENCRYPTED_MARKER, OPAQUE_MARKER] {
+        assert!(!rpc_text.contains(private));
+        assert!(!stderr.contains(private));
+    }
+    assert!(!rpc_text.contains(KEY));
+    assert!(!stderr.contains(KEY));
+
+    let session_dir = temp_dir.join("data").join("sessions").join(session_id_text);
+    for file_name in ["conversation.log", "session.json", "manifest.json"] {
+        let contents = std::fs::read(session_dir.join(file_name))
+            .unwrap_or_else(|error| panic!("failed to read persisted {file_name}: {error}"));
+        let contents = String::from_utf8_lossy(&contents);
+        assert!(!contents.contains(ENCRYPTED_MARKER));
+        assert!(!contents.contains(OPAQUE_MARKER));
+        assert!(!contents.contains(KEY));
+    }
+
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer PROCESS-REASONING-API-KEY-SECRET")
+        );
+        assert!(!String::from_utf8_lossy(request.body()).contains(KEY));
+    }
+    let second_body = requests[1].json_body();
+    assert_eq!(second_body["store"], false);
+    let expected_second_input = json!([
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": concat!(
+                    "Honor message roles and the tool-call protocol. ",
+                    "Use only declared tools and match every tool result to its call."
+                )
+            }]
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "Use configured tools and finish the task."
+            }]
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "read the phase4 process fixture"
+            }]
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_process_a4_t09_t11",
+            "encrypted_content": "enc::PROCESS-A4-T09-T11::AAECAwQFBgcICQ==",
+            "summary": [{
+                "type": "summary_text",
+                "text": "inspect the process fixture"
+            }],
+            "status": "completed",
+            "provider": {
+                "opaque": "PROCESS-PROVIDER-OPAQUE-A4-T09-T11",
+                "trace": [1, true, "preserve only in next HTTP request"]
+            }
+        },
+        {
+            "type": "function_call",
+            "id": "fc_process_a4_t09_t11",
+            "call_id": "process-reasoning-read-call",
+            "name": "read",
+            "arguments": r#"{ "path": "phase4-process.txt" }"#,
+            "status": "completed",
+            "provider": {
+                "opaque": "PROCESS-PROVIDER-OPAQUE-A4-T09-T11",
+                "future": {"preserve": "exactly"}
+            }
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "process-reasoning-read-call",
+            "output": "1: PROCESS-REASONING-READ-CONTENT",
+            "status": "completed"
+        }
+    ]);
+    assert_eq!(second_body["input"], expected_second_input);
+    assert!(String::from_utf8_lossy(requests[1].body()).contains(ENCRYPTED_MARKER));
+    assert!(String::from_utf8_lossy(requests[1].body()).contains(OPAQUE_MARKER));
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
