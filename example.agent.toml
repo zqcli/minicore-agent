@@ -1,2 +1,29 @@
 data_dir = "./.minicore-agent"
 event_capacity = 256
+default_profile = "coding"
+
+[profiles.coding]
+model = "main"
+reasoning = "medium"
+system_prompt = """
+You are a coding agent. Inspect the workspace, use tools when useful,
+make focused changes, run relevant checks, and explain the result.
+"""
+tools = ["read", "write", "edit", "apply_patch", "bash"]
+max_tool_rounds = 32
+approval = "ask"
+
+[profiles.coding.compaction]
+mode = "disabled"
+
+[models.main]
+provider = "open_ai_responses"
+model = "your-model-id"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+physical_context_window = 200000
+output_budget_tokens = 24000
+safety_margin_tokens = 4000
+supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
+supports_tools = true
+request_timeout_seconds = 600

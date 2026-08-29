@@ -580,8 +580,10 @@ fn map_log_error(error: SessionLogError) -> AgentError {
 fn map_model_config_error(error: ModelConfigError) -> AgentError {
     match error {
         ModelConfigError::NotFound => AgentError::ModelNotFound,
-        ModelConfigError::NotImplemented => AgentError::ModelNotImplemented,
-        ModelConfigError::InvalidConfiguration | ModelConfigError::InvalidReference => {
+        ModelConfigError::InvalidConfiguration
+        | ModelConfigError::MissingApiKey
+        | ModelConfigError::ClientBuild
+        | ModelConfigError::InvalidReference => {
             AgentError::Config(crate::config::ConfigError::InvalidModel)
         }
     }

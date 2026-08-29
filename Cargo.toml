@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "RPC-first MiniCore Agent skeleton"
+description = "RPC-first MiniCore Agent"
 
 [lib]
 name = "minicore_agent"
@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 # Public API is pinned to this exact upstream runtime revision.
 minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "7e85eaab18e273e43e03c50040b460f1b13f0ac9", version = "0.3.0" }
+bytes = "=1.10.1"
+futures-util = "=0.3.33"
+reqwest = { version = "=0.12.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
@@ -32,11 +35,8 @@ tokio = { version = "1.53.1", default-features = false, features = [
   "sync",
   "time",
 ] }
-toml = "0.8.23"
-
-[dev-dependencies]
-futures-util = "0.3.33"
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
+toml = "0.8.23"
 
 [lints.rust]
 unsafe_code = "forbid"

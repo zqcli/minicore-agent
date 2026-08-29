@@ -56,7 +56,7 @@ pub enum AgentError {
     ProfileNotFound,
     #[error("model not found")]
     ModelNotFound,
-    #[error("model provider is not implemented in this phase")]
+    #[error("model-backed compaction is not implemented in this phase")]
     ModelNotImplemented,
     #[error("workspace is unavailable")]
     Workspace,
