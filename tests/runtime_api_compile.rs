@@ -3,6 +3,8 @@
 //! The contract owns small public-port implementations and calls their methods,
 //! but the contract function is only referenced as an item and is never run.
 
+// This contract is referenced only as a function item for type checking and is intentionally not executed.
+#[allow(dead_code)]
 mod runtime_public_api_compile_contract {
     use std::collections::BTreeSet;
     use std::sync::Arc;
