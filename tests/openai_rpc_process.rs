@@ -24,10 +24,23 @@ struct RpcProcess {
 
 impl RpcProcess {
     async fn spawn(config_path: &Path, key_env: &str, key: &str) -> Self {
+        Self::spawn_with_extra_env(config_path, key_env, key, &[]).await
+    }
+
+    async fn spawn_with_extra_env(
+        config_path: &Path,
+        key_env: &str,
+        key: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_minicore-agent"));
         command
             .args(["--config", config_path.to_str().unwrap(), "--stdio"])
-            .env(key_env, key)
+            .env(key_env, key);
+        for &(name, value) in extra_env {
+            command.env(name, value);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -131,6 +144,47 @@ impl RpcProcess {
 }
 
 fn write_config(temp_dir: &Path, base_url: &str, key_env: &str, tools: &[&str]) -> PathBuf {
+    write_config_with_additional_models(temp_dir, base_url, key_env, tools, "")
+}
+
+fn write_two_model_config(
+    temp_dir: &Path,
+    base_url: &str,
+    first_key_env: &str,
+    second_key_env: &str,
+    tools: &[&str],
+) -> PathBuf {
+    let additional_models = format!(
+        r#"
+[models.secondary]
+provider = "open_ai_responses"
+model = "secondary-provider-model"
+base_url = "{base_url}"
+api_key_env = "{second_key_env}"
+physical_context_window = 16000
+output_budget_tokens = 1024
+safety_margin_tokens = 1000
+supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
+supports_tools = true
+request_timeout_seconds = 5
+"#
+    );
+    write_config_with_additional_models(
+        temp_dir,
+        base_url,
+        first_key_env,
+        tools,
+        &additional_models,
+    )
+}
+
+fn write_config_with_additional_models(
+    temp_dir: &Path,
+    base_url: &str,
+    key_env: &str,
+    tools: &[&str],
+    additional_models: &str,
+) -> PathBuf {
     let config_path = temp_dir.join("agent.toml");
     let tools = tools
         .iter()
@@ -163,6 +217,7 @@ safety_margin_tokens = 1000
 supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
 supports_tools = true
 request_timeout_seconds = 5
+{additional_models}
 "#,
             temp_dir.join("data")
         ),
@@ -185,6 +240,52 @@ fn completed() -> Value {
             }
         }
     })
+}
+
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_KEY_ENV: &str = "MINICORE_PROCESS_BASH_MODEL_KEY";
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_SECRET: &str = "PROCESS-BASH-MODEL-KEY-SECRET";
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_SECOND_KEY_ENV: &str = "MINICORE_PROCESS_BASH_SECOND_MODEL_KEY";
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_SECOND_SECRET: &str = "PROCESS-BASH-SECOND-MODEL-KEY-SECRET";
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_AUTHORIZATION: &str = "Bearer PROCESS-BASH-MODEL-KEY-SECRET";
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_PUBLIC_ENV: &str = "MINICORE_PROCESS_BASH_PUBLIC";
+#[cfg(any(unix, windows))]
+const PROCESS_BASH_PUBLIC_VALUE: &str = "process-bash-public-value";
+
+#[cfg(unix)]
+fn environment_probe_command() -> &'static str {
+    r#"printf 'credential_one=<%s>\ncredential_two=<%s>\npublic=<%s>\nmarker=<%s>\n' "$MINICORE_PROCESS_BASH_MODEL_KEY" "$MINICORE_PROCESS_BASH_SECOND_MODEL_KEY" "$MINICORE_PROCESS_BASH_PUBLIC" "$MINICORE_AGENT""#
+}
+
+#[cfg(windows)]
+fn environment_probe_command() -> &'static str {
+    r#"[Console]::WriteLine(('credential_one=<{0}>' -f [string]$env:MINICORE_PROCESS_BASH_MODEL_KEY)); [Console]::WriteLine(('credential_two=<{0}>' -f [string]$env:MINICORE_PROCESS_BASH_SECOND_MODEL_KEY)); [Console]::WriteLine(('public=<{0}>' -f [string]$env:MINICORE_PROCESS_BASH_PUBLIC)); [Console]::WriteLine(('marker=<{0}>' -f [string]$env:MINICORE_AGENT))"#
+}
+
+#[cfg(any(unix, windows))]
+fn assert_isolated_environment_probe(value: &str) {
+    assert!(
+        value.contains("credential_one=<>"),
+        "first credential was not removed"
+    );
+    assert!(
+        value.contains("credential_two=<>"),
+        "second credential was not removed"
+    );
+    assert!(value.contains(&format!("public=<{PROCESS_BASH_PUBLIC_VALUE}>")));
+    assert!(value.contains("marker=<1>"));
+    assert_process_bash_secrets_absent(value);
+}
+
+#[cfg(any(unix, windows))]
+fn assert_process_bash_secrets_absent(value: &str) {
+    assert!(!value.contains(PROCESS_BASH_SECRET));
+    assert!(!value.contains(PROCESS_BASH_SECOND_SECRET));
 }
 
 fn contains_key(value: &Value, key: &str) -> bool {
@@ -312,6 +413,149 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_transcript() {
             .iter()
             .any(|item| item["type"] == "function_call_output")
     );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_process_bash_removes_model_credentials_and_preserves_public_environment() {
+    let first = MockResponse::sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "process-bash-environment-call",
+                "name": "bash",
+                "arguments": serde_json::to_string(&json!({
+                    "command": environment_probe_command()
+                }))
+                .unwrap()
+            }
+        }),
+        completed(),
+    ]);
+    let second = MockResponse::sse(&[
+        json!({"type": "response.output_text.delta", "delta": "environment isolated"}),
+        completed(),
+    ]);
+    let server = MockServer::spawn([first, second]).await;
+    let temp_dir = std::env::temp_dir().join(format!(
+        "minicore-agent-openai-bash-environment-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = temp_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = write_two_model_config(
+        &temp_dir,
+        server.base_url(),
+        PROCESS_BASH_KEY_ENV,
+        PROCESS_BASH_SECOND_KEY_ENV,
+        &["bash"],
+    );
+    let mut process = RpcProcess::spawn_with_extra_env(
+        &config,
+        PROCESS_BASH_KEY_ENV,
+        PROCESS_BASH_SECRET,
+        &[
+            (PROCESS_BASH_SECOND_KEY_ENV, PROCESS_BASH_SECOND_SECRET),
+            (PROCESS_BASH_PUBLIC_ENV, PROCESS_BASH_PUBLIC_VALUE),
+        ],
+    )
+    .await;
+
+    process
+        .send("create", "session.create", json!({"workspace": workspace}))
+        .await;
+    let session_id = process.response("create").await["result"]["session"]["session_id"].clone();
+    process
+        .send(
+            "send",
+            "turn.send",
+            json!({"session_id": session_id, "text": "inspect the command environment"}),
+        )
+        .await;
+    let turn = process.response("send").await["result"]["turn"].clone();
+    process.event("tool_started").await;
+    process.event("tool_finished").await;
+    assert_eq!(
+        process.event("output_delta").await["params"]["data"]["delta"],
+        "environment isolated"
+    );
+    process.event("turn_finished").await;
+    process
+        .send(
+            "wait",
+            "turn.wait",
+            json!({
+                "session_id": turn["session_id"],
+                "instance_id": turn["instance_id"],
+                "turn_id": turn["turn_id"],
+            }),
+        )
+        .await;
+    assert_eq!(
+        process.response("wait").await["result"]["terminal"],
+        "completed"
+    );
+
+    process
+        .send(
+            "transcript",
+            "session.transcript",
+            json!({"session_id": session_id, "limit": 100}),
+        )
+        .await;
+    let transcript = process.response("transcript").await;
+    let tool_result = transcript["result"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|entry| entry.get("tool_result"))
+        .expect("transcript must contain the Bash tool result");
+    assert_eq!(tool_result["outcome"], "success");
+    assert_isolated_environment_probe(
+        tool_result["content"]
+            .as_str()
+            .expect("Bash tool result content must be text"),
+    );
+    let transcript_text = transcript.to_string();
+    assert_process_bash_secrets_absent(&transcript_text);
+    process
+        .send("close", "session.close", json!({"session_id": session_id}))
+        .await;
+    process.response("close").await;
+    let (observed, stderr) = process.shutdown().await;
+    let observed = serde_json::to_string(&observed).unwrap();
+    assert_process_bash_secrets_absent(&observed);
+    assert_process_bash_secrets_absent(&stderr);
+
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            request.header("authorization"),
+            Some(PROCESS_BASH_AUTHORIZATION)
+        );
+        for (name, value) in request.headers() {
+            assert!(!name.contains(PROCESS_BASH_SECOND_SECRET));
+            assert!(!value.contains(PROCESS_BASH_SECOND_SECRET));
+            if !name.eq_ignore_ascii_case("authorization") {
+                assert!(!name.contains(PROCESS_BASH_SECRET));
+                assert!(!value.contains(PROCESS_BASH_SECRET));
+            }
+        }
+        assert_process_bash_secrets_absent(&String::from_utf8_lossy(request.body()));
+    }
+    let second_body = requests[1].json_body();
+    let tool_output = second_body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .and_then(|item| item["output"].as_str())
+        .expect("second request must contain the Bash tool output");
+    assert_isolated_environment_probe(tool_output);
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 

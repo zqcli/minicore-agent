@@ -87,6 +87,12 @@ impl ModelConfig {
         }
     }
 
+    pub(crate) fn credential_env_name(&self) -> &str {
+        match self {
+            Self::OpenAiResponses { api_key_env, .. } => api_key_env,
+        }
+    }
+
     pub(crate) fn supported_reasoning(&self) -> &BTreeSet<ReasoningPreference> {
         match self {
             Self::OpenAiResponses {
@@ -235,10 +241,18 @@ mod tests {
     use super::*;
 
     fn config(base_url: &str, output_budget_tokens: u32) -> ModelConfig {
+        config_with_credential_env(base_url, output_budget_tokens, "TEST_OPENAI_API_KEY")
+    }
+
+    fn config_with_credential_env(
+        base_url: &str,
+        output_budget_tokens: u32,
+        api_key_env: &str,
+    ) -> ModelConfig {
         ModelConfig::OpenAiResponses {
             model: "provider-model".to_owned(),
             base_url: base_url.to_owned(),
-            api_key_env: "TEST_OPENAI_API_KEY".to_owned(),
+            api_key_env: api_key_env.to_owned(),
             physical_context_window: 10_000,
             output_budget_tokens,
             safety_margin_tokens: 1_000,
@@ -246,6 +260,21 @@ mod tests {
             supports_tools: true,
             request_timeout_seconds: Some(30),
         }
+    }
+
+    #[test]
+    fn model_configs_expose_credential_environment_names_without_debug_leaks() {
+        const FIRST_ENV: &str = "MINICORE_FIRST_MODEL_CREDENTIAL";
+        const SECOND_ENV: &str = "MINICORE_SECOND_MODEL_CREDENTIAL";
+
+        let first = config_with_credential_env("https://example.invalid/v1", 1_000, FIRST_ENV);
+        let second = config_with_credential_env("https://example.invalid/v1", 1_000, SECOND_ENV);
+
+        assert_eq!(first.credential_env_name(), FIRST_ENV);
+        assert_eq!(second.credential_env_name(), SECOND_ENV);
+        let debug = format!("{first:?} {second:?}");
+        assert!(!debug.contains(FIRST_ENV));
+        assert!(!debug.contains(SECOND_ENV));
     }
 
     #[test]

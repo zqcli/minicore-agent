@@ -241,10 +241,16 @@ source and patch-content cursors, and the result is appended once without front
 are bounded by source logical lines plus patch transport lines, giving
 `O(source bytes + patch bytes)` behavior.
 
-`bash` runs `/bin/sh -lc` on Unix and non-interactive PowerShell on Windows. It
-inherits the Agent environment, adds `MINICORE_AGENT=1`, and resolves its
-relative working directory through Workspace before spawning. The Tool future
-owns one `tokio::process::Child` with null stdin and `kill_on_drop(true)`. Unix
+`bash` runs `/bin/sh -lc` on Unix and non-interactive PowerShell on Windows.
+Bash is not a sandbox. It runs with the filesystem and network authority of the
+`minicore-agent` process and can access host files outside the configured
+Workspace. Before spawning, the Agent removes every environment variable
+configured as a Model API key and sets `MINICORE_AGENT=1`. It otherwise inherits
+the host environment, so other host secrets and files remain accessible.
+Running untrusted models or commands requires external container or OS-level
+isolation. The relative working directory is still resolved through Workspace.
+The Tool future owns one `tokio::process::Child` with null stdin and
+`kill_on_drop(true)`. Unix
 uses the child's anonymous piped stdout/stderr as reactor-backed readers.
 Windows instead creates unique first-instance, inbound byte-mode Tokio named
 pipe servers and gives matching `std::fs::File` clients to PowerShell as its
