@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use minicore_runtime::model::ReasoningPreference;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     Auto,
@@ -41,6 +41,15 @@ pub struct Profile {
     pub compaction: ProfileCompaction,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ProfileInfo {
+    pub(crate) id: String,
+    pub(crate) model: String,
+    pub(crate) reasoning: ReasoningPreference,
+    pub(crate) tools: Vec<String>,
+    pub(crate) approval: ApprovalMode,
+}
+
 fn default_tool_rounds() -> u16 {
     32
 }
@@ -56,5 +65,18 @@ impl Profiles {
 
     pub(crate) fn get(&self, id: &str) -> Option<&Profile> {
         self.values.get(id)
+    }
+
+    pub(crate) fn list(&self) -> Vec<ProfileInfo> {
+        self.values
+            .iter()
+            .map(|(id, profile)| ProfileInfo {
+                id: id.clone(),
+                model: profile.model.clone(),
+                reasoning: profile.reasoning,
+                tools: profile.tools.clone(),
+                approval: profile.approval,
+            })
+            .collect()
     }
 }

@@ -170,6 +170,14 @@ impl Agent {
         PingResponse { version: VERSION }
     }
 
+    pub(crate) fn profile_infos(&self) -> Vec<crate::profiles::ProfileInfo> {
+        self.profiles.list()
+    }
+
+    pub(crate) fn model_infos(&self) -> Vec<crate::models::ModelInfo> {
+        self.models.list()
+    }
+
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, AgentError> {
         let records = self.store.list_sessions().await.map_err(map_store_error)?;
         Ok(records

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use minicore_runtime::model::{Model, ModelRef, ReasoningPreference};
@@ -65,6 +65,15 @@ pub(crate) enum ModelConfigError {
     InvalidReference,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ModelInfo {
+    pub(crate) id: String,
+    pub(crate) model_ref: ModelRef,
+    pub(crate) context_window: u64,
+    pub(crate) supports_tools: bool,
+    pub(crate) supported_reasoning: Vec<ReasoningPreference>,
+}
+
 pub(crate) struct Models {
     values: BTreeMap<String, Arc<dyn Model>>,
 }
@@ -110,6 +119,22 @@ impl Models {
 
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.values.contains_key(id)
+    }
+
+    pub(crate) fn list(&self) -> Vec<ModelInfo> {
+        self.values
+            .iter()
+            .map(|(id, model)| {
+                let descriptor = model.descriptor();
+                ModelInfo {
+                    id: id.clone(),
+                    model_ref: descriptor.model_ref.clone(),
+                    context_window: descriptor.context_window,
+                    supports_tools: descriptor.supports_tools,
+                    supported_reasoning: descriptor.supported_reasoning.iter().copied().collect(),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn model_ref(id: &str) -> Result<ModelRef, ModelConfigError> {
