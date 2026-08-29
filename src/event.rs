@@ -795,17 +795,6 @@ pub(crate) fn forward_core_event(
     }
 }
 
-pub(crate) fn emit_state(event_sink: &AgentEventSink, state: SessionState) -> bool {
-    event_sink.try_send(AgentEvent::SessionState {
-        meta: EventMeta {
-            session_id: state.session_id,
-            instance_id: state.instance_id,
-            dropped_before: 0,
-        },
-        state,
-    }) != AgentSendResult::Closed
-}
-
 pub struct AgentEventStream {
     receiver: mpsc::Receiver<AgentEvent>,
 }
