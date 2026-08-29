@@ -965,7 +965,8 @@ struct TerminalEvent {
 
 #[derive(Deserialize)]
 struct ProviderResponse {
-    status: String,
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     usage: Option<ProviderUsage>,
     #[serde(default)]
@@ -984,8 +985,7 @@ struct ProviderUsage {
 #[derive(Deserialize)]
 struct InputTokenDetails {
     cached_tokens: u64,
-    #[serde(default)]
-    cache_write_tokens: Option<u64>,
+    cache_write_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -1204,7 +1204,11 @@ fn finish_response(
         TerminalKind::Completed => "completed",
         TerminalKind::Incomplete => "incomplete",
     };
-    if response.status != expected_status {
+    if response
+        .status
+        .as_deref()
+        .is_some_and(|status| status != expected_status)
+    {
         return Err(());
     }
     let usage = response.usage.map(provider_usage).transpose()?;
@@ -1239,7 +1243,7 @@ fn finish_response(
 fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
     let cached = usage.input_tokens_details.cached_tokens;
     let cache_write = usage.input_tokens_details.cache_write_tokens;
-    let cached_and_written = cached.checked_add(cache_write.unwrap_or(0)).ok_or(())?;
+    let cached_and_written = cached.checked_add(cache_write).ok_or(())?;
     let reasoning = usage.output_tokens_details.reasoning_tokens;
     let input = usage
         .input_tokens
@@ -1256,7 +1260,7 @@ fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
     Ok(
         Usage::from_optional(Some(input), Some(output), Some(reasoning))
             .with_cache_read_tokens(Some(cached))
-            .with_cache_write_tokens(cache_write)
+            .with_cache_write_tokens(Some(cache_write))
             .with_provider_total_tokens(Some(usage.total_tokens)),
     )
 }

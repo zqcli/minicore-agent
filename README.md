@@ -318,11 +318,11 @@ calls with exactly one start/end. Provider call IDs must satisfy Runtime's
 printable ASCII grammar and the OpenAI boundary of 1..=64 bytes before any
 stream Tool event is queued or any assistant ToolCall/Tool-result history is
 sent; invalid replay is a permanent `NotStarted` request error and performs no
-HTTP request. Only `response.completed` with status `completed` or
-`response.incomplete` with status `incomplete` can produce Finish; missing or
-conflicting statuses are malformed. Usage is optional and absent usage produces
-no Usage event. When present, totals and both detail objects are required, as are
-cached and reasoning counts; cache-write remains optional. Cache and reasoning
+HTTP request. `response.completed` and `response.incomplete` accept a missing or
+null status; when status is present it must respectively be `completed` or
+`incomplete`, and conflicts are malformed. Usage is optional and absent usage
+produces no Usage event. When present, totals and both detail objects are
+required, as are cached, cache-write, and reasoning counts. Cache and reasoning
 subsets may not exceed their totals, all additions must fit, and provider total
 must exactly equal input plus output. Unknown provider fields remain tolerated.
 Valid usage separates direct input/output from cache-read, cache-write, and
