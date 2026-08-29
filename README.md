@@ -81,10 +81,15 @@ rejected. Existing files and directories are canonicalized and must remain under
 the root. Symlinks that resolve inside the root may be read, while escape
 symlinks are rejected; atomic writes also reject a symlink as the final target.
 Write parents are rechecked while missing directories are created. Atomic writes
-use unique `create_new` temp files, sync file contents, rename, and sync the
-parent directory on Unix. Non-Unix platforms have no portable Tokio directory
-fsync contract. These checks prevent ordinary traversal and symlink mistakes but
-do not fully defend against a same-user process concurrently swapping path
+use short opaque `.minicore-write-<pid>-<counter>.tmp` `create_new` files, sync
+file contents, rename, and sync the parent directory on Unix. A parent-directory
+sync failure after rename returns `WorkspaceError::UnknownOutcome`: the complete
+new target may already be visible and is not rolled back. Failures before rename
+return `Unavailable` and leave an existing target unchanged. `read_text` accepts
+UTF-8 including Unicode, newlines, and tabs, but rejects NUL bytes and invalid
+UTF-8 as `Binary`. Non-Unix platforms have no portable Tokio directory-fsync
+contract. These checks prevent ordinary traversal and symlink mistakes but do
+not fully defend against a same-user process concurrently swapping path
 components between checks and filesystem operations; no `openat`/OS locking
 scheme is implemented. Workspace is not yet assembled into Agent capabilities,
 and the existing temporary Agent workspace validation remains unchanged.
