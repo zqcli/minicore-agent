@@ -1,8 +1,8 @@
 # MiniCore Agent
 
-This repository is the Phase 2 RPC-first agent core: one Rust package with a
-library API, a local Store, multiple loaded `SessionRuntime` owners, and an
-offline Fake Model/Tool test seam. It is verified against the
+This repository is the RPC-first agent core: one Rust package with a library
+API, a local Store, a rooted local Workspace, multiple loaded `SessionRuntime`
+owners, and an offline Fake Model/Tool test seam. It is verified against the
 `minicore-runtime` `dev` HEAD
 `7e85eaab18e273e43e03c50040b460f1b13f0ac9` through
 `tests/runtime_api_compile.rs`. The runtime dependency is pinned to that exact
@@ -40,8 +40,9 @@ limit. An oversized frame returns a parse error and ends the stdin loop. EOF
 performs the same graceful shutdown path. For an explicit shutdown request, the
 agent shutdown completes before its success response is written.
 
-The library exposes `AgentConfig`, `AgentError`, `Agent`, the session/turn DTOs,
-the single-consumer `AgentEventStream`, `AgentEvent`, and `run_stdio`. `Agent`
+The library exposes `AgentConfig`, `AgentError`, `Agent`, `Workspace`,
+`WorkspaceError`, the session/turn DTOs, the single-consumer `AgentEventStream`,
+`AgentEvent`, and `run_stdio`. `Agent`
 opens the local Store, manages multiple loaded SessionRuntime owners, and
 forwards typed live events while authoritative durable turn completion is obtained
 from a cloned `TurnHandle`. One outbound sequencer owns each loaded session's
@@ -74,6 +75,20 @@ conversation file is durable before the marker is published. Direct symlinks in
 the session tree, including metadata, manifest, conversation, and temp entries,
 are rejected.
 
+`Workspace::open` stores a canonical directory root. Tool-style paths are UTF-8
+relative strings; absolute paths, parent traversal, NUL, and empty file paths are
+rejected. Existing files and directories are canonicalized and must remain under
+the root. Symlinks that resolve inside the root may be read, while escape
+symlinks are rejected; atomic writes also reject a symlink as the final target.
+Write parents are rechecked while missing directories are created. Atomic writes
+use unique `create_new` temp files, sync file contents, rename, and sync the
+parent directory on Unix. Non-Unix platforms have no portable Tokio directory
+fsync contract. These checks prevent ordinary traversal and symlink mistakes but
+do not fully defend against a same-user process concurrently swapping path
+components between checks and filesystem operations; no `openat`/OS locking
+scheme is implemented. Workspace is not yet assembled into Agent capabilities,
+and the existing temporary Agent workspace validation remains unchanged.
+
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
 returns a stable not-implemented error instead of claiming availability.
@@ -91,8 +106,9 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. Workspace, real
-Tools, Context, Policy, OpenAI HTTP, and RPC method extensions remain outside
-this Phase. The offline process coverage is
+to completion before joining the worker and allowing deletion. Real Tools,
+Context, Policy, OpenAI HTTP, Workspace capability assembly, and RPC method
+extensions remain outside this Phase. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and Store
-coverage is in the internal unit tests of `src/store.rs`.
+and Workspace coverage is in the internal unit tests of `src/store.rs` and
+`src/workspace.rs`.
