@@ -1370,7 +1370,54 @@ async fn loaded_open_is_idempotent_without_reading_session_metadata() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn unloaded_open_revalidates_deleted_and_symlinked_workspace_roots() {
+async fn symlinked_workspace_inputs_persist_and_reopen_the_canonical_target() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-symlinked-workspace-input-{}",
+        SessionId::new().unwrap()
+    ));
+    let target = base.join("target");
+    let root_link = base.join("root-link");
+    tokio::fs::create_dir_all(&target).await.unwrap();
+    symlink(&target, &root_link).unwrap();
+    let canonical_target = tokio::fs::canonicalize(&target).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
+
+    let direct = agent
+        .create_session(create_request(&root_link))
+        .await
+        .unwrap();
+    let dotted = agent
+        .create_session(create_request(&root_link.join(".")))
+        .await
+        .unwrap();
+    for info in [&direct, &dotted] {
+        assert_eq!(info.workspace, canonical_target);
+        assert_eq!(
+            agent
+                .store
+                .load_record(info.session_id)
+                .await
+                .unwrap()
+                .workspace,
+            canonical_target
+        );
+        agent.close_session(info.session_id).await.unwrap();
+        let reopened = agent.open_session(info.session_id).await.unwrap();
+        assert_eq!(reopened.workspace, canonical_target);
+    }
+
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unloaded_open_revalidates_missing_and_redirected_workspace_identity() {
     use std::os::unix::fs::symlink;
 
     let base = std::env::temp_dir().join(format!(
@@ -1378,9 +1425,13 @@ async fn unloaded_open_revalidates_deleted_and_symlinked_workspace_roots() {
         SessionId::new().unwrap()
     ));
     let deleted_workspace = base.join("deleted-workspace");
-    let symlink_workspace = base.join("symlink-workspace");
+    let redirected_workspace = base.join("redirected-workspace");
+    let other_workspace = base.join("other-workspace");
     tokio::fs::create_dir_all(&deleted_workspace).await.unwrap();
-    tokio::fs::create_dir_all(&symlink_workspace).await.unwrap();
+    tokio::fs::create_dir_all(&redirected_workspace)
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&other_workspace).await.unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
     let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
         .await
@@ -1405,16 +1456,22 @@ async fn unloaded_open_revalidates_deleted_and_symlinked_workspace_roots() {
         Err(AgentError::Workspace)
     ));
 
-    let symlinked = agent
-        .create_session(create_request(&symlink_workspace))
+    let redirected = agent
+        .create_session(create_request(&redirected_workspace))
         .await
         .unwrap();
-    agent.close_session(symlinked.session_id).await.unwrap();
-    let moved = base.join("moved-workspace");
-    tokio::fs::rename(&symlink_workspace, &moved).await.unwrap();
-    symlink(&moved, &symlink_workspace).unwrap();
+    let moved_original = base.join("moved-original-workspace");
+    tokio::fs::rename(&redirected_workspace, &moved_original)
+        .await
+        .unwrap();
+    symlink(&other_workspace, &redirected_workspace).unwrap();
+    assert_eq!(
+        agent.open_session(redirected.session_id).await.unwrap(),
+        redirected
+    );
+    agent.close_session(redirected.session_id).await.unwrap();
     assert!(matches!(
-        agent.open_session(symlinked.session_id).await,
+        agent.open_session(redirected.session_id).await,
         Err(AgentError::Workspace)
     ));
     agent.shutdown().await.unwrap();

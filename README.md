@@ -75,11 +75,12 @@ conversation file is durable before the marker is published. Direct symlinks in
 the session tree, including metadata, manifest, conversation, and temp entries,
 are rejected.
 
-`Workspace::open` stores a canonical directory root and rejects a symlink as the
-root itself. Tool-style paths are UTF-8 relative strings; absolute paths, parent
-traversal, NUL, and empty file paths are rejected. Existing files and directories
-are canonicalized and must remain under the root. Symlinks that resolve inside
-the root may be read, while escape symlinks are rejected; atomic writes also
+`Workspace::open` follows symlinks in the input path, requires the resolved target
+to be a directory, and stores its canonical path. Tool-style paths are UTF-8
+relative strings; absolute paths, parent traversal, NUL, and empty file paths are
+rejected. Existing files and directories are canonicalized and must remain under
+the root. Symlinks that resolve inside the root may be read, while escape symlinks
+are rejected; atomic writes also
 reject a symlink as the final target.
 Write parents are rechecked while missing directories are created. Atomic writes
 use short opaque `.minicore-write-<pid>-<counter>.tmp` `create_new` files. A
@@ -251,14 +252,17 @@ the real commit result wins even if cancellation or the deadline becomes ready.
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
 returns a stable not-implemented error instead of claiming availability.
-For every create or unloaded open, Agent opens a fresh concrete Workspace,
-builds the profile's concrete ToolSet, conditionally creates the concrete
-Policy, always creates ProjectContext, and supplies those ports through one
+For every successful create or unloaded open, Agent opens a fresh concrete
+Workspace, builds the profile's concrete ToolSet, conditionally creates the
+concrete Policy, always creates ProjectContext, and supplies those ports through one
 `SessionBindings::new` call; compaction remains disabled with no strategy bound.
-Session records persist the canonical Workspace root; unloaded open revalidates
-it, while an already loaded open remains
-idempotent. Unknown or duplicate profile Tool names fail configuration before
-Store/session startup. Offline loop tests inject only a Fake Model: Workspace,
+Session records persist the canonical Workspace root as durable identity.
+Unloaded open requires the freshly canonicalized root to equal that stored path,
+so replacing it with a symlink or other redirection to a different directory is
+rejected before capability construction; an already loaded open remains
+idempotent without filesystem I/O. Unknown or duplicate profile Tool names fail
+configuration before Store/session startup. Offline loop tests inject only a
+Fake Model: Workspace,
 Tools, Policy, and Context are the production implementations. Store
 assumes one process per data directory and does not implement file locks.
 Loading currently reads the complete log into memory; v0.1 defines no production
