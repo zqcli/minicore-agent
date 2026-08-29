@@ -439,6 +439,16 @@ fn assert_error(response: &Value, code: i64, kind: &str) {
     assert!(response["error"]["data"]["retryable"].is_boolean());
 }
 
+fn contains_key(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key(key) || object.values().any(|value| contains_key(value, key))
+        }
+        Value::Array(values) => values.iter().any(|value| contains_key(value, key)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
 async fn remove_base(path: &Path) {
     let _ = tokio::fs::remove_dir_all(path).await;
 }
@@ -1340,6 +1350,34 @@ async fn model_info_errors_and_events_never_serialize_secrets() {
     let outcome = rpc.response(json!("wait-error")).await;
     assert!(outcome["result"]["terminal"]["failed"]["diagnostic"].is_object());
     rpc.event("turn_finished").await;
+
+    rpc.send(
+        json!("transcript"),
+        "session.transcript",
+        Some(json!({"session_id": session_id, "limit": 100})),
+    )
+    .await;
+    let transcript = rpc.response(json!("transcript")).await;
+    let page = &transcript["result"];
+    assert!(page["entries"].as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.get("user_message").is_some())
+            && entries
+                .iter()
+                .any(|entry| entry.get("assistant_message").is_some())
+            && entries
+                .iter()
+                .any(|entry| entry.get("tool_result").is_some())
+            && entries
+                .iter()
+                .any(|entry| entry.get("turn_terminal").is_some())
+    }));
+    assert!(page.get("next_after").is_some());
+    assert!(page.get("observed_head").is_some());
+    assert_eq!(page["complete"], true);
+    assert!(!contains_key(page, "arguments"));
+    assert!(!contains_key(page, "message"));
 
     let encoded = serde_json::to_string(&rpc.observed).unwrap();
     for secret in [

@@ -4,14 +4,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
-use minicore_runtime::conversation::ConversationSeq;
-use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
+use minicore_runtime::conversation::{ConversationEntry, ConversationSeq, TranscriptPage};
+use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
+use minicore_runtime::model::{ModelFinishReason, ReasoningPreference, Usage};
 use minicore_runtime::session::InteractionAnswer;
-use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer};
+use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer, ToolResultOutcome};
 use minicore_runtime::value::BoundedText;
 
 use crate::agent::{CreateSession, SessionInfo, TurnRef};
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, TurnTerminalView};
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
 
@@ -286,6 +287,166 @@ impl OkResult {
     pub(crate) const TRUE: Self = Self { ok: true };
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct TranscriptPageView {
+    entries: Vec<ConversationEntryView>,
+    next_after: Option<ConversationSeq>,
+    observed_head: ConversationSeq,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConversationEntryView {
+    UserMessage(UserMessageView),
+    AssistantMessage(AssistantMessageView),
+    ToolResult(ToolResultView),
+    Summary(SummaryView),
+    TurnTerminal(TurnTerminalEntryView),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct UserMessageView {
+    seq: ConversationSeq,
+    turn_id: TurnId,
+    text: String,
+    execution: TurnExecutionView,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TurnExecutionView {
+    model: String,
+    reasoning: ReasoningPreference,
+    max_tool_rounds: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AssistantMessageView {
+    seq: ConversationSeq,
+    turn_id: TurnId,
+    model: String,
+    text: Option<String>,
+    reasoning: Option<String>,
+    tool_calls: Vec<ToolCallView>,
+    usage: Usage,
+    finish_reason: ModelFinishReason,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ToolCallView {
+    tool_call_id: ToolCallId,
+    name: String,
+    call_index: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ToolResultView {
+    seq: ConversationSeq,
+    turn_id: TurnId,
+    tool_call_id: ToolCallId,
+    tool_name: String,
+    outcome: ToolResultOutcome,
+    content: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SummaryView {
+    seq: ConversationSeq,
+    through: ConversationSeq,
+    summary: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TurnTerminalEntryView {
+    seq: ConversationSeq,
+    turn_id: TurnId,
+    terminal: TurnTerminalView,
+    usage: Usage,
+    created_at: String,
+}
+
+impl From<TranscriptPage> for TranscriptPageView {
+    fn from(page: TranscriptPage) -> Self {
+        Self {
+            entries: page
+                .entries
+                .into_iter()
+                .map(ConversationEntryView::from)
+                .collect(),
+            next_after: page.next_after,
+            observed_head: page.observed_head,
+            complete: page.complete,
+        }
+    }
+}
+
+impl From<ConversationEntry> for ConversationEntryView {
+    fn from(entry: ConversationEntry) -> Self {
+        match entry {
+            ConversationEntry::UserMessage(entry) => Self::UserMessage(UserMessageView {
+                seq: entry.seq,
+                turn_id: entry.turn_id,
+                text: entry.input.text.as_str().to_owned(),
+                execution: TurnExecutionView {
+                    model: entry.execution.model.as_str().to_owned(),
+                    reasoning: entry.execution.reasoning,
+                    max_tool_rounds: entry.execution.max_tool_rounds,
+                },
+                created_at: entry.created_at.as_str().to_owned(),
+            }),
+            ConversationEntry::AssistantMessage(entry) => {
+                Self::AssistantMessage(AssistantMessageView {
+                    seq: entry.seq,
+                    turn_id: entry.turn_id,
+                    model: entry.model.as_str().to_owned(),
+                    text: entry.text.map(|text| text.as_str().to_owned()),
+                    reasoning: entry
+                        .reasoning
+                        .map(|reasoning| reasoning.as_str().to_owned()),
+                    tool_calls: entry
+                        .tool_calls
+                        .into_iter()
+                        .map(|call| ToolCallView {
+                            tool_call_id: call.tool_call_id().clone(),
+                            name: call.name().as_str().to_owned(),
+                            call_index: call.call_index(),
+                        })
+                        .collect(),
+                    usage: entry.usage,
+                    finish_reason: entry.finish_reason,
+                    created_at: entry.created_at.as_str().to_owned(),
+                })
+            }
+            ConversationEntry::ToolResult(entry) => Self::ToolResult(ToolResultView {
+                seq: entry.seq,
+                turn_id: entry.turn_id,
+                tool_call_id: entry.tool_call_id,
+                tool_name: entry.tool_name.as_str().to_owned(),
+                outcome: entry.outcome,
+                content: entry.content.as_str().to_owned(),
+                created_at: entry.created_at.as_str().to_owned(),
+            }),
+            ConversationEntry::Summary(entry) => Self::Summary(SummaryView {
+                seq: entry.seq,
+                through: entry.through,
+                summary: entry.summary.as_str().to_owned(),
+                created_at: entry.created_at.as_str().to_owned(),
+            }),
+            ConversationEntry::TurnTerminal(entry) => Self::TurnTerminal(TurnTerminalEntryView {
+                seq: entry.seq,
+                turn_id: entry.turn_id,
+                terminal: TurnTerminalView::from(&entry.terminal),
+                usage: entry.usage,
+                created_at: entry.created_at.as_str().to_owned(),
+            }),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct RpcResponse {
     pub(crate) jsonrpc: &'static str,
@@ -370,5 +531,187 @@ impl AgentEventNotification {
             method: "agent.event",
             params: event,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn transcript_view_has_stable_safe_shape_for_every_entry_variant() {
+        let turn_id = "trn_00000000000000000000000000000001";
+        let timestamp = "2026-01-02T03:04:05.006Z";
+        let page: TranscriptPage = serde_json::from_value(json!({
+            "entries": [
+                {
+                    "user_message": {
+                        "seq": 1,
+                        "turn_id": turn_id,
+                        "input": {"text": "user text"},
+                        "execution": {
+                            "model": "fake",
+                            "reasoning": "medium",
+                            "max_tool_rounds": 8
+                        },
+                        "created_at": timestamp
+                    }
+                },
+                {
+                    "assistant_message": {
+                        "seq": 2,
+                        "turn_id": turn_id,
+                        "model": "fake",
+                        "text": "assistant text",
+                        "reasoning": "assistant reasoning",
+                        "tool_calls": [{
+                            "tool_call_id": "call-1",
+                            "name": "write",
+                            "arguments": {"content": "TRANSCRIPT-ARGUMENT-SECRET"},
+                            "call_index": 0
+                        }],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "reasoning_tokens": 3
+                        },
+                        "finish_reason": "tool_calls",
+                        "created_at": timestamp
+                    }
+                },
+                {
+                    "tool_result": {
+                        "seq": 3,
+                        "turn_id": turn_id,
+                        "tool_call_id": "call-1",
+                        "tool_name": "write",
+                        "outcome": "denied",
+                        "content": "durable tool result",
+                        "created_at": timestamp
+                    }
+                },
+                {
+                    "summary": {
+                        "seq": 4,
+                        "through": 3,
+                        "summary": "durable summary",
+                        "created_at": timestamp
+                    }
+                },
+                {
+                    "turn_terminal": {
+                        "seq": 5,
+                        "turn_id": turn_id,
+                        "terminal": {
+                            "failed": {
+                                "diagnostic": {
+                                    "code": "model_unavailable",
+                                    "category": "model",
+                                    "message": "TRANSCRIPT-DIAGNOSTIC-SECRET",
+                                    "retryable": false
+                                }
+                            }
+                        },
+                        "usage": {
+                            "input_tokens": 4,
+                            "output_tokens": 5,
+                            "reasoning_tokens": 6
+                        },
+                        "created_at": timestamp
+                    }
+                }
+            ],
+            "next_after": 5,
+            "observed_head": 5,
+            "complete": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(TranscriptPageView::from(page)).unwrap(),
+            json!({
+                "entries": [
+                    {
+                        "user_message": {
+                            "seq": 1,
+                            "turn_id": turn_id,
+                            "text": "user text",
+                            "execution": {
+                                "model": "fake",
+                                "reasoning": "medium",
+                                "max_tool_rounds": 8
+                            },
+                            "created_at": timestamp
+                        }
+                    },
+                    {
+                        "assistant_message": {
+                            "seq": 2,
+                            "turn_id": turn_id,
+                            "model": "fake",
+                            "text": "assistant text",
+                            "reasoning": "assistant reasoning",
+                            "tool_calls": [{
+                                "tool_call_id": "call-1",
+                                "name": "write",
+                                "call_index": 0
+                            }],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 2,
+                                "reasoning_tokens": 3
+                            },
+                            "finish_reason": "tool_calls",
+                            "created_at": timestamp
+                        }
+                    },
+                    {
+                        "tool_result": {
+                            "seq": 3,
+                            "turn_id": turn_id,
+                            "tool_call_id": "call-1",
+                            "tool_name": "write",
+                            "outcome": "denied",
+                            "content": "durable tool result",
+                            "created_at": timestamp
+                        }
+                    },
+                    {
+                        "summary": {
+                            "seq": 4,
+                            "through": 3,
+                            "summary": "durable summary",
+                            "created_at": timestamp
+                        }
+                    },
+                    {
+                        "turn_terminal": {
+                            "seq": 5,
+                            "turn_id": turn_id,
+                            "terminal": {
+                                "failed": {
+                                    "diagnostic": {
+                                        "code": "model_unavailable",
+                                        "category": "model",
+                                        "retryable": false
+                                    }
+                                }
+                            },
+                            "usage": {
+                                "input_tokens": 4,
+                                "output_tokens": 5,
+                                "reasoning_tokens": 6
+                            },
+                            "created_at": timestamp
+                        }
+                    }
+                ],
+                "next_after": 5,
+                "observed_head": 5,
+                "complete": false
+            })
+        );
     }
 }

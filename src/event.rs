@@ -386,7 +386,7 @@ pub(crate) struct SessionStateView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-struct DiagnosticView {
+pub(crate) struct DiagnosticView {
     code: DiagnosticCode,
     category: DiagnosticCategory,
     retryable: bool,
@@ -394,7 +394,7 @@ struct DiagnosticView {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum TurnTerminalView {
+pub(crate) enum TurnTerminalView {
     Completed,
     Failed { diagnostic: DiagnosticView },
     CancelledByUser,
