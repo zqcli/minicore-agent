@@ -120,6 +120,18 @@ impl Workspace {
         path: &str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, WorkspaceError> {
+        let (bytes, truncated) = self.read_prefix(path, max_bytes).await?;
+        if truncated {
+            return Err(WorkspaceError::TooLarge);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) async fn read_prefix(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), WorkspaceError> {
         let resolved = self.resolve_existing(path).await?;
         let metadata = fs::symlink_metadata(&resolved)
             .await
@@ -131,9 +143,6 @@ impl Workspace {
             return Err(WorkspaceError::NotFile);
         }
         let maximum = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-        if metadata.len() > maximum {
-            return Err(WorkspaceError::TooLarge);
-        }
         let file = File::open(&resolved)
             .await
             .map_err(|error| map_read_error(error, WorkspaceError::NotFile))?;
@@ -146,10 +155,9 @@ impl Workspace {
             .read_to_end(&mut bytes)
             .await
             .map_err(|_| WorkspaceError::Unavailable)?;
-        if bytes.len() > max_bytes {
-            return Err(WorkspaceError::TooLarge);
-        }
-        Ok(bytes)
+        let read_truncated = bytes.len() > max_bytes;
+        bytes.truncate(max_bytes);
+        Ok((bytes, read_truncated))
     }
 
     pub(crate) async fn read_text(
@@ -454,7 +462,7 @@ fn map_read_error(error: io::Error, wrong_type: WorkspaceError) -> WorkspaceErro
 }
 
 #[cfg(test)]
-fn fail_next_before_rename(target: PathBuf) {
+pub(crate) fn fail_next_before_rename(target: PathBuf) {
     BEFORE_RENAME_FAILURES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -476,7 +484,7 @@ fn should_fail_before_rename(target: &Path) -> bool {
 }
 
 #[cfg(test)]
-fn fail_next_directory_sync(path: PathBuf) {
+pub(crate) fn fail_next_directory_sync(path: PathBuf) {
     DIRECTORY_SYNC_FAILURES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
