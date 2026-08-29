@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -10,13 +11,14 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::time::Instant as TokioInstant;
+use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-use minicore_runtime::ids::ToolCallId;
+use minicore_runtime::ids::{SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     AssistantPart, DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError,
     ModelErrorKind, ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelRequest,
-    ModelStartFuture, ModelStream, ReasoningPreference, Usage,
+    ModelStartFuture, ModelStream, ReasoningPreference, RetryHint, Usage,
 };
 use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES};
@@ -30,6 +32,9 @@ const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_SSE_FRAMES: usize = 4_096;
 const MAX_EVENT_BYTES: usize = minicore_runtime::model::MAX_MODEL_EVENT_TEXT_BYTES;
 const MAX_OPENAI_CALL_ID_BYTES: usize = 64;
+const MAX_CONTINUATION_ITEMS_PER_ROUND: usize = 256;
+const MAX_CONTINUATION_BYTES_PER_TURN: usize = 4 * 1024 * 1024;
+const MAX_ACTIVE_CONTINUATIONS: usize = 256;
 
 pub(super) struct OpenAiResponsesSettings {
     pub(super) model_ref: ModelRef,
@@ -43,6 +48,58 @@ pub(super) struct OpenAiResponsesSettings {
     pub(super) request_timeout: Option<Duration>,
 }
 
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TurnKey {
+    instance_id: SessionInstanceId,
+    turn_id: TurnId,
+}
+
+struct TurnContinuation {
+    cancellation: CancellationToken,
+    updated_at: Instant,
+    total_output_item_bytes: usize,
+    rounds: Vec<ProviderRoundReplay>,
+}
+
+#[derive(Clone)]
+struct ProviderRoundReplay {
+    round: u16,
+    tool_call_ids: Vec<ToolCallId>,
+    output_items: Arc<[Value]>,
+    output_item_bytes: usize,
+}
+
+type ContinuationStore = Arc<Mutex<HashMap<TurnKey, TurnContinuation>>>;
+
+fn remove_oldest_continuation(continuations: &mut HashMap<TurnKey, TurnContinuation>) -> bool {
+    let oldest_key = continuations
+        .iter()
+        .map(|(key, continuation)| (*key, continuation.updated_at))
+        .min_by_key(|(key, updated_at)| (*updated_at, *key))
+        .map(|(key, _)| key);
+    let Some(oldest_key) = oldest_key else {
+        return false;
+    };
+    continuations.remove(&oldest_key);
+    true
+}
+
+fn trim_active_continuations(continuations: &mut HashMap<TurnKey, TurnContinuation>) {
+    while continuations.len() > MAX_ACTIVE_CONTINUATIONS {
+        if !remove_oldest_continuation(continuations) {
+            break;
+        }
+    }
+}
+
+fn make_room_for_continuation(continuations: &mut HashMap<TurnKey, TurnContinuation>) {
+    while continuations.len() >= MAX_ACTIVE_CONTINUATIONS {
+        if !remove_oldest_continuation(continuations) {
+            break;
+        }
+    }
+}
+
 pub(super) struct OpenAiResponsesModel {
     descriptor: ModelDescriptor,
     client: reqwest::Client,
@@ -50,6 +107,7 @@ pub(super) struct OpenAiResponsesModel {
     provider_model: String,
     authorization: HeaderValue,
     output_budget_tokens: u32,
+    continuations: ContinuationStore,
 }
 
 impl OpenAiResponsesModel {
@@ -79,19 +137,30 @@ impl OpenAiResponsesModel {
             provider_model: settings.provider_model,
             authorization,
             output_budget_tokens: settings.output_budget_tokens,
+            continuations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     fn build_request(&self, request: &ModelRequest) -> Result<Vec<u8>, ModelError> {
+        self.build_request_with_replay(request, &[])
+            .map(|(encoded, _)| encoded)
+    }
+
+    fn build_request_with_replay(
+        &self,
+        request: &ModelRequest,
+        replay: &[ProviderRoundReplay],
+    ) -> Result<(Vec<u8>, Vec<u16>), ModelError> {
         if !self.descriptor.supports_reasoning(request.reasoning())
             || (!request.tools().is_empty() && !self.descriptor.supports_tools)
         {
             return Err(local_error(ModelErrorKind::InvalidRequest));
         }
-        let body = ResponsesRequest::from_runtime(
+        let (body, matched_replay_rounds) = ResponsesRequest::from_runtime(
             &self.provider_model,
             self.output_budget_tokens,
             request,
+            replay,
         )?;
         let encoded =
             serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
@@ -99,21 +168,109 @@ impl OpenAiResponsesModel {
         if estimated_tokens > self.descriptor.context_window {
             return Err(local_error(ModelErrorKind::ContextOverflow));
         }
-        Ok(encoded)
+        Ok((encoded, matched_replay_rounds))
+    }
+
+    fn continuation_snapshot(
+        &self,
+        key: TurnKey,
+        round: u16,
+        enabled: bool,
+    ) -> Result<Vec<ProviderRoundReplay>, ModelError> {
+        let mut continuations = self
+            .continuations
+            .lock()
+            .map_err(|_| local_error(ModelErrorKind::Internal))?;
+        continuations.retain(|_, continuation| !continuation.cancellation.is_cancelled());
+        if round == 0 || !enabled {
+            continuations.remove(&key);
+        }
+        trim_active_continuations(&mut continuations);
+        if !enabled {
+            return Ok(Vec::new());
+        }
+        let Some(continuation) = continuations.get(&key) else {
+            return Ok(Vec::new());
+        };
+        let next_round = continuation
+            .rounds
+            .iter()
+            .map(|replay| replay.round)
+            .max()
+            .and_then(|highest| highest.checked_add(1));
+        if next_round != Some(round) {
+            continuations.remove(&key);
+            return Ok(Vec::new());
+        }
+        let recomputed_total = continuation
+            .rounds
+            .iter()
+            .try_fold(0_usize, |total, replay| {
+                total.checked_add(replay.output_item_bytes).ok_or(())
+            });
+        if recomputed_total != Ok(continuation.total_output_item_bytes)
+            || continuation.total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_TURN
+        {
+            continuations.remove(&key);
+            return Err(local_error(ModelErrorKind::Internal));
+        }
+        let mut snapshot = continuations
+            .get(&key)
+            .into_iter()
+            .flat_map(|continuation| continuation.rounds.iter())
+            .filter(|replay| replay.round < round)
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshot.sort_by_key(|replay| replay.round);
+        Ok(snapshot)
+    }
+
+    fn remove_continuation(&self, key: TurnKey) {
+        let Ok(mut continuations) = self.continuations.lock() else {
+            return;
+        };
+        continuations.remove(&key);
     }
 
     async fn start_request(
         &self,
         request: ModelRequest,
         context: ModelCallContext,
+        turn_key: TurnKey,
+        continuation_enabled: bool,
     ) -> Result<ModelStream, ModelError> {
+        let round = context.round;
+        let replay = self.continuation_snapshot(turn_key, round, continuation_enabled)?;
         if context.cancellation.is_cancelled() {
             return Err(local_error(ModelErrorKind::Cancelled));
         }
         if Instant::now() >= context.deadline {
             return Err(local_error(ModelErrorKind::Timeout));
         }
-        let body = self.build_request(&request)?;
+        let (body, matched_replay_rounds) = if replay.is_empty() {
+            (self.build_request(&request)?, Vec::new())
+        } else {
+            self.build_request_with_replay(&request, &replay)?
+        };
+        let mut matched_round_ids = BTreeSet::new();
+        let prior_output_item_bytes =
+            matched_replay_rounds
+                .iter()
+                .try_fold(0_usize, |total, matched_round| {
+                    if !matched_round_ids.insert(*matched_round) {
+                        return Err(local_error(ModelErrorKind::Internal));
+                    }
+                    let replay = replay
+                        .iter()
+                        .find(|replay| replay.round == *matched_round)
+                        .ok_or_else(|| local_error(ModelErrorKind::Internal))?;
+                    total
+                        .checked_add(replay.output_item_bytes)
+                        .ok_or_else(|| local_error(ModelErrorKind::Internal))
+                })?;
+        if prior_output_item_bytes > MAX_CONTINUATION_BYTES_PER_TURN {
+            return Err(local_error(ModelErrorKind::Internal));
+        }
         let request = self
             .client
             .post(self.endpoint.clone())
@@ -166,7 +323,14 @@ impl OpenAiResponsesModel {
         }
 
         let bytes: ByteStream = Box::pin(response.bytes_stream());
-        let state = StreamState::new(bytes, cancellation, deadline);
+        let continuation = continuation_enabled.then(|| StreamContinuation {
+            round,
+            cancellation: cancellation.clone(),
+            prior_output_item_bytes,
+            matched_replay_rounds,
+            guard: ContinuationGuard::new(Arc::clone(&self.continuations), turn_key),
+        });
+        let state = StreamState::new_with_continuation(bytes, cancellation, deadline, continuation);
         Ok(Box::pin(stream::unfold(state, next_stream_event)))
     }
 }
@@ -181,7 +345,24 @@ impl Model for OpenAiResponsesModel {
         request: ModelRequest,
         context: ModelCallContext,
     ) -> ModelStartFuture<'a> {
-        Box::pin(self.start_request(request, context))
+        let turn_key = TurnKey {
+            instance_id: context.instance_id,
+            turn_id: context.turn_id,
+        };
+        let continuation_enabled = request.reasoning() != ReasoningPreference::Disabled;
+        Box::pin(async move {
+            let result = self
+                .start_request(request, context, turn_key, continuation_enabled)
+                .await;
+            if let Err(error) = &result {
+                let preserve = error.delivery() == DeliveryState::NotStarted
+                    && matches!(error.retry_hint(), RetryHint::Retryable { .. });
+                if continuation_enabled && !preserve {
+                    self.remove_continuation(turn_key);
+                }
+            }
+            result
+        })
     }
 }
 
@@ -220,8 +401,12 @@ impl<'a> ResponsesRequest<'a> {
         model: &'a str,
         output_budget_tokens: u32,
         request: &ModelRequest,
-    ) -> Result<Self, ModelError> {
+        replay: &[ProviderRoundReplay],
+    ) -> Result<(Self, Vec<u16>), ModelError> {
         let mut input = Vec::new();
+        let mut seen_tool_call_groups = BTreeSet::<Vec<ToolCallId>>::new();
+        let mut used_replays = BTreeSet::<usize>::new();
+        let mut matched_replay_rounds = Vec::new();
         for (message_index, message) in request.messages().iter().enumerate() {
             match message {
                 ModelMessage::System(text) => input.push(InputItem::Message(InputMessage {
@@ -247,6 +432,35 @@ impl<'a> ResponsesRequest<'a> {
                     id: None,
                 })),
                 ModelMessage::Assistant(parts) => {
+                    let tool_call_ids = parts
+                        .iter()
+                        .filter_map(AssistantPart::as_tool_call)
+                        .map(|call| call.tool_call_id().clone())
+                        .collect::<Vec<_>>();
+                    if !tool_call_ids.is_empty() {
+                        if !seen_tool_call_groups.insert(tool_call_ids.clone()) {
+                            return Err(local_error(ModelErrorKind::InvalidRequest));
+                        }
+                        if let Some((replay_index, provider_replay)) = replay
+                            .iter()
+                            .enumerate()
+                            .find(|(replay_index, provider_replay)| {
+                                !used_replays.contains(replay_index)
+                                    && provider_replay.tool_call_ids == tool_call_ids
+                            })
+                        {
+                            used_replays.insert(replay_index);
+                            matched_replay_rounds.push(provider_replay.round);
+                            input.extend(
+                                provider_replay
+                                    .output_items
+                                    .iter()
+                                    .cloned()
+                                    .map(InputItem::Raw),
+                            );
+                            continue;
+                        }
+                    }
                     for (part_index, part) in parts.iter().enumerate() {
                         match part {
                             AssistantPart::Text(text) => {
@@ -312,22 +526,26 @@ impl<'a> ResponsesRequest<'a> {
                 summary: Some("auto"),
             }),
         };
-        Ok(Self {
-            model,
-            input,
-            tools,
-            stream: true,
-            store: false,
-            truncation: "disabled",
-            max_output_tokens: output_budget_tokens,
-            reasoning,
-        })
+        Ok((
+            Self {
+                model,
+                input,
+                tools,
+                stream: true,
+                store: false,
+                truncation: "disabled",
+                max_output_tokens: output_budget_tokens,
+                reasoning,
+            },
+            matched_replay_rounds,
+        ))
     }
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
 enum InputItem {
+    Raw(Value),
     Message(InputMessage),
     FunctionCall(FunctionCallInput),
     FunctionCallOutput(FunctionCallOutputInput),
@@ -634,6 +852,50 @@ fn classify_send_error(error: reqwest::Error) -> ModelError {
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
+struct ContinuationGuard {
+    store: ContinuationStore,
+    key: TurnKey,
+    preserve: bool,
+}
+
+impl ContinuationGuard {
+    fn new(store: ContinuationStore, key: TurnKey) -> Self {
+        Self {
+            store,
+            key,
+            preserve: false,
+        }
+    }
+
+    fn clear(&self) -> Result<(), ()> {
+        self.store.lock().map_err(|_| ())?.remove(&self.key);
+        Ok(())
+    }
+
+    fn preserve(&mut self) {
+        self.preserve = true;
+    }
+}
+
+impl Drop for ContinuationGuard {
+    fn drop(&mut self) {
+        if self.preserve {
+            return;
+        }
+        if let Ok(mut continuations) = self.store.lock() {
+            continuations.remove(&self.key);
+        }
+    }
+}
+
+struct StreamContinuation {
+    round: u16,
+    cancellation: CancellationToken,
+    prior_output_item_bytes: usize,
+    matched_replay_rounds: Vec<u16>,
+    guard: ContinuationGuard,
+}
+
 struct StreamState {
     bytes: ByteStream,
     cancellation: tokio_util::sync::CancellationToken,
@@ -642,8 +904,13 @@ struct StreamState {
     pending: VecDeque<Result<ModelEvent, ModelError>>,
     tools: BTreeMap<u32, ToolState>,
     tool_ids: BTreeSet<ToolCallId>,
+    output_item_indexes: BTreeSet<u32>,
+    output_items: Option<BTreeMap<u32, Value>>,
+    output_item_bytes: usize,
+    continuation: Option<StreamContinuation>,
     provider_event_seen: bool,
     semantic_seen: bool,
+    reasoning_seen: bool,
     refusal_seen: bool,
     terminal_seen: bool,
     done: bool,
@@ -659,11 +926,22 @@ struct ToolState {
 }
 
 impl StreamState {
+    #[cfg(test)]
     fn new(
         bytes: ByteStream,
         cancellation: tokio_util::sync::CancellationToken,
         deadline: TokioInstant,
     ) -> Self {
+        Self::new_with_continuation(bytes, cancellation, deadline, None)
+    }
+
+    fn new_with_continuation(
+        bytes: ByteStream,
+        cancellation: tokio_util::sync::CancellationToken,
+        deadline: TokioInstant,
+        continuation: Option<StreamContinuation>,
+    ) -> Self {
+        let output_items = continuation.as_ref().map(|_| BTreeMap::new());
         Self {
             bytes,
             cancellation,
@@ -672,8 +950,13 @@ impl StreamState {
             pending: VecDeque::new(),
             tools: BTreeMap::new(),
             tool_ids: BTreeSet::new(),
+            output_item_indexes: BTreeSet::new(),
+            output_items,
+            output_item_bytes: 0,
+            continuation,
             provider_event_seen: false,
             semantic_seen: false,
+            reasoning_seen: false,
             refusal_seen: false,
             terminal_seen: false,
             done: false,
@@ -686,6 +969,7 @@ impl StreamState {
     }
 
     fn fail(&mut self, error: ModelError) {
+        let _ = self.clear_continuation();
         self.done = true;
         self.pending.push_back(Err(error));
     }
@@ -696,6 +980,153 @@ impl StreamState {
             self.provider_event_seen,
         );
         self.fail(error);
+    }
+
+    fn prior_output_item_bytes(&self) -> usize {
+        self.continuation
+            .as_ref()
+            .map_or(0, |continuation| continuation.prior_output_item_bytes)
+    }
+
+    fn validate_continuation_bytes(&self, output_item_bytes: usize) -> Result<(), ()> {
+        let total = self
+            .prior_output_item_bytes()
+            .checked_add(output_item_bytes)
+            .ok_or(())?;
+        if total > MAX_CONTINUATION_BYTES_PER_TURN {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn finalize_output_items(&mut self, terminal_output: Option<Vec<Value>>) -> Result<(), ()> {
+        let Some(done_items) = self.output_items.as_ref() else {
+            return Ok(());
+        };
+        let Some(terminal_output) = terminal_output else {
+            return Ok(());
+        };
+        if terminal_output.len() > MAX_CONTINUATION_ITEMS_PER_ROUND
+            || terminal_output
+                .iter()
+                .any(|item| validate_output_item(item).is_err())
+        {
+            return Err(());
+        }
+        let output_item_bytes = serialized_output_item_bytes(terminal_output.iter())?;
+        self.validate_continuation_bytes(output_item_bytes)?;
+        for (output_index, done_item) in done_items {
+            let output_index = usize::try_from(*output_index).map_err(|_| ())?;
+            if terminal_output.get(output_index) != Some(done_item) {
+                return Err(());
+            }
+        }
+        let output_items = terminal_output
+            .into_iter()
+            .enumerate()
+            .map(|(output_index, item)| {
+                u32::try_from(output_index)
+                    .map(|output_index| (output_index, item))
+                    .map_err(|_| ())
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        self.output_item_indexes = output_items.keys().copied().collect();
+        self.output_items = Some(output_items);
+        self.output_item_bytes = output_item_bytes;
+        Ok(())
+    }
+
+    fn save_tool_round(&mut self) -> Result<(), ()> {
+        let Some(continuation) = self.continuation.as_ref() else {
+            return Ok(());
+        };
+        let output_items = self.output_items.as_ref().ok_or(())?;
+        if self.reasoning_seen
+            && !output_items
+                .values()
+                .any(|item| item_type(item) == Some("reasoning"))
+        {
+            return Err(());
+        }
+        let output_item_bytes = serialized_output_item_bytes(output_items.values())?;
+        if output_item_bytes != self.output_item_bytes {
+            return Err(());
+        }
+        self.validate_continuation_bytes(output_item_bytes)?;
+        for (output_index, item) in output_items {
+            if item_type(item) != Some("function_call") {
+                continue;
+            }
+            let tool = self.tools.get(output_index).ok_or(())?;
+            let item: FunctionCallItem = from_value(item.clone())?;
+            if item.call_id.as_str() != tool.tool_call_id.as_str()
+                || item.name.as_str() != tool.name.as_str()
+                || item.arguments.as_str() != tool.arguments.as_str()
+            {
+                return Err(());
+            }
+        }
+        for output_index in self.tools.keys() {
+            if output_items.get(output_index).and_then(item_type) != Some("function_call") {
+                return Err(());
+            }
+        }
+        let replay = ProviderRoundReplay {
+            round: continuation.round,
+            tool_call_ids: self
+                .tools
+                .values()
+                .map(|tool| tool.tool_call_id.clone())
+                .collect(),
+            output_items: output_items.values().cloned().collect::<Vec<_>>().into(),
+            output_item_bytes,
+        };
+        let updated_at = Instant::now();
+        {
+            let mut continuations = continuation.guard.store.lock().map_err(|_| ())?;
+            let existing_rounds = continuations
+                .get(&continuation.guard.key)
+                .map(|continuation| continuation.rounds.clone());
+            let key_exists = existing_rounds.is_some();
+            let mut rounds = existing_rounds.unwrap_or_default();
+            rounds.retain(|existing| {
+                existing.round != replay.round
+                    && continuation.matched_replay_rounds.contains(&existing.round)
+            });
+            rounds.push(replay);
+            rounds.sort_by_key(|replay| replay.round);
+            let total_output_item_bytes = rounds.iter().try_fold(0_usize, |total, replay| {
+                total.checked_add(replay.output_item_bytes).ok_or(())
+            })?;
+            if total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_TURN {
+                return Err(());
+            }
+            if !key_exists {
+                make_room_for_continuation(&mut continuations);
+            }
+            let turn_continuation =
+                continuations
+                    .entry(continuation.guard.key)
+                    .or_insert_with(|| TurnContinuation {
+                        cancellation: continuation.cancellation.clone(),
+                        updated_at,
+                        total_output_item_bytes,
+                        rounds: Vec::new(),
+                    });
+            turn_continuation.cancellation = continuation.cancellation.clone();
+            turn_continuation.updated_at = updated_at.max(turn_continuation.updated_at);
+            turn_continuation.total_output_item_bytes = total_output_item_bytes;
+            turn_continuation.rounds = rounds;
+        }
+        self.continuation.as_mut().ok_or(())?.guard.preserve();
+        Ok(())
+    }
+
+    fn clear_continuation(&self) -> Result<(), ()> {
+        let Some(continuation) = self.continuation.as_ref() else {
+            return Ok(());
+        };
+        continuation.guard.clear()
     }
 }
 
@@ -879,6 +1310,7 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             let event: DeltaEvent = from_value(value)?;
             queue_text(state, event.delta, true)?;
+            state.reasoning_seen = true;
         }
         "response.output_item.added" => {
             let event: OutputItemEvent = from_value(value)?;
@@ -897,6 +1329,7 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         }
         "response.output_item.done" => {
             let event: OutputItemEvent = from_value(value)?;
+            capture_output_item(state, event.output_index, &event.item)?;
             if item_type(&event.item) == Some("function_call") {
                 let item: FunctionCallItem = from_value(event.item)?;
                 finish_tool_item(state, event.output_index, item)?;
@@ -921,6 +1354,56 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
 
 fn item_type(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
+}
+
+fn capture_output_item(state: &mut StreamState, output_index: u32, item: &Value) -> Result<(), ()> {
+    validate_output_item(item)?;
+    if state.output_item_indexes.contains(&output_index)
+        || state
+            .output_items
+            .as_ref()
+            .is_some_and(|items| items.len() >= MAX_CONTINUATION_ITEMS_PER_ROUND)
+    {
+        return Err(());
+    }
+    let output_item_bytes = if state.output_items.is_some() {
+        let item_bytes = serialized_output_item_len(item)?;
+        let output_item_bytes = state.output_item_bytes.checked_add(item_bytes).ok_or(())?;
+        state.validate_continuation_bytes(output_item_bytes)?;
+        Some(output_item_bytes)
+    } else {
+        None
+    };
+    state.output_item_indexes.insert(output_index);
+    if let Some(output_items) = state.output_items.as_mut() {
+        output_items.insert(output_index, item.clone());
+        state.output_item_bytes = output_item_bytes.ok_or(())?;
+    }
+    Ok(())
+}
+
+fn validate_output_item(item: &Value) -> Result<(), ()> {
+    if item.is_object() && item_type(item).is_some() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn serialized_output_item_len(item: &Value) -> Result<usize, ()> {
+    serde_json::to_vec(item)
+        .map(|encoded| encoded.len())
+        .map_err(|_| ())
+}
+
+fn serialized_output_item_bytes<'a>(
+    items: impl IntoIterator<Item = &'a Value>,
+) -> Result<usize, ()> {
+    items.into_iter().try_fold(0_usize, |total, item| {
+        total
+            .checked_add(serialized_output_item_len(item)?)
+            .ok_or(())
+    })
 }
 
 fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, ()> {
@@ -971,6 +1454,8 @@ struct ProviderResponse {
     usage: Option<ProviderUsage>,
     #[serde(default)]
     incomplete_details: Option<IncompleteDetails>,
+    #[serde(default)]
+    output: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize)]
@@ -1212,10 +1697,7 @@ fn finish_response(
         return Err(());
     }
     let usage = response.usage.map(provider_usage).transpose()?;
-    state.terminal_seen = true;
-    if let Some(usage) = usage {
-        state.queue(ModelEvent::Usage { usage });
-    }
+    state.finalize_output_items(response.output)?;
     let reason = if matches!(kind, TerminalKind::Incomplete) {
         match response
             .incomplete_details
@@ -1235,6 +1717,17 @@ fn finish_response(
     } else {
         ModelFinishReason::Stop
     };
+    match reason {
+        ModelFinishReason::ToolCalls => state.save_tool_round()?,
+        ModelFinishReason::Stop | ModelFinishReason::Refused | ModelFinishReason::Length => {
+            state.clear_continuation()?;
+        }
+        ModelFinishReason::ContentFiltered | ModelFinishReason::Unknown => {}
+    }
+    state.terminal_seen = true;
+    if let Some(usage) = usage {
+        state.queue(ModelEvent::Usage { usage });
+    }
     state.queue(ModelEvent::Finish { reason });
     state.done = true;
     Ok(())
