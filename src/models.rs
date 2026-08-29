@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use minicore_runtime::model::{Model, ModelRef, ReasoningPreference};
 
 mod openai;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelConfig {
     OpenAiResponses {
@@ -24,6 +25,34 @@ pub enum ModelConfig {
         #[serde(default)]
         request_timeout_seconds: Option<u64>,
     },
+}
+
+impl fmt::Debug for ModelConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenAiResponses {
+                model,
+                physical_context_window,
+                output_budget_tokens,
+                safety_margin_tokens,
+                supported_reasoning,
+                supports_tools,
+                request_timeout_seconds,
+                ..
+            } => formatter
+                .debug_struct("OpenAiResponses")
+                .field("model", model)
+                .field("base_url", &"<redacted>")
+                .field("api_key_env", &"<redacted>")
+                .field("physical_context_window", physical_context_window)
+                .field("output_budget_tokens", output_budget_tokens)
+                .field("safety_margin_tokens", safety_margin_tokens)
+                .field("supported_reasoning", supported_reasoning)
+                .field("supports_tools", supports_tools)
+                .field("request_timeout_seconds", request_timeout_seconds)
+                .finish(),
+        }
+    }
 }
 
 impl ModelConfig {
@@ -277,6 +306,17 @@ mod tests {
             Models::from_config_with_env(&values, |_| Some("  ".to_owned())),
             Err(ModelConfigError::MissingApiKey)
         ));
+        assert!(matches!(
+            Models::from_config_with_env(&values, |_| Some("bad\nkey".to_owned())),
+            Err(ModelConfigError::InvalidConfiguration)
+        ));
+
+        let debug = format!("{:?}", values["profile-model"]);
+        assert!(debug.contains("provider-model"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("example.invalid"));
+        assert!(!debug.contains("TEST_OPENAI_API_KEY"));
+        assert!(!debug.contains("bad\nkey"));
 
         let models =
             Models::from_config_with_env(&values, |_| Some("test-key".to_owned())).unwrap();

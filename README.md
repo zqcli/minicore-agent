@@ -285,9 +285,12 @@ is not interruptible midway. After the synchronous Workspace commit boundary,
 the real commit result wins even if cancellation or the deadline becomes ready.
 
 `Models` eagerly constructs every configured OpenAI Responses adapter during
-`Agent::open`. The API key is read from `api_key_env` and kept only inside the
-private adapter; missing or empty values fail startup. Base URLs must be HTTP(S)
-without credentials, query, or fragment, and resolve to `<base>/responses`.
+`Agent::open`. The API key is read from `api_key_env`, immediately converted to
+a sensitive Authorization `HeaderValue`, and not retained as a `String`;
+missing, empty, or header-invalid values fail startup. `ModelConfig` Debug output
+redacts both the base URL and API-key environment-variable name. Base URLs must
+be HTTP(S) without credentials, query, or fragment, and resolve to
+`<base>/responses`.
 The descriptor uses the Agent model-profile ID as `ModelRef`; its exposed
 context window is `physical - output budget - safety margin`, while the provider
 request uses the configured output budget as `max_output_tokens`.
@@ -311,18 +314,29 @@ task is spawned. It accepts arbitrary chunks, CR/LF/CRLF, comments, and multi-li
 `data:` frames, with 1 MiB line/frame and queued-frame bounds. Provider text is
 UTF-8/control validated and split on UTF-8 boundaries into MiniCore's 64 KiB
 event limit. Tool calls support split arguments, done-only items, and multiple
-calls with exactly one start/end. Only `response.completed` or
-`response.incomplete` can produce Usage/Finish; early EOF never synthesizes
-success. Usage separates direct input/output from cache-read, cache-write, and
-reasoning tokens while retaining the provider total; the Agent does not compute
-prices or costs.
+calls with exactly one start/end. Provider call IDs must satisfy Runtime's
+printable ASCII grammar and the OpenAI boundary of 1..=64 bytes before any Tool
+event is queued. Only `response.completed` or `response.incomplete` can produce
+Usage/Finish; early EOF never synthesizes success. Usage is accepted only when
+detail totals are present, cache and reasoning subsets do not exceed their
+totals, all additions fit, and a reported provider total exactly equals input
+plus output. Valid usage separates direct input/output from cache-read,
+cache-write, and reasoning tokens; the Agent does not compute prices or costs.
 
 Delivery mapping is conservative: local build/preflight/context failures are
-permanent `NotStarted`; connect failures and HTTP 429 are the only retryable
-`NotStarted` paths; send/response timeouts, 5xx, and uncertain transport outcomes
-are `Unknown`; stream failures after any typed semantic event are `Started`.
-HTTP error bodies are capped at 64 KiB and only machine-readable code/type fields
-are inspected privately. API keys, base URLs, raw bodies, and provider messages
+permanent `NotStarted`; connect failures and non-quota HTTP 429 are the only
+retryable `NotStarted` paths; send/response timeouts, 5xx, and uncertain transport
+outcomes are `Unknown`. Any parsed Responses JSON object with a string `type`
+proves provider-started delivery, including lifecycle and forward-compatible
+unknown events; subsequent cancellation, timeout, EOF, transport, or malformed
+stream errors are therefore `Started`. Without such evidence they are `Unknown`.
+`[DONE]` is not provider event evidence and is never a successful terminal.
+HTTP 429 quota, billing, credit, usage, and bounded organization/project/spend
+limit codes are permanent `QuotaExceeded`; other 429 responses are retryable
+`RateLimited`. Retry delay prefers a valid positive `retry-after-ms`, then a
+positive floating-point `Retry-After` in seconds, then a future HTTP date. HTTP
+error bodies are capped at 64 KiB and only machine-readable code/type fields are
+inspected privately. API keys, base URLs, raw bodies, and provider messages
 never enter diagnostics, Debug output, RPC, events, transcripts, or stderr.
 Redirects are disabled and default tests use only test-owned loopback servers.
 
