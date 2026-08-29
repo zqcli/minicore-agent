@@ -84,14 +84,22 @@ Write parents are rechecked while missing directories are created. Atomic writes
 use short opaque `.minicore-write-<pid>-<counter>.tmp` `create_new` files. A
 temp candidate whose basename is exactly or ASCII-case-insensitively equal to
 the target is skipped before any filesystem access; only that counter is skipped,
-and counter wrapping remains safe through normal alias/collision retry. Atomic
-writes sync file contents, rename, and sync the parent directory on Unix. A
+and counter wrapping remains safe through normal alias/collision retry. Write
+path resolution and canonicalization are asynchronous but do not mutate the
+filesystem. After resolution, parent creation and rechecks, temp creation,
+write/flush/file sync, final-target recheck, rename, and directory sync run as
+one non-yielding `std::fs` commit section. The write Tool accepts at most 512 KiB,
+so this deliberately permits brief executor-thread blocking instead of allowing
+Runtime cancellation to drop a partially executed mutation. No spawned,
+`spawn_blocking`, or detached task owns the commit. Once the synchronous section
+starts it runs to its real `Success`, pre-rename failure, or
+`UnknownOutcome`; cancellation and deadlines apply only before that boundary. A
 parent-directory sync failure after rename returns
 `WorkspaceError::UnknownOutcome`: the complete new target may already be visible
 and is not rolled back. Failures before rename
 return `Unavailable` and leave an existing target unchanged. `read_text` accepts
 UTF-8 including Unicode, newlines, and tabs, but rejects NUL bytes and invalid
-UTF-8 as `Binary`. Non-Unix platforms have no portable Tokio directory-fsync
+UTF-8 as `Binary`. Non-Unix platforms have no portable directory-fsync
 contract. These checks prevent ordinary traversal and symlink mistakes but do
 not fully defend against a same-user process concurrently swapping path
 components between checks and filesystem operations; no `openat`/OS locking
@@ -103,15 +111,25 @@ The crate-private Tool module currently implements only the exact `read` and
 object schemas and reject unknown input fields. `read` supports one-based line
 offsets, a default 400-line limit (maximum 2000), one-level sorted directory
 listings capped at 1000 entries, and `[truncated]` markers for line, 512 KiB file
-prefix, directory-count, or Runtime output limits. NUL and invalid UTF-8 are
-execution failures; a UTF-8 code point split only by the byte cap is safely
-trimmed. `write` accepts at most 512 KiB of UTF-8 content, including empty
-content, and delegates parent creation and atomic replacement to Workspace.
+prefix, directory-count, or Runtime output limits. Workspace retains up to four
+lookahead bytes beyond the visible 512 KiB cap. The decoder uses them only to
+validate a 2/3/4-byte UTF-8 code point or CRLF split by the cap; lookahead bytes
+are never emitted. A valid crossing code point is omitted with `[truncated]`,
+while an invalid continuation or true-EOF incomplete sequence fails. CR is
+accepted only as CRLF and is stripped during newline normalization. NUL, other
+unsafe controls, invalid UTF-8, and any non-UTF-8 directory entry name are
+execution failures. `write` accepts at most 512 KiB of UTF-8 content, including
+empty content, and delegates parent creation and atomic replacement to
+Workspace. Its one-line success output is fully constructed before mutation;
+control characters in the relative path display are escaped while ordinary
+Unicode remains readable, so output validation cannot fail after a successful
+commit.
 Invalid JSON, bounds, and path traversal map to invalid invocation; missing,
 permission, binary, atomic failure, and unknown outcomes map to failed execution.
-Cancellation and deadline are checked before execution and race every awaited
-operation without detached tasks. `edit`, `apply_patch`, and `bash` remain
-unimplemented.
+Cancellation and deadline race every awaited `read` operation. For `write` they
+race only the non-mutating pre-commit path; after the synchronous commit boundary
+the real commit result wins even if cancellation or the deadline becomes ready.
+`edit`, `apply_patch`, and `bash` remain unimplemented.
 
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`

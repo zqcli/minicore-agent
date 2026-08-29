@@ -1,14 +1,17 @@
 use std::ffi::OsString;
-use std::io;
+use std::fs::{self as std_fs, File as StdFile, OpenOptions as StdOpenOptions};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use thiserror::Error;
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::{self, File};
+use tokio::io::AsyncReadExt;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22,20 +25,43 @@ static TEMP_ID_OVERRIDES: OnceLock<Mutex<Vec<(PathBuf, u64)>>> = OnceLock::new()
 static BEFORE_RENAME_GATES: OnceLock<Mutex<Vec<Arc<BeforeRenameGate>>>> = OnceLock::new();
 
 #[cfg(test)]
-struct BeforeRenameGate {
+pub(crate) struct BeforeRenameGate {
     target: PathBuf,
-    started: Arc<tokio::sync::Semaphore>,
-    release: Arc<tokio::sync::Semaphore>,
+    started: AtomicBool,
+    released: Mutex<bool>,
+    release: Condvar,
 }
 
 #[cfg(test)]
 impl BeforeRenameGate {
-    fn new(target: PathBuf) -> Self {
+    pub(crate) fn new(target: PathBuf) -> Self {
         Self {
             target,
-            started: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
+            started: AtomicBool::new(false),
+            released: Mutex::new(false),
+            release: Condvar::new(),
         }
+    }
+
+    pub(crate) async fn wait_started(&self) {
+        while !self.started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+
+    fn block(&self) {
+        self.started.store(true, Ordering::Release);
+        let released = self.released.lock().unwrap();
+        drop(
+            self.release
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
     }
 }
 
@@ -64,6 +90,12 @@ pub enum WorkspaceError {
     TooLarge,
     #[error("workspace file is not valid UTF-8 text")]
     Binary,
+}
+
+pub(crate) struct ReadPrefix {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) visible_len: usize,
+    pub(crate) has_more: bool,
 }
 
 impl Workspace {
@@ -115,23 +147,28 @@ impl Workspace {
         Ok(target)
     }
 
+    pub(crate) fn validate_write_path(&self, path: &str) -> Result<(), WorkspaceError> {
+        normalize_relative(path, false).map(|_| ())
+    }
+
     pub(crate) async fn read_bytes(
         &self,
         path: &str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, WorkspaceError> {
-        let (bytes, truncated) = self.read_prefix(path, max_bytes).await?;
-        if truncated {
+        let mut prefix = self.read_prefix(path, max_bytes).await?;
+        if prefix.has_more {
             return Err(WorkspaceError::TooLarge);
         }
-        Ok(bytes)
+        prefix.bytes.truncate(prefix.visible_len);
+        Ok(prefix.bytes)
     }
 
     pub(crate) async fn read_prefix(
         &self,
         path: &str,
         max_bytes: usize,
-    ) -> Result<(Vec<u8>, bool), WorkspaceError> {
+    ) -> Result<ReadPrefix, WorkspaceError> {
         let resolved = self.resolve_existing(path).await?;
         let metadata = fs::symlink_metadata(&resolved)
             .await
@@ -142,22 +179,25 @@ impl Workspace {
         if !metadata.is_file() {
             return Err(WorkspaceError::NotFile);
         }
-        let maximum = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let read_limit = max_bytes.saturating_add(4);
+        let maximum = u64::try_from(read_limit).unwrap_or(u64::MAX);
         let file = File::open(&resolved)
             .await
             .map_err(|error| map_read_error(error, WorkspaceError::NotFile))?;
         if !file.metadata().await.map_err(map_io_error)?.is_file() {
             return Err(WorkspaceError::NotFile);
         }
-        let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
-        let mut limited = file.take(maximum.saturating_add(1));
+        let mut bytes = Vec::with_capacity(read_limit.min(8 * 1024));
+        let mut limited = file.take(maximum);
         limited
             .read_to_end(&mut bytes)
             .await
             .map_err(|_| WorkspaceError::Unavailable)?;
-        let read_truncated = bytes.len() > max_bytes;
-        bytes.truncate(max_bytes);
-        Ok((bytes, read_truncated))
+        Ok(ReadPrefix {
+            visible_len: bytes.len().min(max_bytes),
+            has_more: bytes.len() > max_bytes,
+            bytes,
+        })
     }
 
     pub(crate) async fn read_text(
@@ -183,10 +223,9 @@ impl Workspace {
             .map(OsString::from)
             .ok_or(WorkspaceError::InvalidPath)?;
         let parent = resolved.parent().ok_or(WorkspaceError::InvalidPath)?;
-        let parent = self.ensure_parent_directory(parent).await?;
-        let target = parent.join(file_name);
-        validate_write_target(&target).await?;
-        atomic_write(&target, bytes).await
+        // Runtime may drop the future only at yield points. Keep every mutation below
+        // this boundary in one synchronous poll through the final directory sync.
+        commit_write(self.root.as_path(), parent, &file_name, bytes)
     }
 
     async fn canonicalize_inside(&self, path: &Path) -> Result<PathBuf, WorkspaceError> {
@@ -236,56 +275,6 @@ impl Workspace {
             }
         }
     }
-
-    async fn ensure_parent_directory(&self, parent: &Path) -> Result<PathBuf, WorkspaceError> {
-        let relative = parent
-            .strip_prefix(self.root.as_path())
-            .map_err(|_| WorkspaceError::Escape)?;
-        let mut current = self.root.as_ref().clone();
-        for component in relative.components() {
-            let Component::Normal(name) = component else {
-                return Err(WorkspaceError::InvalidPath);
-            };
-            let candidate = current.join(name);
-            loop {
-                match fs::symlink_metadata(&candidate).await {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        let resolved = self.canonicalize_inside(&candidate).await?;
-                        if !fs::metadata(&resolved)
-                            .await
-                            .map_err(map_io_error)?
-                            .is_dir()
-                        {
-                            return Err(WorkspaceError::NotDirectory);
-                        }
-                        current = resolved;
-                        break;
-                    }
-                    Ok(metadata) if metadata.is_dir() => {
-                        current = candidate;
-                        break;
-                    }
-                    Ok(_) => return Err(WorkspaceError::NotDirectory),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        match fs::create_dir(&candidate).await {
-                            Ok(()) => {
-                                sync_directory(&current)
-                                    .await
-                                    .map_err(|_| WorkspaceError::Unavailable)?;
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                            Err(_) => return Err(WorkspaceError::Unavailable),
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
-                        return Err(WorkspaceError::NotDirectory);
-                    }
-                    Err(_) => return Err(WorkspaceError::Unavailable),
-                }
-            }
-        }
-        Ok(current)
-    }
 }
 
 fn normalize_relative(path: &str, allow_empty: bool) -> Result<PathBuf, WorkspaceError> {
@@ -325,57 +314,127 @@ async fn validate_write_target(target: &Path) -> Result<(), WorkspaceError> {
     }
 }
 
-async fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), WorkspaceError> {
+fn commit_write(
+    root: &Path,
+    parent: &Path,
+    file_name: &OsString,
+    bytes: &[u8],
+) -> Result<(), WorkspaceError> {
+    let parent = ensure_parent_directory(root, parent)?;
+    let target = parent.join(file_name);
+    validate_write_target_sync(&target)?;
+    atomic_write(&target, bytes)
+}
+
+fn ensure_parent_directory(root: &Path, parent: &Path) -> Result<PathBuf, WorkspaceError> {
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| WorkspaceError::Escape)?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(WorkspaceError::InvalidPath);
+        };
+        let candidate = current.join(name);
+        loop {
+            match std_fs::symlink_metadata(&candidate) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let resolved = canonicalize_inside_sync(root, &candidate)?;
+                    if !std_fs::metadata(&resolved).map_err(map_io_error)?.is_dir() {
+                        return Err(WorkspaceError::NotDirectory);
+                    }
+                    current = resolved;
+                    break;
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    current = candidate;
+                    break;
+                }
+                Ok(_) => return Err(WorkspaceError::NotDirectory),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match std_fs::create_dir(&candidate) {
+                        Ok(()) => {
+                            sync_directory(&current).map_err(|_| WorkspaceError::Unavailable)?
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(_) => return Err(WorkspaceError::Unavailable),
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                    return Err(WorkspaceError::NotDirectory);
+                }
+                Err(_) => return Err(WorkspaceError::Unavailable),
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn canonicalize_inside_sync(root: &Path, path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let resolved = std_fs::canonicalize(path).map_err(map_io_error)?;
+    if !resolved.starts_with(root) {
+        return Err(WorkspaceError::Escape);
+    }
+    Ok(resolved)
+}
+
+fn validate_write_target_sync(target: &Path) -> Result<(), WorkspaceError> {
+    match std_fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(WorkspaceError::InvalidPath),
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(WorkspaceError::NotFile),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+            Err(WorkspaceError::NotDirectory)
+        }
+        Err(_) => Err(WorkspaceError::Unavailable),
+    }
+}
+
+fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), WorkspaceError> {
     let parent = target.parent().ok_or(WorkspaceError::InvalidPath)?;
-    let (temp_path, mut file) = create_unique_temp(target).await?;
-    if file.write_all(bytes).await.is_err()
-        || file.flush().await.is_err()
-        || file.sync_all().await.is_err()
-    {
+    let (temp_path, mut file) = create_unique_temp(target)?;
+    if file.write_all(bytes).is_err() || file.flush().is_err() || file.sync_all().is_err() {
         drop(file);
-        let _ = fs::remove_file(&temp_path).await;
+        let _ = std_fs::remove_file(&temp_path);
         return Err(WorkspaceError::Unavailable);
     }
     drop(file);
     #[cfg(test)]
     if let Some(gate) = take_before_rename_gate(target) {
-        gate.started.add_permits(1);
-        gate.release.acquire().await.unwrap().forget();
+        gate.block();
     }
     #[cfg(test)]
     if should_fail_before_rename(target) {
-        let _ = fs::remove_file(&temp_path).await;
+        let _ = std_fs::remove_file(&temp_path);
         return Err(WorkspaceError::Unavailable);
     }
-    if let Err(error) = validate_write_target(target).await {
-        let _ = fs::remove_file(&temp_path).await;
+    if let Err(error) = validate_write_target_sync(target) {
+        let _ = std_fs::remove_file(&temp_path);
         return Err(error);
     }
-    if fs::rename(&temp_path, target).await.is_err() {
-        let _ = fs::remove_file(&temp_path).await;
+    if std_fs::rename(&temp_path, target).is_err() {
+        let _ = std_fs::remove_file(&temp_path);
         return Err(WorkspaceError::Unavailable);
     }
-    sync_directory(parent)
-        .await
-        .map_err(|_| WorkspaceError::UnknownOutcome)
+    sync_directory(parent).map_err(|_| WorkspaceError::UnknownOutcome)
 }
 
-async fn create_unique_temp(target: &Path) -> Result<(PathBuf, File), WorkspaceError> {
+fn create_unique_temp(target: &Path) -> Result<(PathBuf, StdFile), WorkspaceError> {
     for _ in 0..128 {
         let temp_path = unique_temp_path(target);
         if temp_path_aliases_target(&temp_path, target) {
             continue;
         }
-        match fs::symlink_metadata(&temp_path).await {
+        match std_fs::symlink_metadata(&temp_path) {
             Ok(_) => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(WorkspaceError::Unavailable),
         }
-        match OpenOptions::new()
+        match StdOpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp_path)
-            .await
         {
             Ok(file) => return Ok((temp_path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -425,7 +484,7 @@ fn next_temp_id(_target: &Path) -> u64 {
     NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-async fn sync_directory(path: &Path) -> io::Result<()> {
+fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if should_fail_directory_sync(path) {
         return Err(io::Error::other(
@@ -434,12 +493,11 @@ async fn sync_directory(path: &Path) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        let directory = File::open(path).await?;
-        directory.sync_all().await
+        StdFile::open(path)?.sync_all()
     }
     #[cfg(not(unix))]
     {
-        // Tokio has no portable directory-fsync contract on non-Unix platforms.
+        // Rust has no portable directory-fsync contract on non-Unix platforms.
         let _ = path;
         Ok(())
     }
@@ -515,7 +573,7 @@ fn override_temp_ids(target: PathBuf, ids: impl IntoIterator<Item = u64>) {
 }
 
 #[cfg(test)]
-fn block_before_rename(gate: Arc<BeforeRenameGate>) {
+pub(crate) fn block_before_rename(gate: Arc<BeforeRenameGate>) {
     BEFORE_RENAME_GATES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -699,12 +757,19 @@ mod tests {
         let (base, workspace) = fixture("read-bounds").await;
         let root = base.join("root");
         fs::write(root.join("large.txt"), b"12345").await.unwrap();
+        fs::write(root.join("lookahead.txt"), b"123456789")
+            .await
+            .unwrap();
         fs::write(root.join("binary"), [0xff, 0xfe]).await.unwrap();
 
         assert_eq!(
             workspace.read_bytes("large.txt", 4).await,
             Err(WorkspaceError::TooLarge)
         );
+        let prefix = workspace.read_prefix("lookahead.txt", 4).await.unwrap();
+        assert_eq!(prefix.visible_len, 4);
+        assert!(prefix.has_more);
+        assert_eq!(prefix.bytes, b"12345678");
         assert_eq!(
             workspace.read_text("binary", 8).await,
             Err(WorkspaceError::Binary)
@@ -885,7 +950,7 @@ mod tests {
         cleanup(&base).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn temporary_path_skips_exact_target_alias_across_counter_wrap() {
         let (base, workspace) = fixture("temp-target-alias").await;
         let root = base.join("root");
@@ -898,11 +963,11 @@ mod tests {
         let writer = workspace.clone();
         let path = target_name.clone();
         let task = tokio::spawn(async move { writer.write_atomic(&path, b"target").await });
-        gate.started.acquire().await.unwrap().forget();
+        gate.wait_started().await;
         let target_existed_before_rename = fs::symlink_metadata(&target).await.is_ok();
         let actual_temp = root.join(temp_basename(0));
         let next_candidate_exists = fs::symlink_metadata(&actual_temp).await.is_ok();
-        gate.release.add_permits(1);
+        gate.release();
         task.await.unwrap().unwrap();
 
         assert!(!target_existed_before_rename);
@@ -911,7 +976,7 @@ mod tests {
         cleanup(&base).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn temporary_path_skips_ascii_case_insensitive_target_alias() {
         let (base, workspace) = fixture("temp-target-case-alias").await;
         let root = base.join("root");
@@ -924,12 +989,12 @@ mod tests {
         let writer = workspace.clone();
         let path = target_name.clone();
         let task = tokio::spawn(async move { writer.write_atomic(&path, b"case").await });
-        gate.started.acquire().await.unwrap().forget();
+        gate.wait_started().await;
         let aliased_candidate = root.join(temp_basename(41));
         let alias_candidate_exists = fs::symlink_metadata(&aliased_candidate).await.is_ok();
         let actual_temp = root.join(temp_basename(42));
         let next_candidate_exists = fs::symlink_metadata(&actual_temp).await.is_ok();
-        gate.release.add_permits(1);
+        gate.release();
         task.await.unwrap().unwrap();
 
         assert!(!alias_candidate_exists);
@@ -939,7 +1004,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn temporary_path_skips_real_symlink_after_target_alias() {
         use std::os::unix::fs::symlink;
 
@@ -958,11 +1023,11 @@ mod tests {
         let writer = workspace.clone();
         let path = target_name.clone();
         let task = tokio::spawn(async move { writer.write_atomic(&path, b"inside").await });
-        gate.started.acquire().await.unwrap().forget();
+        gate.wait_started().await;
         let target_existed_before_rename = fs::symlink_metadata(&target).await.is_ok();
         let actual_temp = root.join(temp_basename(53));
         let third_candidate_exists = fs::symlink_metadata(&actual_temp).await.is_ok();
-        gate.release.add_permits(1);
+        gate.release();
         task.await.unwrap().unwrap();
 
         assert!(!target_existed_before_rename);

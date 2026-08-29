@@ -70,7 +70,13 @@ impl Tool for WriteTool {
             if input.content.len() > MAX_WRITE_BYTES {
                 return Err(ToolError::InvalidInvocation);
             }
+            self.workspace
+                .validate_write_path(&input.path)
+                .map_err(map_workspace_error)?;
             let bytes = input.content.len();
+            let path_display = escape_control_characters(&input.path);
+            let output = ToolOutput::new(format!("wrote {bytes} bytes to {path_display}"))
+                .map_err(|_| ToolError::Internal)?;
             run_controlled(&context, async {
                 wait_for_test_io(TOOL_NAME, &input.path).await;
                 self.workspace
@@ -79,11 +85,21 @@ impl Tool for WriteTool {
                     .map_err(map_workspace_error)
             })
             .await?;
-            let output = ToolOutput::new(format!("wrote {bytes} bytes to {}", input.path))
-                .map_err(|_| ToolError::Internal)?;
             Ok(ToolExecutionOutcome::Completed(output))
         })
     }
+}
+
+fn escape_control_characters(path: &str) -> String {
+    let mut output = String::with_capacity(path.len());
+    for character in path.chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[cfg(test)]
@@ -101,7 +117,9 @@ mod tests {
 
     use super::*;
     use crate::tools::{ToolIoGate, block_next_io};
-    use crate::workspace::{fail_next_before_rename, fail_next_directory_sync};
+    use crate::workspace::{
+        BeforeRenameGate, block_before_rename, fail_next_before_rename, fail_next_directory_sync,
+    };
 
     async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, WriteTool) {
         let base = std::env::temp_dir().join(format!(
@@ -218,6 +236,59 @@ mod tests {
         cleanup(&base).await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn success_output_escapes_control_characters_in_relative_path() {
+        let (base, _, tool) = fixture("escaped-output").await;
+        let path = "controls-你-\r-\n-\t-\u{1b}.txt";
+        let output = execute(&tool, json!({"path": path, "content": "written"}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output,
+            "wrote 7 bytes to controls-你-\\r-\\n-\\t-\\u{1b}.txt"
+        );
+        assert_eq!(output.lines().count(), 1);
+        assert!(!output.chars().any(char::is_control));
+        assert_eq!(escape_control_characters("\0"), "\\u{0}");
+        assert_eq!(
+            tokio::fs::read(base.join("root").join(path)).await.unwrap(),
+            b"written"
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn output_is_prevalidated_before_workspace_mutation() {
+        use minicore_runtime::value::MAX_TEXT_BYTES;
+
+        let (base, _, tool) = fixture("output-prevalidation").await;
+        let root = base.join("root");
+        let path = "\u{1b}".repeat(MAX_TEXT_BYTES);
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": path, "content": "must-not-write"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Internal)
+        );
+        assert!(
+            tokio::fs::read_dir(&root)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        cleanup(&base).await;
+    }
+
     #[tokio::test]
     async fn oversize_and_path_escape_are_invalid_invocations() {
         let (base, _, tool) = fixture("invalid").await;
@@ -235,7 +306,7 @@ mod tests {
             .await,
             Err(ToolError::InvalidInvocation)
         );
-        for path in ["", "../escape", "/absolute"] {
+        for path in ["", "../escape", "/absolute", "bad\0path"] {
             assert_eq!(
                 tool.execute(
                     invocation(json!({"path": path, "content": "x"})),
@@ -329,7 +400,7 @@ mod tests {
         let tool = Arc::new(tool);
 
         let cancellation = CancellationToken::new();
-        let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "cancelled"));
+        let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "cancelled-parent/cancelled"));
         block_next_io(Arc::clone(&gate));
         let cancelled_tool = Arc::clone(&tool);
         let cancelled_context = context(
@@ -339,7 +410,7 @@ mod tests {
         let cancelled = tokio::spawn(async move {
             cancelled_tool
                 .execute(
-                    invocation(json!({"path": "cancelled", "content": "x"})),
+                    invocation(json!({"path": "cancelled-parent/cancelled", "content": "x"})),
                     cancelled_context,
                 )
                 .await
@@ -348,18 +419,18 @@ mod tests {
         cancellation.cancel();
         assert_eq!(cancelled.await.unwrap(), Err(ToolError::Cancelled));
         assert!(
-            tokio::fs::symlink_metadata(root.join("cancelled"))
+            tokio::fs::symlink_metadata(root.join("cancelled-parent"))
                 .await
                 .is_err()
         );
 
-        let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "timed-out"));
+        let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "deadline-parent/timed-out"));
         block_next_io(Arc::clone(&gate));
         let deadline_tool = Arc::clone(&tool);
         let deadline = tokio::spawn(async move {
             deadline_tool
                 .execute(
-                    invocation(json!({"path": "timed-out", "content": "x"})),
+                    invocation(json!({"path": "deadline-parent/timed-out", "content": "x"})),
                     context(
                         CancellationToken::new(),
                         Instant::now() + Duration::from_millis(25),
@@ -370,10 +441,105 @@ mod tests {
         gate.started.acquire().await.unwrap().forget();
         assert_eq!(deadline.await.unwrap(), Err(ToolError::TimedOut));
         assert!(
-            tokio::fs::symlink_metadata(root.join("timed-out"))
+            tokio::fs::symlink_metadata(root.join("deadline-parent"))
                 .await
                 .is_err()
         );
+        assert!(
+            tokio::fs::read_dir(&root)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
         cleanup(&base).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_commit_returns_the_real_commit_result() {
+        let (base, workspace, tool) = fixture("commit-cancel").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value"), b"old").await.unwrap();
+        let target = workspace.resolve_for_write("value").await.unwrap();
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({"path": "value", "content": "complete-new"})),
+                context(task_cancellation, Instant::now() + Duration::from_secs(5)),
+            )
+            .await
+        });
+
+        gate.wait_started().await;
+        cancellation.cancel();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let finished_before_release = task.is_finished();
+        gate.release();
+        let result = task.await.unwrap();
+        let target_contents = tokio::fs::read(&target).await.unwrap();
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        let mut temp_found = false;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            temp_found |= entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".minicore-write-"));
+        }
+        cleanup(&base).await;
+
+        assert!(!finished_before_release);
+        let ToolExecutionOutcome::Completed(output) = result.unwrap() else {
+            panic!("write must not request input");
+        };
+        assert_eq!(output.content().as_str(), "wrote 12 bytes to value");
+        assert_eq!(target_contents, b"complete-new");
+        assert!(!temp_found);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_during_commit_returns_post_rename_unknown_outcome() {
+        let (base, workspace, tool) = fixture("commit-deadline-unknown").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value"), b"old").await.unwrap();
+        let target = workspace.resolve_for_write("value").await.unwrap();
+        fail_next_directory_sync(target.parent().unwrap().to_path_buf());
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+        let task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({"path": "value", "content": "complete-new"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_millis(25),
+                ),
+            )
+            .await
+        });
+
+        gate.wait_started().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let finished_before_release = task.is_finished();
+        gate.release();
+        let result = task.await.unwrap();
+        let target_contents = tokio::fs::read(&target).await.unwrap();
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        let mut temp_found = false;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            temp_found |= entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".minicore-write-"));
+        }
+        cleanup(&base).await;
+
+        assert!(!finished_before_release);
+        assert_eq!(result, Err(ToolError::Failed));
+        assert_eq!(target_contents, b"complete-new");
+        assert!(!temp_found);
     }
 }
