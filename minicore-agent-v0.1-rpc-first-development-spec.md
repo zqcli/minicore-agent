@@ -3719,8 +3719,8 @@ spawn minicore-agent --stdio
 minicore-runtime在本机目录，分支dev为最新分支：/Users/zzq/Develops/minicore-runtime
 
 使用2个固定subagent来实施
-implementer：使用got-5.6-luna，思考级别max，来实施和执行
-reviewer：使用got-5.6-luna，思考级别max，来review implement的代码
+implementer：使用gpt-5.6-luna，思考级别max，来实施和执行
+reviewer：使用gpt-5.6-luna，思考级别max，来review implement的代码
 两者循环，直到代码符合要求
 
 你自己来调度安排，并对reviewer最终的结果进行复审
