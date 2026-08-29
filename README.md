@@ -1,5 +1,7 @@
 # MiniCore Agent
 
+[![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
+
 This repository is the RPC-first agent core: one Rust package with a library
 API, a local Store, a rooted local Workspace, multiple loaded `SessionRuntime`
 owners, and an offline Fake Model test seam. It is verified against the
