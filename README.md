@@ -2,7 +2,7 @@
 
 This repository is the RPC-first agent core: one Rust package with a library
 API, a local Store, a rooted local Workspace, multiple loaded `SessionRuntime`
-owners, and an offline Fake Model/Tool test seam. It is verified against the
+owners, and an offline Fake Model test seam. It is verified against the
 `minicore-runtime` `dev` HEAD
 `7e85eaab18e273e43e03c50040b460f1b13f0ac9` through
 `tests/runtime_api_compile.rs`. The runtime dependency is pinned to that exact
@@ -15,30 +15,55 @@ modified here.
 minicore-agent --config ./example.agent.toml --stdio
 ```
 
-The current wire surface is deliberately small:
+The stdio protocol implements the complete v0.1 JSON-RPC method set:
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"agent.ping","params":{}}
+```text
+agent.ping             agent.shutdown
+profile.list           model.list
+session.list           session.create         session.open
+session.close          session.delete         session.state
+session.transcript     turn.send              turn.cancel
+turn.wait              interaction.answer
 ```
 
-returns:
+One NDJSON frame is read at a time and stdout is reserved for JSON-RPC. A single
+bounded outbound channel carries ordinary responses, asynchronous `turn.wait`
+responses, and exact event notifications of the form
+`{"jsonrpc":"2.0","method":"agent.event","params":<AgentEvent>}`. One owned
+writer task is the only code that writes stdout; it serializes one JSON value per
+line and flushes every frame. The event pump awaits outbound capacity, so slow
+stdout propagates backpressure into the Agent's existing outer drop accounting
+without adding fanout or replay.
 
-```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0"}}
-```
+Except for `turn.wait`, requests dispatch sequentially against the one mutable
+Agent owned by the RPC server; there is no Agent actor or global mutex.
+`turn.wait` clones the exact current `TurnHandle`, registers one owned waiter,
+and lets the reader continue, so its response may arrive after later responses.
+No historical handle registry is retained. Params DTOs reject unknown fields.
+Empty methods accept omitted params or `{}` but reject `null`; transcript defaults
+to 100 entries and permits only `1..=100`. Interaction answers use the internal
+`type` tag with approval `allow_once`/`deny`, bounded non-control text, or a
+choice index.
 
-`agent.shutdown` is also accepted. One NDJSON frame is read at a time, stdout
-is reserved for JSON-RPC, and malformed or unknown requests return standard
-JSON-RPC errors without echoing request data. JSON syntax errors return
-`-32700`; valid JSON with an invalid request shape returns `-32600`.
+Request IDs are strings or JSON integers, including negative integers, and are
+preserved exactly. JSON syntax errors use `-32700`; invalid request shape,
+unknown methods, invalid params, and internal errors use `-32600` through
+`-32603`. Domain errors use `-32001` through `-32013` for `session_not_found`,
+`session_not_loaded`, `session_busy`, `session_closed`, `invalid_state`,
+`interaction_not_found`, `turn_not_found`, `profile_not_found`,
+`model_not_found`, `workspace_error`, `store_error`, `provider_error`, and
+`core_error`. Error data contains only `{kind,retryable}` and stable short
+messages; it never serializes an error source, raw provider response, Tool
+arguments, API key, or panic payload. Session-state and Turn-outcome diagnostics
+likewise expose only code, category, and retryability, not diagnostic text.
 
-For `agent.ping` and `agent.shutdown`, `params` may be omitted or be the empty
-object `{}`. `null`, arrays, and non-empty objects return `-32602`. Request IDs
-are limited to strings and JSON integers, including negative integers; the
-response preserves the original ID. Frames are read incrementally with a 1 MiB
-limit. An oversized frame returns a parse error and ends the stdin loop. EOF
-performs the same graceful shutdown path. For an explicit shutdown request, the
-agent shutdown completes before its success response is written.
+Frames are read incrementally with a 1 MiB limit. Oversize, stdin EOF, Ctrl-C,
+explicit `agent.shutdown`, and writer failure all enter the same explicit Agent
+shutdown path. Shutdown waits for the Agent durability barrier, joins every
+pre-existing waiter, naturally drains and joins the event pump, then queues the
+explicit shutdown response. Only after that does it close outbound and await the
+writer, so no waiter or event can write a frame after the shutdown response.
+Writer failures are propagated after owned tasks have been reclaimed.
 
 The library exposes `AgentConfig`, `AgentError`, `Agent`, `Workspace`,
 `WorkspaceError`, the session/turn DTOs, the single-consumer `AgentEventStream`,
@@ -276,8 +301,12 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. OpenAI HTTP and
-RPC method extensions remain outside this Phase. The offline process coverage is
+to completion before joining the worker and allowing deletion. OpenAI HTTP
+remains outside this Phase. The RPC protocol and offline duplex loop are complete,
+but a full binary process session loop requires a constructible production Model;
+the current OpenAI configuration remains rejected until the following adapter
+Phase. Empty-config process tests cover ping, framing, lists, domain errors, EOF,
+oversize, and shutdown without pretending provider support. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
 Store, Workspace, Tool, Context, and Policy coverage is in the internal unit
 tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and

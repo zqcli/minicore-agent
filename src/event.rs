@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Serialize, Serializer};
 use tokio::sync::{Notify, mpsc};
 
-use minicore_runtime::error::DiagnosticSummary;
+use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::Usage;
 use minicore_runtime::session::{
@@ -363,26 +363,44 @@ enum SessionStatusView {
 #[serde(rename_all = "snake_case")]
 enum SessionHealthView {
     Healthy,
-    Degraded { diagnostic: DiagnosticSummary },
+    Degraded { diagnostic: DiagnosticView },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct TurnOutcomeView {
-    pub turn_id: TurnId,
-    pub terminal: minicore_runtime::TurnTerminal,
-    pub usage: Usage,
+pub(crate) struct TurnOutcomeView {
+    turn_id: TurnId,
+    terminal: TurnTerminalView,
+    usage: Usage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct SessionStateView {
-    pub session_id: SessionId,
-    pub instance_id: SessionInstanceId,
-    pub status: SessionStatusView,
-    pub health: SessionHealthView,
-    pub active_turn: Option<TurnId>,
-    pub pending_interaction: Option<PendingInteractionView>,
-    pub conversation_seq: minicore_runtime::ConversationSeq,
-    pub last_terminal: Option<TurnOutcomeView>,
+pub(crate) struct SessionStateView {
+    session_id: SessionId,
+    instance_id: SessionInstanceId,
+    status: SessionStatusView,
+    health: SessionHealthView,
+    active_turn: Option<TurnId>,
+    pending_interaction: Option<PendingInteractionView>,
+    conversation_seq: minicore_runtime::ConversationSeq,
+    last_terminal: Option<TurnOutcomeView>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct DiagnosticView {
+    code: DiagnosticCode,
+    category: DiagnosticCategory,
+    retryable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TurnTerminalView {
+    Completed,
+    Failed { diagnostic: DiagnosticView },
+    CancelledByUser,
+    CancelledByShutdown,
+    CancelledByRestart,
+    BudgetExceeded,
 }
 
 impl From<&SessionState> for SessionStateView {
@@ -399,7 +417,7 @@ impl From<&SessionState> for SessionStateView {
             health: match &state.health {
                 SessionHealth::Healthy => SessionHealthView::Healthy,
                 SessionHealth::Degraded { diagnostic } => SessionHealthView::Degraded {
-                    diagnostic: diagnostic.clone(),
+                    diagnostic: DiagnosticView::from(diagnostic),
                 },
             },
             active_turn: state.active_turn,
@@ -417,8 +435,33 @@ impl From<&minicore_runtime::TurnOutcome> for TurnOutcomeView {
     fn from(outcome: &minicore_runtime::TurnOutcome) -> Self {
         Self {
             turn_id: outcome.turn_id,
-            terminal: outcome.terminal.clone(),
+            terminal: TurnTerminalView::from(&outcome.terminal),
             usage: outcome.usage,
+        }
+    }
+}
+
+impl From<&DiagnosticSummary> for DiagnosticView {
+    fn from(diagnostic: &DiagnosticSummary) -> Self {
+        Self {
+            code: diagnostic.code,
+            category: diagnostic.category,
+            retryable: diagnostic.retryable,
+        }
+    }
+}
+
+impl From<&minicore_runtime::TurnTerminal> for TurnTerminalView {
+    fn from(terminal: &minicore_runtime::TurnTerminal) -> Self {
+        match terminal {
+            minicore_runtime::TurnTerminal::Completed => Self::Completed,
+            minicore_runtime::TurnTerminal::Failed { diagnostic } => Self::Failed {
+                diagnostic: DiagnosticView::from(diagnostic),
+            },
+            minicore_runtime::TurnTerminal::CancelledByUser => Self::CancelledByUser,
+            minicore_runtime::TurnTerminal::CancelledByShutdown => Self::CancelledByShutdown,
+            minicore_runtime::TurnTerminal::CancelledByRestart => Self::CancelledByRestart,
+            minicore_runtime::TurnTerminal::BudgetExceeded => Self::BudgetExceeded,
         }
     }
 }

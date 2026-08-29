@@ -73,6 +73,12 @@ fn assert_error(response: Value, code: i64, id: Value) {
     assert_eq!(response["jsonrpc"], json!("2.0"));
     assert_eq!(response["id"], id);
     assert_eq!(response["error"]["code"], json!(code));
+    assert!(response["error"]["data"]["retryable"].is_boolean());
+}
+
+fn assert_domain_error(response: Value, code: i64, id: Value, kind: &str) {
+    assert_eq!(response["error"]["data"]["kind"], json!(kind));
+    assert_error(response, code, id);
 }
 
 fn assert_ping(response: Value, id: Value) {
@@ -177,6 +183,71 @@ fn eof_shuts_down_without_an_extra_frame() {
     assert_eq!(process.output.read_line(&mut trailing).unwrap(), 0);
     assert!(process.child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn empty_config_exposes_stable_profile_model_and_session_lists() {
+    let mut process = spawn_server();
+
+    for (id, method, field) in [
+        ("profiles", "profile.list", "profiles"),
+        ("models", "model.list", "models"),
+        ("sessions", "session.list", "sessions"),
+    ] {
+        process.send_json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {}
+        }));
+        let response = process.response();
+        assert_eq!(response["id"], json!(id));
+        assert_eq!(response["result"][field], json!([]));
+    }
+
+    let missing = SessionId::new().unwrap();
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "open-missing",
+        "method": "session.open",
+        "params": {"session_id": missing}
+    }));
+    assert_domain_error(
+        process.response(),
+        -32_001,
+        json!("open-missing"),
+        "session_not_found",
+    );
+
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "state-unloaded",
+        "method": "session.state",
+        "params": {"session_id": missing}
+    }));
+    assert_domain_error(
+        process.response(),
+        -32_002,
+        json!("state-unloaded"),
+        "session_not_loaded",
+    );
+
+    let workspace = process.temp_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    process.send_json(json!({
+        "jsonrpc": "2.0",
+        "id": "profile-missing",
+        "method": "session.create",
+        "params": {"workspace": workspace}
+    }));
+    assert_domain_error(
+        process.response(),
+        -32_008,
+        json!("profile-missing"),
+        "profile_not_found",
+    );
+
+    assert!(process.finish().success());
 }
 
 #[test]
