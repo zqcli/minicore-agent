@@ -106,6 +106,31 @@ components between checks and filesystem operations; no `openat`/OS locking
 scheme is implemented. Workspace is not yet assembled into Agent capabilities,
 and the existing temporary Agent workspace validation remains unchanged.
 
+The crate-private concrete `ProjectContext` implements MiniCore's
+`ContextProvider` but is not yet assembled into Agent sessions. Every provider
+call rereads only `<workspace>/AGENTS.md`; there is no cache, recursive
+`AGENTS.md` search, source-composition trait, RAG, or other context source. A
+missing root file returns an empty bundle. A present file returns one
+`ProjectInstructions` block with source `agents-md` and priority 100, including
+an empty-content block for an empty file when its envelope fits the remaining
+budget. Reads retain at most the 256 KiB visible prefix plus four UTF-8/CRLF
+lookahead bytes. Invalid UTF-8, NUL, bare CR, other unsafe controls, wrong file
+types, inaccessible paths, and Workspace escapes are unavailable; CRLF is
+normalized to LF while ordinary Unicode, newline, and tab are preserved.
+
+Project context budgeting uses the same byte/4 ceiling estimator as Core. For
+each candidate content prefix it constructs the exact final system
+`ModelMessage` text,
+`[minicore-context slot=project_instructions source=agents-md]\n...`, and counts
+its serde JSON bytes before comparing `ceil(bytes / 4)` with
+`remaining_context_budget`. A bounded binary search selects the largest UTF-8
+prefix that fits. File-prefix, final-message-size, and token-budget truncation
+all retain `[truncated]`; if even the marker's complete system-message envelope
+does not fit, the provider returns an empty bundle instead of failing the Turn.
+Cancellation and deadlines are biased ahead of the asynchronous Workspace read,
+and dropping the provider future drops that read without mutation or a detached
+task.
+
 The crate-private Tool module currently implements the exact `read`, `write`,
 `edit`, `apply_patch`, and `bash` tools; they are not yet assembled into Agent
 sessions. All five use strict object schemas and reject unknown input fields. `read`
@@ -214,9 +239,9 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. Context, Policy,
-OpenAI HTTP, Workspace/Tool capability assembly, and RPC method extensions remain
-outside this Phase. The offline process coverage is
+to completion before joining the worker and allowing deletion. Policy, OpenAI
+HTTP, Workspace/Tool/Context capability assembly, and RPC method extensions
+remain outside this Phase. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
-Store, Workspace, and Tool coverage is in the internal unit tests of
-`src/store.rs`, `src/workspace.rs`, and `src/tools/`.
+Store, Workspace, Tool, and Context coverage is in the internal unit tests of
+`src/store.rs`, `src/workspace.rs`, `src/tools/`, and `src/context.rs`.

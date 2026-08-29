@@ -2,6 +2,11 @@
 
 mod agent;
 mod config;
+#[allow(
+    dead_code,
+    reason = "ProjectContext is assembled into Agent capabilities in a later phase"
+)]
+mod context;
 mod error;
 mod event;
 mod models;
