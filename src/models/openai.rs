@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
@@ -29,6 +29,7 @@ const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_SSE_FRAMES: usize = 4_096;
 const MAX_EVENT_BYTES: usize = minicore_runtime::model::MAX_MODEL_EVENT_TEXT_BYTES;
+const MAX_OPENAI_CALL_ID_BYTES: usize = 64;
 
 pub(super) struct OpenAiResponsesSettings {
     pub(super) model_ref: ModelRef,
@@ -47,12 +48,16 @@ pub(super) struct OpenAiResponsesModel {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     provider_model: String,
-    api_key: String,
+    authorization: HeaderValue,
     output_budget_tokens: u32,
 }
 
 impl OpenAiResponsesModel {
     pub(super) fn new(settings: OpenAiResponsesSettings) -> Result<Self, ModelConfigError> {
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", settings.api_key))
+            .map_err(|_| ModelConfigError::InvalidConfiguration)?;
+        authorization.set_sensitive(true);
+        drop(settings.api_key);
         let descriptor = ModelDescriptor::new(
             settings.model_ref,
             settings.effective_context_window,
@@ -72,7 +77,7 @@ impl OpenAiResponsesModel {
             client,
             endpoint: settings.endpoint,
             provider_model: settings.provider_model,
-            api_key: settings.api_key,
+            authorization,
             output_budget_tokens: settings.output_budget_tokens,
         })
     }
@@ -109,12 +114,10 @@ impl OpenAiResponsesModel {
             return Err(local_error(ModelErrorKind::Timeout));
         }
         let body = self.build_request(&request)?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-            .map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
         let request = self
             .client
             .post(self.endpoint.clone())
-            .header(AUTHORIZATION, authorization)
+            .header(AUTHORIZATION, self.authorization.clone())
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
             .body(body)
@@ -408,12 +411,7 @@ async fn classify_http_error(
     deadline: TokioInstant,
 ) -> ModelError {
     let status = response.status();
-    let retry_after = response
-        .headers()
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+    let retry_after = retry_after(response.headers(), SystemTime::now());
     let body = match collect_error_body(response, cancellation, deadline).await {
         Ok(body) => body,
         Err(error) => return error,
@@ -433,6 +431,7 @@ async fn classify_http_error(
             "context_length_exceeded" | "context_window_exceeded" | "context_overflow"
         )
     });
+    let quota_exceeded = [code, error_type].into_iter().flatten().any(is_quota_code);
 
     match status.as_u16() {
         400 | 422 if context_overflow => local_error(ModelErrorKind::ContextOverflow),
@@ -440,11 +439,72 @@ async fn classify_http_error(
         401 | 403 => local_error(ModelErrorKind::AuthRejected),
         408 => unknown_error(ModelErrorKind::Timeout),
         413 => local_error(ModelErrorKind::ContextOverflow),
+        429 if quota_exceeded => local_error(ModelErrorKind::QuotaExceeded),
         429 => retryable_error(ModelErrorKind::RateLimited, retry_after),
         500..=599 => unknown_error(ModelErrorKind::ProviderUnavailable),
         400..=499 => local_error(ModelErrorKind::InvalidRequest),
         _ => unknown_error(ModelErrorKind::ProviderUnavailable),
     }
+}
+
+fn is_quota_code(value: &str) -> bool {
+    matches!(
+        value,
+        "insufficient_quota"
+            | "quota_exceeded"
+            | "credit_balance_exhausted"
+            | "billing_hard_limit_reached"
+            | "billing_hard_limit_exceeded"
+            | "billing_limit_reached"
+            | "usage_limit_reached"
+            | "usage_limit_exceeded"
+            | "organization_quota_exceeded"
+            | "project_quota_exceeded"
+            | "organization_usage_limit_reached"
+            | "organization_usage_limit_exceeded"
+            | "project_usage_limit_reached"
+            | "project_usage_limit_exceeded"
+            | "organization_limit_reached"
+            | "organization_limit_exceeded"
+            | "project_limit_reached"
+            | "project_limit_exceeded"
+            | "budget_exceeded"
+            | "organization_budget_exceeded"
+            | "project_budget_exceeded"
+            | "spend_limit_reached"
+            | "spend_limit_exceeded"
+            | "organization_spend_limit_reached"
+            | "organization_spend_limit_exceeded"
+            | "project_spend_limit_reached"
+            | "project_spend_limit_exceeded"
+    )
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<Duration> {
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| positive_duration(value, 1_000.0))
+        .or_else(|| {
+            let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+            positive_duration(value, 1.0).or_else(|| {
+                httpdate::parse_http_date(value)
+                    .ok()?
+                    .duration_since(now)
+                    .ok()
+                    .filter(|duration| !duration.is_zero())
+            })
+        })
+}
+
+fn positive_duration(value: &str, divisor: f64) -> Option<Duration> {
+    let seconds = value.trim().parse::<f64>().ok()? / divisor;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|duration| !duration.is_zero())
 }
 
 async fn collect_error_body(
@@ -505,6 +565,7 @@ struct StreamState {
     pending: VecDeque<Result<ModelEvent, ModelError>>,
     tools: BTreeMap<u32, ToolState>,
     tool_ids: BTreeSet<ToolCallId>,
+    provider_event_seen: bool,
     semantic_seen: bool,
     refusal_seen: bool,
     terminal_seen: bool,
@@ -534,6 +595,7 @@ impl StreamState {
             pending: VecDeque::new(),
             tools: BTreeMap::new(),
             tool_ids: BTreeSet::new(),
+            provider_event_seen: false,
             semantic_seen: false,
             refusal_seen: false,
             terminal_seen: false,
@@ -552,7 +614,10 @@ impl StreamState {
     }
 
     fn malformed(&mut self) {
-        let error = stream_error(ModelErrorKind::InvalidProviderResponse, self.semantic_seen);
+        let error = stream_error(
+            ModelErrorKind::InvalidProviderResponse,
+            self.provider_event_seen,
+        );
         self.fail(error);
     }
 }
@@ -570,12 +635,12 @@ async fn next_stream_event(
         let next = tokio::select! {
             biased;
             _ = state.cancellation.cancelled() => {
-                let error = stream_error(ModelErrorKind::Cancelled, state.semantic_seen);
+                let error = stream_error(ModelErrorKind::Cancelled, state.provider_event_seen);
                 state.fail(error);
                 continue;
             }
             _ = tokio::time::sleep_until(state.deadline) => {
-                let error = stream_error(ModelErrorKind::Timeout, state.semantic_seen);
+                let error = stream_error(ModelErrorKind::Timeout, state.provider_event_seen);
                 state.fail(error);
                 continue;
             }
@@ -583,10 +648,7 @@ async fn next_stream_event(
         };
         match next {
             Some(Ok(chunk)) => {
-                if state.parser.feed(&chunk).is_err() {
-                    state.malformed();
-                    continue;
-                }
+                let parser_failed = state.parser.feed(&chunk).is_err();
                 while let Some(frame) = state.parser.pop_frame() {
                     if handle_frame(&mut state, &frame).is_err() {
                         state.malformed();
@@ -595,6 +657,9 @@ async fn next_stream_event(
                     if state.done {
                         break;
                     }
+                }
+                if parser_failed && !state.done {
+                    state.malformed();
                 }
             }
             Some(Err(error)) => {
@@ -605,7 +670,7 @@ async fn next_stream_event(
                 } else {
                     ModelErrorKind::RequestOutcomeUnknown
                 };
-                let error = stream_error(kind, state.semantic_seen);
+                let error = stream_error(kind, state.provider_event_seen);
                 state.fail(error);
             }
             None => {
@@ -617,7 +682,7 @@ async fn next_stream_event(
                     } else {
                         ModelErrorKind::IncompleteResponse
                     };
-                    let error = stream_error(kind, state.semantic_seen);
+                    let error = stream_error(kind, state.provider_event_seen);
                     state.fail(error);
                 }
             }
@@ -711,12 +776,19 @@ impl SseParser {
 
 fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
     if frame == b"[DONE]" {
-        let error = stream_error(ModelErrorKind::IncompleteResponse, state.semantic_seen);
+        let error = stream_error(
+            ModelErrorKind::IncompleteResponse,
+            state.provider_event_seen,
+        );
         state.fail(error);
         return Ok(());
     }
     let value: Value = serde_json::from_slice(frame).map_err(|_| ())?;
+    if !value.is_object() {
+        return Err(());
+    }
     let event_type = value.get("type").and_then(Value::as_str).ok_or(())?;
+    state.provider_event_seen = true;
     match event_type {
         "response.output_text.delta" => {
             let event: DeltaEvent = from_value(value)?;
@@ -901,7 +973,7 @@ fn start_tool(
     if state.tools.contains_key(&output_index) {
         return if reject_existing { Err(()) } else { Ok(()) };
     }
-    let tool_call_id = ToolCallId::new(item.call_id).map_err(|_| ())?;
+    let tool_call_id = openai_tool_call_id(&item.call_id)?;
     let name = item.name.parse::<ToolName>().map_err(|_| ())?;
     if !state.tool_ids.insert(tool_call_id.clone()) {
         return Err(());
@@ -996,6 +1068,7 @@ fn finish_tool_item(
     output_index: u32,
     item: FunctionCallItem,
 ) -> Result<(), ()> {
+    openai_tool_call_id(&item.call_id)?;
     if !state.tools.contains_key(&output_index) {
         start_tool(state, output_index, item, false)?;
     } else {
@@ -1010,6 +1083,13 @@ fn finish_tool_item(
     }
     state.tools.get_mut(&output_index).ok_or(())?.item_done = true;
     end_tool_once(state, output_index)
+}
+
+fn openai_tool_call_id(value: &str) -> Result<ToolCallId, ()> {
+    if value.is_empty() || value.len() > MAX_OPENAI_CALL_ID_BYTES {
+        return Err(());
+    }
+    ToolCallId::new(value).map_err(|_| ())
 }
 
 fn end_tool_once(state: &mut StreamState, output_index: u32) -> Result<(), ()> {
@@ -1034,8 +1114,8 @@ fn finish_response(
     if state.terminal_seen || state.tools.values().any(|tool| !tool.ended) {
         return Err(());
     }
+    let usage = provider_usage(response.usage.unwrap_or_default())?;
     state.terminal_seen = true;
-    let usage = provider_usage(response.usage.unwrap_or_default());
     state.queue(ModelEvent::Usage { usage });
     let reason = if incomplete {
         match response
@@ -1063,7 +1143,14 @@ fn finish_response(
     Ok(())
 }
 
-fn provider_usage(usage: ProviderUsage) -> Usage {
+fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
+    if usage.input_tokens_details.is_some() && usage.input_tokens.is_none()
+        || usage.output_tokens_details.is_some() && usage.output_tokens.is_none()
+        || usage.total_tokens.is_some()
+            && (usage.input_tokens.is_none() || usage.output_tokens.is_none())
+    {
+        return Err(());
+    }
     let cached = usage
         .input_tokens_details
         .as_ref()
@@ -1072,22 +1159,32 @@ fn provider_usage(usage: ProviderUsage) -> Usage {
         .input_tokens_details
         .as_ref()
         .and_then(|details| details.cache_write_tokens);
+    let cached_and_written = cached
+        .unwrap_or(0)
+        .checked_add(cache_write.unwrap_or(0))
+        .ok_or(())?;
     let reasoning = usage
         .output_tokens_details
         .as_ref()
         .and_then(|details| details.reasoning_tokens);
-    let input = usage.input_tokens.map(|total| {
-        total
-            .saturating_sub(cached.unwrap_or(0))
-            .saturating_sub(cache_write.unwrap_or(0))
-    });
+    let input = usage
+        .input_tokens
+        .map(|total| total.checked_sub(cached_and_written).ok_or(()))
+        .transpose()?;
     let output = usage
         .output_tokens
-        .map(|total| total.saturating_sub(reasoning.unwrap_or(0)));
-    Usage::from_optional(input, output, reasoning)
+        .map(|total| total.checked_sub(reasoning.unwrap_or(0)).ok_or(()))
+        .transpose()?;
+    if let (Some(input_total), Some(output_total)) = (usage.input_tokens, usage.output_tokens) {
+        let combined = input_total.checked_add(output_total).ok_or(())?;
+        if usage.total_tokens.is_some_and(|total| total != combined) {
+            return Err(());
+        }
+    }
+    Ok(Usage::from_optional(input, output, reasoning)
         .with_cache_read_tokens(cached)
         .with_cache_write_tokens(cache_write)
-        .with_provider_total_tokens(usage.total_tokens)
+        .with_provider_total_tokens(usage.total_tokens))
 }
 
 fn local_error(kind: ModelErrorKind) -> ModelError {
@@ -1106,8 +1203,8 @@ fn retryable_error(kind: ModelErrorKind, retry_after: Option<Duration>) -> Model
     ModelError::not_started(kind, retry_after, diagnostic(kind, true))
 }
 
-fn stream_error(kind: ModelErrorKind, semantic_seen: bool) -> ModelError {
-    if semantic_seen {
+fn stream_error(kind: ModelErrorKind, provider_event_seen: bool) -> ModelError {
+    if provider_event_seen {
         started_error(kind)
     } else {
         unknown_error(kind)

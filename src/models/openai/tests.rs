@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -180,6 +180,22 @@ async fn start_error(
     }
 }
 
+async fn run_until_error(
+    model: &OpenAiResponsesModel,
+    request: ModelRequest,
+    context: ModelCallContext,
+) -> (Vec<ModelEvent>, ModelError) {
+    let mut stream = model.start(request, context).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        match stream.next().await {
+            Some(Ok(event)) => events.push(event),
+            Some(Err(error)) => return (events, error),
+            None => panic!("model stream ended without an error"),
+        }
+    }
+}
+
 fn event_text(event: &ModelEvent) -> Option<&str> {
     match event {
         ModelEvent::TextDelta { delta } | ModelEvent::ReasoningDelta { delta } => {
@@ -215,6 +231,8 @@ async fn descriptor_and_request_mapping_are_exact_and_secret_safe() {
     assert_eq!(model.descriptor().model_ref.as_str(), "main");
     assert_eq!(model.descriptor().context_window, 16_384);
     assert!(model.descriptor().supports_tools);
+    assert!(model.authorization.is_sensitive());
+    assert!(!format!("{:?}", model.authorization).contains("TEST-API-KEY-SECRET"));
 
     let events = run_model(
         &model,
@@ -513,6 +531,103 @@ async fn tool_calls_support_split_done_only_and_multiple_without_duplicate_event
 }
 
 #[tokio::test]
+async fn openai_call_ids_are_limited_before_any_tool_event_is_queued() {
+    let split_id = "s".repeat(64);
+    let done_id = "d".repeat(64);
+    let server = MockServer::spawn([MockResponse::sse(&[
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": split_id, "name": "read", "arguments": ""}
+        }),
+        json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "arguments": "{}"
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {"type": "function_call", "call_id": done_id, "name": "read", "arguments": "{}"}
+        }),
+        completed(usage()),
+    ])])
+    .await;
+    let request = ModelRequest::new(
+        vec![ModelMessage::user("read").unwrap()],
+        vec![read_tool()],
+        ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+        ReasoningPreference::Auto,
+    )
+    .unwrap();
+    let events = run_model(
+        &model(server.base_url()),
+        request,
+        context(CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ToolCallStart { .. }))
+            .count(),
+        2
+    );
+    server.finish().await;
+
+    for (length, done_only) in [(65, false), (65, true), (256, false), (256, true)] {
+        let call_id = "x".repeat(length);
+        let event = if done_only {
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": call_id, "name": "read", "arguments": "{}"}
+            })
+        } else {
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": call_id, "name": "read", "arguments": ""}
+            })
+        };
+        let server = MockServer::spawn([MockResponse::sse(&[event])]).await;
+        let request = ModelRequest::new(
+            vec![ModelMessage::user("read").unwrap()],
+            vec![read_tool()],
+            ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+            ReasoningPreference::Auto,
+        )
+        .unwrap();
+        let (events, error) = run_until_error(
+            &model(server.base_url()),
+            request,
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await;
+        assert!(events.is_empty(), "invalid call ID queued a Tool event");
+        assert_error(
+            &error,
+            ModelErrorKind::InvalidProviderResponse,
+            DeliveryState::Started,
+            false,
+        );
+        server.finish().await;
+    }
+}
+
+#[test]
+fn openai_call_id_parser_enforces_all_lengths_and_runtime_grammar() {
+    assert!(openai_tool_call_id(&"x".repeat(64)).is_ok());
+    for length in 65..=256 {
+        assert!(openai_tool_call_id(&"x".repeat(length)).is_err());
+    }
+    for value in ["", "bad id", "bad\"id", "bad\\id", "line\nbreak"] {
+        assert!(openai_tool_call_id(value).is_err());
+    }
+}
+
+#[tokio::test]
 async fn usage_is_disjoint_and_preserves_cache_reasoning_and_provider_total() {
     let server = MockServer::spawn([MockResponse::sse(&[
         json!({"type": "response.output_text.delta", "delta": "usage"}),
@@ -540,6 +655,82 @@ async fn usage_is_disjoint_and_preserves_cache_reasoning_and_provider_total() {
     assert_eq!(usage["cache_write_tokens"], 3);
     assert_eq!(usage["provider_total_tokens"], 31);
     server.finish().await;
+
+    let zero_boundary = json!({
+        "input_tokens": 8,
+        "input_tokens_details": {"cached_tokens": 5, "cache_write_tokens": 3},
+        "output_tokens": 4,
+        "output_tokens_details": {"reasoning_tokens": 4},
+        "total_tokens": 12
+    });
+    let server = MockServer::spawn([MockResponse::sse(&[completed(zero_boundary)])]).await;
+    let events = run_model(
+        &model(server.base_url()),
+        basic_request(ReasoningPreference::Auto),
+        context(CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            ModelEvent::Usage { usage } => Some(serde_json::to_value(usage).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage["input_tokens"], 0);
+    assert_eq!(usage["output_tokens"], 0);
+    assert_eq!(usage["reasoning_tokens"], 4);
+    assert_eq!(usage["cache_read_tokens"], 5);
+    assert_eq!(usage["cache_write_tokens"], 3);
+    assert_eq!(usage["provider_total_tokens"], 12);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn malformed_usage_fails_the_terminal_without_usage_or_finish() {
+    let cases = [
+        json!({"input_tokens_details": {"cached_tokens": 1}}),
+        json!({"output_tokens_details": {"reasoning_tokens": 1}}),
+        json!({
+            "input_tokens": u64::MAX,
+            "input_tokens_details": {"cached_tokens": u64::MAX, "cache_write_tokens": 1}
+        }),
+        json!({
+            "input_tokens": 5,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 3}
+        }),
+        json!({
+            "output_tokens": 3,
+            "output_tokens_details": {"reasoning_tokens": 4}
+        }),
+        json!({"input_tokens": u64::MAX, "output_tokens": 1}),
+        json!({"input_tokens": 2, "output_tokens": 3, "total_tokens": 4}),
+        json!({"output_tokens": 3, "total_tokens": 3}),
+        json!({"input_tokens": 3, "total_tokens": 3}),
+    ];
+    for usage in cases {
+        let server = MockServer::spawn([MockResponse::sse(&[completed(usage)])]).await;
+        let (events, error) = run_until_error(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Usage { .. } | ModelEvent::Finish { .. })),
+            "malformed terminal emitted Usage or Finish"
+        );
+        assert_error(
+            &error,
+            ModelErrorKind::InvalidProviderResponse,
+            DeliveryState::Started,
+            false,
+        );
+        server.finish().await;
+    }
 }
 
 #[tokio::test]
@@ -686,7 +877,7 @@ async fn unsafe_or_oversized_sse_and_invalid_tool_lifecycle_fail_closed() {
 }
 
 #[tokio::test]
-async fn early_eof_and_transport_failures_never_synthesize_success() {
+async fn provider_event_evidence_controls_stream_error_delivery() {
     let no_event = MockResponse::sse_bytes(Vec::new());
     let after_event_body = sse_body(&[json!({
         "type": "response.output_text.delta",
@@ -696,6 +887,23 @@ async fn early_eof_and_transport_failures_never_synthesize_success() {
     let transport_before = MockResponse::sse_bytes(Vec::new()).with_declared_length(10);
     let transport_after = MockResponse::sse_bytes(after_event_body.clone().into_bytes())
         .with_declared_length(after_event_body.len() + 10);
+    let created_body = sse_body(&[json!({"type": "response.created"})]);
+    let unknown_body = sse_body(&[json!({"type": "response.future_event"})]);
+    let created_eof = MockResponse::sse_bytes(created_body.clone().into_bytes());
+    let created_transport = MockResponse::sse_bytes(created_body.clone().into_bytes())
+        .with_declared_length(created_body.len() + 10);
+    let unknown_eof = MockResponse::sse_bytes(unknown_body.into_bytes());
+    let malformed_after_created =
+        MockResponse::sse_bytes(format!("{created_body}data: {{not-json}}\n\n").into_bytes());
+    let malformed_typed_event = MockResponse::sse(&[json!({"type": "response.output_text.delta"})]);
+    let malformed_untyped_object = MockResponse::sse(&[json!({"delta": "missing type"})]);
+    let created_then_parser_overflow = MockResponse::sse_bytes({
+        let mut body = created_body.clone().into_bytes();
+        body.extend_from_slice(b"data: ");
+        body.extend(std::iter::repeat_n(b'x', MAX_SSE_LINE_BYTES + 1));
+        body
+    });
+    let done_only = MockResponse::sse_bytes(b"data: [DONE]\n\n".to_vec());
     let cases = [
         (
             no_event,
@@ -717,6 +925,46 @@ async fn early_eof_and_transport_failures_never_synthesize_success() {
             ModelErrorKind::StreamInterrupted,
             DeliveryState::Started,
         ),
+        (
+            created_eof,
+            ModelErrorKind::IncompleteResponse,
+            DeliveryState::Started,
+        ),
+        (
+            created_transport,
+            ModelErrorKind::RequestOutcomeUnknown,
+            DeliveryState::Started,
+        ),
+        (
+            unknown_eof,
+            ModelErrorKind::IncompleteResponse,
+            DeliveryState::Started,
+        ),
+        (
+            malformed_after_created,
+            ModelErrorKind::InvalidProviderResponse,
+            DeliveryState::Started,
+        ),
+        (
+            malformed_typed_event,
+            ModelErrorKind::InvalidProviderResponse,
+            DeliveryState::Started,
+        ),
+        (
+            malformed_untyped_object,
+            ModelErrorKind::InvalidProviderResponse,
+            DeliveryState::Unknown,
+        ),
+        (
+            created_then_parser_overflow,
+            ModelErrorKind::InvalidProviderResponse,
+            DeliveryState::Started,
+        ),
+        (
+            done_only,
+            ModelErrorKind::IncompleteResponse,
+            DeliveryState::Unknown,
+        ),
     ];
     for (response, kind, delivery) in cases {
         let server = MockServer::spawn([response]).await;
@@ -729,6 +977,88 @@ async fn early_eof_and_transport_failures_never_synthesize_success() {
         .unwrap_err();
         assert_error(&error, kind, delivery, false);
         server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn created_event_makes_stream_cancellation_and_timeout_started() {
+    for timeout in [false, true] {
+        let cancellation = CancellationToken::new();
+        let deadline = if timeout {
+            TokioInstant::now()
+        } else {
+            TokioInstant::now() + Duration::from_secs(5)
+        };
+        let bytes: ByteStream = Box::pin(futures_util::stream::pending());
+        let mut state = StreamState::new(bytes, cancellation.clone(), deadline);
+        handle_frame(&mut state, br#"{"type":"response.in_progress"}"#).unwrap();
+        if !timeout {
+            cancellation.cancel();
+        }
+        let (result, _) = next_stream_event(state).await.unwrap();
+        let error = result.unwrap_err();
+        assert_error(
+            &error,
+            if timeout {
+                ModelErrorKind::Timeout
+            } else {
+                ModelErrorKind::Cancelled
+            },
+            DeliveryState::Started,
+            false,
+        );
+    }
+}
+
+#[test]
+fn retry_after_parser_honors_priority_and_rejects_unsafe_values() {
+    fn headers(values: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in values {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    assert_eq!(
+        retry_after(
+            &headers(&[("retry-after-ms", "1500"), ("retry-after", "9")]),
+            now,
+        ),
+        Some(Duration::from_millis(1_500))
+    );
+    assert_eq!(
+        retry_after(
+            &headers(&[("retry-after-ms", "bad"), ("retry-after", "1.25")]),
+            now,
+        ),
+        Some(Duration::from_millis(1_250))
+    );
+    assert_eq!(
+        retry_after(&headers(&[("retry-after-ms", "12.5")]), now),
+        Some(Duration::from_micros(12_500))
+    );
+    let date = httpdate::fmt_http_date(now + Duration::from_secs(30));
+    assert_eq!(
+        retry_after(&headers(&[("retry-after", &date)]), now),
+        Some(Duration::from_secs(30))
+    );
+    let past = httpdate::fmt_http_date(now - Duration::from_secs(30));
+    for values in [
+        vec![("retry-after-ms", "-1")],
+        vec![("retry-after", "bad")],
+        vec![("retry-after", "0")],
+        vec![("retry-after", "-1")],
+        vec![("retry-after", "NaN")],
+        vec![("retry-after", "inf")],
+        vec![("retry-after", "1e300")],
+        vec![("retry-after", past.as_str())],
+    ] {
+        assert_eq!(retry_after(&headers(&values), now), None);
     }
 }
 
@@ -859,6 +1189,111 @@ async fn http_status_connect_timeout_and_non_sse_errors_have_conservative_delive
         false,
     );
     server.finish().await;
+}
+
+#[tokio::test]
+async fn rate_limits_distinguish_quota_and_parse_retry_after_strictly() {
+    let quota_codes = [
+        "insufficient_quota",
+        "quota_exceeded",
+        "credit_balance_exhausted",
+        "billing_hard_limit_reached",
+        "usage_limit_reached",
+        "organization_quota_exceeded",
+        "project_quota_exceeded",
+        "organization_usage_limit_exceeded",
+        "project_usage_limit_exceeded",
+        "spend_limit_reached",
+        "spend_limit_exceeded",
+        "organization_spend_limit_reached",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_reached",
+        "project_spend_limit_exceeded",
+    ];
+    for (index, code) in quota_codes.into_iter().enumerate() {
+        let body = if index % 2 == 0 {
+            json!({"error": {"code": code}})
+        } else {
+            json!({"error": {"type": code}})
+        };
+        let server = MockServer::spawn([
+            MockResponse::json(429, body.to_string()).with_header("retry-after-ms", "1500")
+        ])
+        .await;
+        let error = start_error(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await;
+        assert_error(
+            &error,
+            ModelErrorKind::QuotaExceeded,
+            DeliveryState::NotStarted,
+            false,
+        );
+        assert_eq!(error.retry_hint(), &RetryHint::Never);
+        server.finish().await;
+    }
+
+    let future = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120));
+    let cases = [
+        (
+            MockResponse::json(429, r#"{"error":{"code":"rate_limit_exceeded"}}"#)
+                .with_header("retry-after-ms", "1500")
+                .with_header("Retry-After", "9"),
+            Some(Duration::from_millis(1_500)),
+        ),
+        (
+            MockResponse::json(429, "{}")
+                .with_header("retry-after-ms", "bad")
+                .with_header("Retry-After", "1.25"),
+            Some(Duration::from_millis(1_250)),
+        ),
+        (
+            MockResponse::json(429, "{}").with_header("Retry-After", &future),
+            None,
+        ),
+        (
+            MockResponse::json(429, "{}").with_header("retry-after-ms", "-1"),
+            None,
+        ),
+        (
+            MockResponse::json(429, "{}").with_header("Retry-After", "NaN"),
+            None,
+        ),
+        (
+            MockResponse::json(429, "{}").with_header("Retry-After", "1e999"),
+            None,
+        ),
+    ];
+    for (index, (response, expected)) in cases.into_iter().enumerate() {
+        let server = MockServer::spawn([response]).await;
+        let error = start_error(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await;
+        assert_error(
+            &error,
+            ModelErrorKind::RateLimited,
+            DeliveryState::NotStarted,
+            true,
+        );
+        let retry_after = match error.retry_hint() {
+            RetryHint::Retryable { retry_after } => *retry_after,
+            RetryHint::Never => panic!("rate limit must be retryable"),
+        };
+        if index == 2 {
+            let retry_after = retry_after.expect("future HTTP date must produce a delay");
+            assert!(retry_after >= Duration::from_secs(118));
+            assert!(retry_after <= Duration::from_secs(120));
+        } else {
+            assert_eq!(retry_after, expected);
+        }
+        server.finish().await;
+    }
 }
 
 #[tokio::test]
