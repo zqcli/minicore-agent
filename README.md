@@ -125,15 +125,32 @@ directory entry name are execution failures.
 non-overlapping exact literal matches. Empty or over-limit input is invalid; no
 match fails, and multiple matches fail unless `replace_all=true`. Its result
 length is calculated before replacement and cannot exceed 512 KiB.
-`apply_patch` uses `diffy` for complete in-memory application to an existing
-UTF-8 file. The patch, source, and result are each capped at 512 KiB, and result
-length is calculated from parsed hunk lines before applying. Headerless input
-must begin directly with `@@`; standard input must begin with one `---`/`+++`
-pair whose paths, after optional `a/` and `b/` prefixes, exactly match the
-separately supplied Tool path. Multiple file sections, create/delete via
+`apply_patch` uses a local exact-position unified-diff parser/applier for an
+existing UTF-8 file. The patch, source, and result are each capped at 512 KiB;
+the result builder checks the cap before every append. Headerless input must
+begin directly with `@@`; standard input has exactly one optional `---`/`+++`
+pair followed by one or more strictly counted, ordered, non-overlapping hunks.
+Hunk positions are applied exactly as declared with no fuzzy search. Standard
+header paths may be unquoted with a tab timestamp or Git/C quoted with supported
+control, quote, backslash, and one-to-three-digit octal byte escapes. Decoded
+paths must be UTF-8 without NUL and, after optional old `a/` or new `b/` prefixes,
+must exactly match the separately supplied safe relative Tool path. Multiple
+file sections, absolute or parent-traversing headers, create/delete via
 `/dev/null`, rename/copy, git preambles or index metadata, binary patches,
 trailing content, partial apply, and path selection from patch headers are
-rejected. Matching CRLF patches preserve CRLF content.
+rejected.
+
+Patch transport accepts LF or CRLF but strips transport CR from hunk content.
+Source text is split into logical lines retaining `None`, LF, or CRLF endings.
+Context and removals compare exact text and exact no-final-newline marker state;
+unchanged mixed endings are copied byte-for-byte. Additions use the source's
+majority line ending (first observed style breaks ties), so CRLF sources remain
+CRLF, while a valid marker can explicitly produce no final newline. The parser
+consumes patch transport lines once, each hunk is applied with forward-only
+source and patch-content cursors, and the result is appended once without front
+`Vec` splices. Structural tests cover thousands of hunks and prove apply steps
+are bounded by source logical lines plus patch transport lines, giving
+`O(source bytes + patch bytes)` behavior.
 
 All mutating Tools fully construct their one-line success output before calling
 Workspace atomic replacement. Control characters in relative path displays are
@@ -141,10 +158,12 @@ escaped while ordinary Unicode remains readable, so output validation cannot
 fail after a successful commit.
 Invalid JSON, bounds, and path traversal map to invalid invocation; missing,
 permission, binary, atomic failure, and unknown outcomes map to failed execution.
-Cancellation and deadline race every awaited read/parse/compute operation. For
-`write`, `edit`, and `apply_patch` they race only the non-mutating pre-commit
-path; after the synchronous commit boundary the real commit result wins even if
-cancellation or the deadline becomes ready. `bash` remains unimplemented.
+Cancellation and deadline race asynchronous source reads and the remaining
+non-mutating pre-commit awaits. Edit and patch parsing/application are bounded
+synchronous compute: once such compute starts it completes in the same poll and
+is not interruptible midway. After the synchronous Workspace commit boundary,
+the real commit result wins even if cancellation or the deadline becomes ready.
+`bash` remains unimplemented.
 
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
