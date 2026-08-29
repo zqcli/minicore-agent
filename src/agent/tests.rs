@@ -18,8 +18,9 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::session::SessionStatus;
 use minicore_runtime::tools::{
-    Tool, ToolContext, ToolDecision, ToolError, ToolExecutionOutcome, ToolFuture, ToolInvocation,
-    ToolOutput, ToolPolicy, ToolPolicyFuture, ToolPolicyRequest, ToolSet, ToolSpec,
+    ApprovalRequest, ApprovalRisk, Tool, ToolContext, ToolDecision, ToolError,
+    ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput, ToolPolicy, ToolPolicyFuture,
+    ToolPolicyRequest, ToolSet, ToolSpec,
 };
 use minicore_runtime::value::BoundedText;
 
@@ -223,6 +224,19 @@ impl ToolPolicy for AllowPolicy {
     }
 }
 
+struct RequireApprovalPolicy;
+
+impl ToolPolicy for RequireApprovalPolicy {
+    fn decide<'a>(&'a self, _request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
+        Box::pin(async {
+            Ok(ToolDecision::require_approval(
+                ApprovalRequest::new("approve read", ApprovalRisk::Low).unwrap(),
+            )
+            .unwrap())
+        })
+    }
+}
+
 fn tool_set(tool: Option<FakeTool>) -> ToolSet {
     let mut builder = ToolSet::builder();
     if let Some(tool) = tool {
@@ -310,6 +324,16 @@ fn create_request(workspace: &Path) -> CreateSession {
         profile: "test".to_owned(),
         title: Some("loop test".to_owned()),
     }
+}
+
+fn session_directory(base: &Path, session_id: SessionId) -> PathBuf {
+    base.join("data")
+        .join("sessions")
+        .join(session_id.to_string())
+}
+
+fn session_record_path(base: &Path, session_id: SessionId) -> PathBuf {
+    session_directory(base, session_id).join("session.json")
 }
 
 #[tokio::test]
@@ -853,6 +877,184 @@ fn core_turn_finished_is_suppressed_and_its_drop_count_reaches_the_next_event() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_turn_close_emits_session_closed_after_closed_transcript_barrier() {
+    let (mut agent, base, workspace, _) = agent_fixture(
+        "active-close",
+        [ModelScript::Text("final")],
+        Vec::new(),
+        None,
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
+    })
+    .await;
+
+    let barrier_gate = Arc::new(crate::sessions::TranscriptBarrierGate::new(info.session_id));
+    crate::sessions::block_transcript_barrier(Arc::clone(&barrier_gate));
+    let shutdown_gate = Arc::new(crate::sessions::SessionShutdownGate::new(info.session_id));
+    crate::sessions::block_session_shutdown(Arc::clone(&shutdown_gate));
+    let sequencer_stop = agent
+        .sessions
+        .get(info.session_id)
+        .unwrap()
+        .sequencer
+        .stop_signal();
+
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "finish while closing".to_owned(),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(turn).unwrap().wait().await.unwrap();
+    barrier_gate.started.acquire().await.unwrap().forget();
+
+    let close = tokio::spawn(async move {
+        let result = agent.close_session(info.session_id).await;
+        (agent, result)
+    });
+    shutdown_gate.started.acquire().await.unwrap().forget();
+    barrier_gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), sequencer_stop.cancelled())
+        .await
+        .unwrap();
+    shutdown_gate.release.add_permits(1);
+    let (agent, result) = close.await.unwrap();
+    result.unwrap();
+
+    let closed = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match events.recv().await {
+                Some(AgentEvent::SessionClosed { session_id, .. })
+                    if session_id == info.session_id =>
+                {
+                    break true;
+                }
+                Some(_) => {}
+                None => break false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(closed, Ok(true));
+    let late_finish = tokio::time::timeout(Duration::from_millis(100), async {
+        while let Some(event) = events.recv().await {
+            assert!(!matches!(event, AgentEvent::SessionClosed { .. }));
+            if matches!(event, AgentEvent::TurnFinished { turn: value, .. } if value == turn) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(late_finish.is_err() || !late_finish.unwrap());
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_for_input_state_precedes_interaction_requested() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-state-order-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::ReadCalls(1)]);
+    let mut agent = Agent::open_with_models(
+        config(base.join("data"), vec!["read"]),
+        models(model),
+        tool_set(Some(FakeTool::read())),
+        Some(Arc::new(RequireApprovalPolicy)),
+    )
+    .await
+    .unwrap();
+    let gate = Arc::new(crate::sessions::SequencerGate::new());
+    crate::sessions::block_sequencer(workspace.clone(), Arc::clone(&gate));
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    gate.started.acquire().await.unwrap().forget();
+    assert!(matches!(
+        next_event(&mut events).await,
+        AgentEvent::SessionOpened { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        AgentEvent::SessionState { state, .. } if state.status == SessionStatus::Idle
+    ));
+
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "request approval".to_owned(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if agent.session_state(info.session_id).unwrap().status
+                == SessionStatus::WaitingForInput
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    gate.release.add_permits(1);
+
+    let mut waiting_state_seen = false;
+    let interaction = loop {
+        match next_event(&mut events).await {
+            AgentEvent::SessionState { state, .. }
+                if state.status == SessionStatus::WaitingForInput =>
+            {
+                assert!(state.pending_interaction.is_some());
+                waiting_state_seen = true;
+            }
+            AgentEvent::InteractionRequested { interaction, .. } => {
+                assert!(waiting_state_seen);
+                break interaction;
+            }
+            _ => {}
+        }
+    };
+    let state = agent.session_state(info.session_id).unwrap();
+    assert_eq!(state.status, SessionStatus::WaitingForInput);
+    assert_eq!(
+        state
+            .pending_interaction
+            .as_ref()
+            .map(|pending| pending.interaction_id),
+        Some(interaction.interaction_id)
+    );
+    agent
+        .answer(AnswerInteraction {
+            session_id: info.session_id,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::Deny,
+            ),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(turn).unwrap().wait().await.unwrap();
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequencer_barrier_orders_successful_live_events_before_finish() {
     let (mut agent, base, workspace, _) = agent_fixture(
         "sequencer-order",
@@ -1100,8 +1302,11 @@ async fn send_returns_before_background_touch_finishes() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let gate = Arc::new(crate::store::TouchGate::new(info.session_id));
-    crate::store::block_next_touch(Arc::clone(&gate));
+    let gate = Arc::new(crate::store::AtomicWriteGate::new(session_record_path(
+        &base,
+        info.session_id,
+    )));
+    crate::store::block_next_atomic_write(Arc::clone(&gate));
     let turn = tokio::time::timeout(
         Duration::from_secs(2),
         agent.send(SendMessage {
@@ -1164,8 +1369,11 @@ async fn close_joins_blocked_metadata_worker_before_delete() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let gate = Arc::new(crate::store::TouchGate::new(info.session_id));
-    crate::store::block_next_touch(Arc::clone(&gate));
+    let gate = Arc::new(crate::store::AtomicWriteGate::new(session_record_path(
+        &base,
+        info.session_id,
+    )));
+    crate::store::block_next_atomic_write(Arc::clone(&gate));
     let _turn = tokio::time::timeout(
         Duration::from_secs(2),
         agent.send(SendMessage {
@@ -1178,11 +1386,29 @@ async fn close_joins_blocked_metadata_worker_before_delete() {
     .unwrap();
     started.acquire().await.unwrap().forget();
     gate.started.acquire().await.unwrap().forget();
+    let metadata_stop = agent
+        .sessions
+        .get(info.session_id)
+        .unwrap()
+        .metadata
+        .stop_signal();
     drop(events);
-    tokio::time::timeout(Duration::from_secs(5), agent.close_session(info.session_id))
+    let close = tokio::spawn(async move {
+        let result = agent.close_session(info.session_id).await;
+        (agent, result)
+    });
+    tokio::time::timeout(Duration::from_secs(5), metadata_stop.cancelled())
+        .await
+        .unwrap();
+    assert!(!close.is_finished());
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), gate.finished.acquire())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .forget();
+    let (mut agent, result) = close.await.unwrap();
+    result.unwrap();
     agent.delete_session(info.session_id).await.unwrap();
     agent.shutdown().await.unwrap();
     remove_base(&base).await;
@@ -1210,11 +1436,12 @@ async fn metadata_worker_serializes_latest_update_before_close_and_delete() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let first_gate = Arc::new(crate::store::TouchGate::new(info.session_id));
-    let second_gate = Arc::new(crate::store::TouchGate::new(info.session_id));
+    let record_path = session_record_path(&base, info.session_id);
+    let first_gate = Arc::new(crate::store::AtomicWriteGate::new(record_path.clone()));
+    let second_gate = Arc::new(crate::store::AtomicWriteGate::new(record_path));
     second_gate.release.add_permits(1);
-    crate::store::block_next_touch(Arc::clone(&first_gate));
-    crate::store::block_next_touch(Arc::clone(&second_gate));
+    crate::store::block_next_atomic_write(Arc::clone(&first_gate));
+    crate::store::block_next_atomic_write(Arc::clone(&second_gate));
 
     let first = agent
         .send(SendMessage {
@@ -1286,11 +1513,12 @@ async fn metadata_unavailable_retry_waits_for_a_new_latest_value() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let first_gate = Arc::new(crate::store::TouchGate::new(info.session_id));
-    let second_gate = Arc::new(crate::store::TouchGate::new(info.session_id));
-    crate::store::block_next_touch(Arc::clone(&first_gate));
-    crate::store::block_next_touch(Arc::clone(&second_gate));
-    crate::store::fail_next_touch_unavailable(info.session_id);
+    let record_path = session_record_path(&base, info.session_id);
+    let first_gate = Arc::new(crate::store::AtomicWriteGate::new(record_path.clone()));
+    let second_gate = Arc::new(crate::store::AtomicWriteGate::new(record_path.clone()));
+    crate::store::block_next_atomic_write(Arc::clone(&first_gate));
+    crate::store::block_next_atomic_write(Arc::clone(&second_gate));
+    crate::store::fail_next_atomic_write_before_rename(&record_path);
     let first = "2020-01-02T03:04:05.006Z".to_owned();
     let second = "2020-01-02T03:04:05.007Z".to_owned();
     assert!(
@@ -1340,7 +1568,7 @@ async fn metadata_unavailable_retry_waits_for_a_new_latest_value() {
 }
 
 #[tokio::test]
-async fn metadata_unknown_outcome_stops_future_updates_without_writing() {
+async fn metadata_unknown_outcome_stops_future_updates_after_uncertain_write() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-touch-unknown-{}",
         SessionId::new().unwrap()
@@ -1361,15 +1589,12 @@ async fn metadata_unknown_outcome_stops_future_updates_without_writing() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let initial = agent
-        .store
-        .load_record(info.session_id)
-        .await
-        .unwrap()
-        .updated_at;
-    let gate = Arc::new(crate::store::TouchGate::new(info.session_id));
-    crate::store::block_next_touch(Arc::clone(&gate));
-    crate::store::fail_next_touch_unknown_outcome(info.session_id);
+    let gate = Arc::new(crate::store::AtomicWriteGate::new(session_record_path(
+        &base,
+        info.session_id,
+    )));
+    crate::store::block_next_atomic_write(Arc::clone(&gate));
+    crate::store::fail_next_directory_sync(&session_directory(&base, info.session_id));
     assert!(
         agent
             .sessions
@@ -1403,7 +1628,7 @@ async fn metadata_unknown_outcome_stops_future_updates_without_writing() {
             .await
             .unwrap()
             .updated_at,
-        initial
+        "2020-01-02T03:04:05.006Z"
     );
     drop(events);
     agent.close_session(info.session_id).await.unwrap();
