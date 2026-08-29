@@ -49,11 +49,13 @@ Core event stream, state watch, outer sink, and completion-ready queue. When a
 state update and Core event are both ready, it emits the latest state first; this
 preserves Runtime's publish-before-enqueue ordering for actionable interaction
 state. Before emitting a durable Agent `TurnFinished`, it submits a transcript
-command to the same actor, drains already-enqueued Core events, and reads the
-latest state. Core `TurnFinished` is advisory because the runtime EventStream is
-best-effort; if Core drops that envelope, its unknown `dropped_before` metadata
-is unrecoverable and the Agent does not fabricate it. A slow consumer blocks
-only the sequencer, never Runtime or request submission. After a successful
+command to the same actor, emits the current latest state, drains already-enqueued
+Core events, and emits the latest state again if it changed during the drain.
+Successfully sent identical states are deduplicated. Core `TurnFinished` is
+advisory because the runtime EventStream is best-effort; if Core drops that
+envelope, its unknown `dropped_before` metadata is unrecoverable and the Agent
+does not fabricate it. A slow consumer blocks only the sequencer, never Runtime
+or request submission. After a successful
 Runtime shutdown barrier and all owned workers have joined, the loaded-session
 owner makes the sole best-effort `SessionClosed` send; failed shutdowns do not
 send it, and no `TurnFinished` can follow it. The Store uses

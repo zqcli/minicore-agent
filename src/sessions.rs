@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::event::{
-    AgentEvent, AgentEventSink, CompletionCancellation, EventMeta, emit_state, forward_core_event,
+    AgentEvent, AgentEventSink, AgentSendResult, CompletionCancellation, EventMeta,
+    forward_core_event,
 };
 
 use minicore_runtime::error::{SessionError, SessionShutdownError};
@@ -185,6 +186,7 @@ async fn run_sequencer(resources: SequencerResources) {
     } = resources;
     #[cfg(test)]
     let sequencer_gate = take_sequencer_gate(&opened.workspace);
+    let mut last_emitted_state = None;
     let Some(instance_id) = opened.instance_id else {
         stop.cancel();
         return;
@@ -197,7 +199,7 @@ async fn run_sequencer(resources: SequencerResources) {
             dropped_before: 0,
         },
     }) == crate::event::AgentSendResult::Closed
-        || !emit_state(&event_sink, state.borrow_and_update().clone())
+        || !emit_latest_state(&mut state, &event_sink, &mut last_emitted_state)
     {
         stop.cancel();
         return;
@@ -231,6 +233,7 @@ async fn run_sequencer(resources: SequencerResources) {
                         &mut state,
                         &event_sink,
                         &stop,
+                        &mut last_emitted_state,
                     ) => keep_running,
                 },
                 None => {
@@ -239,7 +242,11 @@ async fn run_sequencer(resources: SequencerResources) {
                 }
             },
             changed = state.changed(), if state_open => match changed {
-                Ok(()) => emit_state(&event_sink, state.borrow_and_update().clone()),
+                Ok(()) => emit_latest_state(
+                    &mut state,
+                    &event_sink,
+                    &mut last_emitted_state,
+                ),
                 Err(_) => {
                     state_open = false;
                     true
@@ -260,6 +267,29 @@ async fn run_sequencer(resources: SequencerResources) {
     stop.cancel();
 }
 
+fn emit_latest_state(
+    state: &mut watch::Receiver<SessionState>,
+    event_sink: &AgentEventSink,
+    last_emitted_state: &mut Option<SessionState>,
+) -> bool {
+    let latest = state.borrow_and_update().clone();
+    if last_emitted_state.as_ref() == Some(&latest) {
+        return !event_sink.is_closed();
+    }
+    let result = event_sink.try_send(AgentEvent::SessionState {
+        meta: EventMeta {
+            session_id: latest.session_id,
+            instance_id: latest.instance_id,
+            dropped_before: 0,
+        },
+        state: latest.clone(),
+    });
+    if result == AgentSendResult::Sent {
+        *last_emitted_state = Some(latest);
+    }
+    result != AgentSendResult::Closed
+}
+
 async fn process_completion(
     ready: CompletionReady,
     handle: &SessionHandle,
@@ -267,6 +297,7 @@ async fn process_completion(
     state: &mut watch::Receiver<SessionState>,
     event_sink: &AgentEventSink,
     cancellation: &CompletionCancellation,
+    last_emitted_state: &mut Option<SessionState>,
 ) -> bool {
     match transcript_barrier(handle, cancellation).await {
         BarrierResult::Cancelled => return false,
@@ -277,12 +308,15 @@ async fn process_completion(
         BarrierResult::Processed => {}
     }
 
+    if !emit_latest_state(state, event_sink, last_emitted_state) {
+        return false;
+    }
     while let Ok(envelope) = event_stream.try_recv() {
         if !forward_core_event(envelope, event_sink) {
             return false;
         }
     }
-    if !emit_state(event_sink, state.borrow_and_update().clone()) {
+    if !emit_latest_state(state, event_sink, last_emitted_state) {
         return false;
     }
     let sent = event_sink

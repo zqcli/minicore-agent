@@ -1055,6 +1055,133 @@ async fn waiting_for_input_state_precedes_interaction_requested() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_boundary_preserves_cross_turn_interaction_state_order() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-cross-turn-state-order-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::ReadCalls(1)]);
+    let mut agent = Agent::open_with_models(
+        config(base.join("data"), vec!["read"]),
+        models(model),
+        tool_set(Some(FakeTool::read())),
+        Some(Arc::new(RequireApprovalPolicy)),
+    )
+    .await
+    .unwrap();
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
+    })
+    .await;
+
+    let barrier_gate = Arc::new(crate::sessions::TranscriptBarrierGate::new(info.session_id));
+    crate::sessions::block_transcript_barrier(Arc::clone(&barrier_gate));
+    let first = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "first turn".to_owned(),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(first).unwrap().wait().await.unwrap();
+    barrier_gate.started.acquire().await.unwrap().forget();
+
+    let second = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "second turn needs approval".to_owned(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if agent.session_state(info.session_id).unwrap().status
+                == SessionStatus::WaitingForInput
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    barrier_gate.release.add_permits(1);
+
+    let mut first_started = false;
+    let mut first_output = false;
+    let mut first_finished = false;
+    let mut waiting_state_count = 0;
+    let mut waiting_interaction = None;
+    let interaction = loop {
+        match next_event(&mut events).await {
+            AgentEvent::TurnStarted { turn, .. } if turn == first => first_started = true,
+            AgentEvent::OutputDelta { turn, .. } if turn == first => first_output = true,
+            AgentEvent::SessionState { state, .. }
+                if state.status == SessionStatus::WaitingForInput
+                    && state.active_turn == Some(second.turn_id) =>
+            {
+                waiting_state_count += 1;
+                waiting_interaction = state
+                    .pending_interaction
+                    .as_ref()
+                    .map(|pending| pending.interaction_id);
+            }
+            AgentEvent::InteractionRequested { interaction, .. }
+                if interaction.turn_id == second.turn_id =>
+            {
+                assert_eq!(waiting_interaction, Some(interaction.interaction_id));
+                assert_eq!(waiting_state_count, 1);
+                break interaction;
+            }
+            AgentEvent::TurnFinished { turn, .. } if turn == first => {
+                assert!(first_started);
+                assert!(first_output);
+                first_finished = true;
+            }
+            _ => {}
+        }
+    };
+    while !first_finished {
+        match next_event(&mut events).await {
+            AgentEvent::SessionState { state, .. }
+                if state.status == SessionStatus::WaitingForInput
+                    && state.active_turn == Some(second.turn_id) =>
+            {
+                waiting_state_count += 1;
+            }
+            AgentEvent::TurnFinished { turn, .. } if turn == first => {
+                assert!(first_started);
+                assert!(first_output);
+                first_finished = true;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(waiting_state_count, 1);
+
+    agent
+        .answer(AnswerInteraction {
+            session_id: info.session_id,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::Deny,
+            ),
+        })
+        .await
+        .unwrap();
+    agent.turn_handle(second).unwrap().wait().await.unwrap();
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequencer_barrier_orders_successful_live_events_before_finish() {
     let (mut agent, base, workspace, _) = agent_fixture(
         "sequencer-order",
