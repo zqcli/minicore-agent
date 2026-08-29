@@ -155,22 +155,35 @@ are bounded by source logical lines plus patch transport lines, giving
 `bash` runs `/bin/sh -lc` on Unix and non-interactive PowerShell on Windows. It
 inherits the Agent environment, adds `MINICORE_AGENT=1`, and resolves its
 relative working directory through Workspace before spawning. The Tool future
-owns one `tokio::process::Child` with null stdin, piped stdout/stderr, and
-`kill_on_drop(true)`. Two pinned reader futures are polled in the same Tool
-future alongside `child.wait`; no detached reader task is created. Each stream
-retains at most 512 KiB while continuing to drain excess bytes, so total raw
-capture is at most 1 MiB. The final labeled output is additionally bounded by
-the Runtime 256 KiB ToolOutput cap. Invalid UTF-8 becomes U+FFFD; ANSI ESC, NUL,
-CR, and other controls are escaped while newline and tab remain readable. Each
-truncated stream retains its own `[truncated]` marker. Nonzero and signal exits
-are completed Tool outcomes with a numeric code or `exit_code: unavailable`.
+owns one `tokio::process::Child` with null stdin and `kill_on_drop(true)`. Unix
+uses the child's anonymous piped stdout/stderr as reactor-backed readers.
+Windows instead creates unique first-instance, inbound byte-mode Tokio named
+pipe servers and gives matching `std::fs::File` clients to PowerShell as its
+stdout/stderr write handles. The Tool future reads only the overlapped named
+pipe servers, so it creates neither a Tokio blocking file-read job nor a
+detached reader task. Dropping the Tool future drops pending Unix pipe or
+Windows named-pipe reads together with the child. Two reader futures are polled
+by one pinned collector in the same Tool future alongside `child.wait`. Each
+stream retains at most 512 KiB while continuing to drain excess bytes, so total
+raw capture is at most 1 MiB. The final labeled output is additionally bounded
+by the Runtime 256 KiB ToolOutput cap. Invalid UTF-8 becomes U+FFFD; ANSI ESC,
+NUL, CR, and other controls are escaped while newline and tab remain readable.
+Each truncated stream retains its own `[truncated]` marker. Nonzero and signal
+exits are completed Tool outcomes with a numeric code or
+`exit_code: unavailable`.
 
 The effective command deadline is the earlier of ToolContext and input timeout,
 with cancellation biased first. Explicit cancellation or timeout starts killing
-the direct child and awaits reap before returning the exact ToolError; dropping
-the Tool future relies on `kill_on_drop` to terminate that direct child. v0.1
-does not create Unix process groups or Windows Job Objects and does not guarantee
-that grandchildren, daemons, or inherited pipe handles are reclaimed.
+the direct child and awaits reap before returning the exact ToolError. If the
+child already exited, termination succeeds without another kill. A `try_wait`,
+`start_kill`, or post-kill `wait` error is internal and takes precedence over a
+requested cancellation or timeout; the Tool never claims that termination
+completed after such an error. Dropping the Tool future relies on `kill_on_drop`
+to terminate that direct child. v0.1 does not create Unix process groups or
+Windows Job Objects and does not guarantee that grandchildren or daemons are
+reclaimed. Inherited output handles can keep a normal capture open, but timeout,
+cancellation, or future drop closes this Tool's readers without waiting for a
+grandchild to close its copy.
 
 All file-mutating Tools fully construct their one-line success output before
 calling Workspace atomic replacement. Control characters in relative path
