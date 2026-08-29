@@ -116,17 +116,26 @@ an empty-content block for an empty file when its envelope fits the remaining
 budget. Reads retain at most the 256 KiB visible prefix plus four UTF-8/CRLF
 lookahead bytes. Invalid UTF-8, NUL, bare CR, other unsafe controls, wrong file
 types, inaccessible paths, and Workspace escapes are unavailable; CRLF is
-normalized to LF while ordinary Unicode, newline, and tab are preserved.
+normalized to LF while ordinary Unicode, newline, and tab are preserved. If a
+read cap falls between CR and LF, the visible CR is retained as the logical LF
+and the content is marked truncated.
 
-Project context budgeting uses the same byte/4 ceiling estimator as Core. For
-each candidate content prefix it constructs the exact final system
-`ModelMessage` text,
+Project context budgeting uses a conservative full-request delta with Core's
+byte/4 ceiling estimator. For each candidate content prefix it constructs the
+final system `ModelMessage` text,
 `[minicore-context slot=project_instructions source=agents-md]\n...`, and counts
-its serde JSON bytes before comparing `ceil(bytes / 4)` with
-`remaining_context_budget`. A bounded binary search selects the largest UTF-8
-prefix that fits. File-prefix, final-message-size, and token-budget truncation
-all retain `[truncated]`; if even the marker's complete system-message envelope
-does not fit, the provider returns an empty bundle instead of failing the Turn.
+its serde JSON bytes. Since a valid fixed `ModelRequest` already has a nonempty
+messages array, inserting one context message adds exactly one comma, so
+`delta_bytes = message_bytes + 1` and the provider reserves
+`ceil(delta_bytes / 4)` tokens. For any fixed serialized byte count `F` and
+delta `D`, `ceil((F + D) / 4) - ceil(F / 4) <= ceil(D / 4)`; equality is reached
+when `F % 4 == 0`. The resulting predicate is therefore safe for every unknown
+fixed-request residue and is the tight attainable residue-independent bound,
+not a claim that the provider knows the exact prefix possible for a particular
+fixed residue. A bounded binary search selects the largest UTF-8 prefix under
+that predicate. File-prefix, final-message-size, and token-budget truncation all
+retain `[truncated]`; if even the marker's complete system-message envelope does
+not fit, the provider returns an empty bundle instead of failing the Turn.
 Cancellation and deadlines are biased ahead of the asynchronous Workspace read,
 and dropping the provider future drops that read without mutation or a detached
 task.
