@@ -1,7 +1,6 @@
+use std::path::{Component, Path};
 use std::sync::Arc;
 
-use diffy::patch_set::{FileOperation, ParseOptions, PatchSet};
-use diffy::{Line, Patch};
 use minicore_runtime::tools::{
     Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput,
     ToolSpec,
@@ -110,198 +109,602 @@ impl Tool for ApplyPatchTool {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PatchFormat {
-    Headerless,
-    Standard,
+fn apply_single_file_patch(path: &str, source: &str, patch: &str) -> Result<String, ToolError> {
+    apply_single_file_patch_with_stats(path, source, patch).map(|(result, _)| result)
 }
 
-fn apply_single_file_patch(path: &str, source: &str, patch: &str) -> Result<String, ToolError> {
-    let format = validate_patch_shape(path, patch)?;
-    let normalized;
-    let patch = match format {
-        PatchFormat::Headerless => {
-            normalized = format!("--- minicore-source\n+++ minicore-source\n{patch}");
-            normalized.as_str()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineEnding {
+    None,
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
         }
-        PatchFormat::Standard => patch,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceLine<'a> {
+    text: &'a str,
+    ending: LineEnding,
+}
+
+#[derive(Clone, Copy)]
+enum PatchLineKind {
+    Context,
+    Remove,
+    Add,
+}
+
+#[derive(Clone, Copy)]
+struct PatchContent<'a> {
+    kind: PatchLineKind,
+    text: &'a str,
+    old_no_newline: bool,
+    new_no_newline: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HunkRange {
+    index: usize,
+    count: usize,
+    end: usize,
+}
+
+#[derive(Default)]
+struct ApplyStats {
+    source_lines: usize,
+    source_line_visits: usize,
+    patch_lines: usize,
+    patch_content_visits: usize,
+}
+
+impl ApplyStats {
+    fn total_steps(&self) -> usize {
+        self.source_line_visits
+            .saturating_add(self.patch_content_visits)
+    }
+}
+
+struct ResultBuilder {
+    value: String,
+    line_count: usize,
+    previous_had_no_newline: bool,
+}
+
+impl ResultBuilder {
+    fn new(source_len: usize) -> Self {
+        Self {
+            value: String::with_capacity(source_len.min(MAX_PATCH_BYTES)),
+            line_count: 0,
+            previous_had_no_newline: false,
+        }
+    }
+
+    fn append(&mut self, text: &str, ending: LineEnding) -> Result<(), ToolError> {
+        if self.previous_had_no_newline {
+            return Err(ToolError::Failed);
+        }
+        let added = text
+            .len()
+            .checked_add(ending.as_str().len())
+            .ok_or(ToolError::InvalidInvocation)?;
+        let result_len = self
+            .value
+            .len()
+            .checked_add(added)
+            .ok_or(ToolError::InvalidInvocation)?;
+        if result_len > MAX_PATCH_BYTES {
+            return Err(ToolError::InvalidInvocation);
+        }
+        self.value.push_str(text);
+        self.value.push_str(ending.as_str());
+        self.line_count = self
+            .line_count
+            .checked_add(1)
+            .ok_or(ToolError::InvalidInvocation)?;
+        self.previous_had_no_newline = ending == LineEnding::None;
+        Ok(())
+    }
+}
+
+struct PatchLines<'a> {
+    lines: std::str::SplitInclusive<'a, char>,
+    peeked: Option<&'a str>,
+    steps: usize,
+}
+
+impl<'a> PatchLines<'a> {
+    fn new(patch: &'a str) -> Self {
+        Self {
+            lines: patch.split_inclusive('\n'),
+            peeked: None,
+            steps: 0,
+        }
+    }
+
+    fn peek(&mut self) -> Option<&'a str> {
+        if self.peeked.is_none() {
+            self.peeked = self.lines.next();
+        }
+        self.peeked
+    }
+
+    fn next(&mut self) -> Option<&'a str> {
+        let line = self.peeked.take().or_else(|| self.lines.next())?;
+        self.steps = self.steps.saturating_add(1);
+        Some(line)
+    }
+}
+
+fn apply_single_file_patch_with_stats(
+    path: &str,
+    source: &str,
+    patch: &str,
+) -> Result<(String, ApplyStats), ToolError> {
+    let source_lines = split_source_lines(source);
+    let preferred_ending = preferred_line_ending(&source_lines);
+    let mut stats = ApplyStats {
+        source_lines: source_lines.len(),
+        ..ApplyStats::default()
     };
-    let mut patches = PatchSet::parse(patch, ParseOptions::unidiff());
-    let file_patch = patches
-        .next()
-        .ok_or(ToolError::InvalidInvocation)?
-        .map_err(|_| ToolError::InvalidInvocation)?;
-    if patches.next().is_some() {
+    let mut parser = PatchLines::new(patch);
+    let first = parser.next().ok_or(ToolError::InvalidInvocation)?;
+    let mut next_hunk = if strip_transport_ending(first).starts_with("--- ") {
+        let original = parse_header_path(first, "--- ")?;
+        let modified =
+            parse_header_path(parser.next().ok_or(ToolError::InvalidInvocation)?, "+++ ")?;
+        validate_header_path(&original, path, "a/")?;
+        validate_header_path(&modified, path, "b/")?;
+        parser.next().ok_or(ToolError::InvalidInvocation)?
+    } else {
+        first
+    };
+
+    let mut source_cursor = 0usize;
+    let mut builder = ResultBuilder::new(source.len());
+    let mut hunk_count = 0usize;
+    let mut previous_old_end = 0usize;
+    let mut previous_new_end = 0usize;
+
+    loop {
+        let (old_range, new_range) = parse_hunk_header(strip_transport_ending(next_hunk))?;
+        if old_range.index < previous_old_end || new_range.index < previous_new_end {
+            return Err(ToolError::InvalidInvocation);
+        }
+        previous_old_end = old_range.end;
+        previous_new_end = new_range.end;
+
+        let contents = parse_hunk_contents(&mut parser, old_range.count, new_range.count)?;
+        while source_cursor < old_range.index {
+            append_source_line(&source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+        }
+        if source_cursor != old_range.index || builder.line_count != new_range.index {
+            return Err(ToolError::Failed);
+        }
+        for content in contents.iter().copied() {
+            apply_patch_content(
+                content,
+                &source_lines,
+                &mut source_cursor,
+                &mut builder,
+                preferred_ending,
+                &mut stats,
+            )?;
+            stats.patch_content_visits = stats
+                .patch_content_visits
+                .checked_add(1)
+                .ok_or(ToolError::Internal)?;
+        }
+        if source_cursor != old_range.end || builder.line_count != new_range.end {
+            return Err(ToolError::Failed);
+        }
+        hunk_count = hunk_count
+            .checked_add(1)
+            .ok_or(ToolError::InvalidInvocation)?;
+
+        match parser.next() {
+            Some(line) if strip_transport_ending(line).starts_with("@@ ") => {
+                next_hunk = line;
+            }
+            Some(_) => return Err(ToolError::InvalidInvocation),
+            None => break,
+        }
+    }
+
+    if hunk_count == 0 {
         return Err(ToolError::InvalidInvocation);
     }
-    if !matches!(file_patch.operation(), FileOperation::Modify { .. })
-        || file_patch.old_mode().is_some()
-        || file_patch.new_mode().is_some()
-    {
-        return Err(ToolError::InvalidInvocation);
+    while source_cursor < source_lines.len() {
+        append_source_line(&source_lines, &mut source_cursor, &mut builder, &mut stats)?;
     }
-    let text_patch = file_patch
-        .patch()
-        .as_text()
-        .ok_or(ToolError::InvalidInvocation)?;
-    if text_patch.hunks().is_empty() {
-        return Err(ToolError::InvalidInvocation);
-    }
-    let result_len = patched_len(source.len(), text_patch)?;
-    if result_len > MAX_PATCH_BYTES {
-        return Err(ToolError::InvalidInvocation);
-    }
-    let result = diffy::apply(source, text_patch).map_err(|_| ToolError::Failed)?;
-    if result.len() != result_len {
+    stats.patch_lines = parser.steps;
+    if stats.source_line_visits != stats.source_lines {
         return Err(ToolError::Internal);
     }
-    Ok(result)
+    Ok((builder.value, stats))
 }
 
-fn patched_len(source_len: usize, patch: &Patch<'_, str>) -> Result<usize, ToolError> {
-    let mut result_len = source_len;
-    for line in patch.hunks().iter().flat_map(|hunk| hunk.lines()) {
-        match line {
-            Line::Context(_) => {}
-            Line::Delete(line) => {
-                result_len = result_len
-                    .checked_sub(line.len())
-                    .ok_or(ToolError::Failed)?;
+fn parse_hunk_contents<'a>(
+    parser: &mut PatchLines<'a>,
+    expected_old: usize,
+    expected_new: usize,
+) -> Result<Vec<PatchContent<'a>>, ToolError> {
+    let mut contents = Vec::new();
+    let mut old_count = 0usize;
+    let mut new_count = 0usize;
+    while old_count < expected_old || new_count < expected_new {
+        let raw = parser.next().ok_or(ToolError::InvalidInvocation)?;
+        let line = strip_transport_ending(raw);
+        if line == "\\ No newline at end of file" {
+            return Err(ToolError::InvalidInvocation);
+        }
+        let mut content = parse_patch_content(line)?;
+        match content.kind {
+            PatchLineKind::Context => {
+                old_count = old_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
+                new_count = new_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
             }
-            Line::Insert(line) => {
-                result_len = result_len
-                    .checked_add(line.len())
+            PatchLineKind::Remove => {
+                old_count = old_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
+            }
+            PatchLineKind::Add => {
+                new_count = new_count
+                    .checked_add(1)
                     .ok_or(ToolError::InvalidInvocation)?;
             }
         }
-    }
-    Ok(result_len)
-}
-
-fn validate_patch_shape(path: &str, patch: &str) -> Result<PatchFormat, ToolError> {
-    let mut lines = patch.split_inclusive('\n');
-    let first = lines.next().ok_or(ToolError::InvalidInvocation)?;
-    let format = if strip_line_ending(first).starts_with("@@ ") {
-        PatchFormat::Headerless
-    } else if strip_line_ending(first).starts_with("--- ") {
-        let original = patch_header_path(first, "--- ")?;
-        let modified_line = lines.next().ok_or(ToolError::InvalidInvocation)?;
-        let modified = patch_header_path(modified_line, "+++ ")?;
-        if !header_path_matches(original, path, "a/") || !header_path_matches(modified, path, "b/")
-        {
+        if old_count > expected_old || new_count > expected_new {
             return Err(ToolError::InvalidInvocation);
         }
-        PatchFormat::Standard
+        if parser
+            .peek()
+            .is_some_and(|line| strip_transport_ending(line) == "\\ No newline at end of file")
+        {
+            parser.next();
+            mark_no_newline(&mut content)?;
+            if parser
+                .peek()
+                .is_some_and(|line| strip_transport_ending(line) == "\\ No newline at end of file")
+            {
+                return Err(ToolError::InvalidInvocation);
+            }
+        }
+        contents.push(content);
+    }
+    if contents.is_empty() {
+        return Err(ToolError::InvalidInvocation);
+    }
+    Ok(contents)
+}
+
+fn split_source_lines(source: &str) -> Vec<SourceLine<'_>> {
+    let bytes = source.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+        let (text_end, ending) = if index > start && bytes[index - 1] == b'\r' {
+            (index - 1, LineEnding::Crlf)
+        } else {
+            (index, LineEnding::Lf)
+        };
+        lines.push(SourceLine {
+            text: &source[start..text_end],
+            ending,
+        });
+        start = index + 1;
+    }
+    if start < source.len() {
+        lines.push(SourceLine {
+            text: &source[start..],
+            ending: LineEnding::None,
+        });
+    }
+    lines
+}
+
+fn preferred_line_ending(lines: &[SourceLine<'_>]) -> LineEnding {
+    let mut lf = 0usize;
+    let mut crlf = 0usize;
+    let mut first = None;
+    for line in lines {
+        match line.ending {
+            LineEnding::Lf => {
+                lf = lf.saturating_add(1);
+                first.get_or_insert(LineEnding::Lf);
+            }
+            LineEnding::Crlf => {
+                crlf = crlf.saturating_add(1);
+                first.get_or_insert(LineEnding::Crlf);
+            }
+            LineEnding::None => {}
+        }
+    }
+    match crlf.cmp(&lf) {
+        std::cmp::Ordering::Greater => LineEnding::Crlf,
+        std::cmp::Ordering::Less => LineEnding::Lf,
+        std::cmp::Ordering::Equal => first.unwrap_or(LineEnding::Lf),
+    }
+}
+
+fn append_source_line(
+    source: &[SourceLine<'_>],
+    cursor: &mut usize,
+    builder: &mut ResultBuilder,
+    stats: &mut ApplyStats,
+) -> Result<(), ToolError> {
+    let line = *source.get(*cursor).ok_or(ToolError::Failed)?;
+    builder.append(line.text, line.ending)?;
+    *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
+    stats.source_line_visits = stats
+        .source_line_visits
+        .checked_add(1)
+        .ok_or(ToolError::Internal)?;
+    Ok(())
+}
+
+fn apply_patch_content(
+    content: PatchContent<'_>,
+    source: &[SourceLine<'_>],
+    cursor: &mut usize,
+    builder: &mut ResultBuilder,
+    preferred_ending: LineEnding,
+    stats: &mut ApplyStats,
+) -> Result<(), ToolError> {
+    match content.kind {
+        PatchLineKind::Context => {
+            let line = matching_source_line(content, source, *cursor)?;
+            builder.append(line.text, line.ending)?;
+            *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
+            stats.source_line_visits = stats
+                .source_line_visits
+                .checked_add(1)
+                .ok_or(ToolError::Internal)?;
+        }
+        PatchLineKind::Remove => {
+            matching_source_line(content, source, *cursor)?;
+            *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
+            stats.source_line_visits = stats
+                .source_line_visits
+                .checked_add(1)
+                .ok_or(ToolError::Internal)?;
+        }
+        PatchLineKind::Add => {
+            let ending = if content.new_no_newline {
+                LineEnding::None
+            } else {
+                preferred_ending
+            };
+            builder.append(content.text, ending)?;
+        }
+    }
+    Ok(())
+}
+
+fn matching_source_line<'a>(
+    content: PatchContent<'_>,
+    source: &'a [SourceLine<'a>],
+    cursor: usize,
+) -> Result<SourceLine<'a>, ToolError> {
+    let line = *source.get(cursor).ok_or(ToolError::Failed)?;
+    let has_no_newline = line.ending == LineEnding::None;
+    if line.text != content.text || has_no_newline != content.old_no_newline {
+        return Err(ToolError::Failed);
+    }
+    Ok(line)
+}
+
+fn parse_patch_content(line: &str) -> Result<PatchContent<'_>, ToolError> {
+    let (kind, text) = if let Some(text) = line.strip_prefix(' ') {
+        (PatchLineKind::Context, text)
+    } else if let Some(text) = line.strip_prefix('-') {
+        (PatchLineKind::Remove, text)
+    } else if let Some(text) = line.strip_prefix('+') {
+        (PatchLineKind::Add, text)
     } else {
         return Err(ToolError::InvalidInvocation);
     };
-
-    let first_hunk = matches!(format, PatchFormat::Headerless).then_some(first);
-    validate_hunks(first_hunk.into_iter().chain(lines))?;
-    Ok(format)
+    Ok(PatchContent {
+        kind,
+        text,
+        old_no_newline: false,
+        new_no_newline: false,
+    })
 }
 
-fn patch_header_path<'a>(line: &'a str, prefix: &str) -> Result<&'a str, ToolError> {
-    let line = strip_line_ending(line);
-    let path = line
+fn mark_no_newline(content: &mut PatchContent<'_>) -> Result<(), ToolError> {
+    if content.old_no_newline || content.new_no_newline {
+        return Err(ToolError::InvalidInvocation);
+    }
+    match content.kind {
+        PatchLineKind::Context => {
+            content.old_no_newline = true;
+            content.new_no_newline = true;
+        }
+        PatchLineKind::Remove => content.old_no_newline = true,
+        PatchLineKind::Add => content.new_no_newline = true,
+    }
+    Ok(())
+}
+
+fn parse_hunk_header(header: &str) -> Result<(HunkRange, HunkRange), ToolError> {
+    let ranges = header
+        .strip_prefix("@@ ")
+        .and_then(|header| header.strip_suffix(" @@"))
+        .ok_or(ToolError::InvalidInvocation)?;
+    let (old, new) = ranges.split_once(' ').ok_or(ToolError::InvalidInvocation)?;
+    if old.contains(' ') || new.contains(' ') {
+        return Err(ToolError::InvalidInvocation);
+    }
+    Ok((parse_hunk_range(old, '-')?, parse_hunk_range(new, '+')?))
+}
+
+fn parse_hunk_range(range: &str, prefix: char) -> Result<HunkRange, ToolError> {
+    let range = range
         .strip_prefix(prefix)
         .ok_or(ToolError::InvalidInvocation)?;
-    let path = path.split_once('\t').map_or(path, |(path, _)| path);
-    if path.is_empty() || path == "/dev/null" {
+    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+    if !is_decimal(start) || !is_decimal(count) {
+        return Err(ToolError::InvalidInvocation);
+    }
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| ToolError::InvalidInvocation)?;
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| ToolError::InvalidInvocation)?;
+    if start == 0 && count != 0 {
+        return Err(ToolError::InvalidInvocation);
+    }
+    let index = if count == 0 {
+        start
+    } else {
+        start.checked_sub(1).ok_or(ToolError::InvalidInvocation)?
+    };
+    let end = index
+        .checked_add(count)
+        .ok_or(ToolError::InvalidInvocation)?;
+    start
+        .checked_add(count)
+        .ok_or(ToolError::InvalidInvocation)?;
+    Ok(HunkRange { index, count, end })
+}
+
+fn is_decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_header_path(line: &str, prefix: &str) -> Result<String, ToolError> {
+    let line = strip_transport_ending(line);
+    let value = line
+        .strip_prefix(prefix)
+        .ok_or(ToolError::InvalidInvocation)?;
+    let path = if value.starts_with('"') {
+        decode_quoted_path(value)?
+    } else {
+        value
+            .split_once('\t')
+            .map_or(value, |(path, _)| path)
+            .to_owned()
+    };
+    if path.is_empty() || path.contains('\0') {
         return Err(ToolError::InvalidInvocation);
     }
     Ok(path)
 }
 
-fn header_path_matches(header: &str, path: &str, prefix: &str) -> bool {
-    header == path || header.strip_prefix(prefix) == Some(path)
+fn decode_quoted_path(value: &str) -> Result<String, ToolError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 1usize;
+    let mut closed = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                closed = true;
+                break;
+            }
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index).ok_or(ToolError::InvalidInvocation)?;
+                match escaped {
+                    b'\\' | b'"' => {
+                        decoded.push(escaped);
+                        index += 1;
+                    }
+                    b'a' | b'b' | b't' | b'n' | b'v' | b'f' | b'r' => {
+                        decoded.push(match escaped {
+                            b'a' => 0x07,
+                            b'b' => 0x08,
+                            b't' => b'\t',
+                            b'n' => b'\n',
+                            b'v' => 0x0b,
+                            b'f' => 0x0c,
+                            b'r' => b'\r',
+                            _ => unreachable!(),
+                        });
+                        index += 1;
+                    }
+                    b'0'..=b'7' => {
+                        let mut value = 0u16;
+                        let mut digits = 0usize;
+                        while digits < 3
+                            && index < bytes.len()
+                            && matches!(bytes[index], b'0'..=b'7')
+                        {
+                            value = value
+                                .checked_mul(8)
+                                .and_then(|value| value.checked_add(u16::from(bytes[index] - b'0')))
+                                .ok_or(ToolError::InvalidInvocation)?;
+                            index += 1;
+                            digits += 1;
+                        }
+                        decoded
+                            .push(u8::try_from(value).map_err(|_| ToolError::InvalidInvocation)?);
+                    }
+                    _ => return Err(ToolError::InvalidInvocation),
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    if !closed || (index < bytes.len() && bytes[index] != b'\t') {
+        return Err(ToolError::InvalidInvocation);
+    }
+    let path = String::from_utf8(decoded).map_err(|_| ToolError::InvalidInvocation)?;
+    if path.contains('\0') {
+        return Err(ToolError::InvalidInvocation);
+    }
+    Ok(path)
 }
 
-fn validate_hunks<'a>(lines: impl IntoIterator<Item = &'a str>) -> Result<(), ToolError> {
-    let mut lines = lines.into_iter().peekable();
-    let mut hunk_count = 0usize;
-    while let Some(header) = lines.next() {
-        let (expected_old, expected_new) = parse_hunk_counts(strip_line_ending(header))?;
-        let mut old_count = 0usize;
-        let mut new_count = 0usize;
-        let mut marker_allowed = false;
-        while old_count < expected_old || new_count < expected_new {
-            let line = lines.next().ok_or(ToolError::InvalidInvocation)?;
-            let content = strip_line_ending(line);
-            if content == "\\ No newline at end of file" {
-                if !marker_allowed {
-                    return Err(ToolError::InvalidInvocation);
-                }
-                marker_allowed = false;
-                continue;
-            }
-            match line.as_bytes().first().copied() {
-                Some(b' ') => {
-                    old_count = old_count.saturating_add(1);
-                    new_count = new_count.saturating_add(1);
-                }
-                Some(b'-') => old_count = old_count.saturating_add(1),
-                Some(b'+') => new_count = new_count.saturating_add(1),
-                Some(b'\n') | None => {
-                    old_count = old_count.saturating_add(1);
-                    new_count = new_count.saturating_add(1);
-                }
-                _ => return Err(ToolError::InvalidInvocation),
-            }
-            if old_count > expected_old || new_count > expected_new {
-                return Err(ToolError::InvalidInvocation);
-            }
-            marker_allowed = true;
-        }
-        if lines
-            .peek()
-            .is_some_and(|line| strip_line_ending(line) == "\\ No newline at end of file")
-        {
-            if !marker_allowed {
-                return Err(ToolError::InvalidInvocation);
-            }
-            lines.next();
-        }
-        hunk_count = hunk_count.saturating_add(1);
-    }
-    if hunk_count == 0 {
+fn validate_header_path(header: &str, tool_path: &str, prefix: &str) -> Result<(), ToolError> {
+    let candidate = if header == tool_path {
+        header
+    } else {
+        header.strip_prefix(prefix).unwrap_or(header)
+    };
+    let path = Path::new(candidate);
+    if candidate != tool_path
+        || candidate.is_empty()
+        || candidate.contains('\0')
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
         return Err(ToolError::InvalidInvocation);
     }
     Ok(())
 }
 
-fn parse_hunk_counts(header: &str) -> Result<(usize, usize), ToolError> {
-    let ranges = header
-        .strip_prefix("@@ ")
-        .and_then(|header| header.split_once(" @@"))
-        .map(|(ranges, _)| ranges)
-        .ok_or(ToolError::InvalidInvocation)?;
-    let mut ranges = ranges.split_whitespace();
-    let old = ranges.next().ok_or(ToolError::InvalidInvocation)?;
-    let new = ranges.next().ok_or(ToolError::InvalidInvocation)?;
-    if ranges.next().is_some() {
-        return Err(ToolError::InvalidInvocation);
-    }
-    Ok((parse_range_len(old, '-')?, parse_range_len(new, '+')?))
-}
-
-fn parse_range_len(range: &str, prefix: char) -> Result<usize, ToolError> {
-    let range = range
-        .strip_prefix(prefix)
-        .ok_or(ToolError::InvalidInvocation)?;
-    let (start, len) = range.split_once(',').unwrap_or((range, "1"));
-    let start = start
-        .parse::<usize>()
-        .map_err(|_| ToolError::InvalidInvocation)?;
-    let len = len
-        .parse::<usize>()
-        .map_err(|_| ToolError::InvalidInvocation)?;
-    start.checked_add(len).ok_or(ToolError::InvalidInvocation)?;
-    Ok(len)
-}
-
-fn strip_line_ending(line: &str) -> &str {
-    let line = line.strip_suffix('\n').unwrap_or(line);
+fn strip_transport_ending(line: &str) -> &str {
+    let Some(line) = line.strip_suffix('\n') else {
+        return line;
+    };
     line.strip_suffix('\r').unwrap_or(line)
 }
 
@@ -493,6 +896,295 @@ mod tests {
             assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), source);
         }
         cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn hunk_content_at_the_wrong_declared_position_does_not_fuzzy_apply() {
+        let (base, _, tool) = fixture("exact-position").await;
+        let root = base.join("root");
+        let target = root.join("value.txt");
+        let source = "zero\none\ntarget\n";
+        tokio::fs::write(&target, source).await.unwrap();
+        let patch = "@@ -1 +1 @@\n-target\n+changed\n";
+
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "value.txt", "patch": patch})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), source);
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn hunk_ranges_are_strict_ordered_and_support_start_zero_insertions() {
+        let (base, _, tool) = fixture("strict-ranges").await;
+        let root = base.join("root");
+        let target = root.join("value.txt");
+        tokio::fs::write(&target, "tail\n").await.unwrap();
+        assert_eq!(
+            execute(
+                &tool,
+                json!({"path": "value.txt", "patch": "@@ -0,0 +1 @@\n+head\n"})
+            )
+            .await
+            .unwrap(),
+            "patched 5 bytes to 10 bytes at value.txt"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "head\ntail\n"
+        );
+
+        let invalid = [
+            "@@ -0 +1 @@\n-tail\n+TAIL\n",
+            "@@ -1,2 +1 @@\n-tail\n+TAIL\n",
+            "@@ -1 +1 @@ function\n-tail\n+TAIL\n",
+            "@@ -1,0 +1,0 @@\n",
+            "@@ -184467440737095516160,0 +1,0 @@\n+x\n",
+            "@@ -2 +2 @@\n-b\n+B\n@@ -1 +1 @@\n-a\n+A\n",
+            "@@ -1,2 +1,2 @@\n a\n b\n@@ -2 +2 @@\n-b\n+B\n",
+        ];
+        for patch in invalid {
+            tokio::fs::write(&target, "a\nb\n").await.unwrap();
+            assert_eq!(
+                tool.execute(
+                    invocation(json!({"path": "value.txt", "patch": patch})),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                )
+                .await,
+                Err(ToolError::InvalidInvocation),
+                "patch should be rejected as invalid: {patch:?}"
+            );
+            assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "a\nb\n");
+        }
+
+        tokio::fs::write(&target, "a\n").await.unwrap();
+        let wrong_new_position = "@@ -1 +2 @@\n-a\n+A\n";
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "value.txt", "patch": wrong_new_position})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "a\n");
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn c_quoted_headers_decode_tab_quote_backslash_and_octal_utf8() {
+        let (base, _, tool) = fixture("quoted-headers").await;
+        let root = base.join("root");
+        let cases = [
+            (
+                "tab\tname.txt",
+                r#""a/tab\tname.txt""#,
+                r#""b/tab\tname.txt""#,
+            ),
+            (
+                "quote\"name.txt",
+                r#""a/quote\"name.txt""#,
+                r#""b/quote\"name.txt""#,
+            ),
+            (
+                "slash\\name.txt",
+                r#""a/slash\\name.txt""#,
+                r#""b/slash\\name.txt""#,
+            ),
+            ("é.txt", r#""a/\303\251.txt""#, r#""b/\303\251.txt""#),
+        ];
+        for (path, old_header, new_header) in cases {
+            tokio::fs::write(root.join(path), "old\n").await.unwrap();
+            let patch = format!(
+                "--- {old_header}\told timestamp\n+++ {new_header}\tnew timestamp\n@@ -1 +1 @@\n-old\n+new\n"
+            );
+            execute(&tool, json!({"path": path, "patch": patch}))
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(path)).await.unwrap(),
+                "new\n"
+            );
+        }
+
+        tokio::fs::write(root.join("value.txt"), "old\n")
+            .await
+            .unwrap();
+        let invalid_headers = [
+            r#""/absolute""#,
+            r#""a/../value.txt""#,
+            r#""a/value\x.txt""#,
+            r#""a/\377.txt""#,
+            r#""a/\000value.txt""#,
+            r#""a/value.txt"junk"#,
+            r#""a/value.txt"#,
+        ];
+        for old_header in invalid_headers {
+            let patch = format!("--- {old_header}\n+++ \"b/value.txt\"\n@@ -1 +1 @@\n-old\n+new\n");
+            assert_eq!(
+                tool.execute(
+                    invocation(json!({"path": "value.txt", "patch": patch})),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                )
+                .await,
+                Err(ToolError::InvalidInvocation)
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("value.txt"))
+                    .await
+                    .unwrap(),
+                "old\n"
+            );
+        }
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn newline_markers_are_side_specific_and_preserve_crlf_final_newline_state() {
+        let (base, _, tool) = fixture("newline-markers").await;
+        let root = base.join("root");
+        let target = root.join("value.txt");
+
+        tokio::fs::write(&target, b"keep\r\nold").await.unwrap();
+        let old_only = "@@ -2 +2 @@\r\n-old\r\n\\ No newline at end of file\r\n+new\r\n";
+        execute(&tool, json!({"path": "value.txt", "patch": old_only}))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"keep\r\nnew\r\n");
+
+        tokio::fs::write(&target, b"keep\r\nold\r\n").await.unwrap();
+        let new_only = "--- a/value.txt\r\n+++ b/value.txt\r\n@@ -2 +2 @@\r\n-old\r\n+new\r\n\\ No newline at end of file\r\n";
+        execute(&tool, json!({"path": "value.txt", "patch": new_only}))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"keep\r\nnew");
+
+        tokio::fs::write(&target, b"keep\r\nlast").await.unwrap();
+        let context_patch = "@@ -2 +2 @@\r\n last\r\n\\ No newline at end of file\r\n";
+        execute(&tool, json!({"path": "value.txt", "patch": context_patch}))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"keep\r\nlast");
+
+        for patch in [
+            "\\ No newline at end of file\n@@ -1 +1 @@\n-old\n+new\n",
+            "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n\\ No newline at end of file\n+new\n",
+        ] {
+            tokio::fs::write(&target, b"old\n").await.unwrap();
+            assert_eq!(
+                tool.execute(
+                    invocation(json!({"path": "value.txt", "patch": patch})),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                )
+                .await,
+                Err(ToolError::InvalidInvocation)
+            );
+            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"old\n");
+        }
+
+        tokio::fs::write(&target, b"old\n").await.unwrap();
+        let wrong_old_marker = "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n";
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "value.txt", "patch": wrong_old_marker})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"old\n");
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_source_endings_are_preserved_outside_changes_and_additions_use_majority() {
+        let (base, _, tool) = fixture("mixed-endings").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value.txt"), b"one\r\ntwo\nthree\r\n")
+            .await
+            .unwrap();
+        let patch = "@@ -2 +2 @@\n-two\n+TWO\n";
+        execute(&tool, json!({"path": "value.txt", "patch": patch}))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(root.join("value.txt")).await.unwrap(),
+            b"one\r\nTWO\r\nthree\r\n"
+        );
+        cleanup(&base).await;
+    }
+
+    #[test]
+    fn thousands_of_hunks_use_single_forward_source_and_patch_steps() {
+        let mut source = String::new();
+        let mut replacement_patch = String::new();
+        let mut expected = String::new();
+        for index in 0..3_000usize {
+            source.push_str(&format!("v{index:04}\n"));
+            expected.push_str(&format!("V{index:04}\n"));
+            let line = index + 1;
+            replacement_patch.push_str(&format!(
+                "@@ -{line} +{line} @@\n-v{index:04}\n+V{index:04}\n"
+            ));
+        }
+        assert!(replacement_patch.len() <= MAX_PATCH_BYTES);
+        let (result, stats) =
+            apply_single_file_patch_with_stats("value.txt", &source, &replacement_patch).unwrap();
+        assert_eq!(result, expected);
+        assert_eq!(stats.source_line_visits, stats.source_lines);
+        assert_eq!(stats.patch_lines, replacement_patch.lines().count());
+        assert!(stats.total_steps() <= stats.source_lines + replacement_patch.lines().count());
+
+        let mut insertion_patch = String::new();
+        let mut inserted = String::new();
+        for index in 0..3_000usize {
+            let new_line = index + 1;
+            insertion_patch.push_str(&format!("@@ -0,0 +{new_line} @@\n+i{index:04}\n"));
+            inserted.push_str(&format!("i{index:04}\n"));
+        }
+        assert!(insertion_patch.len() <= MAX_PATCH_BYTES);
+        let (result, stats) =
+            apply_single_file_patch_with_stats("value.txt", "", &insertion_patch).unwrap();
+        assert_eq!(result, inserted);
+        assert_eq!(stats.source_line_visits, 0);
+        assert_eq!(stats.patch_lines, insertion_patch.lines().count());
+        assert!(stats.total_steps() <= insertion_patch.lines().count());
+
+        let source = "x".repeat(MAX_PATCH_BYTES - 8_000);
+        let mut over_limit_patch = String::new();
+        for index in 0..5_000usize {
+            let new_line = index + 1;
+            over_limit_patch.push_str(&format!("@@ -0,0 +{new_line} @@\n+x\n"));
+        }
+        assert!(over_limit_patch.len() <= MAX_PATCH_BYTES);
+        assert_eq!(
+            apply_single_file_patch("value.txt", &source, &over_limit_patch),
+            Err(ToolError::InvalidInvocation)
+        );
     }
 
     #[tokio::test]
