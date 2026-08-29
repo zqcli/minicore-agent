@@ -494,6 +494,7 @@ impl Agent {
             sequencer,
             completion,
             metadata,
+            event_sink,
         })
     }
 

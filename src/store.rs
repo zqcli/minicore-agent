@@ -50,28 +50,19 @@ static DELETE_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static CLEANUP_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
-#[derive(Clone, Copy)]
-enum TouchFailure {
-    Unavailable,
-    UnknownOutcome,
-}
-
 #[cfg(test)]
-static TOUCH_FAILURES: OnceLock<Mutex<Vec<(SessionId, TouchFailure)>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct TouchGate {
-    session_id: SessionId,
+pub(crate) struct AtomicWriteGate {
+    path: PathBuf,
     pub(crate) started: Arc<Semaphore>,
     pub(crate) release: Arc<Semaphore>,
     pub(crate) finished: Arc<Semaphore>,
 }
 
 #[cfg(test)]
-impl TouchGate {
-    pub(crate) fn new(session_id: SessionId) -> Self {
+impl AtomicWriteGate {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
-            session_id,
+            path,
             started: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(0)),
             finished: Arc::new(Semaphore::new(0)),
@@ -80,7 +71,7 @@ impl TouchGate {
 }
 
 #[cfg(test)]
-static TOUCH_GATES: OnceLock<Mutex<Vec<Arc<TouchGate>>>> = OnceLock::new();
+static ATOMIC_WRITE_GATES: OnceLock<Mutex<Vec<Arc<AtomicWriteGate>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -314,35 +305,9 @@ impl Store {
         session_id: SessionId,
         updated_at: String,
     ) -> Result<(), StoreError> {
-        #[cfg(test)]
-        let touch_failure = take_touch_failure(session_id);
-        #[cfg(not(test))]
-        let touch_failure: Option<TouchFailure> = None;
-        #[cfg(test)]
-        let touch_gate = take_touch_gate(session_id);
-        #[cfg(test)]
-        if let Some(gate) = &touch_gate {
-            gate.started.add_permits(1);
-            gate.release.acquire().await.unwrap().forget();
-        }
-        let result = if let Some(failure) = touch_failure {
-            Err(match failure {
-                TouchFailure::Unavailable => StoreError::Unavailable,
-                TouchFailure::UnknownOutcome => StoreError::UnknownOutcome,
-            })
-        } else {
-            async {
-                let mut record = self.load_record(session_id).await?;
-                record.updated_at = updated_at;
-                self.write_record(&record).await
-            }
-            .await
-        };
-        #[cfg(test)]
-        if let Some(gate) = touch_gate {
-            gate.finished.add_permits(1);
-        }
-        result
+        let mut record = self.load_record(session_id).await?;
+        record.updated_at = updated_at;
+        self.write_record(&record).await
     }
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
@@ -903,27 +868,41 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError>
         .open(&temp_path)
         .await
         .map_err(|_| AtomicWriteError::Unavailable)?;
-    if file.write_all(bytes).await.is_err()
-        || file.flush().await.is_err()
-        || file.sync_all().await.is_err()
-    {
+    if file.write_all(bytes).await.is_err() {
         let _ = fs::remove_file(&temp_path).await;
         return Err(AtomicWriteError::Unavailable);
     }
-    drop(file);
     #[cfg(test)]
-    if should_fail_atomic_write_before_rename(path) {
+    let atomic_write_gate = take_atomic_write_gate(path);
+    #[cfg(test)]
+    if let Some(gate) = &atomic_write_gate {
+        gate.started.add_permits(1);
+        gate.release.acquire().await.unwrap().forget();
+    }
+    let result = if file.flush().await.is_err() || file.sync_all().await.is_err() {
+        drop(file);
         let _ = fs::remove_file(&temp_path).await;
-        return Err(AtomicWriteError::Unavailable);
+        Err(AtomicWriteError::Unavailable)
+    } else {
+        drop(file);
+        #[cfg(test)]
+        let fail_before_rename = should_fail_atomic_write_before_rename(path);
+        #[cfg(not(test))]
+        let fail_before_rename = false;
+        if fail_before_rename || fs::rename(&temp_path, path).await.is_err() {
+            let _ = fs::remove_file(&temp_path).await;
+            Err(AtomicWriteError::Unavailable)
+        } else if sync_directory(&parent).await.is_err() {
+            Err(AtomicWriteError::UnknownOutcome)
+        } else {
+            Ok(())
+        }
+    };
+    #[cfg(test)]
+    if let Some(gate) = atomic_write_gate {
+        gate.finished.add_permits(1);
     }
-    if fs::rename(&temp_path, path).await.is_err() {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(AtomicWriteError::Unavailable);
-    }
-    if sync_directory(&parent).await.is_err() {
-        return Err(AtomicWriteError::UnknownOutcome);
-    }
-    Ok(())
+    result
 }
 
 fn map_atomic_store_error(error: AtomicWriteError) -> StoreError {
@@ -1068,7 +1047,7 @@ fn should_fail_atomic_write_before_rename(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-fn fail_next_directory_sync(path: &Path) {
+pub(crate) fn fail_next_directory_sync(path: &Path) {
     fail_directory_sync_after(path, 0);
 }
 
@@ -1085,7 +1064,7 @@ fn fail_directory_sync_after(path: &Path, remaining_successes: usize) {
 }
 
 #[cfg(test)]
-fn fail_next_atomic_write_before_rename(path: &Path) {
+pub(crate) fn fail_next_atomic_write_before_rename(path: &Path) {
     ATOMIC_BEFORE_RENAME_FAILURES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -1128,38 +1107,8 @@ fn fail_next_cleanup(path: &Path) {
 }
 
 #[cfg(test)]
-pub(crate) fn fail_next_touch_unavailable(session_id: SessionId) {
-    TOUCH_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, TouchFailure::Unavailable));
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_touch_unknown_outcome(session_id: SessionId) {
-    TOUCH_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, TouchFailure::UnknownOutcome));
-}
-
-#[cfg(test)]
-fn take_touch_failure(session_id: SessionId) -> Option<TouchFailure> {
-    let mut failures = TOUCH_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    failures
-        .iter()
-        .position(|(candidate, _)| *candidate == session_id)
-        .map(|position| failures.remove(position).1)
-}
-
-#[cfg(test)]
-pub(crate) fn block_next_touch(gate: Arc<TouchGate>) {
-    TOUCH_GATES
+pub(crate) fn block_next_atomic_write(gate: Arc<AtomicWriteGate>) {
+    ATOMIC_WRITE_GATES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap()
@@ -1167,14 +1116,14 @@ pub(crate) fn block_next_touch(gate: Arc<TouchGate>) {
 }
 
 #[cfg(test)]
-fn take_touch_gate(session_id: SessionId) -> Option<Arc<TouchGate>> {
-    let mut gates = TOUCH_GATES
+fn take_atomic_write_gate(path: &Path) -> Option<Arc<AtomicWriteGate>> {
+    let mut gates = ATOMIC_WRITE_GATES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap();
     gates
         .iter()
-        .position(|gate| gate.session_id == session_id)
+        .position(|gate| gate.path == path)
         .map(|position| gates.remove(position))
 }
 

@@ -45,13 +45,18 @@ the single-consumer `AgentEventStream`, `AgentEvent`, and `run_stdio`. `Agent`
 opens the local Store, manages multiple loaded SessionRuntime owners, and
 forwards typed live events while authoritative durable turn completion is obtained
 from a cloned `TurnHandle`. One outbound sequencer owns each loaded session's
-Core event stream, state watch, outer sink, and completion-ready queue. Before
-emitting a durable Agent `TurnFinished`, it submits a transcript command to the
-same actor, drains already-enqueued Core events, and reads the latest state. Core
-`TurnFinished` is advisory because the runtime EventStream is best-effort; if
-Core drops that envelope, its unknown `dropped_before` metadata is unrecoverable
-and the Agent does not fabricate it. A slow consumer blocks only the sequencer,
-never Runtime or request submission. The Store uses
+Core event stream, state watch, outer sink, and completion-ready queue. When a
+state update and Core event are both ready, it emits the latest state first; this
+preserves Runtime's publish-before-enqueue ordering for actionable interaction
+state. Before emitting a durable Agent `TurnFinished`, it submits a transcript
+command to the same actor, drains already-enqueued Core events, and reads the
+latest state. Core `TurnFinished` is advisory because the runtime EventStream is
+best-effort; if Core drops that envelope, its unknown `dropped_before` metadata
+is unrecoverable and the Agent does not fabricate it. A slow consumer blocks
+only the sequencer, never Runtime or request submission. After a successful
+Runtime shutdown barrier and all owned workers have joined, the loaded-session
+owner makes the sole best-effort `SessionClosed` send; failed shutdowns do not
+send it, and no `TurnFinished` can follow it. The Store uses
 `<data_dir>/sessions/<session-id>/` with `session.json`, `manifest.json`, and
 `conversation.log`; each append is one durable JSON line containing one batch.
 
@@ -79,8 +84,11 @@ Session metadata `updated_at` is updated in memory immediately and flushed by on
 owned, serialized latest-value worker per loaded session. Temporary unavailable
 errors leave that worker alive for the next update; terminal metadata failures
 stop it, while metadata persistence remains best-effort and never changes a
-submitted turn. Closing explicitly cancels pending metadata work and joins the
-worker before deletion. Workspace, real Tools, Context, Policy, OpenAI HTTP, and
-RPC method extensions remain outside this Phase. The offline process coverage is
+submitted turn. Closing stops the worker from receiving or starting another
+latest-value update, so a queued update that has not started may be discarded.
+Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
+to completion before joining the worker and allowing deletion. Workspace, real
+Tools, Context, Policy, OpenAI HTTP, and RPC method extensions remain outside
+this Phase. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and Store
 coverage is in the internal unit tests of `src/store.rs`.
