@@ -1,6 +1,10 @@
 use std::io;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use minicore_runtime::tools::{
@@ -25,6 +29,17 @@ const FORMATTED_OUTPUT_LIMIT: usize = if MAX_COMMAND_OUTPUT < MAX_TEXT_BYTES {
 } else {
     MAX_TEXT_BYTES
 };
+
+#[cfg(windows)]
+static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
+
+type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
+
+struct SpawnedCommand {
+    child: Child,
+    stdout: OutputReader,
+    stderr: OutputReader,
+}
 
 pub(super) struct BashTool {
     workspace: Arc<Workspace>,
@@ -100,7 +115,7 @@ impl Tool for BashTool {
                 .ok_or(ToolError::InvalidInvocation)?;
             let deadline = context.deadline.min(input_deadline);
             let cwd = resolve_cwd(&self.workspace, &input.cwd, &context, deadline).await?;
-            let output = run_command(&input.command, &cwd, &context, deadline).await?;
+            let output = run_command(&input.command, &cwd, &invocation, &context, deadline).await?;
             let output = ToolOutput::new(output).map_err(|_| ToolError::Internal)?;
             Ok(ToolExecutionOutcome::Completed(output))
         })
@@ -128,6 +143,7 @@ async fn resolve_cwd(
 async fn run_command(
     command: &str,
     cwd: &std::path::Path,
+    invocation: &ToolInvocation,
     context: &ToolContext,
     deadline: Instant,
 ) -> Result<String, ToolError> {
@@ -138,29 +154,10 @@ async fn run_command(
         return Err(ToolError::TimedOut);
     }
 
-    let mut process = shell_command(command);
-    process
-        .current_dir(cwd)
-        .env("MINICORE_AGENT", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = process.spawn().map_err(|_| ToolError::Failed)?;
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(&mut child).await;
-            return Err(ToolError::Internal);
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate_and_reap(&mut child).await;
-            return Err(ToolError::Internal);
-        }
-    };
+    let spawned = spawn_with_output_capture(command, cwd, invocation).await?;
+    let mut child = spawned.child;
+    let stdout = spawned.stdout;
+    let stderr = spawned.stderr;
     let collectors = async { tokio::try_join!(capture_stream(stdout), capture_stream(stderr)) };
     tokio::pin!(collectors);
     let mut status = None;
@@ -181,17 +178,17 @@ async fn run_command(
         };
         match event {
             ProcessEvent::Cancelled => {
-                terminate_and_reap(&mut child).await;
+                terminate_and_reap(&mut child).await?;
                 return Err(ToolError::Cancelled);
             }
             ProcessEvent::TimedOut => {
-                terminate_and_reap(&mut child).await;
+                terminate_and_reap(&mut child).await?;
                 return Err(ToolError::TimedOut);
             }
             ProcessEvent::Exited(Ok(exit_status)) => status = Some(exit_status),
             ProcessEvent::Output(Ok(output)) => captures = Some(output),
             ProcessEvent::Exited(Err(_)) | ProcessEvent::Output(Err(_)) => {
-                terminate_and_reap(&mut child).await;
+                terminate_and_reap(&mut child).await?;
                 return Err(ToolError::Internal);
             }
         }
@@ -203,6 +200,115 @@ async fn run_command(
         &stdout,
         &stderr,
     ))
+}
+
+#[cfg(unix)]
+async fn spawn_with_output_capture(
+    command: &str,
+    cwd: &std::path::Path,
+    _invocation: &ToolInvocation,
+) -> Result<SpawnedCommand, ToolError> {
+    let mut process = shell_command(command);
+    process
+        .current_dir(cwd)
+        .env("MINICORE_AGENT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = process.spawn().map_err(|_| ToolError::Failed)?;
+    drop(process);
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_and_reap(&mut child).await?;
+            return Err(ToolError::Internal);
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_and_reap(&mut child).await?;
+            return Err(ToolError::Internal);
+        }
+    };
+    Ok(SpawnedCommand {
+        child,
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+    })
+}
+
+#[cfg(windows)]
+async fn spawn_with_output_capture(
+    command: &str,
+    cwd: &std::path::Path,
+    invocation: &ToolInvocation,
+) -> Result<SpawnedCommand, ToolError> {
+    let (stdout_server, stdout_client) =
+        create_capture_pipe(invocation, "stdout").map_err(|_| ToolError::Failed)?;
+    let (stderr_server, stderr_client) =
+        create_capture_pipe(invocation, "stderr").map_err(|_| ToolError::Failed)?;
+    tokio::try_join!(stdout_server.connect(), stderr_server.connect())
+        .map_err(|_| ToolError::Failed)?;
+
+    let mut process = shell_command(command);
+    process
+        .current_dir(cwd)
+        .env("MINICORE_AGENT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_client))
+        .stderr(Stdio::from(stderr_client))
+        .kill_on_drop(true);
+    let child = process.spawn().map_err(|_| ToolError::Failed)?;
+    drop(process);
+    Ok(SpawnedCommand {
+        child,
+        stdout: Box::new(stdout_server),
+        stderr: Box::new(stderr_server),
+    })
+}
+
+#[cfg(windows)]
+fn create_capture_pipe(
+    invocation: &ToolInvocation,
+    stream: &str,
+) -> io::Result<(
+    tokio::net::windows::named_pipe::NamedPipeServer,
+    std::fs::File,
+)> {
+    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+
+    let pipe_id = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
+    let tool_call_id = safe_pipe_component(invocation.tool_call_id().as_str());
+    let pipe_name = format!(
+        r"\\.\pipe\minicore-agent-{}-{}-{}-{pipe_id}-{stream}",
+        std::process::id(),
+        invocation.session_id(),
+        tool_call_id,
+    );
+    let server = ServerOptions::new()
+        .pipe_mode(PipeMode::Byte)
+        .access_outbound(false)
+        .first_pipe_instance(true)
+        .create(&pipe_name)?;
+    let client = std::fs::OpenOptions::new().write(true).open(&pipe_name)?;
+    Ok((server, client))
+}
+
+#[cfg(windows)]
+fn safe_pipe_component(value: &str) -> String {
+    value
+        .bytes()
+        .take(48)
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                char::from(byte)
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -255,9 +361,69 @@ where
     Ok(StreamCapture { bytes, truncated })
 }
 
-async fn terminate_and_reap(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+async fn terminate_and_reap(child: &mut Child) -> Result<(), ToolError> {
+    if child.try_wait().map_err(|_| ToolError::Internal)?.is_some() {
+        return Ok(());
+    }
+    start_kill(child).map_err(|_| ToolError::Internal)?;
+    wait_after_kill(child)
+        .await
+        .map_err(|_| ToolError::Internal)?;
+    Ok(())
+}
+
+fn start_kill(child: &mut Child) -> io::Result<()> {
+    #[cfg(test)]
+    if take_termination_failure(child, TerminationFailure::StartKill) {
+        return Err(io::Error::other("injected start_kill failure"));
+    }
+    child.start_kill()
+}
+
+async fn wait_after_kill(child: &mut Child) -> io::Result<ExitStatus> {
+    #[cfg(test)]
+    if take_termination_failure(child, TerminationFailure::Wait) {
+        return Err(io::Error::other("injected wait failure"));
+    }
+    child.wait().await
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TerminationFailure {
+    StartKill,
+    Wait,
+}
+
+#[cfg(test)]
+static TERMINATION_FAILURES: OnceLock<Mutex<Vec<(u32, TerminationFailure)>>> = OnceLock::new();
+
+#[cfg(test)]
+fn inject_termination_failure(pid: u32, failure: TerminationFailure) {
+    TERMINATION_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((pid, failure));
+}
+
+#[cfg(test)]
+fn take_termination_failure(child: &Child, failure: TerminationFailure) -> bool {
+    let Some(pid) = child.id() else {
+        return false;
+    };
+    let mut failures = TERMINATION_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    let Some(position) = failures
+        .iter()
+        .position(|candidate| *candidate == (pid, failure))
+    else {
+        return false;
+    };
+    failures.remove(position);
+    true
 }
 
 fn format_output(status: ExitStatus, stdout: &StreamCapture, stderr: &StreamCapture) -> String {
@@ -713,6 +879,149 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn exited_child_with_inherited_pipes_obeys_input_and_context_deadlines() {
+        assert_grandchild_held_pipe_timeout(
+            "held-pipe-input",
+            1,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_grandchild_held_pipe_timeout(
+            "held-pipe-context",
+            30,
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_timeout_drops_named_pipe_readers_held_by_grandchild() {
+        let (base, workspace, tool) = fixture("windows-held-pipe-timeout").await;
+        let follow_up = BashTool::new(workspace);
+        let pid_file = base.join("root/grandchild.pid");
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({
+                    "command": windows_grandchild_command(false),
+                    "timeout_seconds": 1
+                })),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+            )
+            .await
+        });
+        let pid = read_pid(&pid_file).await;
+        let mut guard = WindowsProcessGuard::new(pid);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ToolError::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(process_exists(pid));
+        assert_windows_follow_up(&follow_up).await;
+        guard.terminate().await;
+        cleanup(&base).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cancellation_drops_named_pipe_readers_held_by_grandchild() {
+        let (base, workspace, tool) = fixture("windows-held-pipe-cancel").await;
+        let follow_up = BashTool::new(workspace);
+        let pid_file = base.join("root/grandchild.pid");
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({
+                    "command": windows_grandchild_command(false),
+                    "timeout_seconds": 30
+                })),
+                context(task_cancellation, Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+        });
+        let pid = read_pid(&pid_file).await;
+        let mut guard = WindowsProcessGuard::new(pid);
+        cancellation.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ToolError::Cancelled)
+        );
+        assert!(process_exists(pid));
+        assert_windows_follow_up(&follow_up).await;
+        guard.terminate().await;
+        cleanup(&base).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_future_drop_cancels_capture_and_runtime_shutdown_is_bounded() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (base, workspace, tool) = fixture("windows-held-pipe-drop").await;
+            let follow_up = BashTool::new(workspace);
+            let pid_file = base.join("root/grandchild.pid");
+            let task = tokio::spawn(async move {
+                tool.execute(
+                    invocation(json!({
+                        "command": windows_grandchild_command(true),
+                        "timeout_seconds": 30
+                    })),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(30),
+                    ),
+                )
+                .await
+            });
+            let pid = read_pid(&pid_file).await;
+            let mut guard = WindowsProcessGuard::new(pid);
+            task.abort();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert_windows_follow_up(&follow_up).await;
+            guard.terminate().await;
+            cleanup(&base).await;
+        });
+        let shutdown_started = Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        assert!(shutdown_started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_kill_failure_is_internal_without_waiting_for_natural_exit() {
+        assert_termination_failure_is_internal("start-kill-failure", TerminationFailure::StartKill)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_failure_is_internal_and_child_drop_finishes_cleanup() {
+        assert_termination_failure_is_internal("wait-failure", TerminationFailure::Wait).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn signal_exit_uses_unavailable_exit_code() {
         let (base, _, tool) = fixture("signal-exit").await;
         let output = execute(&tool, json!({"command": "kill -TERM $$"}))
@@ -724,6 +1033,77 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_grandchild_held_pipe_timeout(
+        label: &str,
+        timeout_seconds: u64,
+        context_deadline: Instant,
+    ) {
+        let (base, _, tool) = fixture(label).await;
+        let pid_file = base.join("root/grandchild.pid");
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({
+                    "command": "sleep 30 & echo $! > grandchild.pid; exit 0",
+                    "timeout_seconds": timeout_seconds
+                })),
+                context(CancellationToken::new(), context_deadline),
+            )
+            .await
+        });
+        let pid = read_pid(&pid_file).await;
+        let mut guard = UnixProcessGuard::new(pid);
+        let result = tokio::time::timeout(Duration::from_secs(3), task).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result.unwrap().unwrap(),
+            Err(ToolError::TimedOut),
+            "collector waited for inherited pipe EOF"
+        );
+        assert!(elapsed < Duration::from_secs(2));
+        assert!(process_exists(pid));
+        guard.terminate().await;
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_termination_failure_is_internal(label: &str, failure: TerminationFailure) {
+        let (base, _, tool) = fixture(label).await;
+        let pid_file = base.join("root/child.pid");
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let mut task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({
+                    "command": "echo $$ > child.pid; exec sleep 30",
+                    "timeout_seconds": 30
+                })),
+                context(task_cancellation, Instant::now() + Duration::from_secs(30)),
+            )
+            .await
+        });
+        let pid = read_pid(&pid_file).await;
+        let mut guard = UnixProcessGuard::new(pid);
+        inject_termination_failure(pid, failure);
+        let started = Instant::now();
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(500), &mut task).await;
+        let observed = match result {
+            Ok(Ok(Err(error))) => Some(error),
+            _ => None,
+        };
+        if !task.is_finished() {
+            task.abort();
+            let _ = task.await;
+        }
+        wait_for_process_exit(pid).await;
+        guard.disarm();
+        cleanup(&base).await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(observed, Some(ToolError::Internal));
+    }
+
+    #[cfg(any(unix, windows))]
     async fn read_pid(path: &Path) -> u32 {
         for _ in 0..200 {
             if let Ok(value) = tokio::fs::read_to_string(path).await {
@@ -733,7 +1113,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("direct child did not publish its PID");
+        panic!("test process did not publish its PID");
     }
 
     #[cfg(unix)]
@@ -754,5 +1134,139 @@ mod tests {
             .arg(format!("kill -0 {pid} 2>/dev/null"))
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    struct UnixProcessGuard {
+        pid: Option<u32>,
+    }
+
+    #[cfg(unix)]
+    impl UnixProcessGuard {
+        fn new(pid: u32) -> Self {
+            Self { pid: Some(pid) }
+        }
+
+        async fn terminate(&mut self) {
+            let Some(pid) = self.pid else {
+                return;
+            };
+            kill_process(pid);
+            wait_for_process_exit(pid).await;
+            self.pid = None;
+        }
+
+        fn disarm(&mut self) {
+            self.pid = None;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnixProcessGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid {
+                kill_process(pid);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn kill_process(pid: u32) {
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -KILL {pid} 2>/dev/null"))
+            .status();
+    }
+
+    #[cfg(windows)]
+    fn windows_grandchild_command(parent_waits: bool) -> String {
+        let parent_tail = if parent_waits {
+            "; Start-Sleep -Seconds 30"
+        } else {
+            ""
+        };
+        format!(
+            "$child = Start-Process -FilePath powershell.exe -NoNewWindow -PassThru \
+             -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', \
+             'Start-Sleep -Seconds 30'); Set-Content -NoNewline -Path \
+             grandchild.pid -Value $child.Id{parent_tail}"
+        )
+    }
+
+    #[cfg(windows)]
+    async fn assert_windows_follow_up(tool: &BashTool) {
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute(tool, json!({"command": "Write-Output follow-up"})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.starts_with("exit_code: 0\nstdout:\nfollow-up"));
+        assert!(output.contains("\nstderr:\n"));
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_process_exit(pid: u32) {
+        for _ in 0..200 {
+            if !process_exists(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test process PID {pid} remained alive");
+    }
+
+    #[cfg(windows)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(format!(
+                "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} \
+                 else {{ exit 1 }}"
+            ))
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    struct WindowsProcessGuard {
+        pid: Option<u32>,
+    }
+
+    #[cfg(windows)]
+    impl WindowsProcessGuard {
+        fn new(pid: u32) -> Self {
+            Self { pid: Some(pid) }
+        }
+
+        async fn terminate(&mut self) {
+            let Some(pid) = self.pid else {
+                return;
+            };
+            kill_process(pid);
+            wait_for_process_exit(pid).await;
+            self.pid = None;
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsProcessGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.pid {
+                kill_process(pid);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn kill_process(pid: u32) {
+        let _ = std::process::Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/F")
+            .status();
     }
 }
