@@ -1,4 +1,5 @@
 mod apply_patch;
+mod bash;
 mod edit;
 mod read;
 mod write;
@@ -16,6 +17,7 @@ use thiserror::Error;
 use crate::{Workspace, WorkspaceError};
 
 use apply_patch::ApplyPatchTool;
+use bash::BashTool;
 use edit::EditTool;
 use read::ReadTool;
 use write::WriteTool;
@@ -23,11 +25,14 @@ use write::WriteTool;
 pub(crate) const MAX_READ_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_WRITE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_PATCH_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_COMMAND_OUTPUT: usize = 1024 * 1024;
+pub(crate) const DEFAULT_COMMAND_TIMEOUT: u64 = 120;
+pub(crate) const MAX_COMMAND_TIMEOUT: u64 = 1_800;
 pub(crate) const DEFAULT_READ_OFFSET: usize = 1;
 pub(crate) const DEFAULT_READ_LIMIT: usize = 400;
 pub(crate) const MAX_READ_LINES: usize = 2_000;
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 1_000;
-pub(crate) const KNOWN_TOOL_NAMES: &[&str] = &["read", "write", "edit", "apply_patch"];
+pub(crate) const KNOWN_TOOL_NAMES: &[&str] = &["read", "write", "edit", "apply_patch", "bash"];
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum BuildToolsError {
@@ -50,6 +55,9 @@ pub(crate) fn build_tools(
         match name.as_str() {
             "apply_patch" => {
                 builder.register(ApplyPatchTool::new(Arc::clone(&workspace)));
+            }
+            "bash" => {
+                builder.register(BashTool::new(Arc::clone(&workspace)));
             }
             "edit" => {
                 builder.register(EditTool::new(Arc::clone(&workspace)));
@@ -195,17 +203,22 @@ mod tests {
     async fn build_tools_registers_exact_subsets_and_rejects_unknown_or_duplicate_names() {
         let (base, workspace) = workspace("subset").await;
         let apply_patch = "apply_patch".parse().unwrap();
+        let bash = "bash".parse().unwrap();
         let edit = "edit".parse().unwrap();
         let read = "read".parse().unwrap();
         let write = "write".parse().unwrap();
 
         let empty = build_tools(&[], Arc::clone(&workspace)).unwrap();
         assert!(!empty.contains(&apply_patch));
+        assert!(!empty.contains(&bash));
         assert!(!empty.contains(&edit));
         assert!(!empty.contains(&read));
         assert!(!empty.contains(&write));
 
-        assert_eq!(KNOWN_TOOL_NAMES, &["read", "write", "edit", "apply_patch"]);
+        assert_eq!(
+            KNOWN_TOOL_NAMES,
+            &["read", "write", "edit", "apply_patch", "bash"]
+        );
 
         for mask in 0..(1usize << KNOWN_TOOL_NAMES.len()) {
             let names = KNOWN_TOOL_NAMES

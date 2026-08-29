@@ -107,8 +107,8 @@ scheme is implemented. Workspace is not yet assembled into Agent capabilities,
 and the existing temporary Agent workspace validation remains unchanged.
 
 The crate-private Tool module currently implements the exact `read`, `write`,
-`edit`, and `apply_patch` tools; they are not yet assembled into Agent sessions.
-All four use strict object schemas and reject unknown input fields. `read`
+`edit`, `apply_patch`, and `bash` tools; they are not yet assembled into Agent
+sessions. All five use strict object schemas and reject unknown input fields. `read`
 supports one-based line offsets, a default 400-line limit (maximum 2000),
 one-level sorted directory listings capped at 1000 entries, and `[truncated]`
 markers for line, 512 KiB file prefix, directory-count, or Runtime output limits.
@@ -152,10 +152,30 @@ source and patch-content cursors, and the result is appended once without front
 are bounded by source logical lines plus patch transport lines, giving
 `O(source bytes + patch bytes)` behavior.
 
-All mutating Tools fully construct their one-line success output before calling
-Workspace atomic replacement. Control characters in relative path displays are
-escaped while ordinary Unicode remains readable, so output validation cannot
-fail after a successful commit.
+`bash` runs `/bin/sh -lc` on Unix and non-interactive PowerShell on Windows. It
+inherits the Agent environment, adds `MINICORE_AGENT=1`, and resolves its
+relative working directory through Workspace before spawning. The Tool future
+owns one `tokio::process::Child` with null stdin, piped stdout/stderr, and
+`kill_on_drop(true)`. Two pinned reader futures are polled in the same Tool
+future alongside `child.wait`; no detached reader task is created. Each stream
+retains at most 512 KiB while continuing to drain excess bytes, so total raw
+capture is at most 1 MiB. The final labeled output is additionally bounded by
+the Runtime 256 KiB ToolOutput cap. Invalid UTF-8 becomes U+FFFD; ANSI ESC, NUL,
+CR, and other controls are escaped while newline and tab remain readable. Each
+truncated stream retains its own `[truncated]` marker. Nonzero and signal exits
+are completed Tool outcomes with a numeric code or `exit_code: unavailable`.
+
+The effective command deadline is the earlier of ToolContext and input timeout,
+with cancellation biased first. Explicit cancellation or timeout starts killing
+the direct child and awaits reap before returning the exact ToolError; dropping
+the Tool future relies on `kill_on_drop` to terminate that direct child. v0.1
+does not create Unix process groups or Windows Job Objects and does not guarantee
+that grandchildren, daemons, or inherited pipe handles are reclaimed.
+
+All file-mutating Tools fully construct their one-line success output before
+calling Workspace atomic replacement. Control characters in relative path
+displays are escaped while ordinary Unicode remains readable, so output
+validation cannot fail after a successful commit.
 Invalid JSON, bounds, and path traversal map to invalid invocation; missing,
 permission, binary, atomic failure, and unknown outcomes map to failed execution.
 Cancellation and deadline race asynchronous source reads and the remaining
@@ -163,7 +183,6 @@ non-mutating pre-commit awaits. Edit and patch parsing/application are bounded
 synchronous compute: once such compute starts it completes in the same poll and
 is not interruptible midway. After the synchronous Workspace commit boundary,
 the real commit result wins even if cancellation or the deadline becomes ready.
-`bash` remains unimplemented.
 
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
@@ -182,9 +201,9 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. The remaining
-Tools, Context, Policy, OpenAI HTTP, Workspace/Tool capability assembly, and RPC
-method extensions remain outside this Phase. The offline process coverage is
+to completion before joining the worker and allowing deletion. Context, Policy,
+OpenAI HTTP, Workspace/Tool capability assembly, and RPC method extensions remain
+outside this Phase. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
 Store, Workspace, and Tool coverage is in the internal unit tests of
 `src/store.rs`, `src/workspace.rs`, and `src/tools/`.
