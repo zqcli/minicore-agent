@@ -140,6 +140,21 @@ Cancellation and deadlines are biased ahead of the asynchronous Workspace read,
 and dropping the provider future drops that read without mutation or a detached
 task.
 
+The crate-private concrete `Policy` implements MiniCore's `ToolPolicy` but is
+not yet assembled into production Agent sessions. Classification is an exact
+five-name match: `read` is read-only, while `write`, `edit`, `apply_patch`, and
+`bash` are mutating. `Auto` allows every known Tool. `Ask` allows `read` and
+returns a `Medium` risk approval request for each mutating call with the prompt
+``Allow tool `<name>` for this call?``. `ReadOnly` allows `read` and denies every
+mutating Tool with a short stable reason. Unknown names and mismatched
+invocation/spec names fail closed with a typed denial in every mode. Approval
+prompts and denial reasons never include Tool arguments, paths, content,
+commands, or raw JSON. A pre-cancelled request returns `Cancelled`; an already
+expired deadline returns the stable `Failed` category. Decisions are immediate,
+with no external await, spawned task, approval cache, session/project grant, or
+persistence; repeated and newly constructed `Ask` policies always request a new
+per-call approval, leaving `AllowOnce`/`Deny` handling to Core.
+
 The crate-private Tool module currently implements the exact `read`, `write`,
 `edit`, `apply_patch`, and `bash` tools; they are not yet assembled into Agent
 sessions. All five use strict object schemas and reject unknown input fields. `read`
@@ -248,9 +263,10 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. Policy, OpenAI
-HTTP, Workspace/Tool/Context capability assembly, and RPC method extensions
+to completion before joining the worker and allowing deletion. OpenAI HTTP,
+Workspace/Tool/Context/Policy capability assembly, and RPC method extensions
 remain outside this Phase. The offline process coverage is
 in `tests/rpc_stdio.rs`, Agent loop coverage is in `src/agent/tests.rs`, and
-Store, Workspace, Tool, and Context coverage is in the internal unit tests of
-`src/store.rs`, `src/workspace.rs`, `src/tools/`, and `src/context.rs`.
+Store, Workspace, Tool, Context, and Policy coverage is in the internal unit
+tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and
+`src/policy.rs`.

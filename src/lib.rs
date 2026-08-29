@@ -10,6 +10,11 @@ mod context;
 mod error;
 mod event;
 mod models;
+#[allow(
+    dead_code,
+    reason = "Policy is assembled into Agent capabilities in a later phase"
+)]
+mod policy;
 mod profiles;
 mod rpc;
 mod sessions;
