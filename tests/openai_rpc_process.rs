@@ -176,7 +176,13 @@ fn completed() -> Value {
         "type": "response.completed",
         "response": {
             "status": "completed",
-            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "total_tokens": 8,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0}
+            }
         }
     })
 }

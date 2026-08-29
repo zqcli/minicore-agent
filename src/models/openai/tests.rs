@@ -125,12 +125,41 @@ fn history_request(reasoning: ReasoningPreference) -> ModelRequest {
     .unwrap()
 }
 
+fn tool_exchange_request(call_id: &str) -> ModelRequest {
+    let call_id = ToolCallId::new(call_id).unwrap();
+    let call = ToolCall::new(
+        call_id.clone(),
+        "read".parse().unwrap(),
+        json!({"path": "input.txt"}),
+        0,
+    )
+    .unwrap();
+    ModelRequest::new(
+        vec![
+            ModelMessage::user("read").unwrap(),
+            ModelMessage::assistant(vec![AssistantPart::ToolCall(call)]).unwrap(),
+            ModelMessage::tool_with_outcome(
+                call_id,
+                ToolOutput::new("result").unwrap(),
+                ToolResultOutcome::Success,
+            )
+            .unwrap(),
+        ],
+        vec![read_tool()],
+        ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+        ReasoningPreference::Auto,
+    )
+    .unwrap()
+}
+
 fn completed(usage: Value) -> Value {
     json!({
         "type": "response.completed",
+        "future_terminal_field": true,
         "response": {
             "status": "completed",
-            "usage": usage
+            "usage": usage,
+            "future_response_field": true
         }
     })
 }
@@ -138,10 +167,12 @@ fn completed(usage: Value) -> Value {
 fn incomplete(reason: &str, usage: Value) -> Value {
     json!({
         "type": "response.incomplete",
+        "future_terminal_field": true,
         "response": {
             "status": "incomplete",
             "incomplete_details": {"reason": reason},
-            "usage": usage
+            "usage": usage,
+            "future_response_field": true
         }
     })
 }
@@ -149,10 +180,15 @@ fn incomplete(reason: &str, usage: Value) -> Value {
 fn usage() -> Value {
     json!({
         "input_tokens": 20,
-        "input_tokens_details": {"cached_tokens": 5, "cache_write_tokens": 3},
+        "input_tokens_details": {
+            "cached_tokens": 5,
+            "cache_write_tokens": 3,
+            "future_input_detail": true
+        },
         "output_tokens": 11,
-        "output_tokens_details": {"reasoning_tokens": 4},
-        "total_tokens": 31
+        "output_tokens_details": {"reasoning_tokens": 4, "future_output_detail": true},
+        "total_tokens": 31,
+        "future_usage_field": true
     })
 }
 
@@ -289,6 +325,92 @@ async fn descriptor_and_request_mapping_are_exact_and_secret_safe() {
         "reasoning history without an exact provider item identity must be omitted"
     );
     assert!(!String::from_utf8_lossy(request.body()).contains("TEST-API-KEY-SECRET"));
+}
+
+#[tokio::test]
+async fn request_replay_call_ids_validate_before_any_http_request() {
+    let valid_id = "v".repeat(64);
+    let server = MockServer::spawn([MockResponse::sse(&[completed(usage())])]).await;
+    run_model(
+        &model(server.base_url()),
+        tool_exchange_request(&valid_id),
+        context(CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 1);
+    let input = requests[0].json_body()["input"].as_array().unwrap().clone();
+    assert!(
+        input
+            .iter()
+            .any(|item| { item["type"] == "function_call" && item["call_id"] == valid_id })
+    );
+    assert!(
+        input
+            .iter()
+            .any(|item| { item["type"] == "function_call_output" && item["call_id"] == valid_id })
+    );
+
+    let invalid_id = "x".repeat(65);
+    for (call_id, valid) in [(&valid_id, true), (&invalid_id, false)] {
+        let call_id = ToolCallId::new(call_id).unwrap();
+        let call = ToolCall::new(
+            call_id.clone(),
+            "read".parse().unwrap(),
+            json!({"path": "input.txt"}),
+            0,
+        )
+        .unwrap();
+        let input = FunctionCallInput::from_runtime(&call);
+        let output =
+            FunctionCallOutputInput::from_runtime(&call_id, &ToolOutput::new("result").unwrap());
+        if valid {
+            assert_eq!(input.unwrap().call_id, valid_id);
+            assert_eq!(output.unwrap().call_id, valid_id);
+        } else {
+            let input_error = match input {
+                Err(error) => error,
+                Ok(_) => panic!("invalid assistant ToolCall ID was accepted"),
+            };
+            let output_error = match output {
+                Err(error) => error,
+                Ok(_) => panic!("invalid Tool result ID was accepted"),
+            };
+            for error in [input_error, output_error] {
+                assert_error(
+                    &error,
+                    ModelErrorKind::InvalidRequest,
+                    DeliveryState::NotStarted,
+                    false,
+                );
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
+            Ok(Ok((_stream, _))) => 1,
+            Ok(Err(error)) => panic!("loopback accept failed: {error}"),
+            Err(_) => 0,
+        }
+    });
+    let error = start_error(
+        &model(&base_url),
+        tool_exchange_request(&invalid_id),
+        context(CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await;
+    let request_count = accepted.await.unwrap();
+    assert_error(
+        &error,
+        ModelErrorKind::InvalidRequest,
+        DeliveryState::NotStarted,
+        false,
+    );
+    assert_eq!(request_count, 0);
 }
 
 #[test]
@@ -690,24 +812,58 @@ async fn usage_is_disjoint_and_preserves_cache_reasoning_and_provider_total() {
 #[tokio::test]
 async fn malformed_usage_fails_the_terminal_without_usage_or_finish() {
     let cases = [
-        json!({"input_tokens_details": {"cached_tokens": 1}}),
-        json!({"output_tokens_details": {"reasoning_tokens": 1}}),
+        json!({}),
+        json!({"input_tokens": 1}),
+        json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+        json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        }),
+        json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {}
+        }),
         json!({
             "input_tokens": u64::MAX,
-            "input_tokens_details": {"cached_tokens": u64::MAX, "cache_write_tokens": 1}
+            "output_tokens": 0,
+            "total_tokens": u64::MAX,
+            "input_tokens_details": {"cached_tokens": u64::MAX, "cache_write_tokens": 1},
+            "output_tokens_details": {"reasoning_tokens": 0}
         }),
         json!({
             "input_tokens": 5,
-            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 3}
+            "output_tokens": 0,
+            "total_tokens": 5,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 3},
+            "output_tokens_details": {"reasoning_tokens": 0}
         }),
         json!({
+            "input_tokens": 0,
             "output_tokens": 3,
+            "total_tokens": 3,
+            "input_tokens_details": {"cached_tokens": 0},
             "output_tokens_details": {"reasoning_tokens": 4}
         }),
-        json!({"input_tokens": u64::MAX, "output_tokens": 1}),
-        json!({"input_tokens": 2, "output_tokens": 3, "total_tokens": 4}),
-        json!({"output_tokens": 3, "total_tokens": 3}),
-        json!({"input_tokens": 3, "total_tokens": 3}),
+        json!({
+            "input_tokens": u64::MAX,
+            "output_tokens": 1,
+            "total_tokens": u64::MAX,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        }),
+        json!({
+            "input_tokens": 2,
+            "output_tokens": 3,
+            "total_tokens": 4,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        }),
     ];
     for usage in cases {
         let server = MockServer::spawn([MockResponse::sse(&[completed(usage)])]).await;
@@ -729,6 +885,92 @@ async fn malformed_usage_fails_the_terminal_without_usage_or_finish() {
             DeliveryState::Started,
             false,
         );
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_status_and_optional_usage_are_strict() {
+    for event_type in ["response.completed", "response.incomplete"] {
+        let valid_status = if event_type == "response.completed" {
+            "completed"
+        } else {
+            "incomplete"
+        };
+        for status in [
+            None,
+            Some(if valid_status == "completed" {
+                "incomplete"
+            } else {
+                "completed"
+            }),
+            Some("failed"),
+            Some("cancelled"),
+            Some("queued"),
+            Some("in_progress"),
+        ] {
+            let mut response = json!({"usage": usage()});
+            if let Some(status) = status {
+                response["status"] = json!(status);
+            }
+            let event = json!({"type": event_type, "response": response});
+            let server = MockServer::spawn([MockResponse::sse(&[event])]).await;
+            let (events, error) = run_until_error(
+                &model(server.base_url()),
+                basic_request(ReasoningPreference::Auto),
+                context(CancellationToken::new(), Duration::from_secs(5)),
+            )
+            .await;
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                ModelEvent::Usage { .. } | ModelEvent::Finish { .. }
+            )));
+            assert_error(
+                &error,
+                ModelErrorKind::InvalidProviderResponse,
+                DeliveryState::Started,
+                false,
+            );
+            server.finish().await;
+        }
+    }
+
+    for (event, expected_reason) in [
+        (
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed"}
+            }),
+            ModelFinishReason::Stop,
+        ),
+        (
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            }),
+            ModelFinishReason::Length,
+        ),
+    ] {
+        let server = MockServer::spawn([MockResponse::sse(&[event])]).await;
+        let events = run_model(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Usage { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ModelEvent::Finish { reason }) if *reason == expected_reason
+        ));
         server.finish().await;
     }
 }
@@ -1011,7 +1253,7 @@ async fn created_event_makes_stream_cancellation_and_timeout_started() {
 }
 
 #[test]
-fn retry_after_parser_honors_priority_and_rejects_unsafe_values() {
+fn retry_targets_subtract_body_time_and_reject_clock_anomalies() {
     fn headers(values: &[(&str, &str)]) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in values {
@@ -1023,31 +1265,38 @@ fn retry_after_parser_honors_priority_and_rejects_unsafe_values() {
         headers
     }
 
-    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let received_monotonic = Instant::now();
+    let received_system = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let current_monotonic = received_monotonic + Duration::from_secs(10);
+    let current_system = received_system + Duration::from_secs(10);
+    let remaining = |values: &[(&str, &str)]| {
+        retry_target(&headers(values), received_monotonic, received_system)
+            .and_then(|target| target.remaining(current_monotonic, current_system))
+    };
+
     assert_eq!(
-        retry_after(
-            &headers(&[("retry-after-ms", "1500"), ("retry-after", "9")]),
-            now,
-        ),
-        Some(Duration::from_millis(1_500))
+        remaining(&[("retry-after", "35")]),
+        Some(Duration::from_secs(25))
+    );
+    assert_eq!(remaining(&[("retry-after", "5")]), None);
+    assert_eq!(
+        remaining(&[("retry-after-ms", "35000"), ("retry-after", "90")]),
+        Some(Duration::from_secs(25))
     );
     assert_eq!(
-        retry_after(
-            &headers(&[("retry-after-ms", "bad"), ("retry-after", "1.25")]),
-            now,
-        ),
-        Some(Duration::from_millis(1_250))
+        remaining(&[("retry-after-ms", "35500")]),
+        Some(Duration::from_millis(25_500))
     );
     assert_eq!(
-        retry_after(&headers(&[("retry-after-ms", "12.5")]), now),
-        Some(Duration::from_micros(12_500))
+        remaining(&[("retry-after-ms", "bad"), ("retry-after", "35.5")]),
+        Some(Duration::from_millis(25_500))
     );
-    let date = httpdate::fmt_http_date(now + Duration::from_secs(30));
+    let date = httpdate::fmt_http_date(received_system + Duration::from_secs(35));
     assert_eq!(
-        retry_after(&headers(&[("retry-after", &date)]), now),
-        Some(Duration::from_secs(30))
+        remaining(&[("retry-after", &date)]),
+        Some(Duration::from_secs(25))
     );
-    let past = httpdate::fmt_http_date(now - Duration::from_secs(30));
+
     for values in [
         vec![("retry-after-ms", "-1")],
         vec![("retry-after", "bad")],
@@ -1056,10 +1305,38 @@ fn retry_after_parser_honors_priority_and_rejects_unsafe_values() {
         vec![("retry-after", "NaN")],
         vec![("retry-after", "inf")],
         vec![("retry-after", "1e300")],
-        vec![("retry-after", past.as_str())],
     ] {
-        assert_eq!(retry_after(&headers(&values), now), None);
+        assert!(retry_target(&headers(&values), received_monotonic, received_system,).is_none());
     }
+
+    let monotonic_target = retry_target(
+        &headers(&[("retry-after", "35")]),
+        received_monotonic,
+        received_system,
+    )
+    .unwrap();
+    assert_eq!(
+        monotonic_target.remaining(
+            received_monotonic
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+            current_system,
+        ),
+        None
+    );
+    let date_target = retry_target(
+        &headers(&[("retry-after", &date)]),
+        received_monotonic,
+        received_system,
+    )
+    .unwrap();
+    assert_eq!(
+        date_target.remaining(
+            current_monotonic,
+            received_system.checked_sub(Duration::from_secs(1)).unwrap(),
+        ),
+        None
+    );
 }
 
 #[tokio::test]
@@ -1161,10 +1438,14 @@ async fn http_status_connect_timeout_and_non_sse_errors_have_conservative_delive
         .await;
         assert_error(&error, kind, delivery, retryable);
         if kind == ModelErrorKind::RateLimited {
-            assert!(matches!(
-                error.retry_hint(),
-                RetryHint::Retryable { retry_after: Some(delay) } if *delay == Duration::from_secs(7)
-            ));
+            let delay = match error.retry_hint() {
+                RetryHint::Retryable {
+                    retry_after: Some(delay),
+                } => *delay,
+                _ => panic!("rate limit retry delay is missing"),
+            };
+            assert!(delay <= Duration::from_secs(7));
+            assert!(delay >= Duration::from_millis(6_900));
         }
         server.finish().await;
     }
@@ -1289,8 +1570,12 @@ async fn rate_limits_distinguish_quota_and_parse_retry_after_strictly() {
             let retry_after = retry_after.expect("future HTTP date must produce a delay");
             assert!(retry_after >= Duration::from_secs(118));
             assert!(retry_after <= Duration::from_secs(120));
+        } else if let Some(expected) = expected {
+            let retry_after = retry_after.expect("numeric retry delay must be present");
+            assert!(retry_after <= expected);
+            assert!(retry_after >= expected.saturating_sub(Duration::from_millis(100)));
         } else {
-            assert_eq!(retry_after, expected);
+            assert_eq!(retry_after, None);
         }
         server.finish().await;
     }
