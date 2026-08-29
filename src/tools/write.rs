@@ -10,7 +10,8 @@ use serde_json::json;
 use crate::Workspace;
 
 use super::{
-    MAX_WRITE_BYTES, map_workspace_error, precheck_control, run_controlled, wait_for_test_io,
+    MAX_WRITE_BYTES, escape_control_characters, map_workspace_error, precheck_control,
+    run_controlled, wait_for_test_io,
 };
 
 const TOOL_NAME: &str = "write";
@@ -88,18 +89,6 @@ impl Tool for WriteTool {
             Ok(ToolExecutionOutcome::Completed(output))
         })
     }
-}
-
-fn escape_control_characters(path: &str) -> String {
-    let mut output = String::with_capacity(path.len());
-    for character in path.chars() {
-        if character.is_control() {
-            output.extend(character.escape_default());
-        } else {
-            output.push(character);
-        }
-    }
-    output
 }
 
 #[cfg(test)]

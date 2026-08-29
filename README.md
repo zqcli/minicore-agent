@@ -106,30 +106,45 @@ components between checks and filesystem operations; no `openat`/OS locking
 scheme is implemented. Workspace is not yet assembled into Agent capabilities,
 and the existing temporary Agent workspace validation remains unchanged.
 
-The crate-private Tool module currently implements only the exact `read` and
-`write` tools; they are not yet assembled into Agent sessions. Both use strict
-object schemas and reject unknown input fields. `read` supports one-based line
-offsets, a default 400-line limit (maximum 2000), one-level sorted directory
-listings capped at 1000 entries, and `[truncated]` markers for line, 512 KiB file
-prefix, directory-count, or Runtime output limits. Workspace retains up to four
-lookahead bytes beyond the visible 512 KiB cap. The decoder uses them only to
-validate a 2/3/4-byte UTF-8 code point or CRLF split by the cap; lookahead bytes
-are never emitted. A valid crossing code point is omitted with `[truncated]`,
-while an invalid continuation or true-EOF incomplete sequence fails. CR is
-accepted only as CRLF and is stripped during newline normalization. NUL, other
-unsafe controls, invalid UTF-8, and any non-UTF-8 directory entry name are
-execution failures. `write` accepts at most 512 KiB of UTF-8 content, including
-empty content, and delegates parent creation and atomic replacement to
-Workspace. Its one-line success output is fully constructed before mutation;
-control characters in the relative path display are escaped while ordinary
-Unicode remains readable, so output validation cannot fail after a successful
-commit.
+The crate-private Tool module currently implements the exact `read`, `write`,
+`edit`, and `apply_patch` tools; they are not yet assembled into Agent sessions.
+All four use strict object schemas and reject unknown input fields. `read`
+supports one-based line offsets, a default 400-line limit (maximum 2000),
+one-level sorted directory listings capped at 1000 entries, and `[truncated]`
+markers for line, 512 KiB file prefix, directory-count, or Runtime output limits.
+Workspace retains up to four lookahead bytes beyond the visible 512 KiB cap. The
+decoder uses them only to validate a 2/3/4-byte UTF-8 code point or CRLF split by
+the cap; lookahead bytes are never emitted. A valid crossing code point is
+omitted with `[truncated]`, while an invalid continuation or true-EOF incomplete
+sequence fails. CR is accepted only as CRLF and is stripped during newline
+normalization. NUL, other unsafe controls, invalid UTF-8, and any non-UTF-8
+directory entry name are execution failures.
+
+`write` accepts at most 512 KiB of UTF-8 content, including empty content.
+`edit` reads an existing UTF-8 file of at most 512 KiB and performs only
+non-overlapping exact literal matches. Empty or over-limit input is invalid; no
+match fails, and multiple matches fail unless `replace_all=true`. Its result
+length is calculated before replacement and cannot exceed 512 KiB.
+`apply_patch` uses `diffy` for complete in-memory application to an existing
+UTF-8 file. The patch, source, and result are each capped at 512 KiB, and result
+length is calculated from parsed hunk lines before applying. Headerless input
+must begin directly with `@@`; standard input must begin with one `---`/`+++`
+pair whose paths, after optional `a/` and `b/` prefixes, exactly match the
+separately supplied Tool path. Multiple file sections, create/delete via
+`/dev/null`, rename/copy, git preambles or index metadata, binary patches,
+trailing content, partial apply, and path selection from patch headers are
+rejected. Matching CRLF patches preserve CRLF content.
+
+All mutating Tools fully construct their one-line success output before calling
+Workspace atomic replacement. Control characters in relative path displays are
+escaped while ordinary Unicode remains readable, so output validation cannot
+fail after a successful commit.
 Invalid JSON, bounds, and path traversal map to invalid invocation; missing,
 permission, binary, atomic failure, and unknown outcomes map to failed execution.
-Cancellation and deadline race every awaited `read` operation. For `write` they
-race only the non-mutating pre-commit path; after the synchronous commit boundary
-the real commit result wins even if cancellation or the deadline becomes ready.
-`edit`, `apply_patch`, and `bash` remain unimplemented.
+Cancellation and deadline race every awaited read/parse/compute operation. For
+`write`, `edit`, and `apply_patch` they race only the non-mutating pre-commit
+path; after the synchronous commit boundary the real commit result wins even if
+cancellation or the deadline becomes ready. `bash` remains unimplemented.
 
 The production TOML shape retains the OpenAI Responses model configuration, but
 that provider is intentionally not implemented in this Phase and `Agent::open`
