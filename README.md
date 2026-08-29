@@ -81,10 +81,14 @@ rejected. Existing files and directories are canonicalized and must remain under
 the root. Symlinks that resolve inside the root may be read, while escape
 symlinks are rejected; atomic writes also reject a symlink as the final target.
 Write parents are rechecked while missing directories are created. Atomic writes
-use short opaque `.minicore-write-<pid>-<counter>.tmp` `create_new` files, sync
-file contents, rename, and sync the parent directory on Unix. A parent-directory
-sync failure after rename returns `WorkspaceError::UnknownOutcome`: the complete
-new target may already be visible and is not rolled back. Failures before rename
+use short opaque `.minicore-write-<pid>-<counter>.tmp` `create_new` files. A
+temp candidate whose basename is exactly or ASCII-case-insensitively equal to
+the target is skipped before any filesystem access; only that counter is skipped,
+and counter wrapping remains safe through normal alias/collision retry. Atomic
+writes sync file contents, rename, and sync the parent directory on Unix. A
+parent-directory sync failure after rename returns
+`WorkspaceError::UnknownOutcome`: the complete new target may already be visible
+and is not rolled back. Failures before rename
 return `Unavailable` and leave an existing target unchanged. `read_text` accepts
 UTF-8 including Unicode, newlines, and tabs, but rejects NUL bytes and invalid
 UTF-8 as `Binary`. Non-Unix platforms have no portable Tokio directory-fsync
