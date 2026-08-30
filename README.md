@@ -444,16 +444,23 @@ private exact reasoning replay in the next HTTP request, Bash removal of all
 configured Model credential variables while preserving ordinary environment,
 and Provider-error redaction even under broad `RUST_LOG=trace`.
 
-The ignored live text smoke runs only when both required variables are present:
+The ignored live smokes run only when both required variables are present:
 
 ```bash
 OPENAI_API_KEY=... \
 MINICORE_AGENT_LIVE_MODEL=... \
-cargo test --locked openai_live_smoke -- --ignored --nocapture
+cargo test --locked openai_live_text_smoke -- --ignored --nocapture
+
+OPENAI_API_KEY=... \
+MINICORE_AGENT_LIVE_MODEL=... \
+MINICORE_AGENT_LIVE_REASONING=medium \
+cargo test --locked openai_live_reasoning_tool_smoke -- --ignored --nocapture
 ```
 
 `MINICORE_AGENT_LIVE_BASE_URL` optionally overrides
-`https://api.openai.com/v1`. The offline process coverage is in
+`https://api.openai.com/v1`; `MINICORE_AGENT_LIVE_REASONING` defaults to
+`medium`, and the reasoning Tool smoke accepts only `low`, `medium`, or `high`.
+The offline process coverage is in
 `tests/rpc_stdio.rs` and `tests/openai_rpc_process.rs`; Agent loop coverage is in
 `src/agent/tests.rs`. Store, Workspace, Tool, Context, and Policy coverage is in
 the internal unit tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and
