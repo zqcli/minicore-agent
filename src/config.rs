@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn model_compaction_is_rejected_for_v0_1() {
+    fn model_compaction_is_rejected_when_unsupported() {
         let mut config = valid_config();
         config.profiles.get_mut("test").unwrap().compaction = ProfileCompaction::Model {
             trigger_tokens: 1_000,

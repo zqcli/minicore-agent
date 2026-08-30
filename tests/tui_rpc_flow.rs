@@ -262,7 +262,7 @@ async fn flows_a_b_i_j_l_discovery_settings_validation_and_manifest_reopen() {
     process.send("a-ping", "agent.ping", json!({})).await;
     assert_eq!(
         process.response("a-ping").await["result"]["version"],
-        "0.1.0"
+        env!("CARGO_PKG_VERSION")
     );
     process.send("a-profiles", "profile.list", json!({})).await;
     let profiles = process.response("a-profiles").await;

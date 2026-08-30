@@ -17,6 +17,36 @@ modified here.
 minicore-agent --config ./example.agent.toml --stdio
 ```
 
+## v0.2 Scope
+
+MiniCore Agent v0.2 is the local Agent backend for one client TUI. The TUI
+communicates with the Agent exclusively through the stdio JSON-RPC interface;
+it does not call the Rust library API directly. This repository does not ship a
+real TUI, plugin system, MCP integration, or Subagent implementation.
+
+A new Session may select a configured `model` and `reasoning` value, or inherit
+the Profile defaults. Those settings are frozen when the Session is created and
+remain unchanged across close, reopen, and Profile edits. Switching model or
+reasoning requires creating a new Session.
+
+`AgentEvent` streams Text and Reasoning output and exposes the Tool lifecycle
+through started, progress, and finished events. Events are best effort and may
+be dropped under pressure; a registered `turn.wait` and the durable Transcript
+are authoritative for final recovery. Restarting the process does not resume an
+active Turn.
+
+This stage does not implement an interactive approval workflow. The existing
+`Ask` mode, interaction shapes, and `interaction.answer` RPC method remain only
+as compatibility surfaces and are not extended here. The example Profile uses
+`approval="auto"`, which executes enabled Tools without user approval and is
+appropriate only in a trusted local environment.
+
+`bash` is not a sandbox and retains the host authority described below. Use
+external container or OS isolation for untrusted models or commands. Run only
+one Agent process for a given `data_dir`; the Store has no cross-process lock.
+Compaction is disabled in v0.2. A configured model-backed compaction strategy is
+rejected at startup.
+
 ## Tracing
 
 Set `RUST_LOG` to enable more detailed binary diagnostics:
@@ -38,7 +68,7 @@ URLs or request/response bodies, user or system prompts, reasoning text,
 encrypted Provider content, Tool arguments, or Bash commands, paths, and
 content.
 
-The stdio protocol implements the complete v0.1 JSON-RPC method set:
+The stdio protocol implements the complete v0.2 JSON-RPC method set:
 
 ```text
 agent.ping             agent.shutdown
@@ -75,11 +105,12 @@ choice index.
 Request IDs are strings or JSON integers, including negative integers, and are
 preserved exactly. JSON syntax errors use `-32700`; invalid request shape,
 unknown methods, invalid params, and internal errors use `-32600` through
-`-32603`. Domain errors use `-32001` through `-32013` for `session_not_found`,
+`-32603`. Domain errors use `-32001` through `-32014` for `session_not_found`,
 `session_not_loaded`, `session_busy`, `session_closed`, `invalid_state`,
 `interaction_not_found`, `turn_not_found`, `profile_not_found`,
-`model_not_found`, `workspace_error`, `store_error`, `provider_error`, and
-`core_error`. Error data contains only `{kind,retryable}` and stable short
+`model_not_found`, `workspace_error`, `store_error`, `provider_error`,
+`core_error`, and `invalid_session_settings`. Error data contains only
+`{kind,retryable}` and stable short
 messages; it never serializes an error source, raw provider response, Tool
 arguments, API key, or panic payload. Session-state and Turn-outcome diagnostics
 likewise expose only code, category, and retryability, not diagnostic text.
@@ -298,8 +329,8 @@ child already exited, termination succeeds without another kill. A `try_wait`,
 `start_kill`, or post-kill `wait` error is internal and takes precedence over a
 requested cancellation or timeout; the Tool never claims that termination
 completed after such an error. Dropping the Tool future relies on `kill_on_drop`
-to terminate that direct child. v0.1 does not create Unix process groups or
-Windows Job Objects and does not guarantee that grandchildren or daemons are
+to terminate that direct child. This release does not create Unix process groups
+or Windows Job Objects and does not guarantee that grandchildren or daemons are
 reclaimed. Inherited output handles can keep a normal capture open, but timeout,
 cancellation, or future drop closes this Tool's readers without waiting for a
 grandchild to close its copy.
@@ -321,7 +352,7 @@ reading any configured credential environment variable, or opening the Store.
 The default profile must be present and defined; every profile and Model must be
 valid; every profile's Model reference, reasoning preference, and Tool use must
 match the referenced Model's capabilities. Model-backed profile compaction is
-unsupported in v0.1 and is rejected at startup rather than deferred to Session
+disabled in v0.2 and is rejected at startup rather than deferred to Session
 creation.
 
 `Models` eagerly constructs every configured OpenAI Responses adapter only after
@@ -422,8 +453,8 @@ configuration before Store/session startup. Agent loop tests that inject a Fake
 Model still use the production Workspace, Tools, Policy, and Context
 implementations. Store
 assumes one process per data directory and does not implement file locks.
-Loading currently reads the complete log into memory; v0.1 defines no production
-log-size limit, so very large logs may consume substantial memory. Each loaded
+Loading currently reads the complete log into memory; this release defines no
+production log-size limit, so very large logs may consume substantial memory. Each loaded
 session retains only its active `TurnHandle`; a `TurnRef` is not a historical
 handle registry key, so callers such as RPC must clone the handle at request time.
 Session metadata `updated_at` is updated in memory immediately and flushed by one
@@ -460,8 +491,9 @@ cargo test --locked openai_live_reasoning_tool_smoke -- --ignored --nocapture
 `MINICORE_AGENT_LIVE_BASE_URL` optionally overrides
 `https://api.openai.com/v1`; `MINICORE_AGENT_LIVE_REASONING` defaults to
 `medium`, and the reasoning Tool smoke accepts only `low`, `medium`, or `high`.
-The offline process coverage is in
-`tests/rpc_stdio.rs` and `tests/openai_rpc_process.rs`; Agent loop coverage is in
-`src/agent/tests.rs`. Store, Workspace, Tool, Context, and Policy coverage is in
+The offline process coverage is in `tests/rpc_stdio.rs`,
+`tests/openai_rpc_process.rs`, `tests/tui_rpc_flow.rs`, and
+`tests/rpc_soak.rs`; Agent loop coverage is in `src/agent/tests.rs`. Store,
+Workspace, Tool, Context, and Policy coverage is in
 the internal unit tests of `src/store.rs`, `src/workspace.rs`, `src/tools/`, `src/context.rs`, and
 `src/policy.rs`.

@@ -11,7 +11,8 @@ make focused changes, run relevant checks, and explain the result.
 """
 tools = ["read", "write", "edit", "apply_patch", "bash"]
 max_tool_rounds = 32
-approval = "ask"
+# Auto mode executes enabled tools without user approval. Use only in a trusted local environment.
+approval = "auto"
 
 [profiles.coding.compaction]
 mode = "disabled"

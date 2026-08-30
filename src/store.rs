@@ -487,7 +487,7 @@ impl LocalSessionLog {
             } => (manifest, log_bytes),
             InitializationState::Corrupt => return Err(log_error(SessionLogErrorKind::Corrupt)),
         };
-        // v0.1 has no log-size limit; loading a very large log is a known
+        // The current format has no log-size limit; loading a very large log is a known
         // memory/latency limitation of this in-memory paging implementation.
         let complete_len = complete_log_length(&bytes);
         if complete_len != bytes.len() {

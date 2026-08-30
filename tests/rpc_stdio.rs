@@ -117,7 +117,10 @@ fn assert_domain_error(response: Value, code: i64, id: Value, kind: &str) {
 fn assert_ping(response: Value, id: Value) {
     assert_eq!(response["jsonrpc"], json!("2.0"));
     assert_eq!(response["id"], id);
-    assert_eq!(response["result"]["version"], json!("0.1.0"));
+    assert_eq!(
+        response["result"]["version"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
 }
 
 fn log_field_equals(line: &str, name: &str, expected: &str) -> bool {
@@ -247,7 +250,7 @@ fn debug_logging_keeps_stdout_json_rpc_only_and_uses_safe_stderr_markers() {
     );
     assert_eq!(
         response_with_id(&responses, &json!("ping"))["result"]["version"],
-        "0.1.0"
+        env!("CARGO_PKG_VERSION")
     );
     assert_eq!(
         response_with_id(&responses, &json!("shutdown"))["result"]["ok"],

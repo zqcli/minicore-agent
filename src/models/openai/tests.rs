@@ -361,7 +361,10 @@ async fn descriptor_and_request_mapping_are_exact_and_secret_safe() {
         Some("Bearer TEST-API-KEY-SECRET")
     );
     assert_eq!(request.header("accept"), Some("text/event-stream"));
-    assert_eq!(request.header("user-agent"), Some("minicore-agent/0.1.0"));
+    assert_eq!(
+        request.header("user-agent"),
+        Some(concat!("minicore-agent/", env!("CARGO_PKG_VERSION")))
+    );
     let body = request.json_body();
     assert_eq!(body["model"], "provider-model");
     assert_eq!(body["stream"], true);
