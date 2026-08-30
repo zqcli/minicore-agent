@@ -3511,29 +3511,11 @@ async fn open_rejects_openai_config_when_its_key_environment_is_missing() {
         SessionId::new().unwrap()
     ));
     let key_env = format!("MINICORE_MISSING_KEY_{}", SessionId::new().unwrap());
-    let text = format!(
-        r#"
-data_dir = "{}"
-default_profile = "test"
-
-[profiles.test]
-model = "main"
-system_prompt = "test"
-
-[models.main]
-provider = "open_ai_responses"
-model = "gpt-test"
-base_url = "https://example.invalid/v1"
-api_key_env = "{key_env}"
-physical_context_window = 1000
-output_budget_tokens = 100
-safety_margin_tokens = 100
-supported_reasoning = ["auto"]
-supports_tools = false
-"#,
-        base.display()
+    let mut config = config(base.join("data"), Vec::new());
+    config.models.insert(
+        "fake".to_owned(),
+        configured_model(fake_supported_reasoning(), true, key_env),
     );
-    let config = AgentConfig::from_toml(&text).unwrap();
     assert!(matches!(
         Agent::open(config).await,
         Err(crate::error::AgentError::Config(
