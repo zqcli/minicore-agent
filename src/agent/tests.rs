@@ -308,8 +308,73 @@ async fn wait_for_event(
     }
 }
 
+fn event_instance_id(event: &AgentEvent) -> SessionInstanceId {
+    match event {
+        AgentEvent::SessionOpened { meta, .. }
+        | AgentEvent::SessionClosed { meta, .. }
+        | AgentEvent::SessionState { meta, .. }
+        | AgentEvent::TurnStarted { meta, .. }
+        | AgentEvent::OutputDelta { meta, .. }
+        | AgentEvent::ToolStarted { meta, .. }
+        | AgentEvent::ToolProgress { meta, .. }
+        | AgentEvent::ToolFinished { meta, .. }
+        | AgentEvent::InteractionRequested { meta, .. }
+        | AgentEvent::InteractionResolved { meta, .. }
+        | AgentEvent::TurnFinished { meta, .. } => meta.instance_id,
+    }
+}
+
+async fn reserve_completion_capacity(
+    agent: &Agent,
+    session_id: SessionId,
+) -> crate::sessions::CompletionCapacityGuard {
+    agent
+        .sessions
+        .get(session_id)
+        .unwrap()
+        .reserve_completion_capacity()
+        .await
+}
+
+fn active_turn_id(agent: &Agent, session_id: SessionId) -> Option<TurnId> {
+    agent
+        .sessions
+        .get(session_id)
+        .and_then(crate::sessions::LoadedSession::active_turn_id)
+}
+
+fn session_pump_stop_token(
+    agent: &Agent,
+    session_id: SessionId,
+) -> tokio_util::sync::CancellationToken {
+    agent
+        .sessions
+        .get(session_id)
+        .unwrap()
+        .session_pump_stop_token()
+}
+
+fn active_completion_task_is_finished(agent: &Agent, session_id: SessionId) -> Option<bool> {
+    agent
+        .sessions
+        .get(session_id)
+        .and_then(crate::sessions::LoadedSession::active_completion_task_is_finished)
+}
+
 async fn remove_base(base: &Path) {
     let _ = tokio::fs::remove_dir_all(base).await;
+}
+
+async fn cleanup_full_event_channel_fixture(
+    agent: Agent,
+    gate: &crate::sessions::SessionPumpStartupGate,
+    probe_registration: Option<crate::event::TurnFinishedAttemptProbeRegistration>,
+    base: &Path,
+) {
+    gate.release.add_permits(1);
+    let _ = tokio::time::timeout(Duration::from_secs(5), agent.shutdown()).await;
+    drop(probe_registration);
+    remove_base(base).await;
 }
 
 #[cfg(unix)]
@@ -392,7 +457,7 @@ fn session_record_path(base: &Path, session_id: SessionId) -> PathBuf {
 }
 
 #[tokio::test]
-async fn agent_lifecycle_text_turn_and_durable_finish_event() {
+async fn agent_lifecycle_text_turn_and_finish_event() {
     let (mut agent, base, workspace, calls) =
         agent_fixture("lifecycle", [ModelScript::Text("final")], Vec::new()).await;
     let mut events = agent.take_events().unwrap();
@@ -447,9 +512,14 @@ async fn agent_lifecycle_text_turn_and_durable_finish_event() {
         |event| matches!(event, AgentEvent::TurnFinished { turn: value, .. } if *value == turn),
     )
     .await;
-    assert!(
-        matches!(finished, AgentEvent::TurnFinished { outcome, .. } if outcome.turn_id == turn.turn_id)
-    );
+    let AgentEvent::TurnFinished {
+        outcome: event_outcome,
+        ..
+    } = finished
+    else {
+        unreachable!();
+    };
+    assert_eq!(event_outcome, outcome);
     let transcript = agent
         .transcript(GetTranscript {
             session_id: info.session_id,
@@ -495,7 +565,7 @@ async fn agent_lifecycle_text_turn_and_durable_finish_event() {
         }
     })
     .await;
-    assert!(late_finish.is_err() || !late_finish.unwrap());
+    assert!(!matches!(late_finish, Ok(true)));
     assert!(!agent.list_sessions().await.unwrap()[0].loaded);
     agent.delete_session(info.session_id).await.unwrap();
     assert!(agent.list_sessions().await.unwrap().is_empty());
@@ -1701,574 +1771,170 @@ fn core_turn_finished_is_suppressed_and_its_drop_count_reaches_the_next_event() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn active_turn_close_emits_session_closed_after_closed_transcript_barrier() {
-    let (mut agent, base, workspace, _) =
-        agent_fixture("active-close", [ModelScript::Text("final")], Vec::new()).await;
-    let mut events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
-    wait_for_event(&mut events, |event| {
-        matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
-    })
-    .await;
-
-    let barrier_gate = Arc::new(crate::sessions::TranscriptBarrierGate::new(info.session_id));
-    crate::sessions::block_transcript_barrier(Arc::clone(&barrier_gate));
-    let shutdown_gate = Arc::new(crate::sessions::SessionShutdownGate::new(info.session_id));
-    crate::sessions::block_session_shutdown(Arc::clone(&shutdown_gate));
-    let sequencer_stop = agent
-        .sessions
-        .get(info.session_id)
-        .unwrap()
-        .sequencer
-        .stop_signal();
-
-    let turn = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "finish while closing".to_owned(),
-        })
-        .await
-        .unwrap();
-    agent.turn_handle(turn).unwrap().wait().await.unwrap();
-    barrier_gate.started.acquire().await.unwrap().forget();
-
-    let close = tokio::spawn(async move {
-        let result = agent.close_session(info.session_id).await;
-        (agent, result)
-    });
-    shutdown_gate.started.acquire().await.unwrap().forget();
-    barrier_gate.release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), sequencer_stop.cancelled())
-        .await
-        .unwrap();
-    shutdown_gate.release.add_permits(1);
-    let (agent, result) = close.await.unwrap();
-    result.unwrap();
-
-    let closed = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match events.recv().await {
-                Some(AgentEvent::SessionClosed { session_id, .. })
-                    if session_id == info.session_id =>
-                {
-                    break true;
-                }
-                Some(_) => {}
-                None => break false,
-            }
-        }
-    })
-    .await;
-    assert_eq!(closed, Ok(true));
-    let late_finish = tokio::time::timeout(Duration::from_millis(100), async {
-        while let Some(event) = events.recv().await {
-            assert!(!matches!(event, AgentEvent::SessionClosed { .. }));
-            if matches!(event, AgentEvent::TurnFinished { turn: value, .. } if value == turn) {
-                return true;
-            }
-        }
-        false
-    })
-    .await;
-    assert!(late_finish.is_err() || !late_finish.unwrap());
-    agent.shutdown().await.unwrap();
-    remove_base(&base).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn waiting_for_input_state_precedes_interaction_requested() {
+async fn slow_agent_event_consumer_does_not_block_turn_or_core_state() {
     let base = std::env::temp_dir().join(format!(
-        "minicore-agent-state-order-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (model, _) = FakeModel::new([ModelScript::tool_call(
-        "write",
-        json!({"path": "approval.txt", "content": "approved"}),
-    )]);
-    let mut agent = Agent::open_with_models(
-        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
-        models(model),
-    )
-    .await
-    .unwrap();
-    let gate = Arc::new(crate::sessions::SequencerGate::new());
-    crate::sessions::block_sequencer(workspace.clone(), Arc::clone(&gate));
-    let mut events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
-    gate.started.acquire().await.unwrap().forget();
-    assert!(matches!(
-        next_event(&mut events).await,
-        AgentEvent::SessionOpened { .. }
-    ));
-    assert!(matches!(
-        next_event(&mut events).await,
-        AgentEvent::SessionState { state, .. } if state.status == SessionStatus::Idle
-    ));
-
-    let turn = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "request approval".to_owned(),
-        })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if agent.session_state(info.session_id).unwrap().status
-                == SessionStatus::WaitingForInput
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    gate.release.add_permits(1);
-
-    let mut waiting_state_seen = false;
-    let interaction = loop {
-        match next_event(&mut events).await {
-            AgentEvent::SessionState { state, .. }
-                if state.status == SessionStatus::WaitingForInput =>
-            {
-                assert!(state.pending_interaction.is_some());
-                waiting_state_seen = true;
-            }
-            AgentEvent::InteractionRequested { interaction, .. } => {
-                assert!(waiting_state_seen);
-                break interaction;
-            }
-            _ => {}
-        }
-    };
-    let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, SessionStatus::WaitingForInput);
-    assert_eq!(
-        state
-            .pending_interaction
-            .as_ref()
-            .map(|pending| pending.interaction_id),
-        Some(interaction.interaction_id)
-    );
-    agent
-        .answer(AnswerInteraction {
-            session_id: info.session_id,
-            interaction_id: interaction.interaction_id,
-            answer: minicore_runtime::InteractionAnswer::Approval(
-                minicore_runtime::tools::ApprovalDecision::Deny,
-            ),
-        })
-        .await
-        .unwrap();
-    agent.turn_handle(turn).unwrap().wait().await.unwrap();
-    agent.shutdown().await.unwrap();
-    remove_base(&base).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completion_boundary_preserves_cross_turn_interaction_state_order() {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-cross-turn-state-order-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (model, _) = FakeModel::new([
-        ModelScript::Text("first"),
-        ModelScript::tool_call(
-            "write",
-            json!({"path": "approval.txt", "content": "approved"}),
-        ),
-    ]);
-    let mut agent = Agent::open_with_models(
-        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
-        models(model),
-    )
-    .await
-    .unwrap();
-    let mut events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
-    wait_for_event(&mut events, |event| {
-        matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
-    })
-    .await;
-
-    let barrier_gate = Arc::new(crate::sessions::TranscriptBarrierGate::new(info.session_id));
-    crate::sessions::block_transcript_barrier(Arc::clone(&barrier_gate));
-    let first = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "first turn".to_owned(),
-        })
-        .await
-        .unwrap();
-    agent.turn_handle(first).unwrap().wait().await.unwrap();
-    barrier_gate.started.acquire().await.unwrap().forget();
-
-    let second = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "second turn needs approval".to_owned(),
-        })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if agent.session_state(info.session_id).unwrap().status
-                == SessionStatus::WaitingForInput
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    barrier_gate.release.add_permits(1);
-
-    let mut first_started = false;
-    let mut first_output = false;
-    let mut first_finished = false;
-    let mut waiting_state_count = 0;
-    let mut waiting_interaction = None;
-    let interaction = loop {
-        match next_event(&mut events).await {
-            AgentEvent::TurnStarted { turn, .. } if turn == first => first_started = true,
-            AgentEvent::OutputDelta { turn, .. } if turn == first => first_output = true,
-            AgentEvent::SessionState { state, .. }
-                if state.status == SessionStatus::WaitingForInput
-                    && state.active_turn == Some(second.turn_id) =>
-            {
-                waiting_state_count += 1;
-                waiting_interaction = state
-                    .pending_interaction
-                    .as_ref()
-                    .map(|pending| pending.interaction_id);
-            }
-            AgentEvent::InteractionRequested { interaction, .. }
-                if interaction.turn_id == second.turn_id =>
-            {
-                assert_eq!(waiting_interaction, Some(interaction.interaction_id));
-                assert_eq!(waiting_state_count, 1);
-                break interaction;
-            }
-            AgentEvent::TurnFinished { turn, .. } if turn == first => {
-                assert!(first_started);
-                assert!(first_output);
-                first_finished = true;
-            }
-            _ => {}
-        }
-    };
-    while !first_finished {
-        match next_event(&mut events).await {
-            AgentEvent::SessionState { state, .. }
-                if state.status == SessionStatus::WaitingForInput
-                    && state.active_turn == Some(second.turn_id) =>
-            {
-                waiting_state_count += 1;
-            }
-            AgentEvent::TurnFinished { turn, .. } if turn == first => {
-                assert!(first_started);
-                assert!(first_output);
-                first_finished = true;
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(waiting_state_count, 1);
-
-    agent
-        .answer(AnswerInteraction {
-            session_id: info.session_id,
-            interaction_id: interaction.interaction_id,
-            answer: minicore_runtime::InteractionAnswer::Approval(
-                minicore_runtime::tools::ApprovalDecision::Deny,
-            ),
-        })
-        .await
-        .unwrap();
-    agent.turn_handle(second).unwrap().wait().await.unwrap();
-    agent.shutdown().await.unwrap();
-    remove_base(&base).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn drained_event_refreshes_state_published_after_initial_completion_emit() {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-drain-state-race-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (model, _) = FakeModel::new([
-        ModelScript::Text("first"),
-        ModelScript::tool_call(
-            "write",
-            json!({"path": "approval.txt", "content": "approved"}),
-        ),
-    ]);
-    let mut agent = Agent::open_with_models(
-        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask),
-        models(model),
-    )
-    .await
-    .unwrap();
-    let mut events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
-    let policy_gate = Arc::new(crate::policy::PolicyDecisionGate::new(
-        info.session_id,
-        ToolCallId::new("write-call-1-0").unwrap(),
-    ));
-    let policy_started = Arc::clone(&policy_gate.started);
-    let policy_release = Arc::clone(&policy_gate.release);
-    crate::policy::block_decision(policy_gate);
-    wait_for_event(&mut events, |event| {
-        matches!(event, AgentEvent::SessionState { state, .. } if state.session_id == info.session_id && state.status == SessionStatus::Idle)
-    })
-    .await;
-
-    let barrier_gate = Arc::new(crate::sessions::TranscriptBarrierGate::new(info.session_id));
-    crate::sessions::block_transcript_barrier(Arc::clone(&barrier_gate));
-    let first = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "first turn".to_owned(),
-        })
-        .await
-        .unwrap();
-    agent.turn_handle(first).unwrap().wait().await.unwrap();
-    barrier_gate.started.acquire().await.unwrap().forget();
-
-    let second = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "second turn races drain".to_owned(),
-        })
-        .await
-        .unwrap();
-    policy_started.acquire().await.unwrap().forget();
-    assert_eq!(
-        agent.session_state(info.session_id).unwrap().status,
-        SessionStatus::Running
-    );
-    let drain_gate = Arc::new(crate::sessions::CompletionDrainGate::new(info.session_id));
-    crate::sessions::block_completion_drain(Arc::clone(&drain_gate));
-    barrier_gate.release.add_permits(1);
-    drain_gate.started.acquire().await.unwrap().forget();
-
-    policy_release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if agent.session_state(info.session_id).unwrap().status
-                == SessionStatus::WaitingForInput
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    drain_gate.release.add_permits(1);
-
-    let mut running_seen = false;
-    let mut waiting_interaction = None;
-    let interaction = loop {
-        match next_event(&mut events).await {
-            AgentEvent::SessionState { state, .. }
-                if state.status == SessionStatus::Running
-                    && state.active_turn == Some(second.turn_id) =>
-            {
-                running_seen = true;
-            }
-            AgentEvent::SessionState { state, .. }
-                if state.status == SessionStatus::WaitingForInput
-                    && state.active_turn == Some(second.turn_id) =>
-            {
-                waiting_interaction = state
-                    .pending_interaction
-                    .as_ref()
-                    .map(|pending| pending.interaction_id);
-            }
-            AgentEvent::InteractionRequested { interaction, .. }
-                if interaction.turn_id == second.turn_id =>
-            {
-                assert!(running_seen);
-                assert_eq!(waiting_interaction, Some(interaction.interaction_id));
-                break interaction;
-            }
-            _ => {}
-        }
-    };
-
-    agent
-        .answer(AnswerInteraction {
-            session_id: info.session_id,
-            interaction_id: interaction.interaction_id,
-            answer: minicore_runtime::InteractionAnswer::Approval(
-                minicore_runtime::tools::ApprovalDecision::Deny,
-            ),
-        })
-        .await
-        .unwrap();
-    agent.turn_handle(second).unwrap().wait().await.unwrap();
-    agent.shutdown().await.unwrap();
-    remove_base(&base).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequencer_barrier_orders_successful_live_events_before_finish() {
-    let (mut agent, base, workspace, _) = agent_fixture(
-        "sequencer-order",
-        [
-            ModelScript::tool_call("read", json!({"path": "input.txt"})),
-            ModelScript::Text("after tool"),
-        ],
-        vec!["read"],
-    )
-    .await;
-    tokio::fs::write(workspace.join("input.txt"), "sequenced read\n")
-        .await
-        .unwrap();
-    let gate = Arc::new(crate::sessions::SequencerGate::new());
-    crate::sessions::block_sequencer(workspace.clone(), Arc::clone(&gate));
-    let mut events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
-    gate.started.acquire().await.unwrap().forget();
-    let turn = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "use the read tool".to_owned(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        agent
-            .turn_handle(turn)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .terminal,
-        TurnTerminal::Completed
-    );
-    gate.release.add_permits(1);
-
-    let mut started = false;
-    let mut output = false;
-    let mut tool_started = false;
-    let mut tool_finished = false;
-    let mut terminal_state = false;
-    loop {
-        match next_event(&mut events).await {
-            AgentEvent::TurnStarted { turn: value, .. } if value == turn => started = true,
-            AgentEvent::OutputDelta { turn: value, .. } if value == turn => output = true,
-            AgentEvent::ToolStarted { turn: value, .. } if value == turn => tool_started = true,
-            AgentEvent::ToolFinished { turn: value, .. } if value == turn => tool_finished = true,
-            AgentEvent::SessionState { state, .. }
-                if state
-                    .last_terminal
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.turn_id == turn.turn_id) =>
-            {
-                terminal_state = true
-            }
-            AgentEvent::TurnFinished { turn: value, .. } if value == turn => break,
-            _ => {}
-        }
-    }
-    assert!(started);
-    assert!(output);
-    assert!(tool_started);
-    assert!(tool_finished);
-    assert!(terminal_state);
-    let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
-        loop {
-            match events.recv().await {
-                Some(AgentEvent::TurnFinished { turn: value, .. }) if value == turn => break true,
-                Some(_) => {}
-                None => break false,
-            }
-        }
-    })
-    .await;
-    assert!(duplicate.is_err() || !duplicate.unwrap());
-    agent.shutdown().await.unwrap();
-    remove_base(&base).await;
-}
-
-#[tokio::test]
-async fn sequencer_does_not_wait_for_a_dropped_core_terminal_event() {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-terminal-drop-{}",
+        "minicore-agent-slow-event-consumer-{}",
         SessionId::new().unwrap()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("final")]);
     let mut agent_config = config(base.join("data"), Vec::new());
-    agent_config.kernel.event_capacity = Some(1);
+    agent_config.event_capacity = 1;
     let mut agent = Agent::open_with_models(agent_config, models(model))
         .await
         .unwrap();
-    let gate = Arc::new(crate::sessions::SequencerGate::new());
-    crate::sessions::block_sequencer(workspace.clone(), Arc::clone(&gate));
-    let mut events = agent.take_events().unwrap();
     let info = agent
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    gate.started.acquire().await.unwrap().forget();
     let turn = agent
         .send(SendMessage {
             session_id: info.session_id,
-            text: "terminal may be dropped".to_owned(),
+            text: "finish without consuming events".to_owned(),
         })
         .await
         .unwrap();
-    agent.turn_handle(turn).unwrap().wait().await.unwrap();
-    gate.release.add_permits(1);
-    let finished = wait_for_event(
-        &mut events,
-        |event| matches!(event, AgentEvent::TurnFinished { turn: value, .. } if *value == turn),
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.turn_handle(turn).unwrap().wait(),
     )
-    .await;
-    assert!(matches!(finished, AgentEvent::TurnFinished { .. }));
-    agent.shutdown().await.unwrap();
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.terminal, TurnTerminal::Completed);
+    assert_eq!(
+        agent.session_state(info.session_id).unwrap().status,
+        SessionStatus::Idle
+    );
+    let transcript = agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 32,
+        })
+        .await
+        .unwrap();
+    assert!(transcript.entries.iter().any(|entry| matches!(
+        entry,
+        minicore_runtime::ConversationEntry::TurnTerminal(terminal)
+            if terminal.turn_id == turn.turn_id
+    )));
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
     remove_base(&base).await;
 }
 
-#[tokio::test]
-async fn completion_notifier_serializes_ready_turns_without_blocking_send() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_owned_completion_task_uses_capacity_one_channel() {
     let base = std::env::temp_dir().join(format!(
-        "minicore-agent-durable-event-{}",
+        "minicore-agent-single-completion-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let started = Arc::new(Semaphore::new(0));
+    let (model, _) = FakeModel::new([ModelScript::Block, ModelScript::Text("second")]);
+    let model = model.with_started(Arc::clone(&started));
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .sessions
+            .get(info.session_id)
+            .unwrap()
+            .pump
+            .completion_capacity(),
+        1
+    );
+    let first = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "first active turn".to_owned(),
+        })
+        .await
+        .unwrap();
+    let active = agent
+        .sessions
+        .get(info.session_id)
+        .unwrap()
+        .active_turn
+        .as_ref()
+        .unwrap();
+    assert_eq!(active.handle.turn_id(), first.turn_id);
+    assert!(!active.completion_task.is_finished());
+    tokio::time::timeout(Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(agent.cancel(first).unwrap());
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.turn_handle(first).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let second = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "second active turn".to_owned(),
+        })
+        .await
+        .unwrap();
+    let active = agent
+        .sessions
+        .get(info.session_id)
+        .unwrap()
+        .active_turn
+        .as_ref()
+        .unwrap();
+    assert_eq!(active.handle.turn_id(), second.turn_id);
+    assert_eq!(
+        agent
+            .sessions
+            .get(info.session_id)
+            .unwrap()
+            .pump
+            .completion_capacity(),
+        1
+    );
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.turn_handle(second).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.terminal, TurnTerminal::Completed);
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_cleanup_retains_active_turn_until_completion_task_is_joined() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-cancelled-completion-cleanup-{}",
         SessionId::new().unwrap()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("first"), ModelScript::Text("second")]);
-    let mut config = config(base.join("data"), Vec::new());
-    config.event_capacity = 1;
-    let mut agent = Agent::open_with_models(config, models(model))
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
         .await
         .unwrap();
     let mut events = agent.take_events().unwrap();
@@ -2276,69 +1942,558 @@ async fn completion_notifier_serializes_ready_turns_without_blocking_send() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let first = agent
-        .send(SendMessage {
+    let capacity_guard = tokio::time::timeout(
+        Duration::from_secs(5),
+        reserve_completion_capacity(&agent, info.session_id),
+    )
+    .await
+    .unwrap();
+    let first = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.send(SendMessage {
             session_id: info.session_id,
-            text: "first request".to_owned(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        agent
-            .turn_handle(first)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .terminal,
-        TurnTerminal::Completed
-    );
-    let second = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "second request".to_owned(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        agent
-            .turn_handle(second)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .terminal,
-        TurnTerminal::Completed
-    );
+            text: "first turn".to_owned(),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let first_outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.turn_handle(first).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first_outcome.terminal, TurnTerminal::Completed);
 
-    assert!(matches!(
-        events.recv().await,
-        Some(AgentEvent::SessionOpened { .. })
-    ));
-    let mut finished = Vec::new();
-    while finished.len() < 2 {
-        if let AgentEvent::TurnFinished { turn, .. } = next_event(&mut events).await {
-            finished.push(turn);
-        }
-    }
-    assert_eq!(finished, vec![first, second]);
-    let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
+    let cancelled_send = tokio::time::timeout(
+        Duration::from_millis(100),
+        agent.send(SendMessage {
+            session_id: info.session_id,
+            text: "cancelled second turn submission".to_owned(),
+        }),
+    )
+    .await;
+    let cleanup_was_cancelled = cancelled_send.is_err();
+    let unexpectedly_submitted = match cancelled_send {
+        Ok(Ok(turn)) => Some(turn),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    let retained_turn_id = active_turn_id(&agent, info.session_id);
+
+    drop(capacity_guard);
+    let retried_turn = match tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.send(SendMessage {
+            session_id: info.session_id,
+            text: "retried second turn submission".to_owned(),
+        }),
+    )
+    .await
+    {
+        Ok(Ok(turn)) => Some(turn),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    let first_completion_observed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match events.recv().await {
-                Some(AgentEvent::TurnFinished { .. }) => break true,
+                Some(AgentEvent::TurnFinished { turn, .. }) if turn == first => break true,
+                Some(_) => {}
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let turn_to_wait = retried_turn.or(unexpectedly_submitted);
+    let retried_turn_completed = if let Some(turn) = turn_to_wait {
+        match agent.turn_handle(turn) {
+            Ok(handle) => matches!(
+                tokio::time::timeout(Duration::from_secs(5), handle.wait()).await,
+                Ok(Ok(outcome)) if outcome.terminal == TurnTerminal::Completed
+            ),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    let shutdown_succeeded = matches!(
+        tokio::time::timeout(Duration::from_secs(5), agent.shutdown()).await,
+        Ok(Ok(()))
+    );
+    drop(events);
+    let cleanup_succeeded = tokio::time::timeout(Duration::from_secs(5), remove_base(&base))
+        .await
+        .is_ok();
+
+    assert!(cleanup_was_cancelled);
+    assert_eq!(retained_turn_id, Some(first.turn_id));
+    assert!(first_completion_observed);
+    assert!(retried_turn.is_some());
+    assert!(retried_turn_completed);
+    assert!(shutdown_succeeded);
+    assert!(cleanup_succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn congested_outer_events_do_not_couple_session_execution() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-session-event-isolation-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace_a = base.join("workspace-a");
+    let workspace_b = base.join("workspace-b");
+    tokio::fs::create_dir_all(&workspace_a).await.unwrap();
+    tokio::fs::create_dir_all(&workspace_b).await.unwrap();
+    let workspace_a = tokio::fs::canonicalize(&workspace_a).await.unwrap();
+    let workspace_b = tokio::fs::canonicalize(&workspace_b).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("a"), ModelScript::Text("b")]);
+    let mut agent_config = config(base.join("data"), Vec::new());
+    agent_config.event_capacity = 1;
+    let mut agent = Agent::open_with_models(agent_config, models(model))
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::sessions::SessionPumpStartupGate::new());
+    crate::sessions::block_session_pump_startup(workspace_a.clone(), Arc::clone(&gate));
+    let a = agent
+        .create_session(create_request(&workspace_a))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let b = agent
+        .create_session(create_request(&workspace_b))
+        .await
+        .unwrap();
+    gate.release.add_permits(1);
+    let turn_a = agent
+        .send(SendMessage {
+            session_id: a.session_id,
+            text: "session A".to_owned(),
+        })
+        .await
+        .unwrap();
+    let handle_a = agent.turn_handle(turn_a).unwrap();
+    let turn_b = agent
+        .send(SendMessage {
+            session_id: b.session_id,
+            text: "session B".to_owned(),
+        })
+        .await
+        .unwrap();
+    let handle_b = agent.turn_handle(turn_b).unwrap();
+    let (outcome_a, outcome_b) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(handle_a.wait(), handle_b.wait())
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome_a.unwrap().terminal, TurnTerminal::Completed);
+    assert_eq!(outcome_b.unwrap().terminal, TurnTerminal::Completed);
+    assert_eq!(
+        agent.session_state(a.session_id).unwrap().status,
+        SessionStatus::Idle
+    );
+    assert_eq!(
+        agent.session_state(b.session_id).unwrap().status,
+        SessionStatus::Idle
+    );
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_active_turn_reclaims_completion_and_pump_tasks() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-active-close-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let started = Arc::new(Semaphore::new(0));
+    let (model, _) = FakeModel::new([ModelScript::Block]);
+    let model = model.with_started(Arc::clone(&started));
+    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+        .await
+        .unwrap();
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "close active turn".to_owned(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let handle = agent.turn_handle(turn).unwrap();
+    let pump_stop = agent
+        .sessions
+        .get(info.session_id)
+        .unwrap()
+        .pump
+        .stop_token();
+    tokio::time::timeout(Duration::from_secs(5), agent.close_session(info.session_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pump_stop.is_cancelled());
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.terminal, TurnTerminal::CancelledByShutdown);
+    assert!(!agent.sessions.contains(info.session_id));
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_closed_is_last_event_for_its_instance() {
+    let (mut agent, base, workspace, _) = agent_fixture(
+        "session-closed-last",
+        [ModelScript::Text("final")],
+        Vec::new(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            AgentEvent::SessionState { state, .. }
+                if state.session_id == info.session_id
+                    && state.status == SessionStatus::Idle
+        )
+    })
+    .await;
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "complete before close".to_owned(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.turn_handle(turn).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let instance_id = info.instance_id.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), agent.close_session(info.session_id))
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            AgentEvent::SessionClosed { session_id, meta }
+                if *session_id == info.session_id && meta.instance_id == instance_id
+        )
+    })
+    .await;
+    let late_same_instance = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match events.recv().await {
+                Some(event) if event_instance_id(&event) == instance_id => break true,
                 Some(_) => {}
                 None => break false,
             }
         }
     })
     .await;
-    assert!(duplicate.is_err() || !duplicate.unwrap());
-    agent.shutdown().await.unwrap();
+    assert!(!matches!(late_same_instance, Ok(true)));
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
     remove_base(&base).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_interaction_event_leaves_answerable_session_state() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-interaction-event-drop-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let workspace = tokio::fs::canonicalize(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::tool_call(
+        "write",
+        json!({"path": "approval.txt", "content": "approved"}),
+    )]);
+    let mut agent_config =
+        config_with_approval(base.join("data"), vec!["write"], ApprovalMode::Ask);
+    agent_config.event_capacity = 1;
+    let mut agent = Agent::open_with_models(agent_config, models(model))
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::sessions::SessionPumpStartupGate::new());
+    crate::sessions::block_session_pump_startup(workspace.clone(), Arc::clone(&gate));
+    let events = agent.take_events().unwrap();
+    let info = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gate.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    gate.release.add_permits(1);
+
+    let turn = agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "request approval without an event slot".to_owned(),
+        })
+        .await
+        .unwrap();
+    let interaction = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = agent.session_state(info.session_id).unwrap();
+            if state.status == SessionStatus::WaitingForInput {
+                break state
+                    .pending_interaction
+                    .expect("waiting state needs interaction");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(interaction.turn_id, turn.turn_id);
+    agent
+        .answer(AnswerInteraction {
+            session_id: info.session_id,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::Deny,
+            ),
+        })
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.turn_handle(turn).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.terminal, TurnTerminal::Completed);
+    assert!(
+        !tokio::fs::try_exists(workspace.join("approval.txt"))
+            .await
+            .unwrap()
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(events);
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_event_channel_drops_turn_finished_without_late_replay() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-best-effort-finish-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let workspace = tokio::fs::canonicalize(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("final")]);
+    let mut agent_config = config(base.join("data"), Vec::new());
+    agent_config.event_capacity = 1;
+    let mut agent = Agent::open_with_models(agent_config, models(model))
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::sessions::SessionPumpStartupGate::new());
+    crate::sessions::block_session_pump_startup(workspace.clone(), Arc::clone(&gate));
+    let mut events = agent.take_events().unwrap();
+    let info = match agent.create_session(create_request(&workspace)).await {
+        Ok(info) => info,
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, None, &base).await;
+            panic!("session creation failed");
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), gate.started.acquire()).await {
+        Ok(Ok(permit)) => permit.forget(),
+        Ok(Err(_)) => {
+            cleanup_full_event_channel_fixture(agent, &gate, None, &base).await;
+            panic!("initial pump startup gate closed before SessionOpened emission");
+        }
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, None, &base).await;
+            panic!("initial SessionOpened emission did not reach the pump startup gate");
+        }
+    }
+    let probe = Arc::new(crate::event::TurnFinishedAttemptProbe::new(
+        info.session_id,
+        info.instance_id.unwrap(),
+    ));
+    let probe_registration = crate::event::register_turn_finished_attempt_probe(Arc::clone(&probe));
+    gate.release.add_permits(1);
+
+    let turn = match agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "complete while events are full".to_owned(),
+        })
+        .await
+    {
+        Ok(turn) => turn,
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("turn submission failed");
+        }
+    };
+    let turn_handle = match agent.turn_handle(turn) {
+        Ok(handle) => handle,
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("submitted TurnHandle was unavailable");
+        }
+    };
+    let waiter = turn_handle.clone();
+    drop(turn_handle);
+    let outcome = match tokio::time::timeout(Duration::from_secs(5), waiter.wait()).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("authoritative TurnHandle wait failed");
+        }
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("authoritative TurnHandle wait depended on event capacity");
+        }
+    };
+    assert_eq!(outcome.turn_id, turn.turn_id);
+    assert_eq!(outcome.terminal, TurnTerminal::Completed);
+
+    let state = match agent.session_state(info.session_id) {
+        Ok(state) => state,
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("authoritative session state query failed");
+        }
+    };
+    assert_eq!(state.instance_id, turn.instance_id);
+    assert_eq!(state.status, SessionStatus::Idle);
+    assert!(state.last_terminal.as_ref().is_some_and(|terminal| {
+        terminal.turn_id == turn.turn_id && terminal.terminal == TurnTerminal::Completed
+    }));
+    let transcript = match agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 32,
+        })
+        .await
+    {
+        Ok(transcript) => transcript,
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("authoritative transcript query failed");
+        }
+    };
+    assert!(transcript.entries.iter().any(|entry| matches!(
+        entry,
+        minicore_runtime::ConversationEntry::TurnTerminal(terminal)
+            if terminal.turn_id == turn.turn_id
+                && terminal.terminal == TurnTerminal::Completed
+    )));
+
+    if tokio::time::timeout(Duration::from_secs(5), probe.wait_started())
+        .await
+        .is_err()
+    {
+        cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+        panic!("TurnFinished send attempt did not start");
+    }
+    let completed_while_full =
+        tokio::time::timeout(Duration::from_millis(100), probe.wait_completed()).await;
+    if completed_while_full.is_err() {
+        cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+        panic!("TurnFinished send attempt did not complete while the event channel remained full");
+    }
+
+    let released = match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("event stream closed before releasing the old full-slot event");
+        }
+        Err(_) => {
+            cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+            panic!("old full-slot event was not available");
+        }
+    };
+    if !matches!(
+        released,
+        AgentEvent::SessionOpened { session, meta }
+            if session.session_id == turn.session_id
+                && session.instance_id == Some(turn.instance_id)
+                && meta.instance_id == turn.instance_id
+    ) {
+        cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+        panic!("old full-slot event did not match the created session instance");
+    }
+    let violation = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match events.recv().await {
+                Some(AgentEvent::TurnFinished {
+                    turn: observed,
+                    outcome,
+                    ..
+                }) if observed == turn
+                    && outcome.turn_id == turn.turn_id
+                    && observed.instance_id == turn.instance_id =>
+                {
+                    break "same TurnFinished was replayed after capacity returned";
+                }
+                Some(_) => {}
+                None => break "event stream closed during the no-replay window",
+            }
+        }
+    })
+    .await
+    .ok();
+
+    cleanup_full_event_channel_fixture(agent, &gate, Some(probe_registration), &base).await;
+    if let Some(violation) = violation {
+        panic!("{violation}");
+    }
+}
+
 #[tokio::test]
-async fn dropped_event_receiver_stops_completion_worker() {
+async fn dropped_event_receiver_stops_session_pump_and_completion_task() {
     let (mut agent, base, workspace, _) =
         agent_fixture("dropped-events", [ModelScript::Block], Vec::new()).await;
     let events = agent.take_events().unwrap();
@@ -2346,19 +2501,47 @@ async fn dropped_event_receiver_stops_completion_worker() {
         .create_session(create_request(&workspace))
         .await
         .unwrap();
-    let _turn = agent
+    let turn = agent
         .send(SendMessage {
             session_id: info.session_id,
             text: "hello".to_owned(),
         })
         .await
         .unwrap();
+    let pump_stop = session_pump_stop_token(&agent, info.session_id);
+    let active_turn_matches = active_turn_id(&agent, info.session_id) == Some(turn.turn_id);
+    let completion_task_was_running =
+        active_completion_task_is_finished(&agent, info.session_id) == Some(false);
     drop(events);
-    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+    let pump_stopped_before_shutdown =
+        tokio::time::timeout(Duration::from_secs(5), pump_stop.cancelled())
+            .await
+            .is_ok();
+    let completion_task_stopped_before_shutdown =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match active_completion_task_is_finished(&agent, info.session_id) {
+                    Some(true) => break true,
+                    Some(false) => tokio::task::yield_now().await,
+                    None => break false,
+                }
+            }
+        })
         .await
-        .unwrap()
-        .unwrap();
-    remove_base(&base).await;
+        .unwrap_or(false);
+    let shutdown_succeeded = tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    let cleanup_succeeded = tokio::time::timeout(Duration::from_secs(5), remove_base(&base))
+        .await
+        .is_ok();
+
+    assert!(active_turn_matches);
+    assert!(completion_task_was_running);
+    assert!(pump_stopped_before_shutdown);
+    assert!(completion_task_stopped_before_shutdown);
+    assert!(shutdown_succeeded);
+    assert!(cleanup_succeeded);
 }
 
 #[tokio::test]
@@ -2692,56 +2875,6 @@ async fn metadata_unknown_outcome_stops_future_updates_after_uncertain_write() {
     agent.close_session(info.session_id).await.unwrap();
     agent.delete_session(info.session_id).await.unwrap();
     agent.shutdown().await.unwrap();
-    remove_base(&base).await;
-}
-
-#[tokio::test]
-async fn shutdown_with_full_events_cancels_completion_worker() {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-shutdown-events-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let started = Arc::new(Semaphore::new(0));
-    let (model, _) = FakeModel::new([ModelScript::Block]);
-    let model = model.with_started(Arc::clone(&started));
-    let mut config = config(base.join("data"), Vec::new());
-    config.event_capacity = 1;
-    let mut agent = Agent::open_with_models(config, models(model))
-        .await
-        .unwrap();
-    let mut events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
-    let turn = agent
-        .send(SendMessage {
-            session_id: info.session_id,
-            text: "cancel before shutdown".to_owned(),
-        })
-        .await
-        .unwrap();
-    started.acquire().await.unwrap().forget();
-    assert!(agent.cancel(turn).unwrap());
-    assert_eq!(
-        agent
-            .turn_handle(turn)
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .terminal,
-        TurnTerminal::CancelledByUser
-    );
-    tokio::time::timeout(Duration::from_secs(5), agent.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
-    while let Some(event) = events.recv().await {
-        assert!(!matches!(event, AgentEvent::TurnFinished { .. }));
-    }
     remove_base(&base).await;
 }
 

@@ -4,12 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use crate::event::{
-    AgentEvent, AgentEventSink, AgentSendResult, CompletionCancellation, EventMeta,
-    forward_core_event,
-};
-
-use minicore_runtime::error::{SessionError, SessionShutdownError};
+use minicore_runtime::error::SessionShutdownError;
 use minicore_runtime::ids::{SessionId, TurnId};
 use minicore_runtime::session::{
     SessionEventStream, SessionHandle, SessionRuntime, SessionState, TurnHandle,
@@ -18,10 +13,14 @@ use minicore_runtime::storage::SessionLogErrorKind;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{SessionInfo, TurnRef};
 use crate::error::{AgentError, StoreError};
+use crate::event::{AgentEvent, AgentEventSink, AgentSendResult, EventMeta, forward_core_event};
 use crate::store::{SessionRecord, Store};
+
+const COMPLETION_CHANNEL_CAPACITY: usize = 1;
 
 pub(crate) struct Sessions {
     loaded: HashMap<SessionId, LoadedSession>,
@@ -31,42 +30,41 @@ pub(crate) struct LoadedSession {
     pub(crate) record: SessionRecord,
     pub(crate) runtime: SessionRuntime,
     pub(crate) handle: SessionHandle,
-    pub(crate) active_turn: Option<TurnHandle>,
-    pub(crate) sequencer: OutboundSequencer,
-    pub(crate) completion: CompletionNotifier,
+    pub(crate) active_turn: Option<ActiveTurn>,
+    pub(crate) pump: SessionPump,
     pub(crate) metadata: MetadataWorker,
     pub(crate) event_sink: AgentEventSink,
 }
 
-pub(crate) struct CompletionReady {
-    turn_ref: TurnRef,
-    outcome: minicore_runtime::TurnOutcome,
+pub(crate) struct ActiveTurn {
+    pub(crate) handle: TurnHandle,
+    pub(crate) completion_task: JoinHandle<()>,
 }
 
-pub(crate) struct OutboundSequencer {
-    completion_input: mpsc::UnboundedSender<CompletionReady>,
-    stop: CompletionCancellation,
+pub(crate) struct CompletionReady {
+    pub(crate) turn_ref: TurnRef,
+    pub(crate) outcome: minicore_runtime::TurnOutcome,
+}
+
+pub(crate) struct SessionPump {
+    completion_tx: mpsc::Sender<CompletionReady>,
+    stop: CancellationToken,
     task: JoinHandle<()>,
 }
 
-struct SequencerResources {
-    event_stream: SessionEventStream,
-    state: watch::Receiver<SessionState>,
-    handle: SessionHandle,
-    completion_input: mpsc::UnboundedReceiver<CompletionReady>,
-    event_sink: AgentEventSink,
-    opened: SessionInfo,
-    stop: CompletionCancellation,
+#[cfg(test)]
+pub(crate) struct CompletionCapacityGuard {
+    _permit: mpsc::OwnedPermit<CompletionReady>,
 }
 
 #[cfg(test)]
-pub(crate) struct SequencerGate {
+pub(crate) struct SessionPumpStartupGate {
     pub(crate) started: Arc<tokio::sync::Semaphore>,
     pub(crate) release: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(test)]
-impl SequencerGate {
+impl SessionPumpStartupGate {
     pub(crate) fn new() -> Self {
         Self {
             started: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -76,138 +74,84 @@ impl SequencerGate {
 }
 
 #[cfg(test)]
-type SequencerGateList = Mutex<Vec<(std::path::PathBuf, Arc<SequencerGate>)>>;
+type SessionPumpStartupGateList = Mutex<Vec<(std::path::PathBuf, Arc<SessionPumpStartupGate>)>>;
 
 #[cfg(test)]
-static SEQUENCER_GATES: OnceLock<SequencerGateList> = OnceLock::new();
+static SESSION_PUMP_STARTUP_GATES: OnceLock<SessionPumpStartupGateList> = OnceLock::new();
 
-#[cfg(test)]
-pub(crate) struct TranscriptBarrierGate {
-    session_id: SessionId,
-    pub(crate) started: Arc<tokio::sync::Semaphore>,
-    pub(crate) release: Arc<tokio::sync::Semaphore>,
-}
-
-#[cfg(test)]
-impl TranscriptBarrierGate {
-    pub(crate) fn new(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            started: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
-        }
-    }
-}
-
-#[cfg(test)]
-static TRANSCRIPT_BARRIER_GATES: OnceLock<Mutex<Vec<Arc<TranscriptBarrierGate>>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct CompletionDrainGate {
-    session_id: SessionId,
-    pub(crate) started: Arc<tokio::sync::Semaphore>,
-    pub(crate) release: Arc<tokio::sync::Semaphore>,
-}
-
-#[cfg(test)]
-impl CompletionDrainGate {
-    pub(crate) fn new(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            started: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
-        }
-    }
-}
-
-#[cfg(test)]
-static COMPLETION_DRAIN_GATES: OnceLock<Mutex<Vec<Arc<CompletionDrainGate>>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct SessionShutdownGate {
-    session_id: SessionId,
-    pub(crate) started: Arc<tokio::sync::Semaphore>,
-    pub(crate) release: Arc<tokio::sync::Semaphore>,
-}
-
-#[cfg(test)]
-impl SessionShutdownGate {
-    pub(crate) fn new(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            started: Arc::new(tokio::sync::Semaphore::new(0)),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
-        }
-    }
-}
-
-#[cfg(test)]
-static SESSION_SHUTDOWN_GATES: OnceLock<Mutex<Vec<Arc<SessionShutdownGate>>>> = OnceLock::new();
-
-impl OutboundSequencer {
+impl SessionPump {
     pub(crate) fn new(
         task_runtime: &Handle,
         event_stream: SessionEventStream,
         state: watch::Receiver<SessionState>,
-        handle: SessionHandle,
         event_sink: AgentEventSink,
         opened: SessionInfo,
     ) -> Self {
-        let (completion_input, completion_receiver) = mpsc::unbounded_channel();
-        let stop = CompletionCancellation::new();
-        let task = task_runtime.spawn(run_sequencer(SequencerResources {
+        let (completion_tx, completion_rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
+        let stop = CancellationToken::new();
+        let task = task_runtime.spawn(run_session_pump(
             event_stream,
             state,
-            handle,
-            completion_input: completion_receiver,
-            event_sink: event_sink.clone(),
+            completion_rx,
+            event_sink,
             opened,
-            stop: stop.clone(),
-        }));
+            stop.clone(),
+        ));
         Self {
-            completion_input,
+            completion_tx,
             stop,
             task,
         }
     }
 
-    pub(crate) fn completion_sender(&self) -> mpsc::UnboundedSender<CompletionReady> {
-        self.completion_input.clone()
+    pub(crate) fn completion_sender(&self) -> mpsc::Sender<CompletionReady> {
+        self.completion_tx.clone()
     }
 
-    pub(crate) fn stop_signal(&self) -> CompletionCancellation {
+    pub(crate) fn stop_token(&self) -> CancellationToken {
         self.stop.clone()
     }
 
-    pub(crate) async fn close(self) -> Result<(), AgentError> {
+    pub(crate) fn stop(&self) {
+        self.stop.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_capacity(&self) -> usize {
+        self.completion_tx.max_capacity()
+    }
+
+    #[cfg(test)]
+    async fn reserve_completion_capacity(&self) -> CompletionCapacityGuard {
+        CompletionCapacityGuard {
+            _permit: self.completion_tx.clone().reserve_owned().await.unwrap(),
+        }
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
         let Self {
-            completion_input,
+            completion_tx,
             stop,
             task,
         } = self;
         stop.cancel();
-        drop(completion_input);
-        task.await.map_err(|_| AgentError::Internal).map(|_| ())
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.stop.cancel();
+        drop(completion_tx);
+        task.await.map_err(|_| AgentError::Internal)
     }
 }
 
-async fn run_sequencer(resources: SequencerResources) {
-    let SequencerResources {
-        mut event_stream,
-        mut state,
-        handle,
-        mut completion_input,
-        event_sink,
-        opened,
-        stop,
-    } = resources;
+async fn run_session_pump(
+    mut event_stream: SessionEventStream,
+    mut state: watch::Receiver<SessionState>,
+    mut completions: mpsc::Receiver<CompletionReady>,
+    event_sink: AgentEventSink,
+    opened: SessionInfo,
+    stop: CancellationToken,
+) {
     #[cfg(test)]
-    let sequencer_gate = take_sequencer_gate(&opened.workspace);
+    let startup_gate = take_session_pump_startup_gate(&opened.workspace);
     let mut last_emitted_state = None;
+    let session_id = opened.session_id;
     let Some(instance_id) = opened.instance_id else {
         stop.cancel();
         return;
@@ -215,70 +159,56 @@ async fn run_sequencer(resources: SequencerResources) {
     if event_sink.try_send(AgentEvent::SessionOpened {
         session: opened,
         meta: EventMeta {
-            session_id: handle.session_id(),
+            session_id,
             instance_id,
             dropped_before: 0,
         },
-    }) == crate::event::AgentSendResult::Closed
+    }) == AgentSendResult::Closed
         || !emit_latest_state(&mut state, &event_sink, &mut last_emitted_state)
     {
         stop.cancel();
         return;
     }
     #[cfg(test)]
-    if let Some(gate) = sequencer_gate {
+    if let Some(gate) = startup_gate {
         gate.started.add_permits(1);
-        gate.release.acquire().await.unwrap().forget();
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            permit = gate.release.acquire() => {
+                if let Ok(permit) = permit {
+                    permit.forget();
+                }
+            }
+        }
     }
 
-    let mut core_open = true;
-    let mut state_open = true;
-    let mut completion_open = true;
     loop {
-        if !core_open && !state_open && !completion_open {
-            break;
-        }
         let keep_running = tokio::select! {
             biased;
             _ = stop.cancelled() => false,
             _ = event_sink.closed() => false,
-            ready = completion_input.recv(), if completion_open => match ready {
-                Some(ready) => tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => false,
-                    _ = event_sink.closed() => false,
-                    keep_running = process_completion(
-                        ready,
-                        &handle,
-                        &mut event_stream,
-                        &mut state,
-                        &event_sink,
-                        &stop,
-                        &mut last_emitted_state,
-                    ) => keep_running,
-                },
-                None => {
-                    completion_open = false;
-                    true
-                }
-            },
-            changed = state.changed(), if state_open => match changed {
-                Ok(()) => emit_latest_state(
-                    &mut state,
-                    &event_sink,
-                    &mut last_emitted_state,
-                ),
-                Err(_) => {
-                    state_open = false;
-                    true
-                }
-            },
-            envelope = event_stream.recv(), if core_open => match envelope {
+            changed = state.changed() => {
+                changed.is_ok()
+                    && emit_latest_state(&mut state, &event_sink, &mut last_emitted_state)
+            }
+            envelope = event_stream.recv() => match envelope {
                 Some(envelope) => forward_core_event(envelope, &event_sink),
-                None => {
-                    core_open = false;
-                    true
+                None => false,
+            },
+            ready = completions.recv() => match ready {
+                Some(ready) => {
+                    event_sink.try_send(AgentEvent::TurnFinished {
+                        turn: ready.turn_ref,
+                        outcome: ready.outcome,
+                        meta: EventMeta {
+                            session_id: ready.turn_ref.session_id,
+                            instance_id: ready.turn_ref.instance_id,
+                            dropped_before: 0,
+                        },
+                    }) != AgentSendResult::Closed
                 }
+                None => true,
             },
         };
         if !keep_running {
@@ -311,190 +241,9 @@ fn emit_latest_state(
     result != AgentSendResult::Closed
 }
 
-async fn process_completion(
-    ready: CompletionReady,
-    handle: &SessionHandle,
-    event_stream: &mut SessionEventStream,
-    state: &mut watch::Receiver<SessionState>,
-    event_sink: &AgentEventSink,
-    cancellation: &CompletionCancellation,
-    last_emitted_state: &mut Option<SessionState>,
-) -> bool {
-    match transcript_barrier(handle, cancellation).await {
-        BarrierResult::Cancelled => return false,
-        BarrierResult::Closed => {
-            cancellation.cancel();
-            return false;
-        }
-        BarrierResult::Processed => {}
-    }
-
-    if !emit_latest_state(state, event_sink, last_emitted_state) {
-        return false;
-    }
-    #[cfg(test)]
-    if let Some(gate) = take_completion_drain_gate(handle.session_id()) {
-        gate.started.add_permits(1);
-        gate.release.acquire().await.unwrap().forget();
-    }
-    while let Ok(envelope) = event_stream.try_recv() {
-        if !emit_latest_state(state, event_sink, last_emitted_state) {
-            return false;
-        }
-        if !forward_core_event(envelope, event_sink) {
-            return false;
-        }
-    }
-    if !emit_latest_state(state, event_sink, last_emitted_state) {
-        return false;
-    }
-    let sent = event_sink
-        .send_durable(
-            AgentEvent::TurnFinished {
-                turn: ready.turn_ref,
-                outcome: ready.outcome,
-                meta: EventMeta {
-                    session_id: ready.turn_ref.session_id,
-                    instance_id: ready.turn_ref.instance_id,
-                    dropped_before: 0,
-                },
-            },
-            cancellation.clone(),
-        )
-        .await;
-    sent || !event_sink.is_closed()
-}
-
-enum BarrierResult {
-    Processed,
-    Cancelled,
-    Closed,
-}
-
-async fn transcript_barrier(
-    handle: &SessionHandle,
-    cancellation: &CompletionCancellation,
-) -> BarrierResult {
-    #[cfg(test)]
-    if let Some(gate) = take_transcript_barrier_gate(handle.session_id()) {
-        gate.started.add_permits(1);
-        gate.release.acquire().await.unwrap().forget();
-    }
-    loop {
-        let result = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return BarrierResult::Cancelled,
-            result = handle.transcript(None, 1) => result,
-        };
-        match result {
-            Err(SessionError::Backpressure) => {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return BarrierResult::Cancelled,
-                    _ = tokio::task::yield_now() => {}
-                }
-            }
-            Err(SessionError::Closed) => return BarrierResult::Closed,
-            Ok(_) | Err(_) => return BarrierResult::Processed,
-        }
-    }
-}
-
-pub(crate) struct CompletionNotifier {
-    sender: mpsc::UnboundedSender<CompletionJob>,
-    cancellation: CompletionCancellation,
-    task: JoinHandle<()>,
-}
-
-struct CompletionJob {
-    turn: TurnHandle,
-    turn_ref: TurnRef,
-}
-
-impl CompletionNotifier {
-    pub(crate) fn new(
-        task_runtime: &Handle,
-        completion_input: mpsc::UnboundedSender<CompletionReady>,
-        stop: CompletionCancellation,
-    ) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let cancellation = CompletionCancellation::new();
-        let task = task_runtime.spawn(completion_worker(
-            receiver,
-            completion_input,
-            cancellation.clone(),
-            stop,
-        ));
-        Self {
-            sender,
-            cancellation,
-            task,
-        }
-    }
-
-    pub(crate) fn enqueue(&self, turn: TurnHandle, turn_ref: TurnRef) {
-        let _ = self.sender.send(CompletionJob { turn, turn_ref });
-    }
-
-    pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
-        let Self {
-            sender,
-            cancellation,
-            task,
-        } = self;
-        drop(sender);
-        cancellation.cancel();
-        task.await.map_err(|_| AgentError::Internal).map(|_| ())
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.cancellation.cancel();
-    }
-}
-
-async fn completion_worker(
-    mut receiver: mpsc::UnboundedReceiver<CompletionJob>,
-    completion_input: mpsc::UnboundedSender<CompletionReady>,
-    cancellation: CompletionCancellation,
-    stop: CompletionCancellation,
-) {
-    loop {
-        let Some(job) = (tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => None,
-            _ = stop.cancelled() => None,
-            _ = completion_input.closed() => None,
-            job = receiver.recv() => job,
-        }) else {
-            break;
-        };
-        let outcome = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => break,
-            _ = stop.cancelled() => break,
-            _ = completion_input.closed() => break,
-            outcome = job.turn.wait() => outcome,
-        };
-        let Ok(outcome) = outcome else {
-            // TurnWaitError has no safe TurnOutcome. The runtime state/error surface remains
-            // authoritative, and the FIFO notifier proceeds to the next queued turn.
-            continue;
-        };
-        if completion_input
-            .send(CompletionReady {
-                turn_ref: job.turn_ref,
-                outcome,
-            })
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
 pub(crate) struct MetadataWorker {
     sender: watch::Sender<Option<String>>,
-    cancellation: CompletionCancellation,
+    cancellation: CancellationToken,
     failed: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
@@ -502,7 +251,7 @@ pub(crate) struct MetadataWorker {
 impl MetadataWorker {
     pub(crate) fn new(task_runtime: &Handle, store: Store, session_id: SessionId) -> Self {
         let (sender, receiver) = watch::channel(None);
-        let cancellation = CompletionCancellation::new();
+        let cancellation = CancellationToken::new();
         let failed = Arc::new(AtomicBool::new(false));
         let task = task_runtime.spawn(metadata_worker(
             receiver,
@@ -524,7 +273,7 @@ impl MetadataWorker {
     }
 
     #[cfg(test)]
-    pub(crate) fn stop_signal(&self) -> CompletionCancellation {
+    pub(crate) fn stop_signal(&self) -> CancellationToken {
         self.cancellation.clone()
     }
 
@@ -545,7 +294,7 @@ impl MetadataWorker {
         } = self;
         drop(sender);
         cancellation.cancel();
-        task.await.map_err(|_| AgentError::Internal).map(|_| ())
+        task.await.map_err(|_| AgentError::Internal)
     }
 
     pub(crate) fn cancel(&self) {
@@ -557,7 +306,7 @@ async fn metadata_worker(
     mut receiver: watch::Receiver<Option<String>>,
     store: Store,
     session_id: SessionId,
-    cancellation: CompletionCancellation,
+    cancellation: CancellationToken,
     failed: Arc<AtomicBool>,
 ) {
     loop {
@@ -655,53 +404,75 @@ impl Sessions {
 impl Drop for Sessions {
     fn drop(&mut self) {
         for loaded in self.loaded.values() {
-            loaded.completion.cancel();
-            loaded.sequencer.cancel();
+            loaded.pump.stop();
             loaded.metadata.cancel();
         }
     }
 }
 
 impl LoadedSession {
+    #[cfg(test)]
+    pub(crate) async fn reserve_completion_capacity(&self) -> CompletionCapacityGuard {
+        self.pump.reserve_completion_capacity().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_pump_stop_token(&self) -> CancellationToken {
+        self.pump.stop_token()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_completion_task_is_finished(&self) -> Option<bool> {
+        self.active_turn
+            .as_ref()
+            .map(|active| active.completion_task.is_finished())
+    }
+
     pub(crate) async fn shutdown(self, meta: EventMeta) -> Result<(), AgentError> {
         let Self {
             runtime,
-            completion,
+            active_turn,
+            pump,
             metadata,
-            sequencer,
             event_sink,
             ..
         } = self;
         let runtime_error = runtime.shutdown().await.err();
-        let completion_error = completion.shutdown().await.err();
+        pump.stop();
+        let completion_error = match active_turn {
+            Some(active) => active.completion_task.await.err(),
+            None => None,
+        };
+        let pump_error = pump.shutdown().await.err();
         let metadata_error = metadata.shutdown().await.err();
-        #[cfg(test)]
-        if let Some(gate) = take_session_shutdown_gate(meta.session_id) {
-            gate.started.add_permits(1);
-            gate.release.acquire().await.unwrap().forget();
+        if runtime_error.is_none() {
+            let _ = event_sink.try_send(AgentEvent::SessionClosed {
+                session_id: meta.session_id,
+                meta,
+            });
         }
-        let sequencer_error = sequencer.close().await.err();
         if let Some(error) = runtime_error {
             return Err(map_session_shutdown_error(error));
         }
-        if completion_error.is_some() || metadata_error.is_some() || sequencer_error.is_some() {
+        if completion_error.is_some() || pump_error.is_some() || metadata_error.is_some() {
             return Err(AgentError::Internal);
         }
-        let _ = event_sink.try_send(AgentEvent::SessionClosed {
-            session_id: meta.session_id,
-            meta,
-        });
         Ok(())
     }
 
     pub(crate) fn active_turn_id(&self) -> Option<TurnId> {
-        self.active_turn.as_ref().map(TurnHandle::turn_id)
+        self.active_turn
+            .as_ref()
+            .map(|active| active.handle.turn_id())
     }
 }
 
 #[cfg(test)]
-pub(crate) fn block_sequencer(workspace: std::path::PathBuf, gate: Arc<SequencerGate>) {
-    SEQUENCER_GATES
+pub(crate) fn block_session_pump_startup(
+    workspace: std::path::PathBuf,
+    gate: Arc<SessionPumpStartupGate>,
+) {
+    SESSION_PUMP_STARTUP_GATES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap()
@@ -709,71 +480,10 @@ pub(crate) fn block_sequencer(workspace: std::path::PathBuf, gate: Arc<Sequencer
 }
 
 #[cfg(test)]
-pub(crate) fn block_transcript_barrier(gate: Arc<TranscriptBarrierGate>) {
-    TRANSCRIPT_BARRIER_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(gate);
-}
-
-#[cfg(test)]
-pub(crate) fn block_completion_drain(gate: Arc<CompletionDrainGate>) {
-    COMPLETION_DRAIN_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(gate);
-}
-
-#[cfg(test)]
-fn take_completion_drain_gate(session_id: SessionId) -> Option<Arc<CompletionDrainGate>> {
-    let mut gates = COMPLETION_DRAIN_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|gate| gate.session_id == session_id)
-        .map(|position| gates.remove(position))
-}
-
-#[cfg(test)]
-fn take_transcript_barrier_gate(session_id: SessionId) -> Option<Arc<TranscriptBarrierGate>> {
-    let mut gates = TRANSCRIPT_BARRIER_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|gate| gate.session_id == session_id)
-        .map(|position| gates.remove(position))
-}
-
-#[cfg(test)]
-pub(crate) fn block_session_shutdown(gate: Arc<SessionShutdownGate>) {
-    SESSION_SHUTDOWN_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(gate);
-}
-
-#[cfg(test)]
-fn take_session_shutdown_gate(session_id: SessionId) -> Option<Arc<SessionShutdownGate>> {
-    let mut gates = SESSION_SHUTDOWN_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|gate| gate.session_id == session_id)
-        .map(|position| gates.remove(position))
-}
-
-#[cfg(test)]
-fn take_sequencer_gate(workspace: &std::path::Path) -> Option<Arc<SequencerGate>> {
-    let mut gates = SEQUENCER_GATES
+fn take_session_pump_startup_gate(
+    workspace: &std::path::Path,
+) -> Option<Arc<SessionPumpStartupGate>> {
+    let mut gates = SESSION_PUMP_STARTUP_GATES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap();
