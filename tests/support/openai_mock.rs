@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -23,6 +23,18 @@ pub struct MockResponse {
     declared_length: Option<usize>,
     delay_before_headers: Duration,
     delay_between_chunks: Duration,
+    chunk_gate: Option<Arc<Semaphore>>,
+}
+
+#[derive(Clone)]
+pub struct ChunkGate {
+    permits: Arc<Semaphore>,
+}
+
+impl ChunkGate {
+    pub fn release(&self) {
+        self.permits.add_permits(1);
+    }
 }
 
 impl MockResponse {
@@ -39,6 +51,7 @@ impl MockResponse {
             declared_length: None,
             delay_before_headers: Duration::ZERO,
             delay_between_chunks: Duration::ZERO,
+            chunk_gate: None,
         }
     }
 
@@ -51,6 +64,7 @@ impl MockResponse {
             declared_length: None,
             delay_before_headers: Duration::ZERO,
             delay_between_chunks: Duration::ZERO,
+            chunk_gate: None,
         }
     }
 
@@ -77,6 +91,12 @@ impl MockResponse {
     pub fn with_chunk_delay(mut self, delay: Duration) -> Self {
         self.delay_between_chunks = delay;
         self
+    }
+
+    pub fn with_chunk_gate(mut self) -> (Self, ChunkGate) {
+        let permits = Arc::new(Semaphore::new(0));
+        self.chunk_gate = Some(Arc::clone(&permits));
+        (self, ChunkGate { permits })
     }
 }
 
@@ -131,6 +151,7 @@ pub struct MockServer {
 pub struct ConcurrentMockServer {
     base_url: String,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    captured_notify: Arc<Notify>,
     task: JoinHandle<io::Result<()>>,
 }
 
@@ -142,6 +163,8 @@ impl ConcurrentMockServer {
         let address = listener.local_addr().expect("concurrent mock address");
         let captured = Arc::new(Mutex::new(Vec::new()));
         let task_captured = Arc::clone(&captured);
+        let captured_notify = Arc::new(Notify::new());
+        let task_notify = Arc::clone(&captured_notify);
         let mut responses: VecDeque<_> = responses.into_iter().collect();
         let task = tokio::spawn(async move {
             let mut handlers = JoinSet::new();
@@ -151,66 +174,13 @@ impl ConcurrentMockServer {
                     .pop_front()
                     .expect("checked concurrent response queue must not be empty");
                 let handler_captured = Arc::clone(&task_captured);
+                let handler_notify = Arc::clone(&task_notify);
                 handlers.spawn(async move {
-                    handle_connection(stream, response, handler_captured).await
+                    handle_connection(stream, response, handler_captured, handler_notify).await
                 });
             }
             while let Some(result) = handlers.join_next().await {
                 result.map_err(|_| io::Error::other("concurrent mock handler panicked"))??;
-            }
-            Ok(())
-        });
-        Self {
-            base_url: format!("http://{address}"),
-            captured,
-            task,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub async fn finish(self) -> Vec<CapturedRequest> {
-        self.task
-            .await
-            .expect("concurrent mock server task must not panic")
-            .expect("concurrent mock server I/O must succeed");
-        Arc::try_unwrap(self.captured)
-            .expect("concurrent captured requests must have one owner")
-            .into_inner()
-            .expect("concurrent captured request mutex must not be poisoned")
-    }
-}
-
-async fn handle_connection(
-    mut stream: TcpStream,
-    response: MockResponse,
-    captured: Arc<Mutex<Vec<CapturedRequest>>>,
-) -> io::Result<()> {
-    let request = read_request(&mut stream).await?;
-    captured.lock().unwrap().push(request);
-    write_response(&mut stream, response).await
-}
-
-impl MockServer {
-    pub async fn spawn(responses: impl IntoIterator<Item = MockResponse>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("mock server must bind loopback");
-        let address = listener.local_addr().expect("mock listener address");
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let task_captured = Arc::clone(&captured);
-        let captured_notify = Arc::new(Notify::new());
-        let task_notify = Arc::clone(&captured_notify);
-        let mut responses: VecDeque<_> = responses.into_iter().collect();
-        let task = tokio::spawn(async move {
-            while let Some(response) = responses.pop_front() {
-                let (mut stream, _) = listener.accept().await?;
-                let request = read_request(&mut stream).await?;
-                task_captured.lock().unwrap().push(request);
-                task_notify.notify_waiters();
-                write_response(&mut stream, response).await?;
             }
             Ok(())
         });
@@ -227,27 +197,101 @@ impl MockServer {
     }
 
     pub async fn wait_for_requests(&self, count: usize) {
-        loop {
-            let notified = self.captured_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.captured.lock().unwrap().len() >= count {
-                return;
-            }
-            notified.await;
-        }
+        wait_for_requests(&self.captured, &self.captured_notify, count).await;
     }
 
     pub async fn finish(self) -> Vec<CapturedRequest> {
-        self.task
+        finish_server(self.task).await;
+        Arc::try_unwrap(self.captured)
+            .expect("concurrent captured requests must have one owner")
+            .into_inner()
+            .expect("concurrent captured request mutex must not be poisoned")
+    }
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    response: MockResponse,
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    captured_notify: Arc<Notify>,
+) -> io::Result<()> {
+    let request = read_request(&mut stream).await?;
+    captured.lock().unwrap().push(request);
+    captured_notify.notify_waiters();
+    write_response(&mut stream, response).await
+}
+
+impl MockServer {
+    pub async fn spawn(responses: impl IntoIterator<Item = MockResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("mock server task must not panic")
-            .expect("mock server I/O must succeed");
+            .expect("mock server must bind loopback");
+        let address = listener.local_addr().expect("mock listener address");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let task_captured = Arc::clone(&captured);
+        let captured_notify = Arc::new(Notify::new());
+        let task_notify = Arc::clone(&captured_notify);
+        let mut responses: VecDeque<_> = responses.into_iter().collect();
+        let task = tokio::spawn(async move {
+            while let Some(response) = responses.pop_front() {
+                let (stream, _) = listener.accept().await?;
+                handle_connection(
+                    stream,
+                    response,
+                    Arc::clone(&task_captured),
+                    Arc::clone(&task_notify),
+                )
+                .await?;
+            }
+            Ok(())
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            captured,
+            captured_notify,
+            task,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn wait_for_requests(&self, count: usize) {
+        wait_for_requests(&self.captured, &self.captured_notify, count).await;
+    }
+
+    pub async fn finish(self) -> Vec<CapturedRequest> {
+        finish_server(self.task).await;
         Arc::try_unwrap(self.captured)
             .expect("captured requests must have one owner")
             .into_inner()
             .expect("captured request mutex must not be poisoned")
     }
+}
+
+async fn finish_server(task: JoinHandle<io::Result<()>>) {
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("mock server finish timed out")
+        .expect("mock server task must not panic")
+        .expect("mock server I/O must succeed");
+}
+
+async fn wait_for_requests(captured: &Mutex<Vec<CapturedRequest>>, notify: &Notify, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if captured.lock().unwrap().len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("mock request capture timed out");
 }
 
 async fn read_request(stream: &mut TcpStream) -> io::Result<CapturedRequest> {
@@ -319,19 +363,29 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<CapturedRequest> {
 }
 
 async fn write_response(stream: &mut TcpStream, response: MockResponse) -> io::Result<()> {
-    if !response.delay_before_headers.is_zero() {
-        tokio::time::sleep(response.delay_before_headers).await;
+    let MockResponse {
+        status,
+        content_type,
+        headers,
+        chunks,
+        declared_length,
+        delay_before_headers,
+        delay_between_chunks,
+        chunk_gate,
+    } = response;
+    if !delay_before_headers.is_zero() {
+        tokio::time::sleep(delay_before_headers).await;
     }
-    let body_length = response.chunks.iter().map(Vec::len).sum::<usize>();
-    let declared_length = response.declared_length.unwrap_or(body_length);
+    let body_length = chunks.iter().map(Vec::len).sum::<usize>();
+    let declared_length = declared_length.unwrap_or(body_length);
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
-        reason(response.status),
-        response.content_type,
+        status,
+        reason(status),
+        content_type,
         declared_length,
     );
-    for (name, value) in response.headers {
+    for (name, value) in headers {
         head.push_str(&name);
         head.push_str(": ");
         head.push_str(&value);
@@ -341,9 +395,15 @@ async fn write_response(stream: &mut TcpStream, response: MockResponse) -> io::R
     if stream.write_all(head.as_bytes()).await.is_err() {
         return Ok(());
     }
-    for (index, chunk) in response.chunks.into_iter().enumerate() {
-        if index > 0 && !response.delay_between_chunks.is_zero() {
-            tokio::time::sleep(response.delay_between_chunks).await;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        if let Some(gate) = &chunk_gate {
+            gate.acquire()
+                .await
+                .map_err(|_| io::Error::other("mock response gate closed"))?
+                .forget();
+        }
+        if index > 0 && !delay_between_chunks.is_zero() {
+            tokio::time::sleep(delay_between_chunks).await;
         }
         if stream.write_all(&chunk).await.is_err() {
             return Ok(());

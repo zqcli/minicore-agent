@@ -1,147 +1,15 @@
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
 
 use minicore_runtime::SessionId;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 #[path = "support/openai_mock.rs"]
 mod openai_mock;
 use openai_mock::{MockResponse, MockServer};
 
-struct RpcProcess {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    stderr: Option<ChildStderr>,
-    pending: VecDeque<Value>,
-    events: Vec<Value>,
-    observed: Vec<Value>,
-}
-
-impl RpcProcess {
-    async fn spawn(config_path: &Path, key_env: &str, key: &str) -> Self {
-        Self::spawn_with_extra_env(config_path, key_env, key, &[]).await
-    }
-
-    async fn spawn_with_extra_env(
-        config_path: &Path,
-        key_env: &str,
-        key: &str,
-        extra_env: &[(&str, &str)],
-    ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_minicore-agent"));
-        command
-            .args(["--config", config_path.to_str().unwrap(), "--stdio"])
-            .env(key_env, key);
-        for &(name, value) in extra_env {
-            command.env(name, value);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().unwrap();
-        Self {
-            input: child.stdin.take().unwrap(),
-            output: BufReader::new(child.stdout.take().unwrap()),
-            stderr: child.stderr.take(),
-            child,
-            pending: VecDeque::new(),
-            events: Vec::new(),
-            observed: Vec::new(),
-        }
-    }
-
-    async fn send(&mut self, id: &str, method: &str, params: Value) {
-        let mut frame = serde_json::to_vec(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .unwrap();
-        frame.push(b'\n');
-        self.input.write_all(&frame).await.unwrap();
-        self.input.flush().await.unwrap();
-    }
-
-    async fn response(&mut self, id: &str) -> Value {
-        if let Some(index) = self.pending.iter().position(|frame| frame["id"] == id) {
-            return self.pending.remove(index).unwrap();
-        }
-        loop {
-            let frame = self.next_frame().await.expect("process stdout ended");
-            if frame["method"] == "agent.event" {
-                self.events.push(frame);
-            } else if frame["id"] == id {
-                return frame;
-            } else {
-                self.pending.push_back(frame);
-            }
-        }
-    }
-
-    async fn event(&mut self, event_type: &str) -> Value {
-        if let Some(index) = self.events.iter().position(|frame| {
-            frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type)
-        }) {
-            return self.events.remove(index);
-        }
-        loop {
-            let frame = self.next_frame().await.expect("process stdout ended");
-            if frame["method"] == "agent.event" {
-                if frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type) {
-                    return frame;
-                }
-                self.events.push(frame);
-            } else {
-                self.pending.push_back(frame);
-            }
-        }
-    }
-
-    async fn next_frame(&mut self) -> Option<Value> {
-        let mut line = String::new();
-        let read = tokio::time::timeout(Duration::from_secs(10), self.output.read_line(&mut line))
-            .await
-            .expect("process stdout timed out")
-            .unwrap();
-        if read == 0 {
-            return None;
-        }
-        assert!(line.ends_with('\n'));
-        let frame: Value = serde_json::from_str(&line).unwrap();
-        self.observed.push(frame.clone());
-        Some(frame)
-    }
-
-    async fn shutdown(mut self) -> (Vec<Value>, String) {
-        self.send("shutdown", "agent.shutdown", json!({})).await;
-        assert_eq!(
-            self.response("shutdown").await["result"],
-            json!({"ok": true})
-        );
-        assert!(self.next_frame().await.is_none());
-        let status = tokio::time::timeout(Duration::from_secs(10), self.child.wait())
-            .await
-            .expect("process did not exit")
-            .unwrap();
-        assert!(status.success());
-        let mut stderr = Vec::new();
-        self.stderr
-            .take()
-            .unwrap()
-            .read_to_end(&mut stderr)
-            .await
-            .unwrap();
-        (self.observed, String::from_utf8_lossy(&stderr).into_owned())
-    }
-}
+#[path = "support/rpc_process.rs"]
+mod rpc_process;
+use rpc_process::RpcProcess;
 
 fn write_config(temp_dir: &Path, base_url: &str, key_env: &str, tools: &[&str]) -> PathBuf {
     write_config_with_additional_models(temp_dir, base_url, key_env, tools, "")
