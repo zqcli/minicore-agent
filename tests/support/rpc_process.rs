@@ -119,7 +119,7 @@ impl RpcProcess {
         self.send(&dispatch_ping_id, "agent.ping", json!({})).await;
         assert_eq!(
             self.response(&dispatch_ping_id).await["result"]["version"],
-            "0.1.0"
+            env!("CARGO_PKG_VERSION")
         );
         (turn, wait_id)
     }

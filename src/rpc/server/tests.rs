@@ -581,7 +581,7 @@ async fn every_rpc_method_runs_through_the_real_agent_lifecycle() {
     rpc.send(json!("ping"), "agent.ping", None).await;
     assert_eq!(
         rpc.response(json!("ping")).await["result"]["version"],
-        "0.1.0"
+        env!("CARGO_PKG_VERSION")
     );
 
     rpc.send(json!("profiles"), "profile.list", Some(json!({})))
@@ -878,7 +878,7 @@ async fn turn_wait_is_async_multiple_waiters_and_events_share_one_writer() {
         .await;
     assert_eq!(
         rpc.response(json!("ping-after-waits")).await["result"]["version"],
-        "0.1.0"
+        env!("CARGO_PKG_VERSION")
     );
 
     rpc.send(json!("cancel"), "turn.cancel", Some(turn_params(&turn)))

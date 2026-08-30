@@ -30,7 +30,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.1.0"}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.2.0"}}
 ```
 
 An error response has exactly one `error`:
@@ -74,7 +74,7 @@ shutdown enter the same owned-task shutdown path.
 ## Agent Methods
 
 `agent.ping` accepts omitted params or `{}` and returns
-`{"version":"0.1.0"}`. `agent.shutdown` accepts the same empty params, starts
+`{"version":"0.2.0"}`. `agent.shutdown` accepts the same empty params, starts
 orderly shutdown, and returns `{"ok":true}` as the final frame on success.
 
 ## Discovery
