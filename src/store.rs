@@ -51,6 +51,9 @@ static DELETE_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 static CLEANUP_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
+static SESSIONS_READ_DIR_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
 pub(crate) struct AtomicWriteGate {
     path: PathBuf,
     pub(crate) started: Arc<Semaphore>,
@@ -188,13 +191,13 @@ impl Store {
             }
         }
         let store = Self { root };
-        store.require_sessions_directory().await?;
+        store.require_sessions_root().await?;
         Ok(store)
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
-        self.require_sessions_directory().await?;
-        let mut directory = fs::read_dir(self.sessions_directory())
+        self.require_sessions_root().await?;
+        let mut directory = read_sessions_directory(&self.sessions_directory())
             .await
             .map_err(|_| StoreError::Unavailable)?;
         let mut records = Vec::new();
@@ -203,23 +206,44 @@ impl Store {
             .await
             .map_err(|_| StoreError::Unavailable)?
         {
-            if path_state(&entry.path())
-                .await
-                .map_err(|_| StoreError::Unavailable)?
-                != PathState::Directory
-            {
-                return Err(StoreError::Corrupt);
+            let state = match path_state(&entry.path()).await {
+                Ok(state) => state,
+                Err(_) => {
+                    tracing::warn!(
+                        reason = "metadata_unavailable",
+                        "skipping unreadable session entry"
+                    );
+                    continue;
+                }
+            };
+            if state != PathState::Directory {
+                tracing::warn!(
+                    reason = "not_session_directory",
+                    "skipping unrelated session entry"
+                );
+                continue;
             }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| StoreError::Corrupt)?;
-            let session_id = name.parse::<SessionId>().map_err(|_| StoreError::Corrupt)?;
-            let record = self.load_record(session_id).await?;
-            if record.session_id != session_id {
-                return Err(StoreError::Corrupt);
+            let Ok(name) = entry.file_name().into_string() else {
+                tracing::warn!(reason = "non_utf8_name", "skipping unrelated session entry");
+                continue;
+            };
+            let Ok(session_id) = name.parse::<SessionId>() else {
+                tracing::warn!(
+                    reason = "invalid_session_id",
+                    "skipping unrelated session entry"
+                );
+                continue;
+            };
+            match self.load_record(session_id).await {
+                Ok(record) => records.push(record),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error_kind = error.kind(),
+                        "skipping unreadable session entry"
+                    );
+                }
             }
-            records.push(record);
         }
         records.sort_by_key(|record| record.session_id);
         Ok(records)
@@ -230,7 +254,7 @@ impl Store {
         record: SessionRecord,
     ) -> Result<LocalSessionLog, StoreError> {
         record.validate()?;
-        self.require_sessions_directory().await?;
+        self.require_sessions_root().await?;
         let directory = self.session_directory(record.session_id);
         match path_state(&directory)
             .await
@@ -368,14 +392,12 @@ impl Store {
         .map_err(map_atomic_store_error)
     }
 
-    async fn require_sessions_directory(&self) -> Result<(), StoreError> {
+    async fn require_sessions_root(&self) -> Result<(), StoreError> {
         match path_state(&self.sessions_directory())
             .await
             .map_err(|_| StoreError::Unavailable)?
         {
-            PathState::Directory => reject_symlink_entries(&self.sessions_directory())
-                .await
-                .map_err(map_store_directory_error),
+            PathState::Directory => Ok(()),
             PathState::Missing => Err(StoreError::Unavailable),
             PathState::Symlink | PathState::RegularFile | PathState::Other => {
                 Err(StoreError::Corrupt)
@@ -987,6 +1009,14 @@ async fn path_state(path: &Path) -> io::Result<PathState> {
     }
 }
 
+async fn read_sessions_directory(path: &Path) -> io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    if should_fail_sessions_read_dir(path) {
+        return Err(io::Error::other("injected sessions read_dir failure"));
+    }
+    fs::read_dir(path).await
+}
+
 async fn reject_symlink_entries(directory: &Path) -> io::Result<()> {
     let mut entries = fs::read_dir(directory).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -1147,6 +1177,31 @@ fn fail_next_cleanup(path: &Path) {
         .lock()
         .unwrap()
         .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn fail_next_sessions_read_dir(path: &Path) {
+    SESSIONS_READ_DIR_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn should_fail_sessions_read_dir(path: &Path) -> bool {
+    let mut failures = SESSIONS_READ_DIR_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    failures
+        .iter()
+        .position(|candidate| candidate == path)
+        .map(|position| {
+            failures.remove(position);
+            true
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1466,8 +1521,11 @@ fn log_error(kind: SessionLogErrorKind) -> SessionLogError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
@@ -1489,7 +1547,7 @@ mod tests {
         CONVERSATION_FILE, LocalSessionLog, LogBatch, MANIFEST_FILE, SESSION_RECORD_FILE,
         SessionRecord, Store, StoreError, fail_directory_sync_after,
         fail_next_atomic_write_before_rename, fail_next_cleanup, fail_next_delete_after_partial,
-        fail_next_directory_sync,
+        fail_next_directory_sync, fail_next_sessions_read_dir,
     };
 
     fn session_id(value: u8) -> SessionId {
@@ -1555,6 +1613,24 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
+    struct TestRootGuard {
+        root: PathBuf,
+    }
+
+    impl TestRootGuard {
+        fn new(root: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for TestRootGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn session_directory(root: &Path, id: SessionId) -> PathBuf {
         root.join("sessions").join(id.to_string())
     }
@@ -1577,6 +1653,25 @@ mod tests {
     ) -> (LocalSessionLog, PathBuf) {
         let log = store.create_session(record(id)).await.unwrap();
         (log, session_directory(root, id))
+    }
+
+    async fn create_healthy_session(store: &Store, id: SessionId) {
+        let (mut log, _) = initialized_log(store, id).await;
+        log.close().await.unwrap();
+    }
+
+    fn listed_session_ids(records: &[SessionRecord]) -> Vec<SessionId> {
+        records.iter().map(|record| record.session_id).collect()
+    }
+
+    async fn directory_entry_names(directory: &Path) -> Vec<OsString> {
+        let mut entries = tokio::fs::read_dir(directory).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name());
+        }
+        names.sort();
+        names
     }
 
     #[tokio::test]
@@ -1656,6 +1751,242 @@ mod tests {
                 Err(StoreError::SessionNotFound)
             ));
         }
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn list_sessions_skips_unrelated_regular_files() {
+        let (store, root) = test_store("list-regular-junk").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let healthy = session_id(40);
+        create_healthy_session(&store, healthy).await;
+        tokio::fs::write(root.join("sessions").join(".DS_Store"), b"finder metadata")
+            .await
+            .unwrap();
+
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![healthy]);
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn list_sessions_skips_directories_without_session_ids() {
+        let (store, root) = test_store("list-directory-junk").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let healthy = session_id(41);
+        create_healthy_session(&store, healthy).await;
+        tokio::fs::create_dir(root.join("sessions").join("backup"))
+            .await
+            .unwrap();
+
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![healthy]);
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn list_sessions_skips_corrupt_records_but_explicit_access_stays_strict() {
+        let (store, root) = test_store("list-corrupt-record").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let healthy = session_id(42);
+        let corrupt = session_id(43);
+        create_healthy_session(&store, healthy).await;
+        create_healthy_session(&store, corrupt).await;
+        let corrupt_record_path = session_directory(&root, corrupt).join(SESSION_RECORD_FILE);
+        let mut corrupt_record: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&corrupt_record_path).await.unwrap()).unwrap();
+        corrupt_record
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), json!(true));
+        tokio::fs::write(
+            &corrupt_record_path,
+            serde_json::to_vec(&corrupt_record).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![healthy]);
+        assert!(matches!(
+            store.load_record(corrupt).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(
+            store.open_log(corrupt).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn list_sessions_skips_record_identity_mismatches_but_load_stays_strict() {
+        let (store, root) = test_store("list-record-identity").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let directory_id = session_id(44);
+        let record_id = session_id(45);
+        create_healthy_session(&store, directory_id).await;
+        tokio::fs::write(
+            session_directory(&root, directory_id).join(SESSION_RECORD_FILE),
+            serde_json::to_vec(&record(record_id)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(store.list_sessions().await.unwrap().is_empty());
+        assert!(matches!(
+            store.load_record(directory_id).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(
+            store.open_log(directory_id).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn list_sessions_sorts_multiple_healthy_sessions() {
+        let (store, root) = test_store("list-sorted").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let low = session_id(46);
+        let middle = session_id(47);
+        let high = session_id(48);
+        for id in [high, low, middle] {
+            create_healthy_session(&store, id).await;
+        }
+
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![low, middle, high]);
+
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn create_session_succeeds_while_unrelated_junk_exists() {
+        let (store, root) = test_store("create-with-junk").await;
+        let _root_guard = TestRootGuard::new(&root);
+        tokio::fs::write(root.join("sessions").join(".DS_Store"), b"finder metadata")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("sessions").join("backup"))
+            .await
+            .unwrap();
+        let id = session_id(49);
+
+        let mut log = store.create_session(record(id)).await.unwrap();
+        log.initialize(manifest(id)).await.unwrap();
+        log.close().await.unwrap();
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![id]);
+
+        remove_root(&root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_session_succeeds_while_unrelated_symlink_entry_exists() {
+        let (store, root) = test_store("create-with-symlink-junk").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let target = root.join("unrelated-symlink-target");
+        tokio::fs::create_dir(&target).await.unwrap();
+        let marker_path = target.join("marker");
+        let marker = b"unrelated symlink target marker";
+        tokio::fs::write(&marker_path, marker).await.unwrap();
+        let link = root.join("sessions").join("unrelated-link");
+        symlink(&target, &link).unwrap();
+        let id = session_id(51);
+
+        let create_succeeded = match store.create_session(record(id)).await {
+            Ok(log) => {
+                drop(log);
+                true
+            }
+            Err(_) => false,
+        };
+        let created_record = store.load_record(id).await;
+        let marker_after = tokio::fs::read(&marker_path).await.unwrap();
+        let link_remained = tokio::fs::symlink_metadata(&link)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        remove_root(&root).await;
+
+        assert!(create_succeeded);
+        assert!(matches!(created_record, Ok(record) if record.session_id == id));
+        assert_eq!(marker_after, marker);
+        assert!(link_remained);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_session_rejects_exact_session_symlink_without_touching_target() {
+        let (store, root) = test_store("create-exact-symlink").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let target = root.join("exact-symlink-target");
+        tokio::fs::create_dir(&target).await.unwrap();
+        let marker_path = target.join("marker");
+        let marker = b"exact symlink target marker";
+        tokio::fs::write(&marker_path, marker).await.unwrap();
+        let target_entries_before = directory_entry_names(&target).await;
+        let id = session_id(52);
+        let link = session_directory(&root, id);
+        symlink(&target, &link).unwrap();
+
+        let create_was_corrupt = matches!(
+            store.create_session(record(id)).await,
+            Err(StoreError::Corrupt)
+        );
+        let target_entries_after = directory_entry_names(&target).await;
+        let marker_after = tokio::fs::read(&marker_path).await.unwrap();
+        let link_remained = tokio::fs::symlink_metadata(&link)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        remove_root(&root).await;
+
+        assert!(create_was_corrupt);
+        assert_eq!(target_entries_after, target_entries_before);
+        assert_eq!(marker_after, marker);
+        assert!(link_remained);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_maps_sessions_root_read_dir_failure_to_unavailable_once() {
+        let (store, root) = test_store("list-read-dir-fault").await;
+        let _root_guard = TestRootGuard::new(&root);
+        fail_next_sessions_read_dir(&store.sessions_directory());
+
+        assert!(matches!(
+            store.list_sessions().await,
+            Err(StoreError::Unavailable)
+        ));
+        assert!(store.list_sessions().await.unwrap().is_empty());
+
+        remove_root(&root).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn list_sessions_skips_non_utf8_directory_names() {
+        let (store, root) = test_store("list-non-utf8").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let healthy = session_id(50);
+        create_healthy_session(&store, healthy).await;
+        let name = OsString::from_vec(vec![b'b', b'a', b'c', b'k', b'u', b'p', 0xff]);
+        tokio::fs::create_dir(root.join("sessions").join(name))
+            .await
+            .unwrap();
+
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![healthy]);
+
         remove_root(&root).await;
     }
 
@@ -2012,46 +2343,69 @@ mod tests {
     #[tokio::test]
     async fn delete_failures_are_unknown_and_missing_is_only_not_found() {
         let (store, root) = test_store("delete-fault").await;
+        let _root_guard = TestRootGuard::new(&root);
 
-        assert!(matches!(
-            store.delete_session(session_id(33)).await,
-            Err(StoreError::SessionNotFound)
-        ));
+        let missing_delete_result = store.delete_session(session_id(33)).await;
 
         let partial_id = session_id(34);
         let (mut partial_log, partial_directory) = initialized_log(&store, partial_id).await;
         partial_log.close().await.unwrap();
         fail_next_delete_after_partial(&partial_directory);
-        assert!(matches!(
-            store.delete_session(partial_id).await,
-            Err(StoreError::UnknownOutcome)
-        ));
-        assert!(tokio::fs::try_exists(&partial_directory).await.unwrap());
-        assert!(matches!(
-            store.load_record(partial_id).await,
-            Err(StoreError::Corrupt)
-        ));
-        assert!(matches!(
-            store.list_sessions().await,
-            Err(StoreError::Corrupt)
-        ));
+        let partial_delete_result = store.delete_session(partial_id).await;
+        let partial_manifest_path = partial_directory.join(MANIFEST_FILE);
+        let partial_conversation_path = partial_directory.join(CONVERSATION_FILE);
+        let partial_record_path = partial_directory.join(SESSION_RECORD_FILE);
+        let directory_existed_before_list =
+            tokio::fs::try_exists(&partial_directory).await.unwrap();
+        let record_existed_before_list = tokio::fs::try_exists(&partial_record_path).await.unwrap();
+        let directory_entries_before_list = directory_entry_names(&partial_directory).await;
+        let manifest_before_list = tokio::fs::read(&partial_manifest_path).await.unwrap();
+        let conversation_before_list = tokio::fs::read(&partial_conversation_path).await.unwrap();
+        let partial_load_result = store.load_record(partial_id).await;
+        let partial_list_result = store.list_sessions().await;
+        let directory_existed_after_list = tokio::fs::try_exists(&partial_directory).await.unwrap();
+        let record_existed_after_list = tokio::fs::try_exists(&partial_record_path).await.unwrap();
+        let directory_entries_after_list = directory_entry_names(&partial_directory).await;
+        let manifest_after_list = tokio::fs::read(&partial_manifest_path).await.unwrap();
+        let conversation_after_list = tokio::fs::read(&partial_conversation_path).await.unwrap();
 
         let synced_id = session_id(35);
         let (mut synced_log, synced_directory) = initialized_log(&store, synced_id).await;
         synced_log.close().await.unwrap();
         fail_next_directory_sync(&store.sessions_directory());
-        assert!(matches!(
-            store.delete_session(synced_id).await,
-            Err(StoreError::UnknownOutcome)
-        ));
-        assert!(!tokio::fs::try_exists(&synced_directory).await.unwrap());
+        let synced_delete_result = store.delete_session(synced_id).await;
+        let synced_directory_exists = tokio::fs::try_exists(&synced_directory).await.unwrap();
 
         remove_root(&root).await;
+
+        assert!(matches!(
+            missing_delete_result,
+            Err(StoreError::SessionNotFound)
+        ));
+        assert!(matches!(
+            partial_delete_result,
+            Err(StoreError::UnknownOutcome)
+        ));
+        assert!(directory_existed_before_list);
+        assert!(!record_existed_before_list);
+        assert!(matches!(partial_load_result, Err(StoreError::Corrupt)));
+        assert!(matches!(partial_list_result, Ok(records) if records.is_empty()));
+        assert_eq!(directory_existed_after_list, directory_existed_before_list);
+        assert_eq!(record_existed_after_list, record_existed_before_list);
+        assert_eq!(directory_entries_after_list, directory_entries_before_list);
+        assert_eq!(manifest_after_list, manifest_before_list);
+        assert_eq!(conversation_after_list, conversation_before_list);
+        assert!(matches!(
+            synced_delete_result,
+            Err(StoreError::UnknownOutcome)
+        ));
+        assert!(!synced_directory_exists);
     }
 
     #[tokio::test]
     async fn existing_session_without_metadata_is_corrupt_not_missing() {
         let (store, root) = test_store("missing-record").await;
+        let _root_guard = TestRootGuard::new(&root);
         let id = session_id(36);
         let (mut log, directory) = initialized_log(&store, id).await;
         log.close().await.unwrap();
@@ -2063,10 +2417,7 @@ mod tests {
             store.load_record(id).await,
             Err(StoreError::Corrupt)
         ));
-        assert!(matches!(
-            store.list_sessions().await,
-            Err(StoreError::Corrupt)
-        ));
+        assert!(store.list_sessions().await.unwrap().is_empty());
         assert!(matches!(store.open_log(id).await, Err(StoreError::Corrupt)));
 
         remove_root(&root).await;
@@ -2197,22 +2548,51 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlinked_store_paths_are_rejected_without_following() {
+    async fn symlink_entries_are_skipped_while_store_paths_remain_strict() {
         let (store, root) = test_store("symlinks").await;
+        let _root_guard = TestRootGuard::new(&root);
         let outside = root.join("outside");
         tokio::fs::create_dir(&outside).await.unwrap();
 
+        let healthy_id = session_id(23);
+        create_healthy_session(&store, healthy_id).await;
         let linked_id = session_id(24);
+        tokio::fs::write(
+            outside.join(SESSION_RECORD_FILE),
+            serde_json::to_vec(&record(linked_id)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let linked_target_entries_before = directory_entry_names(&outside).await;
+        let linked_record_before = tokio::fs::read(outside.join(SESSION_RECORD_FILE))
+            .await
+            .unwrap();
         let linked_directory = session_directory(&root, linked_id);
         symlink(&outside, &linked_directory).unwrap();
-        assert!(matches!(
-            store.list_sessions().await,
-            Err(StoreError::Corrupt)
-        ));
+        let records = store.list_sessions().await.unwrap();
+        assert_eq!(listed_session_ids(&records), vec![healthy_id]);
         assert!(matches!(
             store.load_record(linked_id).await,
             Err(StoreError::Corrupt)
         ));
+        assert!(matches!(
+            store.delete_session(linked_id).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(
+            store.create_session(record(linked_id)).await,
+            Err(StoreError::Corrupt)
+        ));
+        assert_eq!(
+            directory_entry_names(&outside).await,
+            linked_target_entries_before
+        );
+        assert_eq!(
+            tokio::fs::read(outside.join(SESSION_RECORD_FILE))
+                .await
+                .unwrap(),
+            linked_record_before
+        );
         tokio::fs::remove_file(&linked_directory).await.unwrap();
 
         let id = session_id(25);
@@ -2297,7 +2677,6 @@ mod tests {
 
         let root_two = root.join("root-two");
         let store_two = Store::open(root_two.clone()).await.unwrap();
-        drop(store_two);
         let outside_sessions = outside.join("sessions");
         tokio::fs::create_dir(&outside_sessions).await.unwrap();
         tokio::fs::remove_dir(root_two.join("sessions"))
@@ -2305,7 +2684,20 @@ mod tests {
             .unwrap();
         symlink(&outside_sessions, root_two.join("sessions")).unwrap();
         assert!(matches!(
-            Store::open(root_two).await,
+            store_two.list_sessions().await,
+            Err(StoreError::Corrupt)
+        ));
+        assert!(matches!(
+            Store::open(root_two.clone()).await,
+            Err(StoreError::InvalidRoot)
+        ));
+
+        let top_level_target = root.join("top-level-target");
+        let top_level_link = root.join("top-level-link");
+        drop(Store::open(top_level_target.clone()).await.unwrap());
+        symlink(&top_level_target, &top_level_link).unwrap();
+        assert!(matches!(
+            Store::open(top_level_link).await,
             Err(StoreError::InvalidRoot)
         ));
 
@@ -2515,16 +2907,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_directory_and_metadata_are_not_silently_ignored() {
-        let (store, root) = test_store("invalid").await;
-        let invalid_directory = root.join("sessions").join("not-a-session-id");
-        tokio::fs::create_dir_all(&invalid_directory).await.unwrap();
-        assert!(matches!(
-            store.list_sessions().await,
-            Err(StoreError::Corrupt)
-        ));
-        tokio::fs::remove_dir_all(&invalid_directory).await.unwrap();
-
+    async fn explicit_metadata_access_rejects_unknown_fields() {
+        let (store, root) = test_store("invalid-metadata").await;
+        let _root_guard = TestRootGuard::new(&root);
         let id = session_id(8);
         let mut log = store.create_session(record(id)).await.unwrap();
         log.initialize(manifest(id)).await.unwrap();
@@ -2546,6 +2931,7 @@ mod tests {
             store.load_record(id).await,
             Err(StoreError::Corrupt)
         ));
+        assert!(matches!(store.open_log(id).await, Err(StoreError::Corrupt)));
         remove_root(&root).await;
     }
 
