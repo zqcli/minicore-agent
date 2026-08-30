@@ -14,7 +14,7 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-use minicore_runtime::ids::{SessionInstanceId, ToolCallId, TurnId};
+use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     AssistantPart, DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError,
     ModelErrorKind, ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelRequest,
@@ -52,6 +52,25 @@ pub(super) struct OpenAiResponsesSettings {
 struct TurnKey {
     instance_id: SessionInstanceId,
     turn_id: TurnId,
+}
+
+#[derive(Clone, Copy)]
+struct RequestTraceContext {
+    session_id: SessionId,
+    instance_id: SessionInstanceId,
+    turn_id: TurnId,
+    round: u16,
+}
+
+impl From<&ModelCallContext> for RequestTraceContext {
+    fn from(context: &ModelCallContext) -> Self {
+        Self {
+            session_id: context.session_id,
+            instance_id: context.instance_id,
+            turn_id: context.turn_id,
+            round: context.round,
+        }
+    }
 }
 
 struct TurnContinuation {
@@ -239,6 +258,7 @@ impl OpenAiResponsesModel {
         turn_key: TurnKey,
         continuation_enabled: bool,
     ) -> Result<ModelStream, ModelError> {
+        let trace = RequestTraceContext::from(&context);
         let round = context.round;
         let replay = self.continuation_snapshot(turn_key, round, continuation_enabled)?;
         if context.cancellation.is_cancelled() {
@@ -303,14 +323,17 @@ impl OpenAiResponsesModel {
         };
 
         if !response.status().is_success() {
-            return Err(classify_http_error(
+            let status_class = http_status_class(response.status());
+            let error = classify_http_error(
                 response,
                 cancellation,
                 deadline,
                 Instant::now(),
                 SystemTime::now(),
             )
-            .await);
+            .await;
+            log_provider_request_failure(trace, &error, status_class);
+            return Err(error);
         }
         let is_sse = response
             .headers()
@@ -330,7 +353,13 @@ impl OpenAiResponsesModel {
             matched_replay_rounds,
             guard: ContinuationGuard::new(Arc::clone(&self.continuations), turn_key),
         });
-        let state = StreamState::new_with_continuation(bytes, cancellation, deadline, continuation);
+        let state = StreamState::new_with_continuation(
+            bytes,
+            cancellation,
+            deadline,
+            continuation,
+            Some(trace),
+        );
         Ok(Box::pin(stream::unfold(state, next_stream_event)))
     }
 }
@@ -349,17 +378,43 @@ impl Model for OpenAiResponsesModel {
             instance_id: context.instance_id,
             turn_id: context.turn_id,
         };
+        let trace = RequestTraceContext::from(&context);
         let continuation_enabled = request.reasoning() != ReasoningPreference::Disabled;
         Box::pin(async move {
+            tracing::debug!(
+                session_id = %trace.session_id,
+                instance_id = %trace.instance_id,
+                turn_id = %trace.turn_id,
+                round = trace.round,
+                "provider request start"
+            );
             let result = self
                 .start_request(request, context, turn_key, continuation_enabled)
                 .await;
             if let Err(error) = &result {
+                tracing::debug!(
+                    session_id = %trace.session_id,
+                    instance_id = %trace.instance_id,
+                    turn_id = %trace.turn_id,
+                    round = trace.round,
+                    error_kind = ?error.kind(),
+                    delivery = ?error.delivery(),
+                    retryable = model_error_retryable(error),
+                    "provider request start failed"
+                );
                 let preserve = error.delivery() == DeliveryState::NotStarted
                     && matches!(error.retry_hint(), RetryHint::Retryable { .. });
                 if continuation_enabled && !preserve {
                     self.remove_continuation(turn_key);
                 }
+            } else {
+                tracing::debug!(
+                    session_id = %trace.session_id,
+                    instance_id = %trace.instance_id,
+                    turn_id = %trace.turn_id,
+                    round = trace.round,
+                    "provider response stream opened"
+                );
             }
             result
         })
@@ -697,6 +752,36 @@ async fn classify_http_error(
     }
 }
 
+fn http_status_class(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        400..=499 => "client_error",
+        500..=599 => "server_error",
+        _ => "other",
+    }
+}
+
+fn model_error_retryable(error: &ModelError) -> bool {
+    matches!(error.retry_hint(), RetryHint::Retryable { .. })
+}
+
+fn log_provider_request_failure(
+    trace: RequestTraceContext,
+    error: &ModelError,
+    status_class: &'static str,
+) {
+    tracing::warn!(
+        session_id = %trace.session_id,
+        instance_id = %trace.instance_id,
+        turn_id = %trace.turn_id,
+        round = trace.round,
+        error_kind = ?error.kind(),
+        delivery = ?error.delivery(),
+        retryable = model_error_retryable(error),
+        status_class = status_class,
+        "provider request failed"
+    );
+}
+
 fn is_quota_code(value: &str) -> bool {
     matches!(
         value,
@@ -908,6 +993,7 @@ struct StreamState {
     output_items: Option<BTreeMap<u32, Value>>,
     output_item_bytes: usize,
     continuation: Option<StreamContinuation>,
+    trace: Option<RequestTraceContext>,
     provider_event_seen: bool,
     semantic_seen: bool,
     reasoning_seen: bool,
@@ -932,7 +1018,7 @@ impl StreamState {
         cancellation: tokio_util::sync::CancellationToken,
         deadline: TokioInstant,
     ) -> Self {
-        Self::new_with_continuation(bytes, cancellation, deadline, None)
+        Self::new_with_continuation(bytes, cancellation, deadline, None, None)
     }
 
     fn new_with_continuation(
@@ -940,6 +1026,7 @@ impl StreamState {
         cancellation: tokio_util::sync::CancellationToken,
         deadline: TokioInstant,
         continuation: Option<StreamContinuation>,
+        trace: Option<RequestTraceContext>,
     ) -> Self {
         let output_items = continuation.as_ref().map(|_| BTreeMap::new());
         Self {
@@ -954,6 +1041,7 @@ impl StreamState {
             output_items,
             output_item_bytes: 0,
             continuation,
+            trace,
             provider_event_seen: false,
             semantic_seen: false,
             reasoning_seen: false,
@@ -969,6 +1057,17 @@ impl StreamState {
     }
 
     fn fail(&mut self, error: ModelError) {
+        if let Some(trace) = self.trace {
+            tracing::warn!(
+                session_id = %trace.session_id,
+                instance_id = %trace.instance_id,
+                turn_id = %trace.turn_id,
+                round = trace.round,
+                error_kind = ?error.kind(),
+                delivery = ?error.delivery(),
+                "provider stream failed"
+            );
+        }
         let _ = self.clear_continuation();
         self.done = true;
         self.pending.push_back(Err(error));
@@ -1725,6 +1824,16 @@ fn finish_response(
         ModelFinishReason::ContentFiltered | ModelFinishReason::Unknown => {}
     }
     state.terminal_seen = true;
+    if let Some(trace) = state.trace {
+        tracing::debug!(
+            session_id = %trace.session_id,
+            instance_id = %trace.instance_id,
+            turn_id = %trace.turn_id,
+            round = trace.round,
+            finish_reason = ?reason,
+            "provider request terminal"
+        );
+    }
     if let Some(usage) = usage {
         state.queue(ModelEvent::Usage { usage });
     }

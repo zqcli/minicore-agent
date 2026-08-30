@@ -331,7 +331,12 @@ async fn metadata_worker(
         match result {
             Ok(()) => {}
             Err(error) if metadata_error_is_retryable(&error) => continue,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error_kind = error.kind(),
+                    "metadata update failed"
+                );
                 failed.store(true, Ordering::Release);
                 return;
             }

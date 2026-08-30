@@ -20,7 +20,7 @@ use minicore_runtime::storage::{
 };
 use minicore_runtime::value::BoundedText;
 
-use crate::error::StoreError;
+use crate::error::{StoreError, session_log_error_kind};
 
 const SESSIONS_DIR: &str = "sessions";
 const SESSION_RECORD_FILE: &str = "session.json";
@@ -262,7 +262,7 @@ impl Store {
                 remove_empty_session_directory(&directory, &self.sessions_directory()).await,
             ));
         }
-        Ok(LocalSessionLog::new(directory))
+        Ok(LocalSessionLog::new(directory, record.session_id))
     }
 
     pub async fn load_record(&self, session_id: SessionId) -> Result<SessionRecord, StoreError> {
@@ -290,9 +290,9 @@ impl Store {
     pub async fn open_log(&self, session_id: SessionId) -> Result<LocalSessionLog, StoreError> {
         self.load_record(session_id).await?;
         let directory = self.require_session_directory(session_id).await?;
-        LocalSessionLog::load(directory)
-            .await
-            .map_err(StoreError::Log)
+        let result = LocalSessionLog::load(directory).await;
+        log_session_log_result(session_id, "open_log", &result);
+        result.map_err(StoreError::Log)
     }
 
     pub async fn touch(&self, session_id: SessionId) -> Result<(), StoreError> {
@@ -386,6 +386,7 @@ impl Store {
 
 pub struct LocalSessionLog {
     directory: PathBuf,
+    session_id: SessionId,
     manifest: Option<SessionManifest>,
     entries: Vec<ConversationEntry>,
     file: Option<File>,
@@ -402,9 +403,10 @@ pub struct LocalSessionLog {
 }
 
 impl LocalSessionLog {
-    fn new(directory: PathBuf) -> Self {
+    fn new(directory: PathBuf, session_id: SessionId) -> Self {
         Self {
             directory,
+            session_id,
             manifest: None,
             entries: Vec::new(),
             file: None,
@@ -442,6 +444,10 @@ impl LocalSessionLog {
         let complete_len = complete_log_length(&bytes);
         if complete_len != bytes.len() {
             truncate_log(&conversation_path, complete_len).await?;
+            tracing::warn!(
+                session_id = %expected_session_id,
+                "session log tail repaired"
+            );
             bytes.truncate(complete_len);
         }
         let (entries, head) = decode_batches(&bytes)?;
@@ -453,6 +459,7 @@ impl LocalSessionLog {
             .map_err(|_| log_error(SessionLogErrorKind::Unavailable))?;
         Ok(Self {
             directory,
+            session_id: expected_session_id,
             manifest: Some(manifest),
             entries,
             file: Some(file),
@@ -753,7 +760,7 @@ impl LocalSessionLog {
     }
 
     #[cfg(test)]
-    fn inject_unknown_after_write(&mut self) {
+    pub(crate) fn inject_unknown_after_write(&mut self) {
         self.fail_after_write = true;
     }
 
@@ -785,11 +792,19 @@ impl LocalSessionLog {
 
 impl SessionLog for LocalSessionLog {
     fn initialize<'a>(&'a mut self, manifest: SessionManifest) -> LogFuture<'a, ConversationSeq> {
-        Box::pin(async move { self.initialize_inner(manifest).await })
+        Box::pin(async move {
+            let result = self.initialize_inner(manifest).await;
+            log_session_log_result(self.session_id, "initialize", &result);
+            result
+        })
     }
 
     fn load_manifest<'a>(&'a mut self) -> LogFuture<'a, SessionManifest> {
-        Box::pin(async move { self.load_manifest_inner().await })
+        Box::pin(async move {
+            let result = self.load_manifest_inner().await;
+            log_session_log_result(self.session_id, "load_manifest", &result);
+            result
+        })
     }
 
     fn read_page<'a>(
@@ -797,7 +812,11 @@ impl SessionLog for LocalSessionLog {
         after: Option<ConversationSeq>,
         limit: usize,
     ) -> LogFuture<'a, ConversationPage> {
-        Box::pin(async move { self.read_page_inner(after, limit).await })
+        Box::pin(async move {
+            let result = self.read_page_inner(after, limit).await;
+            log_session_log_result(self.session_id, "read_page", &result);
+            result
+        })
     }
 
     fn append<'a>(
@@ -805,12 +824,36 @@ impl SessionLog for LocalSessionLog {
         expected_head: ConversationSeq,
         entries: Vec<ConversationEntry>,
     ) -> LogFuture<'a, AppendReceipt> {
-        Box::pin(async move { self.append_inner(expected_head, entries).await })
+        Box::pin(async move {
+            let result = self.append_inner(expected_head, entries).await;
+            log_session_log_result(self.session_id, "append", &result);
+            result
+        })
     }
 
     fn close<'a>(&'a mut self) -> LogFuture<'a, ()> {
-        Box::pin(async move { self.close_inner().await })
+        Box::pin(async move {
+            let result = self.close_inner().await;
+            log_session_log_result(self.session_id, "close", &result);
+            result
+        })
     }
+}
+
+fn log_session_log_result<T>(
+    session_id: SessionId,
+    operation: &'static str,
+    result: &Result<T, SessionLogError>,
+) {
+    let Err(error) = result else {
+        return;
+    };
+    tracing::warn!(
+        session_id = %session_id,
+        operation = operation,
+        error_kind = session_log_error_kind(error.kind()),
+        "session log operation failed"
+    );
 }
 
 fn valid_metadata_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
@@ -1932,7 +1975,7 @@ mod tests {
         let id = session_id(30);
         let (mut initialized, directory) = initialized_log(&store, id).await;
         initialized.close().await.unwrap();
-        let mut loaded = LocalSessionLog::new(directory.clone());
+        let mut loaded = LocalSessionLog::new(directory.clone(), id);
         tokio::fs::OpenOptions::new()
             .append(true)
             .open(directory.join(CONVERSATION_FILE))

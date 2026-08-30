@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use minicore_runtime::config::{SessionSpec, Timestamp, TurnOptions, UserInput};
 use minicore_runtime::context::ContextProvider;
-use minicore_runtime::conversation::TranscriptPage;
+use minicore_runtime::conversation::{TranscriptPage, TurnTerminal};
 use minicore_runtime::error::{SessionError, SessionOpenErrorKind};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
 use minicore_runtime::session::{
@@ -144,9 +144,9 @@ impl Agent {
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone())
             .await
-            .map_err(map_store_error)?;
+            .map_err(|error| map_logged_store_error("agent_open", None, error))?;
         let (events_tx, events_rx) = mpsc::channel(config.event_capacity);
-        Ok(Self {
+        let agent = Self {
             config,
             store,
             profiles,
@@ -157,7 +157,9 @@ impl Agent {
             events_rx: Some(events_rx),
             task_runtime,
             kernel,
-        })
+        };
+        tracing::info!("agent open success");
+        Ok(agent)
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -184,7 +186,11 @@ impl Agent {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, AgentError> {
-        let records = self.store.list_sessions().await.map_err(map_store_error)?;
+        let records = self
+            .store
+            .list_sessions()
+            .await
+            .map_err(|error| map_logged_store_error("list_sessions", None, error))?;
         Ok(records
             .iter()
             .map(|record| self.session_info(record, self.sessions.get(record.session_id)))
@@ -226,35 +232,51 @@ impl Agent {
             .store
             .create_session(record.clone())
             .await
-            .map_err(map_store_error)?;
+            .map_err(|error| map_logged_store_error("create_session", Some(session_id), error))?;
         let runtime = match SessionRuntime::create(session_id, spec, Box::new(log), options).await {
             Ok(runtime) => runtime,
             Err(error) => {
-                let _ = self.store.delete_session(session_id).await;
+                if let Err(cleanup_error) = self.store.delete_session(session_id).await {
+                    log_store_error("create_session_cleanup", Some(session_id), &cleanup_error);
+                }
                 return Err(map_session_open_error(error));
             }
         };
         let loaded = match self.attach_runtime(runtime, record.clone()).await {
             Ok(loaded) => loaded,
             Err(error) => {
-                let _ = self.store.delete_session(session_id).await;
+                if let Err(cleanup_error) = self.store.delete_session(session_id).await {
+                    log_store_error("create_session_cleanup", Some(session_id), &cleanup_error);
+                }
                 return Err(error);
             }
         };
         let info = self.session_info(&record, Some(&loaded));
+        let instance_id = loaded.handle.instance_id();
         let _ = self.sessions.insert(session_id, loaded);
+        tracing::info!(
+            session_id = %session_id,
+            instance_id = %instance_id,
+            "session created"
+        );
         Ok(info)
     }
 
     pub async fn open_session(&mut self, session_id: SessionId) -> Result<SessionInfo, AgentError> {
         if let Some(loaded) = self.sessions.get(session_id) {
-            return Ok(self.session_info(&loaded.record, Some(loaded)));
+            let info = self.session_info(&loaded.record, Some(loaded));
+            tracing::debug!(
+                session_id = %session_id,
+                instance_id = %loaded.handle.instance_id(),
+                "session opened"
+            );
+            return Ok(info);
         }
         let record = self
             .store
             .load_record(session_id)
             .await
-            .map_err(map_store_error)?;
+            .map_err(|error| map_logged_store_error("load_record", Some(session_id), error))?;
         let workspace = Arc::new(
             Workspace::open(record.workspace.clone())
                 .await
@@ -269,11 +291,13 @@ impl Agent {
             .cloned()
             .ok_or(AgentError::ProfileNotFound)?;
         let (spec, options) = self.session_parts(&profile, workspace)?;
-        let mut log = self
-            .store
-            .open_log(session_id)
-            .await
-            .map_err(map_store_error)?;
+        let mut log = self.store.open_log(session_id).await.map_err(|error| {
+            if matches!(&error, StoreError::Log(_)) {
+                map_store_error(error)
+            } else {
+                map_logged_store_error("open_log", Some(session_id), error)
+            }
+        })?;
         let manifest = log.load_manifest().await.map_err(map_log_error)?;
         if manifest.session_id != session_id || manifest.spec != spec {
             log.close().await.map_err(map_log_error)?;
@@ -284,7 +308,13 @@ impl Agent {
             .map_err(map_session_open_error)?;
         let loaded = self.attach_runtime(runtime, record.clone()).await?;
         let info = self.session_info(&record, Some(&loaded));
+        let instance_id = loaded.handle.instance_id();
         let _ = self.sessions.insert(session_id, loaded);
+        tracing::info!(
+            session_id = %session_id,
+            instance_id = %instance_id,
+            "session opened"
+        );
         Ok(info)
     }
 
@@ -298,17 +328,38 @@ impl Agent {
             instance_id: loaded.handle.instance_id(),
             dropped_before: 0,
         };
-        loaded.shutdown(meta).await
+        let instance_id = meta.instance_id;
+        let result = loaded.shutdown(meta).await;
+        if result.is_ok() {
+            tracing::info!(
+                session_id = %session_id,
+                instance_id = %instance_id,
+                "session closed"
+            );
+        } else {
+            tracing::warn!(
+                session_id = %session_id,
+                instance_id = %instance_id,
+                error_kind = "shutdown",
+                "session close failed"
+            );
+        }
+        result
     }
 
     pub async fn delete_session(&mut self, session_id: SessionId) -> Result<(), AgentError> {
         if self.sessions.contains(session_id) {
             return Err(AgentError::SessionAlreadyLoaded);
         }
-        self.store
+        let result = self
+            .store
             .delete_session(session_id)
             .await
-            .map_err(map_store_error)
+            .map_err(|error| map_logged_store_error("delete_session", Some(session_id), error));
+        if result.is_ok() {
+            tracing::info!(session_id = %session_id, "session deleted");
+        }
+        result
     }
 
     pub fn session_state(&self, session_id: SessionId) -> Result<SessionState, AgentError> {
@@ -349,8 +400,22 @@ impl Agent {
                 outcome = completion_turn.wait() => outcome,
             };
             let Ok(outcome) = outcome else {
+                tracing::warn!(
+                    session_id = %turn_ref.session_id,
+                    instance_id = %turn_ref.instance_id,
+                    turn_id = %turn_ref.turn_id,
+                    error_kind = "turn_wait",
+                    "turn completion wait failed"
+                );
                 return;
             };
+            tracing::info!(
+                session_id = %turn_ref.session_id,
+                instance_id = %turn_ref.instance_id,
+                turn_id = %turn_ref.turn_id,
+                outcome = turn_terminal_category(&outcome.terminal),
+                "turn completed"
+            );
             let ready = CompletionReady { turn_ref, outcome };
             tokio::select! {
                 biased;
@@ -366,6 +431,12 @@ impl Agent {
             handle: turn,
             completion_task,
         });
+        tracing::info!(
+            session_id = %turn_ref.session_id,
+            instance_id = %turn_ref.instance_id,
+            turn_id = %turn_ref.turn_id,
+            "turn submitted"
+        );
         self.schedule_touch(session_id);
         Ok(turn_ref)
     }
@@ -381,9 +452,24 @@ impl Agent {
             .as_ref()
             .ok_or(AgentError::TurnNotFound)?;
         if active.handle.is_finished() {
+            tracing::debug!(
+                session_id = %turn.session_id,
+                instance_id = %turn.instance_id,
+                turn_id = %turn.turn_id,
+                cancelled = false,
+                "turn cancel requested"
+            );
             return Ok(false);
         }
-        Ok(active.handle.cancel())
+        let cancelled = active.handle.cancel();
+        tracing::info!(
+            session_id = %turn.session_id,
+            instance_id = %turn.instance_id,
+            turn_id = %turn.turn_id,
+            cancelled = cancelled,
+            "turn cancel requested"
+        );
+        Ok(cancelled)
     }
 
     pub fn turn_handle(&self, turn: TurnRef) -> Result<TurnHandle, AgentError> {
@@ -427,9 +513,11 @@ impl Agent {
     }
 
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
+        tracing::info!("agent shutdown begin");
         let result = self.sessions.shutdown_all().await;
         drop(self.events_tx);
         drop(self.events_rx.take());
+        tracing::info!(success = result.is_ok(), "agent shutdown end");
         result
     }
 
@@ -543,7 +631,7 @@ impl Agent {
     }
 
     async fn cleanup_finished_turn(&mut self, session_id: SessionId) -> Result<(), AgentError> {
-        let completion_result = {
+        let (completion_result, instance_id, turn_id) = {
             let loaded = self
                 .sessions
                 .get_mut(session_id)
@@ -554,14 +642,27 @@ impl Agent {
             if !active.handle.is_finished() {
                 return Ok(());
             }
-            (&mut active.completion_task).await
+            let instance_id = active.handle.instance_id();
+            let turn_id = active.handle.turn_id();
+            let result = (&mut active.completion_task).await;
+            (result, instance_id, turn_id)
         };
         self.sessions
             .get_mut(session_id)
             .expect("finished turn belongs to loaded session")
             .active_turn
             .take();
-        completion_result.map_err(|_| AgentError::Internal)
+        if completion_result.is_err() {
+            tracing::warn!(
+                session_id = %session_id,
+                instance_id = %instance_id,
+                turn_id = %turn_id,
+                error_kind = "completion_join",
+                "turn completion task failed"
+            );
+            return Err(AgentError::Internal);
+        }
+        Ok(())
     }
 
     fn schedule_touch(&mut self, session_id: SessionId) {
@@ -587,6 +688,17 @@ fn validate_turn_ref(loaded: &LoadedSession, turn: TurnRef) -> Result<(), AgentE
         return Err(AgentError::TurnNotFound);
     }
     Ok(())
+}
+
+fn turn_terminal_category(terminal: &TurnTerminal) -> &'static str {
+    match terminal {
+        TurnTerminal::Completed => "completed",
+        TurnTerminal::Failed { .. } => "failed",
+        TurnTerminal::CancelledByUser => "cancelled_by_user",
+        TurnTerminal::CancelledByShutdown => "cancelled_by_shutdown",
+        TurnTerminal::CancelledByRestart => "cancelled_by_restart",
+        TurnTerminal::BudgetExceeded => "budget_exceeded",
+    }
 }
 
 fn current_timestamp() -> Result<String, AgentError> {
@@ -632,6 +744,32 @@ fn map_store_error(error: StoreError) -> AgentError {
         | StoreError::CleanupFailed { .. }
         | StoreError::Internal
         | StoreError::Log(_) => AgentError::Store,
+    }
+}
+
+fn map_logged_store_error(
+    operation: &'static str,
+    session_id: Option<SessionId>,
+    error: StoreError,
+) -> AgentError {
+    log_store_error(operation, session_id, &error);
+    map_store_error(error)
+}
+
+fn log_store_error(operation: &'static str, session_id: Option<SessionId>, error: &StoreError) {
+    if let Some(session_id) = session_id {
+        tracing::warn!(
+            operation = operation,
+            session_id = %session_id,
+            error_kind = error.kind(),
+            "store operation failed"
+        );
+    } else {
+        tracing::warn!(
+            operation = operation,
+            error_kind = error.kind(),
+            "store operation failed"
+        );
     }
 }
 

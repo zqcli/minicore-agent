@@ -119,25 +119,37 @@ impl RpcServer {
             tokio::select! {
                 biased;
                 writer_result = &mut writer_status_rx => {
+                    tracing::warn!(kind = "writer_stopped", "rpc writer failure");
                     observed_writer_result = Some(writer_result.unwrap_or(Err(AgentError::Internal)));
                     break StopReason::WriterStopped;
                 }
                 signal = &mut shutdown_signal => {
                     break match signal {
                         Ok(()) => StopReason::Signal,
-                        Err(error) => StopReason::Error(AgentError::Io(error)),
+                        Err(error) => {
+                            tracing::warn!(kind = "signal_failure", "rpc shutdown signal failed");
+                            StopReason::Error(AgentError::Io(error))
+                        }
                     };
                 }
                 waiter = self.waiters.join_next(), if !self.waiters.is_empty() => {
                     if waiter.is_some_and(|result| result.is_err()) {
+                        tracing::warn!(kind = "waiter_join", "rpc waiter failed");
                         break StopReason::Error(AgentError::Internal);
                     }
                 }
                 frame = read_frame(reader) => {
                     match frame {
-                        Err(error) => break StopReason::Error(AgentError::Io(error)),
-                        Ok(Frame::Eof) => break StopReason::Eof,
+                        Err(error) => {
+                            tracing::warn!(kind = "read_failure", "rpc read failed");
+                            break StopReason::Error(AgentError::Io(error));
+                        }
+                        Ok(Frame::Eof) => {
+                            tracing::debug!("rpc stdin eof");
+                            break StopReason::Eof;
+                        }
                         Ok(Frame::Oversized) => {
+                            tracing::warn!(kind = "oversized_frame", "rpc request rejected");
                             if self.send(RpcResponse::error(
                                 None,
                                 PARSE_ERROR,
@@ -182,6 +194,7 @@ impl RpcServer {
 
     async fn dispatch(&mut self, request: RpcRequest) -> Dispatch {
         let RpcRequest { id, method, params } = request;
+        tracing::debug!(method = canonical_method(&method), "rpc dispatch");
         match method.as_str() {
             "agent.ping" => {
                 let _: EmptyParams = match params_or_error(&id, params) {
@@ -392,7 +405,9 @@ impl RpcServer {
         self.outbound_tx
             .send(RpcOutbound::Response(response))
             .await
-            .map_err(|_| ())
+            .map_err(|_| {
+                tracing::warn!(kind = "outbound_closed", "rpc writer failure");
+            })
     }
 
     async fn finish(
@@ -403,6 +418,14 @@ impl RpcServer {
         writer_status_rx: oneshot::Receiver<Result<(), AgentError>>,
         mut writer_result: Option<Result<(), AgentError>>,
     ) -> Result<(), AgentError> {
+        let reason_kind = match &reason {
+            StopReason::Eof => "eof",
+            StopReason::Signal => "signal",
+            StopReason::Shutdown(_) => "request",
+            StopReason::Error(_) => "error",
+            StopReason::WriterStopped => "writer_stopped",
+        };
+        tracing::info!(reason = reason_kind, "rpc shutdown begin");
         let (shutdown_id, mut primary_error) = match reason {
             StopReason::Shutdown(id) => (Some(id), None),
             StopReason::Error(error) => (None, Some(error)),
@@ -441,16 +464,17 @@ impl RpcServer {
         }
         let writer_join = writer_task.await;
 
-        if let Some(Err(error)) = writer_result {
-            return Err(error);
-        }
-        if writer_join.is_err() {
-            return Err(AgentError::Internal);
-        }
-        if let Some(error) = primary_error {
-            return Err(error);
-        }
-        shutdown_result
+        let result = if let Some(Err(error)) = writer_result {
+            Err(error)
+        } else if writer_join.is_err() {
+            Err(AgentError::Internal)
+        } else if let Some(error) = primary_error {
+            Err(error)
+        } else {
+            shutdown_result
+        };
+        tracing::info!(success = result.is_ok(), "rpc shutdown end");
+        result
     }
 
     fn agent(&self) -> &Agent {
@@ -483,7 +507,11 @@ async fn run_writer<W>(
 ) where
     W: AsyncWrite + Unpin,
 {
-    let _ = status.send(write_outbound(writer, outbound).await);
+    let result = write_outbound(writer, outbound).await;
+    if result.is_err() {
+        tracing::warn!(kind = "write_failure", "rpc writer failure");
+    }
+    let _ = status.send(result);
 }
 
 async fn write_outbound<W>(
@@ -503,10 +531,13 @@ where
 }
 
 fn parse_frame(frame: &[u8]) -> Result<RpcRequest, RpcResponse> {
-    let value = serde_json::from_slice::<Value>(frame)
-        .map_err(|_| RpcResponse::error(None, PARSE_ERROR, "parse error", "parse_error", false))?;
+    let value = serde_json::from_slice::<Value>(frame).map_err(|_| {
+        tracing::warn!(kind = "parse_error", "rpc request rejected");
+        RpcResponse::error(None, PARSE_ERROR, "parse error", "parse_error", false)
+    })?;
     let candidate_id = request_id(&value);
     parse_request(value).map_err(|_| {
+        tracing::warn!(kind = "invalid_request", "rpc request rejected");
         RpcResponse::error(
             candidate_id,
             INVALID_REQUEST,
@@ -551,6 +582,7 @@ where
 }
 
 fn invalid_params(id: Option<RpcId>) -> RpcResponse {
+    tracing::debug!(kind = "invalid_params", "rpc request rejected");
     RpcResponse::error(
         id,
         INVALID_PARAMS,
@@ -612,6 +644,7 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
         | AgentError::RpcSerialization
         | AgentError::Io(_) => (INTERNAL_ERROR, "internal error", "internal_error", false),
     };
+    tracing::debug!(error_kind = kind, retryable = retryable, "rpc domain error");
     RpcResponse::error(Some(id), code, message, kind, retryable)
 }
 
@@ -622,7 +655,33 @@ fn turn_wait_error(id: RpcId, error: &TurnWaitError) -> RpcResponse {
         | TurnWaitError::RuntimeTerminated(diagnostic) => diagnostic.retryable,
         _ => false,
     };
+    tracing::debug!(
+        error_kind = "core_error",
+        retryable = retryable,
+        "rpc domain error"
+    );
     RpcResponse::error(Some(id), CORE_ERROR, "core error", "core_error", retryable)
+}
+
+fn canonical_method(method: &str) -> &'static str {
+    match method {
+        "agent.ping" => "agent.ping",
+        "agent.shutdown" => "agent.shutdown",
+        "profile.list" => "profile.list",
+        "model.list" => "model.list",
+        "session.list" => "session.list",
+        "session.create" => "session.create",
+        "session.open" => "session.open",
+        "session.close" => "session.close",
+        "session.delete" => "session.delete",
+        "session.state" => "session.state",
+        "session.transcript" => "session.transcript",
+        "turn.send" => "turn.send",
+        "turn.cancel" => "turn.cancel",
+        "turn.wait" => "turn.wait",
+        "interaction.answer" => "interaction.answer",
+        _ => "unknown",
+    }
 }
 
 async fn read_frame<R>(reader: &mut R) -> io::Result<Frame>

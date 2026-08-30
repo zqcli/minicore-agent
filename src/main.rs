@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use minicore_agent::{Agent, AgentConfig, AgentError, run_stdio};
+use tracing_subscriber::filter::{FilterExt, filter_fn};
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Debug)]
 enum Command {
@@ -12,10 +15,28 @@ enum Command {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    init_tracing();
+    tracing::info!("agent startup");
     if let Err(error) = run().await {
         eprintln!("minicore-agent: {error}");
         std::process::exit(1);
     }
+}
+
+fn init_tracing() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("minicore_agent=info"));
+    let target_filter = filter_fn(|metadata| {
+        metadata.target() == "minicore_agent" || metadata.target().starts_with("minicore_agent::")
+    });
+    let filter = target_filter.and(env_filter);
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_ansi(false)
+        .compact()
+        .with_filter(filter);
+    tracing_subscriber::registry().with(layer).init();
 }
 
 async fn run() -> Result<(), AgentError> {
