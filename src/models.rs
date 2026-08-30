@@ -124,12 +124,12 @@ pub(crate) enum ModelConfigError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ModelInfo {
-    pub(crate) id: String,
-    pub(crate) model_ref: ModelRef,
-    pub(crate) context_window: u64,
-    pub(crate) supports_tools: bool,
-    pub(crate) supported_reasoning: Vec<ReasoningPreference>,
+pub struct ModelInfo {
+    pub id: String,
+    pub model_ref: ModelRef,
+    pub context_window: u64,
+    pub supports_tools: bool,
+    pub supported_reasoning: Vec<ReasoningPreference>,
 }
 
 pub(crate) struct Models {
