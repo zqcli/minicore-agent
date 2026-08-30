@@ -697,7 +697,7 @@ mod tests {
         cleanup(&base).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn directory_listing_rejects_non_utf8_names_without_lossy_merging() {
         use std::ffi::OsString;
