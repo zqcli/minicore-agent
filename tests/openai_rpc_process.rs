@@ -307,33 +307,15 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_transcript() {
         .await;
     let created = process.response("create").await;
     let session_id = created["result"]["session"]["session_id"].clone();
-    process
-        .send(
-            "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": "read the input"}),
-        )
+    let (_, wait_id) = process
+        .send_turn_and_register_wait("read", &session_id, "read the input")
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
     process.event("tool_started").await;
     process.event("tool_finished").await;
     let output = process.event("output_delta").await;
     assert_eq!(output["params"]["data"]["delta"], "process final");
-    process.event("turn_finished").await;
-
-    process
-        .send(
-            "wait",
-            "turn.wait",
-            json!({
-                "session_id": turn["session_id"],
-                "instance_id": turn["instance_id"],
-                "turn_id": turn["turn_id"],
-            }),
-        )
-        .await;
     assert_eq!(
-        process.response("wait").await["result"]["terminal"],
+        process.response(&wait_id).await["result"]["terminal"],
         "completed"
     );
     process
@@ -473,14 +455,9 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         .expect("created session ID must be text")
         .to_owned();
     let user_prompt = format!("read the phase4 process fixture {USER_MARKER}");
-    process
-        .send(
-            "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": user_prompt.clone()}),
-        )
+    let (_, wait_id) = process
+        .send_turn_and_register_wait("reasoning", &session_id, &user_prompt)
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
     let reasoning_output = process.event("output_delta").await;
     assert_eq!(reasoning_output["params"]["data"]["channel"], "reasoning");
     assert_eq!(
@@ -495,20 +472,8 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         final_output["params"]["data"]["delta"],
         "reasoning process final"
     );
-    process.event("turn_finished").await;
-    process
-        .send(
-            "wait",
-            "turn.wait",
-            json!({
-                "session_id": turn["session_id"],
-                "instance_id": turn["instance_id"],
-                "turn_id": turn["turn_id"],
-            }),
-        )
-        .await;
     assert_eq!(
-        process.response("wait").await["result"]["terminal"],
+        process.response(&wait_id).await["result"]["terminal"],
         "completed"
     );
     process
@@ -699,34 +664,17 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
         .send("create", "session.create", json!({"workspace": workspace}))
         .await;
     let session_id = process.response("create").await["result"]["session"]["session_id"].clone();
-    process
-        .send(
-            "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": "inspect the command environment"}),
-        )
+    let (_, wait_id) = process
+        .send_turn_and_register_wait("bash", &session_id, "inspect the command environment")
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
     process.event("tool_started").await;
     process.event("tool_finished").await;
     assert_eq!(
         process.event("output_delta").await["params"]["data"]["delta"],
         "environment isolated"
     );
-    process.event("turn_finished").await;
-    process
-        .send(
-            "wait",
-            "turn.wait",
-            json!({
-                "session_id": turn["session_id"],
-                "instance_id": turn["instance_id"],
-                "turn_id": turn["turn_id"],
-            }),
-        )
-        .await;
     assert_eq!(
-        process.response("wait").await["result"]["terminal"],
+        process.response(&wait_id).await["result"]["terminal"],
         "completed"
     );
 
@@ -824,14 +772,9 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
         .as_str()
         .expect("created session ID must be text")
         .to_owned();
-    process
-        .send(
-            "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": "fail safely"}),
-        )
+    let (turn, wait_id) = process
+        .send_turn_and_register_wait("provider-error", &session_id, "fail safely")
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
     assert_eq!(turn["session_id"], session_id);
     let instance_id_text = turn["instance_id"]
         .as_str()
@@ -841,19 +784,7 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
         .as_str()
         .expect("submitted turn ID must be text")
         .to_owned();
-    process.event("turn_finished").await;
-    process
-        .send(
-            "wait",
-            "turn.wait",
-            json!({
-                "session_id": turn["session_id"],
-                "instance_id": turn["instance_id"],
-                "turn_id": turn["turn_id"],
-            }),
-        )
-        .await;
-    assert!(process.response("wait").await["result"]["terminal"]["failed"].is_object());
+    assert!(process.response(&wait_id).await["result"]["terminal"]["failed"].is_object());
     process
         .send(
             "transcript",

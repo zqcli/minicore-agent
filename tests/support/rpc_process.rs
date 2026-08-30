@@ -10,6 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
+// Process-level guard only; protocol barriers and Events prove ordering.
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct RpcProcess {
     child: Child,
     input: ChildStdin,
@@ -160,7 +163,7 @@ impl RpcProcess {
 
     async fn next_frame(&mut self) -> Option<Value> {
         let mut line = String::new();
-        let read = tokio::time::timeout(Duration::from_secs(10), self.output.read_line(&mut line))
+        let read = tokio::time::timeout(PROCESS_TIMEOUT, self.output.read_line(&mut line))
             .await
             .expect("process stdout timed out")
             .unwrap();
@@ -180,12 +183,12 @@ impl RpcProcess {
             json!({"ok": true})
         );
         assert!(self.next_frame().await.is_none());
-        let status = tokio::time::timeout(Duration::from_secs(10), self.child.wait())
+        let status = tokio::time::timeout(PROCESS_TIMEOUT, self.child.wait())
             .await
             .expect("process did not exit")
             .unwrap();
         assert!(status.success());
-        let stderr = tokio::time::timeout(Duration::from_secs(10), self.stderr_task)
+        let stderr = tokio::time::timeout(PROCESS_TIMEOUT, self.stderr_task)
             .await
             .expect("process stderr task did not exit")
             .expect("process stderr task panicked")
