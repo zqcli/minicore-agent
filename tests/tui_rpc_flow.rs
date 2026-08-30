@@ -173,36 +173,6 @@ async fn create_session(
     process.response(id).await["result"]["session"].clone()
 }
 
-async fn send_and_register_wait(
-    process: &mut RpcProcess,
-    prefix: &str,
-    session_id: &Value,
-    text: &str,
-) -> (Value, String) {
-    let send_id = format!("{prefix}-send");
-    process
-        .send(
-            &send_id,
-            "turn.send",
-            json!({"session_id": session_id, "text": text}),
-        )
-        .await;
-    let turn = process.response(&send_id).await["result"]["turn"].clone();
-    let wait_id = format!("{prefix}-wait");
-    process
-        .send(&wait_id, "turn.wait", turn_params(&turn))
-        .await;
-    let dispatch_ping_id = format!("{wait_id}-dispatch-ping");
-    process
-        .send(&dispatch_ping_id, "agent.ping", json!({}))
-        .await;
-    assert_eq!(
-        process.response(&dispatch_ping_id).await["result"]["version"],
-        "0.1.0"
-    );
-    (turn, wait_id)
-}
-
 async fn transcript(process: &mut RpcProcess, id: &str, session_id: &Value) -> Value {
     process
         .send(
@@ -407,8 +377,9 @@ async fn flows_a_b_i_j_l_discovery_settings_validation_and_manifest_reopen() {
     );
     assert_eq!(session_dir_count(&base), before_invalid);
 
-    let (_turn, wait_id) =
-        send_and_register_wait(&mut process, "b-deep-turn", &session_a_id, "run deep high").await;
+    let (_turn, wait_id) = process
+        .send_turn_and_register_wait("b-deep-turn", &session_a_id, "run deep high")
+        .await;
     assert_eq!(
         process.response(&wait_id).await["result"]["terminal"],
         "completed"
@@ -506,8 +477,9 @@ async fn flows_c_d_gated_text_and_separate_reasoning_channels() {
     let session_id = session["session_id"].clone();
 
     // Flow C: each gated TextDelta is observed before the terminal chunk is released.
-    let (text_turn, text_wait) =
-        send_and_register_wait(&mut process, "c", &session_id, "stream text").await;
+    let (text_turn, text_wait) = process
+        .send_turn_and_register_wait("c", &session_id, "stream text")
+        .await;
     server.wait_for_requests(1).await;
     let mut text = String::new();
     for expected in ["hello", " ", "world"] {
@@ -539,8 +511,9 @@ async fn flows_c_d_gated_text_and_separate_reasoning_channels() {
     );
 
     // Flow D: reasoning and text retain independent channels and durable fields.
-    let (reasoning_turn, reasoning_wait) =
-        send_and_register_wait(&mut process, "d", &session_id, "stream reasoning").await;
+    let (reasoning_turn, reasoning_wait) = process
+        .send_turn_and_register_wait("d", &session_id, "stream reasoning")
+        .await;
     server.wait_for_requests(2).await;
     let mut reasoning = String::new();
     for expected in ["Reasoning A", "Reasoning B"] {
@@ -611,8 +584,9 @@ async fn flows_e_f_auto_read_and_write_tool_loops() {
     let session_id = session["session_id"].clone();
 
     // Flow E: auto approval runs read, emits Tool events, and starts round two.
-    let (read_turn, read_wait) =
-        send_and_register_wait(&mut process, "e", &session_id, "read input").await;
+    let (read_turn, read_wait) = process
+        .send_turn_and_register_wait("e", &session_id, "read input")
+        .await;
     let read_started = process
         .event_matching("tool_started", |frame| {
             event_for_turn(frame, &read_turn["turn_id"])
@@ -637,8 +611,9 @@ async fn flows_e_f_auto_read_and_write_tool_loops() {
     assert!(read_transcript.to_string().contains("read final"));
 
     // Flow F: auto write mutates the real Workspace and then completes round two.
-    let (write_turn, write_wait) =
-        send_and_register_wait(&mut process, "f", &session_id, "write output").await;
+    let (write_turn, write_wait) = process
+        .send_turn_and_register_wait("f", &session_id, "write output")
+        .await;
     process
         .event_matching("tool_started", |frame| {
             event_for_turn(frame, &write_turn["turn_id"])
@@ -706,8 +681,9 @@ async fn flow_g_three_turns_wait_immediately_and_persist_contiguous_sequence() {
         .enumerate()
     {
         let prefix = format!("g-{index}");
-        let (_turn, wait_id) =
-            send_and_register_wait(&mut process, &prefix, &session_id, prompt).await;
+        let (_turn, wait_id) = process
+            .send_turn_and_register_wait(&prefix, &session_id, prompt)
+            .await;
         assert_eq!(
             process.response(&wait_id).await["result"]["terminal"],
             "completed"
@@ -756,8 +732,9 @@ async fn flow_h_exact_cancel_wait_idle_then_next_turn_succeeds() {
     let session_id = session["session_id"].clone();
 
     // Flow H: the Provider stream is blocked by a gate, never by a timer.
-    let (blocked_turn, blocked_wait) =
-        send_and_register_wait(&mut process, "h-blocked", &session_id, "block").await;
+    let (blocked_turn, blocked_wait) = process
+        .send_turn_and_register_wait("h-blocked", &session_id, "block")
+        .await;
     server.wait_for_requests(1).await;
     process
         .send("h-cancel", "turn.cancel", turn_params(&blocked_turn))
@@ -776,8 +753,9 @@ async fn flow_h_exact_cancel_wait_idle_then_next_turn_succeeds() {
     );
     gate.release();
 
-    let (_next_turn, next_wait) =
-        send_and_register_wait(&mut process, "h-next", &session_id, "continue").await;
+    let (_next_turn, next_wait) = process
+        .send_turn_and_register_wait("h-next", &session_id, "continue")
+        .await;
     assert_eq!(
         process.response(&next_wait).await["result"]["terminal"],
         "completed"
@@ -810,8 +788,9 @@ async fn flow_k_event_loss_does_not_break_wait_state_or_transcript() {
     let session_id = session["session_id"].clone();
 
     // Flow K: drain startup events, checkpoint, then release the burst without reading stdout.
-    let (turn, wait_id) =
-        send_and_register_wait(&mut process, "k-burst", &session_id, "burst").await;
+    let (turn, wait_id) = process
+        .send_turn_and_register_wait("k-burst", &session_id, "burst")
+        .await;
     server.wait_for_requests(1).await;
     process
         .event_matching("turn_started", |frame| {
@@ -906,11 +885,13 @@ async fn flow_m_two_sessions_run_independently_and_cancel_exact_blocked_turn() {
     let session_b_id = session_b["session_id"].clone();
 
     // Flow M: A remains blocked while B completes a two-round read loop.
-    let (turn_a, wait_a) =
-        send_and_register_wait(&mut process, "m-a", &session_a_id, "block a").await;
+    let (turn_a, wait_a) = process
+        .send_turn_and_register_wait("m-a", &session_a_id, "block a")
+        .await;
     server.wait_for_requests(1).await;
-    let (turn_b, wait_b) =
-        send_and_register_wait(&mut process, "m-b", &session_b_id, "read b").await;
+    let (turn_b, wait_b) = process
+        .send_turn_and_register_wait("m-b", &session_b_id, "read b")
+        .await;
     process
         .event_matching("tool_started", |frame| {
             event_for_turn(frame, &turn_b["turn_id"])
