@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 pub struct RpcProcess {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    stderr: Option<ChildStderr>,
+    stderr_task: JoinHandle<std::io::Result<Vec<u8>>>,
     pending: VecDeque<Value>,
     events: Vec<Value>,
     observed: Vec<Value>,
@@ -43,10 +44,16 @@ impl RpcProcess {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            Ok(bytes)
+        });
         Self {
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
-            stderr: child.stderr.take(),
+            stderr_task,
             child,
             pending: VecDeque::new(),
             events: Vec::new(),
@@ -81,6 +88,40 @@ impl RpcProcess {
                 self.pending.push_back(frame);
             }
         }
+    }
+
+    pub async fn send_turn_and_register_wait(
+        &mut self,
+        prefix: &str,
+        session_id: &Value,
+        text: &str,
+    ) -> (Value, String) {
+        let send_id = format!("{prefix}-send");
+        self.send(
+            &send_id,
+            "turn.send",
+            json!({"session_id": session_id, "text": text}),
+        )
+        .await;
+        let turn = self.response(&send_id).await["result"]["turn"].clone();
+        let wait_id = format!("{prefix}-wait");
+        self.send(
+            &wait_id,
+            "turn.wait",
+            json!({
+                "session_id": turn["session_id"],
+                "instance_id": turn["instance_id"],
+                "turn_id": turn["turn_id"],
+            }),
+        )
+        .await;
+        let dispatch_ping_id = format!("{wait_id}-dispatch-ping");
+        self.send(&dispatch_ping_id, "agent.ping", json!({})).await;
+        assert_eq!(
+            self.response(&dispatch_ping_id).await["result"]["version"],
+            "0.1.0"
+        );
+        (turn, wait_id)
     }
 
     pub async fn event(&mut self, event_type: &str) -> Value {
@@ -144,13 +185,11 @@ impl RpcProcess {
             .expect("process did not exit")
             .unwrap();
         assert!(status.success());
-        let mut stderr = Vec::new();
-        self.stderr
-            .take()
-            .unwrap()
-            .read_to_end(&mut stderr)
+        let stderr = tokio::time::timeout(Duration::from_secs(10), self.stderr_task)
             .await
-            .unwrap();
+            .expect("process stderr task did not exit")
+            .expect("process stderr task panicked")
+            .expect("process stderr read failed");
         (self.observed, String::from_utf8_lossy(&stderr).into_owned())
     }
 }
