@@ -58,9 +58,9 @@ bounded outbound channel carries ordinary responses, asynchronous `turn.wait`
 responses, and exact event notifications of the form
 `{"jsonrpc":"2.0","method":"agent.event","params":<AgentEvent>}`. One owned
 writer task is the only code that writes stdout; it serializes one JSON value per
-line and flushes every frame. The event pump awaits outbound capacity, so slow
-stdout propagates backpressure into the Agent's existing outer drop accounting
-without adding fanout or replay.
+line and flushes every frame. The RPC event-forwarding task awaits outbound
+capacity, so slow stdout eventually fills the Agent event channel and activates
+its existing best-effort drop accounting without adding fanout or replay.
 
 Except for `turn.wait`, requests dispatch sequentially against the one mutable
 Agent owned by the RPC server; there is no Agent actor or global mutex.
@@ -96,34 +96,33 @@ text.
 
 Frames are read incrementally with a 1 MiB limit. Oversize, stdin EOF, Ctrl-C,
 explicit `agent.shutdown`, and writer failure all enter the same explicit Agent
-shutdown path. Shutdown waits for the Agent durability barrier, joins every
-pre-existing waiter, naturally drains and joins the event pump, then queues the
-explicit shutdown response. Only after that does it close outbound and await the
-writer, so no waiter or event can write a frame after the shutdown response.
-Writer failures are propagated after owned tasks have been reclaimed.
+shutdown path. Shutdown awaits Agent shutdown, joins every pre-existing
+`turn.wait` waiter and the RPC event-forwarding task, then queues the explicit
+shutdown response. Only after that does it close outbound and await the writer,
+so no waiter or event can write a frame after the shutdown response. Writer
+failures are propagated after owned tasks have been reclaimed.
 
 The library exposes `AgentConfig`, `AgentError`, `Agent`, `Workspace`,
 `WorkspaceError`, the session/turn DTOs, the single-consumer `AgentEventStream`,
-`AgentEvent`, and `run_stdio`. `Agent`
-opens the local Store, manages multiple loaded SessionRuntime owners, and
-forwards typed live events while authoritative durable turn completion is obtained
-from a cloned `TurnHandle`. One outbound sequencer owns each loaded session's
-Core event stream, state watch, outer sink, and completion-ready queue. When a
-state update and Core event are both ready, it emits the latest state first; this
-preserves Runtime's publish-before-enqueue ordering for actionable interaction
-state. Before emitting a durable Agent `TurnFinished`, it submits a transcript
-command to the same actor, emits the current latest state, refreshes state before
-each drained Core envelope, and emits the latest state again if it changed during
-the drain. Successfully sent identical states are deduplicated. State remains
-best-effort: outer-channel backpressure records a drop and does not block the
-following Core event. Core `TurnFinished` is advisory because the runtime
-EventStream is best-effort; if Core drops that envelope, its unknown
-`dropped_before` metadata is unrecoverable and the Agent does not fabricate it.
-A slow consumer blocks only the sequencer, never Runtime or request submission.
-After a successful
-Runtime shutdown barrier and all owned workers have joined, the loaded-session
-owner makes the sole best-effort `SessionClosed` send; failed shutdowns do not
-send it, and no `TurnFinished` can follow it. The Store uses
+`AgentEvent`, and `run_stdio`. `Agent` opens the local Store and manages multiple
+loaded `SessionRuntime` owners. Each loaded Session owns one `SessionPump` that
+watches the Core event stream, the Session state watch, and a bounded completion
+channel of capacity 1. `SessionOpened` is normally attempted first, followed by
+the current initial state. Core events and observed state updates retain their
+own source order, but there is no strict total order across those sources or the
+completion channel; state watches may also coalesce intermediate values.
+
+Every `AgentEvent`, including open, state, Core-derived events, completion, and
+close, is sent with best-effort `try_send` and may be dropped under pressure.
+`TurnFinished` is produced from an owned `TurnHandle::wait` task, but it may be
+dropped and may race with the last Output or Tool event from the Core stream.
+The authoritative final result is obtained from `turn.wait`, `session.state`,
+`session.transcript`, and the durable `LocalSessionLog`, not from observing an
+Agent event. If `InteractionRequested` is dropped, the pending interaction
+remains available through `session.state` and can still be answered. During
+close, Runtime shutdown, the active completion task, `SessionPump`, and metadata
+worker are awaited; after successful Runtime shutdown, `SessionClosed` is the
+last best-effort send attempted for that Session instance. The Store uses
 `<data_dir>/sessions/<session-id>/` with `session.json`, `manifest.json`, and
 `conversation.log`; each append is one durable JSON line containing one batch.
 
@@ -317,9 +316,18 @@ synchronous compute: once such compute starts it completes in the same poll and
 is not interruptible midway. After the synchronous Workspace commit boundary,
 the real commit result wins even if cancellation or the deadline becomes ready.
 
-`Models` eagerly constructs every configured OpenAI Responses adapter during
-`Agent::open`. The API key is read from `api_key_env`, immediately converted to
-a sensitive Authorization `HeaderValue`, and not retained as a `String`;
+`Agent::open` validates the complete configuration before constructing Models,
+reading any configured credential environment variable, or opening the Store.
+The default profile must be present and defined; every profile and Model must be
+valid; every profile's Model reference, reasoning preference, and Tool use must
+match the referenced Model's capabilities. Model-backed profile compaction is
+unsupported in v0.1 and is rejected at startup rather than deferred to Session
+creation.
+
+`Models` eagerly constructs every configured OpenAI Responses adapter only after
+that validation succeeds. The API key is read from `api_key_env`, immediately
+converted to a sensitive Authorization `HeaderValue`, and not retained as a
+`String`;
 missing, empty, or header-invalid values fail startup. `ModelConfig` Debug output
 redacts both the base URL and API-key environment-variable name. Base URLs must
 be HTTP(S) without credentials, query, or fragment, and resolve to
@@ -329,17 +337,36 @@ context window is `physical - output budget - safety margin`, while the provider
 request uses the configured output budget as `max_output_tokens`.
 
 The private reqwest adapter sends `stream:true`, `store:false`, and
-`truncation:"disabled"`. System messages become developer `input_text`, user
-messages become user `input_text`, assistant text becomes completed assistant
-output, Tool calls preserve their Core call ID and JSON arguments, Tool results
-become completed `function_call_output`, and Tool schemas become flat function
-tools. `Auto` omits reasoning, `Disabled` sends effort `none`, and low/medium/high
-send the exact effort plus summary `auto`. MiniCore's public `ReasoningContent`
-does not retain the complete provider reasoning-item identity required for safe
-Responses replay, so historical reasoning parts are omitted rather than
-fabricated. Historical assistant text uses deterministic local message IDs;
-provider message phase and original message identity are not available through
-the Runtime public history. Text and Tool history remain replayable.
+`truncation:"disabled"`; it does not use Provider-side stored conversations.
+System messages become developer `input_text`, user messages become user
+`input_text`, assistant text becomes completed assistant output, Tool calls
+preserve their Core call ID and JSON arguments, fresh Tool results become
+completed `function_call_output`, and Tool schemas become flat function tools.
+`Auto` omits reasoning, `Disabled` sends effort `none`, and low/medium/high send
+the exact effort plus summary `auto`.
+
+For reasoning-enabled requests, the adapter keeps a private, process-local,
+in-memory continuation keyed to the current Session instance and Turn. A
+continuation is eligible only when the requested Tool round is exactly adjacent
+to the highest successfully saved round for that same Turn. Saved rounds are
+matched to Assistant Tool-call history by the ordered `ToolCallId` vector; each
+match is used once and replaces that normalized Tool-call group in place with
+the exact complete raw Provider output items captured for the round. This
+preserves reasoning and function-call items as the exact captured JSON values,
+including `encrypted_content` and other opaque Provider fields, while fresh Tool
+results are still appended as new `function_call_output` items.
+
+Older or unmatched history remains normalized through the public MiniCore
+messages, and historical reasoning without a matching private continuation is
+omitted rather than fabricated. `ReasoningPreference::Disabled` remains
+normalized and stateless. Continuation data is never persisted or exposed
+through Store, RPC, Agent events, transcripts, or tracing, and it is not
+recovered across Turns, processes, or restarts. A round may retain at most 256
+raw output items, one Turn may retain at most 4 MiB of serialized raw items, and
+at most 256 active Turn continuations are kept, with the oldest evicted when
+necessary. Cancellation, timeout, malformed, started, permanent, or uncertain
+failure, EOF, stream drop, and final success clear the Turn's continuation; a
+retryable `NotStarted` failure may preserve it only for a same-round retry.
 
 The Model stream directly owns reqwest's body stream, cancellation token,
 deadline, bounded incremental SSE parser, and pending typed events; no parser
@@ -391,9 +418,9 @@ Unloaded open requires the freshly canonicalized root to equal that stored path,
 so replacing it with a symlink or other redirection to a different directory is
 rejected before capability construction; an already loaded open remains
 idempotent without filesystem I/O. Unknown or duplicate profile Tool names fail
-configuration before Store/session startup. Offline loop tests inject only a
-Fake Model: Workspace,
-Tools, Policy, and Context are the production implementations. Store
+configuration before Store/session startup. Agent loop tests that inject a Fake
+Model still use the production Workspace, Tools, Policy, and Context
+implementations. Store
 assumes one process per data directory and does not implement file locks.
 Loading currently reads the complete log into memory; v0.1 defines no production
 log-size limit, so very large logs may consume substantial memory. Each loaded
@@ -406,11 +433,16 @@ stop it, while metadata persistence remains best-effort and never changes a
 submitted turn. Closing stops the worker from receiving or starting another
 latest-value update, so a queued update that has not started may be discarded.
 Once `Store::touch_at` has entered filesystem I/O, shutdown awaits that operation
-to completion before joining the worker and allowing deletion. Default tests are
-offline: unit and Agent-loop suites use Tokio loopback HTTP, and
-`tests/openai_rpc_process.rs` runs the real stdio binary through a two-request
-OpenAI→read Tool→OpenAI completion plus a provider-secret error case. Empty-config
-framing tests remain in `tests/rpc_stdio.rs`.
+to completion before joining the worker and allowing deletion.
+
+Default tests are offline. Most Agent-loop tests inject a Fake Model, while
+Provider tests use only test-owned loopback HTTP servers. `tests/rpc_stdio.rs`
+runs the real stdio binary with a complete configuration and covers framing,
+request IDs, stable RPC behavior, JSON-RPC-only stdout, and safe stderr markers.
+`tests/openai_rpc_process.rs` covers a real OpenAI→Tool→OpenAI process loop,
+private exact reasoning replay in the next HTTP request, Bash removal of all
+configured Model credential variables while preserving ordinary environment,
+and Provider-error redaction even under broad `RUST_LOG=trace`.
 
 The ignored live text smoke runs only when both required variables are present:
 
