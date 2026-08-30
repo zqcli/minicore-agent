@@ -1,8 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use serde::{Serialize, Serializer};
-use tokio::sync::{Notify, mpsc};
+#[cfg(test)]
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
@@ -139,49 +142,95 @@ struct DropState {
     pending: u64,
 }
 
-#[derive(Clone)]
-pub(crate) struct CompletionCancellation {
-    inner: Arc<CompletionCancellationState>,
+#[cfg(test)]
+pub(crate) struct TurnFinishedAttemptProbe {
+    session_id: SessionId,
+    instance_id: SessionInstanceId,
+    started: Arc<Semaphore>,
+    completed: Arc<Semaphore>,
 }
 
-struct CompletionCancellationState {
-    cancelled: AtomicBool,
-    notify: Notify,
-}
-
-impl CompletionCancellation {
-    pub(crate) fn new() -> Self {
+#[cfg(test)]
+impl TurnFinishedAttemptProbe {
+    pub(crate) fn new(session_id: SessionId, instance_id: SessionInstanceId) -> Self {
         Self {
-            inner: Arc::new(CompletionCancellationState {
-                cancelled: AtomicBool::new(false),
-                notify: Notify::new(),
-            }),
+            session_id,
+            instance_id,
+            started: Arc::new(Semaphore::new(0)),
+            completed: Arc::new(Semaphore::new(0)),
         }
     }
 
-    pub(crate) fn cancel(&self) {
-        if !self.inner.cancelled.swap(true, Ordering::Release) {
-            self.inner.notify.notify_waiters();
-        }
+    pub(crate) async fn wait_started(&self) {
+        self.started.acquire().await.unwrap().forget();
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::Acquire)
+    pub(crate) async fn wait_completed(&self) {
+        self.completed.acquire().await.unwrap().forget();
     }
 
-    pub(crate) async fn cancelled(&self) {
-        loop {
-            if self.inner.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            let notified = self.inner.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.inner.cancelled.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
+    fn matches(&self, turn: TurnRef) -> bool {
+        self.session_id == turn.session_id && self.instance_id == turn.instance_id
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TurnFinishedAttemptProbeRegistration {
+    probe: Arc<TurnFinishedAttemptProbe>,
+}
+
+#[cfg(test)]
+impl Drop for TurnFinishedAttemptProbeRegistration {
+    fn drop(&mut self) {
+        let mut probes = turn_finished_attempt_probes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probes.retain(|probe| !Arc::ptr_eq(probe, &self.probe));
+    }
+}
+
+#[cfg(test)]
+static TURN_FINISHED_ATTEMPT_PROBES: OnceLock<Mutex<Vec<Arc<TurnFinishedAttemptProbe>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn turn_finished_attempt_probes() -> &'static Mutex<Vec<Arc<TurnFinishedAttemptProbe>>> {
+    TURN_FINISHED_ATTEMPT_PROBES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn register_turn_finished_attempt_probe(
+    probe: Arc<TurnFinishedAttemptProbe>,
+) -> TurnFinishedAttemptProbeRegistration {
+    turn_finished_attempt_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::clone(&probe));
+    TurnFinishedAttemptProbeRegistration { probe }
+}
+
+#[cfg(test)]
+fn begin_turn_finished_attempt(event: &AgentEvent) -> Vec<Arc<TurnFinishedAttemptProbe>> {
+    let AgentEvent::TurnFinished { turn, .. } = event else {
+        return Vec::new();
+    };
+    let probes = turn_finished_attempt_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|probe| probe.matches(*turn))
+        .cloned()
+        .collect::<Vec<_>>();
+    for probe in &probes {
+        probe.started.add_permits(1);
+    }
+    probes
+}
+
+#[cfg(test)]
+fn complete_turn_finished_attempt(probes: Vec<Arc<TurnFinishedAttemptProbe>>) {
+    for probe in probes {
+        probe.completed.add_permits(1);
     }
 }
 
@@ -204,7 +253,9 @@ impl AgentEventSink {
         let core_dropped = event.dropped_before();
         let reported = pending.pending.saturating_add(core_dropped);
         event.set_dropped_before(reported);
-        match self.sender.try_send(event) {
+        #[cfg(test)]
+        let attempt_probes = begin_turn_finished_attempt(&event);
+        let result = match self.sender.try_send(event) {
             Ok(()) => {
                 pending.pending = 0;
                 AgentSendResult::Sent
@@ -217,7 +268,10 @@ impl AgentEventSink {
                 AgentSendResult::Dropped
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AgentSendResult::Closed,
-        }
+        };
+        #[cfg(test)]
+        complete_turn_finished_attempt(attempt_probes);
+        result
     }
 
     pub(crate) fn record_core_drops(&self, dropped: u64) {
@@ -226,42 +280,6 @@ impl AgentEventSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pending.pending = pending.pending.saturating_add(dropped);
-    }
-
-    pub(crate) async fn send_durable(
-        &self,
-        mut event: AgentEvent,
-        cancellation: CompletionCancellation,
-    ) -> bool {
-        let reserved_drops = {
-            let mut state = self
-                .drop_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.sender.is_closed() {
-                return false;
-            }
-            let core_dropped = event.dropped_before();
-            let reserved_drops = state.pending.saturating_add(core_dropped);
-            event.set_dropped_before(reserved_drops);
-            state.pending = 0;
-            reserved_drops
-        };
-        let sent = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => false,
-            result = self.sender.send(event) => result.is_ok(),
-        };
-        {
-            let mut state = self
-                .drop_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !sent {
-                state.pending = state.pending.saturating_add(reserved_drops);
-            }
-        }
-        sent
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -900,18 +918,6 @@ mod tests {
         }
     }
 
-    fn finish(dropped_before: u64) -> AgentEvent {
-        AgentEvent::TurnFinished {
-            turn: turn(),
-            outcome: minicore_runtime::TurnOutcome {
-                turn_id: ids().2,
-                terminal: minicore_runtime::TurnTerminal::Completed,
-                usage: Usage::default(),
-            },
-            meta: meta(dropped_before),
-        }
-    }
-
     fn interaction(kind: InteractionKind) -> minicore_runtime::PendingInteraction {
         let (_, _, turn_id) = ids();
         minicore_runtime::PendingInteraction {
@@ -1074,7 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outer_drop_accounting_adds_core_drop_and_reaches_durable_finish() {
+    async fn outer_drop_accounting_combines_core_and_agent_drops() {
         let (sender, mut receiver) = mpsc::channel(1);
         let sink = AgentEventSink::new(sender);
         assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
@@ -1093,110 +1099,5 @@ mod tests {
                 ..
             }
         ));
-
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Dropped);
-        let durable = tokio::spawn({
-            let sink = sink.clone();
-            async move {
-                sink.send_durable(finish(0), CompletionCancellation::new())
-                    .await
-            }
-        });
-        let _ = receiver.recv().await.unwrap();
-        let durable_event = receiver.recv().await.unwrap();
-        assert!(matches!(
-            durable_event,
-            AgentEvent::TurnFinished {
-                meta: EventMeta {
-                    dropped_before: 1,
-                    ..
-                },
-                ..
-            }
-        ));
-        assert!(durable.await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn durable_finish_reports_pending_core_drop_count() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let sink = AgentEventSink::new(sender);
-        sink.record_core_drops(11);
-        assert!(
-            sink.send_durable(finish(0), CompletionCancellation::new())
-                .await
-        );
-        assert!(matches!(
-            receiver.recv().await.unwrap(),
-            AgentEvent::TurnFinished {
-                meta: EventMeta {
-                    dropped_before: 11,
-                    ..
-                },
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn durable_send_finishes_when_receiver_is_dropped_or_session_is_cancelled() {
-        let (sender, receiver) = mpsc::channel(1);
-        drop(receiver);
-        let sink = AgentEventSink::new(sender);
-        assert!(
-            !sink
-                .send_durable(finish(0), CompletionCancellation::new())
-                .await
-        );
-
-        let (sender, mut receiver) = mpsc::channel(1);
-        let sink = AgentEventSink::new(sender);
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
-        let cancellation = CompletionCancellation::new();
-        let task = tokio::spawn({
-            let sink = sink.clone();
-            let cancellation = cancellation.clone();
-            async move { sink.send_durable(finish(0), cancellation).await }
-        });
-        cancellation.cancel();
-        assert!(!task.await.unwrap());
-        let _ = receiver.recv().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_durable_send_restores_pending_drops_and_clears_in_flight() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let sink = AgentEventSink::new(sender);
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Dropped);
-        let cancellation = CompletionCancellation::new();
-        let task = tokio::spawn({
-            let sink = sink.clone();
-            let cancellation = cancellation.clone();
-            async move { sink.send_durable(finish(0), cancellation).await }
-        });
-        cancellation.cancel();
-        assert!(!task.await.unwrap());
-        let _ = receiver.recv().await.unwrap();
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
-        let recovered = receiver.recv().await.unwrap();
-        assert!(matches!(
-            recovered,
-            AgentEvent::OutputDelta {
-                meta: EventMeta {
-                    dropped_before: 1,
-                    ..
-                },
-                ..
-            }
-        ));
-        assert_eq!(
-            sink.try_send(AgentEvent::SessionClosed {
-                session_id: ids().0,
-                meta: meta(0),
-            }),
-            AgentSendResult::Sent
-        );
     }
 }

@@ -27,7 +27,7 @@ use crate::models::{ModelConfig, ModelConfigError, Models};
 use crate::policy::Policy;
 use crate::profiles::{Profile, Profiles};
 use crate::sessions::{
-    CompletionNotifier, LoadedSession, MetadataWorker, OutboundSequencer, Sessions,
+    ActiveTurn, CompletionReady, LoadedSession, MetadataWorker, SessionPump, Sessions,
 };
 use crate::store::{SessionRecord, Store};
 use crate::tools::{BuildToolsError, CommandEnvironment, build_tools};
@@ -320,7 +320,7 @@ impl Agent {
 
     pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
         let session_id = request.session_id;
-        self.cleanup_finished_turn(session_id)?;
+        self.cleanup_finished_turn(session_id).await?;
         let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
         let handle = {
             let loaded = self
@@ -334,12 +334,38 @@ impl Agent {
             .await
             .map_err(map_session_error)?;
         let turn_ref = TurnRef::from_handle(&turn);
+        let (completion_tx, stop) = {
+            let loaded = self
+                .sessions
+                .get(session_id)
+                .expect("submitted turn belongs to loaded session");
+            (loaded.pump.completion_sender(), loaded.pump.stop_token())
+        };
+        let completion_turn = turn.clone();
+        let completion_task = self.task_runtime.spawn(async move {
+            let outcome = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return,
+                outcome = completion_turn.wait() => outcome,
+            };
+            let Ok(outcome) = outcome else {
+                return;
+            };
+            let ready = CompletionReady { turn_ref, outcome };
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {}
+                _ = completion_tx.send(ready) => {}
+            }
+        });
         let loaded = self
             .sessions
             .get_mut(session_id)
             .expect("submitted turn belongs to loaded session");
-        loaded.active_turn = Some(turn.clone());
-        loaded.completion.enqueue(turn.clone(), turn_ref);
+        loaded.active_turn = Some(ActiveTurn {
+            handle: turn,
+            completion_task,
+        });
         self.schedule_touch(session_id);
         Ok(turn_ref)
     }
@@ -354,10 +380,10 @@ impl Agent {
             .active_turn
             .as_ref()
             .ok_or(AgentError::TurnNotFound)?;
-        if active.is_finished() {
+        if active.handle.is_finished() {
             return Ok(false);
         }
-        Ok(active.cancel())
+        Ok(active.handle.cancel())
     }
 
     pub fn turn_handle(&self, turn: TurnRef) -> Result<TurnHandle, AgentError> {
@@ -372,7 +398,7 @@ impl Agent {
         loaded
             .active_turn
             .as_ref()
-            .cloned()
+            .map(|active| active.handle.clone())
             .ok_or(AgentError::TurnNotFound)
     }
 
@@ -483,18 +509,12 @@ impl Agent {
             created_at: record.created_at.clone(),
             updated_at: record.updated_at.clone(),
         };
-        let sequencer = OutboundSequencer::new(
+        let pump = SessionPump::new(
             &self.task_runtime,
             event_stream,
             state,
-            handle.clone(),
             event_sink.clone(),
             opened,
-        );
-        let completion = CompletionNotifier::new(
-            &self.task_runtime,
-            sequencer.completion_sender(),
-            sequencer.stop_signal(),
         );
         let metadata =
             MetadataWorker::new(&self.task_runtime, self.store.clone(), runtime.session_id());
@@ -503,8 +523,7 @@ impl Agent {
             runtime,
             handle,
             active_turn: None,
-            sequencer,
-            completion,
+            pump,
             metadata,
             event_sink,
         })
@@ -523,19 +542,26 @@ impl Agent {
         }
     }
 
-    fn cleanup_finished_turn(&mut self, session_id: SessionId) -> Result<(), AgentError> {
-        let loaded = self
-            .sessions
+    async fn cleanup_finished_turn(&mut self, session_id: SessionId) -> Result<(), AgentError> {
+        let completion_result = {
+            let loaded = self
+                .sessions
+                .get_mut(session_id)
+                .ok_or(AgentError::SessionNotLoaded)?;
+            let Some(active) = loaded.active_turn.as_mut() else {
+                return Ok(());
+            };
+            if !active.handle.is_finished() {
+                return Ok(());
+            }
+            (&mut active.completion_task).await
+        };
+        self.sessions
             .get_mut(session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        if loaded
+            .expect("finished turn belongs to loaded session")
             .active_turn
-            .as_ref()
-            .is_some_and(TurnHandle::is_finished)
-        {
-            loaded.active_turn = None;
-        }
-        Ok(())
+            .take();
+        completion_result.map_err(|_| AgentError::Internal)
     }
 
     fn schedule_touch(&mut self, session_id: SessionId) {
