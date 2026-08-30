@@ -42,12 +42,12 @@ pub struct Profile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ProfileInfo {
-    pub(crate) id: String,
-    pub(crate) model: String,
-    pub(crate) reasoning: ReasoningPreference,
-    pub(crate) tools: Vec<String>,
-    pub(crate) approval: ApprovalMode,
+pub struct ProfileInfo {
+    pub id: String,
+    pub model: String,
+    pub reasoning: ReasoningPreference,
+    pub tools: Vec<String>,
+    pub approval: ApprovalMode,
 }
 
 fn default_tool_rounds() -> u16 {

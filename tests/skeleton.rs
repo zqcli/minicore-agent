@@ -1,4 +1,10 @@
-use minicore_agent::{AgentConfig, ConfigError};
+use std::future::Future;
+
+use minicore_agent::{
+    Agent, AgentConfig, AgentError, ApprovalMode, ConfigError, ModelInfo, ProfileInfo, TurnRef,
+};
+use minicore_runtime::model::{ModelRef, ReasoningPreference};
+use minicore_runtime::session::TurnOutcome;
 
 fn complete_config(event_capacity: usize) -> String {
     format!(
@@ -47,4 +53,43 @@ fn complete_public_config_exposes_default_profile_and_model() {
     assert_eq!(config.default_profile, "test");
     assert!(config.profiles.contains_key("test"));
     assert!(config.models.contains_key("main"));
+}
+
+#[test]
+fn public_agent_query_and_wait_contract_compiles() {
+    let _: fn(&Agent) -> Vec<ProfileInfo> = Agent::list_profiles;
+    let _: fn(&Agent) -> Vec<ModelInfo> = Agent::list_models;
+    fn wait<'a>(
+        agent: &'a Agent,
+        turn: TurnRef,
+    ) -> impl Future<Output = Result<TurnOutcome, AgentError>> + 'a {
+        agent.wait_turn(turn)
+    }
+    let _ = wait;
+
+    let profile = ProfileInfo {
+        id: "coding".to_owned(),
+        model: "deep".to_owned(),
+        reasoning: ReasoningPreference::High,
+        tools: vec!["read".to_owned()],
+        approval: ApprovalMode::Auto,
+    };
+    assert_eq!(profile.id, "coding");
+    assert_eq!(profile.model, "deep");
+    assert_eq!(profile.reasoning, ReasoningPreference::High);
+    assert_eq!(profile.tools, ["read"]);
+    assert_eq!(profile.approval, ApprovalMode::Auto);
+
+    let model = ModelInfo {
+        id: "deep".to_owned(),
+        model_ref: "deep".parse::<ModelRef>().unwrap(),
+        context_window: 128_000,
+        supports_tools: true,
+        supported_reasoning: vec![ReasoningPreference::High],
+    };
+    assert_eq!(model.id, "deep");
+    assert_eq!(model.model_ref.to_string(), "deep");
+    assert_eq!(model.context_window, 128_000);
+    assert!(model.supports_tools);
+    assert_eq!(model.supported_reasoning, [ReasoningPreference::High]);
 }

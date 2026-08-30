@@ -29,7 +29,7 @@ use crate::error::{AgentError, CoreErrorView};
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, ProfileCompaction};
 
-use super::{agent_error, run_with_io, turn_wait_error};
+use super::{agent_error, run_with_io};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -522,6 +522,22 @@ async fn profile_and_model_lists_are_btree_ordered() {
         ("alpha".to_owned(), model),
     ]));
     let agent = Agent::open_with_models(config, models).await.unwrap();
+    assert_eq!(
+        agent
+            .list_profiles()
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "zeta"]
+    );
+    assert_eq!(
+        agent
+            .list_models()
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "fake", "zeta"]
+    );
     let mut rpc = RpcHarness::spawn(agent);
 
     rpc.send(json!("profiles"), "profile.list", None).await;
@@ -1537,7 +1553,8 @@ fn agent_error_table_is_stable_and_never_serializes_sources() {
             true,
         ),
     );
-    let value = serde_json::to_value(turn_wait_error(id, &wait_error)).unwrap();
+    let error = crate::agent::map_turn_wait_error(wait_error);
+    let value = serde_json::to_value(agent_error(id, &error)).unwrap();
     assert_eq!(value["error"]["code"], -32_013);
     assert_eq!(value["error"]["data"]["kind"], "core_error");
     assert_eq!(value["error"]["data"]["retryable"], true);

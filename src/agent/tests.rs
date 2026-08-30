@@ -668,7 +668,7 @@ async fn agent_lifecycle_text_turn_and_finish_event() {
         })
         .await
         .unwrap();
-    let outcome = agent.turn_handle(turn).unwrap().wait().await.unwrap();
+    let outcome = agent.wait_turn(turn).await.unwrap();
     assert_eq!(outcome.terminal, TurnTerminal::Completed);
     assert_eq!(
         agent.session_state(info.session_id).unwrap().status,
@@ -1881,7 +1881,7 @@ async fn old_instance_turn_references_are_rejected_after_reopen() {
     };
     assert!(matches!(agent.cancel(stale), Err(AgentError::TurnNotFound)));
     assert!(matches!(
-        agent.turn_handle(stale),
+        agent.wait_turn(stale).await,
         Err(AgentError::TurnNotFound)
     ));
     agent.shutdown().await.unwrap();

@@ -10,9 +10,7 @@ use tokio::io::{
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
-use minicore_runtime::error::TurnWaitError;
-
-use crate::agent::{Agent, AnswerInteraction, GetTranscript, SendMessage};
+use crate::agent::{Agent, AnswerInteraction, GetTranscript, SendMessage, wait_turn_handle};
 use crate::error::AgentError;
 use crate::event::{AgentEventStream, SessionStateView, TurnOutcomeView};
 
@@ -219,7 +217,7 @@ impl RpcServer {
                 Dispatch::Response(success(
                     &id,
                     ProfilesResult {
-                        profiles: self.agent().profile_infos(),
+                        profiles: self.agent().list_profiles(),
                     },
                 ))
             }
@@ -231,7 +229,7 @@ impl RpcServer {
                 Dispatch::Response(success(
                     &id,
                     ModelsResult {
-                        models: self.agent().model_infos(),
+                        models: self.agent().list_models(),
                     },
                 ))
             }
@@ -360,9 +358,9 @@ impl RpcServer {
                     Ok(handle) => {
                         let outbound = self.outbound_tx.clone();
                         self.waiters.spawn(async move {
-                            let response = match handle.wait().await {
+                            let response = match wait_turn_handle(handle).await {
                                 Ok(outcome) => success(&id, TurnOutcomeView::from(&outcome)),
-                                Err(error) => turn_wait_error(id, &error),
+                                Err(error) => agent_error(id, &error),
                             };
                             let _ = outbound.send(RpcOutbound::Response(response)).await;
                         });
@@ -652,21 +650,6 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
     };
     tracing::debug!(error_kind = kind, retryable = retryable, "rpc domain error");
     RpcResponse::error(Some(id), code, message, kind, retryable)
-}
-
-fn turn_wait_error(id: RpcId, error: &TurnWaitError) -> RpcResponse {
-    let retryable = match error {
-        TurnWaitError::DurabilityUnknown(diagnostic)
-        | TurnWaitError::DurabilityUnavailable(diagnostic)
-        | TurnWaitError::RuntimeTerminated(diagnostic) => diagnostic.retryable,
-        _ => false,
-    };
-    tracing::debug!(
-        error_kind = "core_error",
-        retryable = retryable,
-        "rpc domain error"
-    );
-    RpcResponse::error(Some(id), CORE_ERROR, "core error", "core_error", retryable)
 }
 
 fn canonical_method(method: &str) -> &'static str {

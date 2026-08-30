@@ -10,11 +10,11 @@ use tokio::sync::mpsc;
 use minicore_runtime::config::{SessionSpec, Timestamp, TurnOptions, UserInput};
 use minicore_runtime::context::ContextProvider;
 use minicore_runtime::conversation::{TranscriptPage, TurnTerminal};
-use minicore_runtime::error::{SessionError, SessionOpenErrorKind};
+use minicore_runtime::error::{SessionError, SessionOpenErrorKind, TurnWaitError};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
 use minicore_runtime::model::ReasoningPreference;
 use minicore_runtime::session::{
-    InteractionAnswer, SessionRuntime, SessionRuntimeOptions, SessionState, TurnHandle,
+    InteractionAnswer, SessionRuntime, SessionRuntimeOptions, SessionState, TurnHandle, TurnOutcome,
 };
 use minicore_runtime::tools::ToolPolicy;
 
@@ -23,9 +23,9 @@ use crate::config::AgentConfig;
 use crate::context::ProjectContext;
 use crate::error::{AgentError, StoreError};
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
-use crate::models::{ModelConfig, ModelConfigError, Models};
+use crate::models::{ModelConfig, ModelConfigError, ModelInfo, Models};
 use crate::policy::Policy;
-use crate::profiles::{Profile, Profiles};
+use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::sessions::{
     ActiveTurn, CompletionReady, LoadedSession, MetadataWorker, SessionPump, Sessions,
 };
@@ -194,11 +194,11 @@ impl Agent {
         PingResponse { version: VERSION }
     }
 
-    pub(crate) fn profile_infos(&self) -> Vec<crate::profiles::ProfileInfo> {
+    pub fn list_profiles(&self) -> Vec<ProfileInfo> {
         self.profiles.list()
     }
 
-    pub(crate) fn model_infos(&self) -> Vec<crate::models::ModelInfo> {
+    pub fn list_models(&self) -> Vec<ModelInfo> {
         self.models.list()
     }
 
@@ -520,10 +520,11 @@ impl Agent {
         Ok(cancelled)
     }
 
-    pub fn turn_handle(&self, turn: TurnRef) -> Result<TurnHandle, AgentError> {
-        // The v0.1 contract retains only one active TurnHandle per loaded session. Callers that
-        // need to wait asynchronously (including a future RPC turn.wait method) must clone this
-        // handle at request time; TurnRef is an identity, not a historical handle registry key.
+    pub async fn wait_turn(&self, turn: TurnRef) -> Result<TurnOutcome, AgentError> {
+        wait_turn_handle(self.turn_handle(turn)?).await
+    }
+
+    pub(crate) fn turn_handle(&self, turn: TurnRef) -> Result<TurnHandle, AgentError> {
         let loaded = self
             .sessions
             .get(turn.session_id)
@@ -788,6 +789,23 @@ fn validate_turn_ref(loaded: &LoadedSession, turn: TurnRef) -> Result<(), AgentE
         return Err(AgentError::TurnNotFound);
     }
     Ok(())
+}
+
+pub(crate) async fn wait_turn_handle(handle: TurnHandle) -> Result<TurnOutcome, AgentError> {
+    handle.wait().await.map_err(map_turn_wait_error)
+}
+
+pub(crate) fn map_turn_wait_error(error: TurnWaitError) -> AgentError {
+    let retryable = match error {
+        TurnWaitError::DurabilityUnknown(diagnostic)
+        | TurnWaitError::DurabilityUnavailable(diagnostic)
+        | TurnWaitError::RuntimeTerminated(diagnostic) => diagnostic.retryable,
+        _ => false,
+    };
+    AgentError::Core(crate::error::CoreErrorView::new(
+        "turn wait failed",
+        retryable,
+    ))
 }
 
 fn turn_terminal_category(terminal: &TurnTerminal) -> &'static str {

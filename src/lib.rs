@@ -26,6 +26,7 @@ pub use error::{AgentError, CoreErrorView};
 pub use event::{
     AgentEvent, AgentEventStream, EventMeta, OutputChannel, ToolProgressView, ToolResultView,
 };
-pub use models::ModelConfig;
+pub use models::{ModelConfig, ModelInfo};
+pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use workspace::{Workspace, WorkspaceError};
