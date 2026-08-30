@@ -5547,6 +5547,8 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
         .create_session(CreateSession {
             workspace: workspace.clone(),
             profile: String::new(),
+            model: None,
+            reasoning: None,
             title: None,
         })
         .await

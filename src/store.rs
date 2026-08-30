@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use tokio::sync::Semaphore;
 
@@ -27,6 +27,7 @@ const SESSION_RECORD_FILE: &str = "session.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const CONVERSATION_FILE: &str = "conversation.log";
 const METADATA_TEMP_SUFFIX: &str = ".tmp";
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 256;
 const MAX_TITLE_BYTES: usize = 4_096;
 
@@ -309,6 +310,31 @@ impl Store {
             return Err(StoreError::Corrupt);
         }
         Ok(record)
+    }
+
+    pub(crate) async fn load_manifest(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionManifest, StoreError> {
+        let directory = self.require_session_directory(session_id).await?;
+        let path = directory.join(MANIFEST_FILE);
+        match path_state(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+        {
+            PathState::Missing => return Err(StoreError::Corrupt),
+            PathState::RegularFile => {}
+            PathState::Directory | PathState::Symlink | PathState::Other => {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        let manifest = read_manifest_file(&path)
+            .await
+            .map_err(map_manifest_store_error)?;
+        if manifest.session_id != session_id {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(manifest)
     }
 
     pub async fn open_log(&self, session_id: SessionId) -> Result<LocalSessionLog, StoreError> {
@@ -1281,15 +1307,31 @@ fn directory_session_id(directory: &Path) -> Result<SessionId, SessionLogError> 
 }
 
 async fn read_manifest_file(path: &Path) -> Result<SessionManifest, SessionLogError> {
-    let bytes = fs::read(path)
+    let file = File::open(path)
         .await
         .map_err(|_| log_error(SessionLogErrorKind::Unavailable))?;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    file.take((MAX_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| log_error(SessionLogErrorKind::Unavailable))?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(log_error(SessionLogErrorKind::Corrupt));
+    }
     let manifest = serde_json::from_slice::<SessionManifest>(&bytes)
         .map_err(|_| log_error(SessionLogErrorKind::Corrupt))?;
     if manifest.validate_structural().is_err() {
         return Err(log_error(SessionLogErrorKind::Corrupt));
     }
     Ok(manifest)
+}
+
+fn map_manifest_store_error(error: SessionLogError) -> StoreError {
+    match error.kind() {
+        SessionLogErrorKind::Corrupt => StoreError::Corrupt,
+        SessionLogErrorKind::Unavailable => StoreError::Unavailable,
+        _ => StoreError::Internal,
+    }
 }
 
 async fn initialization_state(
@@ -1544,8 +1586,8 @@ mod tests {
     use minicore_runtime::value::BoundedText;
 
     use super::{
-        CONVERSATION_FILE, LocalSessionLog, LogBatch, MANIFEST_FILE, SESSION_RECORD_FILE,
-        SessionRecord, Store, StoreError, fail_directory_sync_after,
+        CONVERSATION_FILE, LocalSessionLog, LogBatch, MANIFEST_FILE, MAX_MANIFEST_BYTES,
+        SESSION_RECORD_FILE, SessionRecord, Store, StoreError, fail_directory_sync_after,
         fail_next_atomic_write_before_rename, fail_next_cleanup, fail_next_delete_after_partial,
         fail_next_directory_sync, fail_next_sessions_read_dir,
     };
@@ -1751,6 +1793,64 @@ mod tests {
                 Err(StoreError::SessionNotFound)
             ));
         }
+        remove_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn load_manifest_is_bounded_read_only_and_independent_of_conversation() {
+        let (store, root) = test_store("manifest-read-only").await;
+        let _root_guard = TestRootGuard::new(&root);
+        let id = session_id(53);
+        let (mut log, directory) = initialized_log(&store, id).await;
+        let expected = log.load_manifest().await.unwrap();
+        log.close().await.unwrap();
+        tokio::fs::remove_file(directory.join(CONVERSATION_FILE))
+            .await
+            .unwrap();
+        let manifest_path = directory.join(MANIFEST_FILE);
+        let permissions = tokio::fs::metadata(&manifest_path)
+            .await
+            .unwrap()
+            .permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        tokio::fs::set_permissions(&manifest_path, read_only)
+            .await
+            .unwrap();
+        assert_eq!(store.load_manifest(id).await.unwrap(), expected);
+        tokio::fs::set_permissions(&manifest_path, permissions)
+            .await
+            .unwrap();
+
+        let mut value = serde_json::to_value(&expected).unwrap();
+        value["format_version"] = json!(minicore_runtime::SessionManifest::FORMAT_VERSION + 1);
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_manifest(id).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        tokio::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest(session_id(54))).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.load_manifest(id).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        tokio::fs::write(&manifest_path, vec![b'x'; MAX_MANIFEST_BYTES + 1])
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_manifest(id).await,
+            Err(StoreError::Corrupt)
+        ));
+
         remove_root(&root).await;
     }
 
@@ -2634,6 +2734,10 @@ mod tests {
             .await
             .unwrap();
         symlink(&manifest_target, directory.join(MANIFEST_FILE)).unwrap();
+        assert!(matches!(
+            store.load_manifest(id).await,
+            Err(StoreError::Corrupt)
+        ));
         assert!(matches!(store.open_log(id).await, Err(StoreError::Corrupt)));
         tokio::fs::remove_file(directory.join(MANIFEST_FILE))
             .await

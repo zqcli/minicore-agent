@@ -18,13 +18,13 @@ use crate::event::{AgentEventStream, SessionStateView, TurnOutcomeView};
 
 use super::protocol::{
     AgentEventNotification, CORE_ERROR, CancelledResult, EmptyParams, INTERACTION_NOT_FOUND,
-    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, INVALID_STATE, InteractionAnswerParams,
-    METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR, PROFILE_NOT_FOUND,
-    PROVIDER_ERROR, ProfilesResult, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BUSY,
-    SESSION_CLOSED, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STORE_ERROR, SessionCreateParams,
-    SessionParams, SessionResult, SessionTranscriptParams, SessionsResult, TURN_NOT_FOUND,
-    TranscriptPageView, TurnParams, TurnResult, TurnSendParams, WORKSPACE_ERROR, decode_params,
-    parse_request, request_id,
+    INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE,
+    InteractionAnswerParams, METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult,
+    PARSE_ERROR, PROFILE_NOT_FOUND, PROVIDER_ERROR, ProfilesResult, RpcId, RpcOutbound, RpcRequest,
+    RpcResponse, SESSION_BUSY, SESSION_CLOSED, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STORE_ERROR,
+    SessionCreateParams, SessionParams, SessionResult, SessionTranscriptParams, SessionsResult,
+    TURN_NOT_FOUND, TranscriptPageView, TurnParams, TurnResult, TurnSendParams, WORKSPACE_ERROR,
+    decode_params, parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -628,6 +628,12 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             false,
         ),
         AgentError::ModelNotFound => (MODEL_NOT_FOUND, "model not found", "model_not_found", false),
+        AgentError::InvalidSessionSettings => (
+            INVALID_SESSION_SETTINGS,
+            "invalid session settings",
+            "invalid_session_settings",
+            false,
+        ),
         AgentError::Workspace => (WORKSPACE_ERROR, "workspace error", "workspace_error", false),
         AgentError::Store => (STORE_ERROR, "store error", "store_error", false),
         AgentError::ModelNotImplemented => {

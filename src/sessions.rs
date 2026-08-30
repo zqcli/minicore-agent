@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
+use minicore_runtime::config::SessionSpec;
 use minicore_runtime::error::SessionShutdownError;
 use minicore_runtime::ids::{SessionId, TurnId};
 use minicore_runtime::session::{
@@ -28,6 +29,7 @@ pub(crate) struct Sessions {
 
 pub(crate) struct LoadedSession {
     pub(crate) record: SessionRecord,
+    pub(crate) spec: SessionSpec,
     pub(crate) runtime: SessionRuntime,
     pub(crate) handle: SessionHandle,
     pub(crate) active_turn: Option<ActiveTurn>,

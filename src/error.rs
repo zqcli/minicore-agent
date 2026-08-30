@@ -69,6 +69,8 @@ pub enum AgentError {
     ProfileNotFound,
     #[error("model not found")]
     ModelNotFound,
+    #[error("session settings are incompatible")]
+    InvalidSessionSettings,
     #[error("model-backed compaction is not implemented in this phase")]
     ModelNotImplemented,
     #[error("workspace is unavailable")]
