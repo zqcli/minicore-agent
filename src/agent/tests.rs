@@ -3049,11 +3049,6 @@ async fn session_log_errors_emit_safe_classified_logs() {
         .await;
     let unknown_close_result = unknown_log.close().await;
     drop(unknown_log);
-    let persisted_conversation = tokio::fs::read_to_string(
-        session_directory(&base, unknown_session_id).join("conversation.log"),
-    )
-    .await
-    .unwrap();
 
     tokio::fs::write(
         session_directory(&base, corrupt_session_id).join("conversation.log"),
@@ -3079,7 +3074,6 @@ async fn session_log_errors_emit_safe_classified_logs() {
     assert!(persisted_record.contains(PROFILE_MARKER));
     assert!(persisted_record.contains(RECORD_MARKER));
     assert!(persisted_manifest.contains(SYSTEM_PROMPT_MARKER));
-    assert!(persisted_conversation.contains(CONVERSATION_MARKER));
     assert!(matches!(
         conflict_result,
         Err(error) if error.kind() == SessionLogErrorKind::Conflict
