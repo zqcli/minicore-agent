@@ -49,6 +49,10 @@ session.transcript     turn.send              turn.cancel
 turn.wait              interaction.answer
 ```
 
+`session.list` skips unrelated entries and individual session entries with
+unreadable or corrupt metadata. Explicit `session.open` and `session.delete`
+remain strict and report errors for the requested Session.
+
 One NDJSON frame is read at a time and stdout is reserved for JSON-RPC. A single
 bounded outbound channel carries ordinary responses, asynchronous `turn.wait`
 responses, and exact event notifications of the form
