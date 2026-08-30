@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -13,8 +15,9 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome, ToolSpec};
 
-use crate::agent::{Agent, CreateSession, GetTranscript, SendMessage};
+use crate::agent::{Agent, CreateSession, GetTranscript, SendMessage, TurnRef};
 use crate::config::{AgentConfig, KernelOverrides, Profile};
+use crate::event::{AgentEvent, OutputChannel};
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, ProfileCompaction};
 
@@ -5586,35 +5589,374 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
     let _ = tokio::fs::remove_dir_all(base).await;
 }
 
-#[tokio::test]
-#[ignore = "requires OPENAI_API_KEY and MINICORE_AGENT_LIVE_MODEL"]
-async fn openai_live_smoke() {
-    let (Ok(api_key), Ok(provider_model)) = (
-        std::env::var("OPENAI_API_KEY"),
-        std::env::var("MINICORE_AGENT_LIVE_MODEL"),
-    ) else {
-        return;
-    };
-    if api_key.trim().is_empty() || provider_model.trim().is_empty() {
-        return;
+struct LiveOpenAiConfig {
+    api_key: String,
+    provider_model: String,
+    base_url: String,
+    reasoning: ReasoningPreference,
+}
+
+fn required_live_env(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            panic!("required live environment variable is missing or empty")
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("required live environment variable must be valid Unicode")
+        }
     }
-    let base_url = std::env::var("MINICORE_AGENT_LIVE_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
-    let mut settings = settings(&base_url);
-    settings.provider_model = provider_model;
-    settings.api_key = api_key;
-    settings.request_timeout = Some(Duration::from_secs(120));
+}
+
+fn live_config() -> LiveOpenAiConfig {
+    let reasoning = match std::env::var("MINICORE_AGENT_LIVE_REASONING") {
+        Err(std::env::VarError::NotPresent) => ReasoningPreference::Medium,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("optional live reasoning environment variable must be valid Unicode")
+        }
+        Ok(value) => match value.as_str() {
+            "medium" => ReasoningPreference::Medium,
+            "auto" => ReasoningPreference::Auto,
+            "disabled" => ReasoningPreference::Disabled,
+            "low" => ReasoningPreference::Low,
+            "high" => ReasoningPreference::High,
+            _ => {
+                panic!("MINICORE_AGENT_LIVE_REASONING must be auto, disabled, low, medium, or high")
+            }
+        },
+    };
+    let base_url = match std::env::var("MINICORE_AGENT_LIVE_BASE_URL") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "https://api.openai.com/v1".to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("optional live base URL environment variable must be valid Unicode")
+        }
+    };
+    assert!(
+        !base_url.trim().is_empty(),
+        "MINICORE_AGENT_LIVE_BASE_URL must be non-empty when set"
+    );
+    LiveOpenAiConfig {
+        api_key: required_live_env("OPENAI_API_KEY"),
+        provider_model: required_live_env("MINICORE_AGENT_LIVE_MODEL"),
+        base_url,
+        reasoning,
+    }
+}
+
+fn live_reasoning_tool_config() -> LiveOpenAiConfig {
+    let config = live_config();
+    assert!(
+        matches!(
+            config.reasoning,
+            ReasoningPreference::Low | ReasoningPreference::Medium | ReasoningPreference::High
+        ),
+        "reasoning Tool smoke requires low, medium, or high reasoning"
+    );
+    config
+}
+
+fn live_settings(config: &LiveOpenAiConfig) -> OpenAiResponsesSettings {
+    let mut value = settings(&config.base_url);
+    value.provider_model.clone_from(&config.provider_model);
+    value.api_key.clone_from(&config.api_key);
+    value.supported_reasoning = BTreeSet::from([config.reasoning]);
+    value.request_timeout = Some(Duration::from_secs(120));
+    value
+}
+
+fn live_model_config(config: &LiveOpenAiConfig) -> ModelConfig {
+    ModelConfig::OpenAiResponses {
+        model: config.provider_model.clone(),
+        base_url: config.base_url.clone(),
+        api_key_env: "OPENAI_API_KEY".to_owned(),
+        physical_context_window: 18_408,
+        output_budget_tokens: 1_024,
+        safety_margin_tokens: 1_000,
+        supported_reasoning: BTreeSet::from([config.reasoning]),
+        supports_tools: true,
+        request_timeout_seconds: Some(120),
+    }
+}
+
+fn assert_live_usage(usage: &Usage) {
+    let partitions = [
+        usage.input_tokens(),
+        usage.output_tokens(),
+        usage.reasoning_tokens(),
+        usage.cache_read_tokens(),
+        usage.cache_write_tokens(),
+    ];
+    let all_present = partitions.iter().all(Option::is_some);
+    let known_sum = partitions
+        .into_iter()
+        .flatten()
+        .try_fold(0_u64, |sum, value| sum.checked_add(value));
+    let known_sum = known_sum.expect("live Usage partitions must not overflow");
+    if let Some(total) = usage.provider_total_tokens() {
+        assert!(known_sum <= total);
+        if all_present {
+            assert_eq!(known_sum, total);
+        }
+    }
+}
+
+const LIVE_SMOKE_TOKEN: &str = "MINICORE_TUI_SMOKE_7F42";
+
+struct LiveTempDir {
+    path: PathBuf,
+}
+
+impl LiveTempDir {
+    fn new() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "minicore-agent-openai-live-{}",
+                SessionId::new().expect("live temp directory ID")
+            )),
+        }
+    }
+}
+
+impl Drop for LiveTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct LiveToolEvidence {
+    turn: TurnRef,
+    terminal: minicore_runtime::TurnTerminal,
+    outcome_usage: Usage,
+    session_reasoning: ReasoningPreference,
+    assistant_rounds: usize,
+    assistant_usages: Vec<Usage>,
+    saw_read_call: bool,
+    successful_read_with_token: bool,
+    final_text_with_token: bool,
+}
+
+async fn run_live_reasoning_tool(
+    agent: &mut Agent,
+    workspace: &Path,
+) -> Result<LiveToolEvidence, &'static str> {
+    let session = agent
+        .create_session(CreateSession {
+            workspace: workspace.to_owned(),
+            profile: String::new(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .map_err(|_| "live Session creation failed")?;
+    let turn = agent
+        .send(SendMessage {
+            session_id: session.session_id,
+            text: "Use the read tool to read SMOKE.txt.\nAfter reading it, reply with the exact token."
+                .to_owned(),
+        })
+        .await
+        .map_err(|_| "live Turn send failed")?;
+    let outcome = tokio::time::timeout(Duration::from_secs(300), agent.wait_turn(turn))
+        .await
+        .map_err(|_| "live reasoning/tool Turn timed out")?
+        .map_err(|_| "live reasoning/tool Turn wait failed")?;
+    let transcript = agent
+        .transcript(GetTranscript {
+            session_id: session.session_id,
+            after: None,
+            limit: 32,
+        })
+        .await
+        .map_err(|_| "live Transcript read failed")?;
+    let assistants = transcript
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            minicore_runtime::ConversationEntry::AssistantMessage(entry)
+                if entry.turn_id == turn.turn_id =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let read_call_ids = assistants
+        .iter()
+        .flat_map(|entry| &entry.tool_calls)
+        .filter(|call| call.name().as_str() == "read")
+        .map(|call| call.tool_call_id().clone())
+        .collect::<BTreeSet<_>>();
+    let successful_read_with_token = transcript.entries.iter().any(|entry| {
+        matches!(
+            entry,
+            minicore_runtime::ConversationEntry::ToolResult(result)
+                if result.turn_id == turn.turn_id
+                    && result.tool_name.as_str() == "read"
+                    && result.outcome == ToolResultOutcome::Success
+                    && read_call_ids.contains(&result.tool_call_id)
+                    && result.content.as_str().contains(LIVE_SMOKE_TOKEN)
+        )
+    });
+    let final_text_with_token = assistants.iter().any(|entry| {
+        entry.tool_calls.is_empty()
+            && entry
+                .text
+                .as_ref()
+                .is_some_and(|text| text.as_str().contains(LIVE_SMOKE_TOKEN))
+    });
+    Ok(LiveToolEvidence {
+        turn,
+        terminal: outcome.terminal,
+        outcome_usage: outcome.usage,
+        session_reasoning: session.reasoning,
+        assistant_rounds: assistants.len(),
+        assistant_usages: assistants.iter().map(|entry| entry.usage).collect(),
+        saw_read_call: !read_call_ids.is_empty(),
+        successful_read_with_token,
+        final_text_with_token,
+    })
+}
+
+#[ignore = "requires OPENAI_API_KEY and MINICORE_AGENT_LIVE_MODEL"]
+#[tokio::test]
+async fn openai_live_text_smoke() {
+    let config = live_config();
     let events = run_model(
-        &OpenAiResponsesModel::new(settings).unwrap(),
-        basic_request(ReasoningPreference::Auto),
+        &OpenAiResponsesModel::new(live_settings(&config))
+            .expect("live OpenAI settings must be valid"),
+        basic_request(config.reasoning),
         context(CancellationToken::new(), Duration::from_secs(120)),
     )
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("live text request failed; requested reasoning is not downgraded"));
     assert!(
         events
             .iter()
             .any(|event| matches!(event, ModelEvent::TextDelta { .. }))
     );
-    assert!(matches!(events.last(), Some(ModelEvent::Finish { .. })));
+    for event in &events {
+        if let ModelEvent::Usage { usage } = event {
+            assert_live_usage(usage);
+        }
+    }
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Finish {
+            reason: ModelFinishReason::Stop
+        })
+    ));
+}
+
+#[ignore = "requires OPENAI_API_KEY and MINICORE_AGENT_LIVE_MODEL"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_live_reasoning_tool_smoke() {
+    let live = live_reasoning_tool_config();
+    let temp = LiveTempDir::new();
+    let workspace = temp.path.join("workspace");
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .unwrap_or_else(|_| panic!("live workspace creation failed"));
+    tokio::fs::write(workspace.join("SMOKE.txt"), LIVE_SMOKE_TOKEN)
+        .await
+        .unwrap_or_else(|_| panic!("live smoke file creation failed"));
+    let config = AgentConfig {
+        data_dir: temp.path.join("data"),
+        event_capacity: 256,
+        default_profile: "live".to_owned(),
+        profiles: BTreeMap::from([(
+            "live".to_owned(),
+            Profile {
+                model: "main".to_owned(),
+                reasoning: live.reasoning,
+                system_prompt: "Use read when requested; never guess file contents.".to_owned(),
+                tools: vec!["read".to_owned()],
+                max_tool_rounds: 4,
+                approval: ApprovalMode::Auto,
+                compaction: ProfileCompaction::Disabled,
+            },
+        )]),
+        models: BTreeMap::from([("main".to_owned(), live_model_config(&live))]),
+        kernel: KernelOverrides::default(),
+    };
+    let mut agent = Agent::open(config)
+        .await
+        .unwrap_or_else(|_| panic!("live Agent setup failed without exposing credentials"));
+    let mut events = match agent.take_events() {
+        Ok(events) => events,
+        Err(_) => {
+            let shutdown = AssertUnwindSafe(agent.shutdown()).catch_unwind().await;
+            let _ = tokio::fs::remove_dir_all(&temp.path).await;
+            match shutdown {
+                Err(payload) => resume_unwind(payload),
+                Ok(Err(_)) => panic!("live Agent shutdown failed"),
+                Ok(Ok(())) => panic!("live Agent event stream setup failed"),
+            }
+        }
+    };
+    let collector = tokio::spawn(async move {
+        let mut reasoning_by_turn = HashMap::<TurnRef, usize>::new();
+        while let Some(event) = events.recv().await {
+            if let AgentEvent::OutputDelta {
+                turn,
+                channel: OutputChannel::Reasoning,
+                delta,
+                ..
+            } = event
+            {
+                if !delta.is_empty() {
+                    *reasoning_by_turn.entry(turn).or_default() += 1;
+                }
+            }
+        }
+        reasoning_by_turn
+    });
+    let execution = AssertUnwindSafe(run_live_reasoning_tool(&mut agent, &workspace))
+        .catch_unwind()
+        .await;
+    let shutdown = AssertUnwindSafe(agent.shutdown()).catch_unwind().await;
+    let reasoning_by_turn = collector.await;
+    let _ = tokio::fs::remove_dir_all(&temp.path).await;
+
+    let evidence = match execution {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(message)) => panic!("{message}"),
+        Err(payload) => resume_unwind(payload),
+    };
+    match shutdown {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => panic!("live Agent shutdown failed"),
+        Err(payload) => resume_unwind(payload),
+    }
+    let reasoning_by_turn = reasoning_by_turn.expect("live event collector panicked");
+    assert_eq!(evidence.session_reasoning, live.reasoning);
+    assert_eq!(
+        evidence.terminal,
+        minicore_runtime::TurnTerminal::Completed,
+        "live reasoning/tool Turn failed; requested reasoning is not downgraded"
+    );
+    assert_live_usage(&evidence.outcome_usage);
+    for usage in &evidence.assistant_usages {
+        assert_live_usage(usage);
+    }
+    assert!(
+        evidence.assistant_rounds >= 2,
+        "expected a second live Model round"
+    );
+    assert!(evidence.saw_read_call, "expected a live read ToolCall");
+    assert!(
+        evidence.successful_read_with_token,
+        "expected a successful live read ToolResult containing the token"
+    );
+    assert!(
+        evidence.final_text_with_token,
+        "expected a final live answer containing the token"
+    );
+    assert!(
+        reasoning_by_turn
+            .get(&evidence.turn)
+            .is_some_and(|count| *count > 0),
+        "expected a non-empty reasoning OutputDelta for the exact live Turn"
+    );
 }
