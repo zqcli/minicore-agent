@@ -786,12 +786,21 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
             turn_id,
             tool_call_id,
             tool_name,
-        } => Some(AgentEvent::ToolStarted {
-            turn: turn(turn_id),
-            tool_call_id,
-            tool_name: tool_name.to_string(),
-            meta,
-        }),
+        } => {
+            tracing::debug!(
+                session_id = %envelope.session_id,
+                instance_id = %envelope.instance_id,
+                turn_id = %turn_id,
+                tool_name = %tool_name,
+                "tool started"
+            );
+            Some(AgentEvent::ToolStarted {
+                turn: turn(turn_id),
+                tool_call_id,
+                tool_name: tool_name.to_string(),
+                meta,
+            })
+        }
         SessionEvent::ToolProgress {
             turn_id,
             tool_call_id,
@@ -806,15 +815,24 @@ pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentE
             turn_id,
             tool_call_id,
             result,
-        } => Some(AgentEvent::ToolFinished {
-            turn: turn(turn_id),
-            tool_call_id,
-            result: ToolResultView {
-                outcome: result.outcome,
-                content_bytes: result.content_bytes,
-            },
-            meta,
-        }),
+        } => {
+            tracing::debug!(
+                session_id = %envelope.session_id,
+                instance_id = %envelope.instance_id,
+                turn_id = %turn_id,
+                outcome = ?result.outcome,
+                "tool finished"
+            );
+            Some(AgentEvent::ToolFinished {
+                turn: turn(turn_id),
+                tool_call_id,
+                result: ToolResultView {
+                    outcome: result.outcome,
+                    content_bytes: result.content_bytes,
+                },
+                meta,
+            })
+        }
         SessionEvent::InteractionRequested { interaction } => {
             Some(AgentEvent::InteractionRequested {
                 session_id: envelope.session_id,

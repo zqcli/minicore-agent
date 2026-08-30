@@ -17,6 +17,27 @@ modified here.
 minicore-agent --config ./example.agent.toml --stdio
 ```
 
+## Tracing
+
+Set `RUST_LOG` to enable more detailed binary diagnostics:
+
+```bash
+RUST_LOG=minicore_agent=debug \
+  minicore-agent --config ./example.agent.toml --stdio
+```
+
+Tracing is initialized only by the binary and writes only to stderr. Stdout
+remains reserved for newline-delimited JSON-RPC responses and `agent.event`
+notifications. Regardless of how broadly `RUST_LOG` is configured, only
+tracing events whose target is `minicore_agent` or begins with
+`minicore_agent::` are emitted.
+
+Logs use stable operation and error classifications with safe session and Turn
+identifiers. They do not record API keys, Authorization headers, Provider base
+URLs or request/response bodies, user or system prompts, reasoning text,
+encrypted Provider content, Tool arguments, or Bash commands, paths, and
+content.
+
 The stdio protocol implements the complete v0.1 JSON-RPC method set:
 
 ```text

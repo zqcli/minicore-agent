@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::pending;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,23 +10,165 @@ use futures_util::stream;
 use serde_json::json;
 use tokio::sync::Semaphore;
 
-use minicore_runtime::conversation::TurnTerminal;
-use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, SessionShutdownError};
+use minicore_runtime::conversation::{
+    ConversationEntry, ConversationSeq, TurnExecutionRecord, TurnTerminal, UserInputRecord,
+    UserMessageEntry,
+};
+use minicore_runtime::error::{
+    DiagnosticCategory, DiagnosticCode, SessionLogErrorKind, SessionShutdownError,
+};
 use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason, ModelRef,
     ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference, Usage,
 };
 use minicore_runtime::session::SessionStatus;
+use minicore_runtime::storage::SessionLog;
 use minicore_runtime::value::BoundedText;
 
 use crate::config::{AgentConfig, ConfigError, KernelOverrides, Profile};
-use crate::error::{AgentError, CoreErrorView};
+use crate::error::{AgentError, CoreErrorView, StoreError};
 use crate::event::AgentEvent;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, ProfileCompaction};
 
 use super::{Agent, AnswerInteraction, CreateSession, GetTranscript, SendMessage, TurnRef};
+
+const TEST_LOG_CAPACITY: usize = 32 * 1024;
+
+#[derive(Clone)]
+struct BoundedLogWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+struct TestTracingCapture {
+    writer: BoundedLogWriter,
+    capture_dispatch: tracing::Dispatch,
+    _alternate_dispatch: tracing::Dispatch,
+}
+
+struct TestDirectoryGuard {
+    path: PathBuf,
+}
+
+impl TestDirectoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TestDirectoryGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl TestTracingCapture {
+    fn new() -> Self {
+        let writer = BoundedLogWriter::new();
+        let capture_subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(writer.clone())
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .compact()
+            .finish();
+        let alternate_subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::level_filters::LevelFilter::OFF)
+            .with_writer(io::sink)
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .compact()
+            .finish();
+        let capture_dispatch = tracing::Dispatch::new(capture_subscriber);
+        let alternate_dispatch = tracing::Dispatch::new(alternate_subscriber);
+        Self {
+            writer,
+            capture_dispatch,
+            _alternate_dispatch: alternate_dispatch,
+        }
+    }
+
+    fn enter(&self) -> tracing::dispatcher::DefaultGuard {
+        tracing::dispatcher::set_default(&self.capture_dispatch)
+    }
+
+    fn contents(&self) -> String {
+        self.writer.contents()
+    }
+}
+
+impl BoundedLogWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn contents(&self) -> String {
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl Write for BoundedLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remaining = TEST_LOG_CAPACITY.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..buffer.len().min(remaining)]);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for BoundedLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn test_log_field_equals(line: &str, name: &str, expected: &str) -> bool {
+    let prefix = format!("{name}=");
+    line.split_ascii_whitespace().any(|token| {
+        let token = token.trim_end_matches([',', ';']);
+        let Some(value) = token.strip_prefix(&prefix) else {
+            return false;
+        };
+        value == expected
+            || value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                == Some(expected)
+    })
+}
+
+fn session_log_test_entry(seq: u64, turn_id: TurnId, secret: &str) -> ConversationEntry {
+    ConversationEntry::UserMessage(UserMessageEntry {
+        seq: ConversationSeq::new(seq),
+        turn_id,
+        input: UserInputRecord::new(BoundedText::new(secret).unwrap()).unwrap(),
+        execution: TurnExecutionRecord::new(
+            "model:v1".parse().unwrap(),
+            ReasoningPreference::Auto,
+            4,
+        )
+        .unwrap(),
+        created_at: "2020-01-02T03:04:05.006Z".parse().unwrap(),
+    })
+}
 
 #[derive(Clone)]
 enum ModelScript {
@@ -444,6 +587,20 @@ fn create_request(workspace: &Path) -> CreateSession {
         profile: "test".to_owned(),
         title: Some("loop test".to_owned()),
     }
+}
+
+async fn create_closed_session_for_log_test(
+    agent: &mut Agent,
+    workspace: &Path,
+    profile: &str,
+    title: &str,
+) -> SessionId {
+    let mut request = create_request(workspace);
+    request.profile = profile.to_owned();
+    request.title = Some(title.to_owned());
+    let session_id = agent.create_session(request).await.unwrap().session_id;
+    agent.close_session(session_id).await.unwrap();
+    session_id
 }
 
 fn session_directory(base: &Path, session_id: SessionId) -> PathBuf {
@@ -2813,23 +2970,201 @@ async fn metadata_unavailable_retry_waits_for_a_new_latest_value() {
     remove_base(&base).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
+async fn session_log_errors_emit_safe_classified_logs() {
+    const SYSTEM_PROMPT_MARKER: &str = "SESSION-LOG-SYSTEM-PROMPT-MARKER-SECRET";
+    const PROFILE_MARKER: &str = "SESSION-LOG-PROFILE-MARKER-SECRET";
+    const RECORD_MARKER: &str = "SESSION-LOG-RECORD-MARKER-SECRET";
+    const CONVERSATION_MARKER: &str = "SESSION-LOG-CONVERSATION-MARKER-SECRET";
+
+    let tracing_capture = TestTracingCapture::new();
+    let _subscriber_guard = tracing_capture.enter();
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-session-log-tracing-{}",
+        SessionId::new().unwrap()
+    ));
+    let _fixture_guard = TestDirectoryGuard::new(base.clone());
+    let data_dir = base.join("data");
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let workspace = tokio::fs::canonicalize(&workspace).await.unwrap();
+    let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
+    let mut test_config = config(data_dir.clone(), Vec::new());
+    let mut profile = test_config.profiles.remove("test").unwrap();
+    profile.system_prompt = SYSTEM_PROMPT_MARKER.to_owned();
+    test_config.default_profile = PROFILE_MARKER.to_owned();
+    test_config
+        .profiles
+        .insert(PROFILE_MARKER.to_owned(), profile);
+    let mut agent = Agent::open_with_models(test_config, models(model))
+        .await
+        .unwrap();
+    let canonical_data_dir = tokio::fs::canonicalize(&data_dir).await.unwrap();
+
+    let conflict_session_id =
+        create_closed_session_for_log_test(&mut agent, &workspace, PROFILE_MARKER, RECORD_MARKER)
+            .await;
+    let unknown_session_id =
+        create_closed_session_for_log_test(&mut agent, &workspace, PROFILE_MARKER, RECORD_MARKER)
+            .await;
+    let corrupt_session_id =
+        create_closed_session_for_log_test(&mut agent, &workspace, PROFILE_MARKER, RECORD_MARKER)
+            .await;
+    let persisted_record = tokio::fs::read_to_string(
+        session_directory(&base, conflict_session_id).join("session.json"),
+    )
+    .await
+    .unwrap();
+    let persisted_manifest = tokio::fs::read_to_string(
+        session_directory(&base, conflict_session_id).join("manifest.json"),
+    )
+    .await
+    .unwrap();
+
+    let mut conflict_log = agent.store.open_log(conflict_session_id).await.unwrap();
+    let conflict_result = conflict_log
+        .append(
+            ConversationSeq::new(1),
+            vec![session_log_test_entry(
+                1,
+                TurnId::new().unwrap(),
+                CONVERSATION_MARKER,
+            )],
+        )
+        .await;
+    let conflict_close_result = conflict_log.close().await;
+    drop(conflict_log);
+
+    let mut unknown_log = agent.store.open_log(unknown_session_id).await.unwrap();
+    unknown_log.inject_unknown_after_write();
+    let unknown_result = unknown_log
+        .append(
+            ConversationSeq::ZERO,
+            vec![session_log_test_entry(
+                1,
+                TurnId::new().unwrap(),
+                CONVERSATION_MARKER,
+            )],
+        )
+        .await;
+    let unknown_close_result = unknown_log.close().await;
+    drop(unknown_log);
+    let persisted_conversation = tokio::fs::read_to_string(
+        session_directory(&base, unknown_session_id).join("conversation.log"),
+    )
+    .await
+    .unwrap();
+
+    tokio::fs::write(
+        session_directory(&base, corrupt_session_id).join("conversation.log"),
+        format!("{{\"entries\":[\"{CONVERSATION_MARKER}\"]}}\n"),
+    )
+    .await
+    .unwrap();
+    let corrupt_result = match agent.store.open_log(corrupt_session_id).await {
+        Ok(mut log) => log.close().await.map_err(StoreError::Log),
+        Err(error) => Err(error),
+    };
+
+    let conflict_delete_result = agent.delete_session(conflict_session_id).await;
+    let unknown_delete_result = agent.delete_session(unknown_session_id).await;
+    let corrupt_delete_result = agent.delete_session(corrupt_session_id).await;
+    let shutdown_result = agent.shutdown().await;
+    let lexical_data_dir_text = data_dir.to_string_lossy().into_owned();
+    let canonical_data_dir_text = canonical_data_dir.to_string_lossy().into_owned();
+    let workspace_text = workspace.to_string_lossy().into_owned();
+    remove_base(&base).await;
+    let logs = tracing_capture.contents();
+
+    assert!(persisted_record.contains(PROFILE_MARKER));
+    assert!(persisted_record.contains(RECORD_MARKER));
+    assert!(persisted_manifest.contains(SYSTEM_PROMPT_MARKER));
+    assert!(persisted_conversation.contains(CONVERSATION_MARKER));
+    assert!(matches!(
+        conflict_result,
+        Err(error) if error.kind() == SessionLogErrorKind::Conflict
+    ));
+    assert!(conflict_close_result.is_ok());
+    assert!(matches!(
+        unknown_result,
+        Err(error) if error.kind() == SessionLogErrorKind::UnknownOutcome
+    ));
+    assert!(matches!(
+        unknown_close_result,
+        Err(error) if error.kind() == SessionLogErrorKind::UnknownOutcome
+    ));
+    assert!(matches!(
+        corrupt_result,
+        Err(StoreError::Log(error)) if error.kind() == SessionLogErrorKind::Corrupt
+    ));
+    assert!(conflict_delete_result.is_ok());
+    assert!(unknown_delete_result.is_ok());
+    assert!(corrupt_delete_result.is_ok());
+    assert!(shutdown_result.is_ok());
+    assert!(!logs.contains("session log tail repaired"));
+    for private in [
+        lexical_data_dir_text.as_str(),
+        canonical_data_dir_text.as_str(),
+        workspace_text.as_str(),
+        SYSTEM_PROMPT_MARKER,
+        PROFILE_MARKER,
+        RECORD_MARKER,
+        CONVERSATION_MARKER,
+        "entries",
+        "local session log append head conflicts",
+        "local session log is corrupt",
+        "local session log mutation outcome is unknown",
+        "SessionLogError",
+        "Conflict",
+        "Corrupt",
+        "UnknownOutcome",
+    ] {
+        assert!(!logs.contains(private));
+    }
+    for (session_id, operation, error_kind) in [
+        (conflict_session_id, "append", "session_log_conflict"),
+        (unknown_session_id, "append", "session_log_unknown_outcome"),
+        (corrupt_session_id, "open_log", "session_log_corrupt"),
+    ] {
+        let session_id = session_id.to_string();
+        assert!(logs.lines().any(|line| {
+            test_log_field_equals(line, "session_id", &session_id)
+                && test_log_field_equals(line, "operation", operation)
+                && test_log_field_equals(line, "error_kind", error_kind)
+        }));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn metadata_unknown_outcome_stops_future_updates_after_uncertain_write() {
+    const RECORD_MARKER: &str = "METADATA-RECORD-MARKER-SECRET";
+    const CONTENT_MARKER: &str = "METADATA-CONTENT-MARKER-SECRET";
+    const TEST_SECRET_MARKER: &str = "METADATA-TEST-SECRET-MARKER";
+
+    let tracing_capture = TestTracingCapture::new();
+    let _subscriber_guard = tracing_capture.enter();
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-touch-unknown-{}",
         SessionId::new().unwrap()
     ));
+    let data_dir = base.join("data");
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let workspace = tokio::fs::canonicalize(&workspace).await.unwrap();
+    tokio::fs::write(
+        workspace.join("metadata-secret.txt"),
+        format!("{CONTENT_MARKER}-{TEST_SECRET_MARKER}"),
+    )
+    .await
+    .unwrap();
     let (model, _) = FakeModel::new([ModelScript::Text("unused")]);
-    let mut agent = Agent::open_with_models(config(base.join("data"), Vec::new()), models(model))
+    let mut agent = Agent::open_with_models(config(data_dir.clone(), Vec::new()), models(model))
         .await
         .unwrap();
     let events = agent.take_events().unwrap();
-    let info = agent
-        .create_session(create_request(&workspace))
-        .await
-        .unwrap();
+    let mut request = create_request(&workspace);
+    request.title = Some(format!("{RECORD_MARKER}-{TEST_SECRET_MARKER}"));
+    let info = agent.create_session(request).await.unwrap();
     let gate = Arc::new(crate::store::AtomicWriteGate::new(session_record_path(
         &base,
         info.session_id,
@@ -2875,7 +3210,40 @@ async fn metadata_unknown_outcome_stops_future_updates_after_uncertain_write() {
     agent.close_session(info.session_id).await.unwrap();
     agent.delete_session(info.session_id).await.unwrap();
     agent.shutdown().await.unwrap();
+    let session_id_text = info.session_id.to_string();
+    let data_dir_text = data_dir.to_string_lossy().into_owned();
+    let workspace_text = workspace.to_string_lossy().into_owned();
     remove_base(&base).await;
+
+    let logs = tracing_capture.contents();
+    for private in [
+        data_dir_text.as_str(),
+        workspace_text.as_str(),
+        RECORD_MARKER,
+        CONTENT_MARKER,
+        TEST_SECRET_MARKER,
+        "StoreError",
+        "UnknownOutcome",
+    ] {
+        assert!(!logs.contains(private));
+    }
+    let metadata_failure_lines = logs
+        .lines()
+        .filter(|line| line.contains("metadata update failed"))
+        .collect::<Vec<_>>();
+    assert!(
+        !metadata_failure_lines.is_empty(),
+        "metadata terminal failure must emit a stable safe log marker"
+    );
+    let metadata_failure_line = metadata_failure_lines
+        .into_iter()
+        .find(|line| test_log_field_equals(line, "session_id", &session_id_text))
+        .expect("metadata failure log must identify the affected session");
+    assert!(test_log_field_equals(
+        metadata_failure_line,
+        "error_kind",
+        "unknown_outcome"
+    ));
 }
 
 #[tokio::test]

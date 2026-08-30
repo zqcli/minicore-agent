@@ -47,9 +47,27 @@ fn spawn_server() -> RpcProcess {
         "minicore-agent-rpc-test-{}",
         SessionId::new().unwrap()
     ));
+    let config_path = write_server_config(&temp_dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
+        .args(["--config", config_path.to_str().unwrap(), "--stdio"])
+        .env(TEST_CREDENTIAL_ENV, "dummy-test-credential")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    RpcProcess {
+        input: child.stdin.take().unwrap(),
+        output: BufReader::new(child.stdout.take().unwrap()),
+        child,
+        temp_dir,
+    }
+}
+
+fn write_server_config(temp_dir: &std::path::Path) -> PathBuf {
     let data_dir = temp_dir.join("data");
     let config_path = temp_dir.join("agent.toml");
-    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::create_dir_all(temp_dir).unwrap();
     std::fs::write(
         &config_path,
         format!(
@@ -81,20 +99,7 @@ request_timeout_seconds = 30
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
-        .args(["--config", config_path.to_str().unwrap(), "--stdio"])
-        .env(TEST_CREDENTIAL_ENV, "dummy-test-credential")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    RpcProcess {
-        input: child.stdin.take().unwrap(),
-        output: BufReader::new(child.stdout.take().unwrap()),
-        child,
-        temp_dir,
-    }
+    config_path
 }
 
 fn assert_error(response: Value, code: i64, id: Value) {
@@ -113,6 +118,177 @@ fn assert_ping(response: Value, id: Value) {
     assert_eq!(response["jsonrpc"], json!("2.0"));
     assert_eq!(response["id"], id);
     assert_eq!(response["result"]["version"], json!("0.1.0"));
+}
+
+fn log_field_equals(line: &str, name: &str, expected: &str) -> bool {
+    let prefix = format!("{name}=");
+    line.split_ascii_whitespace().any(|token| {
+        let token = token.trim_end_matches([',', ';']);
+        let Some(value) = token.strip_prefix(&prefix) else {
+            return false;
+        };
+        value == expected
+            || value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                == Some(expected)
+    })
+}
+
+fn response_with_id<'response>(responses: &'response [Value], id: &Value) -> &'response Value {
+    responses
+        .iter()
+        .find(|response| response.get("id") == Some(id))
+        .expect("expected JSON-RPC response ID was not observed")
+}
+
+#[test]
+fn debug_logging_keeps_stdout_json_rpc_only_and_uses_safe_stderr_markers() {
+    const MALFORMED_FRAME_MARKER: &str = "PROCESS-B2-RPC-MALFORMED-FRAME-SECRET";
+    const INVALID_SHAPE_MARKER: &str = "PROCESS-B2-RPC-INVALID-SHAPE-SECRET";
+    const UNKNOWN_METHOD_MARKER: &str = "PROCESS-B2-RPC-UNKNOWN-METHOD-SECRET";
+    const UNKNOWN_PARAMS_MARKER: &str = "PROCESS-B2-RPC-UNKNOWN-PARAMS-SECRET";
+    const STARTUP_LOG_MARKER: &str = "agent startup";
+    const RPC_DISPATCH_LOG_MARKER: &str = "rpc dispatch";
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-debug-log-test-{}",
+        SessionId::new().unwrap()
+    ));
+    let config_path = write_server_config(&temp_dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
+        .args(["--config", config_path.to_str().unwrap(), "--stdio"])
+        .env(TEST_CREDENTIAL_ENV, "dummy-test-credential")
+        .env("RUST_LOG", "minicore_agent=debug")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(format!(r#"{{"private":"{MALFORMED_FRAME_MARKER}""#).as_bytes())
+        .unwrap();
+    input.write_all(b"\n").unwrap();
+    for request in [
+        json!({
+            "jsonrpc": "2.0",
+            "id": "invalid-shape",
+            "method": 7,
+            "private": INVALID_SHAPE_MARKER
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": "unknown-method",
+            "method": UNKNOWN_METHOD_MARKER,
+            "params": {"private": UNKNOWN_PARAMS_MARKER}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ping",
+            "method": "agent.ping",
+            "params": {}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": "shutdown",
+            "method": "agent.shutdown",
+            "params": {}
+        }),
+    ] {
+        serde_json::to_writer(&mut input, &request).unwrap();
+        input.write_all(b"\n").unwrap();
+    }
+    input.flush().unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut response_ids = Vec::new();
+    let mut responses = Vec::new();
+    for line in stdout.lines() {
+        let frame: Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("stdout line was not JSON-RPC JSON: {error}: {line}"));
+        assert_eq!(frame["jsonrpc"], "2.0");
+        let notification = frame["method"] == "agent.event"
+            && frame.get("id").is_none()
+            && frame.get("params").is_some()
+            && frame.get("result").is_none()
+            && frame.get("error").is_none();
+        let response = frame.get("id").is_some()
+            && frame.get("method").is_none()
+            && (frame.get("result").is_some() ^ frame.get("error").is_some());
+        assert!(
+            notification || response,
+            "stdout contained JSON that was not a JSON-RPC response or Agent event"
+        );
+        if let Some(id) = frame.get("id") {
+            response_ids.push(id.clone());
+            responses.push(frame);
+        }
+    }
+    assert!(response_ids.contains(&Value::Null));
+    assert!(response_ids.contains(&json!("invalid-shape")));
+    assert!(response_ids.contains(&json!("unknown-method")));
+    assert!(response_ids.contains(&json!("ping")));
+    assert!(response_ids.contains(&json!("shutdown")));
+    assert_eq!(
+        response_with_id(&responses, &Value::Null)["error"]["code"],
+        -32_700
+    );
+    assert_eq!(
+        response_with_id(&responses, &json!("invalid-shape"))["error"]["code"],
+        -32_600
+    );
+    assert_eq!(
+        response_with_id(&responses, &json!("unknown-method"))["error"]["code"],
+        -32_601
+    );
+    assert_eq!(
+        response_with_id(&responses, &json!("ping"))["result"]["version"],
+        "0.1.0"
+    );
+    assert_eq!(
+        response_with_id(&responses, &json!("shutdown"))["result"]["ok"],
+        true
+    );
+    let has_safe_log_marker =
+        stderr.contains(STARTUP_LOG_MARKER) || stderr.contains(RPC_DISPATCH_LOG_MARKER);
+    let has_safe_parse_marker = stderr.lines().any(|line| {
+        line.contains("rpc request rejected") && log_field_equals(line, "kind", "parse_error")
+    });
+    let has_safe_invalid_marker = stderr.lines().any(|line| {
+        line.contains("rpc request rejected") && log_field_equals(line, "kind", "invalid_request")
+    });
+    let has_safe_unknown_marker = stderr.lines().any(|line| {
+        line.contains(RPC_DISPATCH_LOG_MARKER) && log_field_equals(line, "method", "unknown")
+    });
+    let config_path_text = config_path.to_string_lossy().into_owned();
+    let stderr_is_redacted = !stderr.contains(&config_path_text)
+        && !stderr.contains(MALFORMED_FRAME_MARKER)
+        && !stderr.contains(INVALID_SHAPE_MARKER)
+        && !stderr.contains(UNKNOWN_METHOD_MARKER)
+        && !stderr.contains(UNKNOWN_PARAMS_MARKER);
+    let stdout_is_redacted = [
+        MALFORMED_FRAME_MARKER,
+        INVALID_SHAPE_MARKER,
+        UNKNOWN_METHOD_MARKER,
+        UNKNOWN_PARAMS_MARKER,
+    ]
+    .into_iter()
+    .all(|marker| !stdout.contains(marker));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    assert!(stderr_is_redacted);
+    assert!(stdout_is_redacted);
+    assert!(
+        has_safe_log_marker,
+        "stderr must contain a stable safe startup or RPC dispatch marker"
+    );
+    assert!(has_safe_parse_marker);
+    assert!(has_safe_invalid_marker);
+    assert!(has_safe_unknown_marker);
 }
 
 #[test]

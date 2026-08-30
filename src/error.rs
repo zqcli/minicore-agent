@@ -6,7 +6,20 @@ use thiserror::Error;
 
 use crate::config::ConfigError;
 
-use minicore_runtime::storage::SessionLogError;
+use minicore_runtime::storage::{SessionLogError, SessionLogErrorKind};
+
+pub(crate) const fn session_log_error_kind(kind: SessionLogErrorKind) -> &'static str {
+    match kind {
+        SessionLogErrorKind::NotInitialized => "session_log_not_initialized",
+        SessionLogErrorKind::AlreadyInitialized => "session_log_already_initialized",
+        SessionLogErrorKind::Conflict => "session_log_conflict",
+        SessionLogErrorKind::Corrupt => "session_log_corrupt",
+        SessionLogErrorKind::Unavailable => "session_log_unavailable",
+        SessionLogErrorKind::UnknownOutcome => "session_log_unknown_outcome",
+        SessionLogErrorKind::Closed => "session_log_closed",
+        SessionLogErrorKind::Internal => "session_log_internal",
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CoreErrorView {
@@ -101,4 +114,21 @@ pub(crate) enum StoreError {
     Internal,
     #[error("session log operation failed")]
     Log(#[from] SessionLogError),
+}
+
+impl StoreError {
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidRoot => "invalid_root",
+            Self::InvalidRecord => "invalid_record",
+            Self::SessionNotFound => "session_not_found",
+            Self::SessionAlreadyExists => "session_already_exists",
+            Self::Corrupt => "corrupt",
+            Self::Unavailable => "unavailable",
+            Self::UnknownOutcome => "unknown_outcome",
+            Self::CleanupFailed { .. } => "cleanup_failed",
+            Self::Internal => "internal",
+            Self::Log(error) => session_log_error_kind(error.kind()),
+        }
+    }
 }
