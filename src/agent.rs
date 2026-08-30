@@ -12,10 +12,10 @@ use minicore_runtime::context::ContextProvider;
 use minicore_runtime::conversation::{TranscriptPage, TurnTerminal};
 use minicore_runtime::error::{SessionError, SessionOpenErrorKind};
 use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
+use minicore_runtime::model::ReasoningPreference;
 use minicore_runtime::session::{
     InteractionAnswer, SessionRuntime, SessionRuntimeOptions, SessionState, TurnHandle,
 };
-use minicore_runtime::storage::{SessionLog, SessionLogError};
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
@@ -43,7 +43,16 @@ pub struct PingResponse {
 #[serde(deny_unknown_fields)]
 pub struct CreateSession {
     pub workspace: PathBuf,
+
+    #[serde(default)]
     pub profile: String,
+
+    #[serde(default)]
+    pub model: Option<String>,
+
+    #[serde(default)]
+    pub reasoning: Option<ReasoningPreference>,
+
     pub title: Option<String>,
 }
 
@@ -76,10 +85,18 @@ pub struct SessionInfo {
     pub title: Option<String>,
     pub profile: String,
     pub workspace: PathBuf,
+    pub model: String,
+    pub reasoning: ReasoningPreference,
     pub loaded: bool,
     pub instance_id: Option<SessionInstanceId>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+struct ResolvedSessionSettings {
+    profile: String,
+    model: String,
+    reasoning: ReasoningPreference,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -191,24 +208,47 @@ impl Agent {
             .list_sessions()
             .await
             .map_err(|error| map_logged_store_error("list_sessions", None, error))?;
-        Ok(records
-            .iter()
-            .map(|record| self.session_info(record, self.sessions.get(record.session_id)))
-            .collect())
+        let mut sessions = Vec::with_capacity(records.len());
+        for record in records {
+            let manifest = match self.store.load_manifest(record.session_id).await {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %record.session_id,
+                        error_kind = error.kind(),
+                        "skipping session with invalid manifest"
+                    );
+                    continue;
+                }
+            };
+            let loaded = self.sessions.get(record.session_id);
+            if loaded.is_some_and(|loaded| loaded.spec != manifest.spec) {
+                tracing::warn!(
+                    session_id = %record.session_id,
+                    error_kind = "manifest_spec_mismatch",
+                    "skipping session with invalid manifest"
+                );
+                continue;
+            }
+            let spec = loaded.map_or(&manifest.spec, |loaded| &loaded.spec);
+            sessions.push(Self::session_info(
+                &record,
+                spec,
+                loaded.is_some(),
+                loaded.map(|loaded| loaded.handle.instance_id()),
+            ));
+        }
+        Ok(sessions)
     }
 
     pub async fn create_session(
         &mut self,
         request: CreateSession,
     ) -> Result<SessionInfo, AgentError> {
-        let profile_id = if request.profile.is_empty() {
-            self.config.default_profile.clone()
-        } else {
-            request.profile.clone()
-        };
+        let settings = self.resolve_session_settings(&request)?;
         let profile = self
             .profiles
-            .get(&profile_id)
+            .get(&settings.profile)
             .cloned()
             .ok_or(AgentError::ProfileNotFound)?;
         let workspace = Arc::new(
@@ -217,13 +257,14 @@ impl Agent {
                 .map_err(|_| AgentError::Workspace)?,
         );
         let canonical_workspace = workspace.root().to_path_buf();
-        let (spec, options) = self.session_parts(&profile, workspace)?;
+        let spec = self.create_session_spec(&profile, &settings)?;
+        let options = self.runtime_options(&spec, &profile, workspace)?;
         let session_id = SessionId::new().map_err(|_| AgentError::Internal)?;
         let timestamp = current_timestamp()?;
         let record = SessionRecord {
             session_id,
             title: request.title,
-            profile: profile_id,
+            profile: settings.profile,
             workspace: canonical_workspace,
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -233,16 +274,17 @@ impl Agent {
             .create_session(record.clone())
             .await
             .map_err(|error| map_logged_store_error("create_session", Some(session_id), error))?;
-        let runtime = match SessionRuntime::create(session_id, spec, Box::new(log), options).await {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                if let Err(cleanup_error) = self.store.delete_session(session_id).await {
-                    log_store_error("create_session_cleanup", Some(session_id), &cleanup_error);
+        let runtime =
+            match SessionRuntime::create(session_id, spec.clone(), Box::new(log), options).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    if let Err(cleanup_error) = self.store.delete_session(session_id).await {
+                        log_store_error("create_session_cleanup", Some(session_id), &cleanup_error);
+                    }
+                    return Err(map_session_open_error(error));
                 }
-                return Err(map_session_open_error(error));
-            }
-        };
-        let loaded = match self.attach_runtime(runtime, record.clone()).await {
+            };
+        let loaded = match self.attach_runtime(runtime, record.clone(), spec).await {
             Ok(loaded) => loaded,
             Err(error) => {
                 if let Err(cleanup_error) = self.store.delete_session(session_id).await {
@@ -251,8 +293,8 @@ impl Agent {
                 return Err(error);
             }
         };
-        let info = self.session_info(&record, Some(&loaded));
         let instance_id = loaded.handle.instance_id();
+        let info = Self::session_info(&record, &loaded.spec, true, Some(instance_id));
         let _ = self.sessions.insert(session_id, loaded);
         tracing::info!(
             session_id = %session_id,
@@ -264,7 +306,12 @@ impl Agent {
 
     pub async fn open_session(&mut self, session_id: SessionId) -> Result<SessionInfo, AgentError> {
         if let Some(loaded) = self.sessions.get(session_id) {
-            let info = self.session_info(&loaded.record, Some(loaded));
+            let info = Self::session_info(
+                &loaded.record,
+                &loaded.spec,
+                true,
+                Some(loaded.handle.instance_id()),
+            );
             tracing::debug!(
                 session_id = %session_id,
                 instance_id = %loaded.handle.instance_id(),
@@ -277,6 +324,11 @@ impl Agent {
             .load_record(session_id)
             .await
             .map_err(|error| map_logged_store_error("load_record", Some(session_id), error))?;
+        let profile = self
+            .profiles
+            .get(&record.profile)
+            .cloned()
+            .ok_or(AgentError::ProfileNotFound)?;
         let workspace = Arc::new(
             Workspace::open(record.workspace.clone())
                 .await
@@ -285,30 +337,26 @@ impl Agent {
         if workspace.root() != record.workspace.as_path() {
             return Err(AgentError::Workspace);
         }
-        let profile = self
-            .profiles
-            .get(&record.profile)
-            .cloned()
-            .ok_or(AgentError::ProfileNotFound)?;
-        let (spec, options) = self.session_parts(&profile, workspace)?;
-        let mut log = self.store.open_log(session_id).await.map_err(|error| {
+        let manifest = self
+            .store
+            .load_manifest(session_id)
+            .await
+            .map_err(|error| map_logged_store_error("load_manifest", Some(session_id), error))?;
+        let spec = manifest.spec;
+        let options = self.runtime_options(&spec, &profile, workspace)?;
+        let log = self.store.open_log(session_id).await.map_err(|error| {
             if matches!(&error, StoreError::Log(_)) {
                 map_store_error(error)
             } else {
                 map_logged_store_error("open_log", Some(session_id), error)
             }
         })?;
-        let manifest = log.load_manifest().await.map_err(map_log_error)?;
-        if manifest.session_id != session_id || manifest.spec != spec {
-            log.close().await.map_err(map_log_error)?;
-            return Err(AgentError::SessionSpecMismatch);
-        }
         let runtime = SessionRuntime::load(session_id, Box::new(log), options)
             .await
             .map_err(map_session_open_error)?;
-        let loaded = self.attach_runtime(runtime, record.clone()).await?;
-        let info = self.session_info(&record, Some(&loaded));
+        let loaded = self.attach_runtime(runtime, record.clone(), spec).await?;
         let instance_id = loaded.handle.instance_id();
+        let info = Self::session_info(&record, &loaded.spec, true, Some(instance_id));
         let _ = self.sessions.insert(session_id, loaded);
         tracing::info!(
             session_id = %session_id,
@@ -521,34 +569,83 @@ impl Agent {
         result
     }
 
-    fn session_parts(
+    fn resolve_session_settings(
+        &self,
+        request: &CreateSession,
+    ) -> Result<ResolvedSessionSettings, AgentError> {
+        let profile = if request.profile.is_empty() {
+            self.config.default_profile.clone()
+        } else {
+            request.profile.clone()
+        };
+        let template = self
+            .profiles
+            .get(&profile)
+            .ok_or(AgentError::ProfileNotFound)?;
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| template.model.clone());
+        let reasoning = request.reasoning.unwrap_or(template.reasoning);
+        let configured = self.models.get(&model).map_err(map_model_config_error)?;
+        let model_ref =
+            Models::model_ref(&model).map_err(|_| AgentError::InvalidSessionSettings)?;
+        let descriptor = configured.descriptor();
+        if descriptor.model_ref != model_ref
+            || !descriptor.supports_reasoning(reasoning)
+            || (!template.tools.is_empty() && !descriptor.supports_tools)
+        {
+            return Err(AgentError::InvalidSessionSettings);
+        }
+        Ok(ResolvedSessionSettings {
+            profile,
+            model,
+            reasoning,
+        })
+    }
+
+    fn create_session_spec(
         &self,
         profile: &Profile,
-        workspace: Arc<Workspace>,
-    ) -> Result<(SessionSpec, SessionRuntimeOptions), AgentError> {
-        let model = self
-            .models
-            .get(&profile.model)
-            .map_err(map_model_config_error)?;
-        let model_ref = Models::model_ref(&profile.model).map_err(map_model_config_error)?;
+        settings: &ResolvedSessionSettings,
+    ) -> Result<SessionSpec, AgentError> {
+        let model_ref =
+            Models::model_ref(&settings.model).map_err(|_| AgentError::InvalidSessionSettings)?;
         let enabled_tools = profile
             .tools
             .iter()
-            .map(|name| name.parse().map_err(|_| AgentError::InvalidInput))
+            .map(|name| name.parse().map_err(|_| AgentError::InvalidSessionSettings))
             .collect::<Result<BTreeSet<_>, _>>()?;
         let system_prompt = minicore_runtime::BoundedText::new(&profile.system_prompt)
-            .map_err(|_| AgentError::InvalidInput)?;
-        let spec = SessionSpec::new(
+            .map_err(|_| AgentError::InvalidSessionSettings)?;
+        SessionSpec::new(
             model_ref,
-            profile.reasoning,
+            settings.reasoning,
             system_prompt,
             enabled_tools,
             profile.max_tool_rounds,
             minicore_runtime::CompactionConfig::Disabled,
         )
-        .map_err(|_| AgentError::InvalidInput)?;
+        .map_err(|_| AgentError::InvalidSessionSettings)
+    }
+
+    fn runtime_options(
+        &self,
+        spec: &SessionSpec,
+        profile: &Profile,
+        workspace: Arc<Workspace>,
+    ) -> Result<SessionRuntimeOptions, AgentError> {
+        let model = self
+            .models
+            .get(spec.model.as_str())
+            .map_err(map_model_config_error)?;
+        let tool_names = spec
+            .enabled_tools
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect::<Vec<_>>();
         let tools = build_tools(
-            &profile.tools,
+            &tool_names,
             Arc::clone(&workspace),
             self.command_environment.clone(),
         )
@@ -561,6 +658,9 @@ impl Agent {
         let context: Arc<dyn ContextProvider> = Arc::new(ProjectContext::new(workspace));
         let bindings =
             minicore_runtime::SessionBindings::new(model, tools, policy, Some(context), None);
+        bindings
+            .validate(spec, &self.kernel.limits)
+            .map_err(|_| AgentError::InvalidSessionSettings)?;
         let options =
             SessionRuntimeOptions::new(self.kernel.clone(), bindings, self.task_runtime.clone())
                 .map_err(|_| {
@@ -569,13 +669,14 @@ impl Agent {
                         false,
                     ))
                 })?;
-        Ok((spec, options))
+        Ok(options)
     }
 
     async fn attach_runtime(
         &self,
         mut runtime: SessionRuntime,
         record: SessionRecord,
+        spec: SessionSpec,
     ) -> Result<LoadedSession, AgentError> {
         let event_stream = match runtime.take_events() {
             Ok(stream) => stream,
@@ -587,16 +688,7 @@ impl Agent {
         let handle = runtime.handle();
         let state = handle.watch_state();
         let event_sink = AgentEventSink::new(self.events_tx.clone());
-        let opened = SessionInfo {
-            session_id: record.session_id,
-            title: record.title.clone(),
-            profile: record.profile.clone(),
-            workspace: record.workspace.clone(),
-            loaded: true,
-            instance_id: Some(handle.instance_id()),
-            created_at: record.created_at.clone(),
-            updated_at: record.updated_at.clone(),
-        };
+        let opened = Self::session_info(&record, &spec, true, Some(handle.instance_id()));
         let pump = SessionPump::new(
             &self.task_runtime,
             event_stream,
@@ -608,6 +700,7 @@ impl Agent {
             MetadataWorker::new(&self.task_runtime, self.store.clone(), runtime.session_id());
         Ok(LoadedSession {
             record,
+            spec,
             runtime,
             handle,
             active_turn: None,
@@ -617,14 +710,21 @@ impl Agent {
         })
     }
 
-    fn session_info(&self, record: &SessionRecord, loaded: Option<&LoadedSession>) -> SessionInfo {
+    fn session_info(
+        record: &SessionRecord,
+        spec: &SessionSpec,
+        loaded: bool,
+        instance_id: Option<SessionInstanceId>,
+    ) -> SessionInfo {
         SessionInfo {
             session_id: record.session_id,
             title: record.title.clone(),
             profile: record.profile.clone(),
             workspace: record.workspace.clone(),
-            loaded: loaded.is_some(),
-            instance_id: loaded.map(|loaded| loaded.handle.instance_id()),
+            model: spec.model.as_str().to_owned(),
+            reasoning: spec.reasoning,
+            loaded,
+            instance_id,
             created_at: record.created_at.clone(),
             updated_at: record.updated_at.clone(),
         }
@@ -709,15 +809,9 @@ fn current_timestamp() -> Result<String, AgentError> {
 
 fn map_build_tools_error(error: BuildToolsError) -> AgentError {
     match error {
-        BuildToolsError::InvalidConfiguration => {
-            AgentError::Config(crate::config::ConfigError::InvalidProfile)
-        }
+        BuildToolsError::InvalidConfiguration => AgentError::InvalidSessionSettings,
         BuildToolsError::Internal => AgentError::Internal,
     }
-}
-
-fn map_log_error(error: SessionLogError) -> AgentError {
-    map_store_error(StoreError::Log(error))
 }
 
 fn map_model_config_error(error: ModelConfigError) -> AgentError {

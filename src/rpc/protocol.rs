@@ -35,6 +35,7 @@ pub(crate) const WORKSPACE_ERROR: i32 = -32_010;
 pub(crate) const STORE_ERROR: i32 = -32_011;
 pub(crate) const PROVIDER_ERROR: i32 = -32_012;
 pub(crate) const CORE_ERROR: i32 = -32_013;
+pub(crate) const INVALID_SESSION_SETTINGS: i32 = -32_014;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -135,6 +136,10 @@ pub(crate) struct SessionCreateParams {
     #[serde(default)]
     pub(crate) profile: String,
     #[serde(default)]
+    pub(crate) model: Option<String>,
+    #[serde(default)]
+    pub(crate) reasoning: Option<ReasoningPreference>,
+    #[serde(default)]
     pub(crate) title: Option<String>,
 }
 
@@ -143,6 +148,8 @@ impl From<SessionCreateParams> for CreateSession {
         Self {
             workspace: value.workspace,
             profile: value.profile,
+            model: value.model,
+            reasoning: value.reasoning,
             title: value.title,
         }
     }

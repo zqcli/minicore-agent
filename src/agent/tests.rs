@@ -237,10 +237,19 @@ struct FakeModel {
 
 impl FakeModel {
     fn new(scripts: impl IntoIterator<Item = ModelScript>) -> (Arc<Self>, Arc<AtomicUsize>) {
+        Self::with_descriptor("fake", scripts, fake_supported_reasoning(), true)
+    }
+
+    fn with_descriptor(
+        model_ref: &str,
+        scripts: impl IntoIterator<Item = ModelScript>,
+        supported_reasoning: BTreeSet<ReasoningPreference>,
+        supports_tools: bool,
+    ) -> (Arc<Self>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_ref: ModelRef = "fake".parse().unwrap();
+        let model_ref: ModelRef = model_ref.parse().unwrap();
         let descriptor =
-            ModelDescriptor::new(model_ref, 16_384, fake_supported_reasoning(), true).unwrap();
+            ModelDescriptor::new(model_ref, 16_384, supported_reasoning, supports_tools).unwrap();
         let model = Arc::new(Self {
             descriptor,
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
@@ -585,6 +594,8 @@ fn create_request(workspace: &Path) -> CreateSession {
     CreateSession {
         workspace: workspace.to_path_buf(),
         profile: "test".to_owned(),
+        model: None,
+        reasoning: None,
         title: Some("loop test".to_owned()),
     }
 }
@@ -728,6 +739,112 @@ async fn agent_lifecycle_text_turn_and_finish_event() {
     assert!(agent.list_sessions().await.unwrap().is_empty());
     agent.shutdown().await.unwrap();
     while events.recv().await.is_some() {}
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn create_session_freezes_defaults_and_overrides_before_store_creation() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-session-settings-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let supported = fake_supported_reasoning();
+    let (deep, _) =
+        FakeModel::with_descriptor("deep", [ModelScript::Text("deep")], supported.clone(), true);
+    let (fast, _) = FakeModel::with_descriptor(
+        "fast",
+        [ModelScript::Text("fast")],
+        BTreeSet::from([ReasoningPreference::Auto, ReasoningPreference::Low]),
+        true,
+    );
+    let (no_tools, _) = FakeModel::with_descriptor(
+        "no-tools",
+        [ModelScript::Text("no tools")],
+        supported.clone(),
+        false,
+    );
+    let mut agent_config = config(base.join("data"), vec!["read"]);
+    let profile = agent_config.profiles.get_mut("test").unwrap();
+    profile.model = "deep".to_owned();
+    profile.reasoning = ReasoningPreference::High;
+    agent_config.models.insert(
+        "deep".to_owned(),
+        configured_model(
+            supported.clone(),
+            true,
+            "MINICORE_UNUSED_DEEP_KEY".to_owned(),
+        ),
+    );
+    agent_config.models.insert(
+        "fast".to_owned(),
+        configured_model(
+            BTreeSet::from([ReasoningPreference::Auto, ReasoningPreference::Low]),
+            true,
+            "MINICORE_UNUSED_FAST_KEY".to_owned(),
+        ),
+    );
+    agent_config.models.insert(
+        "no-tools".to_owned(),
+        configured_model(supported, false, "MINICORE_UNUSED_NO_TOOLS_KEY".to_owned()),
+    );
+    let deep: Arc<dyn Model> = deep;
+    let fast: Arc<dyn Model> = fast;
+    let no_tools: Arc<dyn Model> = no_tools;
+    let session_models = Models::from_values(BTreeMap::from([
+        ("deep".to_owned(), deep),
+        ("fast".to_owned(), fast),
+        ("no-tools".to_owned(), no_tools),
+    ]));
+    let mut agent = Agent::open_with_models(agent_config, session_models)
+        .await
+        .unwrap();
+
+    let defaulted = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    assert_eq!(defaulted.model, "deep");
+    assert_eq!(defaulted.reasoning, ReasoningPreference::High);
+
+    let mut selected = create_request(&workspace);
+    selected.model = Some("fast".to_owned());
+    selected.reasoning = Some(ReasoningPreference::Low);
+    let selected = agent.create_session(selected).await.unwrap();
+    assert_eq!(selected.model, "fast");
+    assert_eq!(selected.reasoning, ReasoningPreference::Low);
+
+    for (model, reasoning, expected) in [
+        ("fast", None, AgentError::InvalidSessionSettings),
+        (
+            "fast",
+            Some(ReasoningPreference::High),
+            AgentError::InvalidSessionSettings,
+        ),
+        (
+            "no-tools",
+            Some(ReasoningPreference::Low),
+            AgentError::InvalidSessionSettings,
+        ),
+        (
+            "missing",
+            Some(ReasoningPreference::Low),
+            AgentError::ModelNotFound,
+        ),
+    ] {
+        let mut request = create_request(&workspace);
+        request.model = Some(model.to_owned());
+        request.reasoning = reasoning;
+        let error = agent.create_session(request).await.unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+        assert_eq!(agent.store.list_sessions().await.unwrap().len(), 2);
+    }
+
+    agent.shutdown().await.unwrap();
     remove_base(&base).await;
 }
 
@@ -1771,18 +1888,22 @@ async fn old_instance_turn_references_are_rejected_after_reopen() {
     remove_base(&base).await;
 }
 
-async fn assert_profile_drift(label: &str, change: fn(&mut Profile)) {
+#[tokio::test]
+async fn reopening_uses_manifest_spec_after_profile_core_settings_drift() {
     let base = std::env::temp_dir().join(format!(
-        "minicore-agent-profile-drift-{label}-{}",
+        "minicore-agent-profile-drift-{}",
         SessionId::new().unwrap()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let (old_model, _) = FakeModel::new([ModelScript::Text("old")]);
-    let mut old_agent =
-        Agent::open_with_models(config(base.join("data"), Vec::new()), models(old_model))
-            .await
-            .unwrap();
+    let (old_model, old_calls) = FakeModel::new([ModelScript::Text("manifest model")]);
+    let old_requests = old_model.requests();
+    let mut old_agent = Agent::open_with_models(
+        config(base.join("data"), Vec::new()),
+        models(Arc::clone(&old_model)),
+    )
+    .await
+    .unwrap();
     let info = old_agent
         .create_session(create_request(&workspace))
         .await
@@ -1795,16 +1916,100 @@ async fn assert_profile_drift(label: &str, change: fn(&mut Profile)) {
         .join("manifest.json");
     let manifest_before = tokio::fs::read(&manifest_path).await.unwrap();
 
-    let (new_model, _) = FakeModel::new([ModelScript::Text("new")]);
+    let (new_model, new_calls) = FakeModel::with_descriptor(
+        "new",
+        [ModelScript::Text("profile model")],
+        fake_supported_reasoning(),
+        true,
+    );
     let mut new_config = config(base.join("data"), Vec::new());
-    change(new_config.profiles.get_mut("test").unwrap());
-    let mut new_agent = Agent::open_with_models(new_config, models(new_model))
+    let profile = new_config.profiles.get_mut("test").unwrap();
+    profile.model = "new".to_owned();
+    profile.reasoning = ReasoningPreference::High;
+    profile.system_prompt = "changed system prompt".to_owned();
+    profile.tools = vec!["read".to_owned()];
+    profile.max_tool_rounds = 5;
+    new_config.models.insert(
+        "new".to_owned(),
+        configured_model(
+            fake_supported_reasoning(),
+            true,
+            "MINICORE_UNUSED_PROFILE_DRIFT_KEY".to_owned(),
+        ),
+    );
+    let old_runtime_model: Arc<dyn Model> = old_model;
+    let new_runtime_model: Arc<dyn Model> = new_model;
+    let runtime_models = Models::from_values(BTreeMap::from([
+        ("fake".to_owned(), old_runtime_model),
+        ("new".to_owned(), new_runtime_model),
+    ]));
+    let mut new_agent = Agent::open_with_models(new_config, runtime_models)
         .await
         .unwrap();
-    assert!(matches!(
-        new_agent.open_session(info.session_id).await,
-        Err(AgentError::SessionSpecMismatch)
-    ));
+    let listed = new_agent.list_sessions().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].model, "fake");
+    assert_eq!(listed[0].reasoning, ReasoningPreference::Auto);
+    assert!(!listed[0].loaded);
+    let reopened = new_agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(reopened.model, "fake");
+    assert_eq!(reopened.reasoning, ReasoningPreference::Auto);
+    let loaded = new_agent.sessions.get(info.session_id).unwrap();
+    assert_eq!(loaded.spec.model.as_str(), "fake");
+    assert_eq!(loaded.spec.reasoning, ReasoningPreference::Auto);
+    assert_eq!(loaded.spec.system_prompt.as_str(), "You are a test agent.");
+    assert!(loaded.spec.enabled_tools.is_empty());
+    assert_eq!(loaded.spec.max_tool_rounds, 4);
+
+    let turn = new_agent
+        .send(SendMessage {
+            session_id: info.session_id,
+            text: "continue from manifest".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        new_agent
+            .turn_handle(turn)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .terminal,
+        TurnTerminal::Completed
+    );
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(new_calls.load(Ordering::SeqCst), 0);
+    {
+        let requests = old_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools().is_empty());
+        assert!(requests[0].messages().iter().any(|message| matches!(
+            message,
+            minicore_runtime::model::ModelMessage::System(text)
+                if text == "You are a test agent."
+        )));
+        assert!(!requests[0].messages().iter().any(|message| matches!(
+            message,
+            minicore_runtime::model::ModelMessage::System(text)
+                if text == "changed system prompt"
+        )));
+    }
+    let transcript = new_agent
+        .transcript(GetTranscript {
+            session_id: info.session_id,
+            after: None,
+            limit: 32,
+        })
+        .await
+        .unwrap();
+    assert!(transcript.entries.iter().any(|entry| matches!(
+        entry,
+        ConversationEntry::UserMessage(message)
+            if message.execution.model.as_str() == "fake"
+                && message.execution.reasoning == ReasoningPreference::Auto
+                && message.execution.max_tool_rounds == 4
+    )));
     assert_eq!(
         tokio::fs::read(&manifest_path).await.unwrap(),
         manifest_before
@@ -1813,28 +2018,79 @@ async fn assert_profile_drift(label: &str, change: fn(&mut Profile)) {
     remove_base(&base).await;
 }
 
-fn drift_system_prompt(profile: &mut Profile) {
-    profile.system_prompt = "changed system prompt".to_owned();
-}
+#[tokio::test(flavor = "current_thread")]
+async fn list_skips_one_bad_manifest_while_explicit_open_stays_strict() {
+    const MANIFEST_SECRET: &str = "PRIVATE-MANIFEST-CONTENT";
+    let tracing_capture = TestTracingCapture::new();
+    let _subscriber_guard = tracing_capture.enter();
+    let (mut agent, base, workspace, _) = agent_fixture(
+        "bad-manifest-list",
+        [ModelScript::Text("unused")],
+        Vec::new(),
+    )
+    .await;
+    let healthy = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    let corrupt = agent
+        .create_session(create_request(&workspace))
+        .await
+        .unwrap();
+    agent.close_session(healthy.session_id).await.unwrap();
+    let manifest_path = session_directory(&base, corrupt.session_id).join("manifest.json");
+    let manifest_before = tokio::fs::read(&manifest_path).await.unwrap();
+    let corrupt_manifest = format!("not-json {MANIFEST_SECRET}");
+    tokio::fs::write(&manifest_path, &corrupt_manifest)
+        .await
+        .unwrap();
 
-fn drift_reasoning(profile: &mut Profile) {
-    profile.reasoning = ReasoningPreference::High;
-}
+    let listed = agent.list_sessions().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, healthy.session_id);
+    assert_eq!(listed[0].model, "fake");
+    assert_eq!(listed[0].reasoning, ReasoningPreference::Auto);
 
-fn drift_max_rounds(profile: &mut Profile) {
-    profile.max_tool_rounds = 5;
-}
+    let mut mismatched: minicore_runtime::SessionManifest =
+        serde_json::from_slice(&manifest_before).unwrap();
+    mismatched.spec.reasoning = ReasoningPreference::High;
+    tokio::fs::write(&manifest_path, serde_json::to_vec(&mismatched).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(agent.list_sessions().await.unwrap(), listed);
 
-fn drift_tools(profile: &mut Profile) {
-    profile.tools = vec!["read".to_owned()];
-}
+    tokio::fs::write(&manifest_path, &corrupt_manifest)
+        .await
+        .unwrap();
+    agent.close_session(corrupt.session_id).await.unwrap();
+    assert_eq!(
+        tokio::fs::read_to_string(&manifest_path).await.unwrap(),
+        corrupt_manifest
+    );
+    assert!(matches!(
+        agent.open_session(corrupt.session_id).await,
+        Err(AgentError::Store)
+    ));
+    assert_eq!(
+        agent.open_session(healthy.session_id).await.unwrap().model,
+        "fake"
+    );
 
-#[tokio::test]
-async fn opening_rejects_each_supported_profile_spec_drift() {
-    assert_profile_drift("system-prompt", drift_system_prompt).await;
-    assert_profile_drift("reasoning", drift_reasoning).await;
-    assert_profile_drift("max-rounds", drift_max_rounds).await;
-    assert_profile_drift("tools", drift_tools).await;
+    agent.shutdown().await.unwrap();
+    remove_base(&base).await;
+    let logs = tracing_capture.contents();
+    assert!(!logs.contains(MANIFEST_SECRET));
+    let corrupt_id = corrupt.session_id.to_string();
+    assert!(logs.lines().any(|line| {
+        line.contains("skipping session with invalid manifest")
+            && test_log_field_equals(line, "session_id", &corrupt_id)
+            && test_log_field_equals(line, "error_kind", "corrupt")
+    }));
+    assert!(logs.lines().any(|line| {
+        line.contains("skipping session with invalid manifest")
+            && test_log_field_equals(line, "session_id", &corrupt_id)
+            && test_log_field_equals(line, "error_kind", "manifest_spec_mismatch")
+    }));
 }
 
 fn shutdown_diagnostic(retryable: bool) -> minicore_runtime::error::DiagnosticSummary {

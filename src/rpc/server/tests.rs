@@ -85,12 +85,20 @@ struct FakeModel {
 
 impl FakeModel {
     fn new(scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
+        Self::with_capabilities(scripts, fake_supported_reasoning(), true)
+    }
+
+    fn with_capabilities(
+        scripts: impl IntoIterator<Item = ModelScript>,
+        supported_reasoning: BTreeSet<ReasoningPreference>,
+        supports_tools: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             descriptor: ModelDescriptor::new(
                 "fake".parse::<ModelRef>().unwrap(),
                 16_384,
-                fake_supported_reasoning(),
-                true,
+                supported_reasoning,
+                supports_tools,
             )
             .unwrap(),
             scripts: Mutex::new(scripts.into_iter().collect()),
@@ -616,6 +624,8 @@ async fn every_rpc_method_runs_through_the_real_agent_lifecycle() {
     let created = rpc.response(json!("create")).await;
     let session_id = session_id(&created);
     assert_eq!(created["result"]["session"]["profile"], "test");
+    assert_eq!(created["result"]["session"]["model"], "fake");
+    assert_eq!(created["result"]["session"]["reasoning"], "medium");
     assert_eq!(created["result"]["session"]["loaded"], true);
 
     rpc.send(
@@ -757,6 +767,64 @@ async fn every_rpc_method_runs_through_the_real_agent_lifecycle() {
         rpc.response(json!("list-final")).await["result"]["sessions"],
         json!([])
     );
+
+    rpc.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_create_accepts_settings_and_rejects_incompatible_reasoning() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-session-settings-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let model = FakeModel::with_capabilities(
+        [ModelScript::Text("unused")],
+        BTreeSet::from([ReasoningPreference::Medium]),
+        true,
+    );
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), &[], ApprovalMode::Auto),
+        test_models(model),
+    )
+    .await
+    .unwrap();
+    let mut rpc = RpcHarness::spawn(agent);
+
+    rpc.send(
+        json!("invalid"),
+        "session.create",
+        Some(json!({
+            "workspace": workspace,
+            "model": "fake",
+            "reasoning": "high"
+        })),
+    )
+    .await;
+    let invalid = rpc.response(json!("invalid")).await;
+    assert_error(&invalid, -32_014, "invalid_session_settings");
+    assert_eq!(invalid["error"]["data"]["retryable"], false);
+    rpc.send(json!("empty"), "session.list", None).await;
+    assert_eq!(
+        rpc.response(json!("empty")).await["result"]["sessions"],
+        json!([])
+    );
+
+    rpc.send(
+        json!("valid"),
+        "session.create",
+        Some(json!({
+            "workspace": workspace,
+            "model": "fake",
+            "reasoning": "medium"
+        })),
+    )
+    .await;
+    let valid = rpc.response(json!("valid")).await;
+    assert_eq!(valid["result"]["session"]["model"], "fake");
+    assert_eq!(valid["result"]["session"]["reasoning"], "medium");
 
     rpc.shutdown().await;
     remove_base(&base).await;
@@ -1433,6 +1501,11 @@ fn agent_error_table_is_stable_and_never_serializes_sources() {
         (AgentError::TurnNotFound, -32_007, "turn_not_found"),
         (AgentError::ProfileNotFound, -32_008, "profile_not_found"),
         (AgentError::ModelNotFound, -32_009, "model_not_found"),
+        (
+            AgentError::InvalidSessionSettings,
+            -32_014,
+            "invalid_session_settings",
+        ),
         (AgentError::Workspace, -32_010, "workspace_error"),
         (AgentError::Store, -32_011, "store_error"),
         (AgentError::ModelNotImplemented, -32_012, "provider_error"),
