@@ -43,7 +43,7 @@ static APPEND_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 #[cfg(test)]
 static RECORD_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 
-/// Durable per-session product state owned by the Agent. Creating a session
+/// Persistent per-session product state owned by the Agent. Creating a session
 /// copies the profile's defaults into this record, so later profile edits (or
 /// deletion) never change an existing session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ impl SessionRecord {
     }
 }
 
-/// A loaded session: its durable record plus a sanitized in-memory history.
+/// A loaded session: its persistent record plus a sanitized in-memory history.
 pub(crate) struct StoredSession {
     pub(crate) record: SessionRecord,
     pub(crate) history: std::sync::Arc<[HistoryItem]>,
@@ -113,7 +113,7 @@ pub(crate) struct StoredLoopRecord {
     pub(crate) completed_at: String,
 }
 
-/// Durable record of how a loop ended. This is record-keeping only; it never
+/// Stored record of how a loop ended. This is record-keeping only; it never
 /// reconstructs a runtime `LoopReport`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

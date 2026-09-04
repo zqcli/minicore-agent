@@ -27,7 +27,7 @@ Subagent implementation, or compaction.
 A Session may select a configured `model` and `reasoning` value, or inherit the
 Profile defaults. Those settings are frozen when the Session is created and
 persist across close and reopen. `session.update` changes them later: the
-durable record is rewritten and any active loop receives the new execution
+persistent record is rewritten and any active loop receives the new execution
 config at its next request boundary while the current tool batch keeps its old
 snapshot.
 
@@ -45,11 +45,15 @@ One stored Session owns the full conversation:
     history.jsonl     one JSON line per completed loop record
 ```
 
-Every completed loop appends its sanitized history as a single durable JSON
-line. The append happens before the in-memory history is merged: if the append
-fails, the turn returns `persistence: failed` and the Session becomes blocked,
-refusing further turns so memory and disk never diverge. Reopening a Session
-replays `history.jsonl` into memory. Old v0.2 session data is not migrated.
+Every completed loop appends its sanitized history as a single JSON line. The
+append happens before the in-memory history is merged: if the append fails, the
+turn returns `persistence: failed` and the Session becomes blocked, refusing
+further turns so memory and disk never diverge. Reopening a Session replays
+`history.jsonl` into memory, providing best-effort crash tail repair for trailing
+incomplete lines. `persistence: persisted` means the Agent's append operation
+completed successfully in the running process. The Store is not a transactional
+ledger and does not provide an end-to-end crash-durability proof. Old v0.2
+session data is not migrated.
 
 Runtime `Finished` is not an Agent `TurnFinished`. After the loop finishes, the
 Agent attempts to persist the report, conditionally merges its history, and only
@@ -99,8 +103,8 @@ turn.send              turn.cancel            turn.wait
 turn.steer             interaction.answer
 ```
 
-`session.transcript` is gone; `session.history` returns the sanitized durable
-conversation. Errors are classified as before with domain codes `-32001`
+`session.transcript` is gone; `session.history` returns the sanitized stored
+history. Errors are classified as before with domain codes `-32001`
 through `-32016` plus `-32015 history_too_large` and `-32016
 steer_queue_full`. The full wire contract, frame interleaving guarantees, event
 shapes, and error mapping are documented in [docs/rpc.md](docs/rpc.md).
@@ -168,6 +172,13 @@ owns the global event channel; one Session owns its own history and runs at
 most one loop task at a time. `session.create` and `session.open` never start a
 loop. `session.close` cancels any active loop, joins the worker, and persists
 cleanly before returning.
+
+`Agent::shutdown` is the cleanup barrier for embedded Rust callers. It cancels
+active loops, waits for Agent-owned loop tasks, and awaits persistence wrap-up.
+Dropping an Agent with live turns does not synchronously wait for Agent-owned
+loop tasks. MiniCore Agent v0.3 uses the Runtime user-cancellation path when
+closing or shutting down an active Session; it does not currently preserve a
+distinct shutdown cancellation reason.
 
 ## Development
 

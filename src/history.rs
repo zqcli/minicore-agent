@@ -82,7 +82,7 @@ fn sanitize_assistant(
     }))
 }
 
-/// Request for one paginated slice of a session's durable history.
+/// Request for one paginated slice of a session's stored history.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetHistory {
@@ -117,7 +117,7 @@ pub struct IndexedHistoryItem {
     pub item: HistoryItemView,
 }
 
-/// Redacted view of one durable `HistoryItem`.
+/// Redacted view of one stored `HistoryItem`.
 ///
 /// Tool-call arguments and opaque reasoning are never exposed here; read the
 /// authoritative view through the safe fields only.
