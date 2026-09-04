@@ -1036,7 +1036,7 @@ mod tests {
         let follow_up = BashTool::new(workspace, empty_command_environment());
         let pid_file = base.join("root/grandchild.pid");
         let started = Instant::now();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             tool.execute(
                 invocation(json!({
                     "command": windows_grandchild_command(false),
@@ -1049,7 +1049,7 @@ mod tests {
             )
             .await
         });
-        let pid = read_pid(&pid_file).await;
+        let pid = read_pid_or_task(&pid_file, &mut task).await;
         let mut guard = WindowsProcessGuard::new(pid);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(3), task)
@@ -1073,7 +1073,7 @@ mod tests {
         let pid_file = base.join("root/grandchild.pid");
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             tool.execute(
                 invocation(json!({
                     "command": windows_grandchild_command(false),
@@ -1083,7 +1083,7 @@ mod tests {
             )
             .await
         });
-        let pid = read_pid(&pid_file).await;
+        let pid = read_pid_or_task(&pid_file, &mut task).await;
         let mut guard = WindowsProcessGuard::new(pid);
         cancellation.cancel();
         assert_eq!(
@@ -1110,7 +1110,7 @@ mod tests {
             let (base, workspace, tool) = fixture("windows-held-pipe-drop").await;
             let follow_up = BashTool::new(workspace, empty_command_environment());
             let pid_file = base.join("root/grandchild.pid");
-            let task = tokio::spawn(async move {
+            let mut task = tokio::spawn(async move {
                 tool.execute(
                     invocation(json!({
                         "command": windows_grandchild_command(true),
@@ -1123,7 +1123,7 @@ mod tests {
                 )
                 .await
             });
-            let pid = read_pid(&pid_file).await;
+            let pid = read_pid_or_task(&pid_file, &mut task).await;
             let mut guard = WindowsProcessGuard::new(pid);
             task.abort();
             assert!(
@@ -1238,7 +1238,7 @@ mod tests {
         assert_eq!(observed, Some(ToolError::Internal));
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     async fn read_pid(path: &Path) -> u32 {
         for _ in 0..200 {
             if let Ok(value) = tokio::fs::read_to_string(path).await {
@@ -1247,6 +1247,44 @@ mod tests {
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test process did not publish its PID");
+    }
+
+    #[cfg(windows)]
+    fn report_finished_pid_task(
+        result: Result<Result<ToolExecutionOutcome, ToolError>, tokio::task::JoinError>,
+    ) -> ! {
+        match result {
+            Ok(Ok(ToolExecutionOutcome::Completed(_))) => {
+                panic!("tool returned Completed before publishing its PID")
+            }
+            Ok(Ok(ToolExecutionOutcome::RequestInput(_))) => {
+                panic!("tool returned RequestInput before publishing its PID")
+            }
+            Ok(Err(error)) => panic!("tool failed before publishing its PID: {error}"),
+            Err(error) => panic!("tool task ended before publishing its PID: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn read_pid_or_task(
+        path: &Path,
+        task: &mut tokio::task::JoinHandle<Result<ToolExecutionOutcome, ToolError>>,
+    ) -> u32 {
+        for _ in 0..200 {
+            if let Ok(value) = tokio::fs::read_to_string(path).await {
+                if let Ok(pid) = value.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::select! {
+                result = &mut *task => report_finished_pid_task(result),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        if task.is_finished() {
+            report_finished_pid_task((&mut *task).await);
         }
         panic!("test process did not publish its PID");
     }
