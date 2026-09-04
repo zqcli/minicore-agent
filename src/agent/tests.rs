@@ -759,7 +759,13 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
     assert!(matches!(error, Err(AgentError::SessionBlocked)));
     let state = agent.session_state(info.session_id).unwrap();
     assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
-    agent.close_session(info.session_id).await.unwrap();
+    let close = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        agent.close_session(info.session_id),
+    )
+    .await
+    .expect("close must reclaim a panicked worker");
+    assert!(matches!(close, Err(AgentError::Internal)));
     agent.shutdown().await.unwrap();
 }
 
@@ -903,6 +909,86 @@ async fn append_failure_blocks_session_and_returns_failed_persistence() {
         })
         .await;
     assert!(matches!(busy, Err(AgentError::SessionBlocked)));
+}
+
+#[tokio::test]
+async fn blocked_send_does_not_discard_previous_turn_result() {
+    let (data_dir, _guard) = fixture_dir(&format!("blocked-discard-{}", next_id()));
+    let (workspace, _guard) = workspace_file("blocked-discard-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("persist me")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    fail_next_append(info.session_id);
+
+    let turn = send_text(&mut agent, info.session_id, "first turn").await;
+
+    // Wait deterministically for the session to transition to Blocked.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let state = agent.session_state(info.session_id).unwrap();
+        if state.status == crate::sessions::SessionStatus::Blocked {
+            assert_eq!(
+                state.block_reason,
+                Some(crate::sessions::SessionBlockReason::Persistence)
+            );
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "session did not reach Blocked; final status: {:?}",
+                state.status
+            );
+        }
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+    }
+
+    // A second send fails with SessionBlocked.
+    let second_send = agent
+        .send(crate::agent::SendMessage {
+            session_id: info.session_id,
+            text: "second turn".to_owned(),
+        })
+        .await;
+    assert!(matches!(second_send, Err(AgentError::SessionBlocked)));
+
+    // First turn.wait still resolves with the authoritative runtime outcome and persistence failure.
+    let first_result = agent
+        .wait_turn(turn)
+        .await
+        .expect("previous turn wait must succeed even after blocked send");
+    assert_eq!(
+        first_result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        first_result.persistence,
+        crate::sessions::TurnPersistence::Failed
+    );
+
+    // Repeated wait returns the same result.
+    let second_wait = agent
+        .wait_turn(turn)
+        .await
+        .expect("repeated wait on blocked turn must succeed");
+    assert_eq!(
+        second_wait.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        second_wait.persistence,
+        crate::sessions::TurnPersistence::Failed
+    );
+    assert_eq!(second_wait.turn, turn);
+
+    // Close reclaims the active task cleanly.
+    agent.close_session(info.session_id).await.unwrap();
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]
