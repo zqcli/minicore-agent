@@ -678,6 +678,86 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
 }
 
 #[tokio::test]
+async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
+    let (agent, base, workspace) = test_agent(
+        "blocked-discard",
+        [ModelScript::Text("hello")],
+        &["read"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    fail_next_append(session_id.as_str().unwrap().parse().unwrap());
+
+    // 1. send first turn
+    harness
+        .send(
+            json!("send1"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "hello"})),
+        )
+        .await;
+    let sent = harness.response(json!("send1")).await;
+    let turn = sent["result"]["turn"].clone();
+
+    // 2. Deterministically wait for session to reach blocked state before waiting turn.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        harness
+            .send(
+                json!("poll_state"),
+                "session.state",
+                Some(json!({"session_id": session_id})),
+            )
+            .await;
+        let state = harness.response(json!("poll_state")).await;
+        if state["result"]["status"] == json!("blocked") {
+            assert_eq!(state["result"]["block_reason"], json!("persistence"));
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "session did not reach blocked; final state: {:?}",
+                state["result"]
+            );
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    }
+
+    // 3. Second send fails with -32004 session_blocked
+    harness
+        .send(
+            json!("send2"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "again"})),
+        )
+        .await;
+    let send2 = harness.response(json!("send2")).await;
+    assert_eq!(send2["error"]["code"], json!(-32004));
+
+    // 4. First turn.wait still succeeds (not -32007 turn_not_found)
+    harness
+        .send(json!("wait1"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let waited1 = harness.response(json!("wait1")).await;
+    assert_eq!(waited1["result"]["outcome"]["type"], json!("completed"));
+    assert_eq!(waited1["result"]["persistence"], json!("failed"));
+
+    // 5. Repeated turn.wait also succeeds
+    harness
+        .send(json!("wait2"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let waited2 = harness.response(json!("wait2")).await;
+    assert_eq!(waited2["result"]["outcome"]["type"], json!("completed"));
+    assert_eq!(waited2["result"]["persistence"], json!("failed"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
 async fn interaction_answer_resolves_an_approval() {
     let (agent, base, workspace) = test_agent(
         "approval",

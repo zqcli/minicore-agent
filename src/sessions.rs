@@ -456,6 +456,9 @@ impl Session {
     pub(crate) async fn cleanup_finished(&self) -> Result<(), AgentError> {
         let (finished, completed) = {
             let inner = self.shared.inner.lock().unwrap();
+            if inner.blocked.is_some() {
+                return Err(AgentError::SessionBlocked);
+            }
             match inner.active.as_ref() {
                 None => return Ok(()),
                 Some(active) => (
@@ -473,6 +476,9 @@ impl Session {
         }
         let task = {
             let mut inner = self.shared.inner.lock().unwrap();
+            if inner.blocked.is_some() {
+                return Err(AgentError::SessionBlocked);
+            }
             inner.active.as_mut().and_then(|active| active.task.take())
         };
         if let Some(task) = task {
@@ -486,10 +492,10 @@ impl Session {
             }
         }
         let mut inner = self.shared.inner.lock().unwrap();
-        inner.active = None;
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
+        inner.active = None;
         Ok(())
     }
 
