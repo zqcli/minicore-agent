@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -15,7 +16,9 @@ use minicore_runtime::model::{ModelError, ModelErrorKind, RetryHint, Usage};
 use crate::error::StoreError;
 use crate::history::sanitize_history;
 use crate::ids::SessionId;
+use crate::models::Models;
 use crate::profiles::ApprovalMode;
+use crate::tools::KNOWN_TOOL_NAMES;
 
 pub(crate) const SESSION_FORMAT_VERSION: u32 = 1;
 
@@ -29,10 +32,8 @@ const MAX_LOOP_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SESSION_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4_096;
-const MAX_MODEL_BYTES: usize = 256;
 const MAX_TITLE_BYTES: usize = 4_096;
 const MAX_TIMESTAMP_BYTES: usize = 64;
-const MAX_TOOL_NAME_BYTES: usize = 64;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 128 * 1024;
 
 static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -65,17 +66,20 @@ pub(crate) struct SessionRecord {
 
 impl SessionRecord {
     pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        let mut seen_tools = BTreeSet::new();
+        let valid_tools = self.tools.len() <= KNOWN_TOOL_NAMES.len()
+            && self.tools.iter().all(|name| {
+                KNOWN_TOOL_NAMES.contains(&name.as_str()) && seen_tools.insert(name.as_str())
+            });
+
         if self.format_version != SESSION_FORMAT_VERSION
             || !valid_text(&self.profile, MAX_PROFILE_BYTES, false)
-            || !valid_text(&self.model, MAX_MODEL_BYTES, false)
+            || Models::model_ref(&self.model).is_err()
             || self.workspace.as_os_str().is_empty()
             || self.workspace.as_os_str().len() > MAX_WORKSPACE_BYTES
-            || self.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES
+            || !valid_multiline_text(&self.system_prompt, MAX_SYSTEM_PROMPT_BYTES, false)
             || !(1..=1_024).contains(&self.max_tool_rounds)
-            || self
-                .tools
-                .iter()
-                .any(|name| !valid_text(name, MAX_TOOL_NAME_BYTES, false))
+            || !valid_tools
             || !valid_timestamp(&self.created_at)
             || !valid_timestamp(&self.updated_at)
             || self
@@ -783,6 +787,14 @@ fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
     (allow_empty || !value.is_empty())
         && value.len() <= maximum
         && value.chars().all(|character| !character.is_control())
+}
+
+fn valid_multiline_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty())
+        && value.len() <= maximum
+        && value
+            .chars()
+            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
 }
 
 fn valid_timestamp(value: &str) -> bool {
@@ -1584,6 +1596,134 @@ mod tests {
                 .iter()
                 .any(|part| part.as_tool_call().is_some())
         );
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn session_record_validation_accepts_valid_multiline_prompt_and_known_tools() {
+        let (base, store, session_id) = fixture("valid-record").await;
+        let mut record = record(&store, session_id);
+        record.system_prompt = concat!(
+            "You are a helpful assistant.\n",
+            "\tPlease follow instructions:\n",
+            "1. Read files.\n",
+            "2. Write files."
+        )
+        .to_owned();
+        record.tools = vec!["read".to_owned(), "write".to_owned(), "bash".to_owned()];
+        record.model = "provider/model-v1:beta".to_owned();
+        assert!(record.validate().is_ok());
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn session_record_validation_rejects_empty_and_control_chars_in_system_prompt() {
+        let (base, store, session_id) = fixture("invalid-prompt").await;
+        let mut record = record(&store, session_id);
+
+        record.system_prompt = String::new();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.system_prompt = "hello\0world".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.system_prompt = "hello\x01world".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.system_prompt = "hello\rworld".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.system_prompt = "hello\r\nworld".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.system_prompt = "hello\n\tworld".to_owned();
+        assert!(record.validate().is_ok());
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn session_record_validation_rejects_unknown_and_duplicate_tools() {
+        let (base, store, session_id) = fixture("invalid-tools").await;
+        let mut record = record(&store, session_id);
+
+        record.tools = vec!["read".to_owned(), "unknown_tool".to_owned()];
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.tools = vec!["read".to_owned(), "read".to_owned()];
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.tools = vec![];
+        assert!(record.validate().is_ok());
+
+        record.tools = KNOWN_TOOL_NAMES
+            .iter()
+            .map(|&name| name.to_owned())
+            .collect();
+        assert!(record.validate().is_ok());
+
+        record.tools.push("read".to_owned());
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn session_record_validation_rejects_invalid_model_ids() {
+        let (base, store, session_id) = fixture("invalid-model").await;
+        let mut record = record(&store, session_id);
+
+        record.model = String::new();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.model = "my model".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.model = "model\nid".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.model = "model@invalid".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.model = "model$invalid".to_owned();
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+
+        record.model = "main".to_owned();
+        assert!(record.validate().is_ok());
+
+        record.model = "vendor/model-name:v1.0".to_owned();
+        assert!(record.validate().is_ok());
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_session_record_skipped_by_list_and_rejected_by_open() {
+        let (base, store, valid_id) = fixture("corrupt-record-list-open").await;
+
+        let valid_record = record(&store, valid_id);
+        store.create_session(&valid_record).await.unwrap();
+
+        let invalid_id = SessionId::new().unwrap();
+        let invalid_dir = store.session_directory(invalid_id);
+        fs::create_dir_all(&invalid_dir).await.unwrap();
+
+        let mut invalid_record = record(&store, invalid_id);
+        invalid_record.system_prompt = String::new();
+        let invalid_bytes = serde_json::to_vec(&invalid_record).unwrap();
+        fs::write(invalid_dir.join(SESSION_RECORD_FILE), invalid_bytes)
+            .await
+            .unwrap();
+        fs::write(invalid_dir.join(HISTORY_FILE), b"")
+            .await
+            .unwrap();
+
+        let listed = store.list_sessions().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, valid_id);
+
+        let open_result = store.load_session(invalid_id).await;
+        assert!(matches!(open_result, Err(StoreError::Corrupt)));
+
+        assert!(store.load_session(valid_id).await.is_ok());
+
         let _ = fs::remove_dir_all(base).await;
     }
 }

@@ -1998,3 +1998,36 @@ async fn invalid_agents_md_fails_the_turn_as_a_prompt_error() {
         crate::sessions::TurnPersistence::Persisted
     );
 }
+
+#[tokio::test]
+async fn invalid_session_json_skipped_by_list_and_fails_open() {
+    let (data_dir, _guard) = fixture_dir(&format!("invalid-record-{}", next_id()));
+    let (workspace, _guard) = workspace_file("invalid-record-ws", "a.txt", b"hello");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    agent.close_session(info.session_id).await.unwrap();
+
+    let record_path = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("session.json");
+    let raw = std::fs::read_to_string(&record_path).unwrap();
+    let mut parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    parsed["system_prompt"] = json!("");
+    let updated = serde_json::to_string(&parsed).unwrap();
+    std::fs::write(&record_path, updated).unwrap();
+
+    let listed = agent.list_sessions().await.unwrap();
+    assert!(listed.is_empty());
+    assert!(matches!(
+        agent.open_session(info.session_id).await,
+        Err(AgentError::Store)
+    ));
+
+    agent.shutdown().await.unwrap();
+}
