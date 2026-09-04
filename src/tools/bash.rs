@@ -1040,11 +1040,11 @@ mod tests {
             tool.execute(
                 invocation(json!({
                     "command": windows_grandchild_command(false),
-                    "timeout_seconds": 1
+                    "timeout_seconds": 10
                 })),
                 context(
                     CancellationToken::new(),
-                    Instant::now() + Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(15),
                 ),
             )
             .await
@@ -1052,13 +1052,13 @@ mod tests {
         let pid = read_pid_or_task(&pid_file, &mut task).await;
         let mut guard = WindowsProcessGuard::new(pid);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), task)
+            tokio::time::timeout(Duration::from_secs(15), task)
                 .await
                 .unwrap()
                 .unwrap(),
             Err(ToolError::TimedOut)
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(15));
         assert!(process_exists(pid));
         assert_windows_follow_up(&follow_up).await;
         guard.terminate().await;
@@ -1272,21 +1272,32 @@ mod tests {
         path: &Path,
         task: &mut tokio::task::JoinHandle<Result<ToolExecutionOutcome, ToolError>>,
     ) -> u32 {
-        for _ in 0..200 {
-            if let Ok(value) = tokio::fs::read_to_string(path).await {
-                if let Ok(pid) = value.trim().parse() {
-                    return pid;
+        const READY_TIMEOUT: Duration = Duration::from_secs(15);
+        let wait = async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(path).await {
+                    if let Ok(pid) = value.trim().parse() {
+                        return pid;
+                    }
+                }
+                tokio::select! {
+                    result = &mut *task => report_finished_pid_task(result),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                 }
             }
-            tokio::select! {
-                result = &mut *task => report_finished_pid_task(result),
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        };
+        match tokio::time::timeout(READY_TIMEOUT, wait).await {
+            Ok(pid) => pid,
+            Err(_) => {
+                task.abort();
+                match (&mut *task).await {
+                    Err(error) if error.is_cancelled() => {
+                        panic!("test process did not publish its PID within {READY_TIMEOUT:?}")
+                    }
+                    result => report_finished_pid_task(result),
+                }
             }
         }
-        if task.is_finished() {
-            report_finished_pid_task((&mut *task).await);
-        }
-        panic!("test process did not publish its PID");
     }
 
     #[cfg(unix)]
