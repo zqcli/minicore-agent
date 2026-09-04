@@ -71,7 +71,9 @@ the event stream.
 
 `agent.shutdown` waits for the Agent, pre-existing waiter tasks, and event pump,
 then queues its response last. EOF, Ctrl-C, writer failure, and explicit
-shutdown enter the same owned-task shutdown path.
+shutdown enter the same owned-task shutdown path. MiniCore Agent v0.3 uses the
+Runtime user-cancellation path when closing or shutting down an active Session;
+it does not currently preserve a distinct shutdown cancellation reason.
 
 ## Agent Methods
 
@@ -156,7 +158,7 @@ Params are omitted or `{}`.
 ```
 
 Each element of `sessions` is a SessionInfo object. The Store supplies records
-in stable Session ID order. Entries whose durable data cannot be read are
+in stable Session ID order. Entries whose persistent record cannot be read are
 omitted; explicit operations on such a Session remain strict.
 
 ### `session.create`
@@ -183,10 +185,12 @@ The result has a `session` member containing the created SessionInfo.
 ### Other Session Methods
 
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
-  member containing SessionInfo (with `loaded: true`) after loading the durable
+  member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
 - `session.close` cancels any active loop, joins its worker, and returns
-  `{"ok":true}`.
+  `{"ok":true}`. MiniCore Agent v0.3 uses the Runtime user-cancellation path
+  when closing or shutting down an active Session; it does not currently preserve
+  a distinct shutdown cancellation reason.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`.
 - `session.state` takes a loaded Session ID and returns the current Session
   state projection.
@@ -198,7 +202,7 @@ The result has a `session` member containing the created SessionInfo.
 ```
 
 `model` and `reasoning` are optional but at least one must be present; otherwise
-the request is rejected with `-32602`. The change is validated and the durable
+the request is rejected with `-32602`. The change is validated and the persistent
 `session.json` updated before the response. Any active loop keeps running with
 its current snapshot; the update is forwarded to the loop and takes effect at
 the next request boundary.
@@ -212,7 +216,7 @@ the next request boundary.
 
 `active_revision` is the revision applied to the running loop, or `null` when
 the session is idle. It is also `null` when `session.update` races with a loop
-that has already sealed: the durable Session settings are updated for the next
+that has already sealed: the persistent Session settings are updated for the next
 turn, but no revision is applied to the sealed loop.
 
 ## History
@@ -224,7 +228,7 @@ turn, but no revision is applied to the sealed loop.
 ```
 
 `offset` defaults to 0. `limit` defaults to 100 and must be in `1..=100`. Items
-are returned in durable order with contiguous indexes.
+are returned in stored history order with contiguous indexes.
 
 ```json
 {
@@ -296,8 +300,11 @@ response arrives:
 
 `outcome.type` is `completed`, `cancelled` (with `reason`), or `failed` (with
 `kind` and optionally `model_error`). `persistence` is `persisted` or `failed`.
-A failed JSONL append returns the completed loop report with
-`persistence: failed` and blocks the Session from further turns.
+`persistence: persisted` means the Agent's append operation completed
+successfully in the running process. The Store is not a transactional ledger and
+does not provide an end-to-end crash-durability proof. A failed JSONL append
+returns the completed loop report with `persistence: failed` and blocks the
+Session from further turns.
 
 ### `turn.cancel`
 

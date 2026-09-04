@@ -126,6 +126,12 @@ struct ResolvedSessionSettings {
     reasoning: ReasoningPreference,
 }
 
+/// Top-level coordinator for the local Store and loaded Sessions.
+///
+/// `Agent::shutdown` is the cleanup barrier for embedded Rust callers: it
+/// cancels active loops, waits for Agent-owned loop tasks, and awaits
+/// persistence wrap-up. Dropping an `Agent` with live turns does not
+/// synchronously wait for Agent-owned loop tasks.
 pub struct Agent {
     config: AgentConfig,
     store: Store,
@@ -349,6 +355,12 @@ impl Agent {
         Ok(info)
     }
 
+    /// Closes and unloads a loaded Session by ID.
+    ///
+    /// If the Session has an active loop, it is cancelled and its Agent-owned task
+    /// is joined before unloading. MiniCore Agent v0.3 uses the Runtime
+    /// user-cancellation path when closing or shutting down an active Session;
+    /// it does not currently preserve a distinct shutdown cancellation reason.
     pub async fn close_session(
         &mut self,
         session_id: crate::ids::SessionId,
@@ -531,6 +543,16 @@ impl Agent {
         session.history(&request)
     }
 
+    /// Orderly shutdown barrier for embedded Rust callers.
+    ///
+    /// Cancels active loops across all loaded Sessions, waits for Agent-owned
+    /// loop tasks and persistence completion, and drops event channels.
+    /// Dropping an `Agent` with live turns does not synchronously wait for
+    /// Agent-owned loop tasks.
+    ///
+    /// MiniCore Agent v0.3 uses the Runtime user-cancellation path when closing
+    /// or shutting down an active Session; it does not currently preserve a distinct
+    /// shutdown cancellation reason.
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
         let result = self.sessions.shutdown_all().await;
