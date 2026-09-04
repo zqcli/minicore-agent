@@ -325,9 +325,8 @@ fn create_capture_pipe(
     let pipe_id = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
     let tool_call_id = safe_pipe_component(invocation.tool_call_id().as_str());
     let pipe_name = format!(
-        r"\\.\pipe\minicore-agent-{}-{}-{}-{pipe_id}-{stream}",
+        r"\\.\pipe\minicore-agent-{}-{}-{pipe_id}-{stream}",
         std::process::id(),
-        invocation.session_id(),
         tool_call_id,
     );
     let server = ServerOptions::new()
