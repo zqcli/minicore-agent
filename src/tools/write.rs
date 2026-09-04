@@ -492,19 +492,22 @@ mod tests {
         fail_next_directory_sync(target.parent().unwrap().to_path_buf());
         let gate = Arc::new(BeforeRenameGate::new(target.clone()));
         block_before_rename(Arc::clone(&gate));
+        let deadline = Instant::now() + Duration::from_millis(1000);
         let task = tokio::spawn(async move {
             tool.execute(
                 invocation(json!({"path": "value", "content": "complete-new"})),
-                context(
-                    CancellationToken::new(),
-                    Instant::now() + Duration::from_millis(25),
-                ),
+                context(CancellationToken::new(), deadline),
             )
             .await
         });
 
-        gate.wait_started().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("worker reached pre-rename gate before deadline");
+        tokio::time::sleep_until(
+            tokio::time::Instant::from_std(deadline) + Duration::from_millis(25),
+        )
+        .await;
         let finished_before_release = task.is_finished();
         gate.release();
         let result = task.await.unwrap();
