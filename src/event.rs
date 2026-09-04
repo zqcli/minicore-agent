@@ -1,29 +1,30 @@
-#[cfg(test)]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use serde::{Serialize, Serializer};
-#[cfg(test)]
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
-use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
-use minicore_runtime::model::Usage;
-use minicore_runtime::session::{
-    InteractionKind, SessionEvent, SessionEventEnvelope, SessionHealth, SessionState, SessionStatus,
-};
+use minicore_runtime::execution::ConfigRevision;
+use minicore_runtime::interaction::{InteractionKind, PendingInteraction};
+use minicore_runtime::model::{ModelError, Usage};
 use minicore_runtime::tools::{ApprovalRisk, ToolInputAnswerKind, ToolProgress, ToolResultOutcome};
+use minicore_runtime::{InteractionId, LoopId, ToolCallId};
 
-use crate::agent::{SessionInfo, TurnRef};
+use crate::agent::SessionInfo;
+use crate::history::{HistoryItemView, HistoryPage};
+use crate::ids::SessionId;
+use crate::sessions::{SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef};
 
+/// Identity and drop accounting attached to every agent event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct EventMeta {
     pub session_id: SessionId,
-    pub instance_id: SessionInstanceId,
+    pub loop_id: Option<LoopId>,
     pub dropped_before: u64,
 }
 
+/// Best-effort live events. Events never participate in correctness; the
+/// authoritative results are `turn.wait` and `session.history`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentEvent {
     SessionOpened {
@@ -42,43 +43,56 @@ pub enum AgentEvent {
         turn: TurnRef,
         meta: EventMeta,
     },
+    RequestStarted {
+        turn: TurnRef,
+        request_index: u32,
+        config_revision: ConfigRevision,
+        model: String,
+        reasoning: minicore_runtime::model::ReasoningPreference,
+        meta: EventMeta,
+    },
     OutputDelta {
         turn: TurnRef,
+        request_index: u32,
         channel: OutputChannel,
         delta: String,
         meta: EventMeta,
     },
     ToolStarted {
         turn: TurnRef,
+        request_index: u32,
         tool_call_id: ToolCallId,
         tool_name: String,
         meta: EventMeta,
     },
     ToolProgress {
         turn: TurnRef,
+        request_index: u32,
         tool_call_id: ToolCallId,
         progress: ToolProgressView,
         meta: EventMeta,
     },
     ToolFinished {
         turn: TurnRef,
+        request_index: u32,
         tool_call_id: ToolCallId,
         result: ToolResultView,
         meta: EventMeta,
     },
     InteractionRequested {
-        session_id: SessionId,
-        interaction: minicore_runtime::PendingInteraction,
+        turn: TurnRef,
+        interaction: PendingInteractionView,
         meta: EventMeta,
     },
     InteractionResolved {
-        session_id: SessionId,
+        turn: TurnRef,
         interaction_id: InteractionId,
         meta: EventMeta,
     },
     TurnFinished {
         turn: TurnRef,
-        outcome: minicore_runtime::TurnOutcome,
+        outcome: LoopOutcomeView,
+        persistence: TurnPersistence,
         meta: EventMeta,
     },
 }
@@ -92,12 +106,13 @@ impl AgentEvent {
         self.meta_mut().dropped_before = dropped_before;
     }
 
-    fn meta(&self) -> &EventMeta {
+    pub(crate) fn meta(&self) -> &EventMeta {
         match self {
             Self::SessionOpened { meta, .. }
             | Self::SessionClosed { meta, .. }
             | Self::SessionState { meta, .. }
             | Self::TurnStarted { meta, .. }
+            | Self::RequestStarted { meta, .. }
             | Self::OutputDelta { meta, .. }
             | Self::ToolStarted { meta, .. }
             | Self::ToolProgress { meta, .. }
@@ -108,12 +123,13 @@ impl AgentEvent {
         }
     }
 
-    fn meta_mut(&mut self) -> &mut EventMeta {
+    pub(crate) fn meta_mut(&mut self) -> &mut EventMeta {
         match self {
             Self::SessionOpened { meta, .. }
             | Self::SessionClosed { meta, .. }
             | Self::SessionState { meta, .. }
             | Self::TurnStarted { meta, .. }
+            | Self::RequestStarted { meta, .. }
             | Self::OutputDelta { meta, .. }
             | Self::ToolStarted { meta, .. }
             | Self::ToolProgress { meta, .. }
@@ -125,13 +141,15 @@ impl AgentEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) enum AgentSendResult {
     Sent,
     Dropped,
     Closed,
 }
 
+/// Cloneable sender that merges runtime-envelope drops and its own bounded
+/// queue drops into the next delivered event's `dropped_before`.
 #[derive(Clone)]
 pub(crate) struct AgentEventSink {
     sender: mpsc::Sender<AgentEvent>,
@@ -140,98 +158,6 @@ pub(crate) struct AgentEventSink {
 
 struct DropState {
     pending: u64,
-}
-
-#[cfg(test)]
-pub(crate) struct TurnFinishedAttemptProbe {
-    session_id: SessionId,
-    instance_id: SessionInstanceId,
-    started: Arc<Semaphore>,
-    completed: Arc<Semaphore>,
-}
-
-#[cfg(test)]
-impl TurnFinishedAttemptProbe {
-    pub(crate) fn new(session_id: SessionId, instance_id: SessionInstanceId) -> Self {
-        Self {
-            session_id,
-            instance_id,
-            started: Arc::new(Semaphore::new(0)),
-            completed: Arc::new(Semaphore::new(0)),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.started.acquire().await.unwrap().forget();
-    }
-
-    pub(crate) async fn wait_completed(&self) {
-        self.completed.acquire().await.unwrap().forget();
-    }
-
-    fn matches(&self, turn: TurnRef) -> bool {
-        self.session_id == turn.session_id && self.instance_id == turn.instance_id
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct TurnFinishedAttemptProbeRegistration {
-    probe: Arc<TurnFinishedAttemptProbe>,
-}
-
-#[cfg(test)]
-impl Drop for TurnFinishedAttemptProbeRegistration {
-    fn drop(&mut self) {
-        let mut probes = turn_finished_attempt_probes()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        probes.retain(|probe| !Arc::ptr_eq(probe, &self.probe));
-    }
-}
-
-#[cfg(test)]
-static TURN_FINISHED_ATTEMPT_PROBES: OnceLock<Mutex<Vec<Arc<TurnFinishedAttemptProbe>>>> =
-    OnceLock::new();
-
-#[cfg(test)]
-fn turn_finished_attempt_probes() -> &'static Mutex<Vec<Arc<TurnFinishedAttemptProbe>>> {
-    TURN_FINISHED_ATTEMPT_PROBES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-#[cfg(test)]
-pub(crate) fn register_turn_finished_attempt_probe(
-    probe: Arc<TurnFinishedAttemptProbe>,
-) -> TurnFinishedAttemptProbeRegistration {
-    turn_finished_attempt_probes()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(Arc::clone(&probe));
-    TurnFinishedAttemptProbeRegistration { probe }
-}
-
-#[cfg(test)]
-fn begin_turn_finished_attempt(event: &AgentEvent) -> Vec<Arc<TurnFinishedAttemptProbe>> {
-    let AgentEvent::TurnFinished { turn, .. } = event else {
-        return Vec::new();
-    };
-    let probes = turn_finished_attempt_probes()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .filter(|probe| probe.matches(*turn))
-        .cloned()
-        .collect::<Vec<_>>();
-    for probe in &probes {
-        probe.started.add_permits(1);
-    }
-    probes
-}
-
-#[cfg(test)]
-fn complete_turn_finished_attempt(probes: Vec<Arc<TurnFinishedAttemptProbe>>) {
-    for probe in probes {
-        probe.completed.add_permits(1);
-    }
 }
 
 impl AgentEventSink {
@@ -250,28 +176,20 @@ impl AgentEventSink {
         if self.sender.is_closed() {
             return AgentSendResult::Closed;
         }
-        let core_dropped = event.dropped_before();
-        let reported = pending.pending.saturating_add(core_dropped);
+        let own_drops = event.dropped_before();
+        let reported = pending.pending.saturating_add(own_drops);
         event.set_dropped_before(reported);
-        #[cfg(test)]
-        let attempt_probes = begin_turn_finished_attempt(&event);
-        let result = match self.sender.try_send(event) {
+        match self.sender.try_send(event) {
             Ok(()) => {
                 pending.pending = 0;
                 AgentSendResult::Sent
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                pending.pending = pending
-                    .pending
-                    .saturating_add(core_dropped)
-                    .saturating_add(1);
+                pending.pending = pending.pending.saturating_add(own_drops).saturating_add(1);
                 AgentSendResult::Dropped
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AgentSendResult::Closed,
-        };
-        #[cfg(test)]
-        complete_turn_finished_attempt(attempt_probes);
-        result
+        }
     }
 
     pub(crate) fn record_core_drops(&self, dropped: u64) {
@@ -281,14 +199,6 @@ impl AgentEventSink {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pending.pending = pending.pending.saturating_add(dropped);
     }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.sender.is_closed()
-    }
-
-    pub(crate) async fn closed(&self) {
-        self.sender.closed().await;
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -296,6 +206,15 @@ impl AgentEventSink {
 pub enum OutputChannel {
     Text,
     Reasoning,
+}
+
+impl OutputChannel {
+    pub(crate) fn from_runtime(channel: minicore_runtime::OutputChannel) -> Self {
+        match channel {
+            minicore_runtime::OutputChannel::Text => Self::Text,
+            minicore_runtime::OutputChannel::Reasoning => Self::Reasoning,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -324,24 +243,157 @@ pub struct ToolResultView {
     pub content_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ApprovalRiskView {
-    Low,
-    Medium,
-    High,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoopOutcomeView {
+    Completed,
+    Cancelled {
+        reason: CancelReasonView,
+    },
+    Failed {
+        kind: String,
+        model_error: Option<ModelErrorView>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ToolInputAnswerKindView {
-    Text,
-    SingleChoice,
+pub enum CancelReasonView {
+    User,
+    OwnerDropped,
+    Shutdown,
+    Deadline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatusView {
+    Idle,
+    Running,
+    WaitingForInput,
+    Finishing,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBlockReasonView {
+    Persistence,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopStatusView {
+    Starting,
+    RunningModel,
+    RunningTools,
+    WaitingForInput,
+    Finishing,
+    Finished,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LoopStateView {
+    pub loop_id: LoopId,
+    pub status: LoopStatusView,
+    pub request_index: u32,
+    pub config_revision: ConfigRevision,
+    pub model: Option<String>,
+    pub pending_interaction: Option<PendingInteractionView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionStateView {
+    pub session_id: SessionId,
+    pub status: SessionStatusView,
+    pub active_loop: Option<LoopStateView>,
+    pub block_reason: Option<SessionBlockReasonView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelErrorView {
+    pub kind: String,
+    pub delivery: String,
+    pub retryable: bool,
+    pub retry_after_millis: Option<u64>,
+}
+
+impl ModelErrorView {
+    pub(crate) fn from_model(error: &ModelError) -> Self {
+        let retry_after_millis = match error.retry_hint() {
+            minicore_runtime::model::RetryHint::Never => None,
+            minicore_runtime::model::RetryHint::Retryable { retry_after } => {
+                retry_after.and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            }
+        };
+        Self {
+            kind: crate::store::model_error_kind(error.kind()),
+            delivery: crate::store::delivery_state(error.delivery()),
+            retryable: error.diagnostic().retryable,
+            retry_after_millis,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TurnResultView {
+    pub turn: TurnRef,
+    pub outcome: LoopOutcomeView,
+    pub usage: Usage,
+    pub requests: u32,
+    pub tool_rounds: u16,
+    pub final_config_revision: ConfigRevision,
+    pub persistence: TurnPersistence,
+}
+
+impl TurnResultView {
+    pub(crate) fn from_turn_result(result: &crate::sessions::TurnResult) -> Self {
+        Self {
+            turn: result.turn,
+            outcome: LoopOutcomeView::from_report(&result.report),
+            usage: result.report.usage,
+            requests: result.report.requests,
+            tool_rounds: result.report.tool_rounds,
+            final_config_revision: result.report.final_config_revision,
+            persistence: result.persistence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HistoryPageView {
+    pub items: Vec<IndexedHistoryItemView>,
+    pub next_offset: Option<usize>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IndexedHistoryItemView {
+    pub index: usize,
+    pub item: HistoryItemView,
+}
+
+impl From<&HistoryPage> for HistoryPageView {
+    fn from(page: &HistoryPage) -> Self {
+        Self {
+            items: page
+                .items
+                .iter()
+                .map(|item| IndexedHistoryItemView {
+                    index: item.index,
+                    item: item.item.clone(),
+                })
+                .collect(),
+            next_offset: page.next_offset,
+            total: page.total,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum InteractionKindView {
+pub enum InteractionKindView {
     Approval {
         prompt: String,
         risk: ApprovalRiskView,
@@ -353,142 +405,39 @@ enum InteractionKindView {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ToolInputChoiceView {
-    index: usize,
-    text: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRiskView {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInputAnswerKindView {
+    Text,
+    SingleChoice,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct PendingInteractionView {
+pub struct ToolInputChoiceView {
+    pub index: usize,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PendingInteractionView {
     pub interaction_id: InteractionId,
-    pub turn_id: TurnId,
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub kind: InteractionKindView,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SessionStatusView {
-    Idle,
-    Running,
-    WaitingForInput,
-    Closing,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SessionHealthView {
-    Healthy,
-    Degraded { diagnostic: DiagnosticView },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct TurnOutcomeView {
-    turn_id: TurnId,
-    terminal: TurnTerminalView,
-    usage: Usage,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct SessionStateView {
-    session_id: SessionId,
-    instance_id: SessionInstanceId,
-    status: SessionStatusView,
-    health: SessionHealthView,
-    active_turn: Option<TurnId>,
-    pending_interaction: Option<PendingInteractionView>,
-    conversation_seq: minicore_runtime::ConversationSeq,
-    last_terminal: Option<TurnOutcomeView>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct DiagnosticView {
-    code: DiagnosticCode,
-    category: DiagnosticCategory,
-    retryable: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TurnTerminalView {
-    Completed,
-    Failed { diagnostic: DiagnosticView },
-    CancelledByUser,
-    CancelledByShutdown,
-    CancelledByRestart,
-    BudgetExceeded,
-}
-
-impl From<&SessionState> for SessionStateView {
-    fn from(state: &SessionState) -> Self {
-        Self {
-            session_id: state.session_id,
-            instance_id: state.instance_id,
-            status: match state.status {
-                SessionStatus::Idle => SessionStatusView::Idle,
-                SessionStatus::Running => SessionStatusView::Running,
-                SessionStatus::WaitingForInput => SessionStatusView::WaitingForInput,
-                SessionStatus::Closing => SessionStatusView::Closing,
-            },
-            health: match &state.health {
-                SessionHealth::Healthy => SessionHealthView::Healthy,
-                SessionHealth::Degraded { diagnostic } => SessionHealthView::Degraded {
-                    diagnostic: DiagnosticView::from(diagnostic),
-                },
-            },
-            active_turn: state.active_turn,
-            pending_interaction: state
-                .pending_interaction
-                .as_ref()
-                .map(PendingInteractionView::from),
-            conversation_seq: state.conversation_seq,
-            last_terminal: state.last_terminal.as_ref().map(TurnOutcomeView::from),
-        }
-    }
-}
-
-impl From<&minicore_runtime::TurnOutcome> for TurnOutcomeView {
-    fn from(outcome: &minicore_runtime::TurnOutcome) -> Self {
-        Self {
-            turn_id: outcome.turn_id,
-            terminal: TurnTerminalView::from(&outcome.terminal),
-            usage: outcome.usage,
-        }
-    }
-}
-
-impl From<&DiagnosticSummary> for DiagnosticView {
-    fn from(diagnostic: &DiagnosticSummary) -> Self {
-        Self {
-            code: diagnostic.code,
-            category: diagnostic.category,
-            retryable: diagnostic.retryable,
-        }
-    }
-}
-
-impl From<&minicore_runtime::TurnTerminal> for TurnTerminalView {
-    fn from(terminal: &minicore_runtime::TurnTerminal) -> Self {
-        match terminal {
-            minicore_runtime::TurnTerminal::Completed => Self::Completed,
-            minicore_runtime::TurnTerminal::Failed { diagnostic } => Self::Failed {
-                diagnostic: DiagnosticView::from(diagnostic),
-            },
-            minicore_runtime::TurnTerminal::CancelledByUser => Self::CancelledByUser,
-            minicore_runtime::TurnTerminal::CancelledByShutdown => Self::CancelledByShutdown,
-            minicore_runtime::TurnTerminal::CancelledByRestart => Self::CancelledByRestart,
-            minicore_runtime::TurnTerminal::BudgetExceeded => Self::BudgetExceeded,
-        }
-    }
-}
-
-impl From<&minicore_runtime::PendingInteraction> for PendingInteractionView {
-    fn from(interaction: &minicore_runtime::PendingInteraction) -> Self {
+impl From<&PendingInteraction> for PendingInteractionView {
+    fn from(interaction: &PendingInteraction) -> Self {
         Self {
             interaction_id: interaction.interaction_id,
-            turn_id: interaction.turn_id,
             tool_call_id: interaction.tool_call_id.clone(),
             tool_name: interaction.tool_name.to_string(),
             kind: match &interaction.kind {
@@ -517,6 +466,48 @@ impl From<&minicore_runtime::PendingInteraction> for PendingInteractionView {
                     },
                 },
             },
+        }
+    }
+}
+
+impl From<&SessionState> for SessionStateView {
+    fn from(state: &SessionState) -> Self {
+        Self {
+            session_id: state.session_id,
+            status: match state.status {
+                SessionStatus::Idle => SessionStatusView::Idle,
+                SessionStatus::Running => SessionStatusView::Running,
+                SessionStatus::WaitingForInput => SessionStatusView::WaitingForInput,
+                SessionStatus::Finishing => SessionStatusView::Finishing,
+                SessionStatus::Blocked => SessionStatusView::Blocked,
+            },
+            active_loop: state.active_loop.as_ref().map(|loop_state| LoopStateView {
+                loop_id: loop_state.loop_id,
+                status: match loop_state.status {
+                    minicore_runtime::LoopStatus::Starting => LoopStatusView::Starting,
+                    minicore_runtime::LoopStatus::RunningModel => LoopStatusView::RunningModel,
+                    minicore_runtime::LoopStatus::RunningTools => LoopStatusView::RunningTools,
+                    minicore_runtime::LoopStatus::WaitingForInput => {
+                        LoopStatusView::WaitingForInput
+                    }
+                    minicore_runtime::LoopStatus::Finishing => LoopStatusView::Finishing,
+                    minicore_runtime::LoopStatus::Finished => LoopStatusView::Finished,
+                },
+                request_index: loop_state.request_index,
+                config_revision: loop_state.config_revision,
+                model: loop_state
+                    .model
+                    .as_ref()
+                    .map(|model| model.as_str().to_owned()),
+                pending_interaction: loop_state
+                    .pending_interaction
+                    .as_ref()
+                    .map(PendingInteractionView::from),
+            }),
+            block_reason: state.block_reason.map(|reason| match reason {
+                SessionBlockReason::Persistence => SessionBlockReasonView::Persistence,
+                SessionBlockReason::Internal => SessionBlockReasonView::Internal,
+            }),
         }
     }
 }
@@ -554,8 +545,28 @@ impl Serialize for AgentEvent {
             Self::TurnStarted { turn, meta } => {
                 serialize_event(serializer, "turn_started", TurnData { turn, meta: *meta })
             }
+            Self::RequestStarted {
+                turn,
+                request_index,
+                config_revision,
+                model,
+                reasoning,
+                meta,
+            } => serialize_event(
+                serializer,
+                "request_started",
+                RequestStartedData {
+                    turn,
+                    request_index: *request_index,
+                    config_revision: *config_revision,
+                    model,
+                    reasoning: *reasoning,
+                    meta: *meta,
+                },
+            ),
             Self::OutputDelta {
                 turn,
+                request_index,
                 channel,
                 delta,
                 meta,
@@ -564,6 +575,7 @@ impl Serialize for AgentEvent {
                 "output_delta",
                 OutputDeltaData {
                     turn,
+                    request_index: *request_index,
                     channel,
                     delta,
                     meta: *meta,
@@ -571,6 +583,7 @@ impl Serialize for AgentEvent {
             ),
             Self::ToolStarted {
                 turn,
+                request_index,
                 tool_call_id,
                 tool_name,
                 meta,
@@ -579,6 +592,7 @@ impl Serialize for AgentEvent {
                 "tool_started",
                 ToolStartedData {
                     turn,
+                    request_index: *request_index,
                     tool_call_id,
                     tool_name,
                     meta: *meta,
@@ -586,6 +600,7 @@ impl Serialize for AgentEvent {
             ),
             Self::ToolProgress {
                 turn,
+                request_index,
                 tool_call_id,
                 progress,
                 meta,
@@ -594,6 +609,7 @@ impl Serialize for AgentEvent {
                 "tool_progress",
                 ToolProgressData {
                     turn,
+                    request_index: *request_index,
                     tool_call_id,
                     progress,
                     meta: *meta,
@@ -601,6 +617,7 @@ impl Serialize for AgentEvent {
             ),
             Self::ToolFinished {
                 turn,
+                request_index,
                 tool_call_id,
                 result,
                 meta,
@@ -609,33 +626,34 @@ impl Serialize for AgentEvent {
                 "tool_finished",
                 ToolFinishedData {
                     turn,
+                    request_index: *request_index,
                     tool_call_id,
                     result,
                     meta: *meta,
                 },
             ),
             Self::InteractionRequested {
-                session_id,
+                turn,
                 interaction,
                 meta,
             } => serialize_event(
                 serializer,
                 "interaction_requested",
                 InteractionRequestedData {
-                    session_id: *session_id,
-                    interaction: PendingInteractionView::from(interaction),
+                    turn,
+                    interaction,
                     meta: *meta,
                 },
             ),
             Self::InteractionResolved {
-                session_id,
+                turn,
                 interaction_id,
                 meta,
             } => serialize_event(
                 serializer,
                 "interaction_resolved",
                 InteractionResolvedData {
-                    session_id: *session_id,
+                    turn,
                     interaction_id: *interaction_id,
                     meta: *meta,
                 },
@@ -643,13 +661,15 @@ impl Serialize for AgentEvent {
             Self::TurnFinished {
                 turn,
                 outcome,
+                persistence,
                 meta,
             } => serialize_event(
                 serializer,
                 "turn_finished",
                 TurnFinishedData {
                     turn,
-                    outcome: TurnOutcomeView::from(outcome),
+                    outcome,
+                    persistence: *persistence,
                     meta: *meta,
                 },
             ),
@@ -701,8 +721,19 @@ struct TurnData<'a> {
 }
 
 #[derive(Serialize)]
+struct RequestStartedData<'a> {
+    turn: &'a TurnRef,
+    request_index: u32,
+    config_revision: ConfigRevision,
+    model: &'a str,
+    reasoning: minicore_runtime::model::ReasoningPreference,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
 struct OutputDeltaData<'a> {
     turn: &'a TurnRef,
+    request_index: u32,
     channel: &'a OutputChannel,
     delta: &'a str,
     meta: EventMeta,
@@ -711,6 +742,7 @@ struct OutputDeltaData<'a> {
 #[derive(Serialize)]
 struct ToolStartedData<'a> {
     turn: &'a TurnRef,
+    request_index: u32,
     tool_call_id: &'a ToolCallId,
     tool_name: &'a str,
     meta: EventMeta,
@@ -719,6 +751,7 @@ struct ToolStartedData<'a> {
 #[derive(Serialize)]
 struct ToolProgressData<'a> {
     turn: &'a TurnRef,
+    request_index: u32,
     tool_call_id: &'a ToolCallId,
     progress: &'a ToolProgressView,
     meta: EventMeta,
@@ -727,21 +760,22 @@ struct ToolProgressData<'a> {
 #[derive(Serialize)]
 struct ToolFinishedData<'a> {
     turn: &'a TurnRef,
+    request_index: u32,
     tool_call_id: &'a ToolCallId,
     result: &'a ToolResultView,
     meta: EventMeta,
 }
 
 #[derive(Serialize)]
-struct InteractionRequestedData {
-    session_id: SessionId,
-    interaction: PendingInteractionView,
+struct InteractionRequestedData<'a> {
+    turn: &'a TurnRef,
+    interaction: &'a PendingInteractionView,
     meta: EventMeta,
 }
 
 #[derive(Serialize)]
-struct InteractionResolvedData {
-    session_id: SessionId,
+struct InteractionResolvedData<'a> {
+    turn: &'a TurnRef,
     interaction_id: InteractionId,
     meta: EventMeta,
 }
@@ -749,131 +783,13 @@ struct InteractionResolvedData {
 #[derive(Serialize)]
 struct TurnFinishedData<'a> {
     turn: &'a TurnRef,
-    outcome: TurnOutcomeView,
+    outcome: &'a LoopOutcomeView,
+    persistence: TurnPersistence,
     meta: EventMeta,
 }
 
-pub(crate) fn map_session_event(envelope: SessionEventEnvelope) -> Option<AgentEvent> {
-    let turn = |turn_id| TurnRef {
-        session_id: envelope.session_id,
-        instance_id: envelope.instance_id,
-        turn_id,
-    };
-    let meta = EventMeta {
-        session_id: envelope.session_id,
-        instance_id: envelope.instance_id,
-        dropped_before: envelope.dropped_before,
-    };
-    match envelope.event {
-        SessionEvent::TurnStarted { turn_id } => Some(AgentEvent::TurnStarted {
-            turn: turn(turn_id),
-            meta,
-        }),
-        SessionEvent::OutputDelta {
-            turn_id,
-            channel,
-            delta,
-        } => Some(AgentEvent::OutputDelta {
-            turn: turn(turn_id),
-            channel: match channel {
-                minicore_runtime::session::OutputChannel::Text => OutputChannel::Text,
-                minicore_runtime::session::OutputChannel::Reasoning => OutputChannel::Reasoning,
-            },
-            delta: delta.as_str().to_owned(),
-            meta,
-        }),
-        SessionEvent::ToolStarted {
-            turn_id,
-            tool_call_id,
-            tool_name,
-        } => {
-            tracing::debug!(
-                session_id = %envelope.session_id,
-                instance_id = %envelope.instance_id,
-                turn_id = %turn_id,
-                tool_name = %tool_name,
-                "tool started"
-            );
-            Some(AgentEvent::ToolStarted {
-                turn: turn(turn_id),
-                tool_call_id,
-                tool_name: tool_name.to_string(),
-                meta,
-            })
-        }
-        SessionEvent::ToolProgress {
-            turn_id,
-            tool_call_id,
-            progress,
-        } => Some(AgentEvent::ToolProgress {
-            turn: turn(turn_id),
-            tool_call_id,
-            progress: ToolProgressView::from(&progress),
-            meta,
-        }),
-        SessionEvent::ToolFinished {
-            turn_id,
-            tool_call_id,
-            result,
-        } => {
-            tracing::debug!(
-                session_id = %envelope.session_id,
-                instance_id = %envelope.instance_id,
-                turn_id = %turn_id,
-                outcome = ?result.outcome,
-                "tool finished"
-            );
-            Some(AgentEvent::ToolFinished {
-                turn: turn(turn_id),
-                tool_call_id,
-                result: ToolResultView {
-                    outcome: result.outcome,
-                    content_bytes: result.content_bytes,
-                },
-                meta,
-            })
-        }
-        SessionEvent::InteractionRequested { interaction } => {
-            Some(AgentEvent::InteractionRequested {
-                session_id: envelope.session_id,
-                interaction,
-                meta,
-            })
-        }
-        SessionEvent::InteractionResolved { interaction_id, .. } => {
-            Some(AgentEvent::InteractionResolved {
-                session_id: envelope.session_id,
-                interaction_id,
-                meta,
-            })
-        }
-        SessionEvent::TurnFinished { .. }
-        | SessionEvent::ModelStarted { .. }
-        | SessionEvent::ModelFinished { .. }
-        | SessionEvent::HealthChanged { .. } => None,
-    }
-}
-
-pub(crate) fn forward_core_event(
-    envelope: SessionEventEnvelope,
-    event_sink: &AgentEventSink,
-) -> bool {
-    let dropped_before = envelope.dropped_before;
-    if matches!(&envelope.event, SessionEvent::TurnFinished { .. }) {
-        // SessionEventStream is best-effort. Core TurnFinished is only an observation;
-        // authoritative completion comes from TurnHandle::wait. If Core drops this envelope,
-        // its own unknown dropped_before count cannot be recovered or safely fabricated.
-        event_sink.record_core_drops(dropped_before);
-        return !event_sink.is_closed();
-    }
-    if let Some(event) = map_session_event(envelope) {
-        event_sink.try_send(event) != AgentSendResult::Closed
-    } else {
-        event_sink.record_core_drops(dropped_before);
-        !event_sink.is_closed()
-    }
-}
-
+/// Requests one paginated history slice through an Agent-owned session.
+/// Public single-consumer agent event stream.
 pub struct AgentEventStream {
     receiver: mpsc::Receiver<AgentEvent>,
 }
@@ -885,237 +801,5 @@ impl AgentEventStream {
 
     pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.receiver.recv().await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use minicore_runtime::ids::{InteractionId, SessionId, ToolCallId, TurnId};
-    use minicore_runtime::session::{InteractionKind, SessionHealth, SessionState, SessionStatus};
-    use minicore_runtime::tools::{
-        ApprovalRequest, ApprovalRisk, ToolInputAnswerKind, ToolInputRequest,
-    };
-    use minicore_runtime::value::BoundedText;
-    use serde_json::json;
-    use tokio::sync::mpsc;
-
-    use super::*;
-
-    fn ids() -> (SessionId, SessionInstanceId, TurnId) {
-        (
-            "ses_00000000000000000000000000000001".parse().unwrap(),
-            "ins_00000000000000000000000000000001".parse().unwrap(),
-            "trn_00000000000000000000000000000001".parse().unwrap(),
-        )
-    }
-
-    fn meta(dropped_before: u64) -> EventMeta {
-        let (session_id, instance_id, _) = ids();
-        EventMeta {
-            session_id,
-            instance_id,
-            dropped_before,
-        }
-    }
-
-    fn turn() -> TurnRef {
-        let (session_id, instance_id, turn_id) = ids();
-        TurnRef {
-            session_id,
-            instance_id,
-            turn_id,
-        }
-    }
-
-    fn output(dropped_before: u64) -> AgentEvent {
-        AgentEvent::OutputDelta {
-            turn: turn(),
-            channel: OutputChannel::Text,
-            delta: "text".to_owned(),
-            meta: meta(dropped_before),
-        }
-    }
-
-    fn interaction(kind: InteractionKind) -> minicore_runtime::PendingInteraction {
-        let (_, _, turn_id) = ids();
-        minicore_runtime::PendingInteraction {
-            interaction_id: "int_00000000000000000000000000000001"
-                .parse::<InteractionId>()
-                .unwrap(),
-            turn_id,
-            tool_call_id: ToolCallId::new("call-1").unwrap(),
-            tool_name: "write".parse().unwrap(),
-            kind,
-        }
-    }
-
-    fn approval_interaction() -> minicore_runtime::PendingInteraction {
-        interaction(InteractionKind::Approval(
-            ApprovalRequest::new("Allow write?", ApprovalRisk::High).unwrap(),
-        ))
-    }
-
-    fn tool_input_interaction() -> minicore_runtime::PendingInteraction {
-        interaction(InteractionKind::ToolInput(
-            ToolInputRequest::new(
-                "Choose a format",
-                vec![
-                    BoundedText::new("Markdown").unwrap(),
-                    BoundedText::new("Plain text").unwrap(),
-                ],
-                ToolInputAnswerKind::SingleChoice,
-            )
-            .unwrap(),
-        ))
-    }
-
-    #[test]
-    fn approval_interaction_wire_is_bounded_and_answerable() {
-        let (_, instance_id, turn_id) = ids();
-        let pending = approval_interaction();
-        let value = serde_json::to_value(AgentEvent::InteractionRequested {
-            session_id: ids().0,
-            interaction: pending,
-            meta: meta(3),
-        })
-        .unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "type": "interaction_requested",
-                "data": {
-                    "session_id": ids().0,
-                    "interaction": {
-                        "interaction_id": "int_00000000000000000000000000000001",
-                        "turn_id": turn_id,
-                        "tool_call_id": "call-1",
-                        "tool_name": "write",
-                        "kind": {
-                            "type": "approval",
-                            "data": {"prompt": "Allow write?", "risk": "high"}
-                        }
-                    },
-                    "meta": {
-                        "session_id": ids().0,
-                        "instance_id": instance_id,
-                        "dropped_before": 3
-                    }
-                }
-            })
-        );
-        assert!(!value.to_string().contains("arguments"));
-    }
-
-    #[test]
-    fn tool_input_interaction_wire_preserves_choice_shape_and_state_pending() {
-        let (session_id, instance_id, turn_id) = ids();
-        let pending = tool_input_interaction();
-        let event = AgentEvent::InteractionRequested {
-            session_id,
-            interaction: pending.clone(),
-            meta: meta(0),
-        };
-        let value = serde_json::to_value(event).unwrap();
-        assert_eq!(
-            value["data"]["interaction"]["kind"],
-            json!({
-                "type": "tool_input",
-                "data": {
-                    "prompt": "Choose a format",
-                    "choices": [
-                        {"index": 0, "text": "Markdown"},
-                        {"index": 1, "text": "Plain text"}
-                    ],
-                    "answer_kind": "single_choice"
-                }
-            })
-        );
-
-        let state = SessionState {
-            session_id,
-            instance_id,
-            status: SessionStatus::WaitingForInput,
-            health: SessionHealth::Healthy,
-            active_turn: Some(turn_id),
-            pending_interaction: Some(pending),
-            conversation_seq: minicore_runtime::ConversationSeq::ZERO,
-            last_terminal: None,
-        };
-        let state_value = serde_json::to_value(AgentEvent::SessionState {
-            state,
-            meta: meta(2),
-        })
-        .unwrap();
-        assert_eq!(
-            state_value["data"]["state"]["pending_interaction"]["kind"],
-            value["data"]["interaction"]["kind"]
-        );
-        assert_eq!(state_value["data"]["meta"]["dropped_before"], 2);
-        assert!(!state_value.to_string().contains("arguments"));
-    }
-
-    #[test]
-    fn core_event_mapping_preserves_complete_event_meta() {
-        let (session_id, instance_id, turn_id) = ids();
-        let mapped = map_session_event(SessionEventEnvelope {
-            session_id,
-            instance_id,
-            dropped_before: 7,
-            event: SessionEvent::TurnStarted { turn_id },
-        })
-        .unwrap();
-        assert!(matches!(
-            mapped,
-            AgentEvent::TurnStarted {
-                meta: EventMeta {
-                    session_id: value_session,
-                    instance_id: value_instance,
-                    dropped_before: 7
-                },
-                ..
-            } if value_session == session_id && value_instance == instance_id
-        ));
-
-        let requested = map_session_event(SessionEventEnvelope {
-            session_id,
-            instance_id,
-            dropped_before: 8,
-            event: SessionEvent::InteractionRequested {
-                interaction: approval_interaction(),
-            },
-        })
-        .unwrap();
-        assert!(matches!(
-            requested,
-            AgentEvent::InteractionRequested {
-                meta: EventMeta {
-                    dropped_before: 8,
-                    ..
-                },
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn outer_drop_accounting_combines_core_and_agent_drops() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let sink = AgentEventSink::new(sender);
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Dropped);
-        assert_eq!(sink.try_send(output(2)), AgentSendResult::Dropped);
-        let _ = receiver.recv().await.unwrap();
-        assert_eq!(sink.try_send(output(0)), AgentSendResult::Sent);
-        let recovered = receiver.recv().await.unwrap();
-        assert!(matches!(
-            recovered,
-            AgentEvent::OutputDelta {
-                meta: EventMeta {
-                    dropped_before: 4,
-                    ..
-                },
-                ..
-            }
-        ));
     }
 }

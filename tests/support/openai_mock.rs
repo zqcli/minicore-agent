@@ -148,6 +148,7 @@ pub struct MockServer {
     captured_notify: Arc<Notify>,
     fully_written: Arc<ProgressCounter>,
     handler_finished: Arc<ProgressCounter>,
+    served: Arc<AtomicUsize>,
     task: JoinHandle<io::Result<()>>,
 }
 
@@ -295,23 +296,42 @@ impl MockServer {
         let captured_notify = Arc::new(Notify::new());
         let task_notify = Arc::clone(&captured_notify);
         let fully_written = Arc::new(ProgressCounter::new());
-        let task_fully_written = Arc::clone(&fully_written);
         let handler_finished = Arc::new(ProgressCounter::new());
         let task_handler_finished = Arc::clone(&handler_finished);
+        let served = Arc::new(AtomicUsize::new(0));
+        let task_served = Arc::clone(&served);
+        let _ = fully_written;
         let mut responses: VecDeque<_> = responses.into_iter().collect();
         let task = tokio::spawn(async move {
-            while let Some(response) = responses.pop_front() {
-                let (stream, _) = listener.accept().await?;
-                let result = handle_connection(
-                    stream,
-                    response,
-                    Arc::clone(&task_captured),
-                    Arc::clone(&task_notify),
-                    Arc::clone(&task_fully_written),
-                )
-                .await;
-                task_handler_finished.increment();
-                result?;
+            // A response only counts as served once a complete request has
+            // been read. HTTP clients may open and abort extra connections
+            // (connection pooling, cancellation), and those must not consume
+            // a scripted response.
+            while !responses.is_empty() {
+                let (mut stream, _) = listener.accept().await?;
+                // Stray/aborted connections (client cancellation, pooling)
+                // must not stall the accept loop: drop anything that does not
+                // deliver a complete request promptly.
+                let request =
+                    tokio::time::timeout(Duration::from_secs(5), read_request(&mut stream))
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                let Some(request) = request else {
+                    continue;
+                };
+                let response = responses.pop_front().expect("checked response queue");
+                task_served.fetch_add(1, Ordering::SeqCst);
+                let handler_captured = Arc::clone(&task_captured);
+                let handler_notify = Arc::clone(&task_notify);
+                let handler_finished = Arc::clone(&task_handler_finished);
+                tokio::spawn(async move {
+                    handler_captured.lock().unwrap().push(request);
+                    handler_notify.notify_waiters();
+                    let result = write_response(&mut stream, response).await;
+                    handler_finished.increment();
+                    result
+                });
             }
             Ok(())
         });
@@ -321,6 +341,7 @@ impl MockServer {
             captured_notify,
             fully_written,
             handler_finished,
+            served,
             task,
         }
     }
@@ -356,7 +377,20 @@ impl MockServer {
     }
 
     pub async fn finish(self) -> Vec<CapturedRequest> {
-        finish_server(self.task).await;
+        // The accept loop returns once every scripted response was handed to
+        // a handler task; wait for those handlers to actually finish writing
+        // before unwrapping the shared capture.
+        let expected = self.served.load(Ordering::SeqCst);
+        let task = self.task;
+        finish_server(task).await;
+        if expected > 0 {
+            wait_for_progress(
+                &self.handler_finished,
+                expected,
+                "mock response handler timed out",
+            )
+            .await;
+        }
         Arc::try_unwrap(self.captured)
             .expect("captured requests must have one owner")
             .into_inner()

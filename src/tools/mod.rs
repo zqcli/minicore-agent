@@ -198,7 +198,7 @@ mod tests {
     async fn workspace(label: &str) -> (PathBuf, Arc<Workspace>) {
         let base = std::env::temp_dir().join(format!(
             "minicore-agent-tools-build-{label}-{}",
-            minicore_runtime::SessionId::new().unwrap()
+            crate::ids::SessionId::new().unwrap()
         ));
         let root = base.join("root");
         tokio::fs::create_dir_all(&root).await.unwrap();

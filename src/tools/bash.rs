@@ -128,7 +128,7 @@ impl Tool for BashTool {
         &self.spec
     }
 
-    fn execute<'a>(&'a self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'a> {
+    fn execute(&self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'_> {
         Box::pin(async move {
             precheck_control(&context)?;
             if invocation.tool_name() != self.spec.name() {
@@ -576,7 +576,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use minicore_runtime::ids::{SessionInstanceId, ToolCallId, TurnId};
+    use minicore_runtime::ToolCallId;
     use minicore_runtime::tools::{
         Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolInvocation, ToolProgressSink,
     };
@@ -686,7 +686,7 @@ mod tests {
     async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, BashTool) {
         let base = std::env::temp_dir().join(format!(
             "minicore-agent-bash-tool-{label}-{}",
-            minicore_runtime::SessionId::new().unwrap()
+            crate::ids::SessionId::new().unwrap()
         ));
         let root = base.join("root");
         tokio::fs::create_dir_all(&root).await.unwrap();
@@ -697,13 +697,6 @@ mod tests {
 
     fn invocation(arguments: Value) -> ToolInvocation {
         ToolInvocation {
-            session_id: "ses_00000000000000000000000000000001".parse().unwrap(),
-            instance_id: "ins_00000000000000000000000000000001"
-                .parse::<SessionInstanceId>()
-                .unwrap(),
-            turn_id: "trn_00000000000000000000000000000001"
-                .parse::<TurnId>()
-                .unwrap(),
             tool_call_id: ToolCallId::new("bash-call").unwrap(),
             tool_name: TOOL_NAME.parse().unwrap(),
             arguments,

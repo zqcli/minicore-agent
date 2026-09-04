@@ -55,7 +55,7 @@ impl Policy {
 }
 
 impl ToolPolicy for Policy {
-    fn decide<'a>(&'a self, request: ToolPolicyRequest) -> ToolPolicyFuture<'a> {
+    fn decide(&self, request: ToolPolicyRequest) -> ToolPolicyFuture<'_> {
         Box::pin(std::future::ready(self.decide_now(&request)))
     }
 }
@@ -76,27 +76,28 @@ fn deny(reason: &str) -> Result<ToolDecision, ToolPolicyError> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
-    use minicore_runtime::session::{InteractionKind, PendingInteraction};
+    use minicore_runtime::interaction::{InteractionKind, PendingInteraction};
     use minicore_runtime::tools::{
         ApprovalRequest, ApprovalRisk, ToolDecision, ToolInvocation, ToolPolicy, ToolPolicyError,
         ToolPolicyRequest, ToolSpec,
     };
+    use minicore_runtime::{InteractionId, LoopId, ToolCallId};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::event::{AgentEvent, EventMeta};
+    use crate::ids::SessionId;
+    use crate::sessions::TurnRef;
 
     const KNOWN_TOOLS: &[&str] = &["read", "write", "edit", "apply_patch", "bash"];
     const MUTATING_TOOLS: &[&str] = &["write", "edit", "apply_patch", "bash"];
     const SECRET: &str = "TOP-SECRET-ARGUMENT";
 
-    fn ids() -> (SessionId, SessionInstanceId, TurnId) {
+    fn ids() -> (SessionId, LoopId) {
         (
             "ses_00000000000000000000000000000001".parse().unwrap(),
-            "ins_00000000000000000000000000000001".parse().unwrap(),
-            "trn_00000000000000000000000000000001".parse().unwrap(),
+            "lup_00000000000000000000000000000001".parse().unwrap(),
         )
     }
 
@@ -132,12 +133,9 @@ mod tests {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> ToolPolicyRequest {
-        let (session_id, instance_id, turn_id) = ids();
+        let _ = ids();
         ToolPolicyRequest {
             invocation: ToolInvocation::new(
-                session_id,
-                instance_id,
-                turn_id,
                 ToolCallId::new("policy-call").unwrap(),
                 invocation_name.parse().unwrap(),
                 arguments(),
@@ -175,22 +173,25 @@ mod tests {
     }
 
     fn serialized_approval_event(name: &str, request: ApprovalRequest) -> serde_json::Value {
-        let (session_id, instance_id, turn_id) = ids();
+        let (session_id, loop_id) = ids();
         let interaction = PendingInteraction {
             interaction_id: "int_00000000000000000000000000000001"
                 .parse::<InteractionId>()
                 .unwrap(),
-            turn_id,
             tool_call_id: ToolCallId::new("policy-call").unwrap(),
             tool_name: name.parse().unwrap(),
             kind: InteractionKind::Approval(request),
         };
-        serde_json::to_value(AgentEvent::InteractionRequested {
+        let turn = TurnRef {
             session_id,
-            interaction,
+            loop_id,
+        };
+        serde_json::to_value(AgentEvent::InteractionRequested {
+            turn,
+            interaction: (&interaction).into(),
             meta: EventMeta {
                 session_id,
-                instance_id,
+                loop_id: Some(loop_id),
                 dropped_before: 0,
             },
         })

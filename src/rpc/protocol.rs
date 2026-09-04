@@ -4,15 +4,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
-use minicore_runtime::conversation::{ConversationEntry, ConversationSeq, TranscriptPage};
-use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, ToolCallId, TurnId};
-use minicore_runtime::model::{ModelFinishReason, ReasoningPreference, Usage};
-use minicore_runtime::session::InteractionAnswer;
-use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer, ToolResultOutcome};
+use minicore_runtime::interaction::InteractionAnswer;
+use minicore_runtime::model::ReasoningPreference;
+use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer};
 use minicore_runtime::value::BoundedText;
+use minicore_runtime::{InteractionId, LoopId};
 
-use crate::agent::{CreateSession, SessionInfo, TurnRef};
-use crate::event::{AgentEvent, TurnTerminalView};
+use crate::agent::{CreateSession, SessionInfo, SteerMessage, TurnRef, UpdateSession};
+use crate::event::AgentEvent;
+use crate::history::GetHistory;
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
 
@@ -25,7 +25,7 @@ pub(crate) const INTERNAL_ERROR: i32 = -32_603;
 pub(crate) const SESSION_NOT_FOUND: i32 = -32_001;
 pub(crate) const SESSION_NOT_LOADED: i32 = -32_002;
 pub(crate) const SESSION_BUSY: i32 = -32_003;
-pub(crate) const SESSION_CLOSED: i32 = -32_004;
+pub(crate) const SESSION_BLOCKED: i32 = -32_004;
 pub(crate) const INVALID_STATE: i32 = -32_005;
 pub(crate) const INTERACTION_NOT_FOUND: i32 = -32_006;
 pub(crate) const TURN_NOT_FOUND: i32 = -32_007;
@@ -33,9 +33,10 @@ pub(crate) const PROFILE_NOT_FOUND: i32 = -32_008;
 pub(crate) const MODEL_NOT_FOUND: i32 = -32_009;
 pub(crate) const WORKSPACE_ERROR: i32 = -32_010;
 pub(crate) const STORE_ERROR: i32 = -32_011;
-pub(crate) const PROVIDER_ERROR: i32 = -32_012;
-pub(crate) const CORE_ERROR: i32 = -32_013;
+pub(crate) const RUNTIME_ERROR: i32 = -32_013;
 pub(crate) const INVALID_SESSION_SETTINGS: i32 = -32_014;
+pub(crate) const HISTORY_TOO_LARGE: i32 = -32_015;
+pub(crate) const STEER_QUEUE_FULL: i32 = -32_016;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -158,54 +159,98 @@ impl From<SessionCreateParams> for CreateSession {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionParams {
-    pub(crate) session_id: SessionId,
+    pub(crate) session_id: crate::ids::SessionId,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SessionTranscriptParams {
-    pub(crate) session_id: SessionId,
+pub(crate) struct SessionHistoryParams {
+    pub(crate) session_id: crate::ids::SessionId,
     #[serde(default)]
-    pub(crate) after: Option<ConversationSeq>,
-    #[serde(default = "default_transcript_limit")]
+    pub(crate) offset: usize,
+    #[serde(default = "default_history_limit")]
     pub(crate) limit: usize,
 }
 
-impl SessionTranscriptParams {
-    pub(crate) fn validate(&self) -> Result<(), InvalidParams> {
-        if (1..=100).contains(&self.limit) {
-            Ok(())
-        } else {
-            Err(InvalidParams)
+impl From<SessionHistoryParams> for GetHistory {
+    fn from(value: SessionHistoryParams) -> Self {
+        Self {
+            session_id: value.session_id,
+            offset: value.offset,
+            limit: value.limit,
         }
     }
 }
 
-fn default_transcript_limit() -> usize {
+fn default_history_limit() -> usize {
     100
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct SessionUpdateParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    #[serde(default)]
+    pub(crate) reasoning: Option<ReasoningPreference>,
+}
+
+impl SessionUpdateParams {
+    pub(crate) fn has_field(&self) -> bool {
+        self.model.is_some() || self.reasoning.is_some()
+    }
+}
+
+impl From<SessionUpdateParams> for UpdateSession {
+    fn from(value: SessionUpdateParams) -> Self {
+        Self {
+            session_id: value.session_id,
+            model: value.model,
+            reasoning: value.reasoning,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TurnSendParams {
-    pub(crate) session_id: SessionId,
+    pub(crate) session_id: crate::ids::SessionId,
     pub(crate) text: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TurnParams {
-    pub(crate) session_id: SessionId,
-    pub(crate) instance_id: SessionInstanceId,
-    pub(crate) turn_id: TurnId,
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) loop_id: LoopId,
 }
 
 impl From<TurnParams> for TurnRef {
     fn from(value: TurnParams) -> Self {
         Self {
             session_id: value.session_id,
-            instance_id: value.instance_id,
-            turn_id: value.turn_id,
+            loop_id: value.loop_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TurnSteerParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) loop_id: LoopId,
+    pub(crate) text: String,
+}
+
+impl From<TurnSteerParams> for SteerMessage {
+    fn from(value: TurnSteerParams) -> Self {
+        Self {
+            turn: TurnRef {
+                session_id: value.session_id,
+                loop_id: value.loop_id,
+            },
+            text: value.text,
         }
     }
 }
@@ -213,7 +258,8 @@ impl From<TurnParams> for TurnRef {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InteractionAnswerParams {
-    pub(crate) session_id: SessionId,
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) loop_id: LoopId,
     pub(crate) interaction_id: InteractionId,
     pub(crate) answer: InteractionAnswerWire,
 }
@@ -276,6 +322,21 @@ pub(crate) struct SessionResult {
 }
 
 #[derive(Serialize)]
+pub(crate) struct SessionUpdateResult {
+    pub(crate) session: SessionInfo,
+    pub(crate) active_revision: Option<minicore_runtime::execution::ConfigRevision>,
+}
+
+impl From<crate::agent::SessionUpdateResult> for SessionUpdateResult {
+    fn from(value: crate::agent::SessionUpdateResult) -> Self {
+        Self {
+            session: value.session,
+            active_revision: value.active_revision,
+        }
+    }
+}
+
+#[derive(Serialize)]
 pub(crate) struct TurnResult {
     pub(crate) turn: TurnRef,
 }
@@ -292,166 +353,6 @@ pub(crate) struct OkResult {
 
 impl OkResult {
     pub(crate) const TRUE: Self = Self { ok: true };
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct TranscriptPageView {
-    entries: Vec<ConversationEntryView>,
-    next_after: Option<ConversationSeq>,
-    observed_head: ConversationSeq,
-    complete: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ConversationEntryView {
-    UserMessage(UserMessageView),
-    AssistantMessage(AssistantMessageView),
-    ToolResult(ToolResultView),
-    Summary(SummaryView),
-    TurnTerminal(TurnTerminalEntryView),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct UserMessageView {
-    seq: ConversationSeq,
-    turn_id: TurnId,
-    text: String,
-    execution: TurnExecutionView,
-    created_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct TurnExecutionView {
-    model: String,
-    reasoning: ReasoningPreference,
-    max_tool_rounds: u16,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct AssistantMessageView {
-    seq: ConversationSeq,
-    turn_id: TurnId,
-    model: String,
-    text: Option<String>,
-    reasoning: Option<String>,
-    tool_calls: Vec<ToolCallView>,
-    usage: Usage,
-    finish_reason: ModelFinishReason,
-    created_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ToolCallView {
-    tool_call_id: ToolCallId,
-    name: String,
-    call_index: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ToolResultView {
-    seq: ConversationSeq,
-    turn_id: TurnId,
-    tool_call_id: ToolCallId,
-    tool_name: String,
-    outcome: ToolResultOutcome,
-    content: String,
-    created_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct SummaryView {
-    seq: ConversationSeq,
-    through: ConversationSeq,
-    summary: String,
-    created_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct TurnTerminalEntryView {
-    seq: ConversationSeq,
-    turn_id: TurnId,
-    terminal: TurnTerminalView,
-    usage: Usage,
-    created_at: String,
-}
-
-impl From<TranscriptPage> for TranscriptPageView {
-    fn from(page: TranscriptPage) -> Self {
-        Self {
-            entries: page
-                .entries
-                .into_iter()
-                .map(ConversationEntryView::from)
-                .collect(),
-            next_after: page.next_after,
-            observed_head: page.observed_head,
-            complete: page.complete,
-        }
-    }
-}
-
-impl From<ConversationEntry> for ConversationEntryView {
-    fn from(entry: ConversationEntry) -> Self {
-        match entry {
-            ConversationEntry::UserMessage(entry) => Self::UserMessage(UserMessageView {
-                seq: entry.seq,
-                turn_id: entry.turn_id,
-                text: entry.input.text.as_str().to_owned(),
-                execution: TurnExecutionView {
-                    model: entry.execution.model.as_str().to_owned(),
-                    reasoning: entry.execution.reasoning,
-                    max_tool_rounds: entry.execution.max_tool_rounds,
-                },
-                created_at: entry.created_at.as_str().to_owned(),
-            }),
-            ConversationEntry::AssistantMessage(entry) => {
-                Self::AssistantMessage(AssistantMessageView {
-                    seq: entry.seq,
-                    turn_id: entry.turn_id,
-                    model: entry.model.as_str().to_owned(),
-                    text: entry.text.map(|text| text.as_str().to_owned()),
-                    reasoning: entry
-                        .reasoning
-                        .map(|reasoning| reasoning.as_str().to_owned()),
-                    tool_calls: entry
-                        .tool_calls
-                        .into_iter()
-                        .map(|call| ToolCallView {
-                            tool_call_id: call.tool_call_id().clone(),
-                            name: call.name().as_str().to_owned(),
-                            call_index: call.call_index(),
-                        })
-                        .collect(),
-                    usage: entry.usage,
-                    finish_reason: entry.finish_reason,
-                    created_at: entry.created_at.as_str().to_owned(),
-                })
-            }
-            ConversationEntry::ToolResult(entry) => Self::ToolResult(ToolResultView {
-                seq: entry.seq,
-                turn_id: entry.turn_id,
-                tool_call_id: entry.tool_call_id,
-                tool_name: entry.tool_name.as_str().to_owned(),
-                outcome: entry.outcome,
-                content: entry.content.as_str().to_owned(),
-                created_at: entry.created_at.as_str().to_owned(),
-            }),
-            ConversationEntry::Summary(entry) => Self::Summary(SummaryView {
-                seq: entry.seq,
-                through: entry.through,
-                summary: entry.summary.as_str().to_owned(),
-                created_at: entry.created_at.as_str().to_owned(),
-            }),
-            ConversationEntry::TurnTerminal(entry) => Self::TurnTerminal(TurnTerminalEntryView {
-                seq: entry.seq,
-                turn_id: entry.turn_id,
-                terminal: TurnTerminalView::from(&entry.terminal),
-                usage: entry.usage,
-                created_at: entry.created_at.as_str().to_owned(),
-            }),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -538,187 +439,5 @@ impl AgentEventNotification {
             method: "agent.event",
             params: event,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn transcript_view_has_stable_safe_shape_for_every_entry_variant() {
-        let turn_id = "trn_00000000000000000000000000000001";
-        let timestamp = "2026-01-02T03:04:05.006Z";
-        let page: TranscriptPage = serde_json::from_value(json!({
-            "entries": [
-                {
-                    "user_message": {
-                        "seq": 1,
-                        "turn_id": turn_id,
-                        "input": {"text": "user text"},
-                        "execution": {
-                            "model": "fake",
-                            "reasoning": "medium",
-                            "max_tool_rounds": 8
-                        },
-                        "created_at": timestamp
-                    }
-                },
-                {
-                    "assistant_message": {
-                        "seq": 2,
-                        "turn_id": turn_id,
-                        "model": "fake",
-                        "text": "assistant text",
-                        "reasoning": "assistant reasoning",
-                        "tool_calls": [{
-                            "tool_call_id": "call-1",
-                            "name": "write",
-                            "arguments": {"content": "TRANSCRIPT-ARGUMENT-SECRET"},
-                            "call_index": 0
-                        }],
-                        "usage": {
-                            "input_tokens": 1,
-                            "output_tokens": 2,
-                            "reasoning_tokens": 3
-                        },
-                        "finish_reason": "tool_calls",
-                        "created_at": timestamp
-                    }
-                },
-                {
-                    "tool_result": {
-                        "seq": 3,
-                        "turn_id": turn_id,
-                        "tool_call_id": "call-1",
-                        "tool_name": "write",
-                        "outcome": "denied",
-                        "content": "durable tool result",
-                        "created_at": timestamp
-                    }
-                },
-                {
-                    "summary": {
-                        "seq": 4,
-                        "through": 3,
-                        "summary": "durable summary",
-                        "created_at": timestamp
-                    }
-                },
-                {
-                    "turn_terminal": {
-                        "seq": 5,
-                        "turn_id": turn_id,
-                        "terminal": {
-                            "failed": {
-                                "diagnostic": {
-                                    "code": "model_unavailable",
-                                    "category": "model",
-                                    "message": "TRANSCRIPT-DIAGNOSTIC-SECRET",
-                                    "retryable": false
-                                }
-                            }
-                        },
-                        "usage": {
-                            "input_tokens": 4,
-                            "output_tokens": 5,
-                            "reasoning_tokens": 6
-                        },
-                        "created_at": timestamp
-                    }
-                }
-            ],
-            "next_after": 5,
-            "observed_head": 5,
-            "complete": false
-        }))
-        .unwrap();
-
-        assert_eq!(
-            serde_json::to_value(TranscriptPageView::from(page)).unwrap(),
-            json!({
-                "entries": [
-                    {
-                        "user_message": {
-                            "seq": 1,
-                            "turn_id": turn_id,
-                            "text": "user text",
-                            "execution": {
-                                "model": "fake",
-                                "reasoning": "medium",
-                                "max_tool_rounds": 8
-                            },
-                            "created_at": timestamp
-                        }
-                    },
-                    {
-                        "assistant_message": {
-                            "seq": 2,
-                            "turn_id": turn_id,
-                            "model": "fake",
-                            "text": "assistant text",
-                            "reasoning": "assistant reasoning",
-                            "tool_calls": [{
-                                "tool_call_id": "call-1",
-                                "name": "write",
-                                "call_index": 0
-                            }],
-                            "usage": {
-                                "input_tokens": 1,
-                                "output_tokens": 2,
-                                "reasoning_tokens": 3
-                            },
-                            "finish_reason": "tool_calls",
-                            "created_at": timestamp
-                        }
-                    },
-                    {
-                        "tool_result": {
-                            "seq": 3,
-                            "turn_id": turn_id,
-                            "tool_call_id": "call-1",
-                            "tool_name": "write",
-                            "outcome": "denied",
-                            "content": "durable tool result",
-                            "created_at": timestamp
-                        }
-                    },
-                    {
-                        "summary": {
-                            "seq": 4,
-                            "through": 3,
-                            "summary": "durable summary",
-                            "created_at": timestamp
-                        }
-                    },
-                    {
-                        "turn_terminal": {
-                            "seq": 5,
-                            "turn_id": turn_id,
-                            "terminal": {
-                                "failed": {
-                                    "diagnostic": {
-                                        "code": "model_unavailable",
-                                        "category": "model",
-                                        "retryable": false
-                                    }
-                                }
-                            },
-                            "usage": {
-                                "input_tokens": 4,
-                                "output_tokens": 5,
-                                "reasoning_tokens": 6
-                            },
-                            "created_at": timestamp
-                        }
-                    }
-                ],
-                "next_after": 5,
-                "observed_head": 5,
-                "complete": false
-            })
-        );
     }
 }

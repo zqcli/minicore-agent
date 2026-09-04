@@ -1,7 +1,7 @@
 # Stdio RPC Contract
 
-MiniCore Agent exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON) on
-standard input and standard output.
+MiniCore Agent v0.3 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+on standard input and standard output.
 
 ## Transport And Framing
 
@@ -30,7 +30,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.2.0"}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.0"}}
 ```
 
 An error response has exactly one `error`:
@@ -55,17 +55,19 @@ be recovered.
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
 requests are dispatched sequentially. `turn.wait` is the exception: the server
-clones the exact active Turn handle, spawns an owned waiter, and immediately
-continues reading requests.
+registers one owned waiter and immediately continues reading requests.
 
-Consequently, clients must correlate responses by `id` and events by Session,
-instance, Turn, and Tool call identifiers. The following orderings are not
-guaranteed:
+Clients correlate responses by `id` and events by Session and loop identifiers.
+The following orderings are not guaranteed:
 
 - a `turn.send` response before the corresponding `turn_started` event;
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
 - a deferred `turn.wait` response before responses to later requests.
+
+Output deltas and other live events are best effort and may be dropped under
+pressure. The authoritative sources are `turn.wait` and `session.history`, not
+the event stream.
 
 `agent.shutdown` waits for the Agent, pre-existing waiter tasks, and event pump,
 then queues its response last. EOF, Ctrl-C, writer failure, and explicit
@@ -74,7 +76,7 @@ shutdown enter the same owned-task shutdown path.
 ## Agent Methods
 
 `agent.ping` accepts omitted params or `{}` and returns
-`{"version":"0.2.0"}`. `agent.shutdown` accepts the same empty params, starts
+`{"version":"0.3.0"}`. `agent.shutdown` accepts the same empty params, starts
 orderly shutdown, and returns `{"ok":true}` as the final frame on success.
 
 ## Discovery
@@ -88,17 +90,16 @@ Params are omitted or `{}`. Profiles are sorted by `id`.
   "profiles": [
     {
       "id": "coding",
-      "model": "deep",
+      "model": "coding",
       "reasoning": "high",
-      "tools": ["read", "write"],
+      "tools": ["read", "write", "edit", "apply_patch", "bash"],
       "approval": "auto"
     }
   ]
 }
 ```
 
-`model` and `reasoning` are defaults for new Sessions. `approval` is retained
-for wire compatibility.
+`model` and `reasoning` are defaults for new Sessions.
 
 ### `model.list`
 
@@ -110,7 +111,7 @@ Params are omitted or `{}`. Models are sorted by `id`.
     {
       "id": "deep",
       "model_ref": "deep",
-      "context_window": 128000,
+      "context_window": 197624,
       "supports_tools": true,
       "supported_reasoning": ["auto", "disabled", "low", "medium", "high"]
     }
@@ -137,14 +138,14 @@ shape:
   "model": "deep",
   "reasoning": "high",
   "loaded": true,
-  "instance_id": "ins_...",
   "created_at": "2026-01-02T03:04:05.006Z",
   "updated_at": "2026-01-02T03:04:05.006Z"
 }
 ```
 
-`title` and `instance_id` may be null. `model` and `reasoning` are the actual
-frozen Session settings, not newly read Profile defaults.
+`title` may be null. `model` and `reasoning` are the actual frozen Session
+settings, not newly read Profile defaults. A Session created with the
+`disabled` reasoning preference reports it as `"disabled"`.
 
 ### `session.list`
 
@@ -154,11 +155,9 @@ Params are omitted or `{}`.
 {"sessions":[]}
 ```
 
-Each element of `sessions` is a SessionInfo object.
-
-The Store supplies records in stable Session ID order. Entries whose durable
-manifest cannot be read, or whose loaded spec disagrees with that manifest, are
-omitted. Explicit operations on such a Session remain strict.
+Each element of `sessions` is a SessionInfo object. The Store supplies records
+in stable Session ID order. Entries whose durable data cannot be read are
+omitted; explicit operations on such a Session remain strict.
 
 ### `session.create`
 
@@ -177,244 +176,243 @@ optional. An omitted or empty `profile` selects the configured default Profile.
 Omitted `model` and `reasoning` use that Profile's defaults. Explicit overrides
 are validated as one combination with the Profile's Tools before any Session is
 created; unsupported combinations fail with `-32014` and are never silently
-downgraded.
+downgraded. Creating a Session never starts a loop.
 
 The result has a `session` member containing the created SessionInfo.
 
 ### Other Session Methods
 
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
-  member containing SessionInfo.
-- `session.close` takes a Session ID and returns `{"ok":true}`.
+  member containing SessionInfo (with `loaded: true`) after loading the durable
+  record and history from disk. It never starts a loop.
+- `session.close` cancels any active loop, joins its worker, and returns
+  `{"ok":true}`.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`.
-- `session.state` takes a loaded Session ID and returns the current safe Session
+- `session.state` takes a loaded Session ID and returns the current Session
   state projection.
 
-There are no methods to change the model or reasoning of an existing Session.
-
-## Transcript
-
-### `session.transcript`
+### `session.update`
 
 ```json
-{"session_id":"ses_...","after":12,"limit":100}
+{"session_id":"ses_...","model":"fast","reasoning":"low"}
 ```
 
-`after` is optional and selects entries strictly after that conversation
-sequence. `limit` defaults to 100 and must be in `1..=100`.
-
-The response is:
+`model` and `reasoning` are optional but at least one must be present; otherwise
+the request is rejected with `-32602`. The change is validated and the durable
+`session.json` updated before the response. Any active loop keeps running with
+its current snapshot; the update is forwarded to the loop and takes effect at
+the next request boundary.
 
 ```json
 {
-  "entries": [],
-  "next_after": null,
-  "observed_head": 12,
-  "complete": true
+  "session": { "session_id": "ses_...", "...": "..." },
+  "active_revision": 3
 }
 ```
 
-Entries preserve durable order and are tagged as `user_message`,
-`assistant_message`, `tool_result`, `summary`, or `turn_terminal`. The safe RPC
-projection includes sequence numbers, Turn IDs, timestamps, execution
-model/reasoning/max Tool rounds, assistant text/reasoning/usage/finish reason,
-durable Tool result content, summaries, and terminal outcomes. Assistant Tool
-calls expose their ID, name, and call index but omit arguments. Diagnostics omit
-message text and expose only code, category, and retryability.
+`active_revision` is the revision applied to the running loop, or `null` when
+the session is idle. It is also `null` when `session.update` races with a loop
+that has already sealed: the durable Session settings are updated for the next
+turn, but no revision is applied to the sealed loop.
 
-Clients use `next_after` for pagination. `observed_head` is the head observed by
-that read, and `complete` indicates whether the returned page reaches it.
+## History
 
-## Shared Wire Schemas
+### `session.history`
 
-IDs serialize as strings. Conversation sequence values and token counts serialize
-as unsigned JSON numbers.
+```json
+{"session_id":"ses_...","offset":0,"limit":100}
+```
 
-### EventMeta And TurnRef
+`offset` defaults to 0. `limit` defaults to 100 and must be in `1..=100`. Items
+are returned in durable order with contiguous indexes.
 
-| Schema | Fields | Optionality |
-|---|---|---|
-| `EventMeta` | `session_id`, `instance_id`, `dropped_before: u64` | All fields are always present |
-| `TurnRef` | `session_id`, `instance_id`, `turn_id` | All fields are always present |
+```json
+{
+  "items": [
+    {"index": 0, "item": {"type": "user", "data": {"kind": "prompt", "loop_id": "lup_...", "text": "Fix the parser"}}}
+  ],
+  "next_offset": null,
+  "total": 2
+}
+```
 
-`TurnRef` is the exact identity accepted by `turn.cancel` and `turn.wait` and is
-returned by `turn.send`. An old instance or non-active Turn does not match. The
-Agent keeps no historical Turn registry.
+`next_offset` is the offset of the next page, or `null` when the page is the
+last. Every `loop_id` refers to the runtime loop that produced the item.
 
-### Usage
+Item types and their `data`:
 
-Every Usage member is an optional `u64` and is omitted, not serialized as
-`null`, when the Provider did not report it:
+- `user`: `kind` (prompt), `loop_id`, `text`.
+- `assistant`: `loop_id`, `request_index`, `model`, `reasoning_level`, `text`,
+  `reasoning`, `tool_calls`, `finish_reason`, `usage`. `reasoning` contains
+  visible reasoning text/summaries; opaque provider fields (such as encrypted
+  content) are never included. Each tool call exposes only `tool_call_id`,
+  `name`, and `call_index`; arguments are never present in the wire view.
+- `tool_result`: `loop_id`, `request_index`, `tool_call_id`, `tool_name`,
+  `outcome`, `content`.
 
-| Field | Meaning |
-|---|---|
-| `input_tokens` | Input tokens |
-| `output_tokens` | Output tokens |
-| `reasoning_tokens` | Reasoning tokens |
-| `cache_read_tokens` | Tokens read from Provider cache |
-| `cache_write_tokens` | Tokens written to Provider cache |
-| `provider_total_tokens` | Provider-reported total |
-
-The Usage object itself is always present where specified and may therefore be
-`{}`. The same schema is used by `TurnOutcome`, transcript
-`assistant_message.usage`, and transcript `turn_terminal.usage`.
-
-### TurnOutcome
-
-| Field | Type | Optionality |
-|---|---|---|
-| `turn_id` | Turn ID string | Always present |
-| `terminal` | terminal enum | Always present |
-| `usage` | Usage | Always present; individual Usage fields may be omitted |
-
-`terminal` is one of the strings `completed`, `cancelled_by_user`,
-`cancelled_by_shutdown`, `cancelled_by_restart`, or `budget_exceeded`; failure
-uses `{"failed":{"diagnostic":Diagnostic}}`. `Diagnostic` contains required
-`code`, `category`, and `retryable` fields and never includes diagnostic message
-text. TurnOutcome is reused by `turn.wait`, `SessionState.last_terminal`, and
-`turn_finished.data.outcome`.
-
-### SessionState
-
-`session.state` returns this object directly; the `session_state` event carries
-it under `data.state`.
-
-| Field | Wire type and values | Presence |
-|---|---|---|
-| `session_id` | Session ID string | Always present |
-| `instance_id` | Session instance ID string | Always present |
-| `status` | `idle`, `running`, `waiting_for_input`, or `closing` | Always present |
-| `health` | `"healthy"` or `{"degraded":{"diagnostic":Diagnostic}}` | Always present |
-| `active_turn` | Turn ID string or `null` | Always present; nullable |
-| `pending_interaction` | compatibility PendingInteraction object or `null` | Always present; nullable |
-| `conversation_seq` | unsigned conversation sequence | Always present |
-| `last_terminal` | TurnOutcome or `null` | Always present; nullable |
-
-The compatibility PendingInteraction projection contains `interaction_id`,
-`turn_id`, `tool_call_id`, `tool_name`, and the existing tagged `kind`. This
-document does not define a new interaction or approval workflow.
+The history view is sanitized: user text and tool results pass through, while
+tool arguments and opaque provider content never appear.
 
 ## Turns
 
 ### `turn.send`
 
-`{"session_id":"ses_...","text":"Hello"}` submits a Turn and promptly returns
-`{"turn":TurnRef}`. Clients should issue `turn.wait` immediately and consume
-`agent.event` in parallel.
+```json
+{"session_id":"ses_...","text":"Fix the parser"}
+```
 
-### `turn.cancel`
+Starts one runtime `AgentLoop` for the user message and returns its exact Turn
+identity:
 
-Params are TurnRef. The result is `{"cancelled":true}` when this request
-triggered cancellation. A completed active handle may return `false`; use
-`turn.wait` for its terminal result.
+```json
+{"turn":{"session_id":"ses_...","loop_id":"lup_..."}}
+```
+
+A Session runs at most one active loop. Additional sends while one is active
+fail with `-32003` (session_busy); a Session blocked by a persistence failure
+fails with `-32004`.
 
 ### `turn.wait`
 
-Params are TurnRef. Waiting does not block the request reader, and multiple
-waiters may wait on the same exact active Turn. The result is TurnOutcome, for
-example:
+```json
+{"session_id":"ses_...","loop_id":"lup_..."}
+```
+
+Registers a deferred waiter and returns immediately; the reader keeps
+processing frames. When the Agent-level persistence step completes, the waiter
+response arrives:
 
 ```json
 {
-  "turn_id": "trn_...",
-  "terminal": "completed",
-  "usage": {"input_tokens": 10, "output_tokens": 4}
+  "turn": {"session_id":"ses_...","loop_id":"lup_..."},
+  "outcome": {"type":"completed"},
+  "usage": {"input_tokens":10,"output_tokens":6},
+  "requests": 2,
+  "tool_rounds": 1,
+  "final_config_revision": 0,
+  "persistence": "persisted"
 }
 ```
 
-Runtime wait failures map to `-32013 core_error` without diagnostic text. If the
-active handle has already been cleaned up, the method returns `turn_not_found`;
-recover the durable result from `session.transcript`.
+`outcome.type` is `completed`, `cancelled` (with `reason`), or `failed` (with
+`kind` and optionally `model_error`). `persistence` is `persisted` or `failed`.
+A failed JSONL append returns the completed loop report with
+`persistence: failed` and blocks the Session from further turns.
 
-## Agent Events
+### `turn.cancel`
 
-Events are notifications without an `id`:
+```json
+{"session_id":"ses_...","loop_id":"lup_..."}
+```
+
+Cancels the active loop and returns `{"cancelled":true}`. The corresponding
+`turn.wait` then resolves with a `cancelled` outcome.
+
+### `turn.steer`
+
+```json
+{"session_id":"ses_...","loop_id":"lup_...","text":"Do not modify config files"}
+```
+
+Appends a steering instruction to the active loop and returns `{"ok":true}`. A
+full steer queue is reported with `-32016`.
+
+## Interactions
+
+### `interaction.answer`
+
+Give one answer to a pending interaction surfaced through `session.state` or an
+`interaction_requested` event:
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "method": "agent.event",
-  "params": {
-    "type": "turn_started",
-    "data": {
-      "turn": {
-        "session_id": "ses_...",
-        "instance_id": "ins_...",
-        "turn_id": "trn_..."
-      },
-      "meta": {
-        "session_id": "ses_...",
-        "instance_id": "ins_...",
-        "dropped_before": 0
-      }
-    }
-  }
+  "session_id": "ses_...",
+  "loop_id": "lup_...",
+  "interaction_id": "int_...",
+  "answer": {"type":"approval","decision":"allow_once"}
 }
 ```
 
-Every Event `data` object contains the complete EventMeta object.
+`approval.decision` is `allow_once` or `deny`.
 
-| `params.type` | `params.data` fields |
-|---|---|
-| `session_opened` | `session: SessionInfo`, `meta: EventMeta` |
-| `session_closed` | `session_id`, `meta: EventMeta` |
-| `session_state` | `state: SessionState`, `meta: EventMeta` |
-| `turn_started` | `turn: TurnRef`, `meta: EventMeta` |
-| `output_delta` | `turn: TurnRef`, `channel: "text"` or `"reasoning"`, `delta: string`, `meta: EventMeta` |
-| `tool_started` | `turn: TurnRef`, `tool_call_id`, `tool_name`, `meta: EventMeta` |
-| `tool_progress` | `turn: TurnRef`, `tool_call_id`, `progress: ToolProgress`, `meta: EventMeta` |
-| `tool_finished` | `turn: TurnRef`, `tool_call_id`, `result: ToolResult`, `meta: EventMeta` |
-| `interaction_requested` | `session_id`, `interaction: PendingInteraction`, `meta: EventMeta` |
-| `interaction_resolved` | `session_id`, `interaction_id`, `meta: EventMeta` |
-| `turn_finished` | `turn: TurnRef`, `outcome: TurnOutcome`, `meta: EventMeta` |
+## Session State
 
-`ToolProgress` always contains `message: string|null`, `completed: u64|null`,
-and `total: u64|null`. `ToolResult` always contains `outcome` and
-`content_bytes`; outcome is `success`, `failed`, `denied`, `cancelled`, or
-`input_provided`. Interaction events and the existing `interaction.answer`
-method remain compatibility surfaces only; no new decisions or approval flow
-are defined here.
+`session.state` returns this object directly; the `session_state` event carries
+it under `params.data.state`.
 
-Events are best effort. `meta.dropped_before` is the number of Core and outer
-Agent events attributed to the gap immediately before that delivered event; it
-is not a global sequence number. A value greater than zero means realtime data
-was lost, and the Agent does not replay it. Event loss does not affect Turn
-execution or durability: recover with `turn.wait`, `session.state`, and
-`session.transcript`.
+```json
+{
+  "session_id":"ses_...",
+  "status":"running",
+  "active_loop":null,
+  "block_reason":null
+}
+```
 
-Events and responses share the single writer described in [Frame
-Interleaving](#frame-interleaving), but no additional ordering is guaranteed.
-Clients must correlate frames using request IDs, EventMeta, TurnRef, and Tool
-call IDs rather than arrival order.
+`status` is `idle`, `running`, `waiting_for_input`, `finishing`, or `blocked`.
+`active_loop` is null when idle or after a turn completes; otherwise it carries
+`loop_id`, `status`, `request_index`, `config_revision`, `model`, and
+`pending_interaction`. `block_reason` is `persistence` or `internal` when the
+Session is blocked, else null.
+
+Mapping: no active loop and not blocked is `idle`; a blocked Session is
+`blocked`; a running loop maps to `running`; a loop awaiting input maps to
+`waiting_for_input`; runtime-finishing but agent-persistence-incomplete maps to
+`finishing`; once agent completion is published the Session is `idle` again.
+
+## Events
+
+All events are notifications `{"jsonrpc":"2.0","method":"agent.event",...}`.
+Every event carries `params.data.meta` with `session_id`, an optional
+`loop_id`, and `dropped_before` counting best-effort drops preceding that
+event. Session lifecycle events do not carry `data.turn`; loop-scoped events
+carry the exact `{session_id, loop_id}` reference in `data.turn` plus
+`request_index` where relevant.
+
+Session lifecycle events:
+
+- `session_opened` (`session`, `meta`)
+- `session_closed` (`session_id`, `meta`)
+- `session_state` (`state`, `meta`)
+
+Loop-scoped events:
+
+- `turn_started` (`turn`, `meta`)
+- `request_started` (`turn`, `request_index`, `config_revision`, `model`, `reasoning`)
+- `output_delta` (`turn`, `request_index`, `channel` `text`/`reasoning`, `delta`, `meta`)
+- `tool_started` (`turn`, `request_index`, `tool_call_id`, `tool_name`, `meta`)
+- `tool_progress` (`turn`, `request_index`, `tool_call_id`, `progress`, `meta`)
+- `tool_finished` (`turn`, `request_index`, `tool_call_id`, `result`, `meta`);
+  `result` contains `outcome` and `content_bytes`.
+- `interaction_requested` (`turn`, `interaction`, `meta`)
+- `interaction_resolved` (`turn`, `interaction_id`, `meta`)
+- `turn_finished` (`turn`, `outcome`, `persistence`, `meta`)
 
 ## Errors
 
-All error data uses `{"kind":string,"retryable":bool}`. Messages and kinds are
-stable and never contain Provider responses, credentials, prompts, Tool
-arguments, or diagnostic message text.
+JSON syntax errors use `-32700`; invalid request shape, unknown methods,
+invalid params, and internal errors use `-32600` through `-32603`. Domain
+errors:
 
-| Code | Kind | Meaning |
-|---:|---|---|
-| `-32700` | `parse_error` | Invalid JSON or oversized request frame |
-| `-32600` | `invalid_request` | Invalid JSON-RPC request shape or ID |
-| `-32601` | `method_not_found` | Unknown method |
-| `-32602` | `invalid_params` | Missing, malformed, out-of-range, or unknown params |
-| `-32603` | `internal_error` | Internal, serialization, configuration, or I/O failure |
-| `-32001` | `session_not_found` | Session does not exist |
-| `-32002` | `session_not_loaded` | Operation requires a loaded Session |
-| `-32003` | `session_busy` | Session is running another Turn; retryable |
-| `-32004` | `session_closed` | Session Runtime is closed |
-| `-32005` | `invalid_state` | Operation is incompatible with current Session/interaction state |
-| `-32006` | `interaction_not_found` | Interaction is absent or already resolved |
-| `-32007` | `turn_not_found` | Exact active Turn was not found |
-| `-32008` | `profile_not_found` | Profile ID is not configured |
-| `-32009` | `model_not_found` | Model ID is not configured |
-| `-32010` | `workspace_error` | Workspace cannot be opened or validated |
-| `-32011` | `store_error` | Durable Store operation failed |
-| `-32012` | `provider_error` | Provider/unsupported model operation failed |
-| `-32013` | `core_error` | Runtime operation failed; retryability comes from its safe diagnostic |
-| `-32014` | `invalid_session_settings` | Selected Profile/model/reasoning/Tools are incompatible |
+| Code | Kind |
+|---|---|
+| `-32001` | `session_not_found` |
+| `-32002` | `session_not_loaded` |
+| `-32003` | `session_busy` |
+| `-32004` | `session_blocked` |
+| `-32005` | `invalid_state` |
+| `-32006` | `interaction_not_found` |
+| `-32007` | `turn_not_found` |
+| `-32008` | `profile_not_found` |
+| `-32009` | `model_not_found` |
+| `-32010` | `workspace_error` |
+| `-32011` | `store_error` |
+| `-32012` | `provider_error` (reserved; Agent startup/provider build failures occur before the stdio service accepts requests, so there is currently no runtime RPC response path) |
+| `-32013` | `runtime_error` |
+| `-32014` | `invalid_session_settings` |
+| `-32015` | `history_too_large` |
+| `-32016` | `steer_queue_full` |
 
-Except for `session_busy` and retryable Core diagnostics, current domain errors
-are non-retryable. Clients should still use the response's `data.retryable`
-value rather than hard-coding that policy.
+Error data contains only `{kind,retryable}` and stable short messages; it never
+serializes an error source, raw provider response, Tool arguments, API key, or
+panic payload.

@@ -1,6 +1,6 @@
 [package]
 name = "minicore-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Public API is pinned to this exact upstream runtime revision.
-minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "759902f0c2955df36f0c3ec486586caf30542b29", version = "0.3.0" }
+minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "b642c7424b444c390b9eacc22fb1574215723f62", version = "0.4.0" }
+getrandom = "=0.3.3"
 bytes = "=1.10.1"
 futures-util = "=0.3.33"
 httpdate = "=1.0.3"

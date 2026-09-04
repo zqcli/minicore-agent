@@ -6,34 +6,21 @@ use thiserror::Error;
 
 use crate::config::ConfigError;
 
-use minicore_runtime::storage::{SessionLogError, SessionLogErrorKind};
-
-pub(crate) const fn session_log_error_kind(kind: SessionLogErrorKind) -> &'static str {
-    match kind {
-        SessionLogErrorKind::NotInitialized => "session_log_not_initialized",
-        SessionLogErrorKind::AlreadyInitialized => "session_log_already_initialized",
-        SessionLogErrorKind::Conflict => "session_log_conflict",
-        SessionLogErrorKind::Corrupt => "session_log_corrupt",
-        SessionLogErrorKind::Unavailable => "session_log_unavailable",
-        SessionLogErrorKind::UnknownOutcome => "session_log_unknown_outcome",
-        SessionLogErrorKind::Closed => "session_log_closed",
-        SessionLogErrorKind::Internal => "session_log_internal",
-    }
-}
-
+/// Redacted view of a Runtime control/start failure. Only a stable kind string
+/// and a retryability flag cross the process boundary; never diagnostic bodies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct CoreErrorView {
+pub struct RuntimeErrorView {
     pub kind: &'static str,
     pub retryable: bool,
 }
 
-impl CoreErrorView {
+impl RuntimeErrorView {
     pub const fn new(kind: &'static str, retryable: bool) -> Self {
         Self { kind, retryable }
     }
 }
 
-impl fmt::Display for CoreErrorView {
+impl fmt::Display for RuntimeErrorView {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.kind)
     }
@@ -49,14 +36,10 @@ pub enum AgentError {
     SessionNotLoaded,
     #[error("session is already loaded")]
     SessionAlreadyLoaded,
-    #[error("session specification is incompatible with current configuration")]
-    SessionSpecMismatch,
     #[error("session is busy")]
     SessionBusy,
-    #[error("session is closed")]
-    SessionClosed,
-    #[error("session durability is degraded")]
-    SessionDegraded,
+    #[error("session is blocked after a persistence failure")]
+    SessionBlocked,
     #[error("turn not found")]
     TurnNotFound,
     #[error("interaction not found")]
@@ -65,20 +48,24 @@ pub enum AgentError {
     InvalidInteraction,
     #[error("user input is invalid")]
     InvalidInput,
+    #[error("session history exceeds the loop limits")]
+    HistoryTooLarge,
     #[error("profile not found")]
     ProfileNotFound,
     #[error("model not found")]
     ModelNotFound,
     #[error("session settings are incompatible")]
     InvalidSessionSettings,
-    #[error("model-backed compaction is not implemented in this phase")]
-    ModelNotImplemented,
     #[error("workspace is unavailable")]
     Workspace,
     #[error("store error")]
     Store,
-    #[error("core error: {0}")]
-    Core(CoreErrorView),
+    #[error("the operation is not valid in the current state")]
+    InvalidState,
+    #[error("the steer queue is full")]
+    SteerQueueFull,
+    #[error("runtime error: {0}")]
+    Runtime(RuntimeErrorView),
     #[error("internal error")]
     Internal,
     #[error("agent event stream was already taken")]
@@ -95,27 +82,20 @@ pub enum AgentError {
 pub(crate) enum StoreError {
     #[error("store root is invalid")]
     InvalidRoot,
-    #[error("session metadata is invalid")]
+    #[error("session record is invalid")]
     InvalidRecord,
+    #[error("session storage format is unsupported")]
+    UnsupportedFormat,
     #[error("session not found")]
     SessionNotFound,
     #[error("session already exists")]
     SessionAlreadyExists,
     #[error("store data is corrupt")]
     Corrupt,
+    #[error("store record exceeds the single-line limit")]
+    RecordTooLarge,
     #[error("store is unavailable")]
     Unavailable,
-    #[error("store mutation outcome is unknown")]
-    UnknownOutcome,
-    #[error("store cleanup failed after a known store error")]
-    CleanupFailed {
-        primary: Box<StoreError>,
-        cleanup: Box<StoreError>,
-    },
-    #[error("store operation failed internally")]
-    Internal,
-    #[error("session log operation failed")]
-    Log(#[from] SessionLogError),
 }
 
 impl StoreError {
@@ -123,14 +103,12 @@ impl StoreError {
         match self {
             Self::InvalidRoot => "invalid_root",
             Self::InvalidRecord => "invalid_record",
+            Self::UnsupportedFormat => "unsupported_format",
             Self::SessionNotFound => "session_not_found",
             Self::SessionAlreadyExists => "session_already_exists",
             Self::Corrupt => "corrupt",
+            Self::RecordTooLarge => "record_too_large",
             Self::Unavailable => "unavailable",
-            Self::UnknownOutcome => "unknown_outcome",
-            Self::CleanupFailed { .. } => "cleanup_failed",
-            Self::Internal => "internal",
-            Self::Log(error) => session_log_error_kind(error.kind()),
         }
     }
 }

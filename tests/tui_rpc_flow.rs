@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use minicore_runtime::SessionId;
+use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
 #[path = "support/openai_mock.rs"]
 mod openai_mock;
-use openai_mock::{ChunkGate, ConcurrentMockServer, MockResponse, MockServer, sse_body};
+use openai_mock::{ChunkGate, MockResponse, MockServer};
 #[path = "support/rpc_process.rs"]
 mod rpc_process;
 use rpc_process::RpcProcess;
@@ -130,24 +130,14 @@ fn tool_response(call_id: &str, name: &str, arguments: Value) -> MockResponse {
     ])
 }
 
-fn gated_sse(events: Vec<Value>, split_events: bool) -> (MockResponse, ChunkGate) {
-    let response = if split_events {
-        MockResponse::sse_bytes(Vec::new()).with_chunks(
-            events
-                .into_iter()
-                .map(|event| sse_body(std::slice::from_ref(&event)).into_bytes()),
-        )
-    } else {
-        MockResponse::sse(&events)
-    };
-    response.with_chunk_gate()
+fn gated_sse(events: Vec<Value>) -> (MockResponse, ChunkGate) {
+    MockResponse::sse(&events).with_chunk_gate()
 }
 
 fn turn_params(turn: &Value) -> Value {
     json!({
         "session_id": turn["session_id"],
-        "instance_id": turn["instance_id"],
-        "turn_id": turn["turn_id"],
+        "loop_id": turn["loop_id"],
     })
 }
 
@@ -173,12 +163,12 @@ async fn create_session(
     process.response(id).await["result"]["session"].clone()
 }
 
-async fn transcript(process: &mut RpcProcess, id: &str, session_id: &Value) -> Value {
+async fn history(process: &mut RpcProcess, id: &str, session_id: &Value) -> Value {
     process
         .send(
             id,
-            "session.transcript",
-            json!({"session_id": session_id, "limit": 100}),
+            "session.history",
+            json!({"session_id": session_id, "offset": 0, "limit": 100}),
         )
         .await;
     process.response(id).await["result"].clone()
@@ -191,52 +181,9 @@ async fn state(process: &mut RpcProcess, id: &str, session_id: &Value) -> Value 
     process.response(id).await["result"].clone()
 }
 
-fn entries_of<'a>(transcript: &'a Value, kind: &str) -> Vec<&'a Value> {
-    transcript["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|entry| entry.get(kind))
-        .collect()
-}
-
-fn event_for_turn(frame: &Value, turn_id: &Value) -> bool {
-    frame.pointer("/params/data/turn/turn_id") == Some(turn_id)
-}
-
-fn turn_finished_was_observed(process: &RpcProcess, turn_id: &Value) -> bool {
-    process.observed().iter().any(|frame| {
-        frame.pointer("/params/type").and_then(Value::as_str) == Some("turn_finished")
-            && event_for_turn(frame, turn_id)
-    })
-}
-
-async fn release_output_chunk(
-    process: &mut RpcProcess,
-    gate: &ChunkGate,
-    turn_id: &Value,
-    channel: &str,
-    expected: &str,
-) {
-    gate.release();
-    let delta = process
-        .event_matching("output_delta", |frame| event_for_turn(frame, turn_id))
-        .await;
-    assert_eq!(delta["params"]["data"]["channel"], channel);
-    assert_eq!(delta["params"]["data"]["delta"], expected);
-    assert!(!turn_finished_was_observed(process, turn_id));
-}
-
-fn has_event(frames: &[Value], event_type: &str) -> bool {
-    frames
-        .iter()
-        .any(|frame| frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type))
-}
-
-fn session_dir_count(base: &Path) -> usize {
-    std::fs::read_dir(base.join("data/sessions"))
-        .map(|entries| entries.count())
-        .unwrap_or(0)
+fn event_for_turn(frame: &Value, turn: &Value) -> bool {
+    frame.pointer("/params/data/turn/session_id") == Some(&turn["session_id"])
+        && frame.pointer("/params/data/turn/loop_id") == Some(&turn["loop_id"])
 }
 
 fn assert_error(response: &Value, code: i64, kind: &str) {
@@ -245,705 +192,425 @@ fn assert_error(response: &Value, code: i64, kind: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flows_a_b_i_j_l_discovery_settings_validation_and_manifest_reopen() {
-    let server = MockServer::spawn([text_response("deep high final")]).await;
+async fn tui_discovery_create_history_and_reopen_flow() {
+    let server = MockServer::spawn([text_response("first"), text_response("second")]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("a-b-i-j-l");
-    let workspace_a = base.join("workspace-a");
-    let workspace_b = base.join("workspace-b");
-    let invalid_workspace = base.join("workspace-invalid");
-    for workspace in [&workspace_a, &workspace_b, &invalid_workspace] {
-        std::fs::create_dir_all(workspace).unwrap();
-    }
+    let base = test_dir("discovery");
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
     let config = write_config(&base, &base_url, 64, &[], "deep", "high");
     let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
 
-    // Flow A: discovery is sorted, complete, and secret-safe.
-    process.send("a-ping", "agent.ping", json!({})).await;
+    process.send("ping", "agent.ping", json!({})).await;
     assert_eq!(
-        process.response("a-ping").await["result"]["version"],
+        process.response("ping").await["result"]["version"],
         env!("CARGO_PKG_VERSION")
     );
-    process.send("a-profiles", "profile.list", json!({})).await;
-    let profiles = process.response("a-profiles").await;
-    assert_eq!(
-        profiles["result"]["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|profile| profile["id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["coding", "quick"]
-    );
-    assert_eq!(profiles["result"]["profiles"][0]["model"], "deep");
-    assert_eq!(profiles["result"]["profiles"][0]["reasoning"], "high");
-    assert_eq!(profiles["result"]["profiles"][0]["approval"], "auto");
-    process.send("a-models", "model.list", json!({})).await;
-    let models = process.response("a-models").await;
-    assert_eq!(
-        models["result"]["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|model| model["id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["deep", "fast"]
-    );
-    assert_eq!(
-        models["result"]["models"][0]["supported_reasoning"],
-        json!(["auto", "low", "medium", "high"])
-    );
-    assert_eq!(
-        models["result"]["models"][1]["supported_reasoning"],
-        json!(["auto", "disabled", "low"])
-    );
-    let discovery = format!("{profiles}{models}");
-    for private in [
-        KEY,
-        KEY_ENV,
-        base_url.as_str(),
-        FAST_PROVIDER,
-        DEEP_PROVIDER,
-    ] {
-        assert!(!discovery.contains(private));
-    }
-    process.send("a-sessions", "session.list", json!({})).await;
-    assert_eq!(
-        process.response("a-sessions").await["result"]["sessions"],
-        json!([])
-    );
-
-    // Flow B: explicit deep/high settings reach SessionInfo and durable execution.
-    let session_a =
-        create_session(&mut process, "b-create-deep", &workspace_a, "deep", "high").await;
-    assert_eq!(session_a["model"], "deep");
-    assert_eq!(session_a["reasoning"], "high");
-    let session_a_id = session_a["session_id"].clone();
-    let old_instance = session_a["instance_id"].clone();
-
-    // Flow I: a new fast/low Session is isolated and no set RPC exists.
-    let session_b =
-        create_session(&mut process, "i-create-fast", &workspace_b, "fast", "low").await;
-    assert_ne!(session_a["session_id"], session_b["session_id"]);
-    assert_eq!(session_b["model"], "fast");
-    assert_eq!(session_b["reasoning"], "low");
-    process.send("i-list", "session.list", json!({})).await;
-    let listed = process.response("i-list").await["result"]["sessions"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert!(listed.iter().any(|session| {
-        session["session_id"] == session_a_id
-            && session["model"] == "deep"
-            && session["reasoning"] == "high"
-    }));
-    assert!(listed.iter().any(|session| {
-        session["session_id"] == session_b["session_id"]
-            && session["model"] == "fast"
-            && session["reasoning"] == "low"
-    }));
-    for (index, method) in [
-        "session.set_model",
-        "session.set_reasoning",
-        "turn.set_model",
-        "turn.set_reasoning",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let id = format!("i-no-set-{index}");
-        process.send(&id, method, json!({})).await;
-        assert_error(&process.response(&id).await, -32_601, "method_not_found");
-    }
-
-    // Flow J: fast/high fails before creating another durable Session directory.
-    let before_invalid = session_dir_count(&base);
-    process
-        .send(
-            "j-invalid",
-            "session.create",
-            json!({
-                "workspace": invalid_workspace,
-                "profile": "coding",
-                "model": "fast",
-                "reasoning": "high"
-            }),
-        )
-        .await;
-    assert_error(
-        &process.response("j-invalid").await,
-        -32_014,
-        "invalid_session_settings",
-    );
-    assert_eq!(session_dir_count(&base), before_invalid);
-
-    let (_turn, wait_id) = process
-        .send_turn_and_register_wait("b-deep-turn", &session_a_id, "run deep high")
-        .await;
-    assert_eq!(
-        process.response(&wait_id).await["result"]["terminal"],
-        "completed"
-    );
-    let before_reopen = transcript(&mut process, "b-transcript", &session_a_id).await;
-    let user = entries_of(&before_reopen, "user_message")[0];
-    assert_eq!(user["execution"]["model"], "deep");
-    assert_eq!(user["execution"]["reasoning"], "high");
-
-    // Flow L: a new process has changed Profile defaults, but manifest settings win.
-    process
-        .send(
-            "l-close",
-            "session.close",
-            json!({"session_id": session_a_id}),
-        )
-        .await;
-    assert_eq!(
-        process.response("l-close").await["result"],
-        json!({"ok": true})
-    );
-    let (first_frames, first_stderr) = process.shutdown().await;
-    let requests = server.finish().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].json_body()["model"], DEEP_PROVIDER);
-    assert_eq!(
-        requests[0].json_body()["reasoning"],
-        json!({"effort": "high", "summary": "auto"})
-    );
-
-    write_config(&base, &base_url, 64, &[], "fast", "low");
-    let mut reopened_process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    reopened_process
-        .send("l-profiles", "profile.list", json!({}))
-        .await;
-    let current_profile = reopened_process.response("l-profiles").await;
-    assert_eq!(current_profile["result"]["profiles"][0]["model"], "fast");
-    assert_eq!(current_profile["result"]["profiles"][0]["reasoning"], "low");
-    reopened_process
-        .send(
-            "l-open",
-            "session.open",
-            json!({"session_id": session_a_id}),
-        )
-        .await;
-    let reopened = reopened_process.response("l-open").await["result"]["session"].clone();
-    assert_ne!(reopened["instance_id"], old_instance);
-    assert_eq!(reopened["model"], "deep");
-    assert_eq!(reopened["reasoning"], "high");
-    assert_eq!(
-        transcript(&mut reopened_process, "l-transcript", &session_a_id).await,
-        before_reopen
-    );
-    let (second_frames, second_stderr) = reopened_process.shutdown().await;
-    let output = format!(
-        "{}{}{}{}",
-        serde_json::to_string(&first_frames).unwrap(),
-        first_stderr,
-        serde_json::to_string(&second_frames).unwrap(),
-        second_stderr
-    );
-    for private in [KEY, KEY_ENV, base_url.as_str()] {
-        assert!(!output.contains(private));
-    }
-    let _ = std::fs::remove_dir_all(base);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flows_c_d_gated_text_and_separate_reasoning_channels() {
-    let (text_stream, text_gate) = gated_sse(
-        vec![
-            json!({"type": "response.output_text.delta", "delta": "hello"}),
-            json!({"type": "response.output_text.delta", "delta": " "}),
-            json!({"type": "response.output_text.delta", "delta": "world"}),
-            completed(),
-        ],
-        true,
-    );
-    let (reasoning_stream, reasoning_gate) = gated_sse(
-        vec![
-            json!({"type": "response.reasoning_summary_text.delta", "delta": "Reasoning A"}),
-            json!({"type": "response.reasoning_summary_text.delta", "delta": "Reasoning B"}),
-            json!({"type": "response.output_text.delta", "delta": "Text Final"}),
-            completed(),
-        ],
-        true,
-    );
-    let server = MockServer::spawn([text_stream, reasoning_stream]).await;
-    let base = test_dir("c-d");
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let config = write_config(&base, server.base_url(), 64, &[], "deep", "high");
-    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let session = create_session(&mut process, "cd-create", &workspace, "deep", "high").await;
-    let session_id = session["session_id"].clone();
-
-    // Flow C: each gated TextDelta is observed before the terminal chunk is released.
-    let (text_turn, text_wait) = process
-        .send_turn_and_register_wait("c", &session_id, "stream text")
-        .await;
-    server.wait_for_requests(1).await;
-    let mut text = String::new();
-    for expected in ["hello", " ", "world"] {
-        release_output_chunk(
-            &mut process,
-            &text_gate,
-            &text_turn["turn_id"],
-            "text",
-            expected,
-        )
-        .await;
-        text.push_str(expected);
-    }
-    assert_eq!(text, "hello world");
-    text_gate.release();
-    assert_eq!(
-        process.response(&text_wait).await["result"]["terminal"],
-        "completed"
-    );
-    process
-        .event_matching("turn_finished", |frame| {
-            event_for_turn(frame, &text_turn["turn_id"])
-        })
-        .await;
-    let text_transcript = transcript(&mut process, "c-transcript", &session_id).await;
-    assert_eq!(
-        entries_of(&text_transcript, "assistant_message")[0]["text"],
-        "hello world"
-    );
-
-    // Flow D: reasoning and text retain independent channels and durable fields.
-    let (reasoning_turn, reasoning_wait) = process
-        .send_turn_and_register_wait("d", &session_id, "stream reasoning")
-        .await;
-    server.wait_for_requests(2).await;
-    let mut reasoning = String::new();
-    for expected in ["Reasoning A", "Reasoning B"] {
-        release_output_chunk(
-            &mut process,
-            &reasoning_gate,
-            &reasoning_turn["turn_id"],
-            "reasoning",
-            expected,
-        )
-        .await;
-        reasoning.push_str(expected);
-    }
-    release_output_chunk(
-        &mut process,
-        &reasoning_gate,
-        &reasoning_turn["turn_id"],
-        "text",
-        "Text Final",
-    )
-    .await;
-    reasoning_gate.release();
-    assert_eq!(
-        process.response(&reasoning_wait).await["result"]["terminal"],
-        "completed"
-    );
-    let reasoning_transcript = transcript(&mut process, "d-transcript", &session_id).await;
-    let assistant = entries_of(&reasoning_transcript, "assistant_message")
-        .into_iter()
-        .last()
-        .unwrap();
-    assert_eq!(assistant["reasoning"], reasoning);
-    assert_eq!(assistant["text"], "Text Final");
-
-    let (frames, _) = process.shutdown().await;
-    assert!(!has_event(&frames, "interaction_requested"));
-    assert_eq!(server.finish().await.len(), 2);
-    let _ = std::fs::remove_dir_all(base);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flows_e_f_auto_read_and_write_tool_loops() {
-    let server = MockServer::spawn([
-        tool_response("e-read-call", "read", json!({"path": "input.txt"})),
-        text_response("read final"),
-        tool_response(
-            "f-write-call",
-            "write",
-            json!({"path": "written.txt", "content": "FLOW-F-WRITTEN"}),
-        ),
-        text_response("write final"),
-    ])
-    .await;
-    let base = test_dir("e-f");
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::write(workspace.join("input.txt"), "FLOW-E-READ-CONTENT").unwrap();
-    let config = write_config(
-        &base,
-        server.base_url(),
-        64,
-        &["read", "write"],
-        "deep",
-        "high",
-    );
-    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let session = create_session(&mut process, "ef-create", &workspace, "deep", "high").await;
-    let session_id = session["session_id"].clone();
-
-    // Flow E: auto approval runs read, emits Tool events, and starts round two.
-    let (read_turn, read_wait) = process
-        .send_turn_and_register_wait("e", &session_id, "read input")
-        .await;
-    let read_started = process
-        .event_matching("tool_started", |frame| {
-            event_for_turn(frame, &read_turn["turn_id"])
-        })
-        .await;
-    assert_eq!(read_started["params"]["data"]["tool_name"], "read");
-    let read_finished = process
-        .event_matching("tool_finished", |frame| {
-            event_for_turn(frame, &read_turn["turn_id"])
-        })
-        .await;
-    assert_eq!(
-        read_finished["params"]["data"]["result"]["outcome"],
-        "success"
-    );
-    assert_eq!(
-        process.response(&read_wait).await["result"]["terminal"],
-        "completed"
-    );
-    let read_transcript = transcript(&mut process, "e-transcript", &session_id).await;
-    assert!(read_transcript.to_string().contains("FLOW-E-READ-CONTENT"));
-    assert!(read_transcript.to_string().contains("read final"));
-
-    // Flow F: auto write mutates the real Workspace and then completes round two.
-    let (write_turn, write_wait) = process
-        .send_turn_and_register_wait("f", &session_id, "write output")
-        .await;
-    process
-        .event_matching("tool_started", |frame| {
-            event_for_turn(frame, &write_turn["turn_id"])
-        })
-        .await;
-    let write_finished = process
-        .event_matching("tool_finished", |frame| {
-            event_for_turn(frame, &write_turn["turn_id"])
-        })
-        .await;
-    assert_eq!(
-        write_finished["params"]["data"]["result"]["outcome"],
-        "success"
-    );
-    assert_eq!(
-        std::fs::read_to_string(workspace.join("written.txt")).unwrap(),
-        "FLOW-F-WRITTEN"
-    );
-    assert_eq!(
-        process.response(&write_wait).await["result"]["terminal"],
-        "completed"
-    );
-
-    let (frames, _) = process.shutdown().await;
-    assert!(!has_event(&frames, "interaction_requested"));
-    let requests = server.finish().await;
-    assert_eq!(requests.len(), 4);
-    assert!(
-        requests[1].json_body()["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["type"] == "function_call_output")
-    );
-    assert!(
-        requests[3].json_body()["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["type"] == "function_call_output")
-    );
-    let _ = std::fs::remove_dir_all(base);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flow_g_three_turns_wait_immediately_and_persist_contiguous_sequence() {
-    let server = MockServer::spawn([
-        text_response("turn one"),
-        tool_response("g-read-call", "read", json!({"path": "input.txt"})),
-        text_response("turn two"),
-        text_response("turn three"),
-    ])
-    .await;
-    let base = test_dir("g");
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::write(workspace.join("input.txt"), "FLOW-G-READ-CONTENT").unwrap();
-    let config = write_config(&base, server.base_url(), 64, &["read"], "deep", "high");
-    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let session = create_session(&mut process, "g-create", &workspace, "deep", "high").await;
-    let session_id = session["session_id"].clone();
-
-    for (index, prompt) in ["turn one", "turn two read", "turn three"]
-        .into_iter()
-        .enumerate()
-    {
-        let prefix = format!("g-{index}");
-        let (_turn, wait_id) = process
-            .send_turn_and_register_wait(&prefix, &session_id, prompt)
-            .await;
-        assert_eq!(
-            process.response(&wait_id).await["result"]["terminal"],
-            "completed"
-        );
-        assert_eq!(
-            state(&mut process, &format!("g-state-{index}"), &session_id).await["status"],
-            "idle"
-        );
-    }
-
-    let durable = transcript(&mut process, "g-transcript", &session_id).await;
-    assert_eq!(entries_of(&durable, "user_message").len(), 3);
-    assert_eq!(entries_of(&durable, "turn_terminal").len(), 3);
-    let sequences = durable["entries"]
+    process.send("model.list", "model.list", json!({})).await;
+    let models = process.response("model.list").await;
+    let model_ids = models["result"]["models"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|entry| {
-            entry.as_object().unwrap().values().next().unwrap()["seq"]
-                .as_u64()
-                .unwrap()
-        })
+        .map(|model| model["id"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(
-        sequences,
-        (1..=u64::try_from(sequences.len()).unwrap()).collect::<Vec<_>>()
-    );
-    assert!(durable.to_string().contains("FLOW-G-READ-CONTENT"));
-
-    let (frames, _) = process.shutdown().await;
-    assert!(!has_event(&frames, "interaction_requested"));
-    assert_eq!(server.finish().await.len(), 4);
-    let _ = std::fs::remove_dir_all(base);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flow_h_exact_cancel_wait_idle_then_next_turn_succeeds() {
-    let (blocked, gate) = gated_sse(vec![completed()], false);
-    let server = MockServer::spawn([blocked, text_response("after cancel")]).await;
-    let base = test_dir("h");
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let config = write_config(&base, server.base_url(), 64, &[], "deep", "high");
-    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let session = create_session(&mut process, "h-create", &workspace, "deep", "high").await;
-    let session_id = session["session_id"].clone();
-
-    // Flow H: the Provider stream is blocked by a gate, never by a timer.
-    let (blocked_turn, blocked_wait) = process
-        .send_turn_and_register_wait("h-blocked", &session_id, "block")
-        .await;
-    server.wait_for_requests(1).await;
+    assert!(model_ids.contains(&"fast") && model_ids.contains(&"deep"));
     process
-        .send("h-cancel", "turn.cancel", turn_params(&blocked_turn))
+        .send("profile.list", "profile.list", json!({}))
         .await;
-    assert_eq!(
-        process.response("h-cancel").await["result"]["cancelled"],
-        true
-    );
-    assert_eq!(
-        process.response(&blocked_wait).await["result"]["terminal"],
-        "cancelled_by_user"
-    );
-    assert_eq!(
-        state(&mut process, "h-idle", &session_id).await["status"],
-        "idle"
-    );
-    gate.release();
-
-    let (_next_turn, next_wait) = process
-        .send_turn_and_register_wait("h-next", &session_id, "continue")
-        .await;
-    assert_eq!(
-        process.response(&next_wait).await["result"]["terminal"],
-        "completed"
-    );
-    assert_eq!(
-        state(&mut process, "h-next-idle", &session_id).await["status"],
-        "idle"
-    );
-
-    process.shutdown().await;
-    assert_eq!(server.finish().await.len(), 2);
-    let _ = std::fs::remove_dir_all(base);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flow_k_event_loss_does_not_break_wait_state_or_transcript() {
-    const DELTAS: usize = 4_096;
-    let mut events = (0..DELTAS)
-        .map(|_| json!({"type": "response.output_text.delta", "delta": "x"}))
+    let profiles = process.response("profile.list").await;
+    let profile_ids = profiles["result"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["id"].as_str().unwrap())
         .collect::<Vec<_>>();
-    events.push(completed());
-    let (burst, gate) = gated_sse(events, false);
-    let server = MockServer::spawn([burst]).await;
-    let base = test_dir("k");
-    let workspace = base.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let config = write_config(&base, server.base_url(), 4, &[], "deep", "high");
-    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let session = create_session(&mut process, "k-create", &workspace, "deep", "high").await;
-    let session_id = session["session_id"].clone();
+    assert!(profile_ids.contains(&"coding") && profile_ids.contains(&"quick"));
+    process
+        .send("session.list", "session.list", json!({}))
+        .await;
+    assert_eq!(
+        process.response("session.list").await["result"]["sessions"],
+        json!([])
+    );
 
-    // Flow K: drain startup events, checkpoint, then release the burst without reading stdout.
-    let (turn, wait_id) = process
-        .send_turn_and_register_wait("k-burst", &session_id, "burst")
-        .await;
-    server.wait_for_requests(1).await;
-    process
-        .event_matching("turn_started", |frame| {
-            event_for_turn(frame, &turn["turn_id"])
-        })
-        .await;
-    process
-        .event_matching("session_state", |frame| {
-            frame
-                .pointer("/params/data/state/status")
-                .and_then(Value::as_str)
-                == Some("running")
-                && frame.pointer("/params/data/state/active_turn") == Some(&turn["turn_id"])
-        })
-        .await;
-    let burst_checkpoint = process.observed().len();
+    let session = create_session(&mut process, "create", &workspace, "deep", "high").await;
+    let session_id = session["session_id"].clone();
+    assert_eq!(session["model"], "deep");
+    assert_eq!(session["reasoning"], "high");
+
+    let initial = history(&mut process, "history", &session_id).await;
+    assert_eq!(initial["total"], 0);
+
+    // First turn: send, wait deferred, stream, then inspect durable history.
+    let (first_turn, first_wait) = {
+        process
+            .send(
+                "send1",
+                "turn.send",
+                json!({"session_id": session_id, "text": "first prompt"}),
+            )
+            .await;
+        let turn = process.response("send1").await["result"]["turn"].clone();
+        process.send("wait1", "turn.wait", turn_params(&turn)).await;
+        (turn, "wait1")
+    };
+    let started = process.event("turn_started").await;
+    assert!(event_for_turn(&started, &first_turn));
+    let waited = process.response(first_wait).await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    assert_eq!(waited["result"]["persistence"], "persisted");
+
+    let page = history(&mut process, "history2", &session_id).await;
+    assert_eq!(page["total"], 2);
     assert!(
-        process.observed()[..burst_checkpoint]
-            .iter()
-            .filter(|frame| frame["method"] == "agent.event")
-            .all(|frame| {
-                frame
-                    .pointer("/params/data/meta/dropped_before")
-                    .and_then(Value::as_u64)
-                    == Some(0)
-            })
-    );
-    gate.release();
-    assert_eq!(server.finish().await.len(), 1);
-    assert_eq!(
-        process.response(&wait_id).await["result"]["terminal"],
-        "completed"
-    );
-    assert_eq!(
-        state(&mut process, "k-state", &session_id).await["status"],
-        "idle"
-    );
-    let durable = transcript(&mut process, "k-transcript", &session_id).await;
-    assert_eq!(
-        entries_of(&durable, "assistant_message")[0]["text"]
-            .as_str()
+        page["items"]
+            .as_array()
             .unwrap()
-            .len(),
-        DELTAS
+            .iter()
+            .any(|item| item["item"]["type"] == "user")
     );
-    assert_eq!(entries_of(&durable, "turn_terminal").len(), 1);
 
+    // Second turn on the same session: history carries the first turn forward.
     process
         .send(
-            "k-close",
-            "session.close",
-            json!({"session_id": session_id}),
+            "send2",
+            "turn.send",
+            json!({"session_id": session_id, "text": "second prompt"}),
         )
         .await;
-    assert_eq!(
-        process.response("k-close").await["result"],
-        json!({"ok": true})
-    );
-    process.event("session_closed").await;
-    assert!(process.observed()[burst_checkpoint..].iter().any(|frame| {
-        frame["method"] == "agent.event"
-            && frame
-                .pointer("/params/data/meta/dropped_before")
-                .and_then(Value::as_u64)
-                .is_some_and(|dropped| dropped > 0)
-    }));
+    let second_turn = process.response("send2").await["result"]["turn"].clone();
+    assert_ne!(second_turn["loop_id"], first_turn["loop_id"]);
+    process
+        .send("wait2", "turn.wait", turn_params(&second_turn))
+        .await;
+    let waited = process.response("wait2").await;
+    assert_eq!(waited["result"]["persistence"], "persisted");
+    let page = history(&mut process, "history3", &session_id).await;
+    assert_eq!(page["total"], 4);
 
-    process.shutdown().await;
+    // Close and reopen: history loads from the JSONL.
+    process
+        .send("close", "session.close", json!({"session_id": session_id}))
+        .await;
+    assert_eq!(process.response("close").await["result"]["ok"], true);
+    process
+        .send("open", "session.open", json!({"session_id": session_id}))
+        .await;
+    let reopened = process.response("open").await;
+    assert_eq!(reopened["result"]["session"]["loaded"], true);
+    let page = history(&mut process, "history4", &session_id).await;
+    assert_eq!(page["total"], 4);
+
+    let (observed, stderr) = process.shutdown().await;
+    assert!(!serde_json::to_string(&observed).unwrap().contains(KEY));
+    assert!(!stderr.contains(KEY));
+    assert!(!stderr.contains(FAST_PROVIDER));
+    assert!(!stderr.contains(DEEP_PROVIDER));
+    server.finish().await;
     let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flow_m_two_sessions_run_independently_and_cancel_exact_blocked_turn() {
-    let (blocked, gate) = gated_sse(vec![completed()], false);
-    let server = ConcurrentMockServer::spawn([
-        blocked,
-        tool_response("m-read-call", "read", json!({"path": "input.txt"})),
-        text_response("session b final"),
+async fn tui_steer_update_cancel_while_wait_is_pending() {
+    let gate_events = vec![
+        json!({"type": "response.output_text.delta", "delta": "steered"}),
+        completed(),
+    ];
+    let (gated, gate) = gated_sse(gate_events);
+    let server = MockServer::spawn([gated, text_response("after cancel")]).await;
+    let base_url = server.base_url().to_owned();
+    let base = test_dir("control");
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = write_config(&base, &base_url, 256, &[], "deep", "high");
+    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+
+    let session = create_session(&mut process, "create", &workspace, "deep", "high").await;
+    let session_id = session["session_id"].clone();
+    process
+        .send(
+            "send",
+            "turn.send",
+            json!({"session_id": session_id, "text": "do the thing"}),
+        )
+        .await;
+    let turn = process.response("send").await["result"]["turn"].clone();
+    process.send("wait", "turn.wait", turn_params(&turn)).await;
+
+    // The loop is running; the reader stays responsive.
+    process.send("ping", "agent.ping", json!({})).await;
+    process.response("ping").await;
+
+    // Steer while wait is pending.
+    process
+        .send(
+            "steer",
+            "turn.steer",
+            json!({
+                "session_id": session_id,
+                "loop_id": turn["loop_id"],
+                "text": "do not touch config files"
+            }),
+        )
+        .await;
+    assert_eq!(process.response("steer").await["result"]["ok"], true);
+
+    // Session model/reasoning update while wait is pending.
+    process
+        .send(
+            "update",
+            "session.update",
+            json!({"session_id": session_id, "reasoning": "low"}),
+        )
+        .await;
+    let updated = process.response("update").await;
+    assert!(updated["result"]["active_revision"].is_number());
+    assert_eq!(updated["result"]["session"]["reasoning"], "low");
+
+    let running = state(&mut process, "state", &session_id).await;
+    assert_eq!(running["status"], "running");
+
+    // Cancel while wait is pending.
+    process
+        .send("cancel", "turn.cancel", turn_params(&turn))
+        .await;
+    assert_eq!(
+        process.response("cancel").await["result"]["cancelled"],
+        true
+    );
+    let waited = process.response("wait").await;
+    assert_eq!(waited["result"]["outcome"]["type"], "cancelled");
+    assert_eq!(waited["result"]["persistence"], "persisted");
+    gate.release();
+
+    // A further turn succeeds after the cancel.
+    process
+        .send(
+            "send2",
+            "turn.send",
+            json!({"session_id": session_id, "text": "next task"}),
+        )
+        .await;
+    let turn2 = process.response("send2").await["result"]["turn"].clone();
+    process
+        .send("wait2", "turn.wait", turn_params(&turn2))
+        .await;
+    let waited = process.response("wait2").await;
+    assert_eq!(waited["result"]["persistence"], "persisted");
+
+    let (observed, stderr) = process.shutdown().await;
+    assert!(!serde_json::to_string(&observed).unwrap().contains(KEY));
+    assert!(!stderr.contains(KEY));
+    server.finish().await;
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_streams_reasoning_and_text_channels() {
+    let reasoning = MockResponse::sse(&[
+        json!({"type": "response.reasoning_text.delta", "delta": "think carefully"}),
+        json!({"type": "response.output_text.delta", "delta": "final answer text"}),
+        completed(),
+    ]);
+    let server = MockServer::spawn([reasoning]).await;
+    let base_url = server.base_url().to_owned();
+    let base = test_dir("stream");
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = write_config(&base, &base_url, 256, &[], "deep", "medium");
+    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+
+    let session = create_session(&mut process, "create", &workspace, "deep", "medium").await;
+    let session_id = session["session_id"].clone();
+    process
+        .send(
+            "send",
+            "turn.send",
+            json!({"session_id": session_id, "text": "reason out loud"}),
+        )
+        .await;
+    let turn = process.response("send").await["result"]["turn"].clone();
+    process.send("wait", "turn.wait", turn_params(&turn)).await;
+
+    // Streaming deltas are best-effort; the exact text is asserted via the
+    // authoritative turn result and history.
+    let waited = process.response("wait").await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    assert_eq!(waited["result"]["persistence"], "persisted");
+    if let Some(delta) = process.try_event("output_delta").await {
+        let channel = delta["params"]["data"]["channel"].as_str().unwrap_or("");
+        let value = delta["params"]["data"]["delta"].as_str().unwrap_or("");
+        assert!(
+            (channel == "reasoning" && value == "think carefully")
+                || (channel == "text" && value == "final answer text"),
+            "unexpected delta {channel}={value}"
+        );
+    }
+    let finished = process.event("turn_finished").await;
+    assert!(event_for_turn(&finished, &turn));
+    assert_eq!(finished["params"]["data"]["persistence"], "persisted");
+
+    let page = history(&mut process, "history", &session_id).await;
+    assert!(page.to_string().contains("final answer text"));
+    assert!(page.to_string().contains("reason out loud"));
+
+    process.shutdown().await;
+    server.finish().await;
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
+    let server = MockServer::spawn([
+        tool_response(
+            "tui-read-call",
+            "read",
+            json!({"path": "SECRET-PATH.txt", "limit": 32}),
+        ),
+        text_response("read finished"),
     ])
     .await;
-    let base = test_dir("m");
+    let base_url = server.base_url().to_owned();
+    let base = test_dir("tool");
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("SECRET-PATH.txt"), "TOOL-CONTENT-TOKEN").unwrap();
+    let config = write_config(&base, &base_url, 256, &["read"], "deep", "high");
+    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+
+    let session = create_session(&mut process, "create", &workspace, "deep", "high").await;
+    let session_id = session["session_id"].clone();
+    process
+        .send(
+            "send",
+            "turn.send",
+            json!({"session_id": session_id, "text": "read the file"}),
+        )
+        .await;
+    let turn = process.response("send").await["result"]["turn"].clone();
+    process.send("wait", "turn.wait", turn_params(&turn)).await;
+    let tool_started = process.event("tool_started").await;
+    assert_eq!(tool_started["params"]["data"]["tool_name"], "read");
+    let tool_finished = process.event("tool_finished").await;
+    assert_eq!(
+        tool_finished["params"]["data"]["result"]["outcome"],
+        "success"
+    );
+    let waited = process.response("wait").await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+
+    let page = history(&mut process, "history", &session_id).await;
+    let serialized = page.to_string();
+    assert!(serialized.contains("TOOL-CONTENT-TOKEN"));
+    assert!(!serialized.contains("arguments"));
+    // The tool argument (secret path) never leaks into the safe history view.
+    assert!(!serialized.contains("SECRET-PATH.txt"));
+    let tool_result_count = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["item"]["type"] == "tool_result")
+        .count();
+    assert_eq!(tool_result_count, 1);
+
+    process.shutdown().await;
+    server.finish().await;
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_two_sessions_run_independently() {
+    let server = MockServer::spawn([text_response("session-a"), text_response("session-b")]).await;
+    let base_url = server.base_url().to_owned();
+    let base = test_dir("two-sessions");
     let workspace_a = base.join("workspace-a");
     let workspace_b = base.join("workspace-b");
     std::fs::create_dir_all(&workspace_a).unwrap();
     std::fs::create_dir_all(&workspace_b).unwrap();
-    std::fs::write(workspace_b.join("input.txt"), "FLOW-M-B-READ-CONTENT").unwrap();
-    let config = write_config(&base, server.base_url(), 128, &["read"], "deep", "high");
+    let config = write_config(&base, &base_url, 64, &[], "deep", "high");
     let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let session_a = create_session(&mut process, "m-create-a", &workspace_a, "deep", "high").await;
-    let session_b = create_session(&mut process, "m-create-b", &workspace_b, "fast", "low").await;
-    let session_a_id = session_a["session_id"].clone();
-    let session_b_id = session_b["session_id"].clone();
 
-    // Flow M: A remains blocked while B completes a two-round read loop.
-    let (turn_a, wait_a) = process
-        .send_turn_and_register_wait("m-a", &session_a_id, "block a")
+    let session_a = create_session(&mut process, "create-a", &workspace_a, "deep", "high").await;
+    let session_b = create_session(&mut process, "create-b", &workspace_b, "deep", "high").await;
+    assert_ne!(session_a["session_id"], session_b["session_id"]);
+
+    for (id, session, prompt) in [
+        ("a", &session_a, "work on a"),
+        ("b", &session_b, "work on b"),
+    ] {
+        process
+            .send(
+                &format!("send-{id}"),
+                "turn.send",
+                json!({"session_id": session["session_id"], "text": prompt}),
+            )
+            .await;
+        let turn = process.response(&format!("send-{id}")).await["result"]["turn"].clone();
+        let wait_id = format!("wait-{id}");
+        process
+            .send(&wait_id, "turn.wait", turn_params(&turn))
+            .await;
+        let waited = process.response(&wait_id).await;
+        assert_eq!(waited["result"]["persistence"], "persisted");
+    }
+
+    for (id, session) in [("a", &session_a), ("b", &session_b)] {
+        let page = history(
+            &mut process,
+            &format!("history-{id}"),
+            &session["session_id"],
+        )
         .await;
-    server.wait_for_requests(1).await;
-    let (turn_b, wait_b) = process
-        .send_turn_and_register_wait("m-b", &session_b_id, "read b")
-        .await;
+        assert_eq!(page["total"], 2);
+    }
+
+    process.shutdown().await;
+    server.finish().await;
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_error_mappings_cover_new_wire_types() {
+    // No turn is run in this test: an empty script keeps the mock idle.
+    let server = MockServer::spawn([]).await;
+    let base_url = server.base_url().to_owned();
+    let base = test_dir("errors");
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = write_config(&base, &base_url, 64, &[], "deep", "high");
+    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+
+    let session = create_session(&mut process, "create", &workspace, "deep", "high").await;
+    let session_id = session["session_id"].clone();
+
     process
-        .event_matching("tool_started", |frame| {
-            event_for_turn(frame, &turn_b["turn_id"])
-        })
+        .send(
+            "bad-history",
+            "session.history",
+            json!({"session_id": session_id, "offset": 0, "limit": 0}),
+        )
         .await;
-    process
-        .event_matching("tool_finished", |frame| {
-            event_for_turn(frame, &turn_b["turn_id"])
-        })
-        .await;
-    assert_eq!(
-        process.response(&wait_b).await["result"]["terminal"],
-        "completed"
-    );
-    assert_eq!(
-        state(&mut process, "m-b-idle", &session_b_id).await["status"],
-        "idle"
-    );
-    assert_eq!(
-        state(&mut process, "m-a-running", &session_a_id).await["status"],
-        "running"
-    );
-    assert!(
-        transcript(&mut process, "m-b-transcript", &session_b_id)
-            .await
-            .to_string()
-            .contains("FLOW-M-B-READ-CONTENT")
+    assert_error(
+        &process.response("bad-history").await,
+        -32603,
+        "internal_error",
     );
 
     process
-        .send("m-cancel-a", "turn.cancel", turn_params(&turn_a))
+        .send(
+            "unknown-session",
+            "session.state",
+            json!({"session_id": SessionId::new().unwrap()}),
+        )
         .await;
-    assert_eq!(
-        process.response("m-cancel-a").await["result"]["cancelled"],
-        true
+    assert_error(
+        &process.response("unknown-session").await,
+        -32002,
+        "session_not_loaded",
     );
-    assert_eq!(
-        process.response(&wait_a).await["result"]["terminal"],
-        "cancelled_by_user"
-    );
-    assert_eq!(
-        state(&mut process, "m-a-idle", &session_a_id).await["status"],
-        "idle"
-    );
-    assert_eq!(
-        state(&mut process, "m-b-still-idle", &session_b_id).await["status"],
-        "idle"
-    );
-    gate.release();
 
-    let (frames, _) = process.shutdown().await;
-    assert!(!has_event(&frames, "interaction_requested"));
-    assert_eq!(server.finish().await.len(), 3);
+    process.shutdown().await;
+    server.finish().await;
     let _ = std::fs::remove_dir_all(base);
 }

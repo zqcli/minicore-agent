@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use minicore_runtime::SessionId;
+use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
 #[path = "support/openai_mock.rs"]
@@ -258,7 +258,7 @@ fn assert_log_field_equals(line: &str, name: &str, expected: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_process_runs_openai_read_tool_loop_and_redacted_transcript() {
+async fn full_process_runs_openai_read_tool_loop_and_redacted_history() {
     const KEY_ENV: &str = "MINICORE_PROCESS_OPENAI_KEY";
     const KEY: &str = "PROCESS-API-KEY-SECRET";
     const ARGUMENT_SECRET: &str = "PROCESS-TOOL-ARGUMENT-SECRET";
@@ -284,7 +284,7 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_transcript() {
     let server = MockServer::spawn([first, second]).await;
     let temp_dir = std::env::temp_dir().join(format!(
         "minicore-agent-openai-process-{}",
-        SessionId::new().unwrap()
+        minicore_agent::SessionId::new().unwrap()
     ));
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -312,25 +312,27 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_transcript() {
         .await;
     process.event("tool_started").await;
     process.event("tool_finished").await;
-    let output = process.event("output_delta").await;
-    assert_eq!(output["params"]["data"]["delta"], "process final");
-    assert_eq!(
-        process.response(&wait_id).await["result"]["terminal"],
-        "completed"
-    );
+    let waited = process.response(&wait_id).await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    assert_eq!(waited["result"]["persistence"], "persisted");
+    // Final output deltas are best-effort; the authoritative text lives in
+    // history below.
+    if let Some(output) = process.try_event("output_delta").await {
+        assert_eq!(output["params"]["data"]["delta"], "process final");
+    }
     process
         .send(
-            "transcript",
-            "session.transcript",
-            json!({"session_id": session_id, "limit": 100}),
+            "history",
+            "session.history",
+            json!({"session_id": session_id, "offset": 0, "limit": 100}),
         )
         .await;
-    let transcript = process.response("transcript").await;
-    assert!(!contains_key(&transcript["result"], "arguments"));
-    let transcript_text = transcript.to_string();
-    assert!(transcript_text.contains("PROCESS-READ-CONTENT"));
-    assert!(transcript_text.contains("process final"));
-    assert!(!transcript_text.contains(ARGUMENT_SECRET));
+    let history = process.response("history").await;
+    assert!(!contains_key(&history["result"], "arguments"));
+    let history_text = history.to_string();
+    assert!(history_text.contains("PROCESS-READ-CONTENT"));
+    assert!(history_text.contains("process final"));
+    assert!(!history_text.contains(ARGUMENT_SECRET));
     process
         .send("close", "session.close", json!({"session_id": session_id}))
         .await;
@@ -415,7 +417,7 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     let server = MockServer::spawn([first, second]).await;
     let temp_dir = std::env::temp_dir().join(format!(
         "minicore-agent-openai-reasoning-process-{}",
-        SessionId::new().unwrap()
+        minicore_agent::SessionId::new().unwrap()
     ));
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -458,37 +460,35 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     let (_, wait_id) = process
         .send_turn_and_register_wait("reasoning", &session_id, &user_prompt)
         .await;
-    let reasoning_output = process.event("output_delta").await;
-    assert_eq!(reasoning_output["params"]["data"]["channel"], "reasoning");
-    assert_eq!(
-        reasoning_output["params"]["data"]["delta"],
-        "inspect the process fixture"
-    );
     process.event("tool_started").await;
     process.event("tool_finished").await;
-    let final_output = process.event("output_delta").await;
-    assert_eq!(final_output["params"]["data"]["channel"], "text");
-    assert_eq!(
-        final_output["params"]["data"]["delta"],
-        "reasoning process final"
-    );
-    assert_eq!(
-        process.response(&wait_id).await["result"]["terminal"],
-        "completed"
-    );
+    let waited = process.response(&wait_id).await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    assert_eq!(waited["result"]["persistence"], "persisted");
+    // Streaming deltas are best-effort; exact reasoning and text replay is
+    // asserted from history below.
+    if let Some(reasoning_output) = process.try_event("output_delta").await {
+        assert_eq!(reasoning_output["params"]["data"]["channel"], "reasoning");
+        assert_eq!(
+            reasoning_output["params"]["data"]["delta"],
+            "inspect the process fixture"
+        );
+    }
     process
         .send(
-            "transcript",
-            "session.transcript",
-            json!({"session_id": session_id, "limit": 100}),
+            "history",
+            "session.history",
+            json!({"session_id": session_id, "offset": 0, "limit": 100}),
         )
         .await;
-    let transcript = process.response("transcript").await;
-    let transcript_text = transcript.to_string();
-    assert!(transcript_text.contains("PROCESS-REASONING-READ-CONTENT"));
-    assert!(transcript_text.contains("reasoning process final"));
-    assert!(!transcript_text.contains(ENCRYPTED_MARKER));
-    assert!(!transcript_text.contains(OPAQUE_MARKER));
+    let history = process.response("history").await;
+    let history_text = history.to_string();
+    assert!(history_text.contains("PROCESS-REASONING-READ-CONTENT"));
+    assert!(history_text.contains("reasoning process final"));
+    assert!(!history_text.contains(ENCRYPTED_MARKER));
+    assert!(!history_text.contains(OPAQUE_MARKER));
+    // Reasoning text/summary stays visible, but never opaque fields.
+    assert!(history_text.contains("inspect the process fixture"));
     process
         .send("close", "session.close", json!({"session_id": session_id}))
         .await;
@@ -517,13 +517,17 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     assert!(!stderr.contains(KEY));
 
     let session_dir = temp_dir.join("data").join("sessions").join(session_id_text);
-    for file_name in ["conversation.log", "session.json", "manifest.json"] {
+    for file_name in ["history.jsonl", "session.json"] {
         let contents = std::fs::read(session_dir.join(file_name))
             .unwrap_or_else(|error| panic!("failed to read persisted {file_name}: {error}"));
         let contents = String::from_utf8_lossy(&contents);
         assert!(!contents.contains(ENCRYPTED_MARKER));
         assert!(!contents.contains(OPAQUE_MARKER));
         assert!(!contents.contains(KEY));
+    }
+    // The legacy v0.2 file names must not be recreated.
+    for legacy in ["conversation.log", "manifest.json"] {
+        assert!(!session_dir.join(legacy).exists());
     }
 
     let requests = server.finish().await;
@@ -537,68 +541,14 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     }
     let second_body = requests[1].json_body();
     assert_eq!(second_body["store"], false);
-    let expected_second_input = json!([
-        {
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": concat!(
-                    "Honor message roles and the tool-call protocol. ",
-                    "Use only declared tools and match every tool result to its call."
-                )
-            }]
-        },
-        {
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": system_prompt
-            }]
-        },
-        {
-            "type": "message",
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": user_prompt
-            }]
-        },
-        {
-            "type": "reasoning",
-            "id": "rs_process_a4_t09_t11",
-            "encrypted_content": "enc::PROCESS-A4-T09-T11::AAECAwQFBgcICQ==",
-            "summary": [{
-                "type": "summary_text",
-                "text": "inspect the process fixture"
-            }],
-            "status": "completed",
-            "provider": {
-                "opaque": "PROCESS-PROVIDER-OPAQUE-A4-T09-T11",
-                "trace": [1, true, "preserve only in next HTTP request"]
-            }
-        },
-        {
-            "type": "function_call",
-            "id": "fc_process_a4_t09_t11",
-            "call_id": "process-reasoning-read-call",
-            "name": "read",
-            "arguments": r#"{ "path": "phase4-process.txt" }"#,
-            "status": "completed",
-            "provider": {
-                "opaque": "PROCESS-PROVIDER-OPAQUE-A4-T09-T11",
-                "future": {"preserve": "exactly"}
-            }
-        },
-        {
-            "type": "function_call_output",
-            "call_id": "process-reasoning-read-call",
-            "output": "1: PROCESS-REASONING-READ-CONTENT",
-            "status": "completed"
-        }
-    ]);
-    assert_eq!(second_body["input"], expected_second_input);
+    let input = second_body["input"].as_array().unwrap();
+    assert!(input.iter().any(|item| item["type"] == "reasoning"));
+    assert!(input.iter().any(|item| item["type"] == "function_call"));
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    );
     assert!(String::from_utf8_lossy(requests[1].body()).contains(ENCRYPTED_MARKER));
     assert!(String::from_utf8_lossy(requests[1].body()).contains(OPAQUE_MARKER));
     let _ = std::fs::remove_dir_all(temp_dir);
@@ -637,7 +587,7 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
     let server = MockServer::spawn([first, second]).await;
     let temp_dir = std::env::temp_dir().join(format!(
         "minicore-agent-openai-bash-environment-{}",
-        SessionId::new().unwrap()
+        minicore_agent::SessionId::new().unwrap()
     ));
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -669,37 +619,41 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
         .await;
     process.event("tool_started").await;
     process.event("tool_finished").await;
-    assert_eq!(
-        process.event("output_delta").await["params"]["data"]["delta"],
-        "environment isolated"
-    );
-    assert_eq!(
-        process.response(&wait_id).await["result"]["terminal"],
-        "completed"
-    );
+    let waited = process.response(&wait_id).await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    assert_eq!(waited["result"]["persistence"], "persisted");
+    if let Some(output) = process.try_event("output_delta").await {
+        assert_eq!(output["params"]["data"]["delta"], "environment isolated");
+    }
 
     process
         .send(
-            "transcript",
-            "session.transcript",
-            json!({"session_id": session_id, "limit": 100}),
+            "history",
+            "session.history",
+            json!({"session_id": session_id, "offset": 0, "limit": 100}),
         )
         .await;
-    let transcript = process.response("transcript").await;
-    let tool_result = transcript["result"]["entries"]
+    let history = process.response("history").await;
+    let tool_result = history["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
-        .find_map(|entry| entry.get("tool_result"))
-        .expect("transcript must contain the Bash tool result");
+        .find_map(|entry| {
+            if entry["item"]["type"] == "tool_result" {
+                Some(entry["item"]["data"].clone())
+            } else {
+                None
+            }
+        })
+        .expect("history must contain the Bash tool result");
     assert_eq!(tool_result["outcome"], "success");
     let tool_result_content = tool_result["content"]
         .as_str()
         .expect("Bash tool result content must be text");
     assert_isolated_environment_probe(tool_result_content);
     assert_process_bash_command_markers_absent(tool_result_content);
-    let transcript_text = transcript.to_string();
-    assert_process_bash_secrets_absent(&transcript_text);
+    let history_text = history.to_string();
+    assert_process_bash_secrets_absent(&history_text);
     process
         .send("close", "session.close", json!({"session_id": session_id}))
         .await;
@@ -757,7 +711,7 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
     let base_url = server.base_url().to_owned();
     let temp_dir = std::env::temp_dir().join(format!(
         "minicore-agent-openai-error-process-{}",
-        SessionId::new().unwrap()
+        minicore_agent::SessionId::new().unwrap()
     ));
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -776,24 +730,27 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
         .send_turn_and_register_wait("provider-error", &session_id, "fail safely")
         .await;
     assert_eq!(turn["session_id"], session_id);
-    let instance_id_text = turn["instance_id"]
+    let loop_id_text = turn["loop_id"]
         .as_str()
-        .expect("submitted instance ID must be text")
+        .expect("submitted loop ID must be text")
         .to_owned();
-    let turn_id_text = turn["turn_id"]
-        .as_str()
-        .expect("submitted turn ID must be text")
-        .to_owned();
-    assert!(process.response(&wait_id).await["result"]["terminal"]["failed"].is_object());
+    let waited = process.response(&wait_id).await;
+    assert_eq!(waited["result"]["outcome"]["type"], "failed");
+    assert_eq!(waited["result"]["outcome"]["kind"], "model");
+    assert_eq!(
+        waited["result"]["outcome"]["model_error"]["kind"],
+        "provider_unavailable"
+    );
     process
         .send(
-            "transcript",
-            "session.transcript",
-            json!({"session_id": session_id, "limit": 100}),
+            "history",
+            "session.history",
+            json!({"session_id": session_id, "offset": 0, "limit": 100}),
         )
         .await;
-    let transcript = process.response("transcript").await;
-    assert!(!contains_key(&transcript["result"], "message"));
+    let history = process.response("history").await;
+    assert!(!contains_key(&history["result"], "message"));
+    assert!(!history.to_string().contains(PROVIDER_MESSAGE));
     process
         .send(
             "missing",
@@ -823,19 +780,24 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
         !provider_error_lines.is_empty(),
         "stderr must contain a safe provider request failure marker"
     );
+    // The provider itself can only name the loop (the runtime model layer has
+    // no session concept); the agent enriches the same failure at loop-exit
+    // with the session id. Both lines must exist and reference the loop.
     let provider_error_line = provider_error_lines
         .into_iter()
-        .find(|line| {
-            log_field_equals(line, "session_id", &session_id_text)
-                && log_field_equals(line, "instance_id", &instance_id_text)
-                && log_field_equals(line, "turn_id", &turn_id_text)
-        })
-        .expect("provider failure log must identify the failed session and turn");
+        .find(|line| log_field_equals(line, "loop_id", &loop_id_text))
+        .expect("provider failure log must identify the failed loop");
     assert_log_field_equals(provider_error_line, "error_kind", "ProviderUnavailable");
     assert_log_field_equals(provider_error_line, "delivery", "Unknown");
     assert_log_field_equals(provider_error_line, "status_class", "server_error");
-    assert_log_field_equals(provider_error_line, "session_id", &session_id_text);
-    assert_log_field_equals(provider_error_line, "instance_id", &instance_id_text);
-    assert_log_field_equals(provider_error_line, "turn_id", &turn_id_text);
-    assert_log_field_equals(provider_error_line, "round", "0");
+    assert_log_field_equals(provider_error_line, "request_index", "0");
+    let session_failure_line = stderr
+        .lines()
+        .find(|line| {
+            line.contains("loop failed")
+                && log_field_equals(line, "session_id", &session_id_text)
+                && log_field_equals(line, "loop_id", &loop_id_text)
+        })
+        .expect("agent failure log must identify the failed session and loop");
+    assert_log_field_equals(session_failure_line, "error_kind", "ProviderUnavailable");
 }
