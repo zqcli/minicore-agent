@@ -832,8 +832,22 @@ async fn next_send_cleans_up_finished_turn_without_explicit_wait() {
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "one").await;
-    // Let the loop finish, then send again without waiting for the first turn.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let state = agent.session_state(info.session_id).unwrap();
+        if state.status == crate::sessions::SessionStatus::Idle {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "first turn did not reach Idle; final status: {:?}",
+                state.status
+            );
+        }
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
+    }
+    // Send again after Agent-level completion, without waiting for the first turn.
     let second = send_text(&mut agent, info.session_id, "two").await;
     assert_ne!(turn.loop_id, second.loop_id);
     let result = wait_text(&agent, second).await;
