@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
-use minicore_runtime::SessionId;
+use minicore_agent::SessionId;
 
 use serde_json::{Value, json};
 

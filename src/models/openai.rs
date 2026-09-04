@@ -14,7 +14,6 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     AssistantPart, DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError,
     ModelErrorKind, ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelRequest,
@@ -22,6 +21,7 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES};
+use minicore_runtime::{LoopId, ToolCallId};
 
 use super::ModelConfigError;
 
@@ -33,7 +33,7 @@ const MAX_QUEUED_SSE_FRAMES: usize = 4_096;
 const MAX_EVENT_BYTES: usize = minicore_runtime::model::MAX_MODEL_EVENT_TEXT_BYTES;
 const MAX_OPENAI_CALL_ID_BYTES: usize = 64;
 const MAX_CONTINUATION_ITEMS_PER_ROUND: usize = 256;
-const MAX_CONTINUATION_BYTES_PER_TURN: usize = 4 * 1024 * 1024;
+const MAX_CONTINUATION_BYTES_PER_LOOP: usize = 4 * 1024 * 1024;
 const MAX_ACTIVE_CONTINUATIONS: usize = 256;
 
 pub(super) struct OpenAiResponsesSettings {
@@ -48,49 +48,12 @@ pub(super) struct OpenAiResponsesSettings {
     pub(super) request_timeout: Option<Duration>,
 }
 
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct TurnKey {
-    instance_id: SessionInstanceId,
-    turn_id: TurnId,
-}
+/// Continuations are keyed by the runtime loop that owns the model requests;
+/// one agent turn maps to one loop. `request_index` is zero-based and must be
+/// consecutive for replay within the same loop/model instance.
+type ContinuationStore = Arc<Mutex<HashMap<LoopId, LoopContinuation>>>;
 
-#[derive(Clone, Copy)]
-struct RequestTraceContext {
-    session_id: SessionId,
-    instance_id: SessionInstanceId,
-    turn_id: TurnId,
-    round: u16,
-}
-
-impl From<&ModelCallContext> for RequestTraceContext {
-    fn from(context: &ModelCallContext) -> Self {
-        Self {
-            session_id: context.session_id,
-            instance_id: context.instance_id,
-            turn_id: context.turn_id,
-            round: context.round,
-        }
-    }
-}
-
-struct TurnContinuation {
-    cancellation: CancellationToken,
-    updated_at: Instant,
-    total_output_item_bytes: usize,
-    rounds: Vec<ProviderRoundReplay>,
-}
-
-#[derive(Clone)]
-struct ProviderRoundReplay {
-    round: u16,
-    tool_call_ids: Vec<ToolCallId>,
-    output_items: Arc<[Value]>,
-    output_item_bytes: usize,
-}
-
-type ContinuationStore = Arc<Mutex<HashMap<TurnKey, TurnContinuation>>>;
-
-fn remove_oldest_continuation(continuations: &mut HashMap<TurnKey, TurnContinuation>) -> bool {
+fn remove_oldest_continuation(continuations: &mut HashMap<LoopId, LoopContinuation>) -> bool {
     let oldest_key = continuations
         .iter()
         .map(|(key, continuation)| (*key, continuation.updated_at))
@@ -103,7 +66,7 @@ fn remove_oldest_continuation(continuations: &mut HashMap<TurnKey, TurnContinuat
     true
 }
 
-fn trim_active_continuations(continuations: &mut HashMap<TurnKey, TurnContinuation>) {
+fn trim_active_continuations(continuations: &mut HashMap<LoopId, LoopContinuation>) {
     while continuations.len() > MAX_ACTIVE_CONTINUATIONS {
         if !remove_oldest_continuation(continuations) {
             break;
@@ -111,12 +74,44 @@ fn trim_active_continuations(continuations: &mut HashMap<TurnKey, TurnContinuati
     }
 }
 
-fn make_room_for_continuation(continuations: &mut HashMap<TurnKey, TurnContinuation>) {
+fn make_room_for_continuation(continuations: &mut HashMap<LoopId, LoopContinuation>) {
     while continuations.len() >= MAX_ACTIVE_CONTINUATIONS {
         if !remove_oldest_continuation(continuations) {
             break;
         }
     }
+}
+
+/// Redacted identity observed by tracing only: provider continuation is keyed
+/// by `LoopId` and `request_index`, never by prompts, arguments, or responses.
+#[derive(Clone, Copy)]
+struct RequestTraceContext {
+    loop_id: LoopId,
+    request_index: u32,
+}
+
+impl From<&ModelCallContext> for RequestTraceContext {
+    fn from(context: &ModelCallContext) -> Self {
+        Self {
+            loop_id: context.loop_id,
+            request_index: context.request_index,
+        }
+    }
+}
+
+struct LoopContinuation {
+    cancellation: CancellationToken,
+    updated_at: Instant,
+    total_output_item_bytes: usize,
+    requests: Vec<ProviderRequestReplay>,
+}
+
+#[derive(Clone)]
+struct ProviderRequestReplay {
+    request_index: u32,
+    tool_call_ids: Vec<ToolCallId>,
+    output_items: Arc<[Value]>,
+    output_item_bytes: usize,
 }
 
 pub(super) struct OpenAiResponsesModel {
@@ -168,14 +163,14 @@ impl OpenAiResponsesModel {
     fn build_request_with_replay(
         &self,
         request: &ModelRequest,
-        replay: &[ProviderRoundReplay],
-    ) -> Result<(Vec<u8>, Vec<u16>), ModelError> {
+        replay: &[ProviderRequestReplay],
+    ) -> Result<(Vec<u8>, Vec<u32>), ModelError> {
         if !self.descriptor.supports_reasoning(request.reasoning())
             || (!request.tools().is_empty() && !self.descriptor.supports_tools)
         {
             return Err(local_error(ModelErrorKind::InvalidRequest));
         }
-        let (body, matched_replay_rounds) = ResponsesRequest::from_runtime(
+        let (body, matched_request_indexes) = ResponsesRequest::from_runtime(
             &self.provider_model,
             self.output_budget_tokens,
             request,
@@ -187,108 +182,110 @@ impl OpenAiResponsesModel {
         if estimated_tokens > self.descriptor.context_window {
             return Err(local_error(ModelErrorKind::ContextOverflow));
         }
-        Ok((encoded, matched_replay_rounds))
+        Ok((encoded, matched_request_indexes))
     }
 
     fn continuation_snapshot(
         &self,
-        key: TurnKey,
-        round: u16,
+        loop_id: LoopId,
+        request_index: u32,
         enabled: bool,
-    ) -> Result<Vec<ProviderRoundReplay>, ModelError> {
+    ) -> Result<Vec<ProviderRequestReplay>, ModelError> {
         let mut continuations = self
             .continuations
             .lock()
             .map_err(|_| local_error(ModelErrorKind::Internal))?;
         continuations.retain(|_, continuation| !continuation.cancellation.is_cancelled());
-        if round == 0 || !enabled {
-            continuations.remove(&key);
+        if request_index == 0 || !enabled {
+            continuations.remove(&loop_id);
         }
         trim_active_continuations(&mut continuations);
         if !enabled {
             return Ok(Vec::new());
         }
-        let Some(continuation) = continuations.get(&key) else {
+        let Some(continuation) = continuations.get(&loop_id) else {
             return Ok(Vec::new());
         };
-        let next_round = continuation
-            .rounds
+        let next_request_index = continuation
+            .requests
             .iter()
-            .map(|replay| replay.round)
+            .map(|replay| replay.request_index)
             .max()
             .and_then(|highest| highest.checked_add(1));
-        if next_round != Some(round) {
-            continuations.remove(&key);
+        if next_request_index != Some(request_index) {
+            // A non-consecutive index (model switch, stale continue) starts
+            // a clean request; old continuation is discarded.
+            continuations.remove(&loop_id);
             return Ok(Vec::new());
         }
         let recomputed_total = continuation
-            .rounds
+            .requests
             .iter()
             .try_fold(0_usize, |total, replay| {
                 total.checked_add(replay.output_item_bytes).ok_or(())
             });
         if recomputed_total != Ok(continuation.total_output_item_bytes)
-            || continuation.total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_TURN
+            || continuation.total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_LOOP
         {
-            continuations.remove(&key);
+            continuations.remove(&loop_id);
             return Err(local_error(ModelErrorKind::Internal));
         }
         let mut snapshot = continuations
-            .get(&key)
+            .get(&loop_id)
             .into_iter()
-            .flat_map(|continuation| continuation.rounds.iter())
-            .filter(|replay| replay.round < round)
+            .flat_map(|continuation| continuation.requests.iter())
+            .filter(|replay| replay.request_index < request_index)
             .cloned()
             .collect::<Vec<_>>();
-        snapshot.sort_by_key(|replay| replay.round);
+        snapshot.sort_by_key(|replay| replay.request_index);
         Ok(snapshot)
     }
 
-    fn remove_continuation(&self, key: TurnKey) {
+    fn remove_continuation(&self, loop_id: LoopId) {
         let Ok(mut continuations) = self.continuations.lock() else {
             return;
         };
-        continuations.remove(&key);
+        continuations.remove(&loop_id);
     }
 
     async fn start_request(
         &self,
         request: ModelRequest,
         context: ModelCallContext,
-        turn_key: TurnKey,
+        loop_id: LoopId,
         continuation_enabled: bool,
     ) -> Result<ModelStream, ModelError> {
         let trace = RequestTraceContext::from(&context);
-        let round = context.round;
-        let replay = self.continuation_snapshot(turn_key, round, continuation_enabled)?;
+        let request_index = context.request_index;
+        let replay = self.continuation_snapshot(loop_id, request_index, continuation_enabled)?;
         if context.cancellation.is_cancelled() {
             return Err(local_error(ModelErrorKind::Cancelled));
         }
         if Instant::now() >= context.deadline {
             return Err(local_error(ModelErrorKind::Timeout));
         }
-        let (body, matched_replay_rounds) = if replay.is_empty() {
+        let (body, matched_request_indexes) = if replay.is_empty() {
             (self.build_request(&request)?, Vec::new())
         } else {
             self.build_request_with_replay(&request, &replay)?
         };
-        let mut matched_round_ids = BTreeSet::new();
+        let mut matched_request_ids = BTreeSet::new();
         let prior_output_item_bytes =
-            matched_replay_rounds
+            matched_request_indexes
                 .iter()
-                .try_fold(0_usize, |total, matched_round| {
-                    if !matched_round_ids.insert(*matched_round) {
+                .try_fold(0_usize, |total, matched_index| {
+                    if !matched_request_ids.insert(*matched_index) {
                         return Err(local_error(ModelErrorKind::Internal));
                     }
                     let replay = replay
                         .iter()
-                        .find(|replay| replay.round == *matched_round)
+                        .find(|replay| replay.request_index == *matched_index)
                         .ok_or_else(|| local_error(ModelErrorKind::Internal))?;
                     total
                         .checked_add(replay.output_item_bytes)
                         .ok_or_else(|| local_error(ModelErrorKind::Internal))
                 })?;
-        if prior_output_item_bytes > MAX_CONTINUATION_BYTES_PER_TURN {
+        if prior_output_item_bytes > MAX_CONTINUATION_BYTES_PER_LOOP {
             return Err(local_error(ModelErrorKind::Internal));
         }
         let request = self
@@ -347,11 +344,11 @@ impl OpenAiResponsesModel {
 
         let bytes: ByteStream = Box::pin(response.bytes_stream());
         let continuation = continuation_enabled.then(|| StreamContinuation {
-            round,
+            request_index,
             cancellation: cancellation.clone(),
             prior_output_item_bytes,
-            matched_replay_rounds,
-            guard: ContinuationGuard::new(Arc::clone(&self.continuations), turn_key),
+            matched_request_indexes,
+            guard: ContinuationGuard::new(Arc::clone(&self.continuations), loop_id),
         });
         let state = StreamState::new_with_continuation(
             bytes,
@@ -369,34 +366,23 @@ impl Model for OpenAiResponsesModel {
         &self.descriptor
     }
 
-    fn start<'a>(
-        &'a self,
-        request: ModelRequest,
-        context: ModelCallContext,
-    ) -> ModelStartFuture<'a> {
-        let turn_key = TurnKey {
-            instance_id: context.instance_id,
-            turn_id: context.turn_id,
-        };
+    fn start(&self, request: ModelRequest, context: ModelCallContext) -> ModelStartFuture<'_> {
+        let loop_id = context.loop_id;
         let trace = RequestTraceContext::from(&context);
         let continuation_enabled = request.reasoning() != ReasoningPreference::Disabled;
         Box::pin(async move {
             tracing::debug!(
-                session_id = %trace.session_id,
-                instance_id = %trace.instance_id,
-                turn_id = %trace.turn_id,
-                round = trace.round,
+                loop_id = %trace.loop_id,
+                request_index = trace.request_index,
                 "provider request start"
             );
             let result = self
-                .start_request(request, context, turn_key, continuation_enabled)
+                .start_request(request, context, loop_id, continuation_enabled)
                 .await;
             if let Err(error) = &result {
                 tracing::debug!(
-                    session_id = %trace.session_id,
-                    instance_id = %trace.instance_id,
-                    turn_id = %trace.turn_id,
-                    round = trace.round,
+                    loop_id = %trace.loop_id,
+                    request_index = trace.request_index,
                     error_kind = ?error.kind(),
                     delivery = ?error.delivery(),
                     retryable = model_error_retryable(error),
@@ -405,14 +391,12 @@ impl Model for OpenAiResponsesModel {
                 let preserve = error.delivery() == DeliveryState::NotStarted
                     && matches!(error.retry_hint(), RetryHint::Retryable { .. });
                 if continuation_enabled && !preserve {
-                    self.remove_continuation(turn_key);
+                    self.remove_continuation(loop_id);
                 }
             } else {
                 tracing::debug!(
-                    session_id = %trace.session_id,
-                    instance_id = %trace.instance_id,
-                    turn_id = %trace.turn_id,
-                    round = trace.round,
+                    loop_id = %trace.loop_id,
+                    request_index = trace.request_index,
                     "provider response stream opened"
                 );
             }
@@ -456,12 +440,12 @@ impl<'a> ResponsesRequest<'a> {
         model: &'a str,
         output_budget_tokens: u32,
         request: &ModelRequest,
-        replay: &[ProviderRoundReplay],
-    ) -> Result<(Self, Vec<u16>), ModelError> {
+        replay: &[ProviderRequestReplay],
+    ) -> Result<(Self, Vec<u32>), ModelError> {
         let mut input = Vec::new();
         let mut seen_tool_call_groups = BTreeSet::<Vec<ToolCallId>>::new();
         let mut used_replays = BTreeSet::<usize>::new();
-        let mut matched_replay_rounds = Vec::new();
+        let mut matched_request_indexes = Vec::new();
         for (message_index, message) in request.messages().iter().enumerate() {
             match message {
                 ModelMessage::System(text) => input.push(InputItem::Message(InputMessage {
@@ -505,7 +489,7 @@ impl<'a> ResponsesRequest<'a> {
                             })
                         {
                             used_replays.insert(replay_index);
-                            matched_replay_rounds.push(provider_replay.round);
+                            matched_request_indexes.push(provider_replay.request_index);
                             input.extend(
                                 provider_replay
                                     .output_items
@@ -592,7 +576,7 @@ impl<'a> ResponsesRequest<'a> {
                 max_output_tokens: output_budget_tokens,
                 reasoning,
             },
-            matched_replay_rounds,
+            matched_request_indexes,
         ))
     }
 }
@@ -770,10 +754,8 @@ fn log_provider_request_failure(
     status_class: &'static str,
 ) {
     tracing::warn!(
-        session_id = %trace.session_id,
-        instance_id = %trace.instance_id,
-        turn_id = %trace.turn_id,
-        round = trace.round,
+        loop_id = %trace.loop_id,
+        request_index = trace.request_index,
         error_kind = ?error.kind(),
         delivery = ?error.delivery(),
         retryable = model_error_retryable(error),
@@ -939,12 +921,12 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Sen
 
 struct ContinuationGuard {
     store: ContinuationStore,
-    key: TurnKey,
+    key: LoopId,
     preserve: bool,
 }
 
 impl ContinuationGuard {
-    fn new(store: ContinuationStore, key: TurnKey) -> Self {
+    fn new(store: ContinuationStore, key: LoopId) -> Self {
         Self {
             store,
             key,
@@ -974,10 +956,10 @@ impl Drop for ContinuationGuard {
 }
 
 struct StreamContinuation {
-    round: u16,
+    request_index: u32,
     cancellation: CancellationToken,
     prior_output_item_bytes: usize,
-    matched_replay_rounds: Vec<u16>,
+    matched_request_indexes: Vec<u32>,
     guard: ContinuationGuard,
 }
 
@@ -1059,10 +1041,8 @@ impl StreamState {
     fn fail(&mut self, error: ModelError) {
         if let Some(trace) = self.trace {
             tracing::warn!(
-                session_id = %trace.session_id,
-                instance_id = %trace.instance_id,
-                turn_id = %trace.turn_id,
-                round = trace.round,
+                loop_id = %trace.loop_id,
+                request_index = trace.request_index,
                 error_kind = ?error.kind(),
                 delivery = ?error.delivery(),
                 "provider stream failed"
@@ -1092,7 +1072,7 @@ impl StreamState {
             .prior_output_item_bytes()
             .checked_add(output_item_bytes)
             .ok_or(())?;
-        if total > MAX_CONTINUATION_BYTES_PER_TURN {
+        if total > MAX_CONTINUATION_BYTES_PER_LOOP {
             return Err(());
         }
         Ok(())
@@ -1170,8 +1150,8 @@ impl StreamState {
                 return Err(());
             }
         }
-        let replay = ProviderRoundReplay {
-            round: continuation.round,
+        let replay = ProviderRequestReplay {
+            request_index: continuation.request_index,
             tool_call_ids: self
                 .tools
                 .values()
@@ -1183,21 +1163,23 @@ impl StreamState {
         let updated_at = Instant::now();
         {
             let mut continuations = continuation.guard.store.lock().map_err(|_| ())?;
-            let existing_rounds = continuations
+            let existing_requests = continuations
                 .get(&continuation.guard.key)
-                .map(|continuation| continuation.rounds.clone());
-            let key_exists = existing_rounds.is_some();
-            let mut rounds = existing_rounds.unwrap_or_default();
-            rounds.retain(|existing| {
-                existing.round != replay.round
-                    && continuation.matched_replay_rounds.contains(&existing.round)
+                .map(|continuation| continuation.requests.clone());
+            let key_exists = existing_requests.is_some();
+            let mut requests = existing_requests.unwrap_or_default();
+            requests.retain(|existing| {
+                existing.request_index != replay.request_index
+                    && continuation
+                        .matched_request_indexes
+                        .contains(&existing.request_index)
             });
-            rounds.push(replay);
-            rounds.sort_by_key(|replay| replay.round);
-            let total_output_item_bytes = rounds.iter().try_fold(0_usize, |total, replay| {
+            requests.push(replay);
+            requests.sort_by_key(|replay| replay.request_index);
+            let total_output_item_bytes = requests.iter().try_fold(0_usize, |total, replay| {
                 total.checked_add(replay.output_item_bytes).ok_or(())
             })?;
-            if total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_TURN {
+            if total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_LOOP {
                 return Err(());
             }
             if !key_exists {
@@ -1206,16 +1188,16 @@ impl StreamState {
             let turn_continuation =
                 continuations
                     .entry(continuation.guard.key)
-                    .or_insert_with(|| TurnContinuation {
+                    .or_insert_with(|| LoopContinuation {
                         cancellation: continuation.cancellation.clone(),
                         updated_at,
                         total_output_item_bytes,
-                        rounds: Vec::new(),
+                        requests: Vec::new(),
                     });
             turn_continuation.cancellation = continuation.cancellation.clone();
             turn_continuation.updated_at = updated_at.max(turn_continuation.updated_at);
             turn_continuation.total_output_item_bytes = total_output_item_bytes;
-            turn_continuation.rounds = rounds;
+            turn_continuation.requests = requests;
         }
         self.continuation.as_mut().ok_or(())?.guard.preserve();
         Ok(())
@@ -1826,10 +1808,8 @@ fn finish_response(
     state.terminal_seen = true;
     if let Some(trace) = state.trace {
         tracing::debug!(
-            session_id = %trace.session_id,
-            instance_id = %trace.instance_id,
-            turn_id = %trace.turn_id,
-            round = trace.round,
+            loop_id = %trace.loop_id,
+            request_index = trace.request_index,
             finish_reason = ?reason,
             "provider request terminal"
         );

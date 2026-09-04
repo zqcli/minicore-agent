@@ -8,18 +8,20 @@ use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use minicore_runtime::ids::{SessionId, SessionInstanceId, ToolCallId, TurnId};
 use minicore_runtime::model::{
     AssistantPart, DeliveryState, ModelFinishReason, ModelLimits, ModelMessage, ModelRequest,
     ReasoningContent, RetryHint, ToolCall, Usage,
 };
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome, ToolSpec};
+use minicore_runtime::{LoopId, ToolCallId};
 
-use crate::agent::{Agent, CreateSession, GetTranscript, SendMessage, TurnRef};
-use crate::config::{AgentConfig, KernelOverrides, Profile};
+use crate::agent::{Agent, CreateSession, SendMessage};
+use crate::config::{AgentConfig, LoopOverrides, Profile};
 use crate::event::{AgentEvent, OutputChannel};
+use crate::history::{GetHistory, HistoryItemView};
 use crate::models::{ModelConfig, Models};
-use crate::profiles::{ApprovalMode, ProfileCompaction};
+use crate::profiles::ApprovalMode;
+use crate::sessions::TurnRef;
 
 use super::*;
 
@@ -72,59 +74,31 @@ fn agent_model_config(base_url: &str) -> ModelConfig {
 }
 
 fn context(cancellation: CancellationToken, deadline: Duration) -> ModelCallContext {
-    context_for_round(0, cancellation, deadline)
+    context_for_request(0, cancellation, deadline)
 }
 
-fn context_for_round(
-    round: u16,
+fn context_for_request(
+    request_index: u32,
     cancellation: CancellationToken,
     deadline: Duration,
 ) -> ModelCallContext {
-    context_for_identity(
-        "ins_00000000000000000000000000000001"
-            .parse::<SessionInstanceId>()
-            .unwrap(),
-        "trn_00000000000000000000000000000001"
-            .parse::<TurnId>()
-            .unwrap(),
-        round,
+    context_for_loop(
+        "lup_00000000000000000000000000000001".parse().unwrap(),
+        request_index,
         cancellation,
         deadline,
     )
 }
 
-fn context_for_identity(
-    instance_id: SessionInstanceId,
-    turn_id: TurnId,
-    round: u16,
-    cancellation: CancellationToken,
-    deadline: Duration,
-) -> ModelCallContext {
-    context_for_session_identity(
-        "ses_00000000000000000000000000000001"
-            .parse::<SessionId>()
-            .unwrap(),
-        instance_id,
-        turn_id,
-        round,
-        cancellation,
-        deadline,
-    )
-}
-
-fn context_for_session_identity(
-    session_id: SessionId,
-    instance_id: SessionInstanceId,
-    turn_id: TurnId,
-    round: u16,
+fn context_for_loop(
+    loop_id: LoopId,
+    request_index: u32,
     cancellation: CancellationToken,
     deadline: Duration,
 ) -> ModelCallContext {
     ModelCallContext::new(
-        session_id,
-        instance_id,
-        turn_id,
-        round,
+        loop_id,
+        request_index,
         cancellation,
         Instant::now() + deadline,
     )
@@ -474,7 +448,7 @@ async fn same_turn_next_round_replays_exact_reasoning_and_function_call_items() 
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -529,7 +503,7 @@ async fn same_turn_next_round_replays_exact_reasoning_and_function_call_items() 
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -688,7 +662,7 @@ async fn three_round_tool_loop_replays_each_prior_provider_round_once() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -719,7 +693,7 @@ async fn three_round_tool_loop_replays_each_prior_provider_round_once() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -759,7 +733,7 @@ async fn three_round_tool_loop_replays_each_prior_provider_round_once() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(2, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(2, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -903,18 +877,8 @@ async fn round_one_concurrent_turn_continuations_are_isolated_by_identity() {
     ])
     .await;
     let model = Arc::new(model(server.base_url()));
-    let instance_a = "ins_0000000000000000000000000000000a"
-        .parse::<SessionInstanceId>()
-        .unwrap();
-    let turn_a = "trn_0000000000000000000000000000000a"
-        .parse::<TurnId>()
-        .unwrap();
-    let instance_b = "ins_0000000000000000000000000000000b"
-        .parse::<SessionInstanceId>()
-        .unwrap();
-    let turn_b = "trn_0000000000000000000000000000000b"
-        .parse::<TurnId>()
-        .unwrap();
+    let loop_a = "lup_0000000000000000000000000000000a".parse().unwrap();
+    let loop_b = "lup_0000000000000000000000000000000b".parse().unwrap();
 
     run_model(
         &model,
@@ -925,13 +889,7 @@ async fn round_one_concurrent_turn_continuations_are_isolated_by_identity() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_identity(
-            instance_a,
-            turn_a,
-            0,
-            CancellationToken::new(),
-            Duration::from_secs(5),
-        ),
+        context_for_loop(loop_a, 0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -944,13 +902,7 @@ async fn round_one_concurrent_turn_continuations_are_isolated_by_identity() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_identity(
-            instance_b,
-            turn_b,
-            0,
-            CancellationToken::new(),
-            Duration::from_secs(5),
-        ),
+        context_for_loop(loop_b, 0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -1013,24 +965,12 @@ async fn round_one_concurrent_turn_continuations_are_isolated_by_identity() {
         run_model(
             &model,
             request_a,
-            context_for_identity(
-                instance_a,
-                turn_a,
-                1,
-                CancellationToken::new(),
-                Duration::from_secs(5),
-            ),
+            context_for_loop(loop_a, 1, CancellationToken::new(), Duration::from_secs(5),),
         ),
         run_model(
             &model,
             request_b,
-            context_for_identity(
-                instance_b,
-                turn_b,
-                1,
-                CancellationToken::new(),
-                Duration::from_secs(5),
-            ),
+            context_for_loop(loop_b, 1, CancellationToken::new(), Duration::from_secs(5),),
         ),
     );
     result_a.unwrap();
@@ -1161,24 +1101,8 @@ async fn concurrent_streams_save_and_replay_isolated_continuations() {
     ])
     .await;
     let model = Arc::new(model(server.base_url()));
-    let session_a = "ses_000000000000000000000000000000a1"
-        .parse::<SessionId>()
-        .unwrap();
-    let instance_a = "ins_000000000000000000000000000000a1"
-        .parse::<SessionInstanceId>()
-        .unwrap();
-    let turn_a = "trn_000000000000000000000000000000a1"
-        .parse::<TurnId>()
-        .unwrap();
-    let session_b = "ses_000000000000000000000000000000b1"
-        .parse::<SessionId>()
-        .unwrap();
-    let instance_b = "ins_000000000000000000000000000000b1"
-        .parse::<SessionInstanceId>()
-        .unwrap();
-    let turn_b = "trn_000000000000000000000000000000b1"
-        .parse::<TurnId>()
-        .unwrap();
+    let loop_a = "lup_000000000000000000000000000000a1".parse().unwrap();
+    let loop_b = "lup_000000000000000000000000000000b1".parse().unwrap();
 
     let (round_zero_a, round_zero_b) = tokio::join!(
         run_model(
@@ -1190,14 +1114,7 @@ async fn concurrent_streams_save_and_replay_isolated_continuations() {
                 ReasoningPreference::High,
             )
             .unwrap(),
-            context_for_session_identity(
-                session_a,
-                instance_a,
-                turn_a,
-                0,
-                CancellationToken::new(),
-                Duration::from_secs(5),
-            ),
+            context_for_loop(loop_a, 0, CancellationToken::new(), Duration::from_secs(5),),
         ),
         run_model(
             &model,
@@ -1208,14 +1125,7 @@ async fn concurrent_streams_save_and_replay_isolated_continuations() {
                 ReasoningPreference::High,
             )
             .unwrap(),
-            context_for_session_identity(
-                session_b,
-                instance_b,
-                turn_b,
-                0,
-                CancellationToken::new(),
-                Duration::from_secs(5),
-            ),
+            context_for_loop(loop_b, 0, CancellationToken::new(), Duration::from_secs(5),),
         ),
     );
     let round_zero_a = round_zero_a.unwrap();
@@ -1280,26 +1190,12 @@ async fn concurrent_streams_save_and_replay_isolated_continuations() {
         run_model(
             &model,
             request_a,
-            context_for_session_identity(
-                session_a,
-                instance_a,
-                turn_a,
-                1,
-                CancellationToken::new(),
-                Duration::from_secs(5),
-            ),
+            context_for_loop(loop_a, 1, CancellationToken::new(), Duration::from_secs(5),),
         ),
         run_model(
             &model,
             request_b,
-            context_for_session_identity(
-                session_b,
-                instance_b,
-                turn_b,
-                1,
-                CancellationToken::new(),
-                Duration::from_secs(5),
-            ),
+            context_for_loop(loop_b, 1, CancellationToken::new(), Duration::from_secs(5),),
         ),
     );
     round_one_a.unwrap();
@@ -1445,15 +1341,8 @@ async fn fully_consumed_final_stream_does_not_replay_into_new_turn() {
     ])
     .await;
     let model = model(server.base_url());
-    let instance = "ins_00000000000000000000000000000004"
-        .parse::<SessionInstanceId>()
-        .unwrap();
-    let turn_one = "trn_00000000000000000000000000000004"
-        .parse::<TurnId>()
-        .unwrap();
-    let turn_two = "trn_00000000000000000000000000000005"
-        .parse::<TurnId>()
-        .unwrap();
+    let loop_one = "lup_00000000000000000000000000000004".parse().unwrap();
+    let loop_two = "lup_00000000000000000000000000000005".parse().unwrap();
 
     run_model(
         &model,
@@ -1464,9 +1353,8 @@ async fn fully_consumed_final_stream_does_not_replay_into_new_turn() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_identity(
-            instance,
-            turn_one,
+        context_for_loop(
+            loop_one,
             0,
             CancellationToken::new(),
             Duration::from_secs(5),
@@ -1500,9 +1388,8 @@ async fn fully_consumed_final_stream_does_not_replay_into_new_turn() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_identity(
-            instance,
-            turn_one,
+        context_for_loop(
+            loop_one,
             1,
             CancellationToken::new(),
             Duration::from_secs(5),
@@ -1536,9 +1423,8 @@ async fn fully_consumed_final_stream_does_not_replay_into_new_turn() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_identity(
-            instance,
-            turn_two,
+        context_for_loop(
+            loop_two,
             0,
             CancellationToken::new(),
             Duration::from_secs(5),
@@ -1639,7 +1525,7 @@ async fn started_stream_failure_purges_replay_before_same_round_probe() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -1670,7 +1556,7 @@ async fn started_stream_failure_purges_replay_before_same_round_probe() {
     let (events, error) = run_until_error(
         &model,
         failed_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await;
     assert_eq!(
@@ -1703,7 +1589,7 @@ async fn started_stream_failure_purges_replay_before_same_round_probe() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -1783,7 +1669,7 @@ async fn reasoning_disabled_tool_loop_remains_normalized_and_stateless() {
             ReasoningPreference::Disabled,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -1817,7 +1703,7 @@ async fn reasoning_disabled_tool_loop_remains_normalized_and_stateless() {
             ReasoningPreference::Disabled,
         )
         .unwrap(),
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -1941,7 +1827,7 @@ async fn terminal_output_replays_exact_items_when_done_events_are_absent() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -1995,7 +1881,7 @@ async fn terminal_output_replays_exact_items_when_done_events_are_absent() {
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2136,7 +2022,7 @@ async fn terminal_output_rejects_unobserved_function_calls_without_replay() {
     let mut stream = model
         .start(
             round_zero_request,
-            context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+            context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -2180,7 +2066,7 @@ async fn terminal_output_rejects_unobserved_function_calls_without_replay() {
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2311,7 +2197,7 @@ async fn reasoning_delta_without_complete_item_fails_without_replay() {
     let mut stream = model
         .start(
             round_zero_request,
-            context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+            context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -2355,7 +2241,7 @@ async fn reasoning_delta_without_complete_item_fails_without_replay() {
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2497,7 +2383,7 @@ async fn cancelled_turn_token_purges_continuation_before_next_round() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, turn_cancellation.clone(), Duration::from_secs(5)),
+        context_for_request(0, turn_cancellation.clone(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2551,7 +2437,7 @@ async fn cancelled_turn_token_purges_continuation_before_next_round() {
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2659,7 +2545,7 @@ async fn dropping_unpolled_stream_purges_turn_continuation() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2712,7 +2598,7 @@ async fn dropping_unpolled_stream_purges_turn_continuation() {
     let stream = model
         .start(
             round_one_request.clone(),
-            context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+            context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -2721,7 +2607,7 @@ async fn dropping_unpolled_stream_purges_turn_continuation() {
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2834,7 +2720,7 @@ async fn run_provider_start_error_retry_case(
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -2873,7 +2759,7 @@ async fn run_provider_start_error_retry_case(
     let error = start_error(
         &model,
         round_one_request.clone(),
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await;
     assert_error(&error, expected_kind, expected_delivery, expected_retryable);
@@ -2881,7 +2767,7 @@ async fn run_provider_start_error_retry_case(
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -3026,8 +2912,7 @@ async fn active_continuation_limit_evicts_oldest_without_clearing_newest() {
 
     struct ActiveCase {
         index: u32,
-        instance_id: SessionInstanceId,
-        turn_id: TurnId,
+        loop_id: LoopId,
         cancellation: CancellationToken,
         call_id: String,
         arguments: String,
@@ -3069,8 +2954,7 @@ async fn active_continuation_limit_evicts_oldest_without_clearing_newest() {
         ]));
         cases.push(ActiveCase {
             index,
-            instance_id: SessionInstanceId::new().unwrap(),
-            turn_id: TurnId::new().unwrap(),
+            loop_id: LoopId::new().unwrap(),
             cancellation: CancellationToken::new(),
             call_id,
             arguments,
@@ -3105,9 +2989,8 @@ async fn active_continuation_limit_evicts_oldest_without_clearing_newest() {
         let events = run_model(
             &model,
             round_zero_request.clone(),
-            context_for_identity(
-                case.instance_id,
-                case.turn_id,
+            context_for_loop(
+                case.loop_id,
                 0,
                 case.cancellation.clone(),
                 Duration::from_secs(5),
@@ -3157,9 +3040,8 @@ async fn active_continuation_limit_evicts_oldest_without_clearing_newest() {
     run_model(
         &model,
         probe_request(oldest),
-        context_for_identity(
-            oldest.instance_id,
-            oldest.turn_id,
+        context_for_loop(
+            oldest.loop_id,
             1,
             CancellationToken::new(),
             Duration::from_secs(5),
@@ -3170,9 +3052,8 @@ async fn active_continuation_limit_evicts_oldest_without_clearing_newest() {
     run_model(
         &model,
         probe_request(newest),
-        context_for_identity(
-            newest.instance_id,
-            newest.turn_id,
+        context_for_loop(
+            newest.loop_id,
             1,
             CancellationToken::new(),
             Duration::from_secs(5),
@@ -3334,7 +3215,7 @@ async fn continuation_item_count_overflow_fails_without_replaying_partial_items(
     let mut stream = model
         .start(
             round_zero_request,
-            context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+            context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -3378,7 +3259,7 @@ async fn continuation_item_count_overflow_fails_without_replaying_partial_items(
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -3549,7 +3430,7 @@ async fn continuation_raw_byte_overflow_fails_without_replaying_partial_items() 
     let mut stream = model
         .start(
             round_zero_request,
-            context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+            context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -3593,7 +3474,7 @@ async fn continuation_raw_byte_overflow_fails_without_replaying_partial_items() 
     run_model(
         &model,
         round_one_request,
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -3769,7 +3650,7 @@ async fn compacted_request_prunes_unmatched_replay_before_later_round() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -3792,7 +3673,7 @@ async fn compacted_request_prunes_unmatched_replay_before_later_round() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(1, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(1, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -3846,7 +3727,7 @@ async fn compacted_request_prunes_unmatched_replay_before_later_round() {
     run_model(
         &model,
         round_two_request,
-        context_for_round(2, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(2, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -3992,7 +3873,7 @@ async fn skipped_model_round_purges_stale_continuation_before_request() {
             ReasoningPreference::High,
         )
         .unwrap(),
-        context_for_round(0, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -4031,7 +3912,7 @@ async fn skipped_model_round_purges_stale_continuation_before_request() {
     run_model(
         &model,
         skipped_round_request,
-        context_for_round(2, CancellationToken::new(), Duration::from_secs(5)),
+        context_for_request(2, CancellationToken::new(), Duration::from_secs(5)),
     )
     .await
     .unwrap();
@@ -5520,7 +5401,7 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
     let server = MockServer::spawn([first, second]).await;
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-openai-loop-{}",
-        SessionId::new().unwrap()
+        crate::ids::SessionId::new().unwrap()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
@@ -5542,11 +5423,10 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
                 tools: vec!["read".to_owned()],
                 max_tool_rounds: 4,
                 approval: ApprovalMode::Auto,
-                compaction: ProfileCompaction::Disabled,
             },
         )]),
         models: BTreeMap::from([("main".to_owned(), agent_model_config(server.base_url()))]),
-        kernel: KernelOverrides::default(),
+        loop_options: LoopOverrides::default(),
     };
     let mut agent = Agent::open_with_models(config, models).await.unwrap();
     let session = agent
@@ -5566,19 +5446,25 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
         })
         .await
         .unwrap();
-    let outcome = agent.turn_handle(turn).unwrap().wait().await.unwrap();
-    assert_eq!(outcome.terminal, minicore_runtime::TurnTerminal::Completed);
-    let transcript = agent
-        .transcript(GetTranscript {
+    let result = agent.wait_turn(turn).await.unwrap();
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+    let history = agent
+        .history(GetHistory {
             session_id: session.session_id,
-            after: None,
+            offset: 0,
             limit: 100,
         })
-        .await
         .unwrap();
-    let transcript = serde_json::to_string(&transcript).unwrap();
-    assert!(transcript.contains("REAL-READ-CONTENT"));
-    assert!(transcript.contains("read complete"));
+    let serialized = serde_json::to_string(&history).unwrap();
+    assert!(serialized.contains("REAL-READ-CONTENT"));
+    assert!(serialized.contains("read complete"));
     agent.shutdown().await.unwrap();
     let requests = server.finish().await;
     assert_eq!(requests.len(), 2);
@@ -5715,7 +5601,7 @@ impl LiveTempDir {
         Self {
             path: std::env::temp_dir().join(format!(
                 "minicore-agent-openai-live-{}",
-                SessionId::new().expect("live temp directory ID")
+                crate::ids::SessionId::new().expect("live temp directory ID")
             )),
         }
     }
@@ -5729,8 +5615,8 @@ impl Drop for LiveTempDir {
 
 struct LiveToolEvidence {
     turn: TurnRef,
-    terminal: minicore_runtime::TurnTerminal,
-    outcome_usage: Usage,
+    outcome: minicore_runtime::LoopOutcome,
+    report_usage: Usage,
     session_reasoning: ReasoningPreference,
     assistant_rounds: usize,
     assistant_usages: Vec<Usage>,
@@ -5761,62 +5647,52 @@ async fn run_live_reasoning_tool(
         })
         .await
         .map_err(|_| "live Turn send failed")?;
-    let outcome = tokio::time::timeout(Duration::from_secs(300), agent.wait_turn(turn))
+    let result = tokio::time::timeout(Duration::from_secs(300), agent.wait_turn(turn))
         .await
         .map_err(|_| "live reasoning/tool Turn timed out")?
         .map_err(|_| "live reasoning/tool Turn wait failed")?;
-    let transcript = agent
-        .transcript(GetTranscript {
+    let report = &result.report;
+    let page = agent
+        .history(GetHistory {
             session_id: session.session_id,
-            after: None,
+            offset: 0,
             limit: 32,
         })
-        .await
-        .map_err(|_| "live Transcript read failed")?;
-    let assistants = transcript
-        .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            minicore_runtime::ConversationEntry::AssistantMessage(entry)
-                if entry.turn_id == turn.turn_id =>
-            {
-                Some(entry)
+        .map_err(|_| "live History read failed")?;
+
+    let mut assistant_rounds = 0;
+    let mut assistant_usages = Vec::new();
+    let mut saw_read_call = false;
+    let mut successful_read_with_token = false;
+    let mut final_text_with_token = false;
+    for item in &page.items {
+        match &item.item {
+            HistoryItemView::Assistant(view) => {
+                assistant_rounds += 1;
+                assistant_usages.push(view.usage);
+                saw_read_call |= view.tool_calls.iter().any(|call| call.name == "read");
+                if view.tool_calls.is_empty() && view.text.contains(LIVE_SMOKE_TOKEN) {
+                    final_text_with_token = true;
+                }
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let read_call_ids = assistants
-        .iter()
-        .flat_map(|entry| &entry.tool_calls)
-        .filter(|call| call.name().as_str() == "read")
-        .map(|call| call.tool_call_id().clone())
-        .collect::<BTreeSet<_>>();
-    let successful_read_with_token = transcript.entries.iter().any(|entry| {
-        matches!(
-            entry,
-            minicore_runtime::ConversationEntry::ToolResult(result)
-                if result.turn_id == turn.turn_id
-                    && result.tool_name.as_str() == "read"
-                    && result.outcome == ToolResultOutcome::Success
-                    && read_call_ids.contains(&result.tool_call_id)
-                    && result.content.as_str().contains(LIVE_SMOKE_TOKEN)
-        )
-    });
-    let final_text_with_token = assistants.iter().any(|entry| {
-        entry.tool_calls.is_empty()
-            && entry
-                .text
-                .as_ref()
-                .is_some_and(|text| text.as_str().contains(LIVE_SMOKE_TOKEN))
-    });
+            HistoryItemView::ToolResult(view)
+                if view.tool_name == "read"
+                    && view.outcome == ToolResultOutcome::Success
+                    && view.content.contains(LIVE_SMOKE_TOKEN) =>
+            {
+                successful_read_with_token = true;
+            }
+            _ => {}
+        }
+    }
     Ok(LiveToolEvidence {
         turn,
-        terminal: outcome.terminal,
-        outcome_usage: outcome.usage,
+        outcome: report.outcome.clone(),
+        report_usage: report.usage,
         session_reasoning: session.reasoning,
-        assistant_rounds: assistants.len(),
-        assistant_usages: assistants.iter().map(|entry| entry.usage).collect(),
-        saw_read_call: !read_call_ids.is_empty(),
+        assistant_rounds,
+        assistant_usages,
+        saw_read_call,
         successful_read_with_token,
         final_text_with_token,
     })
@@ -5877,11 +5753,10 @@ async fn openai_live_reasoning_tool_smoke() {
                 tools: vec!["read".to_owned()],
                 max_tool_rounds: 4,
                 approval: ApprovalMode::Auto,
-                compaction: ProfileCompaction::Disabled,
             },
         )]),
         models: BTreeMap::from([("main".to_owned(), live_model_config(&live))]),
-        kernel: KernelOverrides::default(),
+        loop_options: LoopOverrides::default(),
     };
     let mut agent = Agent::open(config)
         .await
@@ -5935,11 +5810,11 @@ async fn openai_live_reasoning_tool_smoke() {
     let reasoning_by_turn = reasoning_by_turn.expect("live event collector panicked");
     assert_eq!(evidence.session_reasoning, live.reasoning);
     assert_eq!(
-        evidence.terminal,
-        minicore_runtime::TurnTerminal::Completed,
+        evidence.outcome,
+        minicore_runtime::LoopOutcome::Completed,
         "live reasoning/tool Turn failed; requested reasoning is not downgraded"
     );
-    assert_live_usage(&evidence.outcome_usage);
+    assert_live_usage(&evidence.report_usage);
     for usage in &evidence.assistant_usages {
         assert_live_usage(usage);
     }

@@ -1,40 +1,35 @@
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use minicore_runtime::config::{SessionSpec, Timestamp, TurnOptions, UserInput};
-use minicore_runtime::context::ContextProvider;
-use minicore_runtime::conversation::{TranscriptPage, TurnTerminal};
-use minicore_runtime::error::{SessionError, SessionOpenErrorKind, TurnWaitError};
-use minicore_runtime::ids::{InteractionId, SessionId, SessionInstanceId, TurnId};
+use minicore_runtime::InteractionId;
+use minicore_runtime::execution::{ConfigRevision, ExecutionConfig, UserInput};
+use minicore_runtime::interaction::InteractionAnswer;
 use minicore_runtime::model::ReasoningPreference;
-use minicore_runtime::session::{
-    InteractionAnswer, SessionRuntime, SessionRuntimeOptions, SessionState, TurnHandle, TurnOutcome,
-};
+use minicore_runtime::prompt::PromptProvider;
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
 use crate::config::AgentConfig;
-use crate::context::ProjectContext;
-use crate::error::{AgentError, StoreError};
+use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
 use crate::models::{ModelConfig, ModelConfigError, ModelInfo, Models};
 use crate::policy::Policy;
 use crate::profiles::{Profile, ProfileInfo, Profiles};
-use crate::sessions::{
-    ActiveTurn, CompletionReady, LoadedSession, MetadataWorker, SessionPump, Sessions,
-};
-use crate::store::{SessionRecord, Store};
+use crate::prompt::ProjectPromptProvider;
+use crate::sessions::{Sessions, TurnCompletion};
+use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
 use crate::tools::{BuildToolsError, CommandEnvironment, build_tools};
+
+pub use crate::history::{GetHistory, HistoryPage};
+pub use crate::sessions::{SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct PingResponse {
     pub version: &'static str,
 }
@@ -59,62 +54,76 @@ pub struct CreateSession {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendMessage {
-    pub session_id: SessionId,
+    pub session_id: crate::ids::SessionId,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SteerMessage {
+    pub turn: TurnRef,
     pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnswerInteraction {
-    pub session_id: SessionId,
+    pub turn: TurnRef,
     pub interaction_id: InteractionId,
     pub answer: InteractionAnswer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GetTranscript {
-    pub session_id: SessionId,
-    pub after: Option<minicore_runtime::ConversationSeq>,
-    pub limit: usize,
+pub struct UpdateSession {
+    pub session_id: crate::ids::SessionId,
+
+    #[serde(default)]
+    pub model: Option<String>,
+
+    #[serde(default)]
+    pub reasoning: Option<ReasoningPreference>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionUpdateResult {
+    pub session: SessionInfo,
+    pub active_revision: Option<ConfigRevision>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInfo {
-    pub session_id: SessionId,
+    pub session_id: crate::ids::SessionId,
     pub title: Option<String>,
     pub profile: String,
     pub workspace: PathBuf,
     pub model: String,
     pub reasoning: ReasoningPreference,
     pub loaded: bool,
-    pub instance_id: Option<SessionInstanceId>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl SessionInfo {
+    pub(crate) fn from_record(record: &SessionRecord, loaded: bool) -> Self {
+        Self {
+            session_id: record.session_id,
+            title: record.title.clone(),
+            profile: record.profile.clone(),
+            workspace: record.workspace.clone(),
+            model: record.model.clone(),
+            reasoning: record.reasoning,
+            loaded,
+            created_at: record.created_at.clone(),
+            updated_at: record.updated_at.clone(),
+        }
+    }
 }
 
 struct ResolvedSessionSettings {
     profile: String,
     model: String,
     reasoning: ReasoningPreference,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TurnRef {
-    pub session_id: SessionId,
-    pub instance_id: SessionInstanceId,
-    pub turn_id: TurnId,
-}
-
-impl TurnRef {
-    fn from_handle(handle: &TurnHandle) -> Self {
-        Self {
-            session_id: handle.session_id(),
-            instance_id: handle.instance_id(),
-            turn_id: handle.turn_id(),
-        }
-    }
 }
 
 pub struct Agent {
@@ -124,10 +133,8 @@ pub struct Agent {
     models: Models,
     command_environment: CommandEnvironment,
     sessions: Sessions,
-    events_tx: mpsc::Sender<AgentEvent>,
+    event_sink: AgentEventSink,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
-    task_runtime: Handle,
-    kernel: minicore_runtime::KernelConfig,
 }
 
 impl Agent {
@@ -156,13 +163,12 @@ impl Agent {
                 .map(ModelConfig::credential_env_name)
                 .map(OsString::from),
         );
-        let task_runtime = Handle::try_current().map_err(|_| AgentError::Internal)?;
-        let kernel = config.kernel_config().map_err(AgentError::Config)?;
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone())
             .await
-            .map_err(|error| map_logged_store_error("agent_open", None, error))?;
+            .map_err(crate::sessions::map_store_error)?;
         let (events_tx, events_rx) = mpsc::channel(config.event_capacity);
+        let event_sink = AgentEventSink::new(events_tx);
         let agent = Self {
             config,
             store,
@@ -170,10 +176,8 @@ impl Agent {
             models,
             command_environment,
             sessions: Sessions::new(),
-            events_tx,
+            event_sink,
             events_rx: Some(events_rx),
-            task_runtime,
-            kernel,
         };
         tracing::info!("agent open success");
         Ok(agent)
@@ -207,37 +211,17 @@ impl Agent {
             .store
             .list_sessions()
             .await
-            .map_err(|error| map_logged_store_error("list_sessions", None, error))?;
+            .map_err(crate::sessions::map_store_error)?;
         let mut sessions = Vec::with_capacity(records.len());
         for record in records {
-            let manifest = match self.store.load_manifest(record.session_id).await {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %record.session_id,
-                        error_kind = error.kind(),
-                        "skipping session with invalid manifest"
-                    );
-                    continue;
-                }
-            };
-            let loaded = self.sessions.get(record.session_id);
-            if loaded.is_some_and(|loaded| loaded.spec != manifest.spec) {
-                tracing::warn!(
-                    session_id = %record.session_id,
-                    error_kind = "manifest_spec_mismatch",
-                    "skipping session with invalid manifest"
-                );
-                continue;
+            let session_id = record.session_id;
+            if let Some(session) = self.sessions.get(session_id) {
+                sessions.push(session.info(true));
+            } else {
+                sessions.push(SessionInfo::from_record(&record, false));
             }
-            let spec = loaded.map_or(&manifest.spec, |loaded| &loaded.spec);
-            sessions.push(Self::session_info(
-                &record,
-                spec,
-                loaded.is_some(),
-                loaded.map(|loaded| loaded.handle.instance_id()),
-            ));
         }
+        sessions.sort_by_key(|info| info.session_id);
         Ok(sessions)
     }
 
@@ -257,145 +241,141 @@ impl Agent {
                 .map_err(|_| AgentError::Workspace)?,
         );
         let canonical_workspace = workspace.root().to_path_buf();
-        let spec = self.create_session_spec(&profile, &settings)?;
-        let options = self.runtime_options(&spec, &profile, workspace)?;
-        let session_id = SessionId::new().map_err(|_| AgentError::Internal)?;
-        let timestamp = current_timestamp()?;
-        let record = SessionRecord {
+        let session_id = crate::ids::SessionId::new().map_err(|_| AgentError::Internal)?;
+        let record = build_record(
             session_id,
-            title: request.title,
-            profile: settings.profile,
-            workspace: canonical_workspace,
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
-        };
-        let log = self
-            .store
-            .create_session(record.clone())
+            &settings,
+            &profile,
+            request.title,
+            canonical_workspace,
+        )?;
+        // Every predictable configuration error must fail before the store write.
+        let config = self.execution_config(&record, Arc::clone(&workspace))?;
+        let options = self
+            .config
+            .loop_options(record.max_tool_rounds)
+            .map_err(AgentError::Config)?;
+        self.store
+            .create_session(&record)
             .await
-            .map_err(|error| map_logged_store_error("create_session", Some(session_id), error))?;
-        let runtime =
-            match SessionRuntime::create(session_id, spec.clone(), Box::new(log), options).await {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    if let Err(cleanup_error) = self.store.delete_session(session_id).await {
-                        log_store_error("create_session_cleanup", Some(session_id), &cleanup_error);
-                    }
-                    return Err(map_session_open_error(error));
-                }
-            };
-        let loaded = match self.attach_runtime(runtime, record.clone(), spec).await {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                if let Err(cleanup_error) = self.store.delete_session(session_id).await {
-                    log_store_error("create_session_cleanup", Some(session_id), &cleanup_error);
-                }
-                return Err(error);
-            }
-        };
-        let instance_id = loaded.handle.instance_id();
-        let info = Self::session_info(&record, &loaded.spec, true, Some(instance_id));
-        let _ = self.sessions.insert(session_id, loaded);
-        tracing::info!(
-            session_id = %session_id,
-            instance_id = %instance_id,
-            "session created"
+            .map_err(crate::sessions::map_store_error)?;
+        let session = crate::sessions::Session::new(
+            record.clone(),
+            workspace,
+            Vec::new().into(),
+            config,
+            options,
+            self.store.clone(),
+            self.event_sink.clone(),
         );
+        let _ = self.sessions.insert(session_id, session);
+        let info = self
+            .sessions
+            .get(session_id)
+            .expect("created session is loaded")
+            .info(true);
+        self.event_sink.try_send(AgentEvent::SessionOpened {
+            session: info.clone(),
+            meta: EventMeta {
+                session_id,
+                loop_id: None,
+                dropped_before: 0,
+            },
+        });
+        tracing::info!(session_id = %session_id, "session created");
         Ok(info)
     }
 
-    pub async fn open_session(&mut self, session_id: SessionId) -> Result<SessionInfo, AgentError> {
-        if let Some(loaded) = self.sessions.get(session_id) {
-            let info = Self::session_info(
-                &loaded.record,
-                &loaded.spec,
-                true,
-                Some(loaded.handle.instance_id()),
-            );
-            tracing::debug!(
-                session_id = %session_id,
-                instance_id = %loaded.handle.instance_id(),
-                "session opened"
-            );
-            return Ok(info);
+    pub async fn open_session(
+        &mut self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<SessionInfo, AgentError> {
+        if let Some(session) = self.sessions.get(session_id) {
+            tracing::debug!(session_id = %session_id, "session already loaded");
+            return Ok(session.info(true));
         }
-        let record = self
+        let stored = self
             .store
-            .load_record(session_id)
+            .load_session(session_id)
             .await
-            .map_err(|error| map_logged_store_error("load_record", Some(session_id), error))?;
-        let profile = self
-            .profiles
-            .get(&record.profile)
-            .cloned()
-            .ok_or(AgentError::ProfileNotFound)?;
+            .map_err(crate::sessions::map_store_error)?;
         let workspace = Arc::new(
-            Workspace::open(record.workspace.clone())
+            Workspace::open(stored.record.workspace.clone())
                 .await
                 .map_err(|_| AgentError::Workspace)?,
         );
-        if workspace.root() != record.workspace.as_path() {
+        // The record stores the canonical workspace captured at creation.
+        // If the directory was moved or its path now redirects elsewhere (for
+        // example through a symlink), refuse to run against the wrong root
+        // instead of silently continuing with different project context.
+        if workspace.root() != stored.record.workspace.as_path() {
+            tracing::warn!(
+                session_id = %session_id,
+                stored_workspace = %stored.record.workspace.display(),
+                actual_workspace = %workspace.root().display(),
+                "session workspace identity changed on reopen"
+            );
             return Err(AgentError::Workspace);
         }
-        let manifest = self
-            .store
-            .load_manifest(session_id)
-            .await
-            .map_err(|error| map_logged_store_error("load_manifest", Some(session_id), error))?;
-        let spec = manifest.spec;
-        let options = self.runtime_options(&spec, &profile, workspace)?;
-        let log = self.store.open_log(session_id).await.map_err(|error| {
-            if matches!(&error, StoreError::Log(_)) {
-                map_store_error(error)
-            } else {
-                map_logged_store_error("open_log", Some(session_id), error)
-            }
-        })?;
-        let runtime = SessionRuntime::load(session_id, Box::new(log), options)
-            .await
-            .map_err(map_session_open_error)?;
-        let loaded = self.attach_runtime(runtime, record.clone(), spec).await?;
-        let instance_id = loaded.handle.instance_id();
-        let info = Self::session_info(&record, &loaded.spec, true, Some(instance_id));
-        let _ = self.sessions.insert(session_id, loaded);
-        tracing::info!(
-            session_id = %session_id,
-            instance_id = %instance_id,
-            "session opened"
+        let config = self.execution_config(&stored.record, Arc::clone(&workspace))?;
+        let options = self
+            .config
+            .loop_options(stored.record.max_tool_rounds)
+            .map_err(AgentError::Config)?;
+        let session = crate::sessions::Session::new(
+            stored.record.clone(),
+            workspace,
+            stored.history,
+            config,
+            options,
+            self.store.clone(),
+            self.event_sink.clone(),
         );
+        let _ = self.sessions.insert(session_id, session);
+        let info = self
+            .sessions
+            .get(session_id)
+            .expect("opened session is loaded")
+            .info(true);
+        self.event_sink.try_send(AgentEvent::SessionOpened {
+            session: info.clone(),
+            meta: EventMeta {
+                session_id,
+                loop_id: None,
+                dropped_before: 0,
+            },
+        });
+        tracing::info!(session_id = %session_id, "session opened");
         Ok(info)
     }
 
-    pub async fn close_session(&mut self, session_id: SessionId) -> Result<(), AgentError> {
-        let loaded = self
+    pub async fn close_session(
+        &mut self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<(), AgentError> {
+        let session = self
             .sessions
             .remove(session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        let meta = EventMeta {
+        let result = session.shutdown().await;
+        self.event_sink.try_send(AgentEvent::SessionClosed {
             session_id,
-            instance_id: loaded.handle.instance_id(),
-            dropped_before: 0,
-        };
-        let instance_id = meta.instance_id;
-        let result = loaded.shutdown(meta).await;
+            meta: EventMeta {
+                session_id,
+                loop_id: None,
+                dropped_before: 0,
+            },
+        });
         if result.is_ok() {
-            tracing::info!(
-                session_id = %session_id,
-                instance_id = %instance_id,
-                "session closed"
-            );
-        } else {
-            tracing::warn!(
-                session_id = %session_id,
-                instance_id = %instance_id,
-                error_kind = "shutdown",
-                "session close failed"
-            );
+            tracing::info!(session_id = %session_id, "session closed");
         }
         result
     }
 
-    pub async fn delete_session(&mut self, session_id: SessionId) -> Result<(), AgentError> {
+    pub async fn delete_session(
+        &mut self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<(), AgentError> {
         if self.sessions.contains(session_id) {
             return Err(AgentError::SessionAlreadyLoaded);
         }
@@ -403,168 +383,158 @@ impl Agent {
             .store
             .delete_session(session_id)
             .await
-            .map_err(|error| map_logged_store_error("delete_session", Some(session_id), error));
+            .map_err(crate::sessions::map_store_error);
         if result.is_ok() {
             tracing::info!(session_id = %session_id, "session deleted");
         }
         result
     }
 
-    pub fn session_state(&self, session_id: SessionId) -> Result<SessionState, AgentError> {
+    pub fn session_state(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<SessionState, AgentError> {
         self.sessions
             .get(session_id)
-            .map(|loaded| loaded.handle.state())
+            .map(|session| session.state())
             .ok_or(AgentError::SessionNotLoaded)
     }
 
-    pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
+    pub async fn update_session(
+        &mut self,
+        request: UpdateSession,
+    ) -> Result<SessionUpdateResult, AgentError> {
+        if request.model.is_none() && request.reasoning.is_none() {
+            return Err(AgentError::InvalidArguments);
+        }
         let session_id = request.session_id;
-        self.cleanup_finished_turn(session_id).await?;
-        let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
-        let handle = {
-            let loaded = self
-                .sessions
-                .get_mut(session_id)
-                .ok_or(AgentError::SessionNotLoaded)?;
-            loaded.handle.clone()
-        };
-        let turn = handle
-            .submit(input, TurnOptions::default())
-            .await
-            .map_err(map_session_error)?;
-        let turn_ref = TurnRef::from_handle(&turn);
-        let (completion_tx, stop) = {
-            let loaded = self
-                .sessions
-                .get(session_id)
-                .expect("submitted turn belongs to loaded session");
-            (loaded.pump.completion_sender(), loaded.pump.stop_token())
-        };
-        let completion_turn = turn.clone();
-        let completion_task = self.task_runtime.spawn(async move {
-            let outcome = tokio::select! {
-                biased;
-                _ = stop.cancelled() => return,
-                outcome = completion_turn.wait() => outcome,
-            };
-            let Ok(outcome) = outcome else {
-                tracing::warn!(
-                    session_id = %turn_ref.session_id,
-                    instance_id = %turn_ref.instance_id,
-                    turn_id = %turn_ref.turn_id,
-                    error_kind = "turn_wait",
-                    "turn completion wait failed"
-                );
-                return;
-            };
-            tracing::info!(
-                session_id = %turn_ref.session_id,
-                instance_id = %turn_ref.instance_id,
-                turn_id = %turn_ref.turn_id,
-                outcome = turn_terminal_category(&outcome.terminal),
-                "turn completed"
-            );
-            let ready = CompletionReady { turn_ref, outcome };
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => {}
-                _ = completion_tx.send(ready) => {}
-            }
-        });
-        let loaded = self
+        let session = self
             .sessions
-            .get_mut(session_id)
-            .expect("submitted turn belongs to loaded session");
-        loaded.active_turn = Some(ActiveTurn {
-            handle: turn,
-            completion_task,
-        });
-        tracing::info!(
-            session_id = %turn_ref.session_id,
-            instance_id = %turn_ref.instance_id,
-            turn_id = %turn_ref.turn_id,
-            "turn submitted"
-        );
-        self.schedule_touch(session_id);
-        Ok(turn_ref)
+            .get(session_id)
+            .cloned()
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let workspace = session.workspace();
+        let mut candidate = session.record();
+        if let Some(model) = &request.model {
+            candidate.model = model.clone();
+        }
+        if let Some(reasoning) = request.reasoning {
+            candidate.reasoning = reasoning;
+        }
+        let config = self.execution_config(&candidate, workspace)?;
+        let active_revision = session.update(candidate.clone(), config).await?;
+        Ok(SessionUpdateResult {
+            session: session.info(true),
+            active_revision,
+        })
+    }
+
+    pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
+        let session = self
+            .sessions
+            .get(request.session_id)
+            .cloned()
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
+        session.start_loop(input).await
+    }
+
+    pub fn steer(&self, request: SteerMessage) -> Result<(), AgentError> {
+        let session = self
+            .sessions
+            .get(request.turn.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        session.steer(request.turn, request.text)
     }
 
     pub fn cancel(&self, turn: TurnRef) -> Result<bool, AgentError> {
-        let loaded = self
+        let session = self
             .sessions
             .get(turn.session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        validate_turn_ref(loaded, turn)?;
-        let active = loaded
-            .active_turn
-            .as_ref()
-            .ok_or(AgentError::TurnNotFound)?;
-        if active.handle.is_finished() {
-            tracing::debug!(
-                session_id = %turn.session_id,
-                instance_id = %turn.instance_id,
-                turn_id = %turn.turn_id,
-                cancelled = false,
-                "turn cancel requested"
-            );
-            return Ok(false);
-        }
-        let cancelled = active.handle.cancel();
-        tracing::info!(
-            session_id = %turn.session_id,
-            instance_id = %turn.instance_id,
-            turn_id = %turn.turn_id,
-            cancelled = cancelled,
-            "turn cancel requested"
-        );
-        Ok(cancelled)
+        session.cancel(turn)
     }
 
-    pub async fn wait_turn(&self, turn: TurnRef) -> Result<TurnOutcome, AgentError> {
-        wait_turn_handle(self.turn_handle(turn)?).await
+    #[cfg(test)]
+    pub(crate) fn abort_active_task_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<(), AgentError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        session.abort_active_task()
     }
 
-    pub(crate) fn turn_handle(&self, turn: TurnRef) -> Result<TurnHandle, AgentError> {
-        let loaded = self
+    #[cfg(test)]
+    pub(crate) fn runtime_loop_finished_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<bool, AgentError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        Ok(session.runtime_loop_finished())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_runtime_event_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+        envelope: minicore_runtime::LoopEventEnvelope,
+    ) -> Result<(), AgentError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        crate::sessions::forward_loop_event(session_id, envelope, session);
+        Ok(())
+    }
+
+    pub async fn wait_turn(
+        &self,
+        turn: TurnRef,
+    ) -> Result<Arc<crate::sessions::TurnResult>, AgentError> {
+        let session = self
             .sessions
             .get(turn.session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        validate_turn_ref(loaded, turn)?;
-        loaded
-            .active_turn
-            .as_ref()
-            .map(|active| active.handle.clone())
-            .ok_or(AgentError::TurnNotFound)
+        session.wait(turn).await
+    }
+
+    pub(crate) fn wait_turn_receiver(
+        &self,
+        turn: TurnRef,
+    ) -> Result<watch::Receiver<Option<TurnCompletion>>, AgentError> {
+        let session = self
+            .sessions
+            .get(turn.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        session.wait_receiver(turn)
     }
 
     pub async fn answer(&self, request: AnswerInteraction) -> Result<(), AgentError> {
-        let loaded = self
+        let session = self
             .sessions
-            .get(request.session_id)
+            .get(request.turn.session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        loaded
-            .handle
-            .answer(request.interaction_id, request.answer)
-            .await
-            .map_err(map_session_error)
+        session.answer(request.turn, request.interaction_id, request.answer)
     }
 
-    pub async fn transcript(&self, request: GetTranscript) -> Result<TranscriptPage, AgentError> {
-        let loaded = self
+    pub fn history(&self, request: GetHistory) -> Result<HistoryPage, AgentError> {
+        let session = self
             .sessions
             .get(request.session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        loaded
-            .handle
-            .transcript(request.after, request.limit)
-            .await
-            .map_err(map_session_error)
+        session.history(&request)
     }
 
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
         let result = self.sessions.shutdown_all().await;
-        drop(self.events_tx);
+        drop(self.event_sink);
         drop(self.events_rx.take());
         tracing::info!(success = result.is_ok(), "agent shutdown end");
         result
@@ -589,11 +559,8 @@ impl Agent {
             .unwrap_or_else(|| template.model.clone());
         let reasoning = request.reasoning.unwrap_or(template.reasoning);
         let configured = self.models.get(&model).map_err(map_model_config_error)?;
-        let model_ref =
-            Models::model_ref(&model).map_err(|_| AgentError::InvalidSessionSettings)?;
         let descriptor = configured.descriptor();
-        if descriptor.model_ref != model_ref
-            || !descriptor.supports_reasoning(reasoning)
+        if !descriptor.supports_reasoning(reasoning)
             || (!template.tools.is_empty() && !descriptor.supports_tools)
         {
             return Err(AgentError::InvalidSessionSettings);
@@ -605,224 +572,61 @@ impl Agent {
         })
     }
 
-    fn create_session_spec(
+    /// Assembles a complete runtime `ExecutionConfig` from the session record:
+    /// model, tools, policy, and the project prompt provider. The same
+    /// settings are reused across every turn and replaced atomically on update.
+    fn execution_config(
         &self,
-        profile: &Profile,
-        settings: &ResolvedSessionSettings,
-    ) -> Result<SessionSpec, AgentError> {
-        let model_ref =
-            Models::model_ref(&settings.model).map_err(|_| AgentError::InvalidSessionSettings)?;
-        let enabled_tools = profile
-            .tools
-            .iter()
-            .map(|name| name.parse().map_err(|_| AgentError::InvalidSessionSettings))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        let system_prompt = minicore_runtime::BoundedText::new(&profile.system_prompt)
-            .map_err(|_| AgentError::InvalidSessionSettings)?;
-        SessionSpec::new(
-            model_ref,
-            settings.reasoning,
-            system_prompt,
-            enabled_tools,
-            profile.max_tool_rounds,
-            minicore_runtime::CompactionConfig::Disabled,
-        )
-        .map_err(|_| AgentError::InvalidSessionSettings)
-    }
-
-    fn runtime_options(
-        &self,
-        spec: &SessionSpec,
-        profile: &Profile,
+        record: &SessionRecord,
         workspace: Arc<Workspace>,
-    ) -> Result<SessionRuntimeOptions, AgentError> {
+    ) -> Result<ExecutionConfig, AgentError> {
         let model = self
             .models
-            .get(spec.model.as_str())
+            .get(&record.model)
             .map_err(map_model_config_error)?;
-        let tool_names = spec
-            .enabled_tools
-            .iter()
-            .map(|name| name.as_str().to_owned())
-            .collect::<Vec<_>>();
         let tools = build_tools(
-            &tool_names,
+            &record.tools,
             Arc::clone(&workspace),
             self.command_environment.clone(),
         )
         .map_err(map_build_tools_error)?;
-        let policy: Option<Arc<dyn ToolPolicy>> = if spec.enabled_tools.is_empty() {
+        let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
             None
         } else {
-            Some(Arc::new(Policy::new(profile.approval)))
+            Some(Arc::new(Policy::new(record.approval)))
         };
-        let context: Arc<dyn ContextProvider> = Arc::new(ProjectContext::new(workspace));
-        let bindings =
-            minicore_runtime::SessionBindings::new(model, tools, policy, Some(context), None);
-        bindings
-            .validate(spec, &self.kernel.limits)
-            .map_err(|_| AgentError::InvalidSessionSettings)?;
-        let options =
-            SessionRuntimeOptions::new(self.kernel.clone(), bindings, self.task_runtime.clone())
-                .map_err(|_| {
-                    AgentError::Core(crate::error::CoreErrorView::new(
-                        "session options are invalid",
-                        false,
-                    ))
-                })?;
-        Ok(options)
-    }
-
-    async fn attach_runtime(
-        &self,
-        mut runtime: SessionRuntime,
-        record: SessionRecord,
-        spec: SessionSpec,
-    ) -> Result<LoadedSession, AgentError> {
-        let event_stream = match runtime.take_events() {
-            Ok(stream) => stream,
-            Err(_) => {
-                let _ = runtime.shutdown().await;
-                return Err(AgentError::Internal);
-            }
-        };
-        let handle = runtime.handle();
-        let state = handle.watch_state();
-        let event_sink = AgentEventSink::new(self.events_tx.clone());
-        let opened = Self::session_info(&record, &spec, true, Some(handle.instance_id()));
-        let pump = SessionPump::new(
-            &self.task_runtime,
-            event_stream,
-            state,
-            event_sink.clone(),
-            opened,
+        let prompt: Arc<dyn PromptProvider> = Arc::new(
+            ProjectPromptProvider::new(workspace, record.system_prompt.clone())
+                .map_err(|_| AgentError::InvalidSessionSettings)?,
         );
-        let metadata =
-            MetadataWorker::new(&self.task_runtime, self.store.clone(), runtime.session_id());
-        Ok(LoadedSession {
-            record,
-            spec,
-            runtime,
-            handle,
-            active_turn: None,
-            pump,
-            metadata,
-            event_sink,
-        })
-    }
-
-    fn session_info(
-        record: &SessionRecord,
-        spec: &SessionSpec,
-        loaded: bool,
-        instance_id: Option<SessionInstanceId>,
-    ) -> SessionInfo {
-        SessionInfo {
-            session_id: record.session_id,
-            title: record.title.clone(),
-            profile: record.profile.clone(),
-            workspace: record.workspace.clone(),
-            model: spec.model.as_str().to_owned(),
-            reasoning: spec.reasoning,
-            loaded,
-            instance_id,
-            created_at: record.created_at.clone(),
-            updated_at: record.updated_at.clone(),
-        }
-    }
-
-    async fn cleanup_finished_turn(&mut self, session_id: SessionId) -> Result<(), AgentError> {
-        let (completion_result, instance_id, turn_id) = {
-            let loaded = self
-                .sessions
-                .get_mut(session_id)
-                .ok_or(AgentError::SessionNotLoaded)?;
-            let Some(active) = loaded.active_turn.as_mut() else {
-                return Ok(());
-            };
-            if !active.handle.is_finished() {
-                return Ok(());
-            }
-            let instance_id = active.handle.instance_id();
-            let turn_id = active.handle.turn_id();
-            let result = (&mut active.completion_task).await;
-            (result, instance_id, turn_id)
-        };
-        self.sessions
-            .get_mut(session_id)
-            .expect("finished turn belongs to loaded session")
-            .active_turn
-            .take();
-        if completion_result.is_err() {
-            tracing::warn!(
-                session_id = %session_id,
-                instance_id = %instance_id,
-                turn_id = %turn_id,
-                error_kind = "completion_join",
-                "turn completion task failed"
-            );
-            return Err(AgentError::Internal);
-        }
-        Ok(())
-    }
-
-    fn schedule_touch(&mut self, session_id: SessionId) {
-        let Ok(updated_at) = current_timestamp() else {
-            return;
-        };
-        let Some(loaded) = self.sessions.get_mut(session_id) else {
-            return;
-        };
-        loaded.record.updated_at = updated_at.clone();
-        // A terminal metadata failure only stops persistence; the in-memory session timestamp and
-        // the already accepted turn remain valid. The worker reports false rather than pretending
-        // that this update was queued.
-        let _ = loaded.metadata.update(updated_at);
+        ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
+            .map_err(|_| AgentError::InvalidSessionSettings)
     }
 }
 
-fn validate_turn_ref(loaded: &LoadedSession, turn: TurnRef) -> Result<(), AgentError> {
-    if loaded.handle.instance_id() != turn.instance_id
-        || loaded.handle.session_id() != turn.session_id
-        || loaded.active_turn_id() != Some(turn.turn_id)
-    {
-        return Err(AgentError::TurnNotFound);
-    }
-    Ok(())
-}
-
-pub(crate) async fn wait_turn_handle(handle: TurnHandle) -> Result<TurnOutcome, AgentError> {
-    handle.wait().await.map_err(map_turn_wait_error)
-}
-
-pub(crate) fn map_turn_wait_error(error: TurnWaitError) -> AgentError {
-    let retryable = match error {
-        TurnWaitError::DurabilityUnknown(diagnostic)
-        | TurnWaitError::DurabilityUnavailable(diagnostic)
-        | TurnWaitError::RuntimeTerminated(diagnostic) => diagnostic.retryable,
-        _ => false,
-    };
-    AgentError::Core(crate::error::CoreErrorView::new(
-        "turn wait failed",
-        retryable,
-    ))
-}
-
-fn turn_terminal_category(terminal: &TurnTerminal) -> &'static str {
-    match terminal {
-        TurnTerminal::Completed => "completed",
-        TurnTerminal::Failed { .. } => "failed",
-        TurnTerminal::CancelledByUser => "cancelled_by_user",
-        TurnTerminal::CancelledByShutdown => "cancelled_by_shutdown",
-        TurnTerminal::CancelledByRestart => "cancelled_by_restart",
-        TurnTerminal::BudgetExceeded => "budget_exceeded",
-    }
-}
-
-fn current_timestamp() -> Result<String, AgentError> {
-    Timestamp::now_utc()
-        .map(|timestamp| timestamp.as_str().to_owned())
-        .map_err(|_| AgentError::Internal)
+fn build_record(
+    session_id: crate::ids::SessionId,
+    settings: &ResolvedSessionSettings,
+    profile: &Profile,
+    title: Option<String>,
+    workspace: PathBuf,
+) -> Result<SessionRecord, AgentError> {
+    let now = crate::store::utc_timestamp().map_err(|_| AgentError::Store)?;
+    Ok(SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title,
+        profile: settings.profile.clone(),
+        workspace,
+        model: settings.model.clone(),
+        reasoning: settings.reasoning,
+        system_prompt: profile.system_prompt.clone(),
+        tools: profile.tools.clone(),
+        max_tool_rounds: profile.max_tool_rounds,
+        approval: profile.approval,
+        created_at: now.clone(),
+        updated_at: now,
+    })
 }
 
 fn map_build_tools_error(error: BuildToolsError) -> AgentError {
@@ -841,101 +645,6 @@ fn map_model_config_error(error: ModelConfigError) -> AgentError {
         | ModelConfigError::InvalidReference => {
             AgentError::Config(crate::config::ConfigError::InvalidModel)
         }
-    }
-}
-
-fn map_store_error(error: StoreError) -> AgentError {
-    match error {
-        StoreError::SessionNotFound => AgentError::SessionNotFound,
-        StoreError::SessionAlreadyExists
-        | StoreError::InvalidRoot
-        | StoreError::InvalidRecord
-        | StoreError::Corrupt
-        | StoreError::Unavailable
-        | StoreError::UnknownOutcome
-        | StoreError::CleanupFailed { .. }
-        | StoreError::Internal
-        | StoreError::Log(_) => AgentError::Store,
-    }
-}
-
-fn map_logged_store_error(
-    operation: &'static str,
-    session_id: Option<SessionId>,
-    error: StoreError,
-) -> AgentError {
-    log_store_error(operation, session_id, &error);
-    map_store_error(error)
-}
-
-fn log_store_error(operation: &'static str, session_id: Option<SessionId>, error: &StoreError) {
-    if let Some(session_id) = session_id {
-        tracing::warn!(
-            operation = operation,
-            session_id = %session_id,
-            error_kind = error.kind(),
-            "store operation failed"
-        );
-    } else {
-        tracing::warn!(
-            operation = operation,
-            error_kind = error.kind(),
-            "store operation failed"
-        );
-    }
-}
-
-fn map_session_open_error(error: minicore_runtime::error::SessionOpenError) -> AgentError {
-    match error.kind() {
-        SessionOpenErrorKind::InvalidConfiguration
-        | SessionOpenErrorKind::InvalidManifest
-        | SessionOpenErrorKind::BindingMismatch
-        | SessionOpenErrorKind::SessionIdMismatch => AgentError::Core(
-            crate::error::CoreErrorView::new("session open failed", false),
-        ),
-        SessionOpenErrorKind::Log => {
-            let retryable = error
-                .log_error()
-                .is_some_and(|log_error| log_error.diagnostic().retryable);
-            AgentError::Core(crate::error::CoreErrorView::new(
-                "session log open failed",
-                retryable,
-            ))
-        }
-        SessionOpenErrorKind::RecoveryUncertain => AgentError::Core(
-            crate::error::CoreErrorView::new("session recovery is uncertain", false),
-        ),
-        SessionOpenErrorKind::ActorStartFailed => AgentError::Internal,
-        _ => AgentError::Core(crate::error::CoreErrorView::new(
-            "session open failed",
-            false,
-        )),
-    }
-}
-
-fn map_session_error(error: SessionError) -> AgentError {
-    match error {
-        SessionError::Closed => AgentError::SessionClosed,
-        SessionError::Busy { .. } => AgentError::SessionBusy,
-        SessionError::Degraded(_) => {
-            AgentError::Core(crate::error::CoreErrorView::new("session degraded", false))
-        }
-        SessionError::Backpressure => AgentError::Core(crate::error::CoreErrorView::new(
-            "session command backpressure",
-            true,
-        )),
-        SessionError::InvalidInput(_) => AgentError::InvalidInput,
-        SessionError::InteractionNotFound | SessionError::InteractionAlreadyResolved => {
-            AgentError::InteractionNotFound
-        }
-        SessionError::InteractionKindMismatch => AgentError::InvalidInteraction,
-        SessionError::TranscriptUnavailable(diagnostic) => {
-            AgentError::Core(crate::error::CoreErrorView::new(
-                "session transcript unavailable",
-                diagnostic.retryable,
-            ))
-        }
-        _ => AgentError::Internal,
     }
 }
 

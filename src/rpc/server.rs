@@ -10,19 +10,22 @@ use tokio::io::{
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::agent::{Agent, AnswerInteraction, GetTranscript, SendMessage, wait_turn_handle};
+use crate::agent::{Agent, AnswerInteraction, SendMessage};
 use crate::error::AgentError;
-use crate::event::{AgentEventStream, SessionStateView, TurnOutcomeView};
+use crate::event::{AgentEventStream, HistoryPageView, SessionStateView, TurnResultView};
+use crate::sessions::TurnRef;
+use crate::sessions::await_turn_completion;
 
 use super::protocol::{
-    AgentEventNotification, CORE_ERROR, CancelledResult, EmptyParams, INTERACTION_NOT_FOUND,
+    AgentEventNotification, CancelledResult, EmptyParams, HISTORY_TOO_LARGE, INTERACTION_NOT_FOUND,
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE,
     InteractionAnswerParams, METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult,
-    PARSE_ERROR, PROFILE_NOT_FOUND, PROVIDER_ERROR, ProfilesResult, RpcId, RpcOutbound, RpcRequest,
-    RpcResponse, SESSION_BUSY, SESSION_CLOSED, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STORE_ERROR,
-    SessionCreateParams, SessionParams, SessionResult, SessionTranscriptParams, SessionsResult,
-    TURN_NOT_FOUND, TranscriptPageView, TurnParams, TurnResult, TurnSendParams, WORKSPACE_ERROR,
-    decode_params, parse_request, request_id,
+    PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest,
+    RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED,
+    STEER_QUEUE_FULL, STORE_ERROR, SessionCreateParams, SessionHistoryParams, SessionParams,
+    SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult, TURN_NOT_FOUND,
+    TurnParams, TurnResult, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params,
+    parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -304,23 +307,30 @@ impl RpcServer {
                     .map(|state| SessionStateView::from(&state));
                 Dispatch::Response(agent_result(&id, result))
             }
-            "session.transcript" => {
-                let params: SessionTranscriptParams = match params_or_error(&id, params) {
+            "session.update" => {
+                let params: SessionUpdateParams = match params_or_error(&id, params) {
                     Ok(params) => params,
                     Err(response) => return Dispatch::Response(response),
                 };
-                if params.validate().is_err() {
+                if !params.has_field() {
                     return Dispatch::Response(invalid_params(Some(id)));
                 }
                 let result = self
-                    .agent()
-                    .transcript(GetTranscript {
-                        session_id: params.session_id,
-                        after: params.after,
-                        limit: params.limit,
-                    })
+                    .agent_mut()
+                    .update_session(params.into())
                     .await
-                    .map(TranscriptPageView::from);
+                    .map(SessionUpdateResult::from);
+                Dispatch::Response(agent_result(&id, result))
+            }
+            "session.history" => {
+                let params: SessionHistoryParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self
+                    .agent()
+                    .history(params.into())
+                    .map(|page| HistoryPageView::from(&page));
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.send" => {
@@ -336,6 +346,14 @@ impl RpcServer {
                     })
                     .await
                     .map(|turn| TurnResult { turn });
+                Dispatch::Response(agent_result(&id, result))
+            }
+            "turn.steer" => {
+                let params: TurnSteerParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self.agent().steer(params.into()).map(|()| OkResult::TRUE);
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.cancel" => {
@@ -354,12 +372,14 @@ impl RpcServer {
                     Ok(params) => params,
                     Err(response) => return Dispatch::Response(response),
                 };
-                match self.agent().turn_handle(params.into()) {
-                    Ok(handle) => {
+                match self.agent().wait_turn_receiver(params.into()) {
+                    Ok(receiver) => {
                         let outbound = self.outbound_tx.clone();
                         self.waiters.spawn(async move {
-                            let response = match wait_turn_handle(handle).await {
-                                Ok(outcome) => success(&id, TurnOutcomeView::from(&outcome)),
+                            let response = match await_turn_completion(receiver).await {
+                                Ok(result) => {
+                                    success(&id, TurnResultView::from_turn_result(&result))
+                                }
                                 Err(error) => agent_error(id, &error),
                             };
                             let _ = outbound.send(RpcOutbound::Response(response)).await;
@@ -378,10 +398,14 @@ impl RpcServer {
                     Ok(answer) => answer,
                     Err(_) => return Dispatch::Response(invalid_params(Some(id))),
                 };
+                let turn = TurnRef {
+                    session_id: params.session_id,
+                    loop_id: params.loop_id,
+                };
                 let result = self
                     .agent()
                     .answer(AnswerInteraction {
-                        session_id: params.session_id,
+                        turn,
                         interaction_id: params.interaction_id,
                         answer,
                     })
@@ -605,13 +629,15 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             false,
         ),
         AgentError::SessionBusy => (SESSION_BUSY, "session is busy", "session_busy", true),
-        AgentError::SessionClosed => (SESSION_CLOSED, "session is closed", "session_closed", false),
+        AgentError::SessionBlocked => (
+            SESSION_BLOCKED,
+            "session is blocked",
+            "session_blocked",
+            false,
+        ),
         AgentError::SessionAlreadyLoaded
-        | AgentError::SessionSpecMismatch
-        | AgentError::SessionDegraded
-        | AgentError::InvalidInteraction => {
-            (INVALID_STATE, "invalid state", "invalid_state", false)
-        }
+        | AgentError::InvalidInteraction
+        | AgentError::InvalidState => (INVALID_STATE, "invalid state", "invalid_state", false),
         AgentError::InteractionNotFound => (
             INTERACTION_NOT_FOUND,
             "interaction not found",
@@ -634,10 +660,24 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
         ),
         AgentError::Workspace => (WORKSPACE_ERROR, "workspace error", "workspace_error", false),
         AgentError::Store => (STORE_ERROR, "store error", "store_error", false),
-        AgentError::ModelNotImplemented => {
-            (PROVIDER_ERROR, "provider error", "provider_error", false)
-        }
-        AgentError::Core(view) => (CORE_ERROR, "core error", "core_error", view.retryable),
+        AgentError::SteerQueueFull => (
+            STEER_QUEUE_FULL,
+            "steer queue is full",
+            "steer_queue_full",
+            false,
+        ),
+        AgentError::HistoryTooLarge => (
+            HISTORY_TOO_LARGE,
+            "history too large",
+            "history_too_large",
+            false,
+        ),
+        AgentError::Runtime(view) => (
+            RUNTIME_ERROR,
+            "runtime error",
+            "runtime_error",
+            view.retryable,
+        ),
         AgentError::InvalidInput => {
             return invalid_params(Some(id));
         }
@@ -664,8 +704,10 @@ fn canonical_method(method: &str) -> &'static str {
         "session.close" => "session.close",
         "session.delete" => "session.delete",
         "session.state" => "session.state",
-        "session.transcript" => "session.transcript",
+        "session.update" => "session.update",
+        "session.history" => "session.history",
         "turn.send" => "turn.send",
+        "turn.steer" => "turn.steer",
         "turn.cancel" => "turn.cancel",
         "turn.wait" => "turn.wait",
         "interaction.answer" => "interaction.answer",

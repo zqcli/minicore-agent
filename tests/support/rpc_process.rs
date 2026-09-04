@@ -1,23 +1,27 @@
 #![allow(dead_code)] // Shared by process flow suites with different helper subsets.
 
 use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedReceiver};
 
 // Process-level guard only; protocol barriers and Events prove ordering.
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// An RPC subprocess driven through blocking stdio on dedicated threads.
+/// Async callers never touch the raw pipes directly, which keeps readiness
+/// handling deterministic instead of racing the OS pipe buffers.
 pub struct RpcProcess {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    stderr_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    child: Option<Child>,
+    stdin_tx: Sender<Vec<u8>>,
+    stdout_rx: UnboundedReceiver<String>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
     pending: VecDeque<Value>,
     events: Vec<Value>,
     observed: Vec<Value>,
@@ -44,20 +48,67 @@ impl RpcProcess {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).await?;
-            Ok(bytes)
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut stdin = stdin;
+            for frame in stdin_rx {
+                if stdin.write_all(&frame).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
         });
+
+        let (stdout_tx, stdout_rx) = tokio_mpsc::unbounded_channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if stdout_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if stderr_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let stderr_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_lines = Arc::clone(&stderr_lines);
+        std::thread::spawn(move || {
+            for line in stderr_rx {
+                log_lines.lock().unwrap().push(line);
+            }
+        });
+
         Self {
-            input: child.stdin.take().unwrap(),
-            output: BufReader::new(child.stdout.take().unwrap()),
-            stderr_task,
-            child,
+            child: Some(child),
+            stdin_tx,
+            stdout_rx,
+            stderr_lines,
             pending: VecDeque::new(),
             events: Vec::new(),
             observed: Vec::new(),
@@ -73,8 +124,12 @@ impl RpcProcess {
         }))
         .unwrap();
         frame.push(b'\n');
-        self.input.write_all(&frame).await.unwrap();
-        self.input.flush().await.unwrap();
+        let tx = self.stdin_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(frame);
+        })
+        .await
+        .unwrap();
     }
 
     pub async fn response(&mut self, id: &str) -> Value {
@@ -113,8 +168,7 @@ impl RpcProcess {
             "turn.wait",
             json!({
                 "session_id": turn["session_id"],
-                "instance_id": turn["instance_id"],
-                "turn_id": turn["turn_id"],
+                "loop_id": turn["loop_id"],
             }),
         )
         .await;
@@ -161,19 +215,57 @@ impl RpcProcess {
         &self.observed
     }
 
-    async fn next_frame(&mut self) -> Option<Value> {
-        let mut line = String::new();
-        let read = tokio::time::timeout(PROCESS_TIMEOUT, self.output.read_line(&mut line))
-            .await
-            .expect("process stdout timed out")
-            .unwrap();
-        if read == 0 {
-            return None;
+    /// Best-effort event probe: output deltas are not contractual, so tests
+    /// assert through `turn.wait` and history and treat a delivered delta as
+    /// a bonus signal rather than a requirement.
+    pub async fn try_event(&mut self, event_type: &str) -> Option<Value> {
+        if let Some(index) = self.events.iter().position(|frame| {
+            frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type)
+        }) {
+            return Some(self.events.remove(index));
         }
-        assert!(line.ends_with('\n'));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = self.next_frame().await?;
+                if frame["method"] == "agent.event" {
+                    if frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type) {
+                        return Some(frame);
+                    }
+                    self.events.push(frame);
+                } else {
+                    self.pending.push_back(frame);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn next_frame(&mut self) -> Option<Value> {
+        let line = tokio::time::timeout(PROCESS_TIMEOUT, self.stdout_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                let recent = self
+                    .stderr_lines
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .take(40)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("");
+                panic!("process stdout timed out\n--- recent stderr ---\n{recent}")
+            })?;
+        Some(self.store_line(line))
+    }
+
+    fn store_line(&mut self, line: String) -> Value {
+        assert!(line.ends_with('\n'), "line must be newline terminated");
         let frame: Value = serde_json::from_str(&line).unwrap();
         self.observed.push(frame.clone());
-        Some(frame)
+        frame
     }
 
     pub async fn shutdown(mut self) -> (Vec<Value>, String) {
@@ -183,16 +275,35 @@ impl RpcProcess {
             json!({"ok": true})
         );
         assert!(self.next_frame().await.is_none());
-        let status = tokio::time::timeout(PROCESS_TIMEOUT, self.child.wait())
-            .await
-            .expect("process did not exit")
-            .unwrap();
+        let child = self.child.take().expect("child already taken");
+        let status = tokio::time::timeout(
+            PROCESS_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let mut child = child;
+                child.wait()
+            }),
+        )
+        .await
+        .expect("process did not exit")
+        .expect("process wait task panicked")
+        .expect("process wait failed");
         assert!(status.success());
-        let stderr = tokio::time::timeout(PROCESS_TIMEOUT, self.stderr_task)
-            .await
-            .expect("process stderr task did not exit")
-            .expect("process stderr task panicked")
-            .expect("process stderr read failed");
-        (self.observed, String::from_utf8_lossy(&stderr).into_owned())
+        let stderr = self
+            .stderr_lines
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<String>();
+        (std::mem::take(&mut self.observed), stderr)
+    }
+}
+
+impl Drop for RpcProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

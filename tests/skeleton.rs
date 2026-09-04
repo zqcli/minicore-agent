@@ -1,10 +1,12 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use minicore_agent::{
     Agent, AgentConfig, AgentError, ApprovalMode, ConfigError, ModelInfo, ProfileInfo, TurnRef,
 };
 use minicore_runtime::model::{ModelRef, ReasoningPreference};
-use minicore_runtime::session::TurnOutcome;
+
+use minicore_agent::TurnResult;
 
 fn complete_config(event_capacity: usize) -> String {
     format!(
@@ -59,10 +61,10 @@ fn complete_public_config_exposes_default_profile_and_model() {
 fn public_agent_query_and_wait_contract_compiles() {
     let _: fn(&Agent) -> Vec<ProfileInfo> = Agent::list_profiles;
     let _: fn(&Agent) -> Vec<ModelInfo> = Agent::list_models;
-    fn wait<'a>(
-        agent: &'a Agent,
+    fn wait(
+        agent: &Agent,
         turn: TurnRef,
-    ) -> impl Future<Output = Result<TurnOutcome, AgentError>> + 'a {
+    ) -> impl Future<Output = Result<Arc<TurnResult>, AgentError>> + '_ {
         agent.wait_turn(turn)
     }
     let _ = wait;

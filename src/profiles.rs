@@ -13,17 +13,6 @@ pub enum ApprovalMode {
     ReadOnly,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProfileCompaction {
-    #[default]
-    Disabled,
-    Model {
-        trigger_tokens: u64,
-        target_tokens: u64,
-    },
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -37,8 +26,6 @@ pub struct Profile {
     pub max_tool_rounds: u16,
     #[serde(default)]
     pub approval: ApprovalMode,
-    #[serde(default)]
-    pub compaction: ProfileCompaction,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

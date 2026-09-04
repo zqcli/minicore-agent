@@ -14,8 +14,16 @@ max_tool_rounds = 32
 # Auto mode executes enabled tools without user approval. Use only in a trusted local environment.
 approval = "auto"
 
-[profiles.coding.compaction]
-mode = "disabled"
+# Optional per-loop overrides on top of the Runtime safe defaults.
+# [loop]
+# event_capacity = 256
+# max_pending_steers = 16
+# prompt_timeout_seconds = 30
+# model_timeout_seconds = 600
+# policy_timeout_seconds = 30
+# tool_timeout_seconds = 1800
+# model_retry_attempts = 2
+# model_retry_base_delay_millis = 100
 
 [models.main]
 provider = "open_ai_responses"
