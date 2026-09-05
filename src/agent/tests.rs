@@ -50,6 +50,9 @@ fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
         ReasoningPreference::Low,
         ReasoningPreference::Medium,
         ReasoningPreference::High,
+        ReasoningPreference::XHigh,
+        ReasoningPreference::Max,
+        ReasoningPreference::Ultra,
     ])
 }
 

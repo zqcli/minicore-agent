@@ -30,7 +30,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.0"}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.1"}}
 ```
 
 An error response has exactly one `error`:
@@ -78,7 +78,7 @@ it does not currently preserve a distinct shutdown cancellation reason.
 ## Agent Methods
 
 `agent.ping` accepts omitted params or `{}` and returns
-`{"version":"0.3.0"}`. `agent.shutdown` accepts the same empty params, starts
+`{"version":"0.3.1"}`. `agent.shutdown` accepts the same empty params, starts
 orderly shutdown, and returns `{"ok":true}` as the final frame on success.
 
 ## Discovery
@@ -115,11 +115,21 @@ Params are omitted or `{}`. Models are sorted by `id`.
       "model_ref": "deep",
       "context_window": 197624,
       "supports_tools": true,
-      "supported_reasoning": ["auto", "disabled", "low", "medium", "high"]
+      "supported_reasoning": [
+        "auto", "disabled", "low", "medium", "high", "xhigh", "max", "ultra"
+      ]
     }
   ]
 }
 ```
+
+The example assumes that `deep` is explicitly configured for every listed
+value. `supported_reasoning` is a per-model capability allowlist; Agent does
+not infer or add reasoning values for every OpenAI model. Add `xhigh`, `max`, or
+`ultra` only when the exact model and endpoint document support for that value.
+`ultra` is intended only for an endpoint that explicitly supports that custom
+or future effort value. OpenAI's official supported effort values remain
+specific to the concrete model.
 
 The result does not expose credentials, credential environment names, Provider
 URLs, Provider model IDs, request bodies, or pricing.

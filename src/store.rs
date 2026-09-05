@@ -1040,6 +1040,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extended_reasoning_values_round_trip_in_record_and_history() {
+        let (base, store, session_id) = fixture("extended-reasoning").await;
+        let mut session_record = record(&store, session_id);
+        store.create_session(&session_record).await.unwrap();
+
+        let values = [
+            (ReasoningPreference::XHigh, "xhigh"),
+            (ReasoningPreference::Max, "max"),
+            (ReasoningPreference::Ultra, "ultra"),
+        ];
+        for (reasoning, wire) in values {
+            session_record.reasoning = reasoning;
+            store.write_record(&session_record).await.unwrap();
+            assert_eq!(
+                store.load_record(session_id).await.unwrap().reasoning,
+                reasoning
+            );
+
+            let loop_id = LoopId::new().unwrap();
+            store
+                .append_loop(
+                    session_id,
+                    &StoredLoopRecord {
+                        loop_id,
+                        outcome: StoredLoopOutcome::Completed,
+                        items: vec![HistoryItem::Assistant(AssistantHistory {
+                            loop_id,
+                            request_index: 0,
+                            model: "main".parse().unwrap(),
+                            reasoning,
+                            content: vec![AssistantPart::Text(format!("answer-{wire}"))],
+                            finish_reason: ModelFinishReason::Stop,
+                            usage: Usage::new(1, 2, 0),
+                        })],
+                        usage: Usage::new(1, 2, 0),
+                        requests: 1,
+                        tool_rounds: 0,
+                        final_config_revision: ConfigRevision::INITIAL,
+                        completed_at: utc_timestamp().unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let loaded = store.load_session(session_id).await.unwrap();
+        let history_reasoning = loaded
+            .history
+            .iter()
+            .map(|item| match item {
+                HistoryItem::Assistant(assistant) => assistant.reasoning,
+                other => panic!("unexpected history item {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            history_reasoning,
+            values
+                .iter()
+                .map(|(reasoning, _)| *reasoning)
+                .collect::<Vec<_>>()
+        );
+        let serialized = serde_json::to_string(loaded.history.as_ref()).unwrap();
+        let view = crate::history::page_history(loaded.history.as_ref(), 0, 100);
+        let view_serialized = serde_json::to_string(&view).unwrap();
+        for (_, wire) in values {
+            assert!(serialized.contains(&format!("\"reasoning\":\"{wire}\"")));
+            assert!(view_serialized.contains(&format!("\"reasoning_level\":\"{wire}\"")));
+        }
+        assert_eq!(loaded.record.reasoning, ReasoningPreference::Ultra);
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
     async fn append_and_load_flatten_history_in_order() {
         let (base, store, session_id) = fixture("append").await;
         store

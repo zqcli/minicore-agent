@@ -5,8 +5,8 @@
 MiniCore Agent v0.3 is the RPC-first agent core: one Rust package with a
 library API, a local Store, a rooted local Workspace, multiple loaded Session
 owners, and an offline Fake Model test seam. It is verified against the
-`minicore-runtime` 0.4 Git revision
-`87f3cf92b9b5980b0f468174a319cf53427d858e`. The runtime dependency is pinned to
+`minicore-runtime` 0.4.1 Git revision
+`6cd2bdbc634437dea925495c61c7eb0be10ba171`. The runtime dependency is pinned to
 that exact Git revision; the local sibling checkout is used only for API review
 and is not modified here.
 
@@ -25,11 +25,15 @@ This repository does not ship a real TUI, plugin system, MCP integration,
 Subagent implementation, or compaction.
 
 A Session may select a configured `model` and `reasoning` value, or inherit the
-Profile defaults. Those settings are frozen when the Session is created and
-persist across close and reopen. `session.update` changes them later: the
-persistent record is rewritten and any active loop receives the new execution
-config at its next request boundary while the current tool batch keeps its old
-snapshot.
+Profile defaults. Runtime-backed reasoning values include `auto`, `disabled`,
+`low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; each model's
+`supported_reasoning` is an explicit capability allowlist. The Agent does not
+infer these values for every OpenAI model, and `ultra` is only for an endpoint
+that explicitly documents that custom or future effort value. Those settings
+are frozen when the Session is created and persist across close and reopen.
+`session.update` changes them later: the persistent record is rewritten and
+any active loop receives the new execution config at its next request boundary
+while the current tool batch keeps its old snapshot.
 
 ## Architecture
 
