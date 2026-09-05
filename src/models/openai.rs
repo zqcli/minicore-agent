@@ -564,6 +564,18 @@ impl<'a> ResponsesRequest<'a> {
                 effort: "high",
                 summary: Some("auto"),
             }),
+            ReasoningPreference::XHigh => Some(ReasoningWire {
+                effort: "xhigh",
+                summary: Some("auto"),
+            }),
+            ReasoningPreference::Max => Some(ReasoningWire {
+                effort: "max",
+                summary: Some("auto"),
+            }),
+            ReasoningPreference::Ultra => Some(ReasoningWire {
+                effort: "ultra",
+                summary: Some("auto"),
+            }),
         };
         Ok((
             Self {

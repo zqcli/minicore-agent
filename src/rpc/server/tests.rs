@@ -49,6 +49,9 @@ fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
         ReasoningPreference::Low,
         ReasoningPreference::Medium,
         ReasoningPreference::High,
+        ReasoningPreference::XHigh,
+        ReasoningPreference::Max,
+        ReasoningPreference::Ultra,
     ])
 }
 
@@ -370,12 +373,113 @@ async fn capability_discovery_returns_ordered_lists() {
         .await;
     let models = harness.response(json!("models")).await;
     assert_eq!(models["result"]["models"][0]["id"], json!("fake"));
+    assert_eq!(
+        models["result"]["models"][0]["supported_reasoning"],
+        json!([
+            "auto", "disabled", "low", "medium", "high", "xhigh", "max", "ultra"
+        ])
+    );
 
     harness
         .send(json!("sessions"), "session.list", Some(json!({})))
         .await;
     let sessions = harness.response(json!("sessions")).await;
     assert_eq!(sessions["result"]["sessions"], json!([]));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
+    let (agent, base, workspace) =
+        test_agent("extended-reasoning", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+
+    harness
+        .send(
+            json!("create-xhigh"),
+            "session.create",
+            Some(json!({"workspace": workspace, "reasoning": "xhigh"})),
+        )
+        .await;
+    let created = harness.response(json!("create-xhigh")).await;
+    assert_eq!(created["result"]["session"]["reasoning"], json!("xhigh"));
+    assert_eq!(
+        serde_json::from_value::<ReasoningPreference>(
+            created["result"]["session"]["reasoning"].clone()
+        )
+        .unwrap(),
+        ReasoningPreference::XHigh
+    );
+    let opened = harness.event("session_opened").await;
+    assert_eq!(
+        opened["params"]["data"]["session"]["reasoning"],
+        json!("xhigh")
+    );
+    let session_id = session_id(&created);
+
+    for (wire, expected) in [
+        ("max", ReasoningPreference::Max),
+        ("ultra", ReasoningPreference::Ultra),
+    ] {
+        let request_id = json!(format!("update-{wire}"));
+        harness
+            .send(
+                request_id.clone(),
+                "session.update",
+                Some(json!({"session_id": session_id, "reasoning": wire})),
+            )
+            .await;
+        let updated = harness.response(request_id).await;
+        assert_eq!(updated["result"]["session"]["reasoning"], json!(wire));
+        assert_eq!(
+            serde_json::from_value::<ReasoningPreference>(
+                updated["result"]["session"]["reasoning"].clone()
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+
+    harness
+        .send(
+            json!("reopen"),
+            "session.open",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let reopened = harness.response(json!("reopen")).await;
+    assert_eq!(reopened["result"]["session"]["reasoning"], json!("ultra"));
+    let reopened_event = harness.event("session_opened").await;
+    assert_eq!(
+        reopened_event["params"]["data"]["session"]["reasoning"],
+        json!("ultra")
+    );
+
+    harness
+        .send(
+            json!("close-again"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close-again")).await["result"],
+        json!({"ok": true})
+    );
 
     harness.shutdown().await;
     remove_base(&base).await;

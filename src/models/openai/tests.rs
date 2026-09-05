@@ -43,6 +43,9 @@ fn settings(base_url: &str) -> OpenAiResponsesSettings {
             ReasoningPreference::Low,
             ReasoningPreference::Medium,
             ReasoningPreference::High,
+            ReasoningPreference::XHigh,
+            ReasoningPreference::Max,
+            ReasoningPreference::Ultra,
         ]),
         supports_tools: true,
         request_timeout: Some(Duration::from_secs(5)),
@@ -67,6 +70,9 @@ fn agent_model_config(base_url: &str) -> ModelConfig {
             ReasoningPreference::Low,
             ReasoningPreference::Medium,
             ReasoningPreference::High,
+            ReasoningPreference::XHigh,
+            ReasoningPreference::Max,
+            ReasoningPreference::Ultra,
         ]),
         supports_tools: true,
         request_timeout_seconds: Some(5),
@@ -4059,6 +4065,18 @@ fn reasoning_request_mapping_and_preflight_overflow_are_conservative() {
             ReasoningPreference::High,
             json!({"effort": "high", "summary": "auto"}),
         ),
+        (
+            ReasoningPreference::XHigh,
+            json!({"effort": "xhigh", "summary": "auto"}),
+        ),
+        (
+            ReasoningPreference::Max,
+            json!({"effort": "max", "summary": "auto"}),
+        ),
+        (
+            ReasoningPreference::Ultra,
+            json!({"effort": "ultra", "summary": "auto"}),
+        ),
     ] {
         let body = model.build_request(&basic_request(reasoning)).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -4093,18 +4111,25 @@ fn reasoning_request_mapping_and_preflight_overflow_are_conservative() {
         false,
     );
 
-    let mut unsupported = settings("http://127.0.0.1:1");
-    unsupported.supported_reasoning = BTreeSet::from([ReasoningPreference::Auto]);
-    let error = OpenAiResponsesModel::new(unsupported)
-        .unwrap()
-        .build_request(&basic_request(ReasoningPreference::High))
-        .unwrap_err();
-    assert_error(
-        &error,
-        ModelErrorKind::InvalidRequest,
-        DeliveryState::NotStarted,
-        false,
-    );
+    for reasoning in [
+        ReasoningPreference::High,
+        ReasoningPreference::XHigh,
+        ReasoningPreference::Max,
+        ReasoningPreference::Ultra,
+    ] {
+        let mut unsupported = settings("http://127.0.0.1:1");
+        unsupported.supported_reasoning = BTreeSet::from([ReasoningPreference::Auto]);
+        let error = OpenAiResponsesModel::new(unsupported)
+            .unwrap()
+            .build_request(&basic_request(reasoning))
+            .unwrap_err();
+        assert_error(
+            &error,
+            ModelErrorKind::InvalidRequest,
+            DeliveryState::NotStarted,
+            false,
+        );
+    }
 }
 
 #[tokio::test]
@@ -5509,8 +5534,13 @@ fn live_config() -> LiveOpenAiConfig {
             "disabled" => ReasoningPreference::Disabled,
             "low" => ReasoningPreference::Low,
             "high" => ReasoningPreference::High,
+            "xhigh" => ReasoningPreference::XHigh,
+            "max" => ReasoningPreference::Max,
+            "ultra" => ReasoningPreference::Ultra,
             _ => {
-                panic!("MINICORE_AGENT_LIVE_REASONING must be auto, disabled, low, medium, or high")
+                panic!(
+                    "MINICORE_AGENT_LIVE_REASONING must be auto, disabled, low, medium, high, xhigh, max, or ultra"
+                )
             }
         },
     };
@@ -5538,9 +5568,14 @@ fn live_reasoning_tool_config() -> LiveOpenAiConfig {
     assert!(
         matches!(
             config.reasoning,
-            ReasoningPreference::Low | ReasoningPreference::Medium | ReasoningPreference::High
+            ReasoningPreference::Low
+                | ReasoningPreference::Medium
+                | ReasoningPreference::High
+                | ReasoningPreference::XHigh
+                | ReasoningPreference::Max
+                | ReasoningPreference::Ultra
         ),
-        "reasoning Tool smoke requires low, medium, or high reasoning"
+        "reasoning Tool smoke requires low, medium, high, xhigh, max, or ultra reasoning"
     );
     config
 }

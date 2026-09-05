@@ -390,6 +390,49 @@ mod tests {
     }
 
     #[test]
+    fn extended_reasoning_values_parse_from_toml() {
+        for (wire, expected) in [
+            ("xhigh", ReasoningPreference::XHigh),
+            ("max", ReasoningPreference::Max),
+            ("ultra", ReasoningPreference::Ultra),
+        ] {
+            let config = AgentConfig::from_toml(&format!(
+                r#"
+data_dir = "./test-data"
+event_capacity = 128
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "{wire}"
+system_prompt = "test system prompt"
+tools = []
+max_tool_rounds = 4
+approval = "ask"
+
+[models.main]
+provider = "open_ai_responses"
+model = "provider-model"
+base_url = "https://example.invalid/v1"
+api_key_env = "MINICORE_CONFIG_TEST_KEY"
+physical_context_window = 10000
+output_budget_tokens = 1000
+safety_margin_tokens = 1000
+supported_reasoning = ["{wire}"]
+supports_tools = true
+request_timeout_seconds = 30
+"#
+            ))
+            .unwrap();
+            assert_eq!(config.profiles["test"].reasoning, expected);
+            assert_eq!(
+                config.models["main"].supported_reasoning(),
+                &BTreeSet::from([expected])
+            );
+        }
+    }
+
+    #[test]
     fn valid_complete_toml_passes_validation() {
         let config = AgentConfig::from_toml(
             r#"
