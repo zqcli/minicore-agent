@@ -838,7 +838,9 @@ fn path_arg(args: &serde_json::Value, home: &str) -> Option<String> {
         .or_else(|| args.get("file_path"))
         .and_then(serde_json::Value::as_str);
     raw.map(|path| {
-        let home_match = if home == "/" {
+        let home_match = if home.is_empty() {
+            false
+        } else if home == "/" {
             path.starts_with('/')
         } else {
             path == home
@@ -1066,29 +1068,20 @@ mod tests {
 
         let write = build_tool_display(
             "write",
-            Some(&serde_json::json!({ "path": "/tmp/a.txt", "content": "l1\nl2\nl3" })),
+            Some(&serde_json::json!({ "path": "a.txt", "content": "l1\nl2\nl3" })),
             Some("created"),
         );
-        assert_eq!(write.detail, "/tmp/a.txt");
+        assert_eq!(write.detail, "a.txt");
         assert_eq!(write.input_line_count, Some(3));
         assert_eq!(write.hidden_line_count, Some(4));
 
         let read = build_tool_display(
             "read",
-            Some(&serde_json::json!({ "path": "/project/src/main.rs", "offset": 10, "limit": 5 })),
+            Some(&serde_json::json!({ "path": "src/main.rs", "offset": 10, "limit": 5 })),
             None,
         );
-        assert_eq!(read.detail, "/project/src/main.rs:10-14");
+        assert_eq!(read.detail, "src/main.rs:10-14");
         assert_eq!(read.hidden_line_count, Some(5));
-
-        let home = std::env::var("HOME").unwrap_or_default();
-        let home_path = format!("{home}/src/main.rs");
-        let read_home = build_tool_display(
-            "read",
-            Some(&serde_json::json!({ "path": home_path })),
-            None,
-        );
-        assert_eq!(read_home.detail, "~/src/main.rs");
 
         let edit = build_tool_display(
             "edit",
@@ -1098,6 +1091,31 @@ mod tests {
         assert_eq!(edit.detail, "a.rs");
         assert_eq!(edit.expanded_input.as_deref(), Some("x\ny\nz"));
         assert_eq!(edit.input_line_count, Some(3));
+    }
+
+    #[test]
+    fn path_details_preserve_paths_without_a_home_directory() {
+        for path in ["/tmp/a.txt", "/src/main.rs", "a.rs", "", "C:\\work\\a.rs"] {
+            let args = serde_json::json!({ "path": path });
+            assert_eq!(path_arg(&args, "").as_deref(), Some(path));
+        }
+        let args = serde_json::json!({ "file_path": "/tmp/a.txt" });
+        assert_eq!(path_arg(&args, "").as_deref(), Some("/tmp/a.txt"));
+    }
+
+    #[test]
+    fn path_details_only_abbreviate_a_known_home_boundary() {
+        for (path, home, expected) in [
+            ("/home/test", "/home/test", "~"),
+            ("/home/test/src/main.rs", "/home/test", "~/src/main.rs"),
+            ("/home/testing/a.rs", "/home/test", "/home/testing/a.rs"),
+            ("/tmp/a.txt", "/home/test", "/tmp/a.txt"),
+            ("/", "/", "~"),
+            ("/src/main.rs", "/", "~/src/main.rs"),
+        ] {
+            let args = serde_json::json!({ "path": path });
+            assert_eq!(path_arg(&args, home).as_deref(), Some(expected));
+        }
     }
 
     #[test]
