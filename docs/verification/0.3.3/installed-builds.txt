@@ -1,0 +1,6 @@
+8e136238e245d96ea8e1546338887880850cf46fbaabb7721398cfe65cc3214f  /Users/zzq/Develops/minicore-agent/target/debug/minicore-agent
+aead2cab5598fbf98d5070dbc5cf6fdcd7268be1b88b00caf4df143be6afc6a6  /Users/zzq/Develops/minicore-agent/target/release/minicore-agent
+61836c0738f799533221bb07408122bf2964a7926b499b5c982b1f731d3cce3b  /Users/zzq/Develops/minicore-agent/target/preserved-before-release-ew5WEt/minicore-agent-debug
+4ba61b4622e7d995bf91deaff6f3c8720139b57f1a52a6627e5f442fd68a1bac  /Users/zzq/Develops/minicore-agent/target/preserved-before-release-ew5WEt/minicore-agent-release
+UUID: 4C4C44FE-5555-3144-A1E5-27BB56F25844 (x86_64) /Users/zzq/Develops/minicore-agent/target/debug/minicore-agent
+UUID: 4C4C44FE-5555-3144-A1E5-27BB56F25844 (x86_64) /Users/zzq/Develops/minicore-agent/target/debug/minicore-agent.dSYM/Contents/Resources/DWARF/minicore-agent

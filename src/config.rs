@@ -187,7 +187,7 @@ pub(crate) const fn map_loop_start_error(error: LoopStartError) -> crate::AgentE
 pub enum ConfigError {
     #[error("configuration text is empty")]
     Empty,
-    #[error("configuration could not be parsed")]
+    #[error("configuration could not be parsed (invalid syntax or unsupported fields)")]
     Parse,
     #[error("configuration file could not be read")]
     Read,
@@ -207,6 +207,8 @@ pub enum ConfigError {
     InvalidProfile,
     #[error("configuration model is invalid")]
     InvalidModel,
+    #[error("Model API key environment variable is missing or empty")]
+    MissingModelApiKey,
     #[error("configuration profile model was not found")]
     ProfileModelNotFound,
     #[error("configuration reasoning is unsupported")]

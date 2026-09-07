@@ -8,6 +8,7 @@ mod history;
 mod ids;
 mod models;
 mod policy;
+mod presentation;
 mod profiles;
 mod prompt;
 mod rpc;
@@ -28,7 +29,8 @@ pub use event::{
 };
 pub use ids::{SessionId, SessionIdError};
 pub use models::{ModelConfig, ModelInfo};
+pub use presentation::{AssistantDisplayPart, PresentationView, ToolDisplay};
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
-pub use sessions::SessionBlockReason;
+pub use sessions::{LoopAccepted, SessionBlockReason, SteerAccepted};
 pub use workspace::{Workspace, WorkspaceError};

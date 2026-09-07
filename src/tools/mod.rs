@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use minicore_runtime::tools::{ToolError, ToolSet};
+use minicore_runtime::tools::{ToolError, ToolSet, ToolSetBuilder};
 use thiserror::Error;
 
+use crate::presentation::{Presentation, PresentationTool};
 use crate::{Workspace, WorkspaceError};
 
 use apply_patch::ApplyPatchTool;
@@ -43,10 +44,31 @@ pub(crate) enum BuildToolsError {
     Internal,
 }
 
+#[cfg(test)]
 pub(crate) fn build_tools(
     names: &[String],
     workspace: Arc<Workspace>,
     command_environment: CommandEnvironment,
+) -> Result<ToolSet, BuildToolsError> {
+    build_tools_with(names, workspace, command_environment, None)
+}
+
+/// Builds the tool set with the per-session presentation wrappers active.
+/// The wrappers are display-only and never change tool execution semantics.
+pub(crate) fn build_tools_with_presentation(
+    names: &[String],
+    workspace: Arc<Workspace>,
+    command_environment: CommandEnvironment,
+    presentation: &Arc<Presentation>,
+) -> Result<ToolSet, BuildToolsError> {
+    build_tools_with(names, workspace, command_environment, Some(presentation))
+}
+
+fn build_tools_with(
+    names: &[String],
+    workspace: Arc<Workspace>,
+    command_environment: CommandEnvironment,
+    presentation: Option<&Arc<Presentation>>,
 ) -> Result<ToolSet, BuildToolsError> {
     let mut builder = ToolSet::builder();
     let mut seen = BTreeSet::new();
@@ -54,24 +76,47 @@ pub(crate) fn build_tools(
         if !seen.insert(name.as_str()) {
             return Err(BuildToolsError::InvalidConfiguration);
         }
+        let register = |builder: &mut ToolSetBuilder,
+                        tool: Arc<dyn minicore_runtime::tools::Tool>| {
+            if let Some(presentation) = presentation {
+                builder.register_arc(PresentationTool::new(tool, Arc::clone(presentation)));
+            } else {
+                builder.register_arc(tool);
+            }
+        };
         match name.as_str() {
             "apply_patch" => {
-                builder.register(ApplyPatchTool::new(Arc::clone(&workspace)));
+                register(
+                    &mut builder,
+                    Arc::new(ApplyPatchTool::new(Arc::clone(&workspace))),
+                );
             }
             "bash" => {
-                builder.register(BashTool::new(
-                    Arc::clone(&workspace),
-                    command_environment.clone(),
-                ));
+                register(
+                    &mut builder,
+                    Arc::new(BashTool::new(
+                        Arc::clone(&workspace),
+                        command_environment.clone(),
+                    )),
+                );
             }
             "edit" => {
-                builder.register(EditTool::new(Arc::clone(&workspace)));
+                register(
+                    &mut builder,
+                    Arc::new(EditTool::new(Arc::clone(&workspace))),
+                );
             }
             "read" => {
-                builder.register(ReadTool::new(Arc::clone(&workspace)));
+                register(
+                    &mut builder,
+                    Arc::new(ReadTool::new(Arc::clone(&workspace))),
+                );
             }
             "write" => {
-                builder.register(WriteTool::new(Arc::clone(&workspace)));
+                register(
+                    &mut builder,
+                    Arc::new(WriteTool::new(Arc::clone(&workspace))),
+                );
             }
             _ => return Err(BuildToolsError::InvalidConfiguration),
         }

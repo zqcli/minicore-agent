@@ -30,7 +30,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.1"}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3"}}
 ```
 
 An error response has exactly one `error`:
@@ -78,7 +78,7 @@ it does not currently preserve a distinct shutdown cancellation reason.
 ## Agent Methods
 
 `agent.ping` accepts omitted params or `{}` and returns
-`{"version":"0.3.1"}`. `agent.shutdown` accepts the same empty params, starts
+`{"version":"0.3.3"}`. `agent.shutdown` accepts the same empty params, starts
 orderly shutdown, and returns `{"ok":true}` as the final frame on success.
 
 ## Discovery
@@ -204,6 +204,47 @@ The result has a `session` member containing the created SessionInfo.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`.
 - `session.state` takes a loaded Session ID and returns the current Session
   state projection.
+- `session.presentation` takes a loaded Session ID and returns read-only data
+  for a local UI footer and tool cards. It performs no Store mutation, tool
+  execution, or loop control.
+
+### `session.presentation`
+
+```json
+{"session_id":"ses_..."}
+```
+
+The result is returned directly (not under another `session` member):
+
+```json
+{
+  "session_id": "ses_...",
+  "model_label": "coding",
+  "git_branch": "dev",
+  "context": {
+    "tokens": null,
+    "window": null,
+    "percent": null,
+    "kind": "unknown"
+  },
+  "cost_usd": null,
+  "using_subscription": null,
+  "last_loop": {
+    "loop_id": "lup_...",
+    "started_at": "2026-01-02T03:04:05.006Z",
+    "finished_at": null
+  }
+}
+```
+
+`git_branch` is obtained by the Agent with fixed arguments equivalent to
+`git -C <workspace> symbolic-ref --short HEAD`; it is `null` for a non-Git,
+detached, or unavailable workspace. The lookup runs at session create/open,
+after Tool batches, and at loop completion, never once per UI frame.
+`model_label` is the configured Session model/profile ID, not a provider model
+identifier. Context, cost, and subscription fields are `null`/`unknown` when
+MiniCore has no reliable provider source; cumulative Usage is not treated as
+current context occupancy.
 
 ### `session.update`
 
@@ -243,7 +284,7 @@ are returned in stored history order with contiguous indexes.
 ```json
 {
   "items": [
-    {"index": 0, "item": {"type": "user", "data": {"kind": "prompt", "loop_id": "lup_...", "text": "Fix the parser"}}}
+    {"index": 0, "item": {"type": "user", "data": {"kind": "prompt", "loop_id": "lup_...", "text": "Fix the parser", "timestamp": "2026-01-02T03:04:05.006Z"}}}
   ],
   "next_offset": null,
   "total": 2
@@ -255,14 +296,18 @@ last. Every `loop_id` refers to the runtime loop that produced the item.
 
 Item types and their `data`:
 
-- `user`: `kind` (prompt), `loop_id`, `text`.
+- `user`: `kind` (prompt or steering), `loop_id`, `text`, and optional
+  `timestamp` (the Agent acceptance time in RFC3339; absent for old JSONL or an
+  unavailable clock).
 - `assistant`: `loop_id`, `request_index`, `model`, `reasoning_level`, `text`,
-  `reasoning`, `tool_calls`, `finish_reason`, `usage`. `reasoning` contains
-  visible reasoning text/summaries; opaque provider fields (such as encrypted
-  content) are never included. Each tool call exposes only `tool_call_id`,
-  `name`, and `call_index`; arguments are never present in the wire view.
+  `reasoning`, `tool_calls`, `finish_reason`, `usage`, and optional ordered
+  `parts`. `reasoning` contains visible reasoning text/summaries; opaque
+  provider fields (such as encrypted content) are never included. Each tool
+  call exposes only `tool_call_id`, `name`, `call_index`, and optional
+  whitelisted `display`; raw arguments are never present in the wire view.
 - `tool_result`: `loop_id`, `request_index`, `tool_call_id`, `tool_name`,
-  `outcome`, `content`.
+  `outcome`, bounded `content`, and optional `content_truncated` when the
+  result exceeded the local display cap.
 
 The history view is sanitized: user text and tool results pass through, while
 tool arguments and opaque provider content never appear.
@@ -285,6 +330,16 @@ identity:
 A Session runs at most one active loop. Additional sends while one is active
 fail with `-32003` (session_busy); a Session blocked by a persistence failure
 fails with `-32004`.
+
+The successful result preserves the original `turn` member and may add
+`accepted_at`:
+
+```json
+{"turn":{"session_id":"ses_...","loop_id":"lup_..."},"accepted_at":"2026-01-02T03:04:05.006Z"}
+```
+
+The timestamp is when the Agent accepted the Prompt, not when the loop or
+provider request completed. It may be omitted if the clock was unavailable.
 
 ### `turn.wait`
 
@@ -331,8 +386,10 @@ Cancels the active loop and returns `{"cancelled":true}`. The corresponding
 {"session_id":"ses_...","loop_id":"lup_...","text":"Do not modify config files"}
 ```
 
-Appends a steering instruction to the active loop and returns `{"ok":true}`. A
-full steer queue is reported with `-32016`.
+Appends a steering instruction to the active loop and returns `{"ok":true}`
+with optional `accepted_at`. The timestamp is the Agent acceptance time for
+that Steer, not its later application to a model request. A full steer queue is
+reported with `-32016`.
 
 ## Interactions
 
@@ -399,8 +456,12 @@ Loop-scoped events:
 - `output_delta` (`turn`, `request_index`, `channel` `text`/`reasoning`, `delta`, `meta`)
 - `tool_started` (`turn`, `request_index`, `tool_call_id`, `tool_name`, `meta`)
 - `tool_progress` (`turn`, `request_index`, `tool_call_id`, `progress`, `meta`)
+- `tool_presentation` (`turn`, `request_index`, `tool_call_id`, `tool_name`,
+  `display`, `meta`); it is best effort and may arrive before or after
+  `tool_started`.
 - `tool_finished` (`turn`, `request_index`, `tool_call_id`, `result`, `meta`);
-  `result` contains `outcome` and `content_bytes`.
+  `result` contains `outcome`, `content_bytes`, and optional bounded `content`
+  plus optional `content_truncated`.
 - `interaction_requested` (`turn`, `interaction`, `meta`)
 - `interaction_resolved` (`turn`, `interaction_id`, `meta`)
 - `turn_finished` (`turn`, `outcome`, `persistence`, `meta`)
@@ -433,3 +494,42 @@ errors:
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or
 panic payload.
+
+## Presentation Data And Local Permission
+
+Presentation fields are additive and read-only. The Agent keeps the existing
+execution RPCs and sanitized history contract; clients may ignore unknown
+fields and unknown read-only event types.
+
+`ToolDisplay` is generated by one Agent-owned whitelist formatter and is shared
+by live events and history. It exposes only a bounded detail line and, for
+`write`, `edit`, and `apply_patch`, a bounded `expanded_input` body. Bash detail
+is the bounded command line; read detail is the bounded path/range; other tool
+names receive only a generic identity. Raw invocation JSON, environment data,
+provider objects, and arbitrary unknown-tool arguments are not sent as display
+data. `hidden_line_count` follows the pinned Rail `executionHiddenLineCount` policy:
+write/edit bodies use their whitelisted input rows, while other native tool calls
+use their bounded JSON-argument row count, in both cases plus bounded result
+rows. It is a source display statistic, not permission to expose those raw
+arguments; `truncated: true` means the client must not promise unavailable source
+rows.
+
+This is an intentional local-display permission change: a command, workspace
+path, write body, edit body, or patch supplied by the user/model may reach the
+trusted local TUI through the RPC result/event. Deployments that forward RPC
+frames beyond that local UI must apply their own policy. Those values remain
+excluded from tracing, Agent errors, and redacted `Debug` implementations.
+
+Assistant `parts` are created only from sanitized history and preserve visible
+text, visible reasoning, and ToolCall ID order. Encrypted/signature-only
+reasoning is never included. User `timestamp` values are optional RFC3339
+acceptance times stored inside the same `history.jsonl` loop record as
+`user_times`; old records have no timestamps and are never back-filled with
+the current time. The metadata is FIFO by User occurrence, so repeated text is
+not used as a map key.
+
+The client never reads Store or Workspace for `session.presentation`: the
+Agent performs its own fixed-argument branch lookup and returns honest
+`null`/`unknown` context, cost, and subscription values when no reliable source
+exists. A client must not run `git`, execute a Tool, or use presentation data
+as an execution request.

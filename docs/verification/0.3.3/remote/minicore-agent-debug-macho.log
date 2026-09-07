@@ -1,0 +1,9 @@
+signature_dataoff=47908096 datasize=374448 signature_end=48282544 file_size=48282544
+ncmds=17 sizeofcmds=2224 load_end=2256 first_text_offset=18688 gap=16432
+minos=11.0
+/tmp/minicore-release-028-033.ew5WEt/artifacts/minicore-agent-debug: Mach-O 64-bit executable x86_64
+UUID: 4C4C44FE-5555-3144-A1E5-27BB56F25844 (x86_64) /tmp/minicore-release-028-033.ew5WEt/artifacts/minicore-agent-debug
+nm=passed size=passed dwarfdump=passed
+/tmp/minicore-release-028-033.ew5WEt/artifacts/minicore-agent-debug: valid on disk
+/tmp/minicore-release-028-033.ew5WEt/artifacts/minicore-agent-debug: satisfies its Designated Requirement
+codesign=valid

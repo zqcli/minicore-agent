@@ -118,6 +118,30 @@ impl Workspace {
         self.root.as_path()
     }
 
+    /// Current git branch, read through fixed git arguments (no shell). `None`
+    /// when the workspace is not a git work tree (or git is absent/detached).
+    pub(crate) async fn git_branch(&self) -> Option<String> {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(self.root.as_path())
+            .arg("symbolic-ref")
+            .arg("--short")
+            .arg("HEAD")
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let branch = String::from_utf8(output.stdout).ok()?;
+        let branch = branch.trim();
+        if branch.is_empty() {
+            None
+        } else {
+            Some(branch.to_owned())
+        }
+    }
+
     pub(crate) async fn resolve_existing(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
         let relative = normalize_relative(path, false)?;
         let resolved = self.canonicalize_inside(&self.root.join(relative)).await?;
@@ -667,6 +691,30 @@ mod tests {
         assert_eq!(
             Workspace::open(base.join("not-directory")).await.err(),
             Some(WorkspaceError::NotDirectory)
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn git_branch_uses_the_workspace_and_returns_only_symbolic_head() {
+        let (base, workspace) = fixture("git-branch").await;
+        let root = workspace.root().to_path_buf();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .status()
+            .expect("git must be available for the branch presentation test");
+        assert!(init.success());
+        let set_head = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["symbolic-ref", "HEAD", "refs/heads/presentation/test"])
+            .status()
+            .unwrap();
+        assert!(set_head.success());
+        assert_eq!(
+            workspace.git_branch().await.as_deref(),
+            Some("presentation/test")
         );
         cleanup(&base).await;
     }

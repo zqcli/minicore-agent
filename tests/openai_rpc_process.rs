@@ -332,7 +332,10 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_history() {
     let history_text = history.to_string();
     assert!(history_text.contains("PROCESS-READ-CONTENT"));
     assert!(history_text.contains("process final"));
-    assert!(!history_text.contains(ARGUMENT_SECRET));
+    // The path is an explicitly permitted local-display detail; the raw
+    // invocation object remains absent.
+    assert!(history_text.contains(ARGUMENT_SECRET));
+    assert!(!history_text.contains("\"path\""));
     process
         .send("close", "session.close", json!({"session_id": session_id}))
         .await;

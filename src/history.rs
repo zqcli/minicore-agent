@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -121,7 +122,7 @@ pub struct IndexedHistoryItem {
 ///
 /// Tool-call arguments and opaque reasoning are never exposed here; read the
 /// authoritative view through the safe fields only.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum HistoryItemView {
     User(UserHistoryView),
@@ -130,14 +131,41 @@ pub enum HistoryItemView {
     Summary(SummaryHistoryView),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+impl fmt::Debug for HistoryItemView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User(view) => formatter.debug_tuple("User").field(view).finish(),
+            Self::Assistant(view) => formatter.debug_tuple("Assistant").field(view).finish(),
+            Self::ToolResult(view) => formatter.debug_tuple("ToolResult").field(view).finish(),
+            Self::Summary(view) => formatter.debug_tuple("Summary").field(view).finish(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct UserHistoryView {
     pub loop_id: LoopId,
     pub kind: UserMessageKind,
     pub text: String,
+    /// RFC3339 acceptance time recorded by the Agent (new sessions); `None`
+    /// for pre-`user_times` history — never back-filled with `now()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+impl fmt::Debug for UserHistoryView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserHistoryView")
+            .field("loop_id", &self.loop_id)
+            .field("kind", &self.kind)
+            .field("text_bytes", &self.text.len())
+            .field("timestamp", &self.timestamp)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct AssistantHistoryView {
     pub loop_id: LoopId,
     pub request_index: u32,
@@ -148,6 +176,28 @@ pub struct AssistantHistoryView {
     pub tool_calls: Vec<ToolCallView>,
     pub usage: Usage,
     pub finish_reason: ModelFinishReason,
+    /// Visible assistant parts in their original order (already sanitized);
+    /// the flattened `text`/`reasoning` fields remain for old clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<crate::presentation::AssistantDisplayPart>>,
+}
+
+impl fmt::Debug for AssistantHistoryView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AssistantHistoryView")
+            .field("loop_id", &self.loop_id)
+            .field("request_index", &self.request_index)
+            .field("model", &self.model)
+            .field("reasoning_level", &self.reasoning_level)
+            .field("text_bytes", &self.text.len())
+            .field("reasoning_bytes", &self.reasoning.len())
+            .field("tool_call_count", &self.tool_calls.len())
+            .field("usage", &self.usage)
+            .field("finish_reason", &self.finish_reason)
+            .field("part_count", &self.parts.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -155,9 +205,12 @@ pub struct ToolCallView {
     pub tool_call_id: ToolCallId,
     pub name: String,
     pub call_index: u32,
+    /// Whitelisted display regenerated from the stored arguments/results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<crate::presentation::ToolDisplay>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolResultHistoryView {
     pub loop_id: LoopId,
     pub request_index: u32,
@@ -165,11 +218,37 @@ pub struct ToolResultHistoryView {
     pub tool_name: String,
     pub outcome: ToolResultOutcome,
     pub content: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub content_truncated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+impl fmt::Debug for ToolResultHistoryView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolResultHistoryView")
+            .field("loop_id", &self.loop_id)
+            .field("request_index", &self.request_index)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("tool_name", &self.tool_name)
+            .field("outcome", &self.outcome)
+            .field("content_len", &self.content.len())
+            .field("content_truncated", &self.content_truncated)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct SummaryHistoryView {
     pub content: String,
+}
+
+impl fmt::Debug for SummaryHistoryView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SummaryHistoryView")
+            .field("content_len", &self.content.len())
+            .finish()
+    }
 }
 
 impl From<&HistoryItem> for HistoryItemView {
@@ -193,58 +272,37 @@ impl From<&UserHistory> for UserHistoryView {
             loop_id: user.loop_id,
             kind: user.kind,
             text: user.input.as_text().to_owned(),
+            timestamp: None,
         }
     }
 }
 
 impl From<&AssistantHistory> for AssistantHistoryView {
     fn from(assistant: &AssistantHistory) -> Self {
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls = Vec::new();
-        for part in &assistant.content {
-            match part {
-                AssistantPart::Text(part) => text.push_str(part),
-                AssistantPart::Reasoning(part) => {
-                    if let Some(text) = part.text() {
-                        reasoning.push_str(text);
-                    }
-                    if let Some(summary) = part.summary() {
-                        reasoning.push_str(summary);
-                    }
-                }
-                AssistantPart::ToolCall(call) => tool_calls.push(ToolCallView {
-                    tool_call_id: call.tool_call_id().clone(),
-                    name: call.name().as_str().to_owned(),
-                    call_index: call.call_index(),
-                }),
-            }
-        }
-        Self {
-            loop_id: assistant.loop_id,
-            request_index: assistant.request_index,
-            model: assistant.model.as_str().to_owned(),
-            reasoning_level: assistant.reasoning,
-            text,
-            reasoning,
-            tool_calls,
-            usage: assistant.usage,
-            finish_reason: assistant.finish_reason,
-        }
+        assistant_history_view(assistant, &std::collections::HashMap::new())
     }
 }
 
 impl From<&ToolResultHistory> for ToolResultHistoryView {
     fn from(result: &ToolResultHistory) -> Self {
+        let (content, content_truncated) = crate::presentation::bounded_result_content(
+            result.output.content().as_str(),
+            crate::presentation::MAX_RESULT_DISPLAY_BYTES,
+        );
         Self {
             loop_id: result.loop_id,
             request_index: result.request_index,
             tool_call_id: result.call_id.clone(),
             tool_name: result.tool_name.as_str().to_owned(),
             outcome: result.outcome,
-            content: result.output.content().as_str().to_owned(),
+            content,
+            content_truncated,
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl From<&SummaryHistory> for SummaryHistoryView {
@@ -257,14 +315,54 @@ impl From<&SummaryHistory> for SummaryHistoryView {
 
 /// Pages a session's in-memory history. History only appends while a session
 /// is loaded, so item indexes are stable within one loaded lifetime.
-pub(crate) fn page_history(history: &[HistoryItem], offset: usize, limit: usize) -> HistoryPage {
+/// `user_times` maps `(loop_id, occurrence)` to the persisted RFC3339
+/// acceptance time for each stored User item (old records simply have no
+/// entry). Tool-call displays are regenerated from stored args + results with
+/// the same whitelist formatter the live path uses.
+pub(crate) fn page_history(
+    history: &[HistoryItem],
+    offset: usize,
+    limit: usize,
+    user_times: &std::collections::HashMap<(LoopId, usize), String>,
+) -> HistoryPage {
+    let tool_results = collect_tool_results(history);
     let total = history.len();
     let end = offset.saturating_add(limit).min(total);
     let mut items = Vec::with_capacity(end.saturating_sub(offset));
+    // Count occurrences before the requested page as well. A page boundary
+    // must not make the second identical User item look like occurrence zero.
+    let mut user_occurrences: std::collections::HashMap<LoopId, usize> =
+        std::collections::HashMap::new();
+    for item in history.iter().take(offset) {
+        if let HistoryItem::User(user) = item {
+            *user_occurrences.entry(user.loop_id).or_default() += 1;
+        }
+    }
     for (index, item) in history.iter().enumerate().skip(offset).take(limit) {
         items.push(IndexedHistoryItem {
             index,
-            item: HistoryItemView::from(item),
+            item: match item {
+                HistoryItem::User(user) => {
+                    let occurrence = user_occurrences.entry(user.loop_id).or_insert(0);
+                    let timestamp = user_times.get(&(user.loop_id, *occurrence)).cloned();
+                    *occurrence += 1;
+                    HistoryItemView::User(UserHistoryView {
+                        loop_id: user.loop_id,
+                        kind: user.kind,
+                        text: user.input.as_text().to_owned(),
+                        timestamp,
+                    })
+                }
+                HistoryItem::Assistant(assistant) => {
+                    HistoryItemView::Assistant(assistant_history_view(assistant, &tool_results))
+                }
+                HistoryItem::ToolResult(result) => {
+                    HistoryItemView::ToolResult(ToolResultHistoryView::from(result))
+                }
+                HistoryItem::Summary(summary) => {
+                    HistoryItemView::Summary(SummaryHistoryView::from(summary))
+                }
+            },
         });
     }
     let next_offset = if end < total { Some(end) } else { None };
@@ -272,5 +370,205 @@ pub(crate) fn page_history(history: &[HistoryItem], offset: usize, limit: usize)
         items,
         next_offset,
         total,
+    }
+}
+
+/// Maps `ToolCallId` -> stored result content for regenerating tool displays
+/// from history. Best-effort: a view never needs the result to render.
+fn collect_tool_results(
+    history: &[HistoryItem],
+) -> std::collections::HashMap<(LoopId, u32, ToolCallId), (String, bool)> {
+    let mut results = std::collections::HashMap::new();
+    for item in history {
+        if let HistoryItem::ToolResult(result) = item {
+            let (content, truncated) = crate::presentation::bounded_result_content(
+                result.output.content().as_str(),
+                crate::presentation::MAX_RESULT_DISPLAY_BYTES,
+            );
+            if !content.is_empty() {
+                results.insert(
+                    (result.loop_id, result.request_index, result.call_id.clone()),
+                    (content, truncated),
+                );
+            }
+        }
+    }
+    results
+}
+
+fn assistant_history_view(
+    assistant: &AssistantHistory,
+    tool_results: &std::collections::HashMap<(LoopId, u32, ToolCallId), (String, bool)>,
+) -> AssistantHistoryView {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    for part in &assistant.content {
+        match part {
+            AssistantPart::Text(part) => text.push_str(part),
+            AssistantPart::Reasoning(part) => {
+                if let Some(text) = part.text() {
+                    reasoning.push_str(text);
+                }
+                if let Some(summary) = part.summary() {
+                    reasoning.push_str(summary);
+                }
+            }
+            AssistantPart::ToolCall(call) => {
+                let display = crate::presentation::build_tool_display(
+                    call.name().as_str(),
+                    Some(call.arguments()),
+                    tool_results
+                        .get(&(
+                            assistant.loop_id,
+                            assistant.request_index,
+                            call.tool_call_id().clone(),
+                        ))
+                        .map(|(content, _)| content.as_str()),
+                );
+                tool_calls.push(ToolCallView {
+                    tool_call_id: call.tool_call_id().clone(),
+                    name: call.name().as_str().to_owned(),
+                    call_index: call.call_index(),
+                    display: Some(display),
+                });
+            }
+        }
+    }
+    AssistantHistoryView {
+        loop_id: assistant.loop_id,
+        request_index: assistant.request_index,
+        model: assistant.model.as_str().to_owned(),
+        reasoning_level: assistant.reasoning,
+        text,
+        reasoning,
+        tool_calls,
+        parts: Some(crate::presentation::assistant_display_parts(
+            &assistant.content,
+        )),
+        usage: assistant.usage,
+        finish_reason: assistant.finish_reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minicore_runtime::history::{AssistantHistory, ToolResultHistory};
+    use minicore_runtime::model::{AssistantPart, ModelFinishReason, ModelRef, Usage};
+    use minicore_runtime::tools::{ToolName, ToolOutput, ToolResultOutcome};
+
+    #[test]
+    fn history_tool_display_results_use_the_full_tool_identity() {
+        let call_id: ToolCallId = "same-call".parse().unwrap();
+        let call_one = minicore_runtime::model::ToolCall::new(
+            call_id.clone(),
+            "bash".parse::<ToolName>().unwrap(),
+            serde_json::json!({"command": "first"}),
+            0,
+        )
+        .unwrap();
+        let call_two = minicore_runtime::model::ToolCall::new(
+            call_id.clone(),
+            "bash".parse::<ToolName>().unwrap(),
+            serde_json::json!({"command": "second"}),
+            0,
+        )
+        .unwrap();
+        let loop_one: LoopId = "lup_00000000000000000000000000000001".parse().unwrap();
+        let loop_two: LoopId = "lup_00000000000000000000000000000002".parse().unwrap();
+        let history = vec![
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id: loop_one,
+                request_index: 0,
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::ToolCall(call_one)],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+            HistoryItem::ToolResult(ToolResultHistory {
+                loop_id: loop_one,
+                request_index: 0,
+                call_id: call_id.clone(),
+                tool_name: "bash".parse::<ToolName>().unwrap(),
+                outcome: ToolResultOutcome::Success,
+                output: ToolOutput::new("first result").unwrap(),
+            }),
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id: loop_two,
+                request_index: 0,
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::ToolCall(call_two)],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+            HistoryItem::ToolResult(ToolResultHistory {
+                loop_id: loop_two,
+                request_index: 0,
+                call_id,
+                tool_name: "bash".parse::<ToolName>().unwrap(),
+                outcome: ToolResultOutcome::Success,
+                output: ToolOutput::new("second result").unwrap(),
+            }),
+        ];
+        let results = collect_tool_results(&history);
+        let one = match &history[0] {
+            HistoryItem::Assistant(assistant) => assistant_history_view(assistant, &results),
+            _ => unreachable!(),
+        };
+        let two = match &history[2] {
+            HistoryItem::Assistant(assistant) => assistant_history_view(assistant, &results),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            one.tool_calls[0].display.as_ref().unwrap().detail,
+            "$ first"
+        );
+        assert_eq!(
+            two.tool_calls[0].display.as_ref().unwrap().detail,
+            "$ second"
+        );
+        assert_eq!(
+            one.tool_calls[0]
+                .display
+                .as_ref()
+                .unwrap()
+                .hidden_line_count,
+            Some(4)
+        );
+        assert_eq!(
+            two.tool_calls[0]
+                .display
+                .as_ref()
+                .unwrap()
+                .hidden_line_count,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn history_view_debug_redacts_user_and_tool_content() {
+        let user = UserHistoryView {
+            loop_id: "lup_00000000000000000000000000000001".parse().unwrap(),
+            kind: UserMessageKind::Prompt,
+            text: "do not log this prompt".to_owned(),
+            timestamp: Some("2026-09-05T14:05:06Z".to_owned()),
+        };
+        let tool = ToolResultHistoryView {
+            loop_id: "lup_00000000000000000000000000000001".parse().unwrap(),
+            request_index: 0,
+            tool_call_id: "call".parse().unwrap(),
+            tool_name: "bash".to_owned(),
+            outcome: ToolResultOutcome::Success,
+            content: "do not log this result".to_owned(),
+            content_truncated: false,
+        };
+        let debug = format!("{user:?} {tool:?}");
+        assert!(!debug.contains("do not log this prompt"));
+        assert!(!debug.contains("do not log this result"));
+        assert!(debug.contains("text_bytes"));
+        assert!(debug.contains("content_len"));
     }
 }

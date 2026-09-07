@@ -504,8 +504,10 @@ async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
     let serialized = page.to_string();
     assert!(serialized.contains("TOOL-CONTENT-TOKEN"));
     assert!(!serialized.contains("arguments"));
-    // The tool argument (secret path) never leaks into the safe history view.
-    assert!(!serialized.contains("SECRET-PATH.txt"));
+    // The path is an explicitly permitted local-display detail, while the
+    // raw invocation field is still absent.
+    assert!(serialized.contains("SECRET-PATH.txt"));
+    assert!(!serialized.contains("\"path\""));
     let tool_result_count = page["items"]
         .as_array()
         .unwrap()

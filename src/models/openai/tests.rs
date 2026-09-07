@@ -5873,3 +5873,285 @@ async fn openai_live_reasoning_tool_smoke() {
         "expected a non-empty reasoning OutputDelta for the exact live Turn"
     );
 }
+
+// ============================================================================
+// 0.2.4 reasoning summary part boundaries. A single newline is inserted ONLY
+// between actual nonempty reasoning parts/items (summary_index/item boundary
+// or explicit reasoning item output_item.added/done), never per delta and
+// never via text heuristics. Legacy deltas without any boundary stay concat.
+// ============================================================================
+
+async fn reasoning_text_of(events: Vec<Value>) -> String {
+    let server = MockServer::spawn([MockResponse::sse(&events)]).await;
+    let model = model(server.base_url());
+    let request = ModelRequest::new(
+        vec![ModelMessage::user("reason").unwrap()],
+        vec![],
+        ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+        ReasoningPreference::High,
+    )
+    .unwrap();
+    let events = run_model(
+        &model,
+        request,
+        context_for_request(0, CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ModelEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn reasoning_two_summary_indexes_in_one_item_separate_with_single_newline() {
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_x","summary":[]}}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_x","output_index":0,"summary_index":0,"delta":"Plan"}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_x","output_index":0,"summary_index":0,"delta":"ning ... caveats"}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_x","output_index":0,"summary_index":1,"delta":"Detailing ... timeline"}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_x","output_index":0,"summary_index":2,"delta":"Analyzing ..."}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_x","status":"completed","summary":[{"type":"summary_text","text":"x"}],"provider":{"name":"loopback","trace_id":"t"}}}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "Planning ... caveats\nDetailing ... timeline\nAnalyzing ...",
+        "same-item summary_index parts: fragments concat, parts separated by one newline"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_item_id_change_with_index_reset_still_separates() {
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_a","summary":[]}}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_a","output_index":0,"summary_index":0,"delta":"First"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_a","status":"completed","summary":[{"type":"summary_text","text":"a"}]}}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_b","summary":[]}}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_b","output_index":1,"summary_index":0,"delta":"Second"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_b","status":"completed","summary":[{"type":"summary_text","text":"b"}]}}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "First\nSecond",
+        "item_id change with summary_index reset to 0 is still a boundary"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_item_lifecycle_separates_when_deltas_carry_no_index() {
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_a","summary":[]}}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"Plan"}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"ning"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_a","status":"completed","summary":[{"type":"summary_text","text":"a"}]}}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_b","summary":[]}}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"Detail"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_b","status":"completed","summary":[{"type":"summary_text","text":"b"}]}}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "Planning\nDetail",
+        "explicit reasoning item added/done boundaries separate parts without an index"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_split_and_empty_deltas_do_not_add_lines() {
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"Foo"}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":""}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"bar"}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"Baz"}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "Foobar\nBaz",
+        "split fragments concat, empty deltas add no line, one newline between parts"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_existing_newlines_are_never_doubled_at_boundaries() {
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"Alpha\n"}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"Beta"}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"\nGamma"}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":2,"delta":"Delta"}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "Alpha\nBeta\nGamma\nDelta",
+        "a raw trailing/leading provider newline at a boundary must not be doubled"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_adjacent_responses_keep_their_own_boundaries() {
+    // Two adjacent model responses (request 0 and request 1 in one loop) each
+    // have independent part state; nothing leaks across the response boundary.
+    let server = MockServer::spawn([
+        MockResponse::sse(&[
+            json!({"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"One"}),
+            json!({"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"Two"}),
+            completed(usage()),
+        ]),
+        MockResponse::sse(&[
+            json!({"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"Three"}),
+            json!({"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"Four"}),
+            completed(usage()),
+        ]),
+    ])
+    .await;
+    let model = model(server.base_url());
+    let mut texts = Vec::new();
+    for index in 0..2 {
+        let request = ModelRequest::new(
+            vec![ModelMessage::user("reason").unwrap()],
+            vec![],
+            ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+            ReasoningPreference::High,
+        )
+        .unwrap();
+        let events = run_model(
+            &model,
+            request,
+            context_for_request(index, CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        texts.push(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ModelEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+        );
+    }
+    assert_eq!(texts, vec!["One\nTwo", "Three\nFour"]);
+}
+
+#[test]
+fn queue_reasoning_delta_missing_identity_is_not_a_boundary_and_partial_fields_retain_known() {
+    // White-box parser check for the metadata gap: a provider may drop the
+    // index on a fragment ("ning") and later restore it (" phase"). The known
+    // identity must be RETAINED through the gap (present->absent->present on
+    // the SAME part concatenates); only a genuine known change (summary 0->1)
+    // or a lifecycle transition may separate parts.
+    let bytes: ByteStream = Box::pin(futures_util::stream::empty());
+    let mut state = StreamState::new(bytes, CancellationToken::new(), TokioInstant::now());
+    let mut frame = |delta: &str,
+                     output_index: Option<u32>,
+                     item_id: Option<&str>,
+                     summary_index: Option<u32>| {
+        let event = ReasoningSummaryDeltaEvent {
+            delta: delta.to_owned(),
+            output_index: output_index.map(serde_json::Value::from),
+            item_id: item_id.map(str::to_owned),
+            summary_index: summary_index.map(serde_json::Value::from),
+        };
+        queue_reasoning_delta(&mut state, event).unwrap();
+    };
+    frame("Plan", Some(0), Some("rs_x"), Some(0));
+    frame("ning", None, None, None);
+    frame(" phase", Some(0), Some("rs_x"), Some(0));
+    frame("Detail", None, None, Some(1));
+    let text: String = state
+        .pending
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ModelEvent::ReasoningDelta { delta }) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "Planning phase\nDetail",
+        "missing identity is NOT a boundary; the later index change separates once"
+    );
+}
+
+#[test]
+fn queue_reasoning_delta_empty_delta_with_new_index_signals_the_next_part() {
+    // An EMPTY delta carrying a new summary index announces the next part
+    // before any text; the following identity-less nonempty delta must start a
+    // new part while the empty delta itself emits no line.
+    let bytes: ByteStream = Box::pin(futures_util::stream::empty());
+    let mut state = StreamState::new(bytes, CancellationToken::new(), TokioInstant::now());
+    let mut frame = |delta: &str, summary_index: Option<u32>| {
+        let event = ReasoningSummaryDeltaEvent {
+            delta: delta.to_owned(),
+            output_index: None,
+            item_id: None,
+            summary_index: summary_index.map(serde_json::Value::from),
+        };
+        queue_reasoning_delta(&mut state, event).unwrap();
+    };
+    frame("Foo", Some(0));
+    frame("", Some(1));
+    frame("bar", None);
+    let text: String = state
+        .pending
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ModelEvent::ReasoningDelta { delta }) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "Foo\nbar",
+        "the empty delta carries the boundary, never a blank line"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_missing_identity_recovers_known_part_with_single_newline() {
+    // Live SSE "final" value for the metadata gap sequence: fragments around a
+    // dropped index stay glued, one newline at the genuine summary change.
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_x","output_index":0,"summary_index":0,"delta":"Plan"}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"ning"}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_x","output_index":0,"summary_index":0,"delta":" phase"}),
+        json!({"type":"response.reasoning_summary_text.delta","summary_index":1,"delta":"Detail"}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "Planning phase\nDetail",
+        "live stream must flatten to exactly one newline at the real boundary"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_summary_part_lifecycle_separates_parts_within_one_item() {
+    // Some providers split one reasoning item into multiple summary parts and
+    // only signal the part boundary via `reasoning_summary_part.added/done`;
+    // the delta frames themselves carry no index. Two parts of the SAME item
+    // must still separate with one newline while fragments stay concatenated.
+    let text = reasoning_text_of(vec![
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_one","summary":[]}}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_one","summary_index":0}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"Plan"}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"ning ... caveats"}),
+        json!({"type":"response.reasoning_summary_part.done","output_index":0,"item_id":"rs_one","summary_index":0}),
+        json!({"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_one","summary_index":1}),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"Detailing ... timeline"}),
+        json!({"type":"response.reasoning_summary_part.done","output_index":0,"item_id":"rs_one","summary_index":1}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_one","status":"completed","summary":[{"type":"summary_text","text":"a"}]}}),
+        completed(usage()),
+    ])
+    .await;
+    assert_eq!(
+        text, "Planning ... caveats\nDetailing ... timeline",
+        "part lifecycle inside one reasoning item separates exactly once"
+    );
+}

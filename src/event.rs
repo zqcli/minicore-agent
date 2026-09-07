@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -51,6 +52,15 @@ pub enum AgentEvent {
         reasoning: minicore_runtime::model::ReasoningPreference,
         meta: EventMeta,
     },
+    /// Read-only per-request usage, emitted from the model stream when the
+    /// provider reports it (spec 9.4/12.4). Best-effort: dropped when the
+    /// bounded event queue is full, and never affects execution.
+    RequestUsage {
+        turn: TurnRef,
+        request_index: u32,
+        usage: minicore_runtime::model::Usage,
+        meta: EventMeta,
+    },
     OutputDelta {
         turn: TurnRef,
         request_index: u32,
@@ -65,6 +75,17 @@ pub enum AgentEvent {
         tool_name: String,
         meta: EventMeta,
     },
+    /// Bounded display for one tool call, emitted when that call finishes
+    /// (may arrive before or after `ToolStarted`). Read-only, never drives
+    /// execution.
+    ToolPresentation {
+        turn: TurnRef,
+        request_index: u32,
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        display: crate::presentation::ToolDisplay,
+        meta: EventMeta,
+    },
     ToolProgress {
         turn: TurnRef,
         request_index: u32,
@@ -77,6 +98,16 @@ pub enum AgentEvent {
         request_index: u32,
         tool_call_id: ToolCallId,
         result: ToolResultView,
+        meta: EventMeta,
+    },
+    /// Read-only steering receipt: the number of Steering User items that were
+    /// present in the PREPARED prompt history at this request boundary,
+    /// emitted at the real `Model::start`. Best-effort and metadata-only; it
+    /// never drives execution and never carries steer text.
+    SteerProgress {
+        turn: TurnRef,
+        request_index: u32,
+        applied_count: u64,
         meta: EventMeta,
     },
     InteractionRequested {
@@ -113,12 +144,15 @@ impl AgentEvent {
             | Self::SessionState { meta, .. }
             | Self::TurnStarted { meta, .. }
             | Self::RequestStarted { meta, .. }
+            | Self::RequestUsage { meta, .. }
             | Self::OutputDelta { meta, .. }
             | Self::ToolStarted { meta, .. }
+            | Self::ToolPresentation { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
             | Self::InteractionRequested { meta, .. }
             | Self::InteractionResolved { meta, .. }
+            | Self::SteerProgress { meta, .. }
             | Self::TurnFinished { meta, .. } => meta,
         }
     }
@@ -130,12 +164,15 @@ impl AgentEvent {
             | Self::SessionState { meta, .. }
             | Self::TurnStarted { meta, .. }
             | Self::RequestStarted { meta, .. }
+            | Self::RequestUsage { meta, .. }
             | Self::OutputDelta { meta, .. }
             | Self::ToolStarted { meta, .. }
+            | Self::ToolPresentation { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
             | Self::InteractionRequested { meta, .. }
             | Self::InteractionResolved { meta, .. }
+            | Self::SteerProgress { meta, .. }
             | Self::TurnFinished { meta, .. } => meta,
         }
     }
@@ -217,11 +254,22 @@ impl OutputChannel {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolProgressView {
     pub message: Option<String>,
     pub completed: Option<u64>,
     pub total: Option<u64>,
+}
+
+impl fmt::Debug for ToolProgressView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolProgressView")
+            .field("message_len", &self.message.as_ref().map(String::len))
+            .field("completed", &self.completed)
+            .field("total", &self.total)
+            .finish()
+    }
 }
 
 impl From<&ToolProgress> for ToolProgressView {
@@ -237,10 +285,30 @@ impl From<&ToolProgress> for ToolProgressView {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolResultView {
     pub outcome: ToolResultOutcome,
     pub content_bytes: usize,
+    /// Best-effort bounded result content for local display (same cap as the
+    /// presentation wrapper); `None` when empty or unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Set when the live result exceeded the display cap and `content` is a
+    /// truncated prefix.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub content_truncated: bool,
+}
+
+impl fmt::Debug for ToolResultView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolResultView")
+            .field("outcome", &self.outcome)
+            .field("content_bytes", &self.content_bytes)
+            .field("content_len", &self.content.as_ref().map(String::len))
+            .field("content_truncated", &self.content_truncated)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -564,6 +632,21 @@ impl Serialize for AgentEvent {
                     meta: *meta,
                 },
             ),
+            Self::RequestUsage {
+                turn,
+                request_index,
+                usage,
+                meta,
+            } => serialize_event(
+                serializer,
+                "request_usage",
+                RequestUsageData {
+                    turn,
+                    request_index: *request_index,
+                    usage,
+                    meta: *meta,
+                },
+            ),
             Self::OutputDelta {
                 turn,
                 request_index,
@@ -581,6 +664,21 @@ impl Serialize for AgentEvent {
                     meta: *meta,
                 },
             ),
+            Self::SteerProgress {
+                turn,
+                request_index,
+                applied_count,
+                meta,
+            } => serialize_event(
+                serializer,
+                "steer_progress",
+                SteerProgressData {
+                    turn,
+                    request_index: *request_index,
+                    applied_count: *applied_count,
+                    meta: *meta,
+                },
+            ),
             Self::ToolStarted {
                 turn,
                 request_index,
@@ -595,6 +693,25 @@ impl Serialize for AgentEvent {
                     request_index: *request_index,
                     tool_call_id,
                     tool_name,
+                    meta: *meta,
+                },
+            ),
+            Self::ToolPresentation {
+                turn,
+                request_index,
+                tool_call_id,
+                tool_name,
+                display,
+                meta,
+            } => serialize_event(
+                serializer,
+                "tool_presentation",
+                ToolPresentationData {
+                    turn,
+                    request_index: *request_index,
+                    tool_call_id,
+                    tool_name,
+                    display,
                     meta: *meta,
                 },
             ),
@@ -677,6 +794,10 @@ impl Serialize for AgentEvent {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Serialize)]
 struct EventWire<T> {
     #[serde(rename = "type")]
@@ -731,6 +852,22 @@ struct RequestStartedData<'a> {
 }
 
 #[derive(Serialize)]
+struct RequestUsageData<'a> {
+    turn: &'a TurnRef,
+    request_index: u32,
+    usage: &'a minicore_runtime::model::Usage,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
+struct SteerProgressData<'a> {
+    turn: &'a TurnRef,
+    request_index: u32,
+    applied_count: u64,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
 struct OutputDeltaData<'a> {
     turn: &'a TurnRef,
     request_index: u32,
@@ -745,6 +882,16 @@ struct ToolStartedData<'a> {
     request_index: u32,
     tool_call_id: &'a ToolCallId,
     tool_name: &'a str,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
+struct ToolPresentationData<'a> {
+    turn: &'a TurnRef,
+    request_index: u32,
+    tool_call_id: &'a ToolCallId,
+    tool_name: &'a str,
+    display: &'a crate::presentation::ToolDisplay,
     meta: EventMeta,
 }
 
@@ -801,5 +948,37 @@ impl AgentEventStream {
 
     pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.receiver.recv().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_debug_redacts_display_content() {
+        let view = ToolResultView {
+            outcome: ToolResultOutcome::Success,
+            content_bytes: 42,
+            content: Some("secret command output".to_owned()),
+            content_truncated: true,
+        };
+
+        let debug = format!("{view:?}");
+        assert!(!debug.contains("secret command output"));
+        assert!(debug.contains("content_len"));
+        assert!(debug.contains("content_truncated"));
+    }
+
+    #[test]
+    fn tool_progress_debug_redacts_message() {
+        let view = ToolProgressView {
+            message: Some("secret progress path".to_owned()),
+            completed: Some(1),
+            total: Some(2),
+        };
+        let debug = format!("{view:?}");
+        assert!(!debug.contains("secret progress path"));
+        assert!(debug.contains("message_len"));
     }
 }
