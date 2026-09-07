@@ -122,6 +122,8 @@ impl Workspace {
     /// when the workspace is not a git work tree (or git is absent/detached).
     pub(crate) async fn git_branch(&self) -> Option<String> {
         let output = tokio::process::Command::new("git")
+            // A presentation query must not inherit the Agent's RPC input pipe.
+            .stdin(std::process::Stdio::null())
             .arg("-C")
             .arg(self.root.as_path())
             .arg("symbolic-ref")
