@@ -161,7 +161,6 @@ impl From<SessionCreateParams> for CreateSession {
 pub(crate) struct SessionParams {
     pub(crate) session_id: crate::ids::SessionId,
 }
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionHistoryParams {
@@ -339,6 +338,22 @@ impl From<crate::agent::SessionUpdateResult> for SessionUpdateResult {
 #[derive(Serialize)]
 pub(crate) struct TurnResult {
     pub(crate) turn: TurnRef,
+    /// Agent acceptance time for this Prompt (optional; absent when the
+    /// system clock was unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SteerResult {
+    pub(crate) ok: bool,
+    /// Agent acceptance time for this Steer (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted_at: Option<String>,
+    /// 1-based FIFO acceptance index within the loop; absent when the Agent
+    /// predates steer receipts. Used by the TUI only as read-only progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) steer_index: Option<u64>,
 }
 
 #[derive(Serialize)]

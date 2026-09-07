@@ -75,6 +75,9 @@ impl BlockGate {
 #[derive(Clone)]
 enum ModelScript {
     Text(&'static str),
+    /// Text answer with a distinct per-request usage so per-request identity
+    /// (loop_id, request_index) can be asserted (spec 9.4/12.4).
+    TextWithUsage(&'static str, u64, u64),
     ToolCall(&'static str, serde_json::Value),
     ToolCallAfterGate(BlockGate, &'static str, serde_json::Value),
     /// Parks until `release` fires and signals `entered` when parked.
@@ -224,6 +227,15 @@ impl Model for FakeModel {
                     ModelEvent::text_delta(text).unwrap(),
                     ModelEvent::Usage {
                         usage: Usage::new(1, 1, 0),
+                    },
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ]),
+                ModelScript::TextWithUsage(text, input, output) => events(vec![
+                    ModelEvent::text_delta(text).unwrap(),
+                    ModelEvent::Usage {
+                        usage: Usage::new(input, output, 0),
                     },
                     ModelEvent::Finish {
                         reason: ModelFinishReason::Stop,
@@ -560,6 +572,252 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
         tool_results,
         vec![(ToolResultOutcome::Success, "1: file contents".to_owned())]
     );
+
+    let page = agent
+        .history(GetHistory {
+            session_id: info.session_id,
+            offset: 0,
+            limit: 100,
+        })
+        .unwrap();
+    let crate::history::HistoryItemView::Assistant(assistant) = &page.items[1].item else {
+        panic!("expected the first assistant history item");
+    };
+    assert_eq!(assistant.parts.as_ref().unwrap().len(), 1);
+    let display = assistant.tool_calls[0]
+        .display
+        .as_ref()
+        .expect("history tool display");
+    assert_eq!(display.detail, "file.txt:1-32");
+    assert_eq!(display.hidden_line_count, Some(5));
+}
+
+#[tokio::test]
+async fn live_tool_presentation_and_result_keep_runtime_identity() {
+    let (data_dir, _guard) = fixture_dir(&format!("presentation-live-{}", next_id()));
+    let (workspace, _guard) = workspace_file("presentation-live-ws", "file.txt", b"file contents");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read it").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+
+    let mut presentation = None;
+    let mut tool_result = None;
+    for _ in 0..32 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("live Agent event must arrive")
+            .expect("event stream must remain open");
+        match event {
+            AgentEvent::ToolPresentation {
+                turn: event_turn,
+                request_index,
+                tool_call_id,
+                display,
+                ..
+            } => presentation = Some((event_turn, request_index, tool_call_id, display)),
+            AgentEvent::ToolFinished {
+                turn: event_turn,
+                request_index,
+                tool_call_id,
+                result,
+                ..
+            } => tool_result = Some((event_turn, request_index, tool_call_id, result)),
+            AgentEvent::TurnFinished { .. } => break,
+            _ => {}
+        }
+    }
+
+    let (event_turn, request_index, tool_call_id, display) =
+        presentation.expect("tool presentation event");
+    assert_eq!(event_turn, turn);
+    assert_eq!(request_index, 0);
+    assert_eq!(display.detail, "file.txt:1-32");
+    assert_eq!(display.hidden_line_count, Some(5));
+    let (result_turn, result_request_index, result_tool_call_id, result) =
+        tool_result.expect("tool result event");
+    assert_eq!(result_turn, turn);
+    assert_eq!(result_request_index, 0);
+    assert_eq!(result_tool_call_id, tool_call_id);
+    assert_eq!(result.content.as_deref(), Some("1: file contents"));
+    assert!(!result.content_truncated);
+}
+
+#[tokio::test]
+async fn request_usage_events_carry_real_per_request_usage_across_two_sessions() {
+    let (data_dir, _guard) = fixture_dir(&format!("usage-two-sessions-{}", next_id()));
+    let (workspace_a, _guard_a) = workspace_file("usage-session-a", "a.txt", b"a");
+    let (workspace_b, _guard_b) = workspace_file("usage-session-b", "b.txt", b"b");
+    let model = FakeModel::new(
+        "provider/model-id",
+        [
+            ModelScript::TextWithUsage("a answer", 10, 20),
+            ModelScript::TextWithUsage("b answer", 300, 400),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let session_a = create_session(&mut agent, &workspace_a).await;
+    let session_b = create_session(&mut agent, &workspace_b).await;
+    let turn_a = send_text(&mut agent, session_a.session_id, "a").await;
+    wait_text(&agent, turn_a).await;
+    let turn_b = send_text(&mut agent, session_b.session_id, "b").await;
+    wait_text(&agent, turn_b).await;
+
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("request_usage event must arrive")
+            .expect("event stream must remain open");
+        if let AgentEvent::RequestUsage {
+            turn,
+            request_index,
+            usage,
+            ..
+        } = event
+        {
+            seen.push((
+                turn,
+                request_index,
+                usage.input_tokens(),
+                usage.output_tokens(),
+            ));
+        }
+    }
+    assert!(
+        seen.contains(&(turn_a, 0, Some(10), Some(20))),
+        "seen: {seen:?}"
+    );
+    assert!(
+        seen.contains(&(turn_b, 0, Some(300), Some(400))),
+        "seen: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn request_usage_is_keyed_per_request_index_within_one_loop() {
+    let (data_dir, _guard) = fixture_dir(&format!("usage-requests-{}", next_id()));
+    let (workspace, _guard) = workspace_file("usage-requests-ws", "a.txt", b"file contents");
+    // Request 0 finishes with a tool call (its Usage is (1,1,0)); the tool
+    // runs; request 1 reports a distinct usage (5,6,0). Both must surface as
+    // separate RequestUsage events under the same loop with distinct indexes.
+    let model = FakeModel::new(
+        "deep",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 32})),
+            ModelScript::TextWithUsage("final", 5, 6),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read it").await;
+    wait_text(&agent, turn).await;
+
+    let mut by_index = std::collections::BTreeMap::new();
+    while by_index.len() < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("request_usage event must arrive")
+            .expect("event stream must remain open");
+        if let AgentEvent::RequestUsage {
+            turn: event_turn,
+            request_index,
+            usage,
+            ..
+        } = event
+        {
+            assert_eq!(event_turn, turn, "usage must stay on the same turn");
+            by_index.insert(request_index, (usage.input_tokens(), usage.output_tokens()));
+        }
+    }
+    assert_eq!(by_index.get(&0), Some(&(Some(1), Some(1))));
+    assert_eq!(by_index.get(&1), Some(&(Some(5), Some(6))));
+    let _ = format!("{:?}", by_index); // Debug formatting must not panic (no sensitive fields)
+}
+
+#[tokio::test]
+async fn shared_model_keeps_live_presentation_identity_per_session() {
+    let (data_dir, _guard) = fixture_dir(&format!("presentation-sessions-{}", next_id()));
+    let (workspace_a, _guard_a) = workspace_file("presentation-session-a", "a.txt", b"a");
+    let (workspace_b, _guard_b) = workspace_file("presentation-session-b", "b.txt", b"b");
+    let model = FakeModel::new(
+        "provider/model-id",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt"})),
+            ModelScript::Text("a done"),
+            ModelScript::ToolCall("read", json!({"path": "b.txt"})),
+            ModelScript::Text("b done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let session_a = create_session(&mut agent, &workspace_a).await;
+    let session_b = create_session(&mut agent, &workspace_b).await;
+    let turn_a = send_text(&mut agent, session_a.session_id, "read a").await;
+    wait_text(&agent, turn_a).await;
+    let turn_b = send_text(&mut agent, session_b.session_id, "read b").await;
+    wait_text(&agent, turn_b).await;
+
+    let mut presentations = Vec::new();
+    while presentations.len() < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("presentation event must arrive")
+            .expect("event stream must remain open");
+        if let AgentEvent::ToolPresentation {
+            turn,
+            request_index,
+            display,
+            ..
+        } = event
+        {
+            presentations.push((turn, request_index, display.detail));
+        }
+    }
+    assert!(presentations.contains(&(turn_a, 0, "a.txt".to_owned())));
+    assert!(presentations.contains(&(turn_b, 0, "b.txt".to_owned())));
+    assert_eq!(
+        agent
+            .session_presentation(session_a.session_id)
+            .unwrap()
+            .model_label
+            .as_deref(),
+        Some("main")
+    );
 }
 
 #[tokio::test]
@@ -700,6 +958,64 @@ async fn cancel_turn_returns_cancelled_report_and_session_recovers() {
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+}
+
+#[tokio::test]
+async fn cancelling_wrapped_tool_preserves_runtime_outcome_and_recovery() {
+    let (data_dir, _guard) = fixture_dir(&format!("presentation-cancel-{}", next_id()));
+    let (workspace, _guard) = workspace_file("presentation-cancel-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("bash", json!({"command": "sleep 30"})),
+            ModelScript::Text("after cancel"),
+        ],
+    );
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "run slowly").await;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("tool start event must arrive")
+            .expect("event stream must remain open");
+        if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn) {
+            break;
+        }
+    }
+    assert!(agent.cancel(turn).unwrap());
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+
+    // Dropping the wrapped execute future must not leave the Session busy or
+    // change the next loop's model/tool ownership.
+    let next = send_text(&mut agent, info.session_id, "next").await;
+    let next_result = wait_text(&agent, next).await;
+    assert_eq!(
+        next_result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     );
 }
@@ -1108,6 +1424,55 @@ async fn steer_is_applied_and_persisted_in_order() {
             ("steer two".to_owned(), UserMessageKind::Steering),
         ]
     );
+
+    let page = agent
+        .history(GetHistory {
+            session_id: info.session_id,
+            offset: 0,
+            limit: 100,
+        })
+        .unwrap();
+    let timestamps = page
+        .items
+        .iter()
+        .filter_map(|item| match &item.item {
+            crate::history::HistoryItemView::User(user) => user.timestamp.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps.len(), 3);
+    assert!(timestamps.iter().all(|timestamp| timestamp.ends_with('Z')));
+
+    // Paging must retain the loop-local occurrence instead of restarting at
+    // zero on every page.
+    let second_page = agent
+        .history(GetHistory {
+            session_id: info.session_id,
+            offset: 1,
+            limit: 1,
+        })
+        .unwrap();
+    let crate::history::HistoryItemView::User(second_user) = &second_page.items[0].item else {
+        panic!("expected the second page to contain a User item");
+    };
+    assert_eq!(
+        second_user.timestamp.as_deref(),
+        Some(timestamps[1].as_str())
+    );
+
+    let loaded = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_session(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(loaded.user_times.len(), 3);
+    assert!(
+        loaded
+            .user_times
+            .keys()
+            .all(|(loop_id, _)| *loop_id == turn.loop_id)
+    );
 }
 
 #[tokio::test]
@@ -1365,6 +1730,79 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
 }
 
 #[tokio::test]
+async fn model_swap_keeps_request_identity_for_live_tool_display() {
+    let (data_dir, _guard) = fixture_dir(&format!("presentation-model-swap-{}", next_id()));
+    let (workspace, _guard) = workspace_file("presentation-model-swap-ws", "a.txt", b"a");
+    std::fs::write(workspace.join("b.txt"), b"b").unwrap();
+    let gate = BlockGate::new();
+    let model_a = FakeModel::new(
+        "provider/model-a",
+        [ModelScript::ToolCallAfterGate(
+            gate.clone(),
+            "read",
+            json!({"path": "a.txt"}),
+        )],
+    );
+    let model_b = FakeModel::new(
+        "provider/model-b",
+        [
+            ModelScript::ToolCall("read", json!({"path": "b.txt"})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("other".to_owned(), Arc::clone(&model_b)),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read both").await;
+    gate.entered.notified().await;
+    agent
+        .update_session(crate::agent::UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    gate.release.notify_waiters();
+    wait_text(&agent, turn).await;
+
+    let mut presentations = Vec::new();
+    while presentations.len() < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("model-swap presentation event must arrive")
+            .expect("event stream must remain open");
+        if let AgentEvent::ToolPresentation {
+            turn: event_turn,
+            request_index,
+            display,
+            ..
+        } = event
+        {
+            presentations.push((event_turn, request_index, display.detail));
+        }
+    }
+    assert!(presentations.contains(&(turn, 0, "a.txt".to_owned())));
+    assert!(presentations.contains(&(turn, 1, "b.txt".to_owned())));
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .model_label
+            .as_deref(),
+        Some("other")
+    );
+}
+
+#[tokio::test]
 async fn invalid_update_does_not_write_or_change_memory() {
     let (data_dir, _guard) = fixture_dir(&format!("invalid-update-{}", next_id()));
     let (workspace, _guard) = workspace_file("invalid-update-ws", "a.txt", b"hello");
@@ -1401,7 +1839,7 @@ async fn invalid_update_does_not_write_or_change_memory() {
 }
 
 #[tokio::test]
-async fn history_view_never_exposes_tool_arguments_or_opaque_reasoning() {
+async fn history_view_exposes_whitelisted_tool_detail_without_raw_arguments() {
     let (data_dir, _guard) = fixture_dir(&format!("view-{}", next_id()));
     let (workspace, _guard) = workspace_file("view-ws", "file.txt", b"contents");
     let model = FakeModel::new(
@@ -1429,8 +1867,12 @@ async fn history_view_never_exposes_tool_arguments_or_opaque_reasoning() {
         })
         .unwrap();
     let serialized = serde_json::to_string(&page).unwrap();
-    assert!(!serialized.contains("file.txt"));
+    // A path is an explicitly permitted local-display detail; the raw
+    // invocation object and unrelated argument keys are not.
+    assert!(serialized.contains("file.txt"));
     assert!(!serialized.contains("arguments"));
+    assert!(!serialized.contains("\"path\""));
+    assert!(!serialized.contains("\"limit\""));
     // Safe fields remain visible.
     assert!(serialized.contains("read"));
     assert!(serialized.contains("contents"));

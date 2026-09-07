@@ -97,6 +97,9 @@ impl SessionRecord {
 pub(crate) struct StoredSession {
     pub(crate) record: SessionRecord,
     pub(crate) history: std::sync::Arc<[HistoryItem]>,
+    /// `(loop_id, occurrence)` -> RFC3339 acceptance time, collected from the
+    /// loop records so history views can show persisted user timestamps.
+    pub(crate) user_times: std::collections::HashMap<(LoopId, usize), String>,
 }
 
 /// One completed agent loop, stored as a single JSON line.
@@ -111,6 +114,32 @@ pub(crate) struct StoredLoopRecord {
     pub(crate) tool_rounds: u16,
     pub(crate) final_config_revision: ConfigRevision,
     pub(crate) completed_at: String,
+    /// RFC3339 acceptance times aligned by User-item occurrence (Prompt first,
+    /// then applied Steers). Missing in old JSONL lines, which stay readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) user_times: Option<Vec<Option<String>>>,
+}
+
+impl StoredLoopRecord {
+    fn validate_presentation_metadata(&self) -> Result<(), StoreError> {
+        let user_count = self
+            .items
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::User(_)))
+            .count();
+        let Some(times) = &self.user_times else {
+            return Ok(());
+        };
+        if times.len() > user_count
+            || times
+                .iter()
+                .flatten()
+                .any(|timestamp| !valid_timestamp(timestamp))
+        {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(())
+    }
 }
 
 /// Stored record of how a loop ended. This is record-keeping only; it never
@@ -333,10 +362,14 @@ impl Store {
     ) -> Result<StoredSession, StoreError> {
         let directory = self.require_session_directory(session_id).await?;
         let record = Self::read_record(&directory.join(SESSION_RECORD_FILE), session_id).await?;
-        let history = self
+        let (history, user_times) = self
             .load_history(&directory.join(HISTORY_FILE), session_id)
             .await?;
-        Ok(StoredSession { record, history })
+        Ok(StoredSession {
+            record,
+            history,
+            user_times,
+        })
     }
 
     pub(crate) async fn write_record(&self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -358,6 +391,7 @@ impl Store {
         session_id: SessionId,
         record: &StoredLoopRecord,
     ) -> Result<(), StoreError> {
+        record.validate_presentation_metadata()?;
         let directory = self.require_session_directory(session_id).await?;
         #[cfg(test)]
         if should_fail_append(session_id) {
@@ -457,7 +491,13 @@ impl Store {
         &self,
         path: &Path,
         session_id: SessionId,
-    ) -> Result<std::sync::Arc<[HistoryItem]>, StoreError> {
+    ) -> Result<
+        (
+            std::sync::Arc<[HistoryItem]>,
+            std::collections::HashMap<(LoopId, usize), String>,
+        ),
+        StoreError,
+    > {
         match path_state(path)
             .await
             .map_err(|_| StoreError::Unavailable)?
@@ -476,6 +516,7 @@ impl Store {
             .map_err(|_| StoreError::Unavailable)?;
         let mut reader = BufReader::new(file);
         let mut items = Vec::new();
+        let mut times = std::collections::HashMap::new();
         let mut buffer = Vec::new();
         let mut last_complete_offset = 0u64;
         let mut saw_partial = false;
@@ -536,6 +577,17 @@ impl Store {
             }
             let record: StoredLoopRecord =
                 serde_json::from_slice(&buffer).map_err(|_| StoreError::Corrupt)?;
+            record.validate_presentation_metadata()?;
+            let user_times = record.user_times.clone().unwrap_or_default();
+            let mut user_occurrence = 0usize;
+            for item in &record.items {
+                if let HistoryItem::User(_) = item {
+                    if let Some(Some(time)) = user_times.get(user_occurrence) {
+                        times.insert((record.loop_id, user_occurrence), time.clone());
+                    }
+                    user_occurrence += 1;
+                }
+            }
             items.extend(record.items);
             last_complete_offset = reader
                 .stream_position()
@@ -551,7 +603,7 @@ impl Store {
             }
         }
         let history = sanitize_history(&items).map_err(|_| StoreError::Corrupt)?;
-        Ok(history)
+        Ok((history, times))
     }
 
     fn sessions_directory(&self) -> PathBuf {
@@ -798,11 +850,104 @@ fn valid_multiline_text(value: &str, maximum: usize, allow_empty: bool) -> bool 
 }
 
 fn valid_timestamp(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_TIMESTAMP_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() || byte == b' ' || byte == b'-' || byte == b':')
+    let bytes = value.as_bytes();
+    if bytes.len() > MAX_TIMESTAMP_BYTES || bytes.len() < 20 {
+        return false;
+    }
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| {
+        bytes
+            .get(range)
+            .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+    };
+    if !digits(0..4)
+        || !digits(5..7)
+        || !digits(8..10)
+        || !digits(11..13)
+        || !digits(14..16)
+        || !digits(17..19)
+    {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| {
+        std::str::from_utf8(&bytes[range])
+            .ok()
+            .and_then(|part| part.parse::<u32>().ok())
+    };
+    let Some(year) = number(0..4) else {
+        return false;
+    };
+    let Some(month) = number(5..7) else {
+        return false;
+    };
+    let Some(day) = number(8..10) else {
+        return false;
+    };
+    let Some(hour) = number(11..13) else {
+        return false;
+    };
+    let Some(minute) = number(14..16) else {
+        return false;
+    };
+    let Some(second) = number(17..19) else {
+        return false;
+    };
+    if year == 0
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return false;
+    }
+
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+    match bytes.get(index) {
+        Some(b'Z') => index + 1 == bytes.len(),
+        Some(b'+' | b'-') => {
+            index += 1;
+            if index + 5 != bytes.len()
+                || bytes.get(index + 2) != Some(&b':')
+                || !digits(index..index + 2)
+                || !digits(index + 3..index + 5)
+            {
+                return false;
+            }
+            let offset_hour = number(index..index + 2).unwrap_or(24);
+            let offset_minute = number(index + 3..index + 5).unwrap_or(60);
+            offset_hour <= 23 && offset_minute <= 59
+        }
+        _ => false,
+    }
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 pub(crate) fn utc_timestamp() -> Result<String, StoreError> {
@@ -958,7 +1103,69 @@ mod tests {
             tool_rounds: 0,
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: utc_timestamp().unwrap(),
+            user_times: None,
         }
+    }
+
+    #[tokio::test]
+    async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible() {
+        let (base, store, session_id) = fixture("user-times").await;
+        let session = record(&store, session_id);
+        store.create_session(&session).await.unwrap();
+
+        let mut valid = loop_record(session_id, "same");
+        let loop_id = valid.loop_id;
+        valid.user_times = Some(vec![Some("2026-09-05T14:05:06.007Z".to_owned())]);
+        store.append_loop(session_id, &valid).await.unwrap();
+        let loaded = store.load_session(session_id).await.unwrap();
+        assert_eq!(
+            loaded.user_times.get(&(loop_id, 0)).map(String::as_str),
+            Some("2026-09-05T14:05:06.007Z")
+        );
+
+        // A missing optional field remains the old JSONL compatibility path.
+        let old = loop_record(session_id, "old");
+        store.append_loop(session_id, &old).await.unwrap();
+        let loaded = store.load_session(session_id).await.unwrap();
+        assert_eq!(loaded.history.len(), 2);
+
+        let mut invalid_timestamp = loop_record(session_id, "invalid");
+        invalid_timestamp.user_times = Some(vec![Some("not-a-timestamp".to_owned())]);
+        assert!(matches!(
+            store.append_loop(session_id, &invalid_timestamp).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        let mut too_many = loop_record(session_id, "too many");
+        too_many.user_times = Some(vec![None, None]);
+        assert!(matches!(
+            store.append_loop(session_id, &too_many).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        // The read path applies the same validation to hand-written JSONL.
+        let mut on_disk_invalid = loop_record(session_id, "disk invalid");
+        on_disk_invalid.user_times = Some(vec![Some("2026-99-99T99:99:99Z".to_owned())]);
+        let history_path = base
+            .join(SESSIONS_DIR)
+            .join(session_id.to_string())
+            .join(HISTORY_FILE);
+        let mut bytes = serde_json::to_vec(&on_disk_invalid).unwrap();
+        bytes.push(b'\n');
+        tokio::fs::write(history_path, bytes).await.unwrap();
+        assert!(matches!(
+            store.load_session(session_id).await,
+            Err(StoreError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn timestamp_validation_accepts_generated_rfc3339_and_rejects_lookalikes() {
+        assert!(valid_timestamp("2026-09-05T14:05:06.007Z"));
+        assert!(valid_timestamp("2026-09-05T14:05:06+08:00"));
+        assert!(!valid_timestamp("2026-99-99T99:99:99Z"));
+        assert!(!valid_timestamp("2026-09-05T14:05:06"));
+        assert!(!valid_timestamp("2026-09-05T14:05:06.badZ"));
     }
 
     fn loop_line_with_size(target: usize) -> Vec<u8> {
@@ -987,6 +1194,7 @@ mod tests {
             tool_rounds: 0,
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: utc_timestamp().unwrap(),
+            user_times: None,
         };
         let base = serde_json::to_vec(&record).unwrap();
         let final_text_len = target
@@ -1079,6 +1287,7 @@ mod tests {
                         tool_rounds: 0,
                         final_config_revision: ConfigRevision::INITIAL,
                         completed_at: utc_timestamp().unwrap(),
+                        user_times: None,
                     },
                 )
                 .await
@@ -1102,7 +1311,12 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let serialized = serde_json::to_string(loaded.history.as_ref()).unwrap();
-        let view = crate::history::page_history(loaded.history.as_ref(), 0, 100);
+        let view = crate::history::page_history(
+            loaded.history.as_ref(),
+            0,
+            100,
+            &std::collections::HashMap::new(),
+        );
         let view_serialized = serde_json::to_string(&view).unwrap();
         for (_, wire) in values {
             assert!(serialized.contains(&format!("\"reasoning\":\"{wire}\"")));
@@ -1510,6 +1724,7 @@ mod tests {
             tool_rounds: 0,
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: utc_timestamp().unwrap(),
+            user_times: None,
         };
         assert!(matches!(
             store.append_loop(session_id, &big).await,
@@ -1650,6 +1865,7 @@ mod tests {
             tool_rounds: 1,
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: utc_timestamp().unwrap(),
+            user_times: None,
         };
         store.append_loop(session_id, &record).await.unwrap();
 

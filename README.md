@@ -10,6 +10,11 @@ owners, and an offline Fake Model test seam. It is verified against the
 that exact Git revision; the local sibling checkout is used only for API review
 and is not modified here.
 
+Current release: **0.3.3**, paired with MiniCore TUI **0.2.8**. See
+[release notes](docs/release-0.3.3.md), including the remaining presentation-path
+limitations. This release commits the existing presentation and stream fixes;
+it does not change the pinned Runtime revision.
+
 ## Run
 
 ```bash
@@ -67,10 +72,12 @@ returns the Runtime report and blocks the Session. `turn.steer` and
 `session.update` forward to the live `LoopHandle`; updates during a run never
 disturb the current request.
 
-Live `AgentEvent`s (output deltas, tool lifecycle, state changes) are best
-effort and may be dropped under pressure. The authoritative sources are
-`turn.wait` and `session.history`. Opaque provider reasoning is never persisted
-and never included in RPC views.
+Live `AgentEvent`s (output deltas, tool lifecycle, state changes, and bounded
+presentation data) are best effort and may be dropped under pressure. The
+authoritative sources are `turn.wait` and `session.history`. Opaque provider
+reasoning is never persisted and never included in RPC views. The read-only
+`session.presentation` method supplies local UI footer facts and honest unknown
+context/cost state; it never starts a loop or executes a Tool.
 
 ## Tracing
 
@@ -91,7 +98,9 @@ Logs use stable operation and error classifications with safe Session and loop
 identifiers. They do not record API keys, Authorization headers, Provider base
 URLs or request/response bodies, user or system prompts, reasoning text,
 encrypted Provider content, Tool arguments, or Bash commands, paths, and
-content.
+content. Presentation data deliberately grants the trusted local TUI access to
+bounded command/path/input detail; those values remain excluded from logs,
+errors, and redacted Debug output.
 
 ## RPC Surface
 
@@ -102,7 +111,7 @@ agent.ping             agent.shutdown
 profile.list           model.list
 session.list           session.create         session.open
 session.close          session.delete         session.state
-session.update         session.history
+session.update         session.history       session.presentation
 turn.send              turn.cancel            turn.wait
 turn.steer             interaction.answer
 ```
@@ -112,6 +121,14 @@ history. Errors are classified as before with domain codes `-32001`
 through `-32016` plus `-32015 history_too_large` and `-32016
 steer_queue_full`. The full wire contract, frame interleaving guarantees, event
 shapes, and error mapping are documented in [docs/rpc.md](docs/rpc.md).
+
+`session.presentation` is a read-only footer/tool-card projection. It returns
+the configured Session model label, a fixed-argument Git branch lookup, the
+last-loop activity timestamps, and explicit unknown/null context, cost, and
+subscription fields. Tool presentation is bounded and whitelist-based; live
+and history views use the same formatter. Successful `turn.send` and
+`turn.steer` responses may include Agent acceptance timestamps without
+changing their existing `turn`/`ok` fields.
 
 ## Security Boundary
 
@@ -168,8 +185,9 @@ The crate exposes `AgentConfig`, `AgentError`, `LoopOverrides`, `Profile`,
 session/turn DTOs (`CreateSession`, `UpdateSession`, `SendMessage`,
 `SteerMessage`, `AnswerInteraction`, `GetHistory`, `HistoryPage`,
 `SessionState`, `SessionStatus`, `SessionUpdateResult`, `TurnRef`,
-`TurnResult`, `TurnPersistence`), the single-consumer `AgentEventStream`,
-`AgentEvent`, and `run_stdio`. The crate is `#![forbid(unsafe_code)]`.
+`TurnResult`, `TurnPersistence`, `PresentationView`, `ToolDisplay`, and
+`AssistantDisplayPart`), the single-consumer `AgentEventStream`, `AgentEvent`,
+and `run_stdio`. The crate is `#![forbid(unsafe_code)]`.
 
 `Agent` opens the local Store and manages multiple loaded Sessions. `Agent`
 owns the global event channel; one Session owns its own history and runs at

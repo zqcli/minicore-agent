@@ -23,9 +23,9 @@ use super::protocol::{
     PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest,
     RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED,
     STEER_QUEUE_FULL, STORE_ERROR, SessionCreateParams, SessionHistoryParams, SessionParams,
-    SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult, TURN_NOT_FOUND,
-    TurnParams, TurnResult, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params,
-    parse_request, request_id,
+    SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult, SteerResult,
+    TURN_NOT_FOUND, TurnParams, TurnResult, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR,
+    decode_params, parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -333,6 +333,14 @@ impl RpcServer {
                     .map(|page| HistoryPageView::from(&page));
                 Dispatch::Response(agent_result(&id, result))
             }
+            "session.presentation" => {
+                let params: SessionParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self.agent().session_presentation(params.session_id);
+                Dispatch::Response(agent_result(&id, result))
+            }
             "turn.send" => {
                 let params: TurnSendParams = match params_or_error(&id, params) {
                     Ok(params) => params,
@@ -340,12 +348,15 @@ impl RpcServer {
                 };
                 let result = self
                     .agent_mut()
-                    .send(SendMessage {
+                    .send_accepted(SendMessage {
                         session_id: params.session_id,
                         text: params.text,
                     })
                     .await
-                    .map(|turn| TurnResult { turn });
+                    .map(|accepted| TurnResult {
+                        turn: accepted.turn,
+                        accepted_at: accepted.accepted_at,
+                    });
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.steer" => {
@@ -353,7 +364,14 @@ impl RpcServer {
                     Ok(params) => params,
                     Err(response) => return Dispatch::Response(response),
                 };
-                let result = self.agent().steer(params.into()).map(|()| OkResult::TRUE);
+                let result =
+                    self.agent()
+                        .steer_accepted(params.into())
+                        .map(|accepted| SteerResult {
+                            ok: true,
+                            accepted_at: accepted.accepted_at,
+                            steer_index: accepted.steer_index,
+                        });
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.cancel" => {
@@ -706,6 +724,7 @@ fn canonical_method(method: &str) -> &'static str {
         "session.state" => "session.state",
         "session.update" => "session.update",
         "session.history" => "session.history",
+        "session.presentation" => "session.presentation",
         "turn.send" => "turn.send",
         "turn.steer" => "turn.steer",
         "turn.cancel" => "turn.cancel",

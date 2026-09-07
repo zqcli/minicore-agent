@@ -22,7 +22,7 @@ use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::prompt::ProjectPromptProvider;
 use crate::sessions::{Sessions, TurnCompletion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
-use crate::tools::{BuildToolsError, CommandEnvironment, build_tools};
+use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
 pub use crate::sessions::{SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult};
@@ -256,7 +256,11 @@ impl Agent {
             canonical_workspace,
         )?;
         // Every predictable configuration error must fail before the store write.
-        let config = self.execution_config(&record, Arc::clone(&workspace))?;
+        let presentation = self
+            .build_presentation(session_id, Arc::clone(&workspace), record.model.clone())
+            .await;
+        let config =
+            self.execution_config(&record, Arc::clone(&workspace), Arc::clone(&presentation))?;
         let options = self
             .config
             .loop_options(record.max_tool_rounds)
@@ -269,6 +273,8 @@ impl Agent {
             record.clone(),
             workspace,
             Vec::new().into(),
+            std::collections::HashMap::new(),
+            presentation,
             config,
             options,
             self.store.clone(),
@@ -323,7 +329,18 @@ impl Agent {
             );
             return Err(AgentError::Workspace);
         }
-        let config = self.execution_config(&stored.record, Arc::clone(&workspace))?;
+        let presentation = self
+            .build_presentation(
+                session_id,
+                Arc::clone(&workspace),
+                stored.record.model.clone(),
+            )
+            .await;
+        let config = self.execution_config(
+            &stored.record,
+            Arc::clone(&workspace),
+            Arc::clone(&presentation),
+        )?;
         let options = self
             .config
             .loop_options(stored.record.max_tool_rounds)
@@ -332,6 +349,8 @@ impl Agent {
             stored.record.clone(),
             workspace,
             stored.history,
+            stored.user_times,
+            presentation,
             config,
             options,
             self.store.clone(),
@@ -433,15 +452,27 @@ impl Agent {
         if let Some(reasoning) = request.reasoning {
             candidate.reasoning = reasoning;
         }
-        let config = self.execution_config(&candidate, workspace)?;
+        let config = self.execution_config(&candidate, workspace, session.presentation())?;
         let active_revision = session.update(candidate.clone(), config).await?;
+        session
+            .presentation()
+            .set_model_label(candidate.model.clone());
         Ok(SessionUpdateResult {
             session: session.info(true),
             active_revision,
         })
     }
 
+    /// Sends a prompt and preserves the original public return type. RPC uses
+    /// `send_accepted` when it also needs the optional acceptance timestamp.
     pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
+        Ok(self.send_accepted(request).await?.turn)
+    }
+
+    pub(crate) async fn send_accepted(
+        &mut self,
+        request: SendMessage,
+    ) -> Result<crate::sessions::LoopAccepted, AgentError> {
         let session = self
             .sessions
             .get(request.session_id)
@@ -451,12 +482,34 @@ impl Agent {
         session.start_loop(input).await
     }
 
+    /// Steers the active turn and preserves the original public return type.
+    /// RPC uses `steer_accepted` when it also needs the optional timestamp.
     pub fn steer(&self, request: SteerMessage) -> Result<(), AgentError> {
+        self.steer_accepted(request).map(|_| ())
+    }
+
+    pub(crate) fn steer_accepted(
+        &self,
+        request: SteerMessage,
+    ) -> Result<crate::sessions::SteerAccepted, AgentError> {
         let session = self
             .sessions
             .get(request.turn.session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
         session.steer(request.turn, request.text)
+    }
+
+    /// Read-only footer/detail data for one loaded session (never drives
+    /// execution).
+    pub fn session_presentation(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<crate::presentation::PresentationView, AgentError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        Ok(session.presentation_view())
     }
 
     pub fn cancel(&self, turn: TurnRef) -> Result<bool, AgentError> {
@@ -596,20 +649,25 @@ impl Agent {
 
     /// Assembles a complete runtime `ExecutionConfig` from the session record:
     /// model, tools, policy, and the project prompt provider. The same
-    /// settings are reused across every turn and replaced atomically on update.
+    /// settings are reused across every turn and replaced atomically on
+    /// update. Model and tools are wrapped with the per-session presentation
+    /// (identity capture + bounded display; never execution semantics).
     fn execution_config(
         &self,
         record: &SessionRecord,
         workspace: Arc<Workspace>,
+        presentation: Arc<crate::presentation::Presentation>,
     ) -> Result<ExecutionConfig, AgentError> {
         let model = self
             .models
             .get(&record.model)
             .map_err(map_model_config_error)?;
-        let tools = build_tools(
+        let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
+        let tools = crate::tools::build_tools_with_presentation(
             &record.tools,
             Arc::clone(&workspace),
             self.command_environment.clone(),
+            &presentation,
         )
         .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
@@ -617,12 +675,32 @@ impl Agent {
         } else {
             Some(Arc::new(Policy::new(record.approval)))
         };
-        let prompt: Arc<dyn PromptProvider> = Arc::new(
-            ProjectPromptProvider::new(workspace, record.system_prompt.clone())
-                .map_err(|_| AgentError::InvalidSessionSettings)?,
+        let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
+            Arc::new(
+                ProjectPromptProvider::new(workspace, record.system_prompt.clone())
+                    .map_err(|_| AgentError::InvalidSessionSettings)?,
+            ),
+            presentation,
         );
         ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
             .map_err(|_| AgentError::InvalidSessionSettings)
+    }
+
+    /// Per-session presentation wired into this session's model/tool wrappers
+    /// and the `session.presentation` read. Refreshes the git branch at
+    /// create/open; later refreshes happen at tool-batch boundaries in the
+    /// per-loop worker.
+    async fn build_presentation(
+        &self,
+        session_id: crate::ids::SessionId,
+        workspace: Arc<Workspace>,
+        model_label: String,
+    ) -> Arc<crate::presentation::Presentation> {
+        let presentation =
+            crate::presentation::Presentation::new(session_id, self.event_sink.clone());
+        presentation.set_model_label(model_label);
+        presentation.set_branch(workspace.git_branch().await);
+        presentation
     }
 }
 
@@ -661,8 +739,10 @@ fn map_build_tools_error(error: BuildToolsError) -> AgentError {
 fn map_model_config_error(error: ModelConfigError) -> AgentError {
     match error {
         ModelConfigError::NotFound => AgentError::ModelNotFound,
+        ModelConfigError::MissingApiKey => {
+            AgentError::Config(crate::config::ConfigError::MissingModelApiKey)
+        }
         ModelConfigError::InvalidConfiguration
-        | ModelConfigError::MissingApiKey
         | ModelConfigError::ClientBuild
         | ModelConfigError::InvalidReference => {
             AgentError::Config(crate::config::ConfigError::InvalidModel)

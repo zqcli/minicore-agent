@@ -993,6 +993,7 @@ struct StreamState {
     reasoning_seen: bool,
     refusal_seen: bool,
     terminal_seen: bool,
+    reasoning_parts: ReasoningParts,
     done: bool,
 }
 
@@ -1041,6 +1042,7 @@ impl StreamState {
             reasoning_seen: false,
             refusal_seen: false,
             terminal_seen: false,
+            reasoning_parts: ReasoningParts::default(),
             done: false,
         }
     }
@@ -1401,15 +1403,25 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
             queue_text(state, event.delta, false)?;
         }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-            let event: DeltaEvent = from_value(value)?;
-            queue_text(state, event.delta, true)?;
+            let event: ReasoningSummaryDeltaEvent = from_value(value)?;
+            queue_reasoning_delta(state, event)?;
             state.reasoning_seen = true;
+        }
+        // Explicit summary-part lifecycle: some providers split ONE reasoning
+        // item into several summary parts and only signal the part via these
+        // events (the delta frames carry no index). Each event is a real part
+        // boundary, so a following delta (even index-less) starts a new part
+        // while deltas within the same part keep concatenating.
+        "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+            state.reasoning_parts.mark_item_boundary();
         }
         "response.output_item.added" => {
             let event: OutputItemEvent = from_value(value)?;
             if item_type(&event.item) == Some("function_call") {
                 let item: FunctionCallItem = from_value(event.item)?;
                 start_tool(state, event.output_index, item, true)?;
+            } else if item_type(&event.item) == Some("reasoning") {
+                state.reasoning_parts.mark_item_boundary();
             }
         }
         "response.function_call_arguments.delta" => {
@@ -1426,6 +1438,8 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
             if item_type(&event.item) == Some("function_call") {
                 let item: FunctionCallItem = from_value(event.item)?;
                 finish_tool_item(state, event.output_index, item)?;
+            } else if item_type(&event.item) == Some("reasoning") {
+                state.reasoning_parts.mark_item_boundary();
             }
         }
         "response.completed" => {
@@ -1447,6 +1461,144 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
 
 fn item_type(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
+}
+
+/// Reasoning summary parts are separated by a single newline, never by
+/// text/capitalization heuristics. Each provider `...summary_text.delta`
+/// carries (when present) the item identity (`item_id`/`output_index`) and
+/// the per-item `summary_index`; a boundary is any change in that identity or
+/// an explicit reasoning item `output_item.added`/`done`.
+///
+/// Missing identity is NOT a boundary: a fragment with no fields continues the
+/// current part (the known identity is retained across present->absent->
+/// present gaps), so a provider that drops metadata mid-part and restores it
+/// later still concatenates. Only a genuine KNOWN-field mismatch or a
+/// lifecycle transition separates parts.
+#[derive(Default)]
+struct ReasoningParts {
+    /// Identity of the part the previous delta belonged to (fully-known so
+    /// far: omitted fields inherit this value).
+    last_key: Option<ReasoningPartKey>,
+    /// Lifecycle bumped by reasoning `output_item.added`/`done` and
+    /// `reasoning_summary_part.added`/`done`, so explicit boundaries separate
+    /// parts even when deltas carry no index.
+    lifecycle: u64,
+    /// The `lifecycle` observed on the previous delta.
+    last_lifecycle: u64,
+    /// True once any nonempty reasoning text was handed to the stream.
+    emitted: bool,
+    /// Whether the last emitted nonempty text ends with a raw newline.
+    last_ends_newline: bool,
+    /// A boundary observed on an EMPTY delta (e.g. a new `summary_index` with
+    /// no text): the next nonempty delta emits the separator without the
+    /// empty delta itself producing a blank line.
+    pending_boundary: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReasoningPartKey {
+    output_index: Option<u32>,
+    item_id: Option<String>,
+    summary_index: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ReasoningSummaryDeltaEvent {
+    delta: String,
+    #[serde(default)]
+    output_index: Option<serde_json::Value>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    summary_index: Option<serde_json::Value>,
+}
+
+impl ReasoningParts {
+    fn mark_item_boundary(&mut self) {
+        self.lifecycle = self.lifecycle.wrapping_add(1);
+    }
+}
+
+fn queue_reasoning_delta(
+    state: &mut StreamState,
+    event: ReasoningSummaryDeltaEvent,
+) -> Result<(), ()> {
+    let delta = event.delta.clone();
+    // The delta's explicit fields override the previous known part; omitted
+    // fields inherit it, so a metadata gap never invents a boundary.
+    let merged = merge_reasoning_key(state.reasoning_parts.last_key.clone(), &event);
+    let identity_changed = merged != state.reasoning_parts.last_key;
+    let lifecycle_changed = state.reasoning_parts.last_lifecycle != state.reasoning_parts.lifecycle;
+
+    if delta.is_empty() {
+        // An empty delta can still announce the next part (a new summary index
+        // before any text): remember the transition so the following
+        // identity-less nonempty delta starts a new part, with no blank line.
+        if identity_changed || lifecycle_changed {
+            state.reasoning_parts.last_key = merged;
+            state.reasoning_parts.last_lifecycle = state.reasoning_parts.lifecycle;
+            state.reasoning_parts.pending_boundary = true;
+        }
+        return Ok(());
+    }
+
+    let boundary = identity_changed || lifecycle_changed || state.reasoning_parts.pending_boundary;
+    // A single newline separates two actual nonempty parts; a raw provider
+    // break at either side prevents doubling it.
+    let needs_separator = boundary
+        && state.reasoning_parts.emitted
+        && !state.reasoning_parts.last_ends_newline
+        && !delta.starts_with('\n');
+    if needs_separator {
+        queue_text(state, "\n".to_owned(), true)?;
+    }
+    queue_text(state, delta.clone(), true)?;
+    if boundary {
+        state.reasoning_parts.last_key = merged;
+        state.reasoning_parts.last_lifecycle = state.reasoning_parts.lifecycle;
+    }
+    state.reasoning_parts.pending_boundary = false;
+    state.reasoning_parts.emitted = true;
+    state.reasoning_parts.last_ends_newline = delta.ends_with('\n');
+    Ok(())
+}
+
+/// Overlays a delta's EXPLICIT identity fields over the last known part.
+/// Missing identity (no fields at all) returns the previous key unchanged:
+/// NOT a boundary. A partial delta retains the known fields and only overrides
+/// the fields it actually carries, so a dropped-then-restored index on the
+/// same part stays glued.
+fn merge_reasoning_key(
+    previous: Option<ReasoningPartKey>,
+    event: &ReasoningSummaryDeltaEvent,
+) -> Option<ReasoningPartKey> {
+    let has_identity =
+        event.output_index.is_some() || event.item_id.is_some() || event.summary_index.is_some();
+    if !has_identity {
+        return previous;
+    }
+    let previous = previous.unwrap_or(ReasoningPartKey {
+        output_index: None,
+        item_id: None,
+        summary_index: None,
+    });
+    Some(ReasoningPartKey {
+        output_index: event
+            .output_index
+            .as_ref()
+            .and_then(|value| value_to_u32(value.clone()))
+            .or(previous.output_index),
+        item_id: event.item_id.clone().or(previous.item_id),
+        summary_index: event
+            .summary_index
+            .as_ref()
+            .and_then(|value| value_to_u32(value.clone()))
+            .or(previous.summary_index),
+    })
+}
+
+fn value_to_u32(value: serde_json::Value) -> Option<u32> {
+    value.as_u64().and_then(|number| u32::try_from(number).ok())
 }
 
 fn capture_output_item(state: &mut StreamState, output_index: u32, item: &Value) -> Result<(), ()> {

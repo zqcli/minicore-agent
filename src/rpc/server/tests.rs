@@ -521,6 +521,23 @@ async fn create_open_history_and_send_wait_deferred() {
 
     harness
         .send(
+            json!("presentation"),
+            "session.presentation",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let presentation = harness.response(json!("presentation")).await;
+    assert_eq!(presentation["result"]["session_id"], session_id);
+    assert_eq!(presentation["result"]["model_label"], json!("fake"));
+    assert_eq!(presentation["result"]["context"]["kind"], json!("unknown"));
+    assert!(presentation["result"]["context"]["tokens"].is_null());
+    assert!(presentation["result"]["cost_usd"].is_null());
+    assert!(presentation["result"]["using_subscription"].is_null());
+    assert!(presentation["result"]["git_branch"].is_null());
+    assert!(presentation["result"]["last_loop"].is_null());
+
+    harness
+        .send(
             json!("history"),
             "session.history",
             Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
@@ -537,6 +554,7 @@ async fn create_open_history_and_send_wait_deferred() {
         )
         .await;
     let sent = harness.response(json!("send")).await;
+    assert!(sent["result"]["accepted_at"].is_string());
     let turn = sent["result"]["turn"].clone();
     assert_eq!(turn["session_id"], session_id);
     assert!(turn["loop_id"].as_str().unwrap().starts_with("lup_"));
@@ -555,6 +573,21 @@ async fn create_open_history_and_send_wait_deferred() {
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(waited["result"]["persistence"], json!("persisted"));
     assert_eq!(waited["result"]["turn"]["loop_id"], turn["loop_id"]);
+
+    harness
+        .send(
+            json!("presentation-after"),
+            "session.presentation",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let presentation_after = harness.response(json!("presentation-after")).await;
+    assert_eq!(
+        presentation_after["result"]["last_loop"]["loop_id"],
+        turn["loop_id"]
+    );
+    assert!(presentation_after["result"]["last_loop"]["started_at"].is_string());
+    assert!(presentation_after["result"]["last_loop"]["finished_at"].is_string());
 
     harness
         .send(
@@ -609,7 +642,8 @@ async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
         )
         .await;
     let steer = harness.response(json!("steer")).await;
-    assert_eq!(steer["result"], json!({"ok": true}));
+    assert_eq!(steer["result"]["ok"], json!(true));
+    assert!(steer["result"]["accepted_at"].is_string());
 
     // session.update while wait pending
     harness
@@ -698,6 +732,19 @@ async fn history_view_is_safe_and_pages() {
         .await;
     let waited = harness.response(json!("wait")).await;
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
+    let presentation_event = harness.event("tool_presentation").await;
+    assert_eq!(
+        presentation_event["params"]["data"]["turn"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        presentation_event["params"]["data"]["request_index"],
+        json!(0)
+    );
+    assert_eq!(
+        presentation_event["params"]["data"]["display"]["detail"],
+        json!("secret.txt")
+    );
 
     harness
         .send(
@@ -708,8 +755,11 @@ async fn history_view_is_safe_and_pages() {
         .await;
     let history = harness.response(json!("history")).await;
     let serialized = history["result"].to_string();
-    assert!(!serialized.contains("secret.txt"));
+    // Whitelisted path detail is available to the local TUI, but raw tool
+    // argument object fields are not.
+    assert!(serialized.contains("secret.txt"));
     assert!(!serialized.contains("arguments"));
+    assert!(!serialized.contains("\"path\""));
     // Tool lifecycle is visible through the safe view.
     harness
         .send(

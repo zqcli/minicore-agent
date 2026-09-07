@@ -128,7 +128,9 @@ async fn history_total(process: &mut RpcProcess, id: &str, session_id: &Value) -
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
-    let responses = (0..14)
+    // 20-turn RPC soak: interleave 10 turns per session; each turn runs a
+    // read tool loop (20 provider responses queued ahead of time).
+    let responses = (0..20)
         .flat_map(|index| {
             [
                 read_response(&format!("soak-read-{index}")),
@@ -152,8 +154,8 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
     let session_a_id = session_a["session_id"].clone();
     let session_b_id = session_b["session_id"].clone();
 
-    // Interleave 7 turns per session; each turn runs a read tool loop.
-    for index in 0..7 {
+    // Interleave 10 turns per session; each turn runs a read tool loop.
+    for index in 0..10 {
         for (label, session_id) in [("a", &session_a_id), ("b", &session_b_id)] {
             let send_id = format!("send-{label}-{index}");
             let wait_id = format!("wait-{label}-{index}");
@@ -177,11 +179,11 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
     // Each turn contributes 4 durable items (user, toolcall, tool result, final).
     assert_eq!(
         history_total(&mut process, "history-a", &session_a_id).await,
-        28
+        40
     );
     assert_eq!(
         history_total(&mut process, "history-b", &session_b_id).await,
-        28
+        40
     );
 
     // Reload from disk preserves both histories.
@@ -207,7 +209,7 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
         process.response(&format!("open-{label}")).await;
         assert_eq!(
             history_total(&mut process, &format!("history-{label}-2"), session_id).await,
-            28
+            40
         );
     }
 

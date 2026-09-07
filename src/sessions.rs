@@ -124,6 +124,24 @@ pub struct TurnResult {
     pub persistence: TurnPersistence,
 }
 
+/// One accepted Prompt: the new turn plus the Agent acceptance time (may be
+/// `None` when the clock is unavailable; the TUI shows pending until then).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopAccepted {
+    pub turn: TurnRef,
+    pub accepted_at: Option<String>,
+}
+
+/// One accepted Steer: the runtime accepted it into the loop queue; the field
+/// carries the Agent acceptance time, not the applied/persisted time, and the
+/// 1-based FIFO acceptance index within the loop (absent on older semantics
+/// where the index is unavailable).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SteerAccepted {
+    pub accepted_at: Option<String>,
+    pub steer_index: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnPersistence {
@@ -221,6 +239,8 @@ struct SessionInner {
     record: crate::store::SessionRecord,
     workspace: Arc<Workspace>,
     history: Arc<[HistoryItem]>,
+    user_times: std::collections::HashMap<(LoopId, usize), String>,
+    presentation: Arc<crate::presentation::Presentation>,
     config: ExecutionConfig,
     options: LoopOptions,
     active: Option<ActiveLoop>,
@@ -287,10 +307,15 @@ pub(crate) enum TurnCompletion {
 }
 
 impl Session {
+    // These fields are the Session ownership boundary; keeping construction
+    // explicit makes the model/tool/presentation wiring auditable.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         record: crate::store::SessionRecord,
         workspace: Arc<Workspace>,
         history: Arc<[HistoryItem]>,
+        user_times: std::collections::HashMap<(LoopId, usize), String>,
+        presentation: Arc<crate::presentation::Presentation>,
         config: ExecutionConfig,
         options: LoopOptions,
         store: Store,
@@ -300,6 +325,8 @@ impl Session {
             record,
             workspace,
             history,
+            user_times,
+            presentation,
             config,
             options,
             active: None,
@@ -388,7 +415,7 @@ impl Session {
 
     /// Starts a new `AgentLoop` for one user message. A session runs at most
     /// one active loop; no queueing or auto-cancellation.
-    pub(crate) async fn start_loop(&self, input: UserInput) -> Result<TurnRef, AgentError> {
+    pub(crate) async fn start_loop(&self, input: UserInput) -> Result<LoopAccepted, AgentError> {
         self.cleanup_finished().await?;
         let (history, config, options) = {
             let inner = self.shared.inner.lock().unwrap();
@@ -413,6 +440,10 @@ impl Session {
         };
         let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
         let (completion_tx, completion_rx) = watch::channel(None);
+        // Mark the new current loop before spawning its worker. Otherwise a
+        // very fast model/tool could populate the presentation cache and then
+        // lose its identity when `note_loop_started` clears stale state.
+        let accepted_at = crate::store::utc_timestamp().ok();
         {
             let mut inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
@@ -427,6 +458,10 @@ impl Session {
                 completion: completion_rx,
                 task: None,
             });
+            inner
+                .presentation
+                .note_loop_started(turn.loop_id, accepted_at.clone());
+            inner.presentation.record_prompt_time(accepted_at.clone());
         }
         let task = tokio::spawn(run_active_loop(
             self.clone(),
@@ -450,7 +485,7 @@ impl Session {
             loop_id = %turn.loop_id,
             "turn submitted"
         );
-        Ok(turn)
+        Ok(LoopAccepted { turn, accepted_at })
     }
 
     pub(crate) async fn cleanup_finished(&self) -> Result<(), AgentError> {
@@ -540,14 +575,20 @@ impl Session {
         await_turn_completion(receiver).await
     }
 
-    pub(crate) fn steer(&self, turn: TurnRef, text: String) -> Result<(), AgentError> {
+    pub(crate) fn steer(&self, turn: TurnRef, text: String) -> Result<SteerAccepted, AgentError> {
         let input = UserInput::text(text).map_err(|_| AgentError::InvalidInput)?;
         let inner = self.shared.inner.lock().unwrap();
         let active = inner.active.as_ref().ok_or(AgentError::TurnNotFound)?;
         if active.turn != turn {
             return Err(AgentError::TurnNotFound);
         }
-        active.handle.steer(input).map_err(map_steer_error)
+        active.handle.steer(input).map_err(map_steer_error)?;
+        let accepted_at = crate::store::utc_timestamp().ok();
+        let steer_index = inner.presentation.note_steer_accepted(accepted_at.clone());
+        Ok(SteerAccepted {
+            accepted_at,
+            steer_index,
+        })
     }
 
     pub(crate) fn cancel(&self, turn: TurnRef) -> Result<bool, AgentError> {
@@ -582,7 +623,21 @@ impl Session {
     pub(crate) fn history(&self, request: &GetHistory) -> Result<HistoryPage, AgentError> {
         request.validate()?;
         let inner = self.shared.inner.lock().unwrap();
-        Ok(page_history(&inner.history, request.offset, request.limit))
+        Ok(page_history(
+            &inner.history,
+            request.offset,
+            request.limit,
+            &inner.user_times,
+        ))
+    }
+
+    pub(crate) fn presentation(&self) -> Arc<crate::presentation::Presentation> {
+        let inner = self.shared.inner.lock().unwrap();
+        Arc::clone(&inner.presentation)
+    }
+
+    pub(crate) fn presentation_view(&self) -> crate::presentation::PresentationView {
+        self.presentation().snapshot()
     }
 
     /// Persists the new record and swaps the long-lived execution config.
@@ -684,13 +739,22 @@ async fn run_active_loop(
     let join = agent_loop.join();
     tokio::pin!(join);
     let mut events_open = true;
+    let mut tool_batch_dirty = false;
     let result = loop {
         tokio::select! {
             biased;
             result = &mut join => break result,
             envelope = events.recv(), if events_open => {
                 match envelope {
-                    Some(envelope) => forward_loop_event(turn.session_id, envelope, &session),
+                    Some(envelope) => {
+                        forward_loop_event_and_refresh(
+                            turn.session_id,
+                            envelope,
+                            &session,
+                            &mut tool_batch_dirty,
+                        )
+                        .await;
+                    }
                     None => events_open = false,
                 }
             }
@@ -701,7 +765,11 @@ async fn run_active_loop(
     // unnecessary completion dependency. This also accounts for a queued
     // `Finished` envelope without mapping it to Agent `TurnFinished`.
     while let Ok(envelope) = events.try_recv() {
-        forward_loop_event(turn.session_id, envelope, &session);
+        forward_loop_event_and_refresh(turn.session_id, envelope, &session, &mut tool_batch_dirty)
+            .await;
+    }
+    if tool_batch_dirty {
+        refresh_branch(&session).await;
     }
     let report = match result {
         Ok(report) => {
@@ -729,6 +797,15 @@ async fn run_active_loop(
             return;
         }
     };
+    // The runtime loop is complete regardless of whether the later JSONL
+    // append succeeds. Keep live footer state honest on both outcomes.
+    refresh_branch(&session).await;
+    session.presentation().note_loop_finished();
+    let user_item_count = sanitized
+        .iter()
+        .filter(|item| matches!(item, HistoryItem::User(_)))
+        .count();
+    let user_times = session.presentation().peek_user_times(user_item_count);
     let stored = StoredLoopRecord {
         loop_id: report.loop_id,
         outcome: StoredLoopOutcome::from_report(&report),
@@ -738,6 +815,7 @@ async fn run_active_loop(
         tool_rounds: report.tool_rounds,
         final_config_revision: report.final_config_revision,
         completed_at: utc_timestamp().unwrap_or_default(),
+        user_times: (!user_times.is_empty()).then_some(user_times),
     };
 
     let persistence = {
@@ -751,12 +829,29 @@ async fn run_active_loop(
             Ok(()) => {
                 {
                     let mut inner = session.shared.inner.lock().unwrap();
+                    // Persisted user timestamps align by (loop_id, occurrence).
+                    let mut occurrence = 0usize;
+                    for item in sanitized.iter() {
+                        if let HistoryItem::User(_) = item {
+                            if let Some(Some(time)) = stored
+                                .user_times
+                                .as_ref()
+                                .and_then(|times| times.get(occurrence))
+                            {
+                                inner
+                                    .user_times
+                                    .insert((report.loop_id, occurrence), time.clone());
+                            }
+                            occurrence += 1;
+                        }
+                    }
                     let mut merged = Vec::with_capacity(inner.history.len() + sanitized.len());
                     merged.extend(inner.history.iter().cloned());
                     merged.extend(sanitized.iter().cloned());
                     inner.history = merged.into();
                     inner.blocked = None;
                 }
+                session.presentation().clear_user_times();
                 touch_updated_at_best_effort(&session).await;
                 TurnPersistence::Persisted
             }
@@ -838,6 +933,36 @@ pub(crate) fn forward_loop_event(
     if let Some(event) = map_loop_event(session_id, envelope.event, session) {
         session.shared.events.try_send(event);
     }
+}
+
+async fn forward_loop_event_and_refresh(
+    session_id: SessionId,
+    envelope: minicore_runtime::LoopEventEnvelope,
+    session: &Session,
+    tool_batch_dirty: &mut bool,
+) {
+    let refresh_before_next_request = *tool_batch_dirty
+        && matches!(
+            &envelope.event,
+            minicore_runtime::LoopEvent::RequestStarted { .. }
+        );
+    let tool_finished = matches!(
+        &envelope.event,
+        minicore_runtime::LoopEvent::ToolFinished { .. }
+    );
+    forward_loop_event(session_id, envelope, session);
+    if tool_finished {
+        *tool_batch_dirty = true;
+    }
+    if refresh_before_next_request {
+        refresh_branch(session).await;
+        *tool_batch_dirty = false;
+    }
+}
+
+async fn refresh_branch(session: &Session) {
+    let branch = session.workspace().git_branch().await;
+    session.presentation().set_branch(branch);
 }
 
 fn extract_loop_id(event: &minicore_runtime::LoopEvent) -> Option<LoopId> {
@@ -933,16 +1058,32 @@ fn map_loop_event(
             outcome,
             output_bytes,
             ..
-        } => Some(AgentEvent::ToolFinished {
-            turn,
-            request_index,
-            tool_call_id: call_id,
-            result: ToolResultView {
-                outcome,
-                content_bytes: output_bytes,
-            },
-            meta,
-        }),
+        } => {
+            // The wrapper normally finishes before Runtime emits this event;
+            // the lookup remains best-effort because the event and presentation
+            // channels have independent delivery/drop semantics.
+            let presentation_result = session.presentation().tool_result(
+                crate::presentation::RequestKey {
+                    loop_id,
+                    request_index,
+                },
+                &call_id,
+            );
+            Some(AgentEvent::ToolFinished {
+                turn,
+                request_index,
+                tool_call_id: call_id,
+                result: ToolResultView {
+                    outcome,
+                    content_bytes: output_bytes,
+                    content: presentation_result
+                        .as_ref()
+                        .map(|(content, _)| content.clone()),
+                    content_truncated: presentation_result.is_some_and(|(_, truncated)| truncated),
+                },
+                meta,
+            })
+        }
         minicore_runtime::LoopEvent::InteractionRequested { interaction, .. } => {
             Some(AgentEvent::InteractionRequested {
                 turn,

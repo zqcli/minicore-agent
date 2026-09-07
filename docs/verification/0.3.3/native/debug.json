@@ -1,0 +1,171 @@
+{
+  "terminal": "iTerm2 3.6.11",
+  "window_id": 69091,
+  "evidence_dir": "/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-release-028-033-iterm-gj2alc6c/evidence",
+  "tui_sha256": "08ed8be4c0fe1ee7a63f586cba4837165d6e8644214fb78df3ecb8b285264dba",
+  "agent_sha256": "8e136238e245d96ea8e1546338887880850cf46fbaabb7721398cfe65cc3214f",
+  "pixel_screenshots": "UNVERIFIED; protected iTerm windows, no screenshot attempt or replacement",
+  "agent_version": "0.3.3",
+  "cpu_dimensions": "220, 53",
+  "idle_cpu": {
+    "start_epoch_ms": 1788799602119,
+    "end_epoch_ms": 1788799604120,
+    "wall_seconds": 2.001,
+    "tui_cpu_seconds": 0.0,
+    "agent_cpu_seconds": 0.0,
+    "tui_cpu_percent_one_core": 0.0
+  },
+  "busy_cpu": [
+    {
+      "start_epoch_ms": 1788799605064,
+      "end_epoch_ms": 1788799607072,
+      "wall_seconds": 2.007,
+      "tui_cpu_seconds": 0.03,
+      "agent_cpu_seconds": 0.0,
+      "tui_cpu_percent_one_core": 1.494
+    }
+  ],
+  "scroll_cpu": [
+    {
+      "start_epoch_ms": 1788799612424,
+      "end_epoch_ms": 1788799620425,
+      "wall_seconds": 8.001,
+      "tui_cpu_seconds": 0.28,
+      "agent_cpu_seconds": 0.0,
+      "tui_cpu_percent_one_core": 3.5,
+      "injected_events": 200
+    },
+    {
+      "start_epoch_ms": 1788799620441,
+      "end_epoch_ms": 1788799628442,
+      "wall_seconds": 8.0,
+      "tui_cpu_seconds": 0.27,
+      "agent_cpu_seconds": 0.0,
+      "tui_cpu_percent_one_core": 3.375,
+      "injected_events": 200
+    },
+    {
+      "start_epoch_ms": 1788799628458,
+      "end_epoch_ms": 1788799636463,
+      "wall_seconds": 8.005,
+      "tui_cpu_seconds": 0.28,
+      "agent_cpu_seconds": 0.0,
+      "tui_cpu_percent_one_core": 3.498,
+      "injected_events": 200
+    }
+  ],
+  "scroll_800_cpu_seconds": 1.11,
+  "scroll_800_wall_seconds": 32.992,
+  "scroll_input": {
+    "events": 800,
+    "period_seconds": 0.04,
+    "reverse_every_events": 80,
+    "injection_wall_seconds": 31.972,
+    "measurements": "absolute 25Hz deadlines; 3 x 8 seconds after 0.5s settle; event timestamps recorded; sample separately"
+  },
+  "hover_200_input_seconds": 0.566,
+  "hover_200_cpu_seconds": 0.0,
+  "wheel_100_visible_seconds": 0.569,
+  "wheel_100_cpu_seconds": 0.01,
+  "status": "PASS",
+  "checks": [
+    "same-part tokens concatenate; distinct summary parts without raw newlines occupy three native rows",
+    "two rapid steers appear in dock queue above Working, with a blank gap, not as User cards",
+    "Option+Up withdraws unsent beta; resubmission keeps both entries and changes only local identity",
+    "request alpha excludes beta; request beta follows alpha answer; both history entries appear exactly once",
+    "existing immediate-footer max selection remains intact without another user turn",
+    "idle and held request 2s controls, changing Working display, owned-process CPU only; input remains responsive",
+    "800 paced bidirectional wheel events; continuous-scroll CPU measured for 3x8s; input drain marker and tail confirmed",
+    "long history: 200 hover events preserve responsive input; 100 wheel events scroll; scrollbar drag reaches beginning",
+    "native TUI exits zero and restores its shell"
+  ],
+  "captures": [
+    {
+      "name": "01-thinking-part-boundaries",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "02-two-queued-steers",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "03-queued-60x16",
+      "dimensions": "60, 16"
+    },
+    {
+      "name": "04-alpha-applied-beta-queued",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "05-both-completed",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "06-footer-max",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "07-long-history-tail",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "08-cpu-idle-wide",
+      "dimensions": "220, 53"
+    },
+    {
+      "name": "09-cpu-busy-wide",
+      "dimensions": "220, 53"
+    },
+    {
+      "name": "10-continuous-scroll-wide",
+      "dimensions": "220, 53"
+    },
+    {
+      "name": "08-long-history-scrolled",
+      "dimensions": "100, 32"
+    },
+    {
+      "name": "09-long-history-drag-top",
+      "dimensions": "100, 32"
+    }
+  ],
+  "requests": [
+    {
+      "model": "verify-a",
+      "effort": "high",
+      "alpha": false,
+      "beta": false,
+      "alpha_answer": false
+    },
+    {
+      "model": "verify-a",
+      "effort": "high",
+      "alpha": true,
+      "beta": false,
+      "alpha_answer": false
+    },
+    {
+      "model": "verify-a",
+      "effort": "high",
+      "alpha": true,
+      "beta": true,
+      "alpha_answer": true
+    },
+    {
+      "model": "verify-a",
+      "effort": "max",
+      "alpha": true,
+      "beta": true,
+      "alpha_answer": true
+    },
+    {
+      "model": "verify-a",
+      "effort": "max",
+      "alpha": true,
+      "beta": true,
+      "alpha_answer": true
+    }
+  ],
+  "tui_version": "minicore-tui 0.2.8",
+  "note": "Native iTerm2 screen text and input + real Agent/loopback. No user config or Store; no external provider."
+}

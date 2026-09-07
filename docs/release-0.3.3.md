@@ -1,0 +1,46 @@
+# MiniCore Agent 0.3.3
+
+Paired source release with MiniCore TUI 0.2.8. This commits the previously
+uncommitted Agent work and updates the package/version examples. Runtime remains
+pinned to 0.4.1, revision `6cd2bdbc634437dea925495c61c7eb0be10ba171`.
+No additional execution or provider-request changes were made during this
+version-update step.
+
+## Included Work
+
+- Bounded local-client presentation data: tool details and expanded input,
+  results, ordered assistant parts, acceptance timestamps, request usage and
+  workspace branch. Existing execution RPCs retain their core fields; optional
+  presentation fields and `session.presentation` supply the additional facts.
+- Read-only Steer acceptance indexes and issued-request receipts support the
+  TUI's paced FIFO. Acceptance, inclusion, persistence and completion remain
+  distinct; direct Agent RPC clients still use the Runtime's batching semantics.
+- Responses reasoning summary boundaries are preserved without splitting
+  fragments of the same part. See [0.3.2 notes](release-0.3.2.md).
+- Useful static startup errors distinguish parsing/model/key-environment failures
+  without echoing configuration or key values.
+- Regression, compatibility and redaction coverage accompanies the new fields.
+  Local tool detail/expanded text can contain user-authored secrets and is allowed
+  in the local RPC view, not diagnostic logs.
+
+## Known Limitations
+
+The following review findings are recorded, not fixed by this version update:
+
+- Invalid optional `user_times` metadata can reject an entire history load or
+  append (`src/store.rs`). Presentation degradation is not yet isolated from
+  core storage validation.
+- Git branch queries have no explicit timeout and are awaited on creation/open
+  and before final persistence (`src/workspace.rs`, `src/sessions.rs`). A stalled
+  Git command can delay completion.
+- Each history page scans/copies tool results from the full loaded history
+  (`src/history.rs`), adding unnecessary work for large sessions.
+
+These limitations are not claims that a live failure was reproduced during this
+release. No `max` to `xhigh` conversion or real-request diagnostic was added.
+
+## Verification
+
+See [verification/0.3.3](verification/0.3.3/README.md) for remote build/test logs
+and native execution evidence for the paired release. User stores and local
+configuration are excluded from version control. No release tag is created.

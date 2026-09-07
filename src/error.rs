@@ -28,7 +28,7 @@ impl fmt::Display for RuntimeErrorView {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error("invalid configuration")]
+    #[error("invalid configuration: {0}")]
     Config(#[source] ConfigError),
     #[error("session not found")]
     SessionNotFound,
