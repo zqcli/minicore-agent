@@ -1,3 +1,6 @@
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,6 +19,21 @@ use crate::error::AgentError;
 use crate::ids::SessionId;
 
 const MAX_HISTORY_LIMIT: usize = 100;
+
+#[cfg(test)]
+thread_local! {
+    static TOOL_RESULT_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_tool_result_scan_count() {
+    TOOL_RESULT_SCAN_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn tool_result_scan_count() -> usize {
+    TOOL_RESULT_SCAN_COUNT.with(Cell::get)
+}
 
 /// Cleans a loop's persisted history so provider-opaque continuation data
 /// never reaches the Agent JSONL, the in-memory session history, RPC views,
@@ -325,9 +343,10 @@ pub(crate) fn page_history(
     limit: usize,
     user_times: &std::collections::HashMap<(LoopId, usize), String>,
 ) -> HistoryPage {
-    let tool_results = collect_tool_results(history);
     let total = history.len();
+    let page_start = offset.min(total);
     let end = offset.saturating_add(limit).min(total);
+    let tool_results = collect_tool_results(history, page_start, end);
     let mut items = Vec::with_capacity(end.saturating_sub(offset));
     // Count occurrences before the requested page as well. A page boundary
     // must not make the second identical User item look like occurrence zero.
@@ -373,27 +392,79 @@ pub(crate) fn page_history(
     }
 }
 
-/// Maps `ToolCallId` -> stored result content for regenerating tool displays
-/// from history. Best-effort: a view never needs the result to render.
+/// Maps only ToolResults needed by the current page. Runtime-produced history
+/// appends an Assistant followed immediately by its ToolResult batch, so a
+/// page needs its own items plus the contiguous ToolResult suffix just beyond
+/// the right edge. Best-effort: a view never needs the result to render.
 fn collect_tool_results(
     history: &[HistoryItem],
-) -> std::collections::HashMap<(LoopId, u32, ToolCallId), (String, bool)> {
-    let mut results = std::collections::HashMap::new();
-    for item in history {
-        if let HistoryItem::ToolResult(result) = item {
-            let (content, truncated) = crate::presentation::bounded_result_content(
-                result.output.content().as_str(),
-                crate::presentation::MAX_RESULT_DISPLAY_BYTES,
-            );
-            if !content.is_empty() {
-                results.insert(
-                    (result.loop_id, result.request_index, result.call_id.clone()),
-                    (content, truncated),
-                );
+    page_start: usize,
+    page_end: usize,
+) -> HashMap<(LoopId, u32, ToolCallId), (String, bool)> {
+    let keys = history
+        .iter()
+        .skip(page_start)
+        .take(page_end.saturating_sub(page_start))
+        .filter_map(|item| match item {
+            HistoryItem::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .flat_map(|assistant| {
+            let loop_id = assistant.loop_id;
+            let request_index = assistant.request_index;
+            assistant.content.iter().filter_map(move |part| {
+                part.as_tool_call()
+                    .map(|call| (loop_id, request_index, call.tool_call_id()))
+            })
+        })
+        .collect::<HashSet<(LoopId, u32, &ToolCallId)>>();
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut results = HashMap::new();
+    for item in history
+        .iter()
+        .skip(page_start)
+        .take(page_end.saturating_sub(page_start))
+    {
+        let HistoryItem::ToolResult(result) = item else {
+            continue;
+        };
+        add_tool_result(&mut results, &keys, result);
+    }
+    if results.len() < keys.len() {
+        for item in history.iter().skip(page_end) {
+            let HistoryItem::ToolResult(result) = item else {
+                break;
+            };
+            add_tool_result(&mut results, &keys, result);
+            if results.len() == keys.len() {
+                break;
             }
         }
     }
     results
+}
+
+fn add_tool_result(
+    results: &mut HashMap<(LoopId, u32, ToolCallId), (String, bool)>,
+    keys: &HashSet<(LoopId, u32, &ToolCallId)>,
+    result: &ToolResultHistory,
+) {
+    #[cfg(test)]
+    TOOL_RESULT_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+    if !keys.contains(&(result.loop_id, result.request_index, &result.call_id)) {
+        return;
+    }
+    let key = (result.loop_id, result.request_index, result.call_id.clone());
+    let (content, truncated) = crate::presentation::bounded_result_content(
+        result.output.content().as_str(),
+        crate::presentation::MAX_RESULT_DISPLAY_BYTES,
+    );
+    if !content.is_empty() {
+        results.insert(key, (content, truncated));
+    }
 }
 
 fn assistant_history_view(
@@ -453,10 +524,228 @@ fn assistant_history_view(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use minicore_runtime::history::{AssistantHistory, ToolResultHistory};
     use minicore_runtime::model::{AssistantPart, ModelFinishReason, ModelRef, Usage};
     use minicore_runtime::tools::{ToolName, ToolOutput, ToolResultOutcome};
+
+    fn tool_pair(
+        loop_id: LoopId,
+        request_index: u32,
+        call_id: &str,
+        output: &str,
+    ) -> (HistoryItem, HistoryItem) {
+        let call_id = call_id.parse::<ToolCallId>().unwrap();
+        let call = minicore_runtime::model::ToolCall::new(
+            call_id.clone(),
+            "bash".parse::<ToolName>().unwrap(),
+            serde_json::json!({"command": call_id.as_str()}),
+            0,
+        )
+        .unwrap();
+        (
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id,
+                request_index,
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::ToolCall(call)],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+            HistoryItem::ToolResult(ToolResultHistory {
+                loop_id,
+                request_index,
+                call_id,
+                tool_name: "bash".parse::<ToolName>().unwrap(),
+                outcome: ToolResultOutcome::Success,
+                output: ToolOutput::new(output).unwrap(),
+            }),
+        )
+    }
+
+    fn tool_batch(loop_id: LoopId, request_index: u32) -> (HistoryItem, Vec<HistoryItem>) {
+        let call_ids = ["batch-one", "batch-two"];
+        let calls = call_ids
+            .iter()
+            .enumerate()
+            .map(|(call_index, call_id)| {
+                let call_id = call_id.parse::<ToolCallId>().unwrap();
+                minicore_runtime::model::ToolCall::new(
+                    call_id.clone(),
+                    "bash".parse::<ToolName>().unwrap(),
+                    serde_json::json!({"command": call_id.as_str()}),
+                    call_index as u32,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let results = [
+            ("batch-one", "first batch result"),
+            ("batch-two", "second batch result"),
+        ]
+        .into_iter()
+        .map(|(call_id, output)| {
+            HistoryItem::ToolResult(ToolResultHistory {
+                loop_id,
+                request_index,
+                call_id: call_id.parse().unwrap(),
+                tool_name: "bash".parse::<ToolName>().unwrap(),
+                outcome: ToolResultOutcome::Success,
+                output: ToolOutput::new(output).unwrap(),
+            })
+        })
+        .collect();
+        (
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id,
+                request_index,
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: calls.into_iter().map(AssistantPart::ToolCall).collect(),
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+            results,
+        )
+    }
+
+    #[test]
+    fn page_history_does_not_process_unrelated_tool_results() {
+        let mut history = Vec::new();
+        for index in 0..128 {
+            let (assistant, result) = tool_pair(
+                LoopId::new().unwrap(),
+                0,
+                &format!("old-call-{index}"),
+                "old result",
+            );
+            history.extend([assistant, result]);
+        }
+        let current_assistant_index = history.len();
+        let (assistant, result) =
+            tool_pair(LoopId::new().unwrap(), 0, "current-call", "current result");
+        history.extend([assistant, result]);
+
+        reset_tool_result_scan_count();
+        let page = page_history(&history, current_assistant_index, 1, &HashMap::new());
+
+        assert_eq!(tool_result_scan_count(), 1);
+        let HistoryItemView::Assistant(assistant) = &page.items[0].item else {
+            panic!("expected the current Assistant item");
+        };
+        assert_eq!(
+            assistant.tool_calls[0].display.as_ref().unwrap().detail,
+            "$ current-call"
+        );
+    }
+
+    #[test]
+    fn page_history_skips_result_collection_without_page_tool_calls() {
+        let loop_id = LoopId::new().unwrap();
+        let mut history = vec![HistoryItem::User(UserHistory {
+            loop_id,
+            kind: UserMessageKind::Prompt,
+            input: minicore_runtime::execution::UserInput::text("plain").unwrap(),
+        })];
+        for index in 0..128 {
+            let (assistant, result) = tool_pair(
+                LoopId::new().unwrap(),
+                0,
+                &format!("old-call-{index}"),
+                "old result",
+            );
+            history.extend([assistant, result]);
+        }
+
+        reset_tool_result_scan_count();
+        let page = page_history(&history, 0, 1, &HashMap::new());
+
+        assert_eq!(tool_result_scan_count(), 0);
+        assert!(matches!(page.items[0].item, HistoryItemView::User(_)));
+    }
+
+    #[test]
+    fn page_history_keeps_missing_and_cross_identity_results_distinct() {
+        let loop_id = LoopId::new().unwrap();
+        let (assistant_one, result_one) = tool_pair(loop_id, 0, "same-call", "first result");
+        let (assistant_two, result_two) =
+            tool_pair(loop_id, 1, "same-call", "second result\nextra");
+        let missing_loop = LoopId::new().unwrap();
+        let (missing_assistant, _) = tool_pair(missing_loop, 0, "missing-call", "unused");
+
+        let history = vec![
+            assistant_one,
+            result_one,
+            assistant_two,
+            result_two,
+            missing_assistant,
+        ];
+        let page = page_history(&history, 0, 5, &HashMap::new());
+
+        let HistoryItemView::Assistant(first) = &page.items[0].item else {
+            panic!("expected first Assistant item");
+        };
+        let HistoryItemView::Assistant(second) = &page.items[2].item else {
+            panic!("expected second Assistant item");
+        };
+        let HistoryItemView::Assistant(missing) = &page.items[4].item else {
+            panic!("expected missing-result Assistant item");
+        };
+        assert_eq!(
+            first.tool_calls[0]
+                .display
+                .as_ref()
+                .unwrap()
+                .hidden_line_count,
+            Some(4)
+        );
+        assert_eq!(
+            second.tool_calls[0]
+                .display
+                .as_ref()
+                .unwrap()
+                .hidden_line_count,
+            Some(5)
+        );
+        assert_eq!(
+            missing.tool_calls[0]
+                .display
+                .as_ref()
+                .unwrap()
+                .hidden_line_count,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn page_history_finds_a_tool_batch_beyond_the_page_boundary() {
+        let loop_id = LoopId::new().unwrap();
+        let (assistant, results) = tool_batch(loop_id, 0);
+        let mut history = vec![assistant];
+        history.extend(results);
+
+        reset_tool_result_scan_count();
+        let page = page_history(&history, 0, 1, &HashMap::new());
+
+        assert_eq!(tool_result_scan_count(), 2);
+        let HistoryItemView::Assistant(assistant) = &page.items[0].item else {
+            panic!("expected Assistant item");
+        };
+        assert_eq!(assistant.tool_calls.len(), 2);
+        assert_eq!(assistant.tool_calls[0].call_index, 0);
+        assert_eq!(assistant.tool_calls[1].call_index, 1);
+        assert_eq!(
+            assistant.tool_calls[0].display.as_ref().unwrap().detail,
+            "$ batch-one"
+        );
+        assert_eq!(
+            assistant.tool_calls[1].display.as_ref().unwrap().detail,
+            "$ batch-two"
+        );
+    }
 
     #[test]
     fn history_tool_display_results_use_the_full_tool_identity() {
@@ -513,7 +802,7 @@ mod tests {
                 output: ToolOutput::new("second result").unwrap(),
             }),
         ];
-        let results = collect_tool_results(&history);
+        let results = collect_tool_results(&history, 0, history.len());
         let one = match &history[0] {
             HistoryItem::Assistant(assistant) => assistant_history_view(assistant, &results),
             _ => unreachable!(),
