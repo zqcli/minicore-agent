@@ -116,29 +116,75 @@ pub(crate) struct StoredLoopRecord {
     pub(crate) completed_at: String,
     /// RFC3339 acceptance times aligned by User-item occurrence (Prompt first,
     /// then applied Steers). Missing in old JSONL lines, which stay readable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_user_times",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) user_times: Option<Vec<Option<String>>>,
 }
 
+fn deserialize_user_times<'de, D>(deserializer: D) -> Result<Option<Vec<Option<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Array(values) = value else {
+        return Ok(None);
+    };
+    Ok(Some(
+        values
+            .into_iter()
+            .map(|value| match value {
+                serde_json::Value::String(timestamp) if valid_timestamp(&timestamp) => {
+                    Some(timestamp)
+                }
+                _ => None,
+            })
+            .collect(),
+    ))
+}
+
 impl StoredLoopRecord {
-    fn validate_presentation_metadata(&self) -> Result<(), StoreError> {
+    fn user_times_are_valid(&self) -> bool {
+        let Some(times) = &self.user_times else {
+            return true;
+        };
+        let user_count = self
+            .items
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::User(_)))
+            .count();
+        times.len() <= user_count
+            && times
+                .iter()
+                .flatten()
+                .all(|timestamp| valid_timestamp(timestamp))
+    }
+
+    fn normalized_user_times(&self) -> Option<Vec<Option<String>>> {
         let user_count = self
             .items
             .iter()
             .filter(|item| matches!(item, HistoryItem::User(_)))
             .count();
         let Some(times) = &self.user_times else {
-            return Ok(());
+            return None;
         };
-        if times.len() > user_count
-            || times
-                .iter()
-                .flatten()
-                .any(|timestamp| !valid_timestamp(timestamp))
-        {
-            return Err(StoreError::Corrupt);
+        if times.len() > user_count {
+            return None;
         }
-        Ok(())
+        Some(
+            times
+                .iter()
+                .map(|timestamp| {
+                    timestamp
+                        .as_deref()
+                        .filter(|timestamp| valid_timestamp(timestamp))
+                        .map(str::to_owned)
+                })
+                .collect(),
+        )
     }
 }
 
@@ -391,7 +437,6 @@ impl Store {
         session_id: SessionId,
         record: &StoredLoopRecord,
     ) -> Result<(), StoreError> {
-        record.validate_presentation_metadata()?;
         let directory = self.require_session_directory(session_id).await?;
         #[cfg(test)]
         if should_fail_append(session_id) {
@@ -408,7 +453,21 @@ impl Store {
                 return Err(StoreError::Corrupt);
             }
         }
-        let mut bytes = serde_json::to_vec(record).map_err(|_| StoreError::Corrupt)?;
+        let mut bytes = if record.user_times_are_valid() {
+            serde_json::to_vec(record)
+        } else {
+            let mut normalized = record.clone();
+            normalized.user_times = record.normalized_user_times();
+            serde_json::to_vec(&normalized)
+        }
+        .map_err(|_| StoreError::Corrupt)?;
+        if bytes.len() > MAX_LOOP_RECORD_BYTES && record.user_times.is_some() {
+            // Presentation metadata must not make an otherwise storable core
+            // loop record cross the single-line limit.
+            let mut without_metadata = record.clone();
+            without_metadata.user_times = None;
+            bytes = serde_json::to_vec(&without_metadata).map_err(|_| StoreError::Corrupt)?;
+        }
         if bytes.len() > MAX_LOOP_RECORD_BYTES {
             return Err(StoreError::RecordTooLarge);
         }
@@ -577,8 +636,16 @@ impl Store {
             }
             let record: StoredLoopRecord =
                 serde_json::from_slice(&buffer).map_err(|_| StoreError::Corrupt)?;
-            record.validate_presentation_metadata()?;
-            let user_times = record.user_times.clone().unwrap_or_default();
+            let user_count = record
+                .items
+                .iter()
+                .filter(|item| matches!(item, HistoryItem::User(_)))
+                .count();
+            let user_times = record
+                .user_times
+                .as_deref()
+                .filter(|times| times.len() <= user_count)
+                .unwrap_or(&[]);
             let mut user_occurrence = 0usize;
             for item in &record.items {
                 if let HistoryItem::User(_) = item {
@@ -1107,6 +1174,52 @@ mod tests {
         }
     }
 
+    fn loop_record_with_users(texts: &[&str]) -> StoredLoopRecord {
+        let loop_id = LoopId::new().unwrap();
+        let items = texts
+            .iter()
+            .map(|text| {
+                HistoryItem::User(UserHistory {
+                    loop_id,
+                    kind: minicore_runtime::history::UserMessageKind::Prompt,
+                    input: minicore_runtime::execution::UserInput::text(text).unwrap(),
+                })
+            })
+            .collect();
+        StoredLoopRecord {
+            loop_id,
+            outcome: StoredLoopOutcome::Completed,
+            items,
+            usage: Usage::new(1, 2, 0),
+            requests: 1,
+            tool_rounds: 0,
+            final_config_revision: ConfigRevision::INITIAL,
+            completed_at: utc_timestamp().unwrap(),
+            user_times: None,
+        }
+    }
+
+    async fn append_raw_history_line(
+        store: &Store,
+        session_id: SessionId,
+        value: serde_json::Value,
+    ) {
+        let path = store.session_directory(session_id).join(HISTORY_FILE);
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new().append(true).open(path).await.unwrap();
+        file.write_all(&bytes).await.unwrap();
+        file.flush().await.unwrap();
+    }
+
+    async fn append_raw_history_json_line(store: &Store, session_id: SessionId, json: &str) {
+        let path = store.session_directory(session_id).join(HISTORY_FILE);
+        let mut file = OpenOptions::new().append(true).open(path).await.unwrap();
+        file.write_all(json.as_bytes()).await.unwrap();
+        file.write_all(b"\n").await.unwrap();
+        file.flush().await.unwrap();
+    }
+
     #[tokio::test]
     async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible() {
         let (base, store, session_id) = fixture("user-times").await;
@@ -1126,37 +1239,249 @@ mod tests {
         // A missing optional field remains the old JSONL compatibility path.
         let old = loop_record(session_id, "old");
         store.append_loop(session_id, &old).await.unwrap();
-        let loaded = store.load_session(session_id).await.unwrap();
-        assert_eq!(loaded.history.len(), 2);
-
-        let mut invalid_timestamp = loop_record(session_id, "invalid");
-        invalid_timestamp.user_times = Some(vec![Some("not-a-timestamp".to_owned())]);
-        assert!(matches!(
-            store.append_loop(session_id, &invalid_timestamp).await,
-            Err(StoreError::Corrupt)
-        ));
-
-        let mut too_many = loop_record(session_id, "too many");
-        too_many.user_times = Some(vec![None, None]);
-        assert!(matches!(
-            store.append_loop(session_id, &too_many).await,
-            Err(StoreError::Corrupt)
-        ));
-
-        // The read path applies the same validation to hand-written JSONL.
-        let mut on_disk_invalid = loop_record(session_id, "disk invalid");
-        on_disk_invalid.user_times = Some(vec![Some("2026-99-99T99:99:99Z".to_owned())]);
         let history_path = base
             .join(SESSIONS_DIR)
             .join(session_id.to_string())
             .join(HISTORY_FILE);
-        let mut bytes = serde_json::to_vec(&on_disk_invalid).unwrap();
-        bytes.push(b'\n');
-        tokio::fs::write(history_path, bytes).await.unwrap();
+        let old_jsonl_before_load = fs::read(&history_path).await.unwrap();
+        let loaded = store.load_session(session_id).await.unwrap();
+        assert_eq!(loaded.history.len(), 2);
+        assert_eq!(
+            fs::read(&history_path).await.unwrap(),
+            old_jsonl_before_load
+        );
+
+        let mut invalid_timestamp = loop_record(session_id, "invalid");
+        invalid_timestamp.user_times = Some(vec![Some("not-a-timestamp".to_owned())]);
+        store
+            .append_loop(session_id, &invalid_timestamp)
+            .await
+            .unwrap();
+
+        let mut too_many = loop_record(session_id, "too many");
+        too_many.user_times = Some(vec![
+            Some("2026-09-05T14:05:06.007Z".to_owned()),
+            Some("extra".to_owned()),
+        ]);
+        store.append_loop(session_id, &too_many).await.unwrap();
+
+        let loaded = store.load_session(session_id).await.unwrap();
+        assert_eq!(loaded.history.len(), 4);
+        assert!(
+            !loaded
+                .user_times
+                .contains_key(&(invalid_timestamp.loop_id, 0))
+        );
+        assert!(!loaded.user_times.contains_key(&(too_many.loop_id, 0)));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn user_time_metadata_does_not_displace_core_at_line_limit() {
+        let (base, store, session_id) = fixture("user-times-line-limit").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let mut loop_record: StoredLoopRecord =
+            serde_json::from_slice(&loop_line_with_size(MAX_LOOP_RECORD_BYTES - 32)).unwrap();
+        let user_count = loop_record
+            .items
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::User(_)))
+            .count();
+        loop_record.user_times = Some(
+            (0..user_count)
+                .map(|_| Some("2026-09-05T14:05:06.007Z".to_owned()))
+                .collect(),
+        );
+
+        store.append_loop(session_id, &loop_record).await.unwrap();
+        let loaded = store.load_session(session_id).await.unwrap();
+        assert_eq!(loaded.history.len(), user_count);
+        assert!(loaded.user_times.is_empty());
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn same_text_users_keep_occurrence_when_one_time_is_invalid() {
+        let (base, store, session_id) = fixture("user-time-occurrence").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let mut loop_record = loop_record_with_users(&["same", "same"]);
+        let loop_id = loop_record.loop_id;
+        let valid_time = "2026-09-05T14:05:06.007Z";
+        loop_record.user_times = Some(vec![
+            Some("not-a-timestamp".to_owned()),
+            Some(valid_time.to_owned()),
+        ]);
+        store.append_loop(session_id, &loop_record).await.unwrap();
+
+        let loaded = store.load_session(session_id).await.unwrap();
+        let page =
+            crate::history::page_history(loaded.history.as_ref(), 0, 100, &loaded.user_times);
+        let timestamps = page
+            .items
+            .iter()
+            .map(|item| match &item.item {
+                crate::history::HistoryItemView::User(user) => user.timestamp.as_deref(),
+                other => panic!("unexpected history item {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps, vec![None, Some(valid_time)]);
+        assert!(!loaded.user_times.contains_key(&(loop_id, 0)));
+        assert_eq!(
+            loaded.user_times.get(&(loop_id, 1)).map(String::as_str),
+            Some(valid_time)
+        );
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_user_time_json_does_not_block_history_read_or_append() {
+        let (base, store, session_id) = fixture("malformed-user-times").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        store
+            .append_loop(session_id, &loop_record(session_id, "before"))
+            .await
+            .unwrap();
+
+        let malformed_shape = serde_json::to_value(loop_record(session_id, "object")).unwrap();
+        let malformed_shape = {
+            let mut value = malformed_shape;
+            value["user_times"] = json!({"unexpected": "shape"});
+            value
+        };
+        append_raw_history_line(&store, session_id, malformed_shape).await;
+
+        let malformed_entry = serde_json::to_value(loop_record(session_id, "entry")).unwrap();
+        let malformed_entry = {
+            let mut value = malformed_entry;
+            value["user_times"] = json!([{"unexpected": "entry"}]);
+            value
+        };
+        append_raw_history_line(&store, session_id, malformed_entry).await;
+
+        let loaded = store.load_session(session_id).await.unwrap();
+        let texts = loaded
+            .history
+            .iter()
+            .map(|item| match item {
+                HistoryItem::User(user) => user.input.as_text().to_owned(),
+                other => panic!("unexpected history item {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["before", "object", "entry"]);
+        assert!(loaded.user_times.is_empty());
+
+        store
+            .append_loop(session_id, &loop_record(session_id, "after"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_session(session_id).await.unwrap().history.len(),
+            4
+        );
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn core_history_corruption_is_still_rejected() {
+        let (base, store, session_id) = fixture("core-history-corrupt").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let mut value = serde_json::to_value(loop_record(session_id, "core")).unwrap();
+        value["items"] = json!("not-an-items-array");
+        value["user_times"] = json!({"unexpected": "shape"});
+        append_raw_history_line(&store, session_id, value).await;
+
         assert!(matches!(
             store.load_session(session_id).await,
             Err(StoreError::Corrupt)
         ));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_core_json_fields_are_rejected() {
+        let (base, store, session_id) = fixture("duplicate-core-field").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let raw = serde_json::to_string(&loop_record(session_id, "duplicate core")).unwrap();
+        let duplicate_items = raw.replacen("\"items\":", "\"items\":[],\"items\":", 1);
+        append_raw_history_json_line(&store, session_id, &duplicate_items).await;
+
+        assert!(matches!(
+            store.load_session(session_id).await,
+            Err(StoreError::Corrupt)
+        ));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_user_time_json_fields_are_rejected() {
+        let (base, store, session_id) = fixture("duplicate-user-times-field").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let mut loop_record = loop_record(session_id, "duplicate user times");
+        loop_record.user_times = Some(vec![Some("2026-09-05T14:05:06.007Z".to_owned())]);
+        let raw = serde_json::to_string(&loop_record).unwrap();
+        let duplicate_user_times =
+            raw.replacen("\"user_times\":", "\"user_times\":null,\"user_times\":", 1);
+        append_raw_history_json_line(&store, session_id, &duplicate_user_times).await;
+
+        assert!(matches!(
+            store.load_session(session_id).await,
+            Err(StoreError::Corrupt)
+        ));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_and_wrong_type_core_json_fields_are_rejected() {
+        let unknown_field = {
+            let mut raw =
+                serde_json::to_string(&loop_record(SessionId::new().unwrap(), "unknown")).unwrap();
+            raw.insert_str(raw.len() - 1, ",\"unknown_core\":true");
+            raw
+        };
+        let wrong_type = {
+            let mut raw =
+                serde_json::to_string(&loop_record(SessionId::new().unwrap(), "wrong")).unwrap();
+            let field = "\"items\":";
+            let value_start = raw.find(field).unwrap() + field.len();
+            let value_end = raw[value_start..].find("],\"usage\"").unwrap() + value_start + 1;
+            raw.replace_range(value_start..value_end, "\"not-an-items-array\"");
+            raw
+        };
+
+        for (label, raw) in [
+            ("unknown-core-field", unknown_field),
+            ("wrong-type-core-field", wrong_type),
+        ] {
+            let (base, store, session_id) = fixture(label).await;
+            store
+                .create_session(&record(&store, session_id))
+                .await
+                .unwrap();
+            append_raw_history_json_line(&store, session_id, &raw).await;
+            assert!(matches!(
+                store.load_session(session_id).await,
+                Err(StoreError::Corrupt)
+            ));
+            let _ = fs::remove_dir_all(base).await;
+        }
     }
 
     #[test]
