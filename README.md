@@ -11,9 +11,9 @@ that exact Git revision; the local sibling checkout is used only for API review
 and is not modified here.
 
 Current release: **0.3.3**, paired with MiniCore TUI **0.2.8**. See
-[release notes](docs/release-0.3.3.md), including the remaining presentation-path
-limitations. This release commits the existing presentation and stream fixes;
-it does not change the pinned Runtime revision.
+[release notes](docs/release-0.3.3.md) and the subsequent
+[presentation-path source fixes](docs/verification/presentation-risk-fixes.md).
+These follow-up fixes preserve the pinned Runtime revision and RPC surface.
 
 ## Run
 
