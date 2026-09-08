@@ -25,7 +25,10 @@ version-update step.
 
 ## Known Limitations
 
-The following review findings are recorded, not fixed by this version update:
+The following findings describe the original paired release and were not fixed
+by the version-update step itself. They have since been addressed by
+[follow-up source fixes](verification/presentation-risk-fixes.md). The binaries
+installed during the original paired release were not replaced in that follow-up.
 
 - Invalid optional `user_times` metadata can reject an entire history load or
   append (`src/store.rs`). Presentation degradation is not yet isolated from

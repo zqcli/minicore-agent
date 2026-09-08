@@ -737,6 +737,9 @@ mod tests {
         assert_eq!(assistant.tool_calls.len(), 2);
         assert_eq!(assistant.tool_calls[0].call_index, 0);
         assert_eq!(assistant.tool_calls[1].call_index, 1);
+        for call in &assistant.tool_calls {
+            assert_eq!(call.display.as_ref().unwrap().hidden_line_count, Some(4));
+        }
         assert_eq!(
             assistant.tool_calls[0].display.as_ref().unwrap().detail,
             "$ batch-one"
