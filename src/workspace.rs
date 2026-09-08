@@ -8,12 +8,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::fs::{self, File};
 use tokio::io::AsyncReadExt;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+const GIT_BRANCH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 static BEFORE_RENAME_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
@@ -121,16 +124,30 @@ impl Workspace {
     /// Current git branch, read through fixed git arguments (no shell). `None`
     /// when the workspace is not a git work tree (or git is absent/detached).
     pub(crate) async fn git_branch(&self) -> Option<String> {
-        let output = tokio::process::Command::new("git")
-            // A presentation query must not inherit the Agent's RPC input pipe.
-            .stdin(std::process::Stdio::null())
+        let mut command = tokio::process::Command::new("git");
+        command
             .arg("-C")
             .arg(self.root.as_path())
             .arg("symbolic-ref")
             .arg("--short")
-            .arg("HEAD")
-            .output()
+            .arg("HEAD");
+        Self::git_branch_with_command(command).await
+    }
+
+    async fn git_branch_with_command(mut command: tokio::process::Command) -> Option<String> {
+        // A presentation query must not inherit the Agent's RPC input pipe.
+        command.stdin(std::process::Stdio::null());
+        // Dropping a timed-out or cancelled output future drops its Child;
+        // kill_on_drop requests termination of this query process. The timeout
+        // cannot preempt synchronous OS work during output's initial poll.
+        command.kill_on_drop(true);
+        let output =
+            tokio::time::timeout(
+                GIT_BRANCH_QUERY_TIMEOUT,
+                async move { command.output().await },
+            )
             .await
+            .ok()?
             .ok()?;
         if !output.status.success() {
             return None;
@@ -719,6 +736,75 @@ mod tests {
             Some("presentation/test")
         );
         cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn git_branch_returns_none_for_non_repo_and_missing_command() {
+        let (base, workspace) = fixture("git-branch-failure").await;
+        assert_eq!(workspace.git_branch().await, None);
+
+        let root = workspace.root().to_path_buf();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&root)
+            .status()
+            .expect("git must be available for the detached-head test");
+        assert!(init.success());
+        fs::write(
+            root.join(".git/HEAD"),
+            b"0000000000000000000000000000000000000000",
+        )
+        .await
+        .unwrap();
+        assert_eq!(workspace.git_branch().await, None);
+
+        let command = tokio::process::Command::new(base.join("missing-git"));
+        assert_eq!(Workspace::git_branch_with_command(command).await, None);
+        cleanup(&base).await;
+    }
+
+    #[test]
+    fn git_branch_timeout_child() {
+        let Some(started) = std::env::var_os("MINICORE_GIT_BRANCH_CHILD_STARTED") else {
+            return;
+        };
+        let Some(finished) = std::env::var_os("MINICORE_GIT_BRANCH_CHILD_FINISHED") else {
+            return;
+        };
+        std::fs::write(started, std::process::id().to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::fs::write(finished, b"finished").unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_branch_timeout_returns_none_and_kills_owned_child() {
+        let (base, workspace) = fixture("git-branch-timeout").await;
+        let started = base.join("started");
+        let finished = base.join("finished");
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "workspace::tests::git_branch_timeout_child",
+                "--nocapture",
+            ])
+            .env("MINICORE_GIT_BRANCH_CHILD_STARTED", &started)
+            .env("MINICORE_GIT_BRANCH_CHILD_FINISHED", &finished);
+
+        let started_at = std::time::Instant::now();
+        let branch = Workspace::git_branch_with_command(command).await;
+        let elapsed = started_at.elapsed();
+        assert!(started.exists());
+        assert!(branch.is_none());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "git branch query was not bounded: {elapsed:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(3_200)).await;
+        assert!(!finished.exists());
+        cleanup(&base).await;
+        let _ = workspace;
     }
 
     #[tokio::test]
