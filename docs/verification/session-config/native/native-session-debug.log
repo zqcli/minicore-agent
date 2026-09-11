@@ -1,0 +1,36 @@
+{
+  "profile": "debug",
+  "window_id": 70717,
+  "evidence_dir": "/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-session-native-kymfwfq5/evidence",
+  "tui_sha256": "1e7bff4e063c47a42663b1a509d63247e34891a194bc041054cbd4aa2513cb57",
+  "agent_sha256": "84c85c768f17741ac69e49e81da1c7b2dd92d7c4eed360a51d43e337c86d0bc8",
+  "pixel_screenshots": "UNVERIFIED; actual iTerm2 screen text/input only",
+  "status": "PASS",
+  "checks": [
+    "relative prompt path resolves outside cwd and startup snapshot survives file edit",
+    "mouse rename works during a live request; delete does not cancel or close it",
+    "selected non-active target closes separately; default Cancel never deletes",
+    "explicit delete affects only selected session; another session remains",
+    "model/reasoning mouse selection and profile/new/help/logs shared panels work"
+  ],
+  "requests": [
+    {
+      "number": 0,
+      "model": "verify-a",
+      "file_prompt_present": true,
+      "changed_prompt_absent": true
+    },
+    {
+      "number": 1,
+      "model": "verify-a",
+      "file_prompt_present": true,
+      "changed_prompt_absent": true
+    },
+    {
+      "number": 2,
+      "model": "verify-b",
+      "file_prompt_present": true,
+      "changed_prompt_absent": true
+    }
+  ]
+}

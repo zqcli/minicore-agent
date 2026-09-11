@@ -1,5 +1,10 @@
 # Agent 0.3.3 Verification
 
+Historical version-update baseline, before the presentation-risk fixes and
+same-version Session/config follow-up. Counts and installation details below
+remain the original release evidence; current feature acceptance is in
+[Session Rename And Prompt Files](../session-config.md).
+
 Paired with TUI 0.2.8. Compilation was remote-only in
 `/root/minicore-release-028-033.Fm9vbA`; no user configuration, store or real
 provider was used. No additional Agent Rust behavior was changed during the

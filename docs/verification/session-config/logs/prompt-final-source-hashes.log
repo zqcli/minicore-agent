@@ -1,0 +1,15 @@
+Prompt path encoding final hash binding
+timestamp=2026-09-11T02:41:57Z
+parent_commit=ebd0ef7
+shared_source=/Users/zzq/Develops/minicore-agent
+remote_mirror=/root/minicore-session-panels.H0sLzv/minicore-agent
+--- before Stage5 path-encoding patch ---
+8bddb857646eb153b332096733849cb4f78fb51e26c505fa0c83a421741d3df1  src/config.rs
+19dea8cf1f983adddc207bafcf092610071f72806c807a5dd8b9021445f9d548  src/agent/tests.rs
+--- after ---
+60d9917d316c7e262f455661fdbac91188d39d96e4021219076034230807fbfa  README.md
+de741402f405baa36244df36940fb72150626f8a666d4ca329f9de39fdfd6afc  example.agent.toml
+4770c4f52b4b44bd0ce3732b2c2caedd8467642b9d293017599121ae12ed31b0  src/config.rs
+a152e91099a0fabe98af7595cc21918f92544b325fd717e67212cfc6fd09066f  src/agent/tests.rs
+57b111a4d1e54d10d2ebe0ec922f6dc0320e26d1ee2611aed291c5bd54cdcba0  Cargo.toml
+a8060e8dfb10172e6bf77c33bd29916abfc8ef6a4da578d34691ec495f9854b2  Cargo.lock

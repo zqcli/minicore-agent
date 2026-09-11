@@ -1,5 +1,9 @@
 # MiniCore Agent 0.3.3
 
+This is the historical paired-release baseline. Subsequent same-version
+[Session rename and prompt-file work](verification/session-config.md) has
+separate commits, verification and installed artifacts; it has not been pushed.
+
 Paired source release with MiniCore TUI 0.2.8. This commits the previously
 uncommitted Agent work and updates the package/version examples. Runtime remains
 pinned to 0.4.1, revision `6cd2bdbc634437dea925495c61c7eb0be10ba171`.

@@ -1,0 +1,369 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/minicore_agent-e45fa09e419ee5f3)
+
+running 296 tests
+test agent::tests::cancel_turn_returns_cancelled_report_and_session_recovers ... ok
+test agent::tests::delete_rejects_loaded_session_and_removes_unloaded ... ok
+test agent::tests::aborted_agent_worker_wait_close_and_shutdown_reclaim_without_busy_loop ... ok
+test agent::tests::invalid_update_does_not_write_or_change_memory ... ok
+test agent::tests::invalid_session_json_skipped_by_list_and_fails_open ... ok
+test agent::tests::create_and_open_do_not_start_agent_loop ... ok
+test agent::tests::invalid_agents_md_fails_the_turn_as_a_prompt_error ... ok
+test agent::tests::panicked_agent_worker_publishes_internal_and_blocks_session ... ok
+test agent::tests::rename_request_debug_does_not_include_the_title ... ok
+test agent::tests::close_active_session_cancels_and_waits ... ok
+test agent::tests::rename_persistence_failure_leaves_memory_and_disk_unchanged ... ok
+test agent::tests::append_failure_blocks_session_and_returns_failed_persistence ... ok
+test agent::tests::rename_loaded_session_trims_clears_and_rejects_invalid_titles ... ok
+test agent::tests::event_stream_delivers_lifecycle_events ... ok
+test agent::tests::join_first_drains_queued_finished_without_duplicate_agent_completion ... ok
+test agent::tests::metadata_write_failure_does_not_fail_the_turn ... ok
+test agent::tests::basic_completion_persists_and_merges_history ... ok
+test agent::tests::full_agent_event_channel_keeps_wait_and_history_authoritative ... ok
+test agent::tests::idle_model_update_affects_next_loop ... ok
+test agent::tests::reopen_rejects_workspace_redirected_by_symlink ... ok
+test agent::tests::reopen_rejects_missing_workspace_and_keeps_type_identity ... ok
+test agent::tests::queued_finished_drops_are_accounted_without_runtime_completion_mapping ... ok
+test agent::tests::reopen_after_profile_removal_still_works ... ok
+test agent::tests::send_is_rejected_for_unloaded_session ... ok
+test agent::tests::persisted_history_after_failed_loop_is_still_durable ... ok
+test agent::tests::loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritative ... ok
+test agent::tests::blocked_send_does_not_discard_previous_turn_result ... ok
+test config::tests::default_profile_id_must_exist ... ok
+test config::tests::empty_default_profile_is_rejected ... ok
+test config::tests::empty_models_are_rejected ... ok
+test config::tests::empty_profiles_are_rejected ... ok
+test agent::tests::next_send_cleans_up_finished_turn_without_explicit_wait ... ok
+test config::tests::extended_reasoning_values_parse_from_toml ... ok
+test agent::tests::system_prompt_file_is_loaded_once_and_session_snapshot_survives_reopen ... ok
+test agent::tests::rename_unloaded_session_updates_only_the_persistent_metadata ... ok
+test config::tests::loop_options_applies_overrides_to_runtime_defaults ... ok
+test config::tests::loop_overrides_are_validated ... ok
+test config::tests::load_resolves_a_system_prompt_file_relative_to_the_config_parent ... ok
+test config::tests::profile_model_must_exist ... ok
+test config::tests::legacy_inline_deserialization_stays_pure_and_file_requires_an_explicit_entrypoint ... ok
+test config::tests::load_uses_the_supplied_parent_for_a_symlinked_config_file ... ok
+test agent::tests::close_and_reopen_recovers_from_blocked_session ... ok
+test config::tests::prompt_file_errors_do_not_include_path_or_file_contents ... ok
+test config::tests::prompt_file_must_be_a_regular_file ... ok
+test config::tests::tools_require_model_tool_support ... ok
+test config::tests::unsupported_reasoning_is_rejected ... ok
+test config::tests::prompt_file_symlink_to_a_regular_file_is_allowed ... ok
+test config::tests::valid_default_profile_is_accepted ... ok
+test agent::tests::live_tool_presentation_and_result_keep_runtime_identity ... ok
+test config::tests::windows_style_prompt_path_is_toml_roundtrip_safe ... ok
+test event::tests::tool_progress_debug_redacts_message ... ok
+test config::tests::relative_system_prompt_file_requires_a_config_path ... ok
+test event::tests::tool_result_debug_redacts_display_content ... ok
+test history::tests::history_tool_display_results_use_the_full_tool_identity ... ok
+test history::tests::history_view_debug_redacts_user_and_tool_content ... ok
+test history::tests::page_history_finds_a_tool_batch_beyond_the_page_boundary ... ok
+test history::tests::page_history_keeps_missing_and_cross_identity_results_distinct ... ok
+test agent::tests::history_view_exposes_whitelisted_tool_detail_without_raw_arguments ... ok
+test config::tests::valid_complete_toml_passes_validation ... ok
+test config::tests::prompt_file_object_is_strictly_typed ... ok
+test history::tests::page_history_does_not_process_unrelated_tool_results ... ok
+test history::tests::page_history_skips_result_collection_without_page_tool_calls ... ok
+test agent::tests::cancelling_wrapped_tool_preserves_runtime_outcome_and_recovery ... ok
+test agent::tests::single_active_loop_busy ... ok
+test models::openai::tests::cancelled_turn_token_purges_continuation_before_next_round ... ok
+test agent::tests::stale_turn_ref_is_rejected ... ok
+test models::openai::tests::created_event_makes_stream_cancellation_and_timeout_started ... ok
+test agent::tests::project_prompt_reloads_agents_between_requests_in_one_loop ... ok
+test models::openai::tests::descriptor_and_request_mapping_are_exact_and_secret_safe ... ok
+test models::openai::tests::fragmented_multidata_crlf_and_cr_sse_frames_are_incremental ... ok
+test models::openai::tests::compacted_request_prunes_unmatched_replay_before_later_round ... ok
+test agent::tests::unobserved_event_stream_still_persists ... ok
+test agent::tests::immediate_send_after_completion_does_not_report_busy ... ok
+test models::openai::tests::openai_call_id_parser_enforces_all_lengths_and_runtime_grammar ... ok
+test models::openai::tests::openai_live_reasoning_tool_smoke ... ignored, requires OPENAI_API_KEY and MINICORE_AGENT_LIVE_MODEL
+test models::openai::tests::openai_live_text_smoke ... ignored, requires OPENAI_API_KEY and MINICORE_AGENT_LIVE_MODEL
+test agent::tests::multi_turn_creates_new_loop_each_time_and_history_grows ... ok
+test agent::tests::steer_is_applied_and_persisted_in_order ... ok
+test models::openai::tests::queue_reasoning_delta_empty_delta_with_new_index_signals_the_next_part ... ok
+test agent::tests::rename_serializes_with_busy_completion_and_preserves_a_blocked_session ... ok
+test models::openai::tests::queue_reasoning_delta_missing_identity_is_not_a_boundary_and_partial_fields_retain_known ... ok
+test models::openai::tests::dropping_unpolled_stream_purges_turn_continuation ... ok
+test agent::tests::two_sessions_write_independently ... ok
+test models::openai::tests::fully_consumed_final_stream_does_not_replay_into_new_turn ... ok
+test models::openai::tests::provider_failure_event_is_started_and_never_exposes_raw_details ... ok
+test models::openai::tests::reasoning_adjacent_responses_keep_their_own_boundaries ... ok
+test models::openai::tests::reasoning_existing_newlines_are_never_doubled_at_boundaries ... ok
+test models::openai::tests::reasoning_delta_without_complete_item_fails_without_replay ... ok
+test models::openai::tests::reasoning_disabled_tool_loop_remains_normalized_and_stateless ... ok
+test models::openai::tests::reasoning_item_id_change_with_index_reset_still_separates ... ok
+test models::openai::tests::reasoning_missing_identity_recovers_known_part_with_single_newline ... ok
+test models::openai::tests::openai_call_ids_are_limited_before_any_tool_event_is_queued ... ok
+test models::openai::tests::reasoning_item_lifecycle_separates_when_deltas_carry_no_index ... ok
+test agent::tests::request_usage_events_carry_real_per_request_usage_across_two_sessions ... ok
+test agent::tests::running_model_update_keeps_current_request_and_reports_revision ... ok
+test models::openai::tests::retry_targets_subtract_body_time_and_reject_clock_anomalies ... ok
+test models::openai::tests::reasoning_request_mapping_and_preflight_overflow_are_conservative ... ok
+test models::openai::tests::reasoning_split_and_empty_deltas_do_not_add_lines ... ok
+test config::tests::prompt_file_content_has_explicit_size_encoding_and_content_errors ... ok
+test agent::tests::request_usage_is_keyed_per_request_index_within_one_loop ... ok
+test models::openai::tests::reasoning_summary_part_lifecycle_separates_parts_within_one_item ... ok
+test models::openai::tests::reasoning_two_summary_indexes_in_one_item_separate_with_single_newline ... ok
+test agent::tests::model_swap_keeps_request_identity_for_live_tool_display ... ok
+test models::openai::tests::skipped_model_round_purges_stale_continuation_before_request ... ok
+test agent::tests::running_model_update_applies_to_next_request_in_same_loop ... ok
+test models::openai::tests::malformed_usage_fails_the_terminal_without_usage_or_finish ... ok
+test models::openai::tests::same_turn_next_round_replays_exact_reasoning_and_function_call_items ... ok
+test models::openai::tests::terminal_output_rejects_unobserved_function_calls_without_replay ... ok
+test models::openai::tests::retryable_not_started_rate_limit_preserves_continuation_for_same_round_retry ... ok
+test models::tests::config_rejects_unsafe_base_urls_and_zero_output_budget ... ok
+test models::openai::tests::started_stream_failure_purges_replay_before_same_round_probe ... ok
+test models::tests::model_configs_expose_credential_environment_names_without_debug_leaks ... ok
+test models::openai::tests::large_provider_text_is_split_on_utf8_boundaries ... ok
+test models::openai::tests::terminal_output_replays_exact_items_when_done_events_are_absent ... ok
+test models::tests::models_require_a_nonempty_key_and_build_exact_descriptors ... ok
+test models::openai::tests::real_agent_loop_uses_mock_openai_then_read_tool_then_final_model ... ok
+test policy::tests::ask_mode_has_no_approval_cache_or_cross_instance_state ... ok
+test presentation::tests::assistant_parts_preserve_visible_order_and_redact_debug ... ok
+test presentation::tests::editor_old_and_new_and_bash_hint_lines ... ok
+test policy::tests::pre_cancel_wins_and_expired_deadline_fails_immediately ... ok
+test agent::tests::tool_loop_runs_read_and_persists_one_loop_record ... ok
+test presentation::tests::generic_tool_detail_is_bounded_single_line_and_redacted ... ok
+test policy::tests::unknown_and_mismatched_tools_are_denied_in_every_mode ... ok
+test presentation::tests::path_details_only_abbreviate_a_known_home_boundary ... ok
+test presentation::tests::path_details_preserve_paths_without_a_home_directory ... ok
+test presentation::tests::redacted_debug_never_exposes_raw_text ... ok
+test presentation::tests::hidden_counts_follow_the_fixed_tool_execution_estimator ... ok
+test policy::tests::approval_prompt_debug_and_agent_wire_do_not_expose_arguments ... ok
+test presentation::tests::steer_receipt_commits_only_at_real_start_and_emits_once_per_count ... ok
+test presentation::tests::steer_times_still_feed_the_same_live_times_queue ... ok
+test policy::tests::known_tools_follow_the_three_mode_decision_table ... ok
+test prompt::tests::bare_carriage_return_is_rejected ... ok
+test presentation::tests::whitelist_details_and_counts ... ok
+test prompt::tests::control_character_is_rejected ... ok
+test prompt::tests::empty_content_is_an_empty_instruction_set ... ok
+test prompt::tests::cancellation_after_read_future_is_pending_returns_cancelled ... ok
+test prompt::tests::incomplete_multibyte_at_boundary_without_lookahead_drops_the_char ... ok
+test prompt::tests::expired_prompt_deadline_is_rejected_before_workspace_read ... ok
+test prompt::tests::incomplete_utf8_at_eof_is_a_prompt_error ... ok
+test prompt::tests::invalid_utf8_is_a_prompt_error ... ok
+test models::openai::tests::round_one_concurrent_turn_continuations_are_isolated_by_identity ... ok
+test prompt::tests::pre_cancelled_prompt_is_rejected_before_workspace_read ... ok
+test prompt::tests::truncated_content_gets_marker ... ok
+test prompt::tests::valid_crlf_is_normalized ... ok
+test models::openai::tests::usage_is_disjoint_and_preserves_cache_reasoning_and_provider_total ... ok
+test models::openai::tests::three_round_tool_loop_replays_each_prior_provider_round_once ... ok
+test models::openai::tests::text_reasoning_refusal_and_finish_reasons_map_semantically ... ok
+test models::openai::tests::unknown_provider_start_error_purges_continuation_before_same_round_retry ... ok
+test models::openai::tests::tool_calls_support_split_done_only_and_multiple_without_duplicate_events ... ok
+test rpc::server::tests::capability_discovery_returns_ordered_lists ... ok
+test prompt::tests::crlf_across_the_boundary_is_kept_together ... ok
+test prompt::tests::multibyte_code_point_across_the_boundary_is_completed ... ok
+test prompt::tests::deadline_after_read_future_is_pending_returns_cancelled ... ok
+test rpc::server::tests::error_mapping_covers_blocked_and_stale_turn ... ok
+test models::openai::tests::continuation_item_count_overflow_fails_without_replaying_partial_items ... ok
+test models::openai::tests::rate_limits_distinguish_quota_and_parse_retry_after_strictly ... ok
+test rpc::server::tests::extended_reasoning_round_trips_through_rpc_and_reopen ... ok
+test rpc::server::tests::persistence_failure_returns_failed_and_blocked_state ... ok
+test rpc::server::tests::session_rename_rejects_invalid_titles_and_unknown_fields ... ok
+test rpc::server::tests::session_rename_is_allowed_for_a_blocked_session ... ok
+test rpc::server::tests::session_rename_is_a_separate_rpc_and_persists_title_without_config_revision ... ok
+test sessions::tests::ignored_finished_drops_accumulate_into_subsequent_agent_event ... ok
+test rpc::server::tests::create_open_history_and_send_wait_deferred ... ok
+test rpc::server::tests::session_rename_write_failure_does_not_change_loaded_state ... ok
+test rpc::server::tests::history_view_is_safe_and_pages ... ok
+test rpc::server::tests::session_rename_is_allowed_while_a_loop_is_busy ... ok
+test store::tests::core_history_corruption_is_still_rejected ... ok
+test rpc::server::tests::session_update_requires_an_unknown_field_free_shape_and_model_change ... ok
+test store::tests::append_and_load_flatten_history_in_order ... ok
+test models::openai::tests::terminal_status_and_optional_usage_are_strict ... ok
+test rpc::server::tests::interaction_answer_resolves_an_approval ... ok
+test store::tests::create_round_trip_and_delete ... ok
+test rpc::server::tests::blocked_send_does_not_discard_previous_turn_result_rpc ... ok
+test store::tests::duplicate_core_json_fields_are_rejected ... ok
+test rpc::server::tests::session_rename_supports_unloaded_sessions_and_clears_title ... ok
+test store::tests::duplicate_user_time_json_fields_are_rejected ... ok
+test store::tests::delete_only_removes_the_target_session_directory ... ok
+test store::tests::old_format_is_skipped_in_list_and_rejected_on_open ... ok
+test rpc::server::tests::shutdown_cancels_and_awaits_an_active_loop ... ok
+test store::tests::first_partial_line_only_is_truncated_to_empty_then_append_works ... ok
+test store::tests::final_partial_line_is_ignored_and_truncated ... ok
+test store::tests::middle_corrupt_line_is_corrupt ... ok
+test store::tests::loaded_history_is_sanitized_of_opaque_reasoning ... ok
+test store::tests::missing_history_file_is_corrupt_but_list_still_reads ... ok
+test store::tests::invalid_session_record_skipped_by_list_and_rejected_by_open ... ok
+test store::tests::session_record_validation_accepts_valid_multiline_prompt_and_known_tools ... ok
+test store::tests::session_record_validation_rejects_empty_and_control_chars_in_system_prompt ... ok
+test agent::tests::shared_model_keeps_live_presentation_identity_per_session ... ok
+test store::tests::session_record_validation_rejects_invalid_model_ids ... ok
+test store::tests::timestamp_validation_accepts_generated_rfc3339_and_rejects_lookalikes ... ok
+test store::tests::session_record_validation_rejects_unknown_and_duplicate_tools ... ok
+test store::tests::store_root_symlink_is_rejected ... ok
+test store::tests::symlink_session_files_are_rejected ... ok
+test store::tests::malformed_user_time_json_does_not_block_history_read_or_append ... ok
+test rpc::server::tests::steer_and_update_and_cancel_work_while_wait_is_pending ... ok
+test store::tests::same_text_users_keep_occurrence_when_one_time_is_invalid ... ok
+test store::tests::post_open_sessions_symlink_rejects_all_session_operations ... ok
+test store::tests::extended_reasoning_values_round_trip_in_record_and_history ... ok
+test store::tests::unrelated_files_do_not_break_list ... ok
+test tools::apply_patch::tests::context_failure_and_partial_second_hunk_leave_the_source_unchanged ... ok
+test tools::apply_patch::tests::atomic_failures_and_unknown_outcomes_never_report_success ... ok
+test tools::apply_patch::tests::hunk_content_at_the_wrong_declared_position_does_not_fuzzy_apply ... ok
+test store::tests::unknown_and_wrong_type_core_json_fields_are_rejected ... ok
+test tools::apply_patch::tests::matching_crlf_patch_preserves_crlf_content ... ok
+test tools::apply_patch::tests::headerless_and_standard_hunks_accept_section_headings ... ok
+test tools::apply_patch::tests::mixed_source_endings_are_preserved_outside_changes_and_additions_use_majority ... ok
+test tools::apply_patch::tests::schema_is_strict_and_headerless_patch_is_applied ... ok
+test tools::apply_patch::tests::paths_are_contained_final_symlinks_are_rejected_and_output_is_single_line ... ok
+test store::tests::user_time_metadata_is_bounded_validated_and_old_records_stay_compatible ... ok
+test tools::apply_patch::tests::c_quoted_headers_decode_tab_quote_backslash_and_octal_utf8 ... ok
+test tools::apply_patch::tests::standard_matching_headers_and_multiple_hunks_apply_unicode_changes ... ok
+test tools::apply_patch::tests::newline_markers_are_side_specific_and_preserve_crlf_final_newline_state ... ok
+test tools::bash::tests::command_environment_filters_sorts_and_deduplicates_removed_names ... ok
+test tools::apply_patch::tests::hunk_ranges_are_strict_ordered_and_support_start_zero_insertions ... ok
+test tools::bash::tests::command_environment_preserves_unremoved_public_environment ... ok
+test tools::apply_patch::tests::unsafe_or_multi_file_patch_shapes_are_invalid_and_do_not_write ... ok
+test tools::bash::tests::command_environment_sets_the_agent_marker ... ok
+test tools::bash::tests::cwd_and_agent_environment_are_set_inside_the_workspace ... ok
+test tools::bash::tests::aborting_the_execute_future_triggers_kill_on_drop ... ok
+test tools::bash::tests::cancellation_kills_and_reaps_the_direct_child ... ok
+test tools::bash::tests::invalid_inputs_and_workspace_paths_fail_with_stable_categories ... ok
+test store::tests::oversized_session_record_is_corrupt ... ok
+test tools::bash::tests::nonzero_exit_stdout_and_stderr_are_a_completed_outcome ... ok
+test tools::bash::tests::schema_is_strict_and_success_has_stable_labels ... ok
+test tools::bash::tests::invalid_utf8_ansi_nul_and_controls_are_sanitized ... ok
+test models::openai::tests::provider_event_evidence_controls_stream_error_delivery ... ok
+test tools::apply_patch::tests::cancellation_and_deadline_before_commit_do_not_modify_the_source ... ok
+test tools::bash::tests::signal_exit_uses_unavailable_exit_code ... ok
+test tools::edit::tests::atomic_failures_and_unknown_outcomes_never_report_success ... ok
+test tools::bash::tests::unix_command_environment_removes_configured_credentials ... ok
+test tools::apply_patch::tests::patch_source_and_result_limits_are_enforced_without_writing ... ok
+test tools::bash::tests::start_kill_failure_is_internal_without_waiting_for_natural_exit ... ok
+test tools::bash::tests::wait_failure_is_internal_and_child_drop_finishes_cleanup ... ok
+test tools::edit::tests::paths_are_contained_final_symlinks_are_rejected_and_output_is_single_line ... ok
+test tools::edit::tests::schema_is_strict_and_single_literal_match_is_replaced ... ok
+test tools::edit::tests::no_match_and_ambiguous_fail_without_writing_then_replace_all_is_non_overlapping ... ok
+test tools::read::tests::binary_nul_and_invalid_utf8_fail_without_output_bytes ... ok
+test tools::read::tests::decoder_excludes_lookahead_and_strips_split_crlf ... ok
+test tools::edit::tests::input_source_and_result_limits_are_enforced_before_allocation_or_write ... ok
+test tools::read::tests::directory_listing_rejects_non_utf8_names_without_lossy_merging ... ok
+test models::openai::tests::concurrent_streams_save_and_replay_isolated_continuations ... ok
+test tools::read::tests::path_escape_is_invalid_and_directory_children_are_not_followed ... ok
+test presentation::tests::result_truncation_marks_display_and_bounds_hidden_rows ... ok
+test tools::read::tests::schema_is_strict_and_file_lines_support_defaults_offset_and_limit ... ok
+test tools::edit::tests::cancellation_and_deadline_before_commit_do_not_modify_the_source ... ok
+test tools::tests::build_tools_registers_exact_subsets_and_rejects_unknown_or_duplicate_names ... ok
+test models::openai::tests::http_status_connect_timeout_and_non_sse_errors_have_conservative_delivery ... ok
+test presentation::tests::truncated_input_is_flagged_and_counts_reflect_displayable_rows ... ok
+test tools::write::tests::oversize_and_path_escape_are_invalid_invocations ... ok
+test tools::write::tests::schema_is_strict_and_write_creates_overwrites_and_allows_empty_content ... ok
+test tools::write::tests::success_output_escapes_control_characters_in_relative_path ... ok
+test tools::write::tests::symlink_escape_and_final_target_symlink_are_invalid ... ok
+test tools::read::tests::cancellation_and_deadline_interrupt_waiting_read_operations ... ok
+test tools::write::tests::workspace_atomic_failures_and_unknown_outcomes_are_failed_tools ... ok
+test workspace::tests::atomic_write_rejects_target_symlink ... ok
+test workspace::tests::atomic_overwrite_has_no_partial_result_before_rename ... ok
+test workspace::tests::atomic_write_supports_long_valid_target_basename ... ok
+test workspace::tests::bounded_reads_reject_large_and_binary_text ... ok
+test workspace::tests::directory_sync_failure_after_rename_is_unknown_with_complete_target ... ok
+test workspace::tests::git_branch_timeout_child ... ok
+test workspace::tests::git_branch_returns_none_for_non_repo_and_missing_command ... ok
+test tools::write::tests::cancellation_and_deadline_interrupt_waiting_write_operations ... ok
+test workspace::tests::lexical_validation_rejects_absolute_parent_nul_and_empty_file_paths ... ok
+test workspace::tests::open_canonicalizes_root_and_resolves_relative_files_and_directories ... ok
+test workspace::tests::resolvers_enforce_file_and_directory_types ... ok
+test workspace::tests::git_branch_uses_the_workspace_and_returns_only_symbolic_head ... ok
+test tools::write::tests::cancellation_during_commit_returns_the_real_commit_result ... ok
+test workspace::tests::symlink_escape_is_rejected_for_existing_directory_and_write_parent ... ok
+test workspace::tests::temporary_path_skips_ascii_case_insensitive_target_alias ... ok
+test workspace::tests::symlinks_inside_root_and_workspace_root_are_supported ... ok
+test workspace::tests::temporary_path_skips_exact_target_alias_across_counter_wrap ... ok
+test workspace::tests::temporary_path_skips_real_symlink_after_target_alias ... ok
+test workspace::tests::unique_temp_name_does_not_follow_fixed_symlink ... ok
+test workspace::tests::text_reads_reject_nul_but_allow_unicode_newlines_and_tabs ... ok
+test workspace::tests::write_resolution_and_atomic_write_create_nested_parents ... ok
+test tools::read::tests::directory_listing_is_sorted_marks_directories_and_truncates_at_1000 ... ok
+test tools::read::tests::file_reads_enforce_line_and_byte_truncation_with_utf8_boundaries ... ok
+test tools::apply_patch::tests::thousands_of_hunks_use_single_forward_source_and_patch_steps ... ok
+test models::openai::tests::unsafe_or_oversized_sse_and_invalid_tool_lifecycle_fail_closed ... ok
+test models::openai::tests::request_replay_call_ids_validate_before_any_http_request ... ok
+test tools::write::tests::output_is_prevalidated_before_workspace_mutation ... ok
+test models::openai::tests::cancellation_before_send_and_during_stream_drop_owned_http_work ... ok
+test tools::read::tests::byte_cap_lookahead_validates_utf8_crlf_and_true_eof ... ok
+test store::tests::oversized_line_is_corrupt ... ok
+test tools::bash::tests::simultaneous_large_streams_are_drained_bounded_and_marked ... ok
+test models::openai::tests::active_continuation_limit_evicts_oldest_without_clearing_newest ... ok
+test tools::bash::tests::timeout_kills_and_reaps_the_direct_child ... ok
+test models::openai::tests::continuation_raw_byte_overflow_fails_without_replaying_partial_items ... ok
+test tools::write::tests::deadline_during_commit_returns_post_rename_unknown_outcome ... ok
+test tools::bash::tests::earliest_context_or_input_deadline_wins ... ok
+test tools::bash::tests::exited_child_with_inherited_pipes_obeys_input_and_context_deadlines ... ok
+test store::tests::record_too_large_append_is_rejected ... ok
+test store::tests::oversized_final_partial_line_is_repaired_and_appendable ... ok
+test workspace::tests::git_branch_timeout_returns_none_and_kills_owned_child ... ok
+test store::tests::user_time_metadata_does_not_displace_core_at_line_limit ... ok
+test store::tests::legal_complete_line_at_limit_is_accepted_but_just_over_limit_is_corrupt ... ok
+
+test result: ok. 294 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 5.26s
+
+     Running unittests src/main.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/minicore_agent-8eee20f203a69d1e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/openai_rpc_process.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/openai_rpc_process-a873a199f5f74e7f)
+
+running 4 tests
+test provider_error_body_secret_never_reaches_process_rpc_or_stderr ... ok
+test full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_else ... ok
+test full_process_runs_openai_read_tool_loop_and_redacted_history ... ok
+test full_process_bash_removes_model_credentials_and_preserves_public_environment ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/rpc_soak.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/rpc_soak-ba5e37ff8e618163)
+
+running 2 tests
+test cancel_does_not_break_subsequent_turns_or_history ... ok
+test repeated_turns_on_two_sessions_persist_contiguous_histories ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/rpc_stdio.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/rpc_stdio-4c9ba613afd7e3c2)
+
+running 5 tests
+test eof_shuts_down_without_an_extra_frame ... ok
+test complete_config_exposes_stable_profile_model_and_session_behavior ... ok
+test debug_logging_keeps_stdout_json_rpc_only_and_uses_safe_stderr_markers ... ok
+test stdio_classifies_frames_and_preserves_valid_ids ... ok
+test oversized_frame_is_rejected_before_unbounded_buffering_and_exits ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/skeleton.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/skeleton-2da78c716fce4133)
+
+running 3 tests
+test public_agent_query_and_wait_contract_compiles ... ok
+test complete_public_config_exposes_default_profile_and_model ... ok
+test config_parses_and_rejects_out_of_bound_capacity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/startup_errors.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/startup_errors-ff1e4fc8de31cc10)
+
+running 4 tests
+test config_error_display_carries_predefined_static_cause ... ok
+test unsupported_compaction_field_rejected_without_leaking_config_text ... ok
+test fixed_config_boots_ping_and_shutdown_with_placeholder_key ... ok
+test missing_or_empty_api_key_reports_distinct_safe_message ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/tui_rpc_flow.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/tui_rpc_flow-6681b1acb4466e45)
+
+running 6 tests
+test tui_error_mappings_cover_new_wire_types ... ok
+test tui_streams_reasoning_and_text_channels ... ok
+test tui_tool_loop_shows_lifecycle_and_safe_history ... ok
+test tui_steer_update_cancel_while_wait_is_pending ... ok
+test tui_two_sessions_run_independently ... ok
+test tui_discovery_create_history_and_reopen_flow ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
