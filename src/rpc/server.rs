@@ -23,9 +23,9 @@ use super::protocol::{
     PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest,
     RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED,
     STEER_QUEUE_FULL, STORE_ERROR, SessionCreateParams, SessionHistoryParams, SessionParams,
-    SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult, SteerResult,
-    TURN_NOT_FOUND, TurnParams, TurnResult, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR,
-    decode_params, parse_request, request_id,
+    SessionRenameParams, SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult,
+    SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult, TurnSendParams, TurnSteerParams,
+    WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -320,6 +320,18 @@ impl RpcServer {
                     .update_session(params.into())
                     .await
                     .map(SessionUpdateResult::from);
+                Dispatch::Response(agent_result(&id, result))
+            }
+            "session.rename" => {
+                let params: SessionRenameParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self
+                    .agent_mut()
+                    .rename_session(params.into())
+                    .await
+                    .map(|session| SessionResult { session });
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.history" => {
@@ -723,6 +735,7 @@ fn canonical_method(method: &str) -> &'static str {
         "session.delete" => "session.delete",
         "session.state" => "session.state",
         "session.update" => "session.update",
+        "session.rename" => "session.rename",
         "session.history" => "session.history",
         "session.presentation" => "session.presentation",
         "turn.send" => "turn.send",

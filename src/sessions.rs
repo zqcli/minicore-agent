@@ -683,6 +683,28 @@ impl Session {
         }
     }
 
+    /// Persists only the title and timestamp while serializing with history
+    /// append and metadata touches for this Session.
+    pub(crate) async fn rename(&self, title: Option<String>) -> Result<(), AgentError> {
+        let _io = self.shared.io.lock().await;
+        let updated_at = utc_timestamp().map_err(|_| AgentError::Store)?;
+        let record = {
+            let inner = self.shared.inner.lock().unwrap();
+            let mut record = inner.record.clone();
+            record.title = title;
+            record.updated_at = updated_at;
+            record
+        };
+        self.shared
+            .store
+            .write_record(&record)
+            .await
+            .map_err(map_store_error)?;
+        let mut inner = self.shared.inner.lock().unwrap();
+        inner.record = record;
+        Ok(())
+    }
+
     /// Cancels the active loop (if any) and awaits its Agent-owned task.
     pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
         let active = {
@@ -819,6 +841,8 @@ async fn run_active_loop(
     };
 
     let persistence = {
+        // The same per-session IO lock serializes this metadata touch with
+        // rename and settings updates; each write starts from current record state.
         let _io = session.shared.io.lock().await;
         match session
             .shared

@@ -23,7 +23,7 @@ use crate::config::{AgentConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
-use crate::store::fail_next_append;
+use crate::store::{fail_next_append, fail_next_record_write};
 
 use super::run_with_io;
 
@@ -479,6 +479,312 @@ async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
     assert_eq!(
         harness.response(json!("close-again")).await["result"],
         json!({"ok": true})
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_rename_is_a_separate_rpc_and_persists_title_without_config_revision() {
+    let (agent, base, workspace) = test_agent(
+        "rename-basic",
+        [ModelScript::Text("done")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("rename"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": "  Unicode 名称  "})),
+        )
+        .await;
+    let renamed = harness.response(json!("rename")).await;
+    assert_eq!(renamed["result"]["session"]["title"], json!("Unicode 名称"));
+    assert!(renamed["result"].get("active_revision").is_none());
+    assert_eq!(renamed["result"]["session"]["model"], json!("fake"));
+    assert_eq!(renamed["result"]["session"]["reasoning"], json!("medium"));
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+
+    harness
+        .send(
+            json!("reopen"),
+            "session.open",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let reopened = harness.response(json!("reopen")).await;
+    assert_eq!(
+        reopened["result"]["session"]["title"],
+        json!("Unicode 名称")
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_rename_supports_unloaded_sessions_and_clears_title() {
+    let (agent, base, workspace) = test_agent("rename-unloaded", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+
+    harness
+        .send(
+            json!("rename-unloaded"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": "  Unloaded  "})),
+        )
+        .await;
+    let renamed = harness.response(json!("rename-unloaded")).await;
+    assert_eq!(renamed["result"]["session"]["title"], json!("Unloaded"));
+    assert_eq!(renamed["result"]["session"]["loaded"], json!(false));
+
+    harness
+        .send(
+            json!("clear"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": " \t "})),
+        )
+        .await;
+    let cleared = harness.response(json!("clear")).await;
+    assert!(cleared["result"]["session"]["title"].is_null());
+
+    harness
+        .send(
+            json!("open"),
+            "session.open",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let reopened = harness.response(json!("open")).await;
+    assert!(reopened["result"]["session"]["title"].is_null());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_rename_rejects_invalid_titles_and_unknown_fields() {
+    let (agent, base, workspace) = test_agent("rename-invalid", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    let titles = ["bad\nname", "bad\0name", &"x".repeat(4_097)];
+    for (index, title) in titles.iter().enumerate() {
+        let id = json!(format!("invalid-{index}"));
+        harness
+            .send(
+                id.clone(),
+                "session.rename",
+                Some(json!({"session_id": session_id, "title": title})),
+            )
+            .await;
+        let response = harness.response(id).await;
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["data"]["kind"], json!("invalid_params"));
+        assert!(!response.to_string().contains("bad"));
+    }
+
+    harness
+        .send(
+            json!("unknown"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": "ok", "extra": true})),
+        )
+        .await;
+    let unknown = harness.response(json!("unknown")).await;
+    assert_eq!(unknown["error"]["code"], json!(-32602));
+
+    let missing_id = SessionId::new().unwrap();
+    harness
+        .send(
+            json!("missing"),
+            "session.rename",
+            Some(json!({
+                "session_id": missing_id,
+                "title": "missing"
+            })),
+        )
+        .await;
+    let missing = harness.response(json!("missing")).await;
+    assert_eq!(missing["error"]["code"], json!(-32001));
+    assert_eq!(missing["error"]["data"]["kind"], json!("session_not_found"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_rename_write_failure_does_not_change_loaded_state() {
+    let (agent, base, workspace) =
+        test_agent("rename-write-failure", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
+    fail_next_record_write(typed_id);
+
+    harness
+        .send(
+            json!("rename"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": "not persisted"})),
+        )
+        .await;
+    let failure = harness.response(json!("rename")).await;
+    assert_eq!(failure["error"]["code"], json!(-32011));
+    assert_eq!(failure["error"]["data"]["kind"], json!("store_error"));
+    assert!(!failure.to_string().contains("not persisted"));
+
+    harness
+        .send(json!("list"), "session.list", Some(json!({})))
+        .await;
+    let listed = harness.response(json!("list")).await;
+    assert_eq!(
+        listed["result"]["sessions"][0]["title"],
+        json!("rpc session")
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_rename_is_allowed_while_a_loop_is_busy() {
+    let (agent, base, workspace) = test_agent(
+        "rename-busy-rpc",
+        [ModelScript::Block],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "busy"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+
+    harness
+        .send(
+            json!("rename"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": "Busy title"})),
+        )
+        .await;
+    let renamed = harness.response(json!("rename")).await;
+    assert_eq!(renamed["result"]["session"]["title"], json!("Busy title"));
+    assert!(renamed["result"].get("active_revision").is_none());
+
+    harness
+        .send(
+            json!("cancel"),
+            "turn.cancel",
+            Some(json!({
+                "session_id": turn["session_id"],
+                "loop_id": turn["loop_id"]
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel")).await["result"]["cancelled"],
+        json!(true)
+    );
+    harness
+        .send(
+            json!("wait"),
+            "turn.wait",
+            Some(json!({
+                "session_id": turn["session_id"],
+                "loop_id": turn["loop_id"]
+            })),
+        )
+        .await;
+    let waited = harness.response(json!("wait")).await;
+    assert_eq!(waited["result"]["persistence"], json!("persisted"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_rename_is_allowed_for_a_blocked_session() {
+    let (agent, base, workspace) = test_agent(
+        "rename-blocked-rpc",
+        [ModelScript::Text("done")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
+    fail_next_append(typed_id);
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "block"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(
+            json!("wait"),
+            "turn.wait",
+            Some(json!({
+                "session_id": turn["session_id"],
+                "loop_id": turn["loop_id"]
+            })),
+        )
+        .await;
+    let waited = harness.response(json!("wait")).await;
+    assert_eq!(waited["result"]["persistence"], json!("failed"));
+
+    harness
+        .send(
+            json!("rename"),
+            "session.rename",
+            Some(json!({"session_id": session_id, "title": "Blocked title"})),
+        )
+        .await;
+    let renamed = harness.response(json!("rename")).await;
+    assert_eq!(
+        renamed["result"]["session"]["title"],
+        json!("Blocked title")
     );
 
     harness.shutdown().await;
