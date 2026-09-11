@@ -18,9 +18,9 @@ mod tools;
 mod workspace;
 
 pub use agent::{
-    Agent, AnswerInteraction, CreateSession, GetHistory, HistoryPage, PingResponse, RenameSession,
-    SendMessage, SessionInfo, SessionState, SessionStatus, SessionUpdateResult, SteerMessage,
-    TurnPersistence, TurnRef, TurnResult, UpdateSession, agent_version,
+    Agent, AnswerInteraction, CreateSession, GetHistory, HistoryPage, PingResponse, ReloadResult,
+    RenameSession, SendMessage, SessionInfo, SessionState, SessionStatus, SessionUpdateResult,
+    SteerMessage, TurnPersistence, TurnRef, TurnResult, UpdateSession, agent_version,
 };
 pub use config::{AgentConfig, ApprovalMode, ConfigError, LoopOverrides, Profile};
 pub use error::{AgentError, RuntimeErrorView};

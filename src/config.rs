@@ -53,16 +53,22 @@ impl AgentConfig {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|_| ConfigError::Read)?
-                .join(path)
-        };
+        let path = Self::absolute_lexical_path(path.as_ref())?;
         let text = std::fs::read_to_string(&path).map_err(|_| ConfigError::Read)?;
         Self::from_toml_with_base(&text, path.parent())
+    }
+
+    /// Makes the path absolute without canonicalizing it. In particular,
+    /// symlinked parents remain part of the lexical path used for relative
+    /// prompt files and later reloads.
+    pub(crate) fn absolute_lexical_path(path: &Path) -> Result<PathBuf, ConfigError> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            std::env::current_dir()
+                .map(|current| current.join(path))
+                .map_err(|_| ConfigError::Read)
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {

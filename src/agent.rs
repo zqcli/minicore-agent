@@ -35,6 +35,11 @@ pub struct PingResponse {
     pub version: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ReloadResult {
+    pub ok: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSession {
@@ -152,6 +157,7 @@ struct ResolvedSessionSettings {
 /// synchronously wait for Agent-owned loop tasks.
 pub struct Agent {
     config: AgentConfig,
+    config_path: Option<PathBuf>,
     store: Store,
     profiles: Profiles,
     models: Models,
@@ -167,7 +173,18 @@ impl Agent {
         let models = Models::from_config(&config.models)
             .await
             .map_err(map_model_config_error)?;
-        Self::open_parts(config, models).await
+        Self::open_parts(config, models, None).await
+    }
+
+    /// Opens an Agent from a configuration file and retains its absolute
+    /// lexical path as the only source used by `reload`.
+    pub async fn open_file(path: impl AsRef<std::path::Path>) -> Result<Self, AgentError> {
+        let path = AgentConfig::absolute_lexical_path(path.as_ref()).map_err(AgentError::Config)?;
+        let config = AgentConfig::load(&path).map_err(AgentError::Config)?;
+        let models = Models::from_config(&config.models)
+            .await
+            .map_err(map_model_config_error)?;
+        Self::open_parts(config, models, Some(path)).await
     }
 
     #[cfg(test)]
@@ -176,17 +193,15 @@ impl Agent {
         models: Models,
     ) -> Result<Self, AgentError> {
         config.validate().map_err(AgentError::Config)?;
-        Self::open_parts(config, models).await
+        Self::open_parts(config, models, None).await
     }
 
-    async fn open_parts(config: AgentConfig, models: Models) -> Result<Self, AgentError> {
-        let command_environment = CommandEnvironment::new(
-            config
-                .models
-                .values()
-                .map(ModelConfig::credential_env_name)
-                .map(OsString::from),
-        );
+    async fn open_parts(
+        config: AgentConfig,
+        models: Models,
+        config_path: Option<PathBuf>,
+    ) -> Result<Self, AgentError> {
+        let command_environment = command_environment(&config);
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone())
             .await
@@ -195,6 +210,7 @@ impl Agent {
         let event_sink = AgentEventSink::new(events_tx);
         let agent = Self {
             config,
+            config_path,
             store,
             profiles,
             models,
@@ -209,6 +225,84 @@ impl Agent {
 
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// Reloads the retained startup file into future-turn state. The
+    /// fallible candidate build completes before any in-memory swap.
+    pub async fn reload(&mut self) -> Result<ReloadResult, AgentError> {
+        let path = self
+            .config_path
+            .clone()
+            .ok_or(AgentError::ReloadUnavailable)?;
+        let config = AgentConfig::load(&path).map_err(AgentError::Config)?;
+        self.reload_settings(config).await
+    }
+
+    pub(crate) async fn reload_settings(
+        &mut self,
+        candidate: AgentConfig,
+    ) -> Result<ReloadResult, AgentError> {
+        candidate.validate().map_err(AgentError::Config)?;
+        if candidate.data_dir != self.config.data_dir
+            || candidate.event_capacity != self.config.event_capacity
+        {
+            return Err(AgentError::ReloadRequiresRestart);
+        }
+        let models = Models::from_config(&candidate.models)
+            .await
+            .map_err(map_model_config_error)?;
+        self.apply_reload_settings(candidate, models)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_settings_with_models(
+        &mut self,
+        candidate: AgentConfig,
+        models: Models,
+    ) -> Result<ReloadResult, AgentError> {
+        candidate.validate().map_err(AgentError::Config)?;
+        if candidate.data_dir != self.config.data_dir
+            || candidate.event_capacity != self.config.event_capacity
+        {
+            return Err(AgentError::ReloadRequiresRestart);
+        }
+        self.apply_reload_settings(candidate, models)
+    }
+
+    fn apply_reload_settings(
+        &mut self,
+        candidate: AgentConfig,
+        models: Models,
+    ) -> Result<ReloadResult, AgentError> {
+        let profiles = candidate.profiles();
+        let command_environment = reload_command_environment(&self.command_environment, &candidate);
+        let mut session_candidates = Vec::with_capacity(self.sessions.iter().count());
+        for session in self.sessions.iter() {
+            let record = session.record();
+            let workspace = session.workspace();
+            let presentation = session.presentation();
+            let config = Self::execution_config_with(
+                &models,
+                &command_environment,
+                &record,
+                workspace,
+                presentation,
+            )?;
+            let options = candidate
+                .loop_options(record.max_tool_rounds)
+                .map_err(AgentError::Config)?;
+            session_candidates.push((session.clone(), config, options));
+        }
+
+        self.config = candidate;
+        self.profiles = profiles;
+        self.models = models;
+        self.command_environment = command_environment;
+        for (session, config, options) in session_candidates {
+            session.replace_future_config(config, options);
+        }
+        tracing::info!("agent configuration reloaded");
+        Ok(ReloadResult { ok: true })
     }
 
     pub fn take_events(&mut self) -> Result<AgentEventStream, AgentError> {
@@ -706,15 +800,28 @@ impl Agent {
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
     ) -> Result<ExecutionConfig, AgentError> {
-        let model = self
-            .models
-            .get(&record.model)
-            .map_err(map_model_config_error)?;
+        Self::execution_config_with(
+            &self.models,
+            &self.command_environment,
+            record,
+            workspace,
+            presentation,
+        )
+    }
+
+    fn execution_config_with(
+        models: &Models,
+        command_environment: &CommandEnvironment,
+        record: &SessionRecord,
+        workspace: Arc<Workspace>,
+        presentation: Arc<crate::presentation::Presentation>,
+    ) -> Result<ExecutionConfig, AgentError> {
+        let model = models.get(&record.model).map_err(map_model_config_error)?;
         let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
         let tools = crate::tools::build_tools_with_presentation(
             &record.tools,
             Arc::clone(&workspace),
-            self.command_environment.clone(),
+            command_environment.clone(),
             &presentation,
         )
         .map_err(map_build_tools_error)?;
@@ -800,6 +907,32 @@ fn map_model_config_error(error: ModelConfigError) -> AgentError {
 
 pub const fn agent_version() -> &'static str {
     VERSION
+}
+
+fn command_environment(config: &AgentConfig) -> CommandEnvironment {
+    CommandEnvironment::new(
+        config
+            .models
+            .values()
+            .map(ModelConfig::credential_env_name)
+            .map(OsString::from),
+    )
+}
+
+// Keep prior credential names scrubbed from future Bash children too. A
+// removed model's key may still be present in the Agent process environment;
+// dropping that name during reload would make it visible to a later command.
+fn reload_command_environment(
+    current: &CommandEnvironment,
+    candidate: &AgentConfig,
+) -> CommandEnvironment {
+    current.extended(
+        candidate
+            .models
+            .values()
+            .map(ModelConfig::credential_env_name)
+            .map(OsString::from),
+    )
 }
 
 #[cfg(test)]

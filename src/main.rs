@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use minicore_agent::{Agent, AgentConfig, AgentError, run_stdio};
+use minicore_agent::{Agent, AgentError, run_stdio};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
@@ -46,7 +46,7 @@ async fn run() -> Result<(), AgentError> {
             Ok(())
         }
         Command::Stdio { config } => {
-            let agent = Agent::open(AgentConfig::load(config).map_err(AgentError::Config)?).await?;
+            let agent = Agent::open_file(config).await?;
             run_stdio(agent).await
         }
     }

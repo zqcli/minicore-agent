@@ -1941,6 +1941,376 @@ async fn idle_model_update_affects_next_loop() {
 }
 
 #[tokio::test]
+async fn embedded_open_without_a_file_source_cannot_reload() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-no-source-{}", next_id()));
+    let (workspace, _guard) = workspace_file("reload-no-source-ws", "a.txt", b"hello");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        read_profile(),
+    )
+    .await;
+
+    assert!(matches!(
+        agent.reload().await,
+        Err(AgentError::ReloadUnavailable)
+    ));
+    let _ = create_session(&mut agent, &workspace).await;
+}
+
+#[tokio::test]
+async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-active-{}", next_id()));
+    let (workspace, _guard) = workspace_file("reload-active-ws", "a.txt", b"hello");
+    let gate = BlockGate::new();
+    let model_a = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "old")]);
+    let model_b = FakeModel::new("main", [ModelScript::Text("new")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let first = send_text(&mut agent, info.session_id, "first").await;
+    gate.entered.notified().await;
+
+    let candidate = agent.config().clone();
+    let candidate_models = Models::from_values(BTreeMap::from([(
+        "main".to_owned(),
+        Arc::clone(&model_b) as Arc<dyn Model>,
+    )]));
+    assert_eq!(
+        agent
+            .reload_settings_with_models(candidate, candidate_models)
+            .unwrap(),
+        crate::agent::ReloadResult { ok: true }
+    );
+
+    gate.release.notify_waiters();
+    wait_text(&agent, first).await;
+    assert_eq!(model_a.requests().lock().unwrap().len(), 1);
+
+    let second = send_text(&mut agent, info.session_id, "second").await;
+    wait_text(&agent, second).await;
+    assert_eq!(model_a.requests().lock().unwrap().len(), 1);
+    assert_eq!(model_b.requests().lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reload_command_environment_accumulates_all_prior_credential_names() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-env-merge-{}", next_id()));
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+
+    let mut candidate_b = agent.config().clone();
+    if let Some(ModelConfig::OpenAiResponses { api_key_env, .. }) =
+        candidate_b.models.get_mut("main")
+    {
+        *api_key_env = "MINICORE_RELOAD_UNIT_KEY_B".to_owned();
+    }
+    agent
+        .reload_settings_with_models(
+            candidate_b,
+            Models::from_values(BTreeMap::from([(
+                "main".to_owned(),
+                Arc::clone(&model) as Arc<dyn Model>,
+            )])),
+        )
+        .unwrap();
+
+    let mut candidate_c = agent.config().clone();
+    if let Some(ModelConfig::OpenAiResponses { api_key_env, .. }) =
+        candidate_c.models.get_mut("main")
+    {
+        *api_key_env = "MINICORE_RELOAD_UNIT_KEY_C".to_owned();
+    }
+    agent
+        .reload_settings_with_models(
+            candidate_c,
+            Models::from_values(BTreeMap::from([(
+                "main".to_owned(),
+                Arc::clone(&model) as Arc<dyn Model>,
+            )])),
+        )
+        .unwrap();
+
+    let names = agent
+        .command_environment
+        .names()
+        .iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "MINICORE_AGENT_TEST_KEY",
+            "MINICORE_RELOAD_UNIT_KEY_B",
+            "MINICORE_RELOAD_UNIT_KEY_C",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-atomic-{}", next_id()));
+    let (workspace, _guard) = workspace_file("reload-atomic-ws", "a.txt", b"hello");
+    let model_main = FakeModel::new("main", [ModelScript::Text("main")]);
+    let model_other = FakeModel::new("other", [ModelScript::Text("other")]);
+    let model_reloaded = FakeModel::new("main", [ModelScript::Text("reloaded")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_main)),
+            ("other".to_owned(), Arc::clone(&model_other)),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let first = send_text(&mut agent, info.session_id, "before reload").await;
+    wait_text(&agent, first).await;
+    let history_path = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+    let record_before = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    let models_before = agent
+        .list_models()
+        .into_iter()
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+
+    let mut candidate = agent.config().clone();
+    candidate.profiles.get_mut("test").unwrap().model = "other".to_owned();
+    candidate.profiles.get_mut("test").unwrap().system_prompt = "new profile prompt".to_owned();
+    candidate.models.remove("main");
+    let candidate_models = Models::from_values(BTreeMap::from([(
+        "other".to_owned(),
+        Arc::clone(&model_other) as Arc<dyn Model>,
+    )]));
+    assert!(matches!(
+        agent.reload_settings_with_models(candidate, candidate_models),
+        Err(AgentError::ModelNotFound)
+    ));
+    assert_eq!(
+        agent
+            .list_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>(),
+        models_before
+    );
+    assert_eq!(agent.list_profiles()[0].model, "main");
+    assert_eq!(agent.config().default_profile, "test");
+    assert_eq!(agent.list_sessions().await.unwrap()[0].model, "main");
+    let record_disk_after = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&record_before).unwrap(),
+        serde_json::to_vec(&record_disk_after).unwrap()
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+
+    let mut valid = agent.config().clone();
+    valid.profiles.get_mut("test").unwrap().model = "other".to_owned();
+    valid.profiles.get_mut("test").unwrap().system_prompt = "new profile prompt".to_owned();
+    valid.profiles.insert(
+        "new-default".to_owned(),
+        Profile {
+            model: "other".to_owned(),
+            reasoning: ReasoningPreference::Auto,
+            system_prompt: "new default prompt".to_owned(),
+            tools: Vec::new(),
+            max_tool_rounds: 8,
+            approval: ApprovalMode::Auto,
+        },
+    );
+    valid.default_profile = "new-default".to_owned();
+    let valid_models = Models::from_values(BTreeMap::from([
+        (
+            "main".to_owned(),
+            Arc::clone(&model_reloaded) as Arc<dyn Model>,
+        ),
+        (
+            "other".to_owned(),
+            Arc::clone(&model_other) as Arc<dyn Model>,
+        ),
+    ]));
+    agent
+        .reload_settings_with_models(valid, valid_models)
+        .unwrap();
+    let profiles = agent.list_profiles();
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.id == "new-default" && profile.model == "other")
+    );
+    assert!(
+        profiles
+            .iter()
+            .any(|profile| profile.id == "test" && profile.model == "other")
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+    let record_after = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&record_before).unwrap(),
+        serde_json::to_vec(&record_after).unwrap()
+    );
+
+    let second = send_text(&mut agent, info.session_id, "after reload").await;
+    wait_text(&agent, second).await;
+    {
+        let requests = model_reloaded.requests();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let system_prompt = requests[0]
+            .messages()
+            .iter()
+            .find_map(|message| match message {
+                ModelMessage::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("reloaded request must have a system prompt");
+        assert!(system_prompt.contains("test system prompt"));
+        assert!(!system_prompt.contains("new profile prompt"));
+    }
+
+    let (new_workspace, _new_workspace_guard) =
+        workspace_file("reload-atomic-new-ws", "b.txt", b"new");
+    let new_info = create_session(&mut agent, &new_workspace).await;
+    assert_eq!(new_info.profile, "new-default");
+    assert_eq!(new_info.model, "other");
+    let third = send_text(&mut agent, new_info.session_id, "new session").await;
+    wait_text(&agent, third).await;
+    let requests = model_other.requests();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let new_system_prompt = requests[0]
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            ModelMessage::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("new-session request must have a system prompt");
+    assert!(new_system_prompt.contains("new default prompt"));
+    assert!(!new_system_prompt.contains("test system prompt"));
+}
+
+#[tokio::test]
+async fn reload_rejects_store_and_event_capacity_changes_before_swap() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-restart-{}", next_id()));
+    let (workspace, _guard) = workspace_file("reload-restart-ws", "a.txt", b"hello");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        read_profile(),
+    )
+    .await;
+    let _ = create_session(&mut agent, &workspace).await;
+
+    let mut data_dir_candidate = agent.config().clone();
+    data_dir_candidate.data_dir = data_dir.join("other-data");
+    assert!(matches!(
+        agent.reload_settings_with_models(
+            data_dir_candidate,
+            Models::from_values(BTreeMap::from([(
+                "main".to_owned(),
+                FakeModel::new("main", []) as Arc<dyn Model>,
+            )]))
+        ),
+        Err(AgentError::ReloadRequiresRestart)
+    ));
+
+    let mut event_capacity_candidate = agent.config().clone();
+    event_capacity_candidate.event_capacity += 1;
+    assert!(matches!(
+        agent.reload_settings_with_models(
+            event_capacity_candidate,
+            Models::from_values(BTreeMap::from([(
+                "main".to_owned(),
+                FakeModel::new("main", []) as Arc<dyn Model>,
+            )]))
+        ),
+        Err(AgentError::ReloadRequiresRestart)
+    ));
+    assert_eq!(agent.config().event_capacity, 256);
+}
+
+#[tokio::test]
+async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-blocked-{}", next_id()));
+    let (workspace, _guard) = workspace_file("reload-blocked-ws", "a.txt", b"hello");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([(
+            "main".to_owned(),
+            FakeModel::new("main", [ModelScript::Text("done")]),
+        )]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    fail_next_append(info.session_id);
+    let turn = send_text(&mut agent, info.session_id, "block").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
+    assert_eq!(
+        agent.session_state(info.session_id).unwrap().status,
+        crate::sessions::SessionStatus::Blocked
+    );
+    let history_path = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+
+    let candidate_models = Models::from_values(BTreeMap::from([(
+        "main".to_owned(),
+        FakeModel::new("main", []) as Arc<dyn Model>,
+    )]));
+    let candidate = agent.config().clone();
+    agent
+        .reload_settings_with_models(candidate, candidate_models)
+        .unwrap();
+    assert_eq!(
+        agent.session_state(info.session_id).unwrap().status,
+        crate::sessions::SessionStatus::Blocked
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+    assert!(matches!(
+        agent
+            .send(crate::agent::SendMessage {
+                session_id: info.session_id,
+                text: "still blocked".to_owned(),
+            })
+            .await,
+        Err(AgentError::SessionBlocked)
+    ));
+}
+
+#[tokio::test]
 async fn running_model_update_keeps_current_request_and_reports_revision() {
     let (data_dir, _guard) = fixture_dir(&format!("running-update-{}", next_id()));
     let (workspace, _guard) = workspace_file("running-update-ws", "a.txt", b"hello");

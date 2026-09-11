@@ -81,6 +81,33 @@ it does not currently preserve a distinct shutdown cancellation reason.
 `{"version":"0.3.3"}`. `agent.shutdown` accepts the same empty params, starts
 orderly shutdown, and returns `{"ok":true}` as the final frame on success.
 
+### `agent.reload`
+
+`agent.reload` accepts omitted params or `{}` and rereads only the absolute
+lexical configuration path supplied at startup. The request cannot provide a
+different path:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"agent.reload","params":{}}
+```
+
+On success it returns `{"ok":true}`. The reload parses prompt files and
+rebuilds the model/profile catalog and command environment before validating
+every loaded Session's future execution snapshot. Session records, selected
+models, reasoning, tools, system-prompt snapshots, history, and Store files
+are not rewritten. Existing Sessions keep those persisted snapshots; newly
+created Sessions use the reloaded profile/default catalog. Active loops keep
+their current request configuration and are not updated, cancelled, or
+reopened; the new configuration applies to future turns. `data_dir` and the
+Agent-level `event_capacity` require restart.
+
+`Agent::open` creates an embedded Agent without a reload source and therefore
+returns `reload_unavailable`; the binary uses `Agent::open_file` so its startup
+configuration can be reloaded. A failed reload leaves the current catalog,
+loaded Sessions, and configuration unchanged. The reload operation does not
+reload the Agent binary or previously stored Session system-prompt snapshots;
+workspace `AGENTS.md` remains request-level behavior.
+
 ## Discovery
 
 ### `profile.list`
@@ -508,6 +535,8 @@ errors:
 | `-32014` | `invalid_session_settings` |
 | `-32015` | `history_too_large` |
 | `-32016` | `steer_queue_full` |
+| `-32017` | `reload_requires_restart` |
+| `-32018` | `reload_unavailable` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or

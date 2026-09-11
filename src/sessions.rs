@@ -201,6 +201,10 @@ impl Sessions {
         self.loaded.remove(&session_id)
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Session> {
+        self.loaded.values()
+    }
+
     pub(crate) async fn shutdown_all(&mut self) -> Result<(), AgentError> {
         let mut ids = self.loaded.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
@@ -638,6 +642,14 @@ impl Session {
 
     pub(crate) fn presentation_view(&self) -> crate::presentation::PresentationView {
         self.presentation().snapshot()
+    }
+
+    /// Replaces only the future-turn execution snapshot. This never persists
+    /// Session metadata and never forwards a config update to an active loop.
+    pub(crate) fn replace_future_config(&self, config: ExecutionConfig, options: LoopOptions) {
+        let mut inner = self.shared.inner.lock().unwrap();
+        inner.config = config;
+        inner.options = options;
     }
 
     /// Persists the new record and swaps the long-lived execution config.
