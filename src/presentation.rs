@@ -729,16 +729,32 @@ impl Tool for PresentationTool {
         Box::pin(async move {
             let result = inner.execute(invocation, context).await;
             // Best-effort display bookkeeping after execution; the outcome and
-            // error below are forwarded unchanged.
-            if let Ok(ToolExecutionOutcome::Completed(output)) = &result {
-                let result_text =
-                    bounded_display_copy(output.content().as_str(), MAX_RESULT_DISPLAY_BYTES);
-                presentation.finish_tool(request_key, &tool_call_id, result_text);
-            } else {
-                presentation.finish_tool(request_key, &tool_call_id, None);
-            }
+            // error below are forwarded unchanged. Runtime errors are static
+            // enum variants, but map them explicitly so a future diagnostic
+            // carrying arbitrary text cannot leak into the display cache.
+            let result_text = match &result {
+                Ok(ToolExecutionOutcome::Completed(output)) => {
+                    bounded_display_copy(output.content().as_str(), MAX_RESULT_DISPLAY_BYTES)
+                }
+                Err(error) => {
+                    bounded_display_copy(safe_tool_error_text(*error), MAX_RESULT_DISPLAY_BYTES)
+                }
+                Ok(ToolExecutionOutcome::RequestInput(_)) => None,
+            };
+            presentation.finish_tool(request_key, &tool_call_id, result_text);
             result
         })
+    }
+}
+
+fn safe_tool_error_text(error: minicore_runtime::tools::ToolError) -> &'static str {
+    match error {
+        minicore_runtime::tools::ToolError::Cancelled => "tool execution was cancelled",
+        minicore_runtime::tools::ToolError::Failed => "tool execution failed",
+        minicore_runtime::tools::ToolError::TimedOut => "tool execution timed out",
+        minicore_runtime::tools::ToolError::Panicked => "tool operation panicked",
+        minicore_runtime::tools::ToolError::InvalidInvocation => "tool invocation is invalid",
+        minicore_runtime::tools::ToolError::Internal => "tool operation failed internally",
     }
 }
 
@@ -1037,6 +1053,43 @@ pub(crate) fn bounded_result_content(value: &str, max: usize) -> (String, bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_error_presentation_is_static_for_every_variant() {
+        let cases = [
+            (
+                minicore_runtime::tools::ToolError::Cancelled,
+                "tool execution was cancelled",
+            ),
+            (
+                minicore_runtime::tools::ToolError::Failed,
+                "tool execution failed",
+            ),
+            (
+                minicore_runtime::tools::ToolError::TimedOut,
+                "tool execution timed out",
+            ),
+            (
+                minicore_runtime::tools::ToolError::Panicked,
+                "tool operation panicked",
+            ),
+            (
+                minicore_runtime::tools::ToolError::InvalidInvocation,
+                "tool invocation is invalid",
+            ),
+            (
+                minicore_runtime::tools::ToolError::Internal,
+                "tool operation failed internally",
+            ),
+        ];
+        for (error, expected) in cases {
+            let actual = safe_tool_error_text(error);
+            assert_eq!(actual, expected);
+            assert!(!actual.contains("missing-secret.txt"));
+            assert!(!actual.contains("prompt"));
+            assert!(!actual.contains("diagnostic"));
+        }
+    }
 
     #[test]
     fn redacted_debug_never_exposes_raw_text() {
