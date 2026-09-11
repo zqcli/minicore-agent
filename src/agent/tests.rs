@@ -986,6 +986,70 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
 }
 
 #[tokio::test]
+async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
+    let (data_dir, _guard) = fixture_dir(&format!("presentation-failed-{}", next_id()));
+    let (workspace, _guard) =
+        workspace_file("presentation-failed-ws", "file.txt", b"file contents");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "missing-secret.txt"})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read the missing file").await;
+    wait_text(&agent, turn).await;
+
+    let mut finished = None;
+    while let Some(event) = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        .await
+        .expect("failed tool events must arrive")
+    {
+        if let AgentEvent::ToolFinished { result, .. } = event {
+            finished = Some(result);
+            break;
+        }
+    }
+    let result = finished.expect("failed tool must emit ToolFinished");
+    assert_eq!(result.outcome, ToolResultOutcome::Failed);
+    assert_eq!(result.content.as_deref(), Some("tool execution failed"));
+    assert!(
+        !result
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing-secret.txt")
+    );
+
+    let page = agent
+        .history(GetHistory {
+            session_id: info.session_id,
+            offset: 0,
+            limit: 100,
+        })
+        .unwrap();
+    let tool_result = page
+        .items
+        .iter()
+        .find_map(|item| match &item.item {
+            crate::history::HistoryItemView::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("failed tool must be present in history");
+    assert_eq!(tool_result.outcome, ToolResultOutcome::Failed);
+    assert_eq!(tool_result.content, "tool failed");
+    assert!(!tool_result.content.contains("missing-secret.txt"));
+}
+
+#[tokio::test]
 async fn request_usage_events_carry_real_per_request_usage_across_two_sessions() {
     let (data_dir, _guard) = fixture_dir(&format!("usage-two-sessions-{}", next_id()));
     let (workspace_a, _guard_a) = workspace_file("usage-session-a", "a.txt", b"a");
