@@ -25,7 +25,7 @@ use crate::profiles::{ApprovalMode, Profile};
 use crate::sessions::{WorkerGate, panic_next_worker, pause_next_worker_before_join};
 use crate::store::{Store, fail_next_append, fail_next_record_write};
 
-use super::{Agent, CreateSession, SessionUpdateResult, TurnRef};
+use super::{Agent, CreateSession, RenameSession, SessionUpdateResult, TurnRef};
 
 struct TestDirectoryGuard {
     path: PathBuf,
@@ -432,6 +432,256 @@ async fn create_and_open_do_not_start_agent_loop() {
     let reopened = agent.open_session(info.session_id).await.unwrap();
     let state = agent.session_state(reopened.session_id).unwrap();
     assert_eq!(state.status, crate::sessions::SessionStatus::Idle);
+}
+
+#[tokio::test]
+async fn rename_loaded_session_trims_clears_and_rejects_invalid_titles() {
+    let (data_dir, _guard) = fixture_dir(&format!("rename-loaded-{}", next_id()));
+    let (workspace, _guard) = workspace_file("rename-loaded-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let before = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    let lower_bound = crate::store::utc_timestamp().unwrap();
+
+    let renamed = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: "\u{2003} Renamed session \u{3000}".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(renamed.loaded);
+    assert_eq!(renamed.title.as_deref(), Some("Renamed session"));
+    let after = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(after.title.as_deref(), Some("Renamed session"));
+    let upper_bound = crate::store::utc_timestamp().unwrap();
+    assert!(after.updated_at >= lower_bound);
+    assert!(after.updated_at <= upper_bound);
+    assert_eq!(after.profile, before.profile);
+    assert_eq!(after.workspace, before.workspace);
+    assert_eq!(after.model, before.model);
+    assert_eq!(after.reasoning, before.reasoning);
+    assert_eq!(after.system_prompt, before.system_prompt);
+    assert_eq!(after.tools, before.tools);
+    assert_eq!(after.max_tool_rounds, before.max_tool_rounds);
+    assert_eq!(after.approval, before.approval);
+    assert_eq!(after.created_at, before.created_at);
+
+    let cleared = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: " \t ".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(cleared.title.is_none());
+
+    let exact_multibyte = "é".repeat(2_048);
+    let exact = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: exact_multibyte,
+        })
+        .await
+        .unwrap();
+    assert_eq!(exact.title.as_deref().unwrap().len(), 4_096);
+    let over_limit = format!("{}a", exact.title.unwrap());
+    let result = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: over_limit,
+        })
+        .await;
+    assert!(matches!(result, Err(AgentError::InvalidInput)));
+
+    for title in ["bad\nname", "bad\0name", &"x".repeat(4_097)] {
+        let result = agent
+            .rename_session(RenameSession {
+                session_id: info.session_id,
+                title: title.to_string(),
+            })
+            .await;
+        assert!(matches!(result, Err(AgentError::InvalidInput)));
+    }
+}
+
+#[tokio::test]
+async fn rename_unloaded_session_updates_only_the_persistent_metadata() {
+    let (data_dir, _guard) = fixture_dir(&format!("rename-unloaded-{}", next_id()));
+    let (workspace, _guard) = workspace_file("rename-unloaded-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "keep history").await;
+    wait_text(&agent, turn).await;
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    let before = store.load_session(info.session_id).await.unwrap();
+    assert!(!before.history.is_empty());
+    let history_path = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("history.jsonl");
+    agent.close_session(info.session_id).await.unwrap();
+    std::fs::remove_dir_all(&workspace).unwrap();
+    std::fs::remove_file(&history_path).unwrap();
+
+    let renamed = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: "Unloaded title".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(!renamed.loaded);
+    assert_eq!(renamed.title.as_deref(), Some("Unloaded title"));
+
+    let after = store.load_record(info.session_id).await.unwrap();
+    assert_eq!(after.title.as_deref(), Some("Unloaded title"));
+    assert_eq!(after.system_prompt, before.record.system_prompt);
+    assert!(!history_path.exists());
+}
+
+#[tokio::test]
+async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session() {
+    let (data_dir, _guard) = fixture_dir(&format!("rename-busy-{}", next_id()));
+    let (workspace, _guard) = workspace_file("rename-busy-ws", "a.txt", b"hello");
+    let gate = BlockGate::new();
+    let model = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "done")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "busy").await;
+    gate.entered.notified().await;
+
+    let renamed = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: "While busy".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed.title.as_deref(), Some("While busy"));
+    gate.release.notify_waiters();
+    wait_text(&agent, turn).await;
+    let record = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(record.title.as_deref(), Some("While busy"));
+
+    let (blocked_data, _blocked_guard) = fixture_dir(&format!("rename-blocked-{}", next_id()));
+    let (blocked_workspace, _blocked_workspace_guard) =
+        workspace_file("rename-blocked-ws", "a.txt", b"hello");
+    let blocked_model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut blocked_agent = open_agent(
+        &blocked_data,
+        BTreeMap::from([("main".to_owned(), blocked_model)]),
+        read_profile(),
+    )
+    .await;
+    let blocked_info = create_session(&mut blocked_agent, &blocked_workspace).await;
+    fail_next_append(blocked_info.session_id);
+    let blocked_turn = send_text(&mut blocked_agent, blocked_info.session_id, "block").await;
+    let result = wait_text(&blocked_agent, blocked_turn).await;
+    assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
+    assert_eq!(
+        blocked_agent
+            .session_state(blocked_info.session_id)
+            .unwrap()
+            .status,
+        crate::sessions::SessionStatus::Blocked
+    );
+    let renamed_blocked = blocked_agent
+        .rename_session(RenameSession {
+            session_id: blocked_info.session_id,
+            title: "Blocked title".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed_blocked.title.as_deref(), Some("Blocked title"));
+    assert_eq!(
+        blocked_agent
+            .session_state(blocked_info.session_id)
+            .unwrap()
+            .status,
+        crate::sessions::SessionStatus::Blocked
+    );
+}
+
+#[tokio::test]
+async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
+    let (data_dir, _guard) = fixture_dir(&format!("rename-failure-{}", next_id()));
+    let (workspace, _guard) = workspace_file("rename-failure-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let before = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    fail_next_record_write(info.session_id);
+
+    let result = agent
+        .rename_session(RenameSession {
+            session_id: info.session_id,
+            title: "Should not persist".to_owned(),
+        })
+        .await;
+    assert!(matches!(result, Err(AgentError::Store)));
+    let in_memory = agent.list_sessions().await.unwrap()[0].clone();
+    assert_eq!(in_memory.title, info.title);
+    assert_eq!(in_memory.updated_at, before.updated_at);
+    let record = Store::open(data_dir)
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(record.title, info.title);
+    assert_eq!(record.updated_at, before.updated_at);
+}
+
+#[test]
+fn rename_request_debug_does_not_include_the_title() {
+    let request = RenameSession {
+        session_id: crate::ids::SessionId::new().unwrap(),
+        title: "private title".to_owned(),
+    };
+    assert!(!format!("{request:?}").contains("private title"));
 }
 
 #[tokio::test]

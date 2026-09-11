@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -82,6 +83,23 @@ pub struct UpdateSession {
 
     #[serde(default)]
     pub reasoning: Option<ReasoningPreference>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameSession {
+    pub session_id: crate::ids::SessionId,
+    pub title: String,
+}
+
+impl fmt::Debug for RenameSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RenameSession")
+            .field("session_id", &self.session_id)
+            .field("title", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -461,6 +479,36 @@ impl Agent {
             session: session.info(true),
             active_revision,
         })
+    }
+
+    /// Returns only after the updated SessionInfo is persisted successfully.
+    /// If cancellation or a transport disconnect prevents the response from
+    /// reaching the caller, the persistence outcome is unknown; reread the
+    /// Session before deciding whether a retry is safe.
+    pub async fn rename_session(
+        &mut self,
+        request: RenameSession,
+    ) -> Result<SessionInfo, AgentError> {
+        let title =
+            crate::store::normalize_title(&request.title).map_err(|_| AgentError::InvalidInput)?;
+        let session_id = request.session_id;
+        if let Some(session) = self.sessions.get(session_id).cloned() {
+            session.rename(title).await?;
+            return Ok(session.info(true));
+        }
+
+        let mut record = self
+            .store
+            .load_record(session_id)
+            .await
+            .map_err(crate::sessions::map_store_error)?;
+        record.title = title;
+        record.updated_at = crate::store::utc_timestamp().map_err(|_| AgentError::Store)?;
+        self.store
+            .write_record(&record)
+            .await
+            .map_err(crate::sessions::map_store_error)?;
+        Ok(SessionInfo::from_record(&record, false))
     }
 
     /// Sends a prompt and preserves the original public return type. RPC uses

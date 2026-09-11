@@ -270,6 +270,24 @@ the session is idle. It is also `null` when `session.update` races with a loop
 that has already sealed: the persistent Session settings are updated for the next
 turn, but no revision is applied to the sealed loop.
 
+### `session.rename`
+
+```json
+{"session_id":"ses_...","title":"New title"}
+```
+
+`title` is required and must be a string. The Agent trims leading and trailing
+Unicode whitespace; an empty or all-whitespace title clears the title and is
+persisted as `null`. Non-empty titles are limited to 4,096 UTF-8 bytes and may
+not contain control characters. The method returns a `session` member with the
+complete `SessionInfo` and never changes model, reasoning, tools, history,
+workspace, or an active execution revision. It is valid for loaded idle,
+running, and blocked Sessions as well as closed Sessions. A closed Session is
+renamed from `session.json` metadata only; it does not load its workspace or
+history. A successful return confirms persistence. If the request is
+cancelled or the response transport disconnects, the outcome may be unknown;
+reread the Session before deciding whether to retry.
+
 ## History
 
 ### `session.history`

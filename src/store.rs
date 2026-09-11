@@ -93,6 +93,18 @@ impl SessionRecord {
     }
 }
 
+pub(crate) fn normalize_title(title: &str) -> Result<Option<String>, ()> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if valid_text(title, MAX_TITLE_BYTES, false) {
+        Ok(Some(title.to_owned()))
+    } else {
+        Err(())
+    }
+}
+
 /// A loaded session: its persistent record plus a sanitized in-memory history.
 pub(crate) struct StoredSession {
     pub(crate) record: SessionRecord,

@@ -10,7 +10,9 @@ use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer};
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{InteractionId, LoopId};
 
-use crate::agent::{CreateSession, SessionInfo, SteerMessage, TurnRef, UpdateSession};
+use crate::agent::{
+    CreateSession, RenameSession, SessionInfo, SteerMessage, TurnRef, UpdateSession,
+};
 use crate::event::AgentEvent;
 use crate::history::GetHistory;
 use crate::models::ModelInfo;
@@ -207,6 +209,22 @@ impl From<SessionUpdateParams> for UpdateSession {
             session_id: value.session_id,
             model: value.model,
             reasoning: value.reasoning,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionRenameParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) title: String,
+}
+
+impl From<SessionRenameParams> for RenameSession {
+    fn from(value: SessionRenameParams) -> Self {
+        Self {
+            session_id: value.session_id,
+            title: value.title,
         }
     }
 }

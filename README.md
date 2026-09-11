@@ -40,6 +40,10 @@ are frozen when the Session is created and persist across close and reopen.
 any active loop receives the new execution config at its next request boundary
 while the current tool batch keeps its old snapshot.
 
+`session.rename` changes only the persisted title and metadata timestamp. It
+accepts a trimmed string, treats an empty title as clear, and is safe while a
+Session is idle, running, blocked, or closed.
+
 ## Architecture
 
 Each user message becomes one runtime `AgentLoop`. A Session runs at most one
@@ -111,7 +115,8 @@ agent.ping             agent.shutdown
 profile.list           model.list
 session.list           session.create         session.open
 session.close          session.delete         session.state
-session.update         session.history       session.presentation
+session.update         session.rename        session.history
+session.presentation
 turn.send              turn.cancel            turn.wait
 turn.steer             interaction.answer
 ```
@@ -182,7 +187,7 @@ Store has no cross-process lock.
 
 The crate exposes `AgentConfig`, `AgentError`, `LoopOverrides`, `Profile`,
 `ApprovalMode`, `Agent`, `Workspace`, `WorkspaceError`, `SessionId`, the
-session/turn DTOs (`CreateSession`, `UpdateSession`, `SendMessage`,
+session/turn DTOs (`CreateSession`, `RenameSession`, `UpdateSession`, `SendMessage`,
 `SteerMessage`, `AnswerInteraction`, `GetHistory`, `HistoryPage`,
 `SessionState`, `SessionStatus`, `SessionUpdateResult`, `TurnRef`,
 `TurnResult`, `TurnPersistence`, `PresentationView`, `ToolDisplay`, and
