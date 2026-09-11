@@ -43,6 +43,10 @@ fn fixture_dir(label: &str) -> (PathBuf, TestDirectoryGuard) {
     (path.clone(), TestDirectoryGuard { path })
 }
 
+fn toml_path(path: &Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
     BTreeSet::from([
         ReasoningPreference::Auto,
@@ -673,6 +677,77 @@ async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
         .unwrap();
     assert_eq!(record.title, info.title);
     assert_eq!(record.updated_at, before.updated_at);
+}
+
+#[tokio::test]
+async fn system_prompt_file_is_loaded_once_and_session_snapshot_survives_reopen() {
+    let (base, _guard) = fixture_dir(&format!("prompt-file-snapshot-{}", next_id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let (workspace, _workspace_guard) = workspace_file("prompt-file-ws", "a.txt", b"hello");
+    let prompt_path = base.join("prompt");
+    let config_path = base.join("agent.toml");
+    std::fs::write(&prompt_path, "file prompt\r\noriginal").unwrap();
+    let text = format!(
+        r#"
+data_dir = {data_dir}
+event_capacity = 128
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "auto"
+system_prompt = {{ file = {prompt_path} }}
+tools = []
+max_tool_rounds = 4
+approval = "ask"
+
+[models.main]
+provider = "open_ai_responses"
+model = "provider-model"
+base_url = "https://example.invalid/v1"
+api_key_env = "MINICORE_PROMPT_FILE_TEST_KEY"
+physical_context_window = 10000
+output_budget_tokens = 1000
+safety_margin_tokens = 1000
+supported_reasoning = ["auto"]
+supports_tools = true
+request_timeout_seconds = 30
+"#,
+        data_dir = toml_path(&base.join("data")),
+        prompt_path = toml_path(&prompt_path)
+    );
+    std::fs::write(&config_path, text).unwrap();
+    let config = AgentConfig::load(&config_path).unwrap();
+    assert_eq!(
+        config.profiles["test"].system_prompt,
+        "file prompt\noriginal"
+    );
+    let model = FakeModel::new("main", []);
+    let mut agent = Agent::open_with_models(
+        config,
+        Models::from_values(BTreeMap::from([(
+            "main".to_owned(),
+            model as Arc<dyn Model>,
+        )])),
+    )
+    .await
+    .unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let store = Store::open(base.join("data")).await.unwrap();
+    assert_eq!(
+        store
+            .load_record(info.session_id)
+            .await
+            .unwrap()
+            .system_prompt,
+        "file prompt\noriginal"
+    );
+
+    std::fs::write(&prompt_path, "changed after Agent startup").unwrap();
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    let reopened = store.load_record(info.session_id).await.unwrap();
+    assert_eq!(reopened.system_prompt, "file prompt\noriginal");
 }
 
 #[test]

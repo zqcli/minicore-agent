@@ -29,6 +29,16 @@ exclusively through the stdio JSON-RPC interface (see
 This repository does not ship a real TUI, plugin system, MCP integration,
 Subagent implementation, or compaction.
 
+Profile `system_prompt` keeps its existing inline string form and also accepts
+`{ file = "..." }`. Relative prompt paths are resolved against the parent of
+the absolute config path supplied to `AgentConfig::load`; a config symlink keeps
+its supplied alias directory as the base. The target must resolve to a regular
+UTF-8 file no larger than 128 KiB; CRLF is normalized to LF, and symlinks to
+regular files are allowed. The content is loaded once at Agent startup, and
+each created Session stores its prompt snapshot in `session.json`. The Agent
+never rereads the file on turn or Session reopen. This is configuration-path
+handling, not a race-proof filesystem sandbox.
+
 A Session may select a configured `model` and `reasoning` value, or inherit the
 Profile defaults. Runtime-backed reasoning values include `auto`, `disabled`,
 `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; each model's
