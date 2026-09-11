@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -16,6 +17,14 @@ use super::{
 };
 
 const TOOL_NAME: &str = "apply_patch";
+const CODEX_BEGIN_PATCH: &str = "*** Begin Patch";
+const CODEX_END_PATCH: &str = "*** End Patch";
+const CODEX_UPDATE_FILE: &str = "*** Update File: ";
+const CODEX_END_OF_FILE: &str = "*** End of File";
+const NO_NEWLINE_AT_END: &str = "\\ No newline at end of file";
+// Bound substring compatibility matching across all Codex anchor and hunk queries;
+// this deliberately does not claim an unbounded implementation of every Codex locator.
+const MAX_CODEX_MATCH_VISITS: usize = MAX_PATCH_BYTES.saturating_mul(8);
 
 pub(super) struct ApplyPatchTool {
     workspace: Arc<Workspace>,
@@ -33,19 +42,24 @@ impl ApplyPatchTool {
     pub(super) fn new(workspace: Arc<Workspace>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("apply_patch is a valid tool name"),
-            "Apply one complete unified text patch to one existing workspace file.",
+            "Apply one complete patch to one existing workspace file. Standard unified diffs are single-file only; Codex envelopes must contain exactly one *** Update File operation. Add File, Delete File, Move to, and multifile envelopes are rejected.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Workspace-relative existing file path."
+                        "description": "Workspace-relative path of the one existing file; a Codex Update File path must match it."
                     },
                     "patch": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Single-file unified text patch, limited to 512 KiB."
+                        "description": concat!(
+                            "Single-file standard unified diff or one-file Codex *** Begin Patch envelope. ",
+                            "Example: *** Begin Patch\n",
+                            "*** Update File: value.txt\n@@\n-old\n+new\n*** End Patch. ",
+                            "Add/Delete/Move/multifile forms are rejected; limited to 512 KiB."
+                        )
                     }
                 },
                 "required": ["path", "patch"],
@@ -149,6 +163,7 @@ struct PatchContent<'a> {
     text: &'a str,
     old_no_newline: bool,
     new_no_newline: bool,
+    context_new_ending: Option<LineEnding>,
 }
 
 #[derive(Clone, Copy)]
@@ -158,12 +173,36 @@ struct HunkRange {
     end: usize,
 }
 
+enum CodexLocator<'a> {
+    Range { old: HunkRange, new: HunkRange },
+    Anchor(Option<&'a str>),
+}
+
+struct CodexHunk<'a> {
+    locator: CodexLocator<'a>,
+    contents: Vec<PatchContent<'a>>,
+    end_of_file: bool,
+}
+
+struct ResolvedHunk<'a> {
+    old: HunkRange,
+    new: HunkRange,
+    contents: Vec<PatchContent<'a>>,
+}
+
+struct CodexSource<'source, 'text> {
+    lines: &'source [SourceLine<'text>],
+    index: &'source HashMap<&'text str, Vec<usize>>,
+}
+
+#[allow(dead_code)]
 #[derive(Default)]
 struct ApplyStats {
     source_lines: usize,
     source_line_visits: usize,
     patch_lines: usize,
     patch_content_visits: usize,
+    codex_match_visits: usize,
 }
 
 #[cfg(test)]
@@ -171,6 +210,7 @@ impl ApplyStats {
     fn total_steps(&self) -> usize {
         self.source_line_visits
             .saturating_add(self.patch_content_visits)
+            .saturating_add(self.codex_match_visits)
     }
 }
 
@@ -216,6 +256,156 @@ impl ResultBuilder {
     }
 }
 
+fn apply_single_file_patch_with_stats(
+    path: &str,
+    source: &str,
+    patch: &str,
+) -> Result<(String, ApplyStats), ToolError> {
+    if patch.is_empty() || patch.len() > MAX_PATCH_BYTES || patch.contains('\0') {
+        return Err(ToolError::InvalidInvocation);
+    }
+    let first = patch
+        .split_inclusive('\n')
+        .next()
+        .ok_or(ToolError::InvalidInvocation)?;
+    if strip_transport_ending(first) == CODEX_BEGIN_PATCH {
+        return apply_codex_patch_with_stats(path, source, patch);
+    }
+    apply_unified_patch_with_stats(path, source, patch)
+}
+
+fn apply_codex_patch_with_stats(
+    path: &str,
+    source: &str,
+    patch: &str,
+) -> Result<(String, ApplyStats), ToolError> {
+    let source_lines = split_source_lines(source);
+    let (hunks, patch_lines, codex_match_visits) =
+        parse_and_resolve_codex_patch(path, patch, &source_lines)?;
+    apply_resolved_hunks(
+        source,
+        &source_lines,
+        &hunks,
+        patch_lines,
+        codex_match_visits,
+    )
+}
+
+fn apply_unified_patch_with_stats(
+    path: &str,
+    source: &str,
+    patch: &str,
+) -> Result<(String, ApplyStats), ToolError> {
+    let source_lines = split_source_lines(source);
+    let mut parser = PatchLines::new(patch);
+    let first = parser.next().ok_or(ToolError::InvalidInvocation)?;
+    let mut next_hunk = if strip_transport_ending(first).starts_with("--- ") {
+        let original = parse_header_path(first, "--- ")?;
+        let modified =
+            parse_header_path(parser.next().ok_or(ToolError::InvalidInvocation)?, "+++ ")?;
+        validate_header_path(&original, path, "a/")?;
+        validate_header_path(&modified, path, "b/")?;
+        parser.next().ok_or(ToolError::InvalidInvocation)?
+    } else {
+        first
+    };
+
+    let mut resolved = Vec::new();
+    let mut hunk_count = 0usize;
+    let mut previous_old_end = 0usize;
+    let mut previous_new_end = 0usize;
+
+    loop {
+        let (old_range, new_range) = parse_hunk_header(strip_transport_ending(next_hunk))?;
+        if old_range.index < previous_old_end || new_range.index < previous_new_end {
+            return Err(ToolError::InvalidInvocation);
+        }
+        previous_old_end = old_range.end;
+        previous_new_end = new_range.end;
+
+        let contents = parse_hunk_contents(&mut parser, old_range.count, new_range.count)?;
+        resolved.push(ResolvedHunk {
+            old: old_range,
+            new: new_range,
+            contents,
+        });
+        hunk_count = hunk_count
+            .checked_add(1)
+            .ok_or(ToolError::InvalidInvocation)?;
+
+        match parser.next() {
+            Some(line) if strip_transport_ending(line).starts_with("@@ ") => {
+                next_hunk = line;
+            }
+            Some(_) => return Err(ToolError::InvalidInvocation),
+            None => break,
+        }
+    }
+
+    if hunk_count == 0 {
+        return Err(ToolError::InvalidInvocation);
+    }
+    apply_resolved_hunks(source, &source_lines, &resolved, parser.steps, 0)
+}
+
+fn apply_resolved_hunks(
+    source: &str,
+    source_lines: &[SourceLine<'_>],
+    hunks: &[ResolvedHunk<'_>],
+    patch_lines: usize,
+    codex_match_visits: usize,
+) -> Result<(String, ApplyStats), ToolError> {
+    let preferred_ending = preferred_line_ending(source_lines);
+    let mut stats = ApplyStats {
+        source_lines: source_lines.len(),
+        patch_lines,
+        codex_match_visits,
+        ..ApplyStats::default()
+    };
+    let mut source_cursor = 0usize;
+    let mut builder = ResultBuilder::new(source.len());
+    let mut previous_old_end = 0usize;
+    let mut previous_new_end = 0usize;
+
+    for hunk in hunks {
+        if hunk.old.index < previous_old_end || hunk.new.index < previous_new_end {
+            return Err(ToolError::InvalidInvocation);
+        }
+        previous_old_end = hunk.old.end;
+        previous_new_end = hunk.new.end;
+        while source_cursor < hunk.old.index {
+            append_source_line(source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+        }
+        if source_cursor != hunk.old.index || builder.line_count != hunk.new.index {
+            return Err(ToolError::Failed);
+        }
+        for content in hunk.contents.iter().copied() {
+            apply_patch_content(
+                content,
+                source_lines,
+                &mut source_cursor,
+                &mut builder,
+                preferred_ending,
+                &mut stats,
+            )?;
+            stats.patch_content_visits = stats
+                .patch_content_visits
+                .checked_add(1)
+                .ok_or(ToolError::Internal)?;
+        }
+        if source_cursor != hunk.old.end || builder.line_count != hunk.new.end {
+            return Err(ToolError::Failed);
+        }
+    }
+    while source_cursor < source_lines.len() {
+        append_source_line(source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+    }
+    if stats.source_line_visits != stats.source_lines {
+        return Err(ToolError::Internal);
+    }
+    Ok((builder.value, stats))
+}
+
 struct PatchLines<'a> {
     lines: std::str::SplitInclusive<'a, char>,
     peeked: Option<&'a str>,
@@ -245,92 +435,486 @@ impl<'a> PatchLines<'a> {
     }
 }
 
-fn apply_single_file_patch_with_stats(
+fn parse_and_resolve_codex_patch<'a>(
     path: &str,
-    source: &str,
-    patch: &str,
-) -> Result<(String, ApplyStats), ToolError> {
-    let source_lines = split_source_lines(source);
-    let preferred_ending = preferred_line_ending(&source_lines);
-    let mut stats = ApplyStats {
-        source_lines: source_lines.len(),
-        ..ApplyStats::default()
-    };
-    let mut parser = PatchLines::new(patch);
-    let first = parser.next().ok_or(ToolError::InvalidInvocation)?;
-    let mut next_hunk = if strip_transport_ending(first).starts_with("--- ") {
-        let original = parse_header_path(first, "--- ")?;
-        let modified =
-            parse_header_path(parser.next().ok_or(ToolError::InvalidInvocation)?, "+++ ")?;
-        validate_header_path(&original, path, "a/")?;
-        validate_header_path(&modified, path, "b/")?;
-        parser.next().ok_or(ToolError::InvalidInvocation)?
-    } else {
-        first
-    };
-
+    patch: &'a str,
+    source: &[SourceLine<'a>],
+) -> Result<(Vec<ResolvedHunk<'a>>, usize, usize), ToolError> {
+    let (codex_hunks, patch_lines) = parse_codex_patch(path, patch)?;
+    let total_hunks = codex_hunks.len();
+    let mut resolved = Vec::with_capacity(total_hunks);
     let mut source_cursor = 0usize;
-    let mut builder = ResultBuilder::new(source.len());
-    let mut hunk_count = 0usize;
-    let mut previous_old_end = 0usize;
-    let mut previous_new_end = 0usize;
+    let mut output_cursor = 0usize;
+    let mut previous_start = None;
+    let mut match_visits = 0usize;
+    let preferred_ending = preferred_line_ending(source);
+    let source_index = codex_source_index(source);
+    let codex_source = CodexSource {
+        lines: source,
+        index: &source_index,
+    };
 
-    loop {
-        let (old_range, new_range) = parse_hunk_header(strip_transport_ending(next_hunk))?;
-        if old_range.index < previous_old_end || new_range.index < previous_new_end {
+    for (index, hunk) in codex_hunks.into_iter().enumerate() {
+        if hunk.end_of_file && index + 1 != total_hunks {
             return Err(ToolError::InvalidInvocation);
         }
-        previous_old_end = old_range.end;
-        previous_new_end = new_range.end;
-
-        let contents = parse_hunk_contents(&mut parser, old_range.count, new_range.count)?;
-        while source_cursor < old_range.index {
-            append_source_line(&source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+        let header_only = hunk.contents.is_empty();
+        let old_contents = hunk
+            .contents
+            .iter()
+            .copied()
+            .filter(|content| !matches!(content.kind, PatchLineKind::Add))
+            .collect::<Vec<_>>();
+        let (old_count, new_count) = codex_content_counts(&hunk.contents)?;
+        let start = if header_only {
+            let CodexLocator::Anchor(Some(anchor)) = &hunk.locator else {
+                return Err(ToolError::InvalidInvocation);
+            };
+            find_unique_codex_anchor(source, source_cursor, anchor, &mut match_visits)?
+                .ok_or(ToolError::Failed)?
+        } else {
+            locate_codex_hunk(
+                &hunk.locator,
+                &old_contents,
+                (old_count, new_count),
+                hunk.end_of_file,
+                &codex_source,
+                source_cursor,
+                &mut match_visits,
+            )?
+        };
+        if start < source_cursor || (!header_only && previous_start == Some(start)) {
+            return Err(ToolError::InvalidInvocation);
         }
-        if source_cursor != old_range.index || builder.line_count != new_range.index {
-            return Err(ToolError::Failed);
-        }
-        for content in contents.iter().copied() {
-            apply_patch_content(
-                content,
-                &source_lines,
-                &mut source_cursor,
-                &mut builder,
-                preferred_ending,
-                &mut stats,
-            )?;
-            stats.patch_content_visits = stats
-                .patch_content_visits
-                .checked_add(1)
-                .ok_or(ToolError::Internal)?;
-        }
-        if source_cursor != old_range.end || builder.line_count != new_range.end {
-            return Err(ToolError::Failed);
-        }
-        hunk_count = hunk_count
-            .checked_add(1)
-            .ok_or(ToolError::InvalidInvocation)?;
-
-        match parser.next() {
-            Some(line) if strip_transport_ending(line).starts_with("@@ ") => {
-                next_hunk = line;
+        if let CodexLocator::Range { new, .. } = &hunk.locator {
+            let skipped = start
+                .checked_sub(source_cursor)
+                .ok_or(ToolError::InvalidInvocation)?;
+            let expected_new = output_cursor
+                .checked_add(skipped)
+                .ok_or(ToolError::InvalidInvocation)?;
+            if new.index != expected_new {
+                return Err(ToolError::InvalidInvocation);
             }
-            Some(_) => return Err(ToolError::InvalidInvocation),
-            None => break,
         }
+        let skipped = start
+            .checked_sub(source_cursor)
+            .ok_or(ToolError::InvalidInvocation)?;
+        output_cursor = output_cursor
+            .checked_add(skipped)
+            .ok_or(ToolError::InvalidInvocation)?;
+        source_cursor = start;
+        if header_only {
+            continue;
+        }
+
+        let old_end = start
+            .checked_add(old_count)
+            .ok_or(ToolError::InvalidInvocation)?;
+        let mut contents = hunk.contents;
+        mark_codex_source_endings(&mut contents, source, start, preferred_ending)?;
+        if index + 1 == total_hunks
+            && source
+                .last()
+                .is_some_and(|line| line.ending == LineEnding::None)
+            && old_end == source.len()
+        {
+            mark_codex_result_no_newline(&mut contents, new_count);
+        }
+
+        let old = make_hunk_range(start, old_count)?;
+        let new = make_hunk_range(output_cursor, new_count)?;
+        resolved.push(ResolvedHunk { old, new, contents });
+        source_cursor = old_end;
+        output_cursor = output_cursor
+            .checked_add(new_count)
+            .ok_or(ToolError::InvalidInvocation)?;
+        previous_start = Some(start);
     }
 
-    if hunk_count == 0 {
+    Ok((resolved, patch_lines, match_visits))
+}
+
+fn parse_codex_patch<'a>(
+    path: &str,
+    patch: &'a str,
+) -> Result<(Vec<CodexHunk<'a>>, usize), ToolError> {
+    let mut parser = PatchLines::new(patch);
+    let begin = parser.next().ok_or(ToolError::InvalidInvocation)?;
+    if strip_transport_ending(begin) != CODEX_BEGIN_PATCH {
         return Err(ToolError::InvalidInvocation);
     }
-    while source_cursor < source_lines.len() {
-        append_source_line(&source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+    let update = parser.next().ok_or(ToolError::InvalidInvocation)?;
+    let header_path = strip_transport_ending(update)
+        .strip_prefix(CODEX_UPDATE_FILE)
+        .ok_or(ToolError::InvalidInvocation)?;
+    validate_header_path(header_path, path, "")?;
+
+    let mut hunks = Vec::new();
+    loop {
+        let raw = parser.next().ok_or(ToolError::InvalidInvocation)?;
+        let line = strip_transport_ending(raw);
+        if line == CODEX_END_PATCH {
+            if hunks
+                .last()
+                .is_none_or(|hunk: &CodexHunk<'_>| hunk.contents.is_empty())
+                || parser.next().is_some()
+            {
+                return Err(ToolError::InvalidInvocation);
+            }
+            return Ok((hunks, parser.steps));
+        }
+        if !line.starts_with("@@") {
+            return Err(ToolError::InvalidInvocation);
+        }
+        let locator = parse_codex_locator(line)?;
+        let mut contents = Vec::new();
+        let mut end_of_file = false;
+        loop {
+            let raw = parser.peek().ok_or(ToolError::InvalidInvocation)?;
+            let line = strip_transport_ending(raw);
+            if line == CODEX_END_PATCH || line.starts_with("@@") {
+                break;
+            }
+            if line == CODEX_END_OF_FILE {
+                parser.next();
+                end_of_file = true;
+                break;
+            }
+            if line.starts_with("***") || line == NO_NEWLINE_AT_END {
+                return Err(ToolError::InvalidInvocation);
+            }
+            let raw = parser.next().ok_or(ToolError::InvalidInvocation)?;
+            let line = strip_transport_ending(raw);
+            let mut content = parse_patch_content(line)?;
+            if parser
+                .peek()
+                .is_some_and(|next| strip_transport_ending(next) == NO_NEWLINE_AT_END)
+            {
+                parser.next();
+                mark_no_newline(&mut content)?;
+                if parser
+                    .peek()
+                    .is_some_and(|next| strip_transport_ending(next) == NO_NEWLINE_AT_END)
+                {
+                    return Err(ToolError::InvalidInvocation);
+                }
+            }
+            contents.push(content);
+        }
+        if contents.is_empty()
+            && (end_of_file || !matches!(&locator, CodexLocator::Anchor(Some(_))))
+        {
+            return Err(ToolError::InvalidInvocation);
+        }
+        hunks.push(CodexHunk {
+            locator,
+            contents,
+            end_of_file,
+        });
     }
-    stats.patch_lines = parser.steps;
-    if stats.source_line_visits != stats.source_lines {
-        return Err(ToolError::Internal);
+}
+
+fn parse_codex_locator(line: &str) -> Result<CodexLocator<'_>, ToolError> {
+    let rest = line
+        .strip_prefix("@@")
+        .ok_or(ToolError::InvalidInvocation)?;
+    let header = rest.trim();
+    if header.is_empty() {
+        return Ok(CodexLocator::Anchor(None));
     }
-    Ok((builder.value, stats))
+    if header.starts_with('-') {
+        let (old, new) = parse_hunk_header(line)?;
+        return Ok(CodexLocator::Range { old, new });
+    }
+    if header.contains('\0') {
+        return Err(ToolError::InvalidInvocation);
+    }
+    Ok(CodexLocator::Anchor(Some(header)))
+}
+
+fn codex_content_counts(contents: &[PatchContent<'_>]) -> Result<(usize, usize), ToolError> {
+    let mut old_count = 0usize;
+    let mut new_count = 0usize;
+    for content in contents {
+        match content.kind {
+            PatchLineKind::Context => {
+                old_count = old_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
+                new_count = new_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
+            }
+            PatchLineKind::Remove => {
+                old_count = old_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
+            }
+            PatchLineKind::Add => {
+                new_count = new_count
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation)?;
+            }
+        }
+    }
+    Ok((old_count, new_count))
+}
+
+fn locate_codex_hunk(
+    locator: &CodexLocator<'_>,
+    old_contents: &[PatchContent<'_>],
+    (old_count, new_count): (usize, usize),
+    end_of_file: bool,
+    codex_source: &CodexSource<'_, '_>,
+    search_start: usize,
+    match_visits: &mut usize,
+) -> Result<usize, ToolError> {
+    let source = codex_source.lines;
+    match locator {
+        CodexLocator::Range { old, new } => {
+            if old.count != old_count || new.count != new_count {
+                return Err(ToolError::InvalidInvocation);
+            }
+            let end = old
+                .index
+                .checked_add(old.count)
+                .ok_or(ToolError::InvalidInvocation)?;
+            if end > source.len() || (end_of_file && end != source.len()) {
+                return Err(ToolError::Failed);
+            }
+            if !codex_contents_match_at(old_contents, source, old.index) {
+                return Err(ToolError::Failed);
+            }
+            Ok(old.index)
+        }
+        CodexLocator::Anchor(anchor) => {
+            if end_of_file {
+                let start = source
+                    .len()
+                    .checked_sub(old_count)
+                    .ok_or(ToolError::Failed)?;
+                if !codex_contents_match_at(old_contents, source, start) {
+                    return Err(ToolError::Failed);
+                }
+                return Ok(start);
+            }
+            if old_count == 0 {
+                let Some(anchor) = anchor else {
+                    return Err(ToolError::Failed);
+                };
+                let Some(anchor_line) =
+                    find_unique_codex_anchor(source, search_start, anchor, match_visits)?
+                else {
+                    return Err(ToolError::Failed);
+                };
+                return anchor_line
+                    .checked_add(1)
+                    .ok_or(ToolError::InvalidInvocation);
+            }
+
+            let match_start = if let Some(anchor) = anchor {
+                let Some(anchor_line) =
+                    find_unique_codex_anchor(source, search_start, anchor, match_visits)?
+                else {
+                    return Err(ToolError::Failed);
+                };
+                anchor_line
+            } else {
+                search_start
+            };
+            let Some(start) = find_unique_codex_match(
+                old_contents,
+                source,
+                codex_source.index,
+                match_start,
+                match_visits,
+            )?
+            else {
+                return Err(ToolError::Failed);
+            };
+            Ok(start)
+        }
+    }
+}
+
+fn find_unique_codex_anchor(
+    source: &[SourceLine<'_>],
+    start: usize,
+    anchor: &str,
+    visits: &mut usize,
+) -> Result<Option<usize>, ToolError> {
+    let mut found = None;
+    for (index, line) in source.iter().enumerate().skip(start) {
+        *visits = visits.checked_add(1).ok_or(ToolError::Internal)?;
+        if *visits > MAX_CODEX_MATCH_VISITS {
+            return Err(ToolError::InvalidInvocation);
+        }
+        if line.text.contains(anchor) {
+            if found.is_some() {
+                return Err(ToolError::InvalidInvocation);
+            }
+            found = Some(index);
+        }
+    }
+    Ok(found)
+}
+
+fn codex_source_index<'a>(source: &[SourceLine<'a>]) -> HashMap<&'a str, Vec<usize>> {
+    let mut index = HashMap::new();
+    for (line_index, line) in source.iter().enumerate() {
+        index
+            .entry(line.text)
+            .or_insert_with(Vec::new)
+            .push(line_index);
+    }
+    index
+}
+
+fn find_unique_codex_match<'a>(
+    pattern: &[PatchContent<'a>],
+    source: &[SourceLine<'a>],
+    source_index: &HashMap<&'a str, Vec<usize>>,
+    start: usize,
+    visits: &mut usize,
+) -> Result<Option<usize>, ToolError> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    let mut no_newline_offset = None;
+    for (offset, content) in pattern.iter().enumerate() {
+        if content.old_no_newline && no_newline_offset.replace(offset).is_some() {
+            return Err(ToolError::InvalidInvocation);
+        }
+    }
+
+    let positions = source_index
+        .get(pattern[0].text)
+        .map_or(&[][..], Vec::as_slice);
+    let first = positions
+        .binary_search(&start)
+        .unwrap_or_else(|index| index);
+    let candidates = &positions[first..];
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if candidates.len() == 1 {
+        *visits = visits.checked_add(1).ok_or(ToolError::Internal)?;
+        if *visits > MAX_CODEX_MATCH_VISITS {
+            return Err(ToolError::InvalidInvocation);
+        }
+        return Ok(codex_contents_match_at(pattern, source, candidates[0]).then_some(candidates[0]));
+    }
+
+    let prefix = codex_pattern_prefix(pattern);
+    let mut matched = 0usize;
+    let mut found = None;
+    for (index, line) in source.iter().enumerate().skip(start) {
+        *visits = visits.checked_add(1).ok_or(ToolError::Internal)?;
+        if *visits > MAX_CODEX_MATCH_VISITS {
+            return Err(ToolError::InvalidInvocation);
+        }
+        while matched > 0 && pattern[matched].text != line.text {
+            matched = prefix[matched - 1];
+        }
+        if pattern[matched].text == line.text {
+            matched += 1;
+        }
+        if matched == pattern.len() {
+            let candidate = index + 1 - pattern.len();
+            if no_newline_offset.is_none_or(|offset| {
+                source
+                    .get(candidate + offset)
+                    .is_some_and(|line| line.ending == LineEnding::None)
+            }) {
+                if found.is_some() {
+                    return Err(ToolError::InvalidInvocation);
+                }
+                found = Some(candidate);
+            }
+            matched = prefix[matched - 1];
+        }
+    }
+    Ok(found)
+}
+
+fn codex_pattern_prefix(pattern: &[PatchContent<'_>]) -> Vec<usize> {
+    let mut prefix = vec![0usize; pattern.len()];
+    let mut matched = 0usize;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern[matched].text != pattern[index].text {
+            matched = prefix[matched - 1];
+        }
+        if pattern[matched].text == pattern[index].text {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+    prefix
+}
+
+fn codex_contents_match_at(
+    contents: &[PatchContent<'_>],
+    source: &[SourceLine<'_>],
+    start: usize,
+) -> bool {
+    for (source_index, content) in (start..).zip(contents.iter()) {
+        let Some(line) = source.get(source_index) else {
+            return false;
+        };
+        if line.text != content.text || (content.old_no_newline && line.ending != LineEnding::None)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn mark_codex_source_endings(
+    contents: &mut [PatchContent<'_>],
+    source: &[SourceLine<'_>],
+    start: usize,
+    preferred_ending: LineEnding,
+) -> Result<(), ToolError> {
+    let mut source_lines = source.iter().skip(start);
+    for index in 0..contents.len() {
+        if matches!(contents[index].kind, PatchLineKind::Add) {
+            continue;
+        }
+        let line = source_lines.next().ok_or(ToolError::Failed)?;
+        if line.ending == LineEnding::None {
+            contents[index].old_no_newline = true;
+            if matches!(contents[index].kind, PatchLineKind::Context)
+                && !contents[index].new_no_newline
+                && contents[index + 1..]
+                    .iter()
+                    .any(|content| !matches!(content.kind, PatchLineKind::Remove))
+            {
+                contents[index].context_new_ending = Some(preferred_ending);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mark_codex_result_no_newline(contents: &mut [PatchContent<'_>], new_count: usize) {
+    if new_count == 0 {
+        return;
+    }
+    if let Some(content) = contents
+        .iter_mut()
+        .rev()
+        .find(|content| !matches!(content.kind, PatchLineKind::Remove))
+    {
+        content.new_no_newline = true;
+    }
+}
+
+fn make_hunk_range(index: usize, count: usize) -> Result<HunkRange, ToolError> {
+    let end = index
+        .checked_add(count)
+        .ok_or(ToolError::InvalidInvocation)?;
+    Ok(HunkRange { index, count, end })
 }
 
 fn parse_hunk_contents<'a>(
@@ -471,7 +1055,8 @@ fn apply_patch_content(
     match content.kind {
         PatchLineKind::Context => {
             let line = matching_source_line(content, source, *cursor)?;
-            builder.append(line.text, line.ending)?;
+            let ending = content.context_new_ending.unwrap_or(line.ending);
+            builder.append(line.text, ending)?;
             *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
             stats.source_line_visits = stats
                 .source_line_visits
@@ -526,6 +1111,7 @@ fn parse_patch_content(line: &str) -> Result<PatchContent<'_>, ToolError> {
         text,
         old_no_newline: false,
         new_no_newline: false,
+        context_new_ending: None,
     })
 }
 
@@ -806,6 +1392,15 @@ mod tests {
         assert_eq!(schema["required"], json!(["path", "patch"]));
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["patch"]["minLength"], 1);
+        let description = tool.spec().description().as_str();
+        assert!(description.contains("exactly one *** Update File operation"));
+        assert!(description.contains("Add File, Delete File, Move to"));
+        let patch_description = schema["properties"]["patch"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(patch_description.contains("*** Begin Patch"));
+        assert!(patch_description.contains("*** Update File: value.txt"));
+        assert!(patch_description.contains("Add/Delete/Move/multifile forms are rejected"));
         for arguments in [
             json!({"path": "value.txt"}),
             json!({"path": "value.txt", "patch": "@@ -1 +1 @@\n one\n", "extra": true}),
@@ -837,6 +1432,217 @@ mod tests {
             "one\nTWO\nthree\n"
         );
         cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn codex_update_envelope_applies_to_the_declared_existing_file() {
+        let (base, _, tool) = fixture("codex-envelope").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value.txt"), "old\n")
+            .await
+            .unwrap();
+        let patch = "*** Begin Patch\n*** Update File: value.txt\n@@\n-old\n+new\n*** End Patch\n";
+
+        assert_eq!(
+            execute(&tool, json!({"path": "value.txt", "patch": patch}))
+                .await
+                .unwrap(),
+            "patched 4 bytes to 4 bytes at value.txt"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("value.txt"))
+                .await
+                .unwrap(),
+            "new\n"
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn codex_update_envelope_supports_anchors_ranges_blank_lines_and_eof() {
+        let (base, _, tool) = fixture("codex-features").await;
+        let root = base.join("root");
+        let target = root.join("value.txt");
+        tokio::fs::write(&target, b"header\r\nanchor\r\nold\r\n\r\nfinal")
+            .await
+            .unwrap();
+        let patch = "*** Begin Patch\r\n*** Update File: value.txt\r\n@@ anchor\r\n anchor\r\n-old\r\n+new\r\n@@ -4,2 +4,2 @@\r\n \r\n-final\r\n+tail\r\n*** End of File\r\n*** End Patch\r\n";
+
+        execute(&tool, json!({"path": "value.txt", "patch": patch}))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            b"header\r\nanchor\r\nnew\r\n\r\ntail"
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn codex_envelope_rejects_unsafe_ambiguous_and_overlapping_shapes_without_writing() {
+        let (base, _, tool) = fixture("codex-invalid").await;
+        let root = base.join("root");
+        let target = root.join("value.txt");
+        let source = "a\nb\nc\n";
+        tokio::fs::write(&target, source).await.unwrap();
+        let invalid = [
+            "*** Begin Patch\n*** Add File: value.txt\n+a\n*** End Patch\n",
+            "*** Begin Patch\n*** Delete File: value.txt\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: value.txt\n*** Move to: other.txt\n@@\n-a\n+A\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: value.txt\n@@\n-a\n+A\n*** Update File: other.txt\n@@\n-b\n+B\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: other.txt\n@@\n-a\n+A\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: value.txt\n@@ -1 +1 @@\n-a\n+A\n@@ -1 +1 @@\n-a\n+A2\n*** End Patch\n",
+        ];
+        for patch in invalid {
+            assert_eq!(
+                tool.execute(
+                    invocation(json!({"path": "value.txt", "patch": patch})),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                )
+                .await,
+                Err(ToolError::InvalidInvocation),
+                "Codex shape should be rejected: {patch:?}"
+            );
+            assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), source);
+        }
+
+        tokio::fs::write(&target, "same\nsame\n").await.unwrap();
+        let ambiguous =
+            "*** Begin Patch\n*** Update File: value.txt\n@@\n-same\n+changed\n*** End Patch\n";
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "value.txt", "patch": ambiguous})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::InvalidInvocation)
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "same\nsame\n"
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn codex_envelope_oversize_is_rejected_without_reading_or_writing() {
+        let (base, _, tool) = fixture("codex-oversize").await;
+        let root = base.join("root");
+        let target = root.join("value.txt");
+        tokio::fs::write(&target, "old\n").await.unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: value.txt\n@@\n-old\n+{}\n*** End Patch\n",
+            "x".repeat(MAX_PATCH_BYTES)
+        );
+        assert!(patch.len() > MAX_PATCH_BYTES);
+        assert_eq!(
+            tool.execute(
+                invocation(json!({"path": "value.txt", "patch": patch})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+            )
+            .await,
+            Err(ToolError::InvalidInvocation)
+        );
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "old\n");
+        cleanup(&base).await;
+    }
+
+    #[test]
+    fn codex_matching_handles_repeated_prefixes_without_guessing() {
+        let source = "same\nnoise\nsame\nold\n";
+        let patch =
+            "*** Begin Patch\n*** Update File: value.txt\n@@\n same\n-old\n+new\n*** End Patch\n";
+        let (result, _) = apply_single_file_patch_with_stats("value.txt", source, patch).unwrap();
+        assert_eq!(result, "same\nnoise\nsame\nnew\n");
+    }
+
+    #[test]
+    fn codex_review_regression_consecutive_header_only_hunks() {
+        let source = "outer\ninner\nold\n";
+        let patch = "*** Begin Patch\n*** Update File: value.txt\n@@ outer\n@@ inner\n-old\n+new\n*** End Patch\n";
+        assert_eq!(
+            apply_single_file_patch("value.txt", source, patch),
+            Ok("outer\ninner\nnew\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn codex_review_regression_noeol_context_append_at_eof() {
+        let source = "old";
+        let patch = "*** Begin Patch\n*** Update File: value.txt\n@@\n old\n+new\n*** End of File\n*** End Patch\n";
+        assert_eq!(
+            apply_single_file_patch("value.txt", source, patch),
+            Ok("old\nnew".to_owned())
+        );
+    }
+
+    #[test]
+    fn codex_review_regression_rejects_unanchored_empty_and_eof_hunks() {
+        let invalid = [
+            "*** Begin Patch\n*** Update File: value.txt\n@@ outer\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: value.txt\n@@\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: value.txt\n@@ outer\n*** End of File\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: value.txt\n@@ -0,0 +0,0 @@\n*** End Patch\n",
+        ];
+        for patch in invalid {
+            assert_eq!(
+                apply_single_file_patch("value.txt", "outer\n", patch),
+                Err(ToolError::InvalidInvocation)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_review_regression_preserves_anchor_order_and_range_cursor() {
+        let source = "outer\ninner\nold\n";
+        let cases = [
+            (
+                "*** Begin Patch\n*** Update File: value.txt\n@@ inner\n-old\n+new\n@@ outer\n-inner\n+INNER\n*** End Patch\n",
+                ToolError::Failed,
+            ),
+            (
+                "*** Begin Patch\n*** Update File: value.txt\n@@ outer\n-old\n+new\n*** End of File\n@@ inner\n-old\n+new\n*** End Patch\n",
+                ToolError::InvalidInvocation,
+            ),
+            (
+                "*** Begin Patch\n*** Update File: value.txt\n@@ -3 +2 @@\n-old\n+new\n*** End Patch\n",
+                ToolError::InvalidInvocation,
+            ),
+        ];
+        for (patch, error) in cases {
+            assert_eq!(
+                apply_single_file_patch("value.txt", source, patch),
+                Err(error)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_hunks_use_bounded_forward_matching() {
+        let mut source = String::new();
+        let mut patch = String::from("*** Begin Patch\n*** Update File: value.txt\n");
+        let mut expected = String::new();
+        for index in 0..3_000usize {
+            source.push_str(&format!("v{index:04}\n"));
+            expected.push_str(&format!("V{index:04}\n"));
+            patch.push_str(&format!("@@\n-v{index:04}\n+V{index:04}\n"));
+        }
+        patch.push_str("*** End Patch\n");
+        assert!(patch.len() <= MAX_PATCH_BYTES);
+        let (result, stats) =
+            apply_single_file_patch_with_stats("value.txt", &source, &patch).unwrap();
+        assert_eq!(result, expected);
+        assert!(stats.codex_match_visits <= stats.source_lines);
+        assert!(stats.total_steps() <= 4 * (stats.source_lines + stats.patch_lines));
     }
 
     #[tokio::test]
