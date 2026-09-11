@@ -115,6 +115,10 @@ impl RpcProcess {
         }
     }
 
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("process already shut down").id()
+    }
+
     pub async fn send(&mut self, id: &str, method: &str, params: Value) {
         let mut frame = serde_json::to_vec(&json!({
             "jsonrpc": "2.0",

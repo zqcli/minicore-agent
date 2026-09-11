@@ -39,6 +39,8 @@ pub(crate) const RUNTIME_ERROR: i32 = -32_013;
 pub(crate) const INVALID_SESSION_SETTINGS: i32 = -32_014;
 pub(crate) const HISTORY_TOO_LARGE: i32 = -32_015;
 pub(crate) const STEER_QUEUE_FULL: i32 = -32_016;
+pub(crate) const RELOAD_REQUIRES_RESTART: i32 = -32_017;
+pub(crate) const RELOAD_UNAVAILABLE: i32 = -32_018;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {

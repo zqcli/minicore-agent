@@ -309,4 +309,25 @@ mod tests {
         }
         let _ = tokio::fs::remove_dir_all(base).await;
     }
+
+    #[test]
+    fn command_environment_merge_keeps_previous_and_candidate_names() {
+        let previous = CommandEnvironment::new([
+            OsString::from("MINICORE_RELOAD_UNIT_KEY_A"),
+            OsString::from("MINICORE_RELOAD_UNIT_KEY_B"),
+        ]);
+        let candidate = CommandEnvironment::new([
+            OsString::from("MINICORE_RELOAD_UNIT_KEY_B"),
+            OsString::from("MINICORE_RELOAD_UNIT_KEY_C"),
+        ]);
+        let merged = previous.extended(candidate.names().iter().cloned());
+        assert_eq!(
+            merged.names().to_vec(),
+            vec![
+                OsString::from("MINICORE_RELOAD_UNIT_KEY_A"),
+                OsString::from("MINICORE_RELOAD_UNIT_KEY_B"),
+                OsString::from("MINICORE_RELOAD_UNIT_KEY_C"),
+            ]
+        );
+    }
 }

@@ -20,12 +20,12 @@ use super::protocol::{
     AgentEventNotification, CancelledResult, EmptyParams, HISTORY_TOO_LARGE, INTERACTION_NOT_FOUND,
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE,
     InteractionAnswerParams, METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult,
-    PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest,
-    RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED,
-    STEER_QUEUE_FULL, STORE_ERROR, SessionCreateParams, SessionHistoryParams, SessionParams,
-    SessionRenameParams, SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult,
-    SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult, TurnSendParams, TurnSteerParams,
-    WORKSPACE_ERROR, decode_params, parse_request, request_id,
+    PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE,
+    RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY,
+    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionCreateParams,
+    SessionHistoryParams, SessionParams, SessionRenameParams, SessionResult, SessionUpdateParams,
+    SessionUpdateResult, SessionsResult, SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult,
+    TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -204,6 +204,14 @@ impl RpcServer {
                 };
                 let result = self.agent().ping();
                 Dispatch::Response(success(&id, result))
+            }
+            "agent.reload" => {
+                let _: EmptyParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self.agent_mut().reload().await;
+                Dispatch::Response(agent_result(&id, result))
             }
             "agent.shutdown" => {
                 let _: EmptyParams = match params_or_error(&id, params) {
@@ -702,6 +710,18 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             "history_too_large",
             false,
         ),
+        AgentError::ReloadRequiresRestart => (
+            RELOAD_REQUIRES_RESTART,
+            "configuration reload requires restart",
+            "reload_requires_restart",
+            false,
+        ),
+        AgentError::ReloadUnavailable => (
+            RELOAD_UNAVAILABLE,
+            "configuration reload is unavailable",
+            "reload_unavailable",
+            false,
+        ),
         AgentError::Runtime(view) => (
             RUNTIME_ERROR,
             "runtime error",
@@ -725,6 +745,7 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
 fn canonical_method(method: &str) -> &'static str {
     match method {
         "agent.ping" => "agent.ping",
+        "agent.reload" => "agent.reload",
         "agent.shutdown" => "agent.shutdown",
         "profile.list" => "profile.list",
         "model.list" => "model.list",

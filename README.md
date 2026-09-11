@@ -37,10 +37,22 @@ Profile `system_prompt` keeps its existing inline string form and also accepts
 the absolute config path supplied to `AgentConfig::load`; a config symlink keeps
 its supplied alias directory as the base. The target must resolve to a regular
 UTF-8 file no larger than 128 KiB; CRLF is normalized to LF, and symlinks to
-regular files are allowed. The content is loaded once at Agent startup, and
-each created Session stores its prompt snapshot in `session.json`. The Agent
-never rereads the file on turn or Session reopen. This is configuration-path
-handling, not a race-proof filesystem sandbox.
+regular files are allowed. The content is loaded when the configuration is
+opened or reloaded, and each created Session stores its prompt snapshot in
+`session.json`. The Agent never rereads the file on turn or Session reopen.
+This is configuration-path handling, not a race-proof filesystem sandbox.
+
+`agent.reload` rereads only the startup configuration file path. It rebuilds
+the candidate model/profile catalog and future-turn execution snapshots before
+swapping them; active loops keep their current configuration, and Session
+records, history, and stored system-prompt snapshots are not rewritten. New
+Sessions use the reloaded profiles and defaults; existing Sessions keep their
+persisted snapshots. It does not reload the Agent binary. Future Bash
+children scrub credential environment names from the existing cumulative
+scrub set and the candidate model catalog. `data_dir` and Agent-level `event_capacity` changes
+require restart. An embedded `Agent::open` has no reload source;
+`Agent::open_file` is the source-aware
+entrypoint used by the binary.
 
 A Session may select a configured `model` and `reasoning` value, or inherit the
 Profile defaults. Runtime-backed reasoning values include `auto`, `disabled`,
@@ -124,7 +136,7 @@ errors, and redacted Debug output.
 The stdio protocol implements the v0.3 method set:
 
 ```text
-agent.ping             agent.shutdown
+agent.ping             agent.reload             agent.shutdown
 profile.list           model.list
 session.list           session.create         session.open
 session.close          session.delete         session.state
@@ -135,10 +147,11 @@ turn.steer             interaction.answer
 ```
 
 `session.transcript` is gone; `session.history` returns the sanitized stored
-history. Errors are classified as before with domain codes `-32001`
-through `-32016` plus `-32015 history_too_large` and `-32016
-steer_queue_full`. The full wire contract, frame interleaving guarantees, event
-shapes, and error mapping are documented in [docs/rpc.md](docs/rpc.md).
+history. Errors are classified as before with domain codes `-32001` through
+`-32018`; the added reload errors are `-32017 reload_requires_restart` and
+`-32018 reload_unavailable`. The full wire contract, frame interleaving
+guarantees, event shapes, and error mapping are documented in
+[docs/rpc.md](docs/rpc.md).
 
 `session.presentation` is a read-only footer/tool-card projection. It returns
 the configured Session model label, a fixed-argument Git branch lookup, the

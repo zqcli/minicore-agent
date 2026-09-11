@@ -62,6 +62,10 @@ pub enum AgentError {
     Store,
     #[error("the operation is not valid in the current state")]
     InvalidState,
+    #[error("configuration reload requires restart")]
+    ReloadRequiresRestart,
+    #[error("configuration reload is unavailable")]
+    ReloadUnavailable,
     #[error("the steer queue is full")]
     SteerQueueFull,
     #[error("runtime error: {0}")]

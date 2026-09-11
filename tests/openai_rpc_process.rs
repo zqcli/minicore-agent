@@ -124,6 +124,76 @@ request_timeout_seconds = 5
     config_path
 }
 
+fn write_reload_config(
+    config_path: &Path,
+    data_dir: &Path,
+    base_url: &str,
+    key_env: &str,
+    provider_model: &str,
+    prompt_file: &str,
+) {
+    write_reload_config_with_tools(
+        config_path,
+        data_dir,
+        base_url,
+        key_env,
+        provider_model,
+        prompt_file,
+        &[],
+    );
+}
+
+fn write_reload_config_with_tools(
+    config_path: &Path,
+    data_dir: &Path,
+    base_url: &str,
+    key_env: &str,
+    provider_model: &str,
+    prompt_file: &str,
+    tools: &[&str],
+) {
+    let tools = tools
+        .iter()
+        .map(|tool| format!("\"{tool}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        config_path,
+        format!(
+            r#"data_dir = {data_dir:?}
+event_capacity = 256
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "auto"
+system_prompt = {{ file = {prompt_file:?} }}
+tools = [{tools}]
+max_tool_rounds = 4
+approval = "auto"
+
+[models.main]
+provider = "open_ai_responses"
+model = {provider_model:?}
+base_url = {base_url:?}
+api_key_env = {key_env:?}
+physical_context_window = 16000
+output_budget_tokens = 1024
+safety_margin_tokens = 1000
+supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
+supports_tools = true
+request_timeout_seconds = 5
+"#,
+            data_dir = data_dir,
+            prompt_file = prompt_file,
+            provider_model = provider_model,
+            base_url = base_url,
+            key_env = key_env,
+        ),
+    )
+    .unwrap();
+}
+
 fn completed() -> Value {
     json!({
         "type": "response.completed",
@@ -138,6 +208,29 @@ fn completed() -> Value {
             }
         }
     })
+}
+
+fn bash_call_response(call_id: &str, command: &str) -> MockResponse {
+    MockResponse::sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "bash",
+                "arguments": serde_json::to_string(&json!({"command": command})).unwrap()
+            }
+        }),
+        completed(),
+    ])
+}
+
+fn text_response(text: &str) -> MockResponse {
+    MockResponse::sse(&[
+        json!({"type": "response.output_text.delta", "delta": text}),
+        completed(),
+    ])
 }
 
 #[cfg(any(unix, windows))]
@@ -160,6 +253,18 @@ const PROCESS_BASH_COMMAND_MARKER: &str = "PROCESS-B2-BASH-COMMAND-MARKER";
 const PROCESS_BASH_PATH_MARKER: &str = "process-b2-bash-private-path-marker.txt";
 #[cfg(any(unix, windows))]
 const PROCESS_BASH_CONTENT_MARKER: &str = "PROCESS-B2-BASH-PRIVATE-CONTENT-MARKER";
+#[cfg(any(unix, windows))]
+const PROCESS_RELOAD_KEY_A: &str = "MINICORE_RELOAD_KEY_A";
+#[cfg(any(unix, windows))]
+const PROCESS_RELOAD_KEY_B: &str = "MINICORE_RELOAD_KEY_B";
+#[cfg(any(unix, windows))]
+const PROCESS_RELOAD_KEY_C: &str = "MINICORE_RELOAD_KEY_C";
+#[cfg(any(unix, windows))]
+const PROCESS_RELOAD_SECRET_A: &str = "PROCESS-RELOAD-KEY-A-SECRET";
+#[cfg(any(unix, windows))]
+const PROCESS_RELOAD_SECRET_B: &str = "PROCESS-RELOAD-KEY-B-SECRET";
+#[cfg(any(unix, windows))]
+const PROCESS_RELOAD_SECRET_C: &str = "PROCESS-RELOAD-KEY-C-SECRET";
 
 #[cfg(unix)]
 fn environment_probe_command() -> &'static str {
@@ -222,6 +327,42 @@ fn assert_process_bash_command_markers_absent(value: &str) {
         PROCESS_BASH_CONTENT_MARKER,
     ] {
         assert!(!value.contains(marker));
+    }
+}
+
+#[cfg(unix)]
+fn reload_environment_probe_command() -> &'static str {
+    concat!(
+        "if [ -n \"${MINICORE_RELOAD_KEY_A+x}\" ]; then a=false; else a=true; fi\n",
+        "if [ -n \"${MINICORE_RELOAD_KEY_B+x}\" ]; then b=false; else b=true; fi\n",
+        "if [ -n \"${MINICORE_RELOAD_KEY_C+x}\" ]; then c=false; else c=true; fi\n",
+        "printf 'key_a_unset=%s\\nkey_b_unset=%s\\nkey_c_unset=%s\\n' \"$a\" \"$b\" \"$c\""
+    )
+}
+
+#[cfg(windows)]
+fn reload_environment_probe_command() -> &'static str {
+    concat!(
+        "$a = [string]::IsNullOrEmpty($env:MINICORE_RELOAD_KEY_A); ",
+        "$b = [string]::IsNullOrEmpty($env:MINICORE_RELOAD_KEY_B); ",
+        "$c = [string]::IsNullOrEmpty($env:MINICORE_RELOAD_KEY_C); ",
+        "[Console]::WriteLine(('key_a_unset={0}' -f $a.ToString().ToLower())); ",
+        "[Console]::WriteLine(('key_b_unset={0}' -f $b.ToString().ToLower())); ",
+        "[Console]::WriteLine(('key_c_unset={0}' -f $c.ToString().ToLower()))"
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn assert_reload_environment_is_unset(value: &str) {
+    assert!(value.contains("key_a_unset=true"), "probe output: {value}");
+    assert!(value.contains("key_b_unset=true"), "probe output: {value}");
+    assert!(value.contains("key_c_unset=true"), "probe output: {value}");
+    for secret in [
+        PROCESS_RELOAD_SECRET_A,
+        PROCESS_RELOAD_SECRET_B,
+        PROCESS_RELOAD_SECRET_C,
+    ] {
+        assert!(!value.contains(secret));
     }
 }
 
@@ -360,6 +501,423 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_history() {
             .any(|item| item["type"] == "function_call_output")
     );
     let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() {
+    const KEY_ENV: &str = "MINICORE_PROCESS_RELOAD_KEY";
+    const KEY: &str = "PROCESS-RELOAD-KEY-SECRET";
+    const MISSING_KEY_ENV: &str = "MINICORE_PROCESS_RELOAD_MISSING_KEY_9C4E";
+
+    let (old_response, old_gate) = MockResponse::sse(&[
+        json!({"type": "response.output_text.delta", "delta": "old answer"}),
+        completed(),
+    ])
+    .with_chunk_gate();
+    let old_server = MockServer::spawn([old_response]).await;
+    let new_server = MockServer::spawn([
+        MockResponse::sse(&[
+            json!({"type": "response.output_text.delta", "delta": "new answer"}),
+            completed(),
+        ]),
+        MockResponse::sse(&[
+            json!({"type": "response.output_text.delta", "delta": "new session answer"}),
+            completed(),
+        ]),
+        MockResponse::sse(&[
+            json!({"type": "response.output_text.delta", "delta": "after failed reload"}),
+            completed(),
+        ]),
+    ])
+    .await;
+
+    let root = std::env::temp_dir().join(format!(
+        "minicore-agent-reload-process-{}",
+        minicore_agent::SessionId::new().unwrap()
+    ));
+    let real_dir = root.join("real");
+    let alias_dir = root.join("alias");
+    let data_dir = root.join("data");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::create_dir_all(&alias_dir).unwrap();
+    std::fs::write(alias_dir.join("prompt.md"), "old reload prompt").unwrap();
+    let real_config = real_dir.join("agent.toml");
+    write_reload_config(
+        &real_config,
+        &data_dir,
+        old_server.base_url(),
+        KEY_ENV,
+        "provider-model-old",
+        "prompt.md",
+    );
+    let alias_config = alias_dir.join("agent.toml");
+    std::os::unix::fs::symlink(&real_config, &alias_config).unwrap();
+
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut process = RpcProcess::spawn(&alias_config, KEY_ENV, KEY).await;
+    let pid = process.pid();
+    process
+        .send("create", "session.create", json!({"workspace": workspace}))
+        .await;
+    let first_session = process.response("create").await["result"]["session"]["session_id"].clone();
+    let first_session_text = first_session.as_str().unwrap().to_owned();
+    let session_dir = data_dir.join("sessions").join(&first_session_text);
+    let session_before = std::fs::read(session_dir.join("session.json")).unwrap();
+    let history_before = std::fs::read(session_dir.join("history.jsonl")).unwrap();
+
+    let (_, first_wait) = process
+        .send_turn_and_register_wait("old", &first_session, "first turn")
+        .await;
+    old_server.wait_for_requests(1).await;
+
+    std::fs::write(alias_dir.join("prompt.md"), "new reload prompt").unwrap();
+    write_reload_config(
+        &real_config,
+        &data_dir,
+        new_server.base_url(),
+        KEY_ENV,
+        "provider-model-new",
+        "prompt.md",
+    );
+    process.send("reload", "agent.reload", json!({})).await;
+    let reloaded = process.response("reload").await;
+    assert_eq!(reloaded["result"], json!({"ok": true}));
+    assert_eq!(process.pid(), pid);
+    assert_eq!(
+        std::fs::read(session_dir.join("session.json")).unwrap(),
+        session_before
+    );
+    assert_eq!(
+        std::fs::read(session_dir.join("history.jsonl")).unwrap(),
+        history_before
+    );
+
+    old_gate.release();
+    let first_result = process.response(&first_wait).await;
+    assert_eq!(first_result["result"]["outcome"]["type"], "completed");
+
+    let (_, second_wait) = process
+        .send_turn_and_register_wait("new", &first_session, "second turn")
+        .await;
+    let second_result = process.response(&second_wait).await;
+    assert_eq!(second_result["result"]["outcome"]["type"], "completed");
+
+    process
+        .send(
+            "create-new",
+            "session.create",
+            json!({"workspace": workspace}),
+        )
+        .await;
+    let new_session =
+        process.response("create-new").await["result"]["session"]["session_id"].clone();
+    let (_, third_wait) = process
+        .send_turn_and_register_wait("new-session", &new_session, "new session turn")
+        .await;
+    let third_result = process.response(&third_wait).await;
+    assert_eq!(third_result["result"]["outcome"]["type"], "completed");
+
+    write_reload_config(
+        &real_config,
+        &data_dir,
+        new_server.base_url(),
+        KEY_ENV,
+        "provider-model-missing-prompt",
+        "missing.md",
+    );
+    process
+        .send("missing-prompt", "agent.reload", json!({}))
+        .await;
+    let missing_prompt = process.response("missing-prompt").await;
+    assert_eq!(missing_prompt["error"]["code"], json!(-32603));
+    assert_eq!(
+        missing_prompt["error"]["data"]["kind"],
+        json!("internal_error")
+    );
+    assert!(!missing_prompt.to_string().contains("missing.md"));
+
+    write_reload_config(
+        &real_config,
+        &data_dir,
+        new_server.base_url(),
+        MISSING_KEY_ENV,
+        "provider-model-missing-key",
+        "prompt.md",
+    );
+    process.send("missing", "agent.reload", json!({})).await;
+    let missing = process.response("missing").await;
+    assert_eq!(missing["error"]["code"], json!(-32603));
+    assert_eq!(missing["error"]["message"], json!("internal error"));
+    assert_eq!(
+        missing["error"]["data"],
+        json!({
+            "kind": "internal_error",
+            "retryable": false,
+        })
+    );
+    let alias_path = alias_config.to_string_lossy().into_owned();
+    assert!(!missing.to_string().contains(MISSING_KEY_ENV));
+    assert!(!missing.to_string().contains(KEY));
+    assert!(!missing.to_string().contains(&alias_path));
+
+    let (_, after_failure_wait) = process
+        .send_turn_and_register_wait("after-failure", &first_session, "after failed reload")
+        .await;
+    let after_failure = process.response(&after_failure_wait).await;
+    assert_eq!(after_failure["result"]["outcome"]["type"], "completed");
+
+    write_reload_config(
+        &real_config,
+        &root.join("other-data"),
+        new_server.base_url(),
+        KEY_ENV,
+        "provider-model-restart-required",
+        "prompt.md",
+    );
+    process.send("restart", "agent.reload", json!({})).await;
+    let restart = process.response("restart").await;
+    assert_eq!(restart["error"]["code"], json!(-32017));
+    assert_eq!(
+        restart["error"]["data"],
+        json!({
+            "kind": "reload_requires_restart",
+            "retryable": false,
+        })
+    );
+
+    process
+        .send(
+            "close",
+            "session.close",
+            json!({"session_id": first_session}),
+        )
+        .await;
+    process.response("close").await;
+    let (observed, stderr) = process.shutdown().await;
+    assert!(!serde_json::to_string(&observed).unwrap().contains(KEY));
+    assert!(!stderr.contains(KEY));
+    assert!(!stderr.contains(MISSING_KEY_ENV));
+    assert!(!stderr.contains(&alias_path));
+
+    let old_requests = old_server.finish().await;
+    assert_eq!(old_requests.len(), 1);
+    assert_eq!(old_requests[0].path(), "/responses");
+    assert_eq!(old_requests[0].json_body()["model"], "provider-model-old");
+    assert_eq!(
+        old_requests[0].json_body()["input"][0]["content"][0]["text"],
+        "old reload prompt"
+    );
+
+    let new_requests = new_server.finish().await;
+    assert_eq!(new_requests.len(), 3);
+    assert_eq!(new_requests[0].path(), "/responses");
+    assert_eq!(new_requests[1].path(), "/responses");
+    assert_eq!(new_requests[0].json_body()["model"], "provider-model-new");
+    assert_eq!(new_requests[1].json_body()["model"], "provider-model-new");
+    assert_eq!(
+        new_requests[0].json_body()["input"][0]["content"][0]["text"],
+        "old reload prompt"
+    );
+    assert_eq!(
+        new_requests[1].json_body()["input"][0]["content"][0]["text"],
+        "new reload prompt"
+    );
+    assert_eq!(new_requests[2].json_body()["model"], "provider-model-new");
+    assert_eq!(
+        new_requests[2].json_body()["input"][0]["content"][0]["text"],
+        "old reload prompt"
+    );
+
+    let new_session_text = new_session.as_str().unwrap();
+    let new_record = std::fs::read_to_string(
+        data_dir
+            .join("sessions")
+            .join(new_session_text)
+            .join("session.json"),
+    )
+    .unwrap();
+    assert!(new_record.contains("new reload prompt"));
+    assert!(!new_record.contains("old reload prompt"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn process_reload_cumulatively_scrubs_previous_model_credentials_from_bash() {
+    let command = reload_environment_probe_command();
+    let server = MockServer::spawn([
+        bash_call_response("reload-existing-bash", command),
+        text_response("existing reload bash complete"),
+        bash_call_response("reload-new-bash", command),
+        text_response("new reload bash complete"),
+    ])
+    .await;
+    let root = std::env::temp_dir().join(format!(
+        "minicore-agent-reload-env-process-{}",
+        minicore_agent::SessionId::new().unwrap()
+    ));
+    let data_dir = root.join("data");
+    let workspace = root.join("workspace");
+    let config = root.join("agent.toml");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(root.join("prompt.md"), "reload environment prompt").unwrap();
+    write_reload_config_with_tools(
+        &config,
+        &data_dir,
+        server.base_url(),
+        PROCESS_RELOAD_KEY_A,
+        "provider-model-a",
+        "prompt.md",
+        &["bash"],
+    );
+    let mut process = RpcProcess::spawn_with_extra_env(
+        &config,
+        PROCESS_RELOAD_KEY_A,
+        PROCESS_RELOAD_SECRET_A,
+        &[
+            (PROCESS_RELOAD_KEY_B, PROCESS_RELOAD_SECRET_B),
+            (PROCESS_RELOAD_KEY_C, PROCESS_RELOAD_SECRET_C),
+        ],
+    )
+    .await;
+
+    process
+        .send(
+            "create-existing",
+            "session.create",
+            json!({"workspace": workspace}),
+        )
+        .await;
+    let existing_session =
+        process.response("create-existing").await["result"]["session"]["session_id"].clone();
+
+    write_reload_config_with_tools(
+        &config,
+        &data_dir,
+        server.base_url(),
+        PROCESS_RELOAD_KEY_B,
+        "provider-model-b",
+        "prompt.md",
+        &["bash"],
+    );
+    process.send("reload-b", "agent.reload", json!({})).await;
+    assert_eq!(
+        process.response("reload-b").await["result"],
+        json!({"ok": true})
+    );
+
+    write_reload_config_with_tools(
+        &config,
+        &data_dir,
+        server.base_url(),
+        PROCESS_RELOAD_KEY_C,
+        "provider-model-c",
+        "prompt.md",
+        &["bash"],
+    );
+    process.send("reload-c", "agent.reload", json!({})).await;
+    assert_eq!(
+        process.response("reload-c").await["result"],
+        json!({"ok": true})
+    );
+
+    write_reload_config_with_tools(
+        &config,
+        &data_dir,
+        server.base_url(),
+        PROCESS_RELOAD_KEY_C,
+        "provider-model-invalid-candidate",
+        "missing.md",
+        &["bash"],
+    );
+    process
+        .send("reload-invalid", "agent.reload", json!({}))
+        .await;
+    let invalid = process.response("reload-invalid").await;
+    assert_eq!(invalid["error"]["code"], json!(-32603));
+    assert_eq!(invalid["error"]["data"]["kind"], json!("internal_error"));
+
+    let (_, existing_wait) = process
+        .send_turn_and_register_wait("existing", &existing_session, "probe existing session")
+        .await;
+    process.event("tool_started").await;
+    process.event("tool_finished").await;
+    let existing_result = process.response(&existing_wait).await;
+    assert_eq!(existing_result["result"]["outcome"]["type"], "completed");
+    process
+        .send(
+            "existing-history",
+            "session.history",
+            json!({"session_id": existing_session, "offset": 0, "limit": 100}),
+        )
+        .await;
+    let existing_history = process.response("existing-history").await;
+    assert_reload_environment_is_unset(&existing_history.to_string());
+
+    process
+        .send(
+            "create-new",
+            "session.create",
+            json!({"workspace": workspace}),
+        )
+        .await;
+    let new_session =
+        process.response("create-new").await["result"]["session"]["session_id"].clone();
+    let (_, new_wait) = process
+        .send_turn_and_register_wait("new", &new_session, "probe new session")
+        .await;
+    process.event("tool_started").await;
+    process.event("tool_finished").await;
+    let new_result = process.response(&new_wait).await;
+    assert_eq!(new_result["result"]["outcome"]["type"], "completed");
+    process
+        .send(
+            "new-history",
+            "session.history",
+            json!({"session_id": new_session, "offset": 0, "limit": 100}),
+        )
+        .await;
+    let new_history = process.response("new-history").await;
+    assert_reload_environment_is_unset(&new_history.to_string());
+
+    let (observed, stderr) = process.shutdown().await;
+    let observed = serde_json::to_string(&observed).unwrap();
+    for secret in [
+        PROCESS_RELOAD_SECRET_A,
+        PROCESS_RELOAD_SECRET_B,
+        PROCESS_RELOAD_SECRET_C,
+    ] {
+        assert!(!observed.contains(secret));
+        assert!(!stderr.contains(secret));
+        assert!(!existing_history.to_string().contains(secret));
+        assert!(!new_history.to_string().contains(secret));
+    }
+
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 4);
+    for request in &requests {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer PROCESS-RELOAD-KEY-C-SECRET")
+        );
+        let body = String::from_utf8_lossy(request.body());
+        assert!(!body.contains(PROCESS_RELOAD_SECRET_A));
+        assert!(!body.contains(PROCESS_RELOAD_SECRET_B));
+        assert!(!body.contains(PROCESS_RELOAD_SECRET_C));
+    }
+    assert_eq!(requests[0].json_body()["model"], "provider-model-c");
+    assert_eq!(requests[2].json_body()["model"], "provider-model-c");
+    for index in [1, 3] {
+        let body = String::from_utf8_lossy(requests[index].body());
+        assert!(body.contains("key_a_unset=true"));
+        assert!(body.contains("key_b_unset=true"));
+        assert!(body.contains("key_c_unset=true"));
+    }
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

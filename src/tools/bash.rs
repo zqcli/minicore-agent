@@ -60,6 +60,15 @@ impl CommandEnvironment {
         }
     }
 
+    pub(crate) fn extended(&self, names: impl IntoIterator<Item = OsString>) -> Self {
+        Self::new(self.removed.iter().cloned().chain(names))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> &[OsString] {
+        &self.removed
+    }
+
     fn apply(&self, command: &mut Command) {
         for name in self.removed.iter() {
             command.env_remove(name);

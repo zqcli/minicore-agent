@@ -391,6 +391,49 @@ async fn capability_discovery_returns_ordered_lists() {
 }
 
 #[tokio::test]
+async fn agent_reload_requires_empty_params_and_a_file_source() {
+    let (agent, base, _workspace) = test_agent("reload-rpc", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+
+    harness
+        .send(json!("reload"), "agent.reload", Some(json!({})))
+        .await;
+    let reload = harness.response(json!("reload")).await;
+    assert_eq!(reload["error"]["code"], json!(-32018));
+    assert_eq!(
+        reload["error"]["data"],
+        json!({
+            "kind": "reload_unavailable",
+            "retryable": false,
+        })
+    );
+
+    harness
+        .send(
+            json!("reload-path"),
+            "agent.reload",
+            Some(json!({"path": "/tmp/other.agent.toml"})),
+        )
+        .await;
+    let reload_path = harness.response(json!("reload-path")).await;
+    assert_eq!(reload_path["error"]["code"], json!(-32602));
+    assert_eq!(
+        reload_path["error"]["data"]["kind"],
+        json!("invalid_params")
+    );
+    assert!(!reload_path.to_string().contains("other.agent.toml"));
+
+    harness
+        .send(json!("reload-omitted"), "agent.reload", None)
+        .await;
+    let reload_omitted = harness.response(json!("reload-omitted")).await;
+    assert_eq!(reload_omitted["error"]["code"], json!(-32018));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
 async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
     let (agent, base, workspace) =
         test_agent("extended-reasoning", [], &[], ApprovalMode::Auto).await;
