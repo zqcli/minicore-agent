@@ -1,0 +1,13 @@
+
+running 8 tests
+test config::tests::prompt_file_must_be_a_regular_file ... ok
+test config::tests::prompt_file_errors_do_not_include_path_or_file_contents ... ok
+test config::tests::load_resolves_a_system_prompt_file_relative_to_the_config_parent ... ok
+test config::tests::relative_system_prompt_file_requires_a_config_path ... ok
+test config::tests::prompt_file_symlink_to_a_regular_file_is_allowed ... ok
+test config::tests::prompt_file_object_is_strictly_typed ... ok
+test agent::tests::system_prompt_file_is_loaded_once_and_session_snapshot_survives_reopen ... ok
+test config::tests::prompt_file_content_has_explicit_size_encoding_and_content_errors ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 288 filtered out; finished in 0.02s
+

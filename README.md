@@ -14,6 +14,9 @@ Current release: **0.3.3**, paired with MiniCore TUI **0.2.8**. See
 [release notes](docs/release-0.3.3.md) and the subsequent
 [presentation-path source fixes](docs/verification/presentation-risk-fixes.md).
 These follow-up fixes preserve the pinned Runtime revision and RPC surface.
+The subsequent [Session rename and prompt-file features](docs/verification/session-config.md)
+are separately committed and natively verified with the paired TUI; package
+versions and the Runtime pin are unchanged.
 
 ## Run
 
