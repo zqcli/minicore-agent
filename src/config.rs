@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -37,17 +38,31 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
+        Self::from_toml_with_base(text, None)
+    }
+
+    fn from_toml_with_base(text: &str, config_dir: Option<&Path>) -> Result<Self, ConfigError> {
         if text.trim().is_empty() {
             return Err(ConfigError::Empty);
         }
-        let config: Self = toml::from_str(text).map_err(|_| ConfigError::Parse)?;
+        let mut value: toml::Value = toml::from_str(text).map_err(|_| ConfigError::Parse)?;
+        resolve_system_prompt_files(&mut value, config_dir)?;
+        let config: Self = value.try_into().map_err(|_| ConfigError::Parse)?;
         config.validate()?;
         Ok(config)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|_| ConfigError::Read)?;
-        Self::from_toml(&text)
+        let path = path.as_ref();
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|_| ConfigError::Read)?
+                .join(path)
+        };
+        let text = std::fs::read_to_string(&path).map_err(|_| ConfigError::Read)?;
+        Self::from_toml_with_base(&text, path.parent())
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -150,6 +165,88 @@ impl AgentConfig {
     }
 }
 
+fn resolve_system_prompt_files(
+    value: &mut toml::Value,
+    config_dir: Option<&Path>,
+) -> Result<(), ConfigError> {
+    let Some(profiles) = value
+        .get_mut("profiles")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return Ok(());
+    };
+    for (_, profile) in profiles.iter_mut() {
+        let Some(profile) = profile.as_table_mut() else {
+            continue;
+        };
+        let Some(prompt) = profile.get("system_prompt") else {
+            continue;
+        };
+        let file = match prompt {
+            toml::Value::String(_) => continue,
+            toml::Value::Table(table) => {
+                if table.len() != 1 {
+                    return Err(ConfigError::InvalidSystemPromptFile);
+                }
+                let Some(toml::Value::String(file)) = table.get("file") else {
+                    return Err(ConfigError::InvalidSystemPromptFile);
+                };
+                file.clone()
+            }
+            _ => return Err(ConfigError::InvalidSystemPromptFile),
+        };
+        if file.is_empty() || file.chars().any(char::is_control) {
+            return Err(ConfigError::InvalidSystemPromptFile);
+        }
+        let path = Path::new(&file);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            config_dir
+                .ok_or(ConfigError::SystemPromptFileNeedsConfigPath)?
+                .join(path)
+        };
+        profile.insert(
+            "system_prompt".to_owned(),
+            toml::Value::String(read_system_prompt_file(&path)?),
+        );
+    }
+    Ok(())
+}
+
+fn read_system_prompt_file(path: &Path) -> Result<String, ConfigError> {
+    let metadata = std::fs::metadata(path).map_err(|_| ConfigError::SystemPromptFileRead)?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError::SystemPromptFileNotRegular);
+    }
+    let file = std::fs::File::open(path).map_err(|_| ConfigError::SystemPromptFileRead)?;
+    if !file
+        .metadata()
+        .map_err(|_| ConfigError::SystemPromptFileRead)?
+        .file_type()
+        .is_file()
+    {
+        return Err(ConfigError::SystemPromptFileNotRegular);
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_PROFILE_SYSTEM_PROMPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConfigError::SystemPromptFileRead)?;
+    if bytes.len() > MAX_PROFILE_SYSTEM_PROMPT_BYTES {
+        return Err(ConfigError::SystemPromptFileTooLarge);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| ConfigError::SystemPromptFileUtf8)?;
+    let text = text.replace("\r\n", "\n");
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(ConfigError::SystemPromptFileInvalidContent);
+    }
+    Ok(text)
+}
+
 fn default_event_capacity() -> usize {
     DEFAULT_EVENT_CAPACITY
 }
@@ -189,6 +286,20 @@ pub enum ConfigError {
     Empty,
     #[error("configuration could not be parsed (invalid syntax or unsupported fields)")]
     Parse,
+    #[error("system prompt file configuration is invalid")]
+    InvalidSystemPromptFile,
+    #[error("system prompt file requires a configuration file path")]
+    SystemPromptFileNeedsConfigPath,
+    #[error("system prompt file could not be read")]
+    SystemPromptFileRead,
+    #[error("system prompt file is not a regular file")]
+    SystemPromptFileNotRegular,
+    #[error("system prompt file is too large")]
+    SystemPromptFileTooLarge,
+    #[error("system prompt file is not valid UTF-8")]
+    SystemPromptFileUtf8,
+    #[error("system prompt file content is invalid")]
+    SystemPromptFileInvalidContent,
     #[error("configuration file could not be read")]
     Read,
     #[error("configuration data_dir must not be empty")]
@@ -268,6 +379,41 @@ mod tests {
             )]),
             loop_options: LoopOverrides::default(),
         }
+    }
+
+    fn config_with_prompt_spec(spec: &str) -> String {
+        format!(
+            r#"
+data_dir = "/tmp/minicore-agent-config-test-data"
+event_capacity = 128
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "auto"
+system_prompt = {spec}
+tools = []
+max_tool_rounds = 4
+approval = "ask"
+
+[models.main]
+provider = "open_ai_responses"
+model = "provider-model"
+base_url = "https://example.invalid/v1"
+api_key_env = "MINICORE_CONFIG_TEST_KEY"
+physical_context_window = 10000
+output_budget_tokens = 1000
+safety_margin_tokens = 1000
+supported_reasoning = ["auto"]
+supports_tools = true
+request_timeout_seconds = 30
+"#,
+            spec = spec
+        )
+    }
+
+    fn toml_path(path: &Path) -> String {
+        toml::Value::String(path.to_string_lossy().into_owned()).to_string()
     }
 
     #[test]
@@ -468,5 +614,258 @@ event_capacity = 128
         );
 
         assert!(config.is_ok(), "complete valid TOML was rejected");
+    }
+
+    #[test]
+    fn load_resolves_a_system_prompt_file_relative_to_the_config_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-file-red-{}",
+            std::process::id()
+        ));
+        let prompts = root.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("coding.md"), "line one\r\nline two").unwrap();
+        let config_path = root.join("agent.toml");
+        let data_dir = root.join("data");
+        let text = format!(
+            r#"
+data_dir = {data_dir}
+event_capacity = 128
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "auto"
+system_prompt = {{ file = "prompts/coding.md" }}
+tools = []
+max_tool_rounds = 4
+approval = "ask"
+
+[models.main]
+provider = "open_ai_responses"
+model = "provider-model"
+base_url = "https://example.invalid/v1"
+api_key_env = "MINICORE_CONFIG_FILE_TEST_KEY"
+physical_context_window = 10000
+output_budget_tokens = 1000
+safety_margin_tokens = 1000
+supported_reasoning = ["auto"]
+supports_tools = true
+request_timeout_seconds = 30
+"#,
+            data_dir = toml_path(&data_dir)
+        );
+        std::fs::write(&config_path, text).unwrap();
+
+        let config = AgentConfig::load(&config_path).unwrap();
+        assert_eq!(config.profiles["test"].system_prompt, "line one\nline two");
+        std::fs::write(prompts.join("coding.md"), "changed after load").unwrap();
+        assert_eq!(config.profiles["test"].system_prompt, "line one\nline two");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relative_system_prompt_file_requires_a_config_path() {
+        let result = AgentConfig::from_toml(&config_with_prompt_spec(
+            r#"{ file = "prompts/missing.md" }"#,
+        ));
+        assert!(matches!(
+            result,
+            Err(ConfigError::SystemPromptFileNeedsConfigPath)
+        ));
+    }
+
+    #[test]
+    fn legacy_inline_deserialization_stays_pure_and_file_requires_an_explicit_entrypoint() {
+        let inline: AgentConfig =
+            toml::from_str(&config_with_prompt_spec(r#""legacy inline prompt""#)).unwrap();
+        assert_eq!(
+            inline.profiles["test"].system_prompt,
+            "legacy inline prompt"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-deserialize-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let prompt = root.join("prompt.txt");
+        std::fs::write(&prompt, "absolute prompt").unwrap();
+        let spec = format!(r#"{{ file = {path} }}"#, path = toml_path(&prompt));
+        assert!(toml::from_str::<AgentConfig>(&config_with_prompt_spec(&spec)).is_err());
+        let config = AgentConfig::from_toml(&config_with_prompt_spec(&spec)).unwrap();
+        assert_eq!(config.profiles["test"].system_prompt, "absolute prompt");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prompt_file_object_is_strictly_typed() {
+        for spec in [
+            "7".to_owned(),
+            r#"{ file = 7 }"#.to_owned(),
+            r#"{ file = "prompt", extra = true }"#.to_owned(),
+        ] {
+            assert!(matches!(
+                AgentConfig::from_toml(&config_with_prompt_spec(&spec)),
+                Err(ConfigError::InvalidSystemPromptFile)
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_style_prompt_path_is_toml_roundtrip_safe() {
+        let path = Path::new(r"C:\Users\name\prompt.md");
+        let spec = format!(r#"{{ file = {path} }}"#, path = toml_path(path));
+        let parsed = toml::from_str::<toml::Value>(&format!("system_prompt = {spec}"));
+        assert_eq!(
+            parsed.unwrap()["system_prompt"]["file"].as_str(),
+            Some(r"C:\Users\name\prompt.md")
+        );
+    }
+
+    #[test]
+    fn prompt_file_content_has_explicit_size_encoding_and_content_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-content-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let prompt = root.join("prompt");
+        let spec = format!(r#"{{ file = {path} }}"#, path = toml_path(&prompt));
+
+        for (bytes, expected) in [
+            (b"".as_slice(), ConfigError::SystemPromptFileInvalidContent),
+            (
+                b"bad\0content".as_slice(),
+                ConfigError::SystemPromptFileInvalidContent,
+            ),
+            (&[0xff, 0xfe][..], ConfigError::SystemPromptFileUtf8),
+        ] {
+            std::fs::write(&prompt, bytes).unwrap();
+            assert!(matches!(
+                AgentConfig::from_toml(&config_with_prompt_spec(&spec)),
+                Err(error) if error == expected
+            ));
+        }
+
+        std::fs::write(&prompt, vec![b'a'; 128 * 1024]).unwrap();
+        assert!(AgentConfig::from_toml(&config_with_prompt_spec(&spec)).is_ok());
+        std::fs::write(&prompt, vec![b'a'; 128 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            AgentConfig::from_toml(&config_with_prompt_spec(&spec)),
+            Err(ConfigError::SystemPromptFileTooLarge)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prompt_file_errors_do_not_include_path_or_file_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-safe-error-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let prompt = root.join("private-prompt-path");
+        let secret = "private-prompt-content";
+        std::fs::write(&prompt, format!("{secret}\0")).unwrap();
+        let spec = format!(r#"{{ file = {path} }}"#, path = toml_path(&prompt));
+        let error = AgentConfig::from_toml(&config_with_prompt_spec(&spec)).unwrap_err();
+        let diagnostic = format!("{error} {error:?}");
+        let path_text = prompt.to_string_lossy().into_owned();
+        assert!(!diagnostic.contains(&path_text));
+        assert!(!diagnostic.contains(secret));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prompt_file_must_be_a_regular_file() {
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-regular-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let spec = format!(r#"{{ file = {path} }}"#, path = toml_path(&root));
+        assert!(matches!(
+            AgentConfig::from_toml(&config_with_prompt_spec(&spec)),
+            Err(ConfigError::SystemPromptFileNotRegular)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_symlink_to_a_regular_file_is_allowed() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-symlink-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::write(&target, "prompt").unwrap();
+        symlink(&target, &link).unwrap();
+        let spec = format!(r#"{{ file = {path} }}"#, path = toml_path(&link));
+        let config = AgentConfig::from_toml(&config_with_prompt_spec(&spec)).unwrap();
+        assert_eq!(config.profiles["test"].system_prompt, "prompt");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_uses_the_supplied_parent_for_a_symlinked_config_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "minicore-agent-config-alias-parent-{}",
+            std::process::id()
+        ));
+        let alias_dir = root.join("alias");
+        let real_dir = root.join("real");
+        std::fs::create_dir_all(alias_dir.join("prompts")).unwrap();
+        std::fs::create_dir_all(real_dir.join("prompts")).unwrap();
+        std::fs::write(alias_dir.join("prompts/prompt"), "alias prompt").unwrap();
+        std::fs::write(real_dir.join("prompts/prompt"), "real prompt").unwrap();
+        let config_text = format!(
+            r#"
+data_dir = {data_dir}
+event_capacity = 128
+default_profile = "test"
+
+[profiles.test]
+model = "main"
+reasoning = "auto"
+system_prompt = {{ file = "prompts/prompt" }}
+tools = []
+max_tool_rounds = 4
+approval = "ask"
+
+[models.main]
+provider = "open_ai_responses"
+model = "provider-model"
+base_url = "https://example.invalid/v1"
+api_key_env = "MINICORE_CONFIG_ALIAS_TEST_KEY"
+physical_context_window = 10000
+output_budget_tokens = 1000
+safety_margin_tokens = 1000
+supported_reasoning = ["auto"]
+supports_tools = true
+request_timeout_seconds = 30
+"#,
+            data_dir = toml_path(&root.join("data"))
+        );
+        let real_config = real_dir.join("agent.toml");
+        std::fs::write(&real_config, config_text).unwrap();
+        let alias_config = alias_dir.join("agent.toml");
+        symlink(&real_config, &alias_config).unwrap();
+
+        let config = AgentConfig::load(&alias_config).unwrap();
+        assert_eq!(config.profiles["test"].system_prompt, "alias prompt");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
