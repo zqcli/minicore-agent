@@ -1,5 +1,10 @@
 # Tool, Reload And Stateless Subagent Acceptance
 
+The Agent acceptance below is unchanged. Its original TUI `30ea7ca` pairing is
+historical; current paired TUI `a604e55` adds the separately verified
+[public reload correction](reload-refresh.md). Existing manifests, raw evidence
+and checksums below are preserved, not relabeled as corrective runs.
+
 Accepted source: **`44593cc7fe4b8a49867b4a0fb10a38957a01f70b`**, paired with TUI
 **`30ea7ca828f59cab895486beebc98e4e4f4ecf2e`**. Agent **0.3.3**, TUI **0.2.8**,
 and Runtime **0.4.1** revision `df00602d35008fb4ef1c655e943d8db3d6465331` remain
