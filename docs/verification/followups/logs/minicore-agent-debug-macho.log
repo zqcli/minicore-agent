@@ -1,0 +1,9 @@
+signature_dataoff=49713520 datasize=388560 signature_end=50102080 file_size=50102080
+ncmds=17 sizeofcmds=2224 load_end=2256 first_text_offset=18688 gap=16432
+minos=11.0
+/tmp/minicore-followups.AdCugX/accepted/artifacts/minicore-agent-debug: Mach-O 64-bit executable x86_64
+UUID: 4C4C44EE-5555-3144-A199-E3A17724D6D0 (x86_64) /tmp/minicore-followups.AdCugX/accepted/artifacts/minicore-agent-debug
+nm=passed size=passed dwarfdump=passed
+/tmp/minicore-followups.AdCugX/accepted/artifacts/minicore-agent-debug: valid on disk
+/tmp/minicore-followups.AdCugX/accepted/artifacts/minicore-agent-debug: satisfies its Designated Requirement
+codesign=valid

@@ -1,0 +1,29 @@
+{
+  "agent": "/private/tmp/minicore-followups.AdCugX/accepted/artifacts/minicore-agent-release",
+  "agent_sha256": "57a1c3722cf05c251f499b8a1e4d50032e9c8b3ce9e4efcd27028ff4dfc73914",
+  "checks": [
+    "fresh workspace/store, one real created session, and confirmed empty startup guidance",
+    "/new draft is visible and Esc creates no extra record",
+    "real Esc cancels an active model request without retry",
+    "missing read uses static Agent error body and real mouse fold/expand",
+    "Codex Update File target and complete workspace content/entry set verified",
+    "native stateless subagent single: actual child requests, schema, tools, output, and usage",
+    "native stateless subagent parallel: actual child requests, schema, tools, output, and usage",
+    "native stateless subagent chain: actual child requests, schema, tools, output, and usage",
+    "idle reload is read-only, retains failed Tool history, exposes verify-b, and changes both raw model and alias selection"
+  ],
+  "clean_exit_confirmed": true,
+  "evidence_dir": "/private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-dgp9miuy/evidence",
+  "exit_code": 0,
+  "owned_root": "/private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-dgp9miuy",
+  "pixel_screenshots": "not used; iTerm2 screen text and mouse input only",
+  "profile": "release",
+  "request_count": 19,
+  "request_log": "/private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-dgp9miuy/evidence/requests.jsonl",
+  "result_path": "/private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-dgp9miuy/evidence/result.json",
+  "server_errors": [],
+  "status": "PASS",
+  "tui": "/private/tmp/minicore-followups.AdCugX/accepted/artifacts/minicore-tui-release",
+  "tui_sha256": "0134d6e882746b929c1d9ea26e9bc9ac9cf3672787089cf743dbdace993a9098",
+  "window_id": 74602
+}

@@ -1,0 +1,5 @@
+cwd=/root/minicore-followups.6Dpa6e/accepted/source/minicore-agent
+command=rustup run stable cargo build -j4 --locked --offline 
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+
+exit=0

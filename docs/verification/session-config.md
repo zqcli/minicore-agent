@@ -1,5 +1,9 @@
 # Session Rename And Prompt Files
 
+This is the historical rename/prompt-file boundary. The later same-version
+[Tool/reload/stateless subagent acceptance](followups.md) records current artifacts;
+the source and hashes below are intentionally preserved.
+
 Accepted source: `4869485bce4a2548e00ba2ca48ced49255278613`, paired with TUI
 `cc7675728fdc87754a495cec7db889a1a5074ada`. Agent **0.3.3**, TUI **0.2.8**,
 and Runtime **0.4.1** revision `df00602d35008fb4ef1c655e943d8db3d6465331`

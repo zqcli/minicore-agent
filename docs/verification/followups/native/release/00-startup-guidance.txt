@@ -1,0 +1,32 @@
+ MINICORE  v0.2.8 
+ 
+ Coding agent TUI 
+ q / Ctrl+C to quit 
+ 
+ Open a session — /new, Ctrl+R, or F1 for help 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▸ workspace · verify a · high · ● ready                                                       ctx ?

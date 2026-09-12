@@ -1,0 +1,32 @@
+ ▎                                                                                                 █
+ ▎ NATIVE_ESC_CANCEL                                                                               █
+ ▎ 11:47 PM · 9/12/2026                                                                            █
+ ▎                                                                                                 █
+                                                                                                   █
+ ▎                                                                                                 █
+ ▎ NATIVE_READ_MISSING                                                                             █
+ ▎ 11:47 PM · 9/12/2026                                                                            █
+ ▎                                                                                                 █
+                                                                                                    
+ ▎ read                                                                                             
+ ▎ missing-native.txt                                                                               
+ ▎   tool failed                                                                                    
+                                                                                                    
+  NATIVE_READ_DONE                                                                                  
+                                                                                                    
+ ▎                                                                                                  
+ ▎ NATIVE_PATCH_UPDATE                                                                              
+ ▎ 11:47 PM · 9/12/2026                                                                             
+ ▎                                                                                                  
+                                                                                                    
+ ▎ apply_patch                                                                                      
+ ▎ tool apply_patch                                                                                 
+ ▎   *** Begin Patch                                                                                
+ ▎   *** Update File: fixture.txt                                                                   
+ ↑ scroll position                                                                                  
+ Agent configuration and read-only state reloaded                                                   
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▸ workspace · verify a · high · ● ready · 0m                                ↑100 ↓120 R0 W0 · ctx ?

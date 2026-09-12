@@ -1,0 +1,32 @@
+ MINICORE  v0.2.8 
+ 
+ Coding agent TUI 
+ q / Ctrl+C to quit 
+ 
+ Open a session — /new, Ctrl+R, or F1 for help 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │New session                                                                                      │
+ │workspace  /private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-   │
+ │profile    coding  →                                                                             │
+ │model      verify-a  →                                                                           │
+ │reasoning  high  →                                                                               │
+ │title      (optional)                                                                            │
+ │action     Create session                                                                        │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │Tab moves · Enter confirms · Esc closes                                                          │
+ └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ▸ workspace · verify a · high · ● ready                                                       ctx ?
