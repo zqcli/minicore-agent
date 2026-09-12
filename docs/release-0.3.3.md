@@ -5,6 +5,8 @@ This is the historical paired-release baseline. Subsequent same-version
 separate commits, verification and installed artifacts; it has not been pushed.
 The later [Tool/reload/stateless delegation acceptance](verification/followups.md)
 also retains these versions with its own source/artifact provenance and no push.
+The current paired TUI `a604e55` adds a [public reload correction](verification/reload-refresh.md);
+Agent `f1697f7` source and installed macOS bytes are unchanged.
 
 Paired source release with MiniCore TUI 0.2.8. This commits the previously
 uncommitted Agent work and updates the package/version examples. Runtime remains

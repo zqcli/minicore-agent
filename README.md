@@ -18,8 +18,10 @@ The subsequent [Session rename and prompt-file features](docs/verification/sessi
 are separately committed and natively verified with the paired TUI; package
 versions and the Runtime pin are unchanged. Current
 [Tool, configuration reload and native stateless delegation acceptance](docs/verification/followups.md)
-uses Agent `f1697f7` / TUI `30ea7ca`, verified and installed separately without
-another version bump or push. Persistent subagent orchestration is not included.
+uses unchanged Agent `f1697f7` / corrected TUI `a604e55` after the
+[public reload correction](docs/verification/reload-refresh.md), verified and
+installed separately without another version bump or push. Persistent subagent
+orchestration is not included.
 
 ## Run
 
