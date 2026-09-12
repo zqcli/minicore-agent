@@ -29,8 +29,9 @@ minicore-agent --config ./example.agent.toml --stdio
 The Agent is the local backend for one client TUI. The TUI communicates with it
 exclusively through the stdio JSON-RPC interface (see
 [docs/rpc.md](docs/rpc.md)); it does not call the Rust library API directly.
-This repository does not ship a real TUI, plugin system, MCP integration,
-Subagent implementation, or compaction.
+This repository does not ship a real TUI, plugin system, MCP integration, or
+compaction. It includes a native, stateless `subagent` Tool for explicitly
+delegated child loops.
 
 Profile `system_prompt` keeps its existing inline string form and also accepts
 `{ file = "..." }`. Relative prompt paths are resolved against the parent of
@@ -193,21 +194,40 @@ truncated at a UTF-8 boundary and marked `[truncated]`.
 
 The crate-private `Policy` implements MiniCore's `ToolPolicy` and is bound
 whenever a profile enables at least one Tool. Classification is an exact
-five-name match: `read` is read-only, while `write`, `edit`, `apply_patch`, and
-`bash` are mutating. `Auto` allows every known Tool; `Ask` requests a
-`Medium`-risk approval per mutating call with the prompt
+six-name match: `read` is read-only, while `write`, `edit`, `apply_patch`,
+`bash`, and `subagent` are mutating. `Auto` allows every known Tool; `Ask`
+requests a `Medium`-risk approval per mutating call with the prompt
 ``Allow tool `<name>` for this call?``; `ReadOnly` denies every mutating Tool.
 Approval prompts and denial reasons never include Tool arguments, paths,
 content, commands, or raw JSON.
 
 The Tool module implements the exact `read`, `write`, `edit`, `apply_patch`,
-and `bash` tools. Each production Session receives a new ToolSet sharing only
-that Session's Workspace. All five use strict object schemas and reject unknown
-input fields. `read` supports one-based line offsets, line and byte limits, and
-safe directory listings. `bash` is not a sandbox and retains the host authority
-of the Agent process; use external container or OS isolation for untrusted
-models or commands. Run only one Agent process for a given `data_dir`; the
-Store has no cross-process lock.
+`bash`, and `subagent` tools. Each production Session receives a new ToolSet
+sharing only that Session's Workspace. All six use strict object schemas and
+reject unknown input fields. `subagent` is registered only when the profile
+explicitly names it, runs stateless child `AgentLoop`s without Store records,
+supports one task, bounded parallel `tasks`, and sequential `chain` handoff via
+`{previous}`. Each stage propagates the text from its final assistant response;
+a later textless response does not reuse an earlier round. It excludes itself
+from child tools. Child work is limited to
+the parent Workspace or descendants, uses a fresh model/config snapshot, and
+joins before a normally completed subagent Tool returns. If external Tool or
+turn cancellation/timeout drops that Tool future, its scope only cancels
+children synchronously; the Agent-owned registry retains their handles until
+the Session loop completion, `session.close`, or `Agent::shutdown` drains them.
+The parent Tool may therefore return before that deferred join completes. The
+inherited approval policy remains active; child approval/input requests fail as
+a static stage result because stateless child calls have no separate interaction
+channel. The child runner uses Runtime's authoritative `LoopHandle::watch_state()`
+and `WaitingForInput` state rather than the best-effort `InteractionRequested` event,
+which may be dropped under pressure. Native interaction coverage uses an offline
+fake model/provider seam; it is evidence for this Agent/Runtime integration, not for
+real-provider behavior. `read` supports one-based line offsets, line and byte limits,
+and safe directory listings.
+`bash` is not a sandbox and retains the host authority of the Agent process;
+use external container or OS isolation for untrusted models or commands. Run
+only one Agent process for a given `data_dir`; the Store has no cross-process
+lock.
 
 ## Library
 
@@ -227,7 +247,8 @@ loop. `session.close` cancels any active loop, joins the worker, and persists
 cleanly before returning.
 
 `Agent::shutdown` is the cleanup barrier for embedded Rust callers. It cancels
-active loops, waits for Agent-owned loop tasks, and awaits persistence wrap-up.
+active loops, waits for Agent-owned loop tasks and any native child workers,
+and awaits persistence wrap-up.
 Dropping an Agent with live turns does not synchronously wait for Agent-owned
 loop tasks. MiniCore Agent v0.3 uses the Runtime user-cancellation path when
 closing or shutting down an active Session; it does not currently preserve a

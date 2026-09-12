@@ -28,6 +28,7 @@ use crate::ids::SessionId;
 use crate::store::{
     Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError, utc_timestamp,
 };
+use crate::subagents::SubagentService;
 use crate::workspace::Workspace;
 
 #[cfg(test)]
@@ -237,6 +238,7 @@ struct SessionShared {
     io: tokio::sync::Mutex<()>,
     store: Store,
     events: AgentEventSink,
+    subagents: Arc<SubagentService>,
 }
 
 struct SessionInner {
@@ -322,6 +324,7 @@ impl Session {
         presentation: Arc<crate::presentation::Presentation>,
         config: ExecutionConfig,
         options: LoopOptions,
+        subagents: Arc<SubagentService>,
         store: Store,
         events: AgentEventSink,
     ) -> Self {
@@ -342,6 +345,7 @@ impl Session {
                 io: tokio::sync::Mutex::new(()),
                 store,
                 events,
+                subagents,
             }),
         }
     }
@@ -717,21 +721,25 @@ impl Session {
         Ok(())
     }
 
-    /// Cancels the active loop (if any) and awaits its Agent-owned task.
+    /// Cancels the active loop (if any), awaits its Agent-owned task, and
+    /// drains any child workers owned by this Session.
     pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
+        let session_id = self.session_id();
         let active = {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.active.take()
         };
-        let Some(active) = active else {
-            return Ok(());
+        let task_result = if let Some(active) = active {
+            active.handle.cancel();
+            match active.task {
+                Some(task) => task.await.map_err(|_| AgentError::Internal),
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
         };
-        active.handle.cancel();
-        let task_result = match active.task {
-            Some(task) => task.await,
-            None => Ok(()),
-        };
-        task_result.map_err(|_| AgentError::Internal)
+        self.shared.subagents.drain_session(session_id).await;
+        task_result
     }
 
     fn emit_state(&self) {
@@ -805,6 +813,11 @@ async fn run_active_loop(
     if tool_batch_dirty {
         refresh_branch(&session).await;
     }
+    session
+        .shared
+        .subagents
+        .drain_session(turn.session_id)
+        .await;
     let report = match result {
         Ok(report) => {
             if let minicore_runtime::LoopOutcome::Failed(failure) = &report.outcome {

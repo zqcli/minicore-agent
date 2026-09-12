@@ -14,6 +14,7 @@ mod prompt;
 mod rpc;
 mod sessions;
 pub(crate) mod store;
+mod subagents;
 mod tools;
 mod workspace;
 

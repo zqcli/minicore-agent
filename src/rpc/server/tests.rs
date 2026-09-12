@@ -10,12 +10,15 @@ use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::ids::SessionId;
 use minicore_runtime::ToolCallId;
+use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent, ModelFinishReason, ModelRef,
-    ModelRequest, ModelStartFuture, ModelStream, ReasoningPreference, Usage,
+    Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind, ModelEvent,
+    ModelFinishReason, ModelMessage, ModelRef, ModelRequest, ModelStartFuture, ModelStream,
+    ReasoningPreference, Usage,
 };
 
 use crate::agent::Agent;
@@ -32,8 +35,60 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 enum ModelScript {
     Text(&'static str),
+    NoUsage(&'static str),
+    Capture {
+        inputs: Arc<Mutex<Vec<String>>>,
+        text: &'static str,
+    },
+    Fail,
+    Gate(Arc<ConcurrencyProbe>),
     ToolCalls(Vec<ToolCallScript>),
     Block,
+}
+
+struct ConcurrencyProbe {
+    started: AtomicUsize,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    release: CancellationToken,
+}
+
+impl ConcurrencyProbe {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            release: CancellationToken::new(),
+        })
+    }
+
+    fn observe_active(&self, active: usize) {
+        let mut current = self.max_active.load(Ordering::SeqCst);
+        while active > current {
+            match self.max_active.compare_exchange_weak(
+                current,
+                active,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+fn fake_model_error() -> ModelError {
+    ModelError::started(
+        ModelErrorKind::Internal,
+        DiagnosticSummary::new(
+            DiagnosticCode::Internal,
+            DiagnosticCategory::Internal,
+            minicore_runtime::BoundedText::new("fake model failure").unwrap(),
+            false,
+        ),
+    )
 }
 
 #[derive(Clone)]
@@ -104,7 +159,7 @@ impl Model for FakeModel {
         &self.descriptor
     }
 
-    fn start(&self, _request: ModelRequest, _context: ModelCallContext) -> ModelStartFuture<'_> {
+    fn start(&self, request: ModelRequest, _context: ModelCallContext) -> ModelStartFuture<'_> {
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
         let script = self
             .scripts
@@ -123,6 +178,50 @@ impl Model for FakeModel {
                         reason: ModelFinishReason::Stop,
                     },
                 ])),
+                ModelScript::NoUsage(text) => Ok(model_events(vec![
+                    ModelEvent::text_delta(text).unwrap(),
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ])),
+                ModelScript::Capture { inputs, text } => {
+                    let input = request
+                        .messages()
+                        .iter()
+                        .rev()
+                        .find_map(|message| match message {
+                            ModelMessage::User(text) => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    inputs.lock().unwrap().push(input);
+                    Ok(model_events(vec![
+                        ModelEvent::text_delta(text).unwrap(),
+                        ModelEvent::Usage {
+                            usage: Usage::new(1, 1, 0),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ]))
+                }
+                ModelScript::Fail => Err(fake_model_error()),
+                ModelScript::Gate(probe) => {
+                    probe.started.fetch_add(1, Ordering::SeqCst);
+                    let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    probe.observe_active(active);
+                    probe.release.cancelled().await;
+                    probe.active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(model_events(vec![
+                        ModelEvent::text_delta("gated answer").unwrap(),
+                        ModelEvent::Usage {
+                            usage: Usage::new(1, 1, 0),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ]))
+                }
                 ModelScript::ToolCalls(calls) => {
                     let mut events = Vec::new();
                     for (index, call) in calls.into_iter().enumerate() {
@@ -1120,6 +1219,478 @@ async fn history_view_is_safe_and_pages() {
     let state = harness.response(json!("state")).await;
     assert_eq!(state["result"]["status"], json!("idle"));
     assert!(state["result"]["active_loop"].is_null());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn subagent_tool_runs_a_stateless_child_and_reports_stage_metadata() {
+    let (agent, base, workspace) = test_agent(
+        "subagent-single",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "subagent",
+                arguments: json!({
+                    "model": null,
+                    "reasoning": null,
+                    "task": "Answer from the child",
+                    "tasks": null,
+                    "chain": null,
+                    "cwd": null
+                }),
+            }]),
+            ModelScript::Text("child answer"),
+            ModelScript::Text("parent answer"),
+        ],
+        &["subagent"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "delegate"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let waited = harness.response(json!("wait")).await;
+    assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
+    let progress = harness.event("tool_progress").await;
+    assert!(
+        progress["params"]["data"]["progress"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("stage 1"))
+    );
+
+    harness
+        .send(
+            json!("history"),
+            "session.history",
+            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+        )
+        .await;
+    let history = harness.response(json!("history")).await;
+    let serialized = history["result"].to_string();
+    assert!(serialized.contains("child answer"));
+    assert!(serialized.contains("\\\"status\\\":\\\"completed\\\""));
+    assert!(serialized.contains("\\\"model\\\":\\\"fake\\\""));
+    assert!(serialized.contains("\\\"loop_id\\\":\\\"lup_"));
+    assert!(serialized.contains("\\\"usage\\\""));
+
+    harness
+        .send(json!("sessions"), "session.list", Some(json!({})))
+        .await;
+    let sessions = harness.response(json!("sessions")).await;
+    assert_eq!(sessions["result"]["sessions"].as_array().unwrap().len(), 1);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn subagent_real_child_without_usage_serializes_null_usage() {
+    let (agent, base, workspace) = test_agent(
+        "subagent-no-usage",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "subagent",
+                arguments: json!({
+                    "model": null,
+                    "reasoning": null,
+                    "task": "child without usage",
+                    "tasks": null,
+                    "chain": null,
+                    "cwd": null
+                }),
+            }]),
+            ModelScript::NoUsage("child answer"),
+            ModelScript::Text("parent answer"),
+        ],
+        &["subagent"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "delegate"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+
+    harness
+        .send(
+            json!("history"),
+            "session.history",
+            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+        )
+        .await;
+    let history = harness.response(json!("history")).await;
+    let tool_result = history["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["item"]["type"].as_str() == Some("tool_result"))
+        .unwrap();
+    let details: Value =
+        serde_json::from_str(tool_result["item"]["data"]["content"].as_str().unwrap()).unwrap();
+    assert!(details["stages"][0]["usage"].is_null());
+    assert!(details["usage"].is_null());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn subagent_chain_replaces_previous_and_reports_completion() {
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let (agent, base, workspace) = test_agent(
+        "subagent-chain",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "subagent",
+                arguments: json!({
+                    "model": null,
+                    "reasoning": null,
+                    "task": null,
+                    "tasks": null,
+                    "chain": [
+                        {"model": null, "reasoning": null, "task": "first", "cwd": null},
+                        {"model": null, "reasoning": null, "task": "second {previous}", "cwd": null},
+                        {"model": null, "reasoning": null, "task": "third {previous}", "cwd": null}
+                    ],
+                    "cwd": null
+                }),
+            }]),
+            ModelScript::Capture {
+                inputs: Arc::clone(&inputs),
+                text: "first output",
+            },
+            ModelScript::Capture {
+                inputs: Arc::clone(&inputs),
+                text: "second output",
+            },
+            ModelScript::Capture {
+                inputs: Arc::clone(&inputs),
+                text: "third output",
+            },
+            ModelScript::Text("parent answer"),
+        ],
+        &["subagent"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "delegate"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+
+    harness
+        .send(
+            json!("history"),
+            "session.history",
+            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+        )
+        .await;
+    let history = harness.response(json!("history")).await;
+    let serialized = history["result"].to_string();
+    assert!(serialized.contains("\\\"mode\\\":\\\"chain\\\""));
+    assert!(serialized.contains("first output"));
+    assert!(
+        serialized.contains("second output"),
+        "subagent result: {serialized}"
+    );
+    assert!(serialized.contains("third output"));
+    let tool_result = history["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["item"]["type"].as_str() == Some("tool_result"))
+        .unwrap();
+    let details: Value = serde_json::from_str(
+        tool_result["item"]["data"]["content"]
+            .as_str()
+            .expect("subagent details are serialized as tool output"),
+    )
+    .unwrap();
+    assert_eq!(details["status"], "completed");
+    assert_eq!(details["stages"][0]["status"], "completed");
+    assert_eq!(details["stages"][0]["output"], "first output");
+    assert_eq!(details["stages"][1]["status"], "completed");
+    assert_eq!(details["stages"][1]["output"], "second output");
+    assert_eq!(details["stages"][2]["status"], "completed");
+    assert_eq!(details["stages"][2]["output"], "third output");
+    assert_eq!(
+        inputs.lock().unwrap().clone(),
+        vec![
+            "first".to_owned(),
+            "second first output".to_owned(),
+            "third second output".to_owned()
+        ]
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn subagent_chain_stops_after_failure_and_marks_remaining_stages_skipped() {
+    let parent_inputs = Arc::new(Mutex::new(Vec::new()));
+    let (agent, base, workspace) = test_agent(
+        "subagent-chain-failure",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "subagent",
+                arguments: json!({
+                    "model": null,
+                    "reasoning": null,
+                    "task": null,
+                    "tasks": null,
+                    "chain": [
+                        {"model": null, "reasoning": null, "task": "first", "cwd": null},
+                        {"model": null, "reasoning": null, "task": "second {previous}", "cwd": null},
+                        {"model": null, "reasoning": null, "task": "third {previous}", "cwd": null}
+                    ],
+                    "cwd": null
+                }),
+            }]),
+            ModelScript::Fail,
+            ModelScript::Capture {
+                inputs: Arc::clone(&parent_inputs),
+                text: "parent answer",
+            },
+        ],
+        &["subagent"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "delegate"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+
+    harness
+        .send(
+            json!("history"),
+            "session.history",
+            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+        )
+        .await;
+    let history = harness.response(json!("history")).await;
+    let serialized = history["result"].to_string();
+    assert!(serialized.contains("\\\"status\\\":\\\"failed\\\""));
+    assert!(serialized.contains("\\\"status\\\":\\\"skipped\\\""));
+    let tool_result = history["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["item"]["type"].as_str() == Some("tool_result"))
+        .unwrap();
+    let details: Value = serde_json::from_str(
+        tool_result["item"]["data"]["content"]
+            .as_str()
+            .expect("subagent details are serialized as tool output"),
+    )
+    .unwrap();
+    assert_eq!(details["status"], "failed");
+    assert_eq!(details["stages"][0]["status"], "failed");
+    assert_eq!(details["stages"][0]["error"], "child model failed");
+    assert_eq!(details["stages"][1]["status"], "skipped");
+    assert_eq!(details["stages"][2]["status"], "skipped");
+    assert_eq!(
+        parent_inputs.lock().unwrap().clone(),
+        vec!["delegate".to_owned()]
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn subagent_parallel_starts_at_most_four_workers() {
+    let probe = ConcurrencyProbe::new();
+    let tasks = (0..8)
+        .map(|index| {
+            json!({
+                "model": null,
+                "reasoning": null,
+                "task": format!("child {index}"),
+                "cwd": null
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut scripts = vec![ModelScript::ToolCalls(vec![ToolCallScript {
+        name: "subagent",
+        arguments: json!({
+            "model": null,
+            "reasoning": null,
+            "task": null,
+            "tasks": tasks,
+            "chain": null,
+            "cwd": null
+        }),
+    }])];
+    scripts.extend((0..8).map(|_| ModelScript::Gate(Arc::clone(&probe))));
+    scripts.push(ModelScript::Text("parent answer"));
+    let (agent, base, workspace) = test_agent(
+        "subagent-concurrency",
+        scripts,
+        &["subagent"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "delegate"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+
+    tokio::time::timeout(TIMEOUT, async {
+        while probe.started.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("four child model requests did not start");
+    assert_eq!(probe.started.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.active.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.max_active.load(Ordering::SeqCst), 4);
+
+    probe.release.cancel();
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+    assert_eq!(probe.started.load(Ordering::SeqCst), 8);
+    assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.max_active.load(Ordering::SeqCst), 4);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn subagent_tool_runs_parallel_tasks_with_a_bounded_stage_count() {
+    let (agent, base, workspace) = test_agent(
+        "subagent-parallel",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "subagent",
+                arguments: json!({
+                    "model": null,
+                    "reasoning": null,
+                    "task": null,
+                    "tasks": [
+                        {"model": null, "reasoning": null, "task": "first child", "cwd": null},
+                        {"model": null, "reasoning": null, "task": "second child", "cwd": null}
+                    ],
+                    "chain": null,
+                    "cwd": null
+                }),
+            }]),
+            ModelScript::Text("first answer"),
+            ModelScript::Text("second answer"),
+            ModelScript::Text("parent answer"),
+        ],
+        &["subagent"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "delegate"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+
+    harness
+        .send(
+            json!("history"),
+            "session.history",
+            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+        )
+        .await;
+    let history = harness.response(json!("history")).await;
+    let serialized = history["result"].to_string();
+    assert!(serialized.contains("first answer"));
+    assert!(serialized.contains("second answer"));
+    assert!(serialized.contains("\\\"stages\\\":["));
+    assert!(serialized.contains("\\\"stage_index\\\":1"));
+    assert!(serialized.contains("\\\"stage_index\\\":2"));
 
     harness.shutdown().await;
     remove_base(&base).await;

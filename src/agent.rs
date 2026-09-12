@@ -23,6 +23,7 @@ use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::prompt::ProjectPromptProvider;
 use crate::sessions::{Sessions, TurnCompletion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
+use crate::subagents::{SubagentFactory, SubagentService};
 use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
@@ -152,9 +153,9 @@ struct ResolvedSessionSettings {
 /// Top-level coordinator for the local Store and loaded Sessions.
 ///
 /// `Agent::shutdown` is the cleanup barrier for embedded Rust callers: it
-/// cancels active loops, waits for Agent-owned loop tasks, and awaits
-/// persistence wrap-up. Dropping an `Agent` with live turns does not
-/// synchronously wait for Agent-owned loop tasks.
+/// cancels active loops, waits for Agent-owned loop and child-worker tasks,
+/// and awaits persistence wrap-up. Dropping an `Agent` with live turns does
+/// not synchronously wait for Agent-owned loop tasks.
 pub struct Agent {
     config: AgentConfig,
     config_path: Option<PathBuf>,
@@ -162,6 +163,7 @@ pub struct Agent {
     profiles: Profiles,
     models: Models,
     command_environment: CommandEnvironment,
+    subagents: Arc<SubagentService>,
     sessions: Sessions,
     event_sink: AgentEventSink,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -202,6 +204,7 @@ impl Agent {
         config_path: Option<PathBuf>,
     ) -> Result<Self, AgentError> {
         let command_environment = command_environment(&config);
+        let subagents = Arc::new(SubagentService::new());
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone())
             .await
@@ -215,6 +218,7 @@ impl Agent {
             profiles,
             models,
             command_environment,
+            subagents,
             sessions: Sessions::new(),
             event_sink,
             events_rx: Some(events_rx),
@@ -281,16 +285,18 @@ impl Agent {
             let record = session.record();
             let workspace = session.workspace();
             let presentation = session.presentation();
+            let options = candidate
+                .loop_options(record.max_tool_rounds)
+                .map_err(AgentError::Config)?;
             let config = Self::execution_config_with(
                 &models,
                 &command_environment,
                 &record,
                 workspace,
                 presentation,
+                Arc::clone(&self.subagents),
+                options.clone(),
             )?;
-            let options = candidate
-                .loop_options(record.max_tool_rounds)
-                .map_err(AgentError::Config)?;
             session_candidates.push((session.clone(), config, options));
         }
 
@@ -371,12 +377,16 @@ impl Agent {
         let presentation = self
             .build_presentation(session_id, Arc::clone(&workspace), record.model.clone())
             .await;
-        let config =
-            self.execution_config(&record, Arc::clone(&workspace), Arc::clone(&presentation))?;
         let options = self
             .config
             .loop_options(record.max_tool_rounds)
             .map_err(AgentError::Config)?;
+        let config = self.execution_config(
+            &record,
+            Arc::clone(&workspace),
+            Arc::clone(&presentation),
+            options.clone(),
+        )?;
         self.store
             .create_session(&record)
             .await
@@ -389,6 +399,7 @@ impl Agent {
             presentation,
             config,
             options,
+            Arc::clone(&self.subagents),
             self.store.clone(),
             self.event_sink.clone(),
         );
@@ -448,15 +459,16 @@ impl Agent {
                 stored.record.model.clone(),
             )
             .await;
-        let config = self.execution_config(
-            &stored.record,
-            Arc::clone(&workspace),
-            Arc::clone(&presentation),
-        )?;
         let options = self
             .config
             .loop_options(stored.record.max_tool_rounds)
             .map_err(AgentError::Config)?;
+        let config = self.execution_config(
+            &stored.record,
+            Arc::clone(&workspace),
+            Arc::clone(&presentation),
+            options.clone(),
+        )?;
         let session = crate::sessions::Session::new(
             stored.record.clone(),
             workspace,
@@ -465,6 +477,7 @@ impl Agent {
             presentation,
             config,
             options,
+            Arc::clone(&self.subagents),
             self.store.clone(),
             self.event_sink.clone(),
         );
@@ -564,7 +577,12 @@ impl Agent {
         if let Some(reasoning) = request.reasoning {
             candidate.reasoning = reasoning;
         }
-        let config = self.execution_config(&candidate, workspace, session.presentation())?;
+        let options = self
+            .config
+            .loop_options(candidate.max_tool_rounds)
+            .map_err(AgentError::Config)?;
+        let config =
+            self.execution_config(&candidate, workspace, session.presentation(), options)?;
         let active_revision = session.update(candidate.clone(), config).await?;
         session
             .presentation()
@@ -741,7 +759,8 @@ impl Agent {
     /// Orderly shutdown barrier for embedded Rust callers.
     ///
     /// Cancels active loops across all loaded Sessions, waits for Agent-owned
-    /// loop tasks and persistence completion, and drops event channels.
+    /// loop and child-worker tasks plus persistence completion, and drops event
+    /// channels.
     /// Dropping an `Agent` with live turns does not synchronously wait for
     /// Agent-owned loop tasks.
     ///
@@ -751,6 +770,7 @@ impl Agent {
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
         let result = self.sessions.shutdown_all().await;
+        self.subagents.drain_all().await;
         drop(self.event_sink);
         drop(self.events_rx.take());
         tracing::info!(success = result.is_ok(), "agent shutdown end");
@@ -799,6 +819,7 @@ impl Agent {
         record: &SessionRecord,
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
+        options: minicore_runtime::LoopOptions,
     ) -> Result<ExecutionConfig, AgentError> {
         Self::execution_config_with(
             &self.models,
@@ -806,6 +827,8 @@ impl Agent {
             record,
             workspace,
             presentation,
+            Arc::clone(&self.subagents),
+            options,
         )
     }
 
@@ -815,14 +838,34 @@ impl Agent {
         record: &SessionRecord,
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
+        subagents: Arc<SubagentService>,
+        options: minicore_runtime::LoopOptions,
     ) -> Result<ExecutionConfig, AgentError> {
         let model = models.get(&record.model).map_err(map_model_config_error)?;
         let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
-        let tools = crate::tools::build_tools_with_presentation(
+        let subagent = record
+            .tools
+            .iter()
+            .any(|name| name == crate::subagents::TOOL_NAME)
+            .then(|| SubagentFactory {
+                service: Arc::clone(&subagents),
+                session_id: record.session_id,
+                parent_workspace: Arc::clone(&workspace),
+                models: Arc::new(models.clone()),
+                command_environment: command_environment.clone(),
+                system_prompt: record.system_prompt.clone(),
+                parent_tools: record.tools.clone(),
+                approval: record.approval,
+                options: options.clone(),
+                default_model: record.model.clone(),
+                default_reasoning: record.reasoning,
+            });
+        let tools = crate::tools::build_tools_with_presentation_and_subagent(
             &record.tools,
             Arc::clone(&workspace),
             command_environment.clone(),
             &presentation,
+            subagent.as_ref(),
         )
         .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
