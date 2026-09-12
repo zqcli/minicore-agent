@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-09-12T16:00:05.573467+00:00",
+  "accepted_sources": {
+    "minicore-tui": "30ea7ca828f59cab895486beebc98e4e4f4ecf2e",
+    "minicore-agent": "f1697f78ce48c8f5f3fde0dc9903c153022bfd9e"
+  },
+  "versions": {
+    "tui": "0.2.8",
+    "agent": "0.3.3",
+    "runtime": "0.4.1"
+  },
+  "runtime_revision": "6cd2bdbc634437dea925495c61c7eb0be10ba171",
+  "source_archives": {
+    "minicore-tui": {
+      "file": "minicore-tui.tar",
+      "sha256": "de3c370a544ea79fe7aff08c85a6d0526c081c70447478086d7432bd7f3d5c52"
+    },
+    "minicore-agent": {
+      "file": "minicore-agent.tar",
+      "sha256": "537211912de26c4367665f55286faeadd2d9360733f5698e5ee4aa8905b6d77f"
+    }
+  },
+  "artifacts": {
+    "minicore-agent-debug": {
+      "sha256": "443b88b385d778a41303540f940718cf85968a375ca0f334437f9ff42c4703e6",
+      "bytes": 50102080
+    },
+    "minicore-agent-release": {
+      "sha256": "57a1c3722cf05c251f499b8a1e4d50032e9c8b3ce9e4efcd27028ff4dfc73914",
+      "bytes": 10080240
+    },
+    "minicore-tui-debug": {
+      "sha256": "0fb1f77c203f2e105349ee858336837ea6f80c863445c28bc444b931a4add418",
+      "bytes": 10115328
+    },
+    "minicore-tui-release": {
+      "sha256": "0134d6e882746b929c1d9ea26e9bc9ac9cf3672787089cf743dbdace993a9098",
+      "bytes": 6964288
+    },
+    "terminal-restore": {
+      "sha256": "39ee6bb070a8bf608e67db1cda9ad239079a8ed3921a18925c66d95c874a9202",
+      "bytes": 1638256
+    }
+  },
+  "debug_uuids": {
+    "minicore-agent": "4C4C44EE-5555-3144-A199-E3A17724D6D0",
+    "minicore-tui": "4C4C4417-5555-3144-A1C9-E18509C70FAB"
+  },
+  "gates": {
+    "minicore-tui-stable": {
+      "passed": 498,
+      "failed": 0,
+      "ignored": 19
+    },
+    "minicore-tui-msrv": {
+      "passed": 498,
+      "failed": 0,
+      "ignored": 19
+    },
+    "minicore-agent-stable": {
+      "passed": 369,
+      "failed": 0,
+      "ignored": 2
+    },
+    "minicore-agent-msrv": {
+      "passed": 369,
+      "failed": 0,
+      "ignored": 2
+    },
+    "e2e-stable": {
+      "passed": 18,
+      "failed": 0,
+      "ignored": 0
+    },
+    "e2e-msrv": {
+      "passed": 18,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "native": {
+    "debug": {
+      "status": "PASS",
+      "original_evidence_dir": "/private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-vkwh8vso/evidence",
+      "archived_result": "native/debug/result.json",
+      "result_sha256": "85e181ea6ccb3b96793c8d5f85f7523449bf7ccafc77eabbe484127d41036c47"
+    },
+    "release": {
+      "status": "PASS",
+      "original_evidence_dir": "/private/var/folders/zw/gcpf3t91243dhn6z3bb278s00000gn/T/minicore-native-followups-dgp9miuy/evidence",
+      "archived_result": "native/release/result.json",
+      "result_sha256": "a90428ebcc03aec935a25d9876801b25caa030933385f347d019c75be02d3af5"
+    }
+  },
+  "native_basis": "real iTerm2 screen text/input, real TTY, real Agent binaries, loopback-only providers",
+  "installation": {
+    "status": "PASS",
+    "backup_name": "preserved-before-followups-AdCugX",
+    "user_processes_restarted": false,
+    "config_or_store_modified_by_installation": false,
+    "log_sha256": "09c56f27ac42ee2bc6c80e03cc51a7eb1cc68ffba65b85930066c188053a45e1"
+  },
+  "not_claimed": [
+    "real upstream provider/TLS",
+    "pixel parity",
+    "new Windows or hosted-CI acceptance",
+    "macOS 11 hardware execution",
+    "native busy-reload coverage",
+    "persistent subagent alias/target/adoption/control/manager",
+    "compaction",
+    "new release tag or push"
+  ],
+  "execution_policy": {
+    "accepted_rust_work": "root@192.168.20.199 only",
+    "earlier_unauthorized_local_rust_work": "excluded; see audit/local-execution-violations.tsv"
+  },
+  "helper": {
+    "archived": "scripts/stage7_loopback_model.py",
+    "sha256": "dd3213125ebb4504bc7651e903f06db4d9d2d5522facd791a9d1e0c3428e2e88",
+    "provenance": "extracted from accepted TUI git archive; byte-compared with the checkout helper used by earlier Session/Stream runs"
+  },
+  "reproduction": "Some historical one-off scripts retain original absolute paths; complete evidence and the pinned helper are bundled. No portable harness is claimed.",
+  "evidence_scope": "Agent-focused subset; complete paired evidence is in minicore-tui/docs/verification/followups."
+}

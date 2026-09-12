@@ -1,0 +1,32 @@
+ ▎ NATIVE_SUBAGENT_CHAIN                                                                            
+ ▎ 11:47 PM · 9/12/2026                                                                             
+ ▎                                                                                                  
+                                                                                                    
+ ▎ subagent                                                                                         
+ ▎ tool subagent                                                                                    
+ ▎ ... (28 more lines, ctrl+o to expand)                                                            
+                                                                                                    
+  NATIVE_SUBAGENT_CHAIN_DONE                                                                        
+                                                                                                    
+ ▎                                                                                                  
+ ▎ NATIVE_RELOAD_AFTER                                                                              
+ ▎ 11:47 PM · 9/12/2026                                                                             
+ ▎                                                                                                 █
+                                                                                                   █
+  NATIVE_RELOAD_DONE                                                                               █
+                                                                                                   █
+ ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │Select model                                                                                     │
+ │Model applies at the next model request.                                                         │
+ │>                                                                                                │
+ │→ verify-a  26k context  ✓ tools  • high/max  ✓ current                                          │
+ │  verify-b  26k context  ✓ tools  • high/max                                                     │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │(1/2)                                                                                            │
+ └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ▸ workspace · verify a · high · ● ready · 0m                                ↑110 ↓132 R0 W0 · ctx ?

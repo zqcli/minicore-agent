@@ -1,0 +1,10 @@
+2026-09-12T15:54:23Z
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+rustc 1.85.0 (4d91de4e4 2025-02-17)
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+Debian clang version 19.1.7 (3+b1)
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+InstalledDir: /usr/lib/llvm-19/bin
+Debian LLD 19.1.7
+SDK 26.2

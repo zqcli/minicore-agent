@@ -1,0 +1,32 @@
+ ▎ NATIVE_READ_MISSING                                                                              
+ ▎ 11:47 PM · 9/12/2026                                                                             
+ ▎                                                                                                  
+                                                                                                    
+ ▎ read                                                                                             
+ ▎ missing-native.txt                                                                              █
+ ▎   tool failed                                                                                   █
+                                                                                                   █
+  NATIVE_READ_DONE                                                                                 █
+                                                                                                   █
+ ▎                                                                                                 █
+ ▎ NATIVE_PATCH_UPDATE                                                                             █
+ ▎ 11:47 PM · 9/12/2026                                                                            █
+ ▎                                                                                                 █
+                                                                                                   █
+ ▎ apply_patch                                                                                     █
+ ▎ tool apply_patch                                                                                █
+ ▎   *** Begin Patch                                                                               █
+ ▎   *** Update File: fixture.txt                                                                  █
+ ▎   @@                                                                                            █
+ ▎   -before                                                                                       █
+ ▎   +after                                                                                        █
+ ▎   *** End Patch                                                                                 █
+ ▎   patched 7 bytes to 6 bytes at fixture.txt                                                     █
+                                                                                                   █
+  NATIVE_PATCH_DONE                                                                                █
+                                                                                                   █
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▸ workspace · verify a · high · ● ready · 0m                                  ↑40 ↓48 R0 W0 · ctx ?

@@ -1,0 +1,32 @@
+ ▎ tool subagent                                                                                    
+ ▎ ... (22 more lines, ctrl+o to expand)                                                            
+                                                                                                    
+  NATIVE_SUBAGENT_PARALLEL_DONE                                                                     
+                                                                                                    
+ ▎                                                                                                  
+ ▎ NATIVE_SUBAGENT_CHAIN                                                                            
+ ▎ 11:47 PM · 9/12/2026                                                                             
+ ▎                                                                                                  
+                                                                                                    
+ ▎ subagent                                                                                         
+ ▎ tool subagent                                                                                    
+ ▎ ... (28 more lines, ctrl+o to expand)                                                           █
+                                                                                                   █
+  NATIVE_SUBAGENT_CHAIN_DONE                                                                       █
+                                                                                                   █
+ Agent configuration and read-only state reloaded                                                   
+ ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │Select model                                                                                     │
+ │Model applies at the next model request.                                                         │
+ │>                                                                                                │
+ │→ verify-a  26k context  ✓ tools  • high/max  ✓ current                                          │
+ │  verify-b  26k context  ✓ tools  • high/max                                                     │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │                                                                                                 │
+ │(1/2)                                                                                            │
+ └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ▸ workspace · verify a · high · ● ready · 0m                                ↑100 ↓120 R0 W0 · ctx ?

@@ -1,0 +1,32 @@
+ ▎                                                                                                  
+ ▎ NATIVE_ESC_CANCEL                                                                                
+ ▎ 11:47 PM · 9/12/2026                                                                             
+ ▎                                                                                                  
+ 
+ ▎                                                                                                  
+ ▎ NATIVE_READ_MISSING                                                                              
+ ▎ 11:48 PM · 9/12/2026                                                                             
+ ▎                                                                                                  
+ 
+ ▎ read                                                                                             
+ ▎ failed: tool execution failed · missing-native.txt                                               
+ ▎ ... (4 more lines, ctrl+o to expand)                                                             
+ 
+ 
+ 
+ 
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+ ⠴ Working                                                                                          
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▎                                                                                                  
+ ▸ workspace · verify a · high · ● working                           ↑10 ↓12 R0 W0 · usage ? · ctx ?
