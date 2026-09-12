@@ -13,6 +13,7 @@ make focused changes, run relevant checks, and explain the result.
 # a UTF-8 file relative to this config file, use instead:
 # system_prompt = { file = "prompts/coding.md" }
 tools = ["read", "write", "edit", "apply_patch", "bash"]
+# Add "subagent" explicitly to enable native stateless child-loop delegation.
 max_tool_rounds = 32
 # Auto mode executes enabled tools without user approval. Use only in a trusted local environment.
 approval = "auto"

@@ -309,6 +309,25 @@ fn assert_error(
     assert!(!error.diagnostic().message.as_str().contains("SECRET"));
 }
 
+#[test]
+fn strict_native_subagent_function_tool_is_marked_for_openai() {
+    let value = serde_json::to_value(FunctionTool {
+        tool_type: "function",
+        name: "subagent".to_owned(),
+        description: "delegate".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        strict: Some(true),
+    })
+    .unwrap();
+    assert_eq!(value["type"], json!("function"));
+    assert_eq!(value["strict"], json!(true));
+}
+
 #[tokio::test]
 async fn descriptor_and_request_mapping_are_exact_and_secret_safe() {
     let response = MockResponse::sse(&[
@@ -359,6 +378,7 @@ async fn descriptor_and_request_mapping_are_exact_and_secret_safe() {
     assert_eq!(body["tools"][0]["name"], "read");
     assert_eq!(body["tools"][0]["description"], "Read a file");
     assert!(body["tools"][0]["parameters"].is_object());
+    assert!(body["tools"][0].get("strict").is_none());
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "developer");
     assert_eq!(input[0]["content"][0]["type"], "input_text");
