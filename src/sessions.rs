@@ -212,7 +212,7 @@ impl Sessions {
         ids.sort_unstable();
         let mut first_error = None;
         for session_id in ids {
-            let Some(session) = self.loaded.remove(&session_id) else {
+            let Some(session) = self.loaded.get(&session_id).cloned() else {
                 continue;
             };
             if let Err(error) = session.shutdown().await {
@@ -220,8 +220,18 @@ impl Sessions {
                     first_error = Some(error);
                 }
             }
+            self.loaded.remove(&session_id);
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for Sessions {
+    fn drop(&mut self) {
+        // Ordinary drop cancels; async shutdown is the complete join barrier.
+        for session in self.loaded.values() {
+            session.cancel_active_on_drop();
+        }
     }
 }
 
@@ -253,13 +263,48 @@ struct SessionInner {
     options: LoopOptions,
     active: Option<ActiveLoop>,
     blocked: Option<SessionBlockReason>,
+    closing: bool,
 }
 
 struct ActiveLoop {
     turn: TurnRef,
     handle: LoopHandle,
     completion: watch::Receiver<Option<TurnCompletion>>,
-    task: Option<JoinHandle<()>>,
+    task: Option<Arc<SessionTask>>,
+}
+
+/// Owns one Agent worker without taking its JoinHandle into a local across an
+/// await. If a join future is cancelled, the handle remains in this object so
+/// a later close or cleanup call can join the same worker.
+struct SessionTask {
+    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl SessionTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            join: tokio::sync::Mutex::new(Some(handle)),
+        }
+    }
+
+    async fn join(&self) -> Result<(), AgentError> {
+        let mut slot = self.join.lock().await;
+        let Some(handle) = slot.as_mut() else {
+            return Ok(());
+        };
+        let result = std::pin::Pin::new(handle).await;
+        slot.take();
+        result.map_err(|_| AgentError::Internal)
+    }
+
+    #[cfg(test)]
+    fn abort(&self) {
+        if let Ok(slot) = self.join.try_lock() {
+            if let Some(handle) = slot.as_ref() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 struct CompletionGuard {
@@ -341,6 +386,7 @@ impl Session {
             options,
             active: None,
             blocked: None,
+            closing: false,
         };
         Self {
             shared: Arc::new(SessionShared {
@@ -438,7 +484,7 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.active.is_some() {
+            if inner.closing || inner.active.is_some() {
                 return Err(AgentError::SessionBusy);
             }
             (
@@ -458,14 +504,17 @@ impl Session {
         let (completion_tx, completion_rx) = watch::channel(None);
         // Mark the new current loop before spawning its worker. Otherwise a
         // very fast model/tool could populate the presentation cache and then
-        // lose its identity when `note_loop_started` clears stale state.
+        // lose its identity when `note_loop_started` clears stale state. Keep
+        // the synchronous state publication and JoinHandle ownership in one
+        // lock section so close cannot observe an active loop without its
+        // retained worker handle.
         let accepted_at = crate::store::utc_timestamp().ok();
         {
             let mut inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.active.is_some() {
+            if inner.closing || inner.active.is_some() {
                 return Err(AgentError::SessionBusy);
             }
             inner.active = Some(ActiveLoop {
@@ -478,23 +527,18 @@ impl Session {
                 .presentation
                 .note_loop_started(turn.loop_id, accepted_at.clone());
             inner.presentation.record_prompt_time(accepted_at.clone());
-        }
-        let task = tokio::spawn(run_active_loop(
-            self.clone(),
-            turn,
-            agent_loop,
-            events,
-            CompletionGuard::new(self.clone(), completion_tx),
-        ));
-        {
-            let mut inner = self.shared.inner.lock().unwrap();
-            match inner.active.as_mut() {
-                Some(active) if active.turn == turn => active.task = Some(task),
-                _ => {
-                    task.abort();
-                    return Err(AgentError::Internal);
-                }
-            }
+            let task = Arc::new(SessionTask::new(tokio::spawn(run_active_loop(
+                self.clone(),
+                turn,
+                agent_loop,
+                events,
+                CompletionGuard::new(self.clone(), completion_tx),
+            ))));
+            inner
+                .active
+                .as_mut()
+                .expect("newly inserted active loop")
+                .task = Some(task);
         }
         tracing::info!(
             session_id = %turn.session_id,
@@ -505,49 +549,67 @@ impl Session {
     }
 
     pub(crate) async fn cleanup_finished(&self) -> Result<(), AgentError> {
-        let (finished, completed) = {
+        let active_task = {
             let inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            match inner.active.as_ref() {
-                None => return Ok(()),
-                Some(active) => (
-                    active.task.as_ref().is_some_and(|task| task.is_finished()),
-                    active.completion.borrow().is_some(),
-                ),
-            }
+            inner.active.as_ref().and_then(|active| {
+                active
+                    .completion
+                    .borrow()
+                    .is_some()
+                    .then(|| active.task.clone())
+                    .flatten()
+            })
         };
-        // Agent-level completion is published and the runtime loop has joined;
-        // the worker is only finishing its best-effort event emits. Reaping it
-        // now (instead of reporting busy) keeps an immediate next send from
-        // observing a SessionBusy window after `turn.wait` resolved.
-        if !finished && !completed {
-            return Err(AgentError::SessionBusy);
-        }
-        let task = {
-            let mut inner = self.shared.inner.lock().unwrap();
-            if inner.blocked.is_some() {
-                return Err(AgentError::SessionBlocked);
-            }
-            inner.active.as_mut().and_then(|active| active.task.take())
-        };
-        if let Some(task) = task {
-            if task.await.is_err() {
+        if let Some(task) = active_task {
+            if task.join().await.is_err() {
                 let mut inner = self.shared.inner.lock().unwrap();
-                inner.active = None;
+                if inner
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.task.as_ref())
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
+                {
+                    inner.active = None;
+                }
                 inner.blocked = Some(SessionBlockReason::Internal);
                 drop(inner);
                 self.emit_state();
                 return Err(AgentError::SessionBlocked);
             }
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner.blocked.is_some() {
+                return Err(AgentError::SessionBlocked);
+            }
+            if inner
+                .active
+                .as_ref()
+                .and_then(|active| active.task.as_ref())
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
+            {
+                inner.active = None;
+            }
         }
-        let mut inner = self.shared.inner.lock().unwrap();
+        let inner = self.shared.inner.lock().unwrap();
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
-        inner.active = None;
+        if inner.active.is_some() {
+            return Err(AgentError::SessionBusy);
+        }
         Ok(())
+    }
+
+    fn cancel_active_on_drop(&self) {
+        let handle = {
+            let inner = self.shared.inner.lock().unwrap();
+            inner.active.as_ref().map(|active| active.handle.clone())
+        };
+        if let Some(handle) = handle {
+            let _ = handle.cancel();
+        }
     }
 
     #[cfg(test)]
@@ -678,6 +740,9 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
+            if inner.closing {
+                return Err(AgentError::SessionBusy);
+            }
         }
         self.shared
             .store
@@ -733,21 +798,33 @@ impl Session {
     /// drains any child workers owned by this Session.
     pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
         let session_id = self.session_id();
-        let active = {
+        let (active_handle, active_task) = {
             let mut inner = self.shared.inner.lock().unwrap();
-            inner.active.take()
+            let active_handle = inner.active.as_ref().map(|active| active.handle.clone());
+            let active_task = inner.active.as_ref().and_then(|active| active.task.clone());
+            inner.closing = true;
+            (active_handle, active_task)
         };
-        let task_result = if let Some(active) = active {
-            active.handle.cancel();
-            match active.task {
-                Some(task) => task.await.map_err(|_| AgentError::Internal),
-                None => Ok(()),
+        let mut first_error = None;
+        if let Some(handle) = active_handle {
+            let _ = handle.cancel();
+        }
+        if let Some(task) = active_task {
+            if task.join().await.is_err() {
+                first_error = Some(AgentError::Internal);
             }
-        } else {
-            Ok(())
-        };
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner
+                .active
+                .as_ref()
+                .and_then(|active| active.task.as_ref())
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
+            {
+                inner.active = None;
+            }
+        }
         self.shared.subagents.drain_session(session_id).await;
-        task_result
+        first_error.map_or(Ok(()), Err)
     }
 
     fn emit_state(&self) {

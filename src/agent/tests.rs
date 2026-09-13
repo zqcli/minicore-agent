@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::stream;
@@ -74,6 +74,14 @@ struct BlockGate {
     release: Arc<Notify>,
 }
 
+struct DropSignal(Arc<AtomicBool>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl BlockGate {
     fn new() -> Self {
         Self {
@@ -93,6 +101,7 @@ enum ModelScript {
     ToolCallAfterGate(BlockGate, &'static str, serde_json::Value),
     /// Parks until `release` fires and signals `entered` when parked.
     BlockUntil(BlockGate, &'static str),
+    BlockUntilDrop(BlockGate, Arc<AtomicBool>, &'static str),
     /// Emits many text deltas back-to-back with no awaits so the runtime can
     /// saturate its best-effort event queue deterministically, then ends the
     /// request with one tool call so the loop runs a tool (with an await)
@@ -148,6 +157,20 @@ impl Model for FakeModel {
             let _ = call_index;
             match script {
                 ModelScript::BlockUntil(gate, text) => {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                    events(vec![
+                        ModelEvent::text_delta(text).unwrap(),
+                        ModelEvent::Usage {
+                            usage: Usage::new(1, 1, 0),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ])
+                }
+                ModelScript::BlockUntilDrop(gate, dropped, text) => {
+                    let _signal = DropSignal(dropped);
                     gate.entered.notify_one();
                     gate.release.notified().await;
                     events(vec![
@@ -2155,6 +2178,106 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
     .await
     .expect("close must reclaim a panicked worker");
     assert!(matches!(close, Err(AgentError::Internal)));
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_drop_cancels_an_active_model_future() {
+    let (data_dir, _guard) = fixture_dir(&format!("drop-cancel-{}", next_id()));
+    let (workspace, _guard) = workspace_file("drop-cancel-ws", "a.txt", b"hello");
+    let gate = BlockGate::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::BlockUntilDrop(
+            gate.clone(),
+            Arc::clone(&dropped),
+            "never returned",
+        )],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let _turn = send_text(&mut agent, info.session_id, "drop me").await;
+    gate.entered.notified().await;
+
+    drop(agent);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("Agent drop must cancel the active model future");
+    gate.release.notify_waiters();
+}
+
+#[tokio::test]
+async fn active_shutdown_waits_for_the_session_owned_worker() {
+    let (data_dir, _guard) = fixture_dir(&format!("shutdown-active-{}", next_id()));
+    let (workspace, _guard) = workspace_file("shutdown-active-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let gate = Arc::new(WorkerGate::new());
+    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let _turn = send_text(&mut agent, info.session_id, "shutdown").await;
+    gate.wait_started().await;
+
+    let mut shutdown = tokio::spawn(agent.shutdown());
+    let pending = tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown).await;
+    assert!(pending.is_err(), "shutdown must wait for the owned worker");
+    gate.release();
+    assert!(shutdown.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
+    let (data_dir, _guard) = fixture_dir(&format!("close-cancel-owned-{}", next_id()));
+    let (workspace, _guard) = workspace_file("close-cancel-owned-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let gate = Arc::new(WorkerGate::new());
+    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+
+    let turn = send_text(&mut agent, info.session_id, "close later").await;
+    gate.wait_started().await;
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(25),
+        agent.close_session(info.session_id),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "cancelled close must still be waiting for the worker"
+    );
+    assert!(
+        agent
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|session| session.session_id == info.session_id && session.loaded)
+    );
+
+    gate.release();
+    let _ = agent.wait_turn(turn).await;
+    agent.close_session(info.session_id).await.unwrap();
     agent.shutdown().await.unwrap();
 }
 
