@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod compaction;
 mod config;
 mod error;
 mod event;

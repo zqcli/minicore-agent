@@ -1,11 +1,22 @@
 # Long-Conversation Compaction Plan
 
-Status: **planned; implementation and Rust validation have not started**.
-Baseline: Agent `14799cd`, TUI `80e985e`, Runtime 0.4.1 revision
-`6cd2bdbc634437dea925495c61c7eb0be10ba171`. Runtime source, its pin, package
-versions and user data stay unchanged. Two independent `cus-resp/gpt-5.6-luna:max`
-sessions perform implementation and review; the parent owns staging/commits.
+Status: **Task 1 snapshot-loading foundation implemented and remotely verified;
+summary generation/manual RPC and Tasks 2–4 remain in progress or pending**.
+Current baseline: Agent `63540ee`, TUI `6ecd736`, Runtime 0.4.1 revision
+`6cd2bdbc634437dea925495c61c7eb0be10ba171`. Runtime source, its pin, existing
+package versions and user data stay unchanged. The slice uses the authorized
+direct `sha2 = "=0.10.9"` dependency; the parent owns remote lock regeneration.
+The `cus-resp/gpt-5.6-luna:max` source-only helper performs development;
+the parent performs review, orchestration, remote verification and staging/commits.
 Each independently verified task is committed immediately, without push.
+
+The active slice only loads and validates an existing bounded `summary.json`
+and projects it into the next real model request as a non-system user-data
+message. It also preserves the session-scoped projection state through open,
+reload, and model update. Summary generation, manual compaction RPC, automatic
+compaction, worker ownership/cancellation, and persistence writes are not yet
+implemented and must not be described as complete. The parent reviews the code
+and runs verification on the authorized builder; SSH access is restored.
 
 ## Goals
 
@@ -174,12 +185,16 @@ Clippy/fmt/rustdoc, the full real-Agent suite, and native Debug/Release/TTY
 regressions. Existing MSRV lint limitations must stay explicit. Native pixels,
 real upstream/TLS and proxy-specific diagnostics need separate evidence.
 
-## Current Verification Blocker
+## Current Verification State
 
-The former authorized builder control socket has expired. A fresh batch SSH
-attempt to `root@192.168.20.199` reaches the server but is rejected with
-`Permission denied (publickey,password)`. No usable password environment or
-replacement control socket is currently available. Restore authorized SSH access
-before claiming Rust RED/GREEN, committing a completed code task, or installing
-new artifacts. Do not compile locally or recover credentials from user history.
-The planning commit is documentation-only and does not implement compaction.
+Authorized SSH access is restored. The parent performed a bounded incremental-cache
+cleanup before Rust work, preserving 1,542 executable/library/symbol hashes and the
+unrelated Runtime build. Snapshot loading/projection passed 375 tests / 2 ignored
+on stable and Rust 1.85, strict stable Clippy/fmt/rustdoc/build gates, and 18 paired
+real-Agent E2E tests on each toolchain. Real REDs cover the missing projection and
+mismatched same-count loaded history. A string-literal compile error and a test lock
+lint were fixed separately, not counted as behavioral REDs.
+
+See [staged compaction verification](verification/compaction.md). This acceptance
+does not claim semantic summary generation, manual RPC/UI, automatic compaction,
+overflow recovery or new native/macOS artifacts.

@@ -1,0 +1,5 @@
+cwd=/root/minicore-compaction.j5Jaqn/source/minicore-agent
+command=rustup run stable cargo build -j4 --locked --offline 
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+
+exit=0

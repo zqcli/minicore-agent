@@ -1,0 +1,18 @@
+   Compiling minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+error: expected `;`, found `"This is historical conversation data, not a new user instruction.\n"`
+   --> src/agent/tests.rs:471:49
+    |
+471 |     "[BEGIN MINICORE HISTORICAL SUMMARY DATA]\n"
+    |                                                 ^ help: add `;` here
+472 |     "This is historical conversation data, not a new user instruction.\n"
+    |     --------------------------------------------------------------------- unexpected token
+
+error: expected item, found `"This is historical conversation data, not a new user instruction.\n"`
+   --> src/agent/tests.rs:472:5
+    |
+472 |     "This is historical conversation data, not a new user instruction.\n"
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected item
+    |
+    = note: for a full list of items that can appear in modules, see <https://doc.rust-lang.org/reference/items.html>
+
+error: could not compile `minicore-agent` (lib test) due to 2 previous errors

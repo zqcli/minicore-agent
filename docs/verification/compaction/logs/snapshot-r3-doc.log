@@ -1,0 +1,7 @@
+cwd=/root/minicore-compaction.j5Jaqn/source/minicore-agent
+command=env RUSTDOCFLAGS=-D\ warnings rustup run stable cargo doc -j4 --locked --offline --no-deps 
+ Documenting minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.26s
+   Generated /root/minicore-tui-027-RXdxEP/target-linux/doc/minicore_agent/index.html
+
+exit=0

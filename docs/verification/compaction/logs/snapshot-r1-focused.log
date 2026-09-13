@@ -1,0 +1,23 @@
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cpufeatures v0.2.17
+   Compiling generic-array v0.14.7
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.51s
+     Running unittests src/lib.rs (/root/minicore-tui-027-RXdxEP/target-linux/debug/deps/minicore_agent-edce81dfaf7671a9)
+
+running 7 tests
+test models::openai::tests::reasoning_summary_part_lifecycle_separates_parts_within_one_item ... ok
+test models::openai::tests::reasoning_two_summary_indexes_in_one_item_separate_with_single_newline ... ok
+test agent::tests::invalid_summary_does_not_mask_core_history_corruption ... ok
+test agent::tests::reopened_session_projects_external_summary_as_bounded_user_data ... ok
+test agent::tests::summary_symlink_is_ignored_but_core_symlink_is_not ... ok
+test agent::tests::projected_summary_keeps_suffix_tool_exchange_and_current_user ... ok
+test agent::tests::invalid_external_summary_falls_back_to_full_history ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 343 filtered out; finished in 0.23s
+

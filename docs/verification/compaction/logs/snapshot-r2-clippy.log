@@ -1,0 +1,32 @@
+cwd=/root/minicore-compaction.j5Jaqn/source/minicore-agent
+command=rustup run stable cargo clippy -j4 --locked --offline --all-targets -- -D warnings 
+    Checking typenum v1.20.1
+    Checking cpufeatures v0.2.17
+    Checking generic-array v0.14.7
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+error: this `MutexGuard` is held across an await point
+    --> src/agent/tests.rs:1436:9
+     |
+1436 |     let requests = requests.lock().unwrap();
+     |         ^^^^^^^^
+     |
+     = help: consider using an async-aware `Mutex` type or ensuring the `MutexGuard` is dropped before calling `await`
+note: these are all the await points this lock is held through
+    --> src/agent/tests.rs:1447:37
+     |
+1447 |     agent.close_session(session_id).await.unwrap();
+     |                                     ^^^^^
+...
+1454 |         agent.open_session(session_id).await,
+     |                                        ^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#await_holding_lock
+     = note: `-D clippy::await-holding-lock` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::await_holding_lock)]`
+
+error: could not compile `minicore-agent` (lib test) due to 1 previous error
+
+exit=101

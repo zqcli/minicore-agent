@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
 use minicore_runtime::InteractionId;
+use minicore_runtime::LoopOptions;
 use minicore_runtime::execution::{ConfigRevision, ExecutionConfig, UserInput};
 use minicore_runtime::interaction::InteractionAnswer;
 use minicore_runtime::model::ReasoningPreference;
@@ -14,6 +15,7 @@ use minicore_runtime::prompt::PromptProvider;
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
+use crate::compaction::{CompactionState, load_state};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
@@ -148,6 +150,72 @@ struct ResolvedSessionSettings {
     profile: String,
     model: String,
     reasoning: ReasoningPreference,
+}
+
+struct ExecutionConfigFactory<'a> {
+    models: &'a Models,
+    command_environment: &'a CommandEnvironment,
+    subagents: Arc<SubagentService>,
+    compaction: Arc<CompactionState>,
+}
+
+impl ExecutionConfigFactory<'_> {
+    fn build(
+        &self,
+        record: &SessionRecord,
+        workspace: Arc<Workspace>,
+        presentation: Arc<crate::presentation::Presentation>,
+        options: LoopOptions,
+    ) -> Result<ExecutionConfig, AgentError> {
+        let model = self
+            .models
+            .get(&record.model)
+            .map_err(map_model_config_error)?;
+        let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
+        let subagent = record
+            .tools
+            .iter()
+            .any(|name| name == crate::subagents::TOOL_NAME)
+            .then(|| SubagentFactory {
+                service: Arc::clone(&self.subagents),
+                session_id: record.session_id,
+                parent_workspace: Arc::clone(&workspace),
+                models: Arc::new(self.models.clone()),
+                command_environment: self.command_environment.clone(),
+                system_prompt: record.system_prompt.clone(),
+                parent_tools: record.tools.clone(),
+                approval: record.approval,
+                options: options.clone(),
+                default_model: record.model.clone(),
+                default_reasoning: record.reasoning,
+            });
+        let tools = crate::tools::build_tools_with_presentation_and_subagent(
+            &record.tools,
+            Arc::clone(&workspace),
+            self.command_environment.clone(),
+            &presentation,
+            subagent.as_ref(),
+        )
+        .map_err(map_build_tools_error)?;
+        let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
+            None
+        } else {
+            Some(Arc::new(Policy::new(record.approval)))
+        };
+        let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
+            Arc::new(
+                ProjectPromptProvider::new(
+                    workspace,
+                    record.system_prompt.clone(),
+                    Arc::clone(&self.compaction),
+                )
+                .map_err(|_| AgentError::InvalidSessionSettings)?,
+            ),
+            presentation,
+        );
+        ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
+            .map_err(|_| AgentError::InvalidSessionSettings)
+    }
 }
 
 /// Top-level coordinator for the local Store and loaded Sessions.
@@ -288,15 +356,13 @@ impl Agent {
             let options = candidate
                 .loop_options(record.max_tool_rounds)
                 .map_err(AgentError::Config)?;
-            let config = Self::execution_config_with(
-                &models,
-                &command_environment,
-                &record,
-                workspace,
-                presentation,
-                Arc::clone(&self.subagents),
-                options.clone(),
-            )?;
+            let factory = ExecutionConfigFactory {
+                models: &models,
+                command_environment: &command_environment,
+                subagents: Arc::clone(&self.subagents),
+                compaction: session.compaction_state(),
+            };
+            let config = factory.build(&record, workspace, presentation, options.clone())?;
             session_candidates.push((session.clone(), config, options));
         }
 
@@ -381,11 +447,13 @@ impl Agent {
             .config
             .loop_options(record.max_tool_rounds)
             .map_err(AgentError::Config)?;
+        let compaction = CompactionState::new();
         let config = self.execution_config(
             &record,
             Arc::clone(&workspace),
             Arc::clone(&presentation),
             options.clone(),
+            Arc::clone(&compaction),
         )?;
         self.store
             .create_session(&record)
@@ -400,6 +468,7 @@ impl Agent {
             config,
             options,
             Arc::clone(&self.subagents),
+            compaction,
             self.store.clone(),
             self.event_sink.clone(),
         );
@@ -463,11 +532,13 @@ impl Agent {
             .config
             .loop_options(stored.record.max_tool_rounds)
             .map_err(AgentError::Config)?;
+        let compaction = load_state(&self.store, session_id, &stored.history).await;
         let config = self.execution_config(
             &stored.record,
             Arc::clone(&workspace),
             Arc::clone(&presentation),
             options.clone(),
+            Arc::clone(&compaction),
         )?;
         let session = crate::sessions::Session::new(
             stored.record.clone(),
@@ -478,6 +549,7 @@ impl Agent {
             config,
             options,
             Arc::clone(&self.subagents),
+            compaction,
             self.store.clone(),
             self.event_sink.clone(),
         );
@@ -581,8 +653,13 @@ impl Agent {
             .config
             .loop_options(candidate.max_tool_rounds)
             .map_err(AgentError::Config)?;
-        let config =
-            self.execution_config(&candidate, workspace, session.presentation(), options)?;
+        let config = self.execution_config(
+            &candidate,
+            workspace,
+            session.presentation(),
+            options,
+            session.compaction_state(),
+        )?;
         let active_revision = session.update(candidate.clone(), config).await?;
         session
             .presentation()
@@ -820,68 +897,15 @@ impl Agent {
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
         options: minicore_runtime::LoopOptions,
+        compaction: Arc<CompactionState>,
     ) -> Result<ExecutionConfig, AgentError> {
-        Self::execution_config_with(
-            &self.models,
-            &self.command_environment,
-            record,
-            workspace,
-            presentation,
-            Arc::clone(&self.subagents),
-            options,
-        )
-    }
-
-    fn execution_config_with(
-        models: &Models,
-        command_environment: &CommandEnvironment,
-        record: &SessionRecord,
-        workspace: Arc<Workspace>,
-        presentation: Arc<crate::presentation::Presentation>,
-        subagents: Arc<SubagentService>,
-        options: minicore_runtime::LoopOptions,
-    ) -> Result<ExecutionConfig, AgentError> {
-        let model = models.get(&record.model).map_err(map_model_config_error)?;
-        let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
-        let subagent = record
-            .tools
-            .iter()
-            .any(|name| name == crate::subagents::TOOL_NAME)
-            .then(|| SubagentFactory {
-                service: Arc::clone(&subagents),
-                session_id: record.session_id,
-                parent_workspace: Arc::clone(&workspace),
-                models: Arc::new(models.clone()),
-                command_environment: command_environment.clone(),
-                system_prompt: record.system_prompt.clone(),
-                parent_tools: record.tools.clone(),
-                approval: record.approval,
-                options: options.clone(),
-                default_model: record.model.clone(),
-                default_reasoning: record.reasoning,
-            });
-        let tools = crate::tools::build_tools_with_presentation_and_subagent(
-            &record.tools,
-            Arc::clone(&workspace),
-            command_environment.clone(),
-            &presentation,
-            subagent.as_ref(),
-        )
-        .map_err(map_build_tools_error)?;
-        let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
-            None
-        } else {
-            Some(Arc::new(Policy::new(record.approval)))
+        let factory = ExecutionConfigFactory {
+            models: &self.models,
+            command_environment: &self.command_environment,
+            subagents: Arc::clone(&self.subagents),
+            compaction,
         };
-        let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
-            Arc::new(
-                ProjectPromptProvider::new(workspace, record.system_prompt.clone())
-                    .map_err(|_| AgentError::InvalidSessionSettings)?,
-            ),
-            presentation,
-        );
-        ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
-            .map_err(|_| AgentError::InvalidSessionSettings)
+        factory.build(record, workspace, presentation, options)
     }
 
     /// Per-session presentation wired into this session's model/tool wrappers

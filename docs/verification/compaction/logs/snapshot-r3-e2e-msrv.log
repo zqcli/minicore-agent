@@ -1,0 +1,30 @@
+cwd=/root/minicore-compaction.j5Jaqn/source/minicore-tui
+command=env CARGO_TARGET_DIR=/root/minicore-tui-027-RXdxEP/target-msrv rustup run 1.85.0 cargo test -j4 --locked --offline --test agent_e2e -- --ignored --test-threads=1 
+   Compiling minicore-tui v0.2.8 (/root/minicore-compaction.j5Jaqn/source/minicore-tui)
+    Finished `test` profile [optimized + debuginfo] target(s) in 26.71s
+     Running tests/agent_e2e.rs (/root/minicore-tui-027-RXdxEP/target-msrv/debug/deps/agent_e2e-b64e871d51c7da77)
+
+running 18 tests
+test e2e_configuration_reload_refreshes_catalogs_and_active_session ... ok
+test e2e_fifo_duplicate_texts_are_paced_and_both_persist ... ok
+test e2e_fifo_steers_are_paced_until_receipt ... ok
+test e2e_live_request_usage_shows_during_loop_and_persisted_total_replaces_it ... ok
+test e2e_max_reasoning_ships_literal_max_and_provider_body_carries_it ... ok
+test e2e_reasoning_summary_item_boundaries_survive_to_the_tui ... ok
+test e2e_scenario_a_discovery ... ok
+test e2e_scenario_b_basic_turn ... ok
+test e2e_scenario_c_tool_execution ... ok
+test e2e_scenario_d_steer_turn ... ok
+test e2e_scenario_e2_update_single_request_then_next_turn ... ok
+test e2e_scenario_e_same_loop_update ... ok
+test e2e_scenario_f_shutdown_cancels_active_wait ... ok
+test e2e_session_panel_rename_and_delete_against_current_agent ... ok
+test e2e_stress_second_tool_expansion_survives_background_generation ... ok
+test e2e_stress_session_switch_preserves_tool_fold ... ok
+test e2e_stress_six_loops_ten_requests_no_repeated_final_text ... ok
+test e2e_two_consecutive_steers_both_reach_the_provider ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+
+exit=0

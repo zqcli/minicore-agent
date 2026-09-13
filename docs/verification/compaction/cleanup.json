@@ -1,0 +1,53 @@
+{
+  "roots": [
+    "/root/minicore-tui-027-RXdxEP/target-linux",
+    "/root/minicore-tui-027-RXdxEP/target-msrv",
+    "/root/minicore-tui-027-RXdxEP/target-macos-llvm"
+  ],
+  "protected_root": "/root/minicore-runtime-v04-build",
+  "active_builds_before": [
+    {
+      "pid": 1264691,
+      "name": "cargo",
+      "cwd": "/root/minicore-runtime-v04-build/phase2"
+    }
+  ],
+  "candidates": [
+    {
+      "path": "/root/minicore-tui-027-RXdxEP/target-linux/debug/incremental",
+      "logical_bytes": 2918426873
+    },
+    {
+      "path": "/root/minicore-tui-027-RXdxEP/target-msrv/debug/incremental",
+      "logical_bytes": 1293460675
+    },
+    {
+      "path": "/root/minicore-tui-027-RXdxEP/target-macos-llvm/x86_64-apple-darwin/debug/incremental",
+      "logical_bytes": 953010350
+    },
+    {
+      "path": "/root/minicore-tui-027-RXdxEP/target-macos-llvm/x86_64-apple-darwin/release/incremental",
+      "logical_bytes": 0
+    },
+    {
+      "path": "/root/minicore-tui-027-RXdxEP/target-macos-llvm/debug/incremental",
+      "logical_bytes": 0
+    },
+    {
+      "path": "/root/minicore-tui-027-RXdxEP/target-macos-llvm/release/incremental",
+      "logical_bytes": 0
+    }
+  ],
+  "retained_artifact_count": 1542,
+  "free_bytes_before": 26756915200,
+  "retained_hashes_verified": true,
+  "logical_bytes_removed": 5164897898,
+  "free_bytes_after": 31633502208,
+  "active_builds_after": [
+    {
+      "pid": 1264691,
+      "name": "cargo",
+      "cwd": "/root/minicore-runtime-v04-build/phase2"
+    }
+  ]
+}

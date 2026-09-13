@@ -1,0 +1,26 @@
+    Updating crates.io index
+     Locking 8 packages to latest Rust 1.85 compatible versions
+      Adding block-buffer v0.10.4
+      Adding cpufeatures v0.2.17
+      Adding crypto-common v0.1.7
+      Adding digest v0.10.7
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding sha2 v0.10.9 (available: v0.11.0)
+      Adding typenum v1.20.1
+      Adding version_check v0.9.5
+ Downloading crates ...
+  Downloaded wasi v0.14.7+wasi-0.2.4
+  Downloaded js-sys v0.3.104
+  Downloaded wasm-bindgen-shared v0.2.127
+  Downloaded r-efi v6.0.0
+  Downloaded sha2 v0.10.9
+  Downloaded wasm-streams v0.4.2
+  Downloaded wasm-bindgen-macro v0.2.127
+  Downloaded wasm-bindgen-futures v0.4.77
+  Downloaded web-time v1.1.0
+  Downloaded valuable v0.1.1
+  Downloaded wasm-bindgen v0.2.127
+  Downloaded bumpalo v3.20.3
+  Downloaded wasm-bindgen-macro-support v0.2.127
+  Downloaded web-sys v0.3.104
+  Downloaded windows-sys v0.52.0
