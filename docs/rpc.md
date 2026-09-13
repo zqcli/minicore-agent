@@ -16,6 +16,23 @@ complete JSON object. Requests must fit within 1 MiB including the terminating
 newline. Stdout is reserved for RPC responses and `agent.event` notifications;
 logs are written to stderr.
 
+The 1 MiB limit covers the whole accumulated request, including bytes received
+before an earlier cancellation. The reader retains a partially received frame
+across deferred-waiter, signal, and writer-status wakeups, so a request may
+arrive in arbitrarily fragmented reads without losing its prefix. A frame's
+bytes leave the retained buffer only when the frame completes, at EOF, or when
+the frame is rejected as oversized, which discards the accumulated bytes and
+reports a parse error.
+
+## Deferred Waiter Capacity
+
+At most 32 deferred waiters may be registered at once. When that limit is
+reached, further `turn.wait` and `session.compact` requests fail immediately
+with `-32019` (`resource_exhausted`, retryable) before a compaction operation is
+started. The limit applies only to those two methods: ping, cancel, shutdown,
+and every ordinary request remain serviceable so a client can always drain or
+cancel its work.
+
 A request has this shape:
 
 ```json
@@ -670,6 +687,7 @@ errors:
 | `-32016` | `steer_queue_full` |
 | `-32017` | `reload_requires_restart` |
 | `-32018` | `reload_unavailable` |
+| `-32019` | `resource_exhausted` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or

@@ -20,16 +20,21 @@ use super::protocol::{
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE,
     InteractionAnswerParams, METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult,
     PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE,
-    RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY,
-    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionCompactParams,
-    SessionCreateParams, SessionHistoryParams, SessionParams, SessionRenameParams, SessionResult,
-    SessionUpdateParams, SessionUpdateResult, SessionsResult, SteerResult, TURN_NOT_FOUND,
-    TurnParams, TurnResult, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params,
-    parse_request, request_id,
+    RESOURCE_EXHAUSTED, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse,
+    SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STEER_QUEUE_FULL,
+    STORE_ERROR, SessionCompactParams, SessionCreateParams, SessionHistoryParams, SessionParams,
+    SessionRenameParams, SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult,
+    SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult, TurnSendParams, TurnSteerParams,
+    WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 const OUTBOUND_CAPACITY: usize = 128;
+/// Upper bound on concurrently registered deferred waiters. Waiter tasks are
+/// cheap but client-driven, so an unbounded count is a resource leak. Reaching
+/// this limit rejects only `turn.wait` and `session.compact`; the reader keeps
+/// serving ping, cancel, and shutdown.
+const MAX_DEFERRED_WAITERS: usize = 32;
 
 pub async fn run_stdio(agent: Agent) -> Result<(), AgentError> {
     run_with_io(
@@ -115,6 +120,10 @@ impl RpcServer {
         tokio::pin!(shutdown_signal);
         let mut writer_status_rx = writer_status_rx;
         let mut observed_writer_result = None;
+        // Accumulated bytes of the frame currently being read. It lives outside
+        // the `select!` so cancelling `read_frame` (a resolved deferred waiter,
+        // signal, or writer status) cannot discard a partially consumed frame.
+        let mut frame_buffer = Vec::new();
 
         let reason = loop {
             tokio::select! {
@@ -139,8 +148,8 @@ impl RpcServer {
                         break StopReason::Error(AgentError::Internal);
                     }
                 }
-                frame = read_frame(reader) => {
-                    match frame {
+                frame_result = read_frame(reader, &mut frame_buffer) => {
+                    match frame_result {
                         Err(error) => {
                             tracing::warn!(kind = "read_failure", "rpc read failed");
                             break StopReason::Error(AgentError::Io(error));
@@ -320,6 +329,12 @@ impl RpcServer {
                     Ok(params) => params,
                     Err(response) => return Dispatch::Response(response),
                 };
+                // Reserve waiter capacity before starting the Session-owned
+                // operation, so a full waiter set never launches a compaction
+                // that cannot be awaited.
+                if self.waiters.len() >= MAX_DEFERRED_WAITERS {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
                 match self.agent_mut().compact_session(params.into()).await {
                     Ok(receiver) => {
                         let outbound = self.outbound_tx.clone();
@@ -443,6 +458,9 @@ impl RpcServer {
                 };
                 match self.agent().wait_turn_receiver(params.into()) {
                     Ok(receiver) => {
+                        if self.waiters.len() >= MAX_DEFERRED_WAITERS {
+                            return Dispatch::Response(resource_exhausted(id));
+                        }
                         let outbound = self.outbound_tx.clone();
                         self.waiters.spawn(async move {
                             let response = match await_turn_completion(receiver).await {
@@ -683,6 +701,20 @@ fn invalid_params(id: Option<RpcId>) -> RpcResponse {
     )
 }
 
+fn resource_exhausted(id: RpcId) -> RpcResponse {
+    tracing::warn!(
+        kind = "resource_exhausted",
+        "rpc deferred waiter limit reached"
+    );
+    RpcResponse::error(
+        Some(id),
+        RESOURCE_EXHAUSTED,
+        "too many deferred waiters",
+        "resource_exhausted",
+        true,
+    )
+}
+
 fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
     let (code, message, kind, retryable) = match error {
         AgentError::SessionNotFound => (
@@ -801,34 +833,36 @@ fn canonical_method(method: &str) -> &'static str {
     }
 }
 
-async fn read_frame<R>(reader: &mut R) -> io::Result<Frame>
+async fn read_frame<R>(reader: &mut R, frame: &mut Vec<u8>) -> io::Result<Frame>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut frame = Vec::new();
     loop {
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
             return if frame.is_empty() {
                 Ok(Frame::Eof)
             } else {
-                Ok(Frame::Data(frame))
+                Ok(Frame::Data(std::mem::take(frame)))
             };
         }
 
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(buffer.len(), |position| position + 1);
+        // The limit covers the whole frame, including bytes accumulated before
+        // an earlier cancellation.
         if frame
             .len()
             .checked_add(consumed)
             .is_none_or(|length| length > MAX_RPC_LINE_BYTES)
         {
+            frame.clear();
             return Ok(Frame::Oversized);
         }
         frame.extend_from_slice(&buffer[..consumed]);
         reader.consume(consumed);
         if newline.is_some() {
-            return Ok(Frame::Data(frame));
+            return Ok(Frame::Data(std::mem::take(frame)));
         }
     }
 }

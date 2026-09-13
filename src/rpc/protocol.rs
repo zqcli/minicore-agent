@@ -41,6 +41,7 @@ pub(crate) const HISTORY_TOO_LARGE: i32 = -32_015;
 pub(crate) const STEER_QUEUE_FULL: i32 = -32_016;
 pub(crate) const RELOAD_REQUIRES_RESTART: i32 = -32_017;
 pub(crate) const RELOAD_UNAVAILABLE: i32 = -32_018;
+pub(crate) const RESOURCE_EXHAUSTED: i32 = -32_019;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
