@@ -20,10 +20,12 @@ mod tools;
 mod workspace;
 
 pub use agent::{
-    Agent, AnswerInteraction, CreateSession, GetHistory, HistoryPage, PingResponse, ReloadResult,
-    RenameSession, SendMessage, SessionInfo, SessionState, SessionStatus, SessionUpdateResult,
-    SteerMessage, TurnPersistence, TurnRef, TurnResult, UpdateSession, agent_version,
+    Agent, AnswerInteraction, CompactSession, CreateSession, GetHistory, HistoryPage, PingResponse,
+    ReloadResult, RenameSession, SendMessage, SessionInfo, SessionState, SessionStatus,
+    SessionUpdateResult, SteerMessage, TurnPersistence, TurnRef, TurnResult, UpdateSession,
+    agent_version,
 };
+pub use compaction::{CompactionResult, CompactionStatus};
 pub use config::{AgentConfig, ApprovalMode, ConfigError, LoopOverrides, Profile};
 pub use error::{AgentError, RuntimeErrorView};
 pub use event::{
@@ -34,5 +36,7 @@ pub use models::{ModelConfig, ModelInfo};
 pub use presentation::{AssistantDisplayPart, PresentationView, ToolDisplay};
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
-pub use sessions::{LoopAccepted, SessionBlockReason, SteerAccepted};
+pub use sessions::{
+    CompactionPhase, CompactionProgress, LoopAccepted, SessionBlockReason, SteerAccepted,
+};
 pub use workspace::{Workspace, WorkspaceError};

@@ -183,7 +183,7 @@ async fn read_agents_with_gate(
 /// absent file is handled by the caller; any invalid content (bad UTF-8 or a
 /// disallowed control character) is a prompt error, never silently treated as
 /// "no AGENTS.md".
-fn decode_agents(prefix: &ReadPrefix) -> Result<String, AgentPromptError> {
+pub(crate) fn decode_agents(prefix: &ReadPrefix) -> Result<String, AgentPromptError> {
     if prefix.bytes.is_empty() {
         return Ok(String::new());
     }
@@ -236,7 +236,7 @@ fn decode_agents(prefix: &ReadPrefix) -> Result<String, AgentPromptError> {
 
 /// Combines the session system prompt with optional project instructions,
 /// keeping the profile half intact and truncating only the AGENTS tail.
-fn build_system_prompt(
+pub(crate) fn build_system_prompt(
     system_prompt: &BoundedText,
     agents: Option<String>,
 ) -> Result<BoundedText, ()> {

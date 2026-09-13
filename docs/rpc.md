@@ -54,8 +54,10 @@ be recovered.
 
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
-requests are dispatched sequentially. `turn.wait` is the exception: the server
-registers one owned waiter and immediately continues reading requests.
+requests are dispatched sequentially. `turn.wait` and `session.compact` are
+exceptions: the server registers one owned waiter and immediately continues
+reading requests. A deferred waiter does not own the underlying Session
+operation.
 
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
@@ -63,7 +65,8 @@ The following orderings are not guaranteed:
 - a `turn.send` response before the corresponding `turn_started` event;
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
-- a deferred `turn.wait` response before responses to later requests.
+- a deferred `turn.wait` response before responses to later requests;
+- a deferred `session.compact` response before responses to later requests.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait` and `session.history`, not
@@ -224,16 +227,71 @@ The result has a `session` member containing the created SessionInfo.
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
-- `session.close` cancels any active loop, joins its worker, and returns
-  `{"ok":true}`. MiniCore Agent v0.3 uses the Runtime user-cancellation path
-  when closing or shutting down an active Session; it does not currently preserve
-  a distinct shutdown cancellation reason.
+- `session.close` cancels any active loop or manual compaction, joins all
+  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.3 uses
+  the Runtime user-cancellation path when closing or shutting down an active
+  Session; it does not currently preserve a distinct shutdown cancellation
+  reason.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`.
 - `session.state` takes a loaded Session ID and returns the current Session
-  state projection.
+  state projection. While manual compaction is in progress, the optional
+  `compaction` member reports only its safe operation ID, phase, and item counts;
+  clients use its presence, rather than the ordinary loop `status`, to observe
+  compaction busy.
+- `session.compact` takes `{"session_id":"ses_...","operation_id":"..."}`
+  and returns one deferred result after manual compaction finishes. The
+  operation ID is non-empty printable ASCII and at most 128 bytes, and cannot
+  be reused during one loaded Session lifetime. At most 4096 IDs are retained
+  per loaded Session; the bounded set resets on close/reopen, and a new ID at
+  the cap is rejected as invalid input. Compaction is admitted only for a
+  loaded, idle, settled, unblocked Session; a busy or duplicate request is
+  rejected. `turn.send` and `session.update` are also
+  rejected while it is owned by the Session, while metadata-only
+  `session.rename` remains allowed.
+- `session.compact.cancel` takes the same full identity and returns
+  `{"cancelled":true}` only when that exact operation is still owned. A wrong
+  or stale ID returns `{"cancelled":false}` and, during that loaded Session
+  lifetime, cannot cancel a later operation. Cancellation is cooperative; a
+  write already in its atomic commit phase is allowed to finish and an uncertain
+  write outcome is reported explicitly.
 - `session.presentation` takes a loaded Session ID and returns read-only data
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
+
+The manual compaction methods described here are source-draft APIs. Final
+acceptance and installation remain pending; they are not available in the
+previously installed Agent binary.
+
+The deferred compact result has this shape:
+
+```json
+{
+  "operation_id": "compact-1",
+  "status": "compacted",
+  "before_tokens": 4200,
+  "after_tokens": 900,
+  "covered_loop_count": 6,
+  "covered_item_count": 12,
+  "retained_item_count": 0
+}
+```
+
+`status` is one of `compacted`, `noop`, `failed`, or `unknown_write`.
+`before_tokens` and `after_tokens` are bounded estimates and may be omitted
+when no model call was made. A failed result contains a safe `failure_kind`
+but never the generated summary body. `unknown_write` means the atomic
+replacement outcome could not be established: the disk may have changed after
+the write or rename, while the old in-memory projection remains unpublished.
+Clients must reread the Session and snapshot before deciding what to do; they
+must not retry blindly.
+
+The summary utility calls the selected raw model directly with a fresh loop
+identity, `request_index: 0`, an empty tool list, and the selected reasoning
+preference. History is sent as explicitly labeled data. The complete
+`history.jsonl` remains authoritative and unchanged; a successful bounded
+`summary.json` is a separately validated derived snapshot. On reopen, the
+summary is consumed as a non-system historical-data message and the next
+current User message remains a separate input.
 
 ### `session.presentation`
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use minicore_runtime::model::{Model, ModelRef, ReasoningPreference};
+use minicore_runtime::model::{Model, ModelRef, ModelRequest, ReasoningPreference};
 
 mod openai;
 
@@ -234,6 +234,13 @@ impl Models {
     pub(crate) fn model_ref(id: &str) -> Result<ModelRef, ModelConfigError> {
         id.parse().map_err(|_| ModelConfigError::InvalidReference)
     }
+}
+
+pub(crate) fn serialize_openai_request_for_budget(
+    request: &ModelRequest,
+    writer: &mut dyn std::io::Write,
+) -> Result<(), ()> {
+    openai::serialize_request_for_budget(request, writer).map_err(|_| ())
 }
 
 #[cfg(test)]

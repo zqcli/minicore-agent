@@ -11,7 +11,7 @@ use minicore_runtime::value::BoundedText;
 use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::{
-    CreateSession, RenameSession, SessionInfo, SteerMessage, TurnRef, UpdateSession,
+    CompactSession, CreateSession, RenameSession, SessionInfo, SteerMessage, TurnRef, UpdateSession,
 };
 use crate::event::AgentEvent;
 use crate::history::GetHistory;
@@ -165,6 +165,23 @@ impl From<SessionCreateParams> for CreateSession {
 pub(crate) struct SessionParams {
     pub(crate) session_id: crate::ids::SessionId,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionCompactParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) operation_id: String,
+}
+
+impl From<SessionCompactParams> for CompactSession {
+    fn from(value: SessionCompactParams) -> Self {
+        Self {
+            session_id: value.session_id,
+            operation_id: value.operation_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionHistoryParams {

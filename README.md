@@ -34,8 +34,10 @@ minicore-agent --config ./example.agent.toml --stdio
 The Agent is the local backend for one client TUI. The TUI communicates with it
 exclusively through the stdio JSON-RPC interface (see
 [docs/rpc.md](docs/rpc.md)); it does not call the Rust library API directly.
-This repository does not ship a real TUI, plugin system, MCP integration, or
-compaction. It includes a native, stateless `subagent` Tool for explicitly
+This repository does not ship a real TUI, plugin system, MCP integration,
+automatic compaction, or upstream overflow recovery. Its bounded manual
+compaction implementation is an unaccepted source draft, not part of the installed
+Agent. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
 Profile `system_prompt` keeps its existing inline string form and also accepts
@@ -87,6 +89,7 @@ One stored Session owns the full conversation:
 <data_dir>/sessions/<session_id>/
     session.json      session record (settings, profile, workspace)
     history.jsonl     one JSON line per completed loop record
+    summary.json      bounded, independently validated derived snapshot
 ```
 
 Every completed loop appends its sanitized history as a single JSON line. The
@@ -146,6 +149,7 @@ agent.ping             agent.reload             agent.shutdown
 profile.list           model.list
 session.list           session.create         session.open
 session.close          session.delete         session.state
+session.compact        session.compact.cancel
 session.update         session.rename        session.history
 session.presentation
 turn.send              turn.cancel            turn.wait
@@ -158,6 +162,14 @@ history. Errors are classified as before with domain codes `-32001` through
 `-32018 reload_unavailable`. The full wire contract, frame interleaving
 guarantees, event shapes, and error mapping are documented in
 [docs/rpc.md](docs/rpc.md).
+
+`session.compact` is a deferred, Session-owned manual summary operation;
+`session.compact.cancel` matches its exact operation identity. Operation IDs are
+reserved for the loaded Session lifetime in a bounded 4096-entry set; closing
+and reopening resets that set. The full-history JSONL remains authoritative and
+the bounded summary sidecar is derived. An uncertain atomic replacement may
+have changed disk while leaving the old in-memory projection unpublished, so
+clients must reread before retrying.
 
 `session.presentation` is a read-only footer/tool-card projection. It returns
 the configured Session model label, a fixed-argument Git branch lookup, the
@@ -240,20 +252,21 @@ The crate exposes `AgentConfig`, `AgentError`, `LoopOverrides`, `Profile`,
 `ApprovalMode`, `Agent`, `Workspace`, `WorkspaceError`, `SessionId`, the
 session/turn DTOs (`CreateSession`, `RenameSession`, `UpdateSession`, `SendMessage`,
 `SteerMessage`, `AnswerInteraction`, `GetHistory`, `HistoryPage`,
-`SessionState`, `SessionStatus`, `SessionUpdateResult`, `TurnRef`,
-`TurnResult`, `TurnPersistence`, `PresentationView`, `ToolDisplay`, and
-`AssistantDisplayPart`), the single-consumer `AgentEventStream`, `AgentEvent`,
+`SessionState`, `SessionStatus`, `SessionUpdateResult`, `CompactSession`,
+`CompactionResult`, `CompactionStatus`, `CompactionPhase`, `CompactionProgress`,
+`TurnRef`, `TurnResult`, `TurnPersistence`, `PresentationView`, `ToolDisplay`,
+and `AssistantDisplayPart`), the single-consumer `AgentEventStream`, `AgentEvent`,
 and `run_stdio`. The crate is `#![forbid(unsafe_code)]`.
 
 `Agent` opens the local Store and manages multiple loaded Sessions. `Agent`
 owns the global event channel; one Session owns its own history and runs at
-most one loop task at a time. `session.create` and `session.open` never start a
-loop. `session.close` cancels any active loop, joins the worker, and persists
-cleanly before returning.
+most one loop or manual compaction operation at a time. `session.create` and
+`session.open` never start a loop. `session.close` cancels active work, joins
+Session-owned workers, and persists cleanly before returning.
 
 `Agent::shutdown` is the cleanup barrier for embedded Rust callers. It cancels
-active loops, waits for Agent-owned loop tasks and any native child workers,
-and awaits persistence wrap-up.
+active loops and manual compaction, waits for Agent-owned workers and any
+native child workers, and awaits persistence wrap-up.
 Dropping an Agent with live turns does not synchronously wait for Agent-owned
 loop tasks. MiniCore Agent v0.3 uses the Runtime user-cancellation path when
 closing or shutting down an active Session; it does not currently preserve a

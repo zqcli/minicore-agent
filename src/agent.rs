@@ -15,7 +15,7 @@ use minicore_runtime::prompt::PromptProvider;
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
-use crate::compaction::{CompactionState, load_state};
+use crate::compaction::{CompactionResult, CompactionState, load_state, valid_operation_id};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
@@ -23,7 +23,7 @@ use crate::models::{ModelConfig, ModelConfigError, ModelInfo, Models};
 use crate::policy::Policy;
 use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::prompt::ProjectPromptProvider;
-use crate::sessions::{Sessions, TurnCompletion};
+use crate::sessions::{Sessions, TurnCompletion, await_compaction_completion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
 use crate::subagents::{SubagentFactory, SubagentService};
 use crate::tools::{BuildToolsError, CommandEnvironment};
@@ -65,6 +65,13 @@ pub struct CreateSession {
 pub struct SendMessage {
     pub session_id: crate::ids::SessionId,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactSession {
+    pub session_id: crate::ids::SessionId,
+    pub operation_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -573,8 +580,8 @@ impl Agent {
 
     /// Closes and unloads a loaded Session by ID.
     ///
-    /// If the Session has an active loop, it is cancelled and its Agent-owned task
-    /// is joined before unloading. MiniCore Agent v0.3 uses the Runtime
+    /// If the Session has active work, its Agent-owned loop or manual-compaction task
+    /// is cancelled and joined before unloading. MiniCore Agent v0.3 uses the Runtime
     /// user-cancellation path when closing or shutting down an active Session;
     /// it does not currently preserve a distinct shutdown cancellation reason.
     pub async fn close_session(
@@ -587,7 +594,9 @@ impl Agent {
             .cloned()
             .ok_or(AgentError::SessionNotLoaded)?;
         let result = session.shutdown().await;
-        // Retain ownership until shutdown has joined every Session worker.
+        // The map retains the Session until its complete shutdown barrier has
+        // joined every owned task. This prevents a dropped local owner from
+        // detaching a manual-compaction worker during close.
         self.sessions.remove(session_id);
         self.event_sink.try_send(AgentEvent::SessionClosed {
             session_id,
@@ -722,6 +731,51 @@ impl Agent {
         session.start_loop(input).await
     }
 
+    pub(crate) async fn compact_session(
+        &mut self,
+        request: CompactSession,
+    ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
+        if !valid_operation_id(&request.operation_id) {
+            return Err(AgentError::InvalidInput);
+        }
+        let session = self
+            .sessions
+            .get(request.session_id)
+            .cloned()
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let record = session.record();
+        let model = self
+            .models
+            .get(&record.model)
+            .map_err(map_model_config_error)?;
+        let descriptor = model.descriptor().clone();
+        session
+            .start_compaction(request.operation_id, model, descriptor)
+            .await
+    }
+
+    pub fn cancel_compaction(&self, request: CompactSession) -> Result<bool, AgentError> {
+        if !valid_operation_id(&request.operation_id) {
+            return Err(AgentError::InvalidInput);
+        }
+        let session = self
+            .sessions
+            .get(request.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        session.cancel_compaction(&request.operation_id)
+    }
+
+    /// Runs one manual compaction and resolves after its Session-owned worker
+    /// has published the final result. The RPC server uses the crate-private
+    /// start method above so the request itself remains deferred.
+    pub async fn compact(
+        &mut self,
+        request: CompactSession,
+    ) -> Result<CompactionResult, AgentError> {
+        let receiver = self.compact_session(request).await?;
+        await_compaction_completion(receiver).await
+    }
+
     /// Steers the active turn and preserves the original public return type.
     /// RPC uses `steer_accepted` when it also needs the optional timestamp.
     pub fn steer(&self, request: SteerMessage) -> Result<(), AgentError> {
@@ -838,9 +892,9 @@ impl Agent {
 
     /// Orderly shutdown barrier for embedded Rust callers.
     ///
-    /// Cancels active loops across all loaded Sessions, waits for Agent-owned
-    /// loop and child-worker tasks plus persistence completion, and drops event
-    /// channels.
+    /// Cancels active loops and manual compaction across all loaded Sessions, waits
+    /// for Agent-owned loop/compaction and child-worker tasks plus persistence
+    /// completion, and drops event channels.
     /// Dropping an `Agent` with live turns does not synchronously wait for
     /// Agent-owned loop tasks.
     ///

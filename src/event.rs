@@ -14,7 +14,9 @@ use minicore_runtime::{InteractionId, LoopId, ToolCallId};
 use crate::agent::SessionInfo;
 use crate::history::{HistoryItemView, HistoryPage};
 use crate::ids::SessionId;
-use crate::sessions::{SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef};
+use crate::sessions::{
+    CompactionProgress, SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef,
+};
 
 /// Identity and drop accounting attached to every agent event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -377,6 +379,8 @@ pub struct SessionStateView {
     pub status: SessionStatusView,
     pub active_loop: Option<LoopStateView>,
     pub block_reason: Option<SessionBlockReasonView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionProgress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -576,6 +580,7 @@ impl From<&SessionState> for SessionStateView {
                 SessionBlockReason::Persistence => SessionBlockReasonView::Persistence,
                 SessionBlockReason::Internal => SessionBlockReasonView::Internal,
             }),
+            compaction: state.compaction.clone(),
         }
     }
 }

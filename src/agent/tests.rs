@@ -26,13 +26,19 @@ use crate::history::GetHistory;
 use crate::ids::SessionId;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
-use crate::sessions::{WorkerGate, panic_next_worker, pause_next_worker_before_join};
+use crate::sessions::{
+    WorkerGate, panic_next_worker, pause_next_compaction_after_result,
+    pause_next_worker_before_join,
+};
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
     fail_next_append, fail_next_record_write,
 };
 
-use super::{Agent, CreateSession, RenameSession, SessionUpdateResult, TurnRef, UpdateSession};
+use super::{
+    Agent, CompactSession, CreateSession, RenameSession, SessionUpdateResult, TurnRef,
+    UpdateSession,
+};
 
 struct TestDirectoryGuard {
     path: PathBuf,
@@ -2135,53 +2141,6 @@ async fn close_active_session_cancels_and_waits() {
 }
 
 #[tokio::test]
-async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
-    let (data_dir, _guard) = fixture_dir(&format!("worker-panic-{}", next_id()));
-    let (workspace, _guard) = workspace_file("worker-panic-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
-    panic_next_worker(info.session_id);
-
-    let turn = send_text(&mut agent, info.session_id, "panic").await;
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), agent.wait_turn(turn))
-        .await
-        .expect("worker panic must complete the waiter");
-    assert!(matches!(result, Err(AgentError::Internal)));
-
-    let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
-    assert_eq!(
-        state.block_reason,
-        Some(crate::sessions::SessionBlockReason::Internal)
-    );
-    assert!(state.active_loop.is_none());
-
-    let error = agent
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "after panic".to_owned(),
-        })
-        .await;
-    assert!(matches!(error, Err(AgentError::SessionBlocked)));
-    let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
-    let close = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        agent.close_session(info.session_id),
-    )
-    .await
-    .expect("close must reclaim a panicked worker");
-    assert!(matches!(close, Err(AgentError::Internal)));
-    agent.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn agent_drop_cancels_an_active_model_future() {
     let (data_dir, _guard) = fixture_dir(&format!("drop-cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("drop-cancel-ws", "a.txt", b"hello");
@@ -2213,6 +2172,48 @@ async fn agent_drop_cancels_an_active_model_future() {
     })
     .await
     .expect("Agent drop must cancel the active model future");
+    gate.release.notify_waiters();
+}
+
+#[tokio::test]
+async fn agent_drop_cancels_a_manual_compaction_model_future() {
+    let (data_dir, _guard) = fixture_dir(&format!("drop-compact-cancel-{}", next_id()));
+    let (workspace, _guard) = workspace_file("drop-compact-cancel-ws", "a.txt", b"hello");
+    let gate = BlockGate::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::Text("settled"),
+            ModelScript::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "never returned"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "settled").await;
+    wait_text(&agent, turn).await;
+    let _receiver = agent
+        .compact_session(CompactSession {
+            session_id: info.session_id,
+            operation_id: "drop-compaction".to_owned(),
+        })
+        .await
+        .unwrap();
+    gate.entered.notified().await;
+
+    drop(agent);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("Agent drop must cancel the manual model future");
     gate.release.notify_waiters();
 }
 
@@ -2278,6 +2279,157 @@ async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
     gate.release();
     let _ = agent.wait_turn(turn).await;
     agent.close_session(info.session_id).await.unwrap();
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
+    let (data_dir, _guard) = fixture_dir(&format!("compact-close-cancel-{}", next_id()));
+    let (workspace, _guard) = workspace_file("compact-close-cancel-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "settled").await;
+    wait_text(&agent, turn).await;
+
+    let gate = Arc::new(WorkerGate::new());
+    pause_next_compaction_after_result(info.session_id, Arc::clone(&gate));
+    let result = agent
+        .compact(CompactSession {
+            session_id: info.session_id,
+            operation_id: "close-cancel-compaction".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        crate::compaction::CompactionStatus::Compacted
+    );
+    gate.wait_started().await;
+
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(25),
+        agent.close_session(info.session_id),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "cancelled close must still be waiting for compaction"
+    );
+    assert!(
+        agent
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|session| session.session_id == info.session_id && session.loaded)
+    );
+    gate.release();
+    agent.close_session(info.session_id).await.unwrap();
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_operation_ids_are_bounded_and_reset_on_reopen() {
+    let (data_dir, _guard) = fixture_dir(&format!("compact-id-cap-{}", next_id()));
+    let (workspace, _guard) = workspace_file("compact-id-cap-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+
+    for index in 0..4_096 {
+        let result = agent
+            .compact(CompactSession {
+                session_id: info.session_id,
+                operation_id: format!("bounded-{index}"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, crate::compaction::CompactionStatus::Noop);
+    }
+    assert!(matches!(
+        agent
+            .compact(CompactSession {
+                session_id: info.session_id,
+                operation_id: "bounded-over-cap".to_owned(),
+            })
+            .await,
+        Err(AgentError::InvalidInput)
+    ));
+
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(
+        agent
+            .compact(CompactSession {
+                session_id: info.session_id,
+                operation_id: "bounded-0".to_owned(),
+            })
+            .await
+            .unwrap()
+            .status,
+        crate::compaction::CompactionStatus::Noop
+    );
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
+    let (data_dir, _guard) = fixture_dir(&format!("worker-panic-{}", next_id()));
+    let (workspace, _guard) = workspace_file("worker-panic-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    panic_next_worker(info.session_id);
+
+    let turn = send_text(&mut agent, info.session_id, "panic").await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), agent.wait_turn(turn))
+        .await
+        .expect("worker panic must complete the waiter");
+    assert!(matches!(result, Err(AgentError::Internal)));
+
+    let state = agent.session_state(info.session_id).unwrap();
+    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
+    assert_eq!(
+        state.block_reason,
+        Some(crate::sessions::SessionBlockReason::Internal)
+    );
+    assert!(state.active_loop.is_none());
+
+    let error = agent
+        .send(crate::agent::SendMessage {
+            session_id: info.session_id,
+            text: "after panic".to_owned(),
+        })
+        .await;
+    assert!(matches!(error, Err(AgentError::SessionBlocked)));
+    let state = agent.session_state(info.session_id).unwrap();
+    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
+    let close = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        agent.close_session(info.session_id),
+    )
+    .await
+    .expect("close must reclaim a panicked worker");
+    assert!(matches!(close, Err(AgentError::Internal)));
     agent.shutdown().await.unwrap();
 }
 
@@ -2799,6 +2951,73 @@ async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
     wait_text(&agent, second).await;
     assert_eq!(model_a.requests().lock().unwrap().len(), 1);
     assert_eq!(model_b.requests().lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reload_does_not_change_a_running_compaction_binding() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-compaction-{}", next_id()));
+    let (workspace, _guard) = workspace_file("reload-compaction-ws", "a.txt", b"hello");
+    let gate = BlockGate::new();
+    let model_a = FakeModel::new(
+        "main",
+        [
+            ModelScript::Text("settled"),
+            ModelScript::BlockUntil(gate.clone(), "old summary"),
+        ],
+    );
+    let model_b = FakeModel::new("main", [ModelScript::Text("new turn")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("replacement".to_owned(), Arc::clone(&model_b)),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let settled_text = "settled history ".repeat(128);
+    let turn = send_text(&mut agent, info.session_id, &settled_text).await;
+    wait_text(&agent, turn).await;
+
+    let mut result = agent
+        .compact_session(CompactSession {
+            session_id: info.session_id,
+            operation_id: "reload-compaction-binding".to_owned(),
+        })
+        .await
+        .unwrap();
+    gate.entered.notified().await;
+
+    let candidate = agent.config().clone();
+    let candidate_models = Models::from_values(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_b) as Arc<dyn Model>),
+        (
+            "replacement".to_owned(),
+            Arc::clone(&model_b) as Arc<dyn Model>,
+        ),
+    ]));
+    agent
+        .reload_settings_with_models(candidate, candidate_models)
+        .unwrap();
+
+    gate.release.notify_waiters();
+    let compacted = loop {
+        if let Some(result) = result.borrow().clone() {
+            break result;
+        }
+        result.changed().await.unwrap();
+    };
+    assert_eq!(
+        compacted.status,
+        crate::compaction::CompactionStatus::Compacted
+    );
+
+    let next = send_text(&mut agent, info.session_id, "after reload").await;
+    wait_text(&agent, next).await;
+    assert_eq!(model_a.requests().lock().unwrap().len(), 2);
+    assert_eq!(model_b.requests().lock().unwrap().len(), 1);
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -1,23 +1,30 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::execution::{ConfigRevision, ExecutionConfig, UserInput};
 use minicore_runtime::history::HistoryItem;
 use minicore_runtime::interaction::InteractionAnswer;
+use minicore_runtime::model::{Model, ModelDescriptor};
+use minicore_runtime::tools::{ToolName, ToolSpec};
 use minicore_runtime::{
     AgentLoop, AnswerError, LoopHandle, LoopOptions, LoopReport, SteerError, UpdateError,
 };
 use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
-use crate::compaction::CompactionState;
+use crate::compaction::{
+    CompactionInput, CompactionResult, CompactionState, CompactionStatus, generate_summary,
+};
 use crate::config::map_loop_start_error;
 use crate::error::{AgentError, StoreError};
 use crate::event::{
@@ -27,10 +34,11 @@ use crate::event::{
 use crate::history::{GetHistory, HistoryPage, page_history, sanitize_history};
 use crate::ids::SessionId;
 use crate::store::{
-    Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError, utc_timestamp,
+    Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError,
+    SummaryCommit, utc_timestamp,
 };
 use crate::subagents::SubagentService;
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, WorkspaceError};
 
 #[cfg(test)]
 static PANIC_WORKERS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
@@ -38,6 +46,8 @@ static PANIC_WORKERS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 type WorkerGateEntry = (SessionId, Arc<WorkerGate>);
 #[cfg(test)]
 static PAUSE_BEFORE_JOIN: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
+#[cfg(test)]
+static PAUSE_AFTER_COMPACTION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct WorkerGate {
@@ -109,6 +119,27 @@ fn take_pause_before_join(session_id: SessionId) -> Option<Arc<WorkerGate>> {
         .map(|position| gates.remove(position).1)
 }
 
+#[cfg(test)]
+pub(crate) fn pause_next_compaction_after_result(session_id: SessionId, gate: Arc<WorkerGate>) {
+    PAUSE_AFTER_COMPACTION_RESULT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, gate));
+}
+
+#[cfg(test)]
+fn take_pause_after_compaction_result(session_id: SessionId) -> Option<Arc<WorkerGate>> {
+    let mut gates = PAUSE_AFTER_COMPACTION_RESULT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|(candidate, _)| *candidate == session_id)
+        .map(|position| gates.remove(position).1)
+}
+
 /// A user turn maps one-to-one to one runtime `AgentLoop`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -168,12 +199,30 @@ pub enum SessionBlockReason {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    Preparing,
+    Summarizing,
+    Merging,
+    Committing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompactionProgress {
+    pub operation_id: String,
+    pub phase: CompactionPhase,
+    pub covered_item_count: usize,
+    pub retained_item_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionState {
     pub session_id: SessionId,
     pub status: SessionStatus,
     pub active_loop: Option<minicore_runtime::LoopState>,
     pub block_reason: Option<SessionBlockReason>,
+    pub compaction: Option<CompactionProgress>,
 }
 
 pub(crate) struct Sessions {
@@ -220,6 +269,8 @@ impl Sessions {
                     first_error = Some(error);
                 }
             }
+            // Keep the Session in the map until its shutdown barrier has
+            // joined every owned worker, including manual compaction.
             self.loaded.remove(&session_id);
         }
         first_error.map_or(Ok(()), Err)
@@ -228,9 +279,12 @@ impl Sessions {
 
 impl Drop for Sessions {
     fn drop(&mut self) {
-        // Ordinary drop cancels; async shutdown is the complete join barrier.
+        // Ordinary Agent drop is intentionally non-blocking. Manual workers
+        // still receive cancellation through their Session-owned token; the
+        // async shutdown path above is the complete join barrier.
         for session in self.loaded.values() {
             session.cancel_active_on_drop();
+            session.cancel_compaction_on_drop();
         }
     }
 }
@@ -264,6 +318,11 @@ struct SessionInner {
     active: Option<ActiveLoop>,
     blocked: Option<SessionBlockReason>,
     closing: bool,
+    compaction: Option<Arc<CompactionOperation>>,
+    compaction_progress: Option<CompactionProgress>,
+    // Operation IDs stay reserved for this loaded Session so stale cancel
+    // requests cannot target a later operation with the same identity.
+    used_compaction_ids: BTreeSet<String>,
 }
 
 struct ActiveLoop {
@@ -304,6 +363,184 @@ impl SessionTask {
                 handle.abort();
             }
         }
+    }
+}
+
+struct CompactionOperation {
+    operation_id: String,
+    cancellation: CancellationToken,
+    result: watch::Sender<Option<CompactionResult>>,
+    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    state: AtomicU8,
+}
+
+const COMPACTION_RUNNING: u8 = 0;
+const COMPACTION_CANCELLED: u8 = 1;
+const COMPACTION_COMMITTING: u8 = 2;
+const COMPACTION_COMPLETED: u8 = 3;
+const MAX_USED_COMPACTION_IDS: usize = 4_096;
+
+struct CompactionReservation {
+    operation: Arc<CompactionOperation>,
+    model: Arc<dyn Model>,
+    descriptor: ModelDescriptor,
+    record: crate::store::SessionRecord,
+    history: Arc<[HistoryItem]>,
+    workspace: Arc<Workspace>,
+    tool_schemas: Vec<ToolSpec>,
+    previous_summary: Option<minicore_runtime::value::BoundedText>,
+    previous_covered_item_count: usize,
+    deadline: Instant,
+}
+
+struct CompactionCompletionGuard {
+    session: Session,
+    operation: Arc<CompactionOperation>,
+    armed: bool,
+}
+
+impl CompactionOperation {
+    fn new(operation_id: String) -> (Arc<Self>, watch::Receiver<Option<CompactionResult>>) {
+        let (result, receiver) = watch::channel(None);
+        let operation = Arc::new(Self {
+            operation_id,
+            cancellation: CancellationToken::new(),
+            result,
+            join: tokio::sync::Mutex::new(None),
+            state: AtomicU8::new(COMPACTION_RUNNING),
+        });
+        (operation, receiver)
+    }
+
+    fn cancel(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                COMPACTION_RUNNING,
+                COMPACTION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.cancellation.cancel();
+        true
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.state.load(Ordering::Acquire) == COMPACTION_CANCELLED
+            || self.cancellation.is_cancelled()
+    }
+
+    fn try_begin_commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                COMPACTION_RUNNING,
+                COMPACTION_COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn commit_started(&self) -> bool {
+        self.state.load(Ordering::Acquire) == COMPACTION_COMMITTING
+    }
+
+    fn failed_result(&self, failure_kind: &'static str) -> CompactionResult {
+        CompactionResult {
+            operation_id: self.operation_id.clone(),
+            status: CompactionStatus::Failed,
+            before_tokens: None,
+            after_tokens: None,
+            covered_loop_count: 0,
+            covered_item_count: 0,
+            retained_item_count: 0,
+            failure_kind: Some(failure_kind.to_owned()),
+        }
+    }
+
+    fn unknown_write_result(&self) -> CompactionResult {
+        CompactionResult {
+            operation_id: self.operation_id.clone(),
+            status: CompactionStatus::UnknownWrite,
+            before_tokens: None,
+            after_tokens: None,
+            covered_loop_count: 0,
+            covered_item_count: 0,
+            retained_item_count: 0,
+            failure_kind: Some("write_outcome_unknown".to_owned()),
+        }
+    }
+
+    fn publish(&self, result: CompactionResult) {
+        let result = match self.state.compare_exchange(
+            COMPACTION_RUNNING,
+            COMPACTION_COMPLETED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => result,
+            Err(COMPACTION_CANCELLED) => {
+                self.state.store(COMPACTION_COMPLETED, Ordering::Release);
+                self.failed_result("cancelled")
+            }
+            Err(COMPACTION_COMMITTING) => {
+                self.state.store(COMPACTION_COMPLETED, Ordering::Release);
+                result
+            }
+            Err(COMPACTION_COMPLETED) => result,
+            Err(_) => result,
+        };
+        self.result.send_replace(Some(result));
+    }
+
+    async fn join(&self) -> Result<(), AgentError> {
+        let mut slot = self.join.lock().await;
+        let Some(handle) = slot.as_mut() else {
+            return Ok(());
+        };
+        let result = std::pin::Pin::new(handle).await;
+        slot.take();
+        result.map_err(|_| AgentError::Internal)
+    }
+}
+
+impl CompactionCompletionGuard {
+    fn new(session: Session, operation: Arc<CompactionOperation>) -> Self {
+        Self {
+            session,
+            operation,
+            armed: true,
+        }
+    }
+
+    fn publish(&mut self, result: CompactionResult) {
+        if !self.armed {
+            return;
+        }
+        self.session
+            .publish_compaction_result(&self.operation, result);
+        self.armed = false;
+    }
+}
+
+impl Drop for CompactionCompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let result = if self.operation.commit_started() {
+            self.operation.unknown_write_result()
+        } else if self.operation.cancellation_requested() {
+            self.operation.failed_result("cancelled")
+        } else {
+            self.operation.failed_result("internal")
+        };
+        self.session
+            .publish_compaction_result(&self.operation, result);
     }
 }
 
@@ -387,6 +624,9 @@ impl Session {
             active: None,
             blocked: None,
             closing: false,
+            compaction: None,
+            compaction_progress: None,
+            used_compaction_ids: BTreeSet::new(),
         };
         Self {
             shared: Arc::new(SessionShared {
@@ -472,6 +712,7 @@ impl Session {
             status,
             active_loop,
             block_reason: inner.blocked,
+            compaction: inner.compaction_progress.clone(),
         }
     }
 
@@ -484,7 +725,7 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || inner.active.is_some() {
+            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
             }
             (
@@ -514,7 +755,7 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || inner.active.is_some() {
+            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
             }
             inner.active = Some(ActiveLoop {
@@ -592,14 +833,114 @@ impl Session {
                 inner.active = None;
             }
         }
-        let inner = self.shared.inner.lock().unwrap();
-        if inner.blocked.is_some() {
-            return Err(AgentError::SessionBlocked);
+        if self.reap_finished_compaction().await? {
+            return Ok(());
         }
-        if inner.active.is_some() {
-            return Err(AgentError::SessionBusy);
+        Err(AgentError::SessionBusy)
+    }
+
+    pub(crate) async fn start_compaction(
+        &self,
+        operation_id: String,
+        model: Arc<dyn Model>,
+        descriptor: ModelDescriptor,
+    ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
+        self.cleanup_finished().await?;
+        let _io = self.shared.io.lock().await;
+        let (operation, receiver) = CompactionOperation::new(operation_id.clone());
+
+        // Acquire the operation's join slot before publishing the reservation.
+        // From the point where the Session becomes busy to the point where the
+        // spawned task is stored, there is no further await at which the only
+        // JoinHandle could be dropped and detached.
+        let mut join_slot = operation.join.lock().await;
+        let reservation = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner.blocked.is_some() {
+                return Err(AgentError::SessionBlocked);
+            }
+            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
+                return Err(AgentError::SessionBusy);
+            }
+            if inner.used_compaction_ids.contains(&operation_id) {
+                return Err(AgentError::SessionBusy);
+            }
+            if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
+                return Err(AgentError::InvalidInput);
+            }
+            let previous = self.shared.compaction.project(&inner.history);
+            let (previous_summary, previous_covered_item_count) = previous
+                .map(|projection| {
+                    let covered_item_count =
+                        inner.history.len().saturating_sub(projection.suffix.len());
+                    (Some(projection.summary), covered_item_count)
+                })
+                .unwrap_or((None, 0));
+            let enabled = inner
+                .record
+                .tools
+                .iter()
+                .filter_map(|name| name.parse::<ToolName>().ok())
+                .collect();
+            let tool_schemas = inner.config.tools().specs_for(&enabled);
+            let retained_item_count = inner
+                .history
+                .len()
+                .saturating_sub(previous_covered_item_count);
+            inner.compaction = Some(Arc::clone(&operation));
+            inner.used_compaction_ids.insert(operation_id.clone());
+            inner.compaction_progress = Some(CompactionProgress {
+                operation_id: operation_id.clone(),
+                phase: CompactionPhase::Preparing,
+                covered_item_count: previous_covered_item_count,
+                retained_item_count,
+            });
+            CompactionReservation {
+                operation: Arc::clone(&operation),
+                model,
+                descriptor,
+                record: inner.record.clone(),
+                history: Arc::clone(&inner.history),
+                workspace: Arc::clone(&inner.workspace),
+                tool_schemas,
+                previous_summary,
+                previous_covered_item_count,
+                deadline: Instant::now()
+                    .checked_add(inner.options.model_timeout)
+                    .unwrap_or_else(Instant::now),
+            }
+        };
+        drop(_io);
+        let task = tokio::spawn(run_compaction(self.clone(), reservation));
+        *join_slot = Some(task);
+        drop(join_slot);
+        self.emit_state();
+        Ok(receiver)
+    }
+
+    pub(crate) fn cancel_compaction(&self, operation_id: &str) -> Result<bool, AgentError> {
+        let operation = {
+            let inner = self.shared.inner.lock().unwrap();
+            inner
+                .compaction
+                .as_ref()
+                .filter(|operation| operation.operation_id == operation_id)
+                .cloned()
+        };
+        let Some(operation) = operation else {
+            return Ok(false);
+        };
+        Ok(operation.cancel())
+    }
+
+    fn cancel_compaction_on_drop(&self) {
+        let operation = {
+            let inner = self.shared.inner.lock().unwrap();
+            inner.compaction.clone()
+        };
+        if let Some(operation) = operation {
+            let _ = operation.cancel();
         }
-        Ok(())
     }
 
     fn cancel_active_on_drop(&self) {
@@ -609,6 +950,88 @@ impl Session {
         };
         if let Some(handle) = handle {
             let _ = handle.cancel();
+        }
+    }
+
+    async fn reap_finished_compaction(&self) -> Result<bool, AgentError> {
+        let operation = {
+            let inner = self.shared.inner.lock().unwrap();
+            inner.compaction.clone()
+        };
+        let Some(operation) = operation else {
+            return Ok(true);
+        };
+        if operation.result.borrow().is_none() {
+            return Ok(false);
+        }
+        if operation.join().await.is_err() {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &operation))
+            {
+                inner.compaction = None;
+                inner.compaction_progress = None;
+            }
+            inner.blocked = Some(SessionBlockReason::Internal);
+            drop(inner);
+            self.emit_state();
+            return Err(AgentError::SessionBlocked);
+        }
+        let cleared = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            let same = inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &operation));
+            if same {
+                inner.compaction = None;
+            }
+            same && inner.compaction_progress.take().is_some()
+        };
+        if cleared {
+            self.emit_state();
+        }
+        Ok(true)
+    }
+
+    fn publish_compaction_result(&self, operation: &CompactionOperation, result: CompactionResult) {
+        // Clear wire-visible progress before waking result waiters. The
+        // operation handle remains Session-owned until a later join.
+        let should_emit = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            let should_clear = inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| std::ptr::eq(candidate.as_ref(), operation));
+            let should_emit = should_clear && inner.compaction_progress.take().is_some();
+            operation.publish(result);
+            should_emit
+        };
+        if should_emit {
+            self.emit_state();
+        }
+    }
+
+    fn set_compaction_phase(&self, operation: &CompactionOperation, phase: CompactionPhase) {
+        let changed = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner
+                .compaction
+                .as_ref()
+                .is_none_or(|candidate| !std::ptr::eq(candidate.as_ref(), operation))
+            {
+                false
+            } else if let Some(progress) = inner.compaction_progress.as_mut() {
+                progress.phase = phase;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.emit_state();
         }
     }
 
@@ -740,7 +1163,7 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing {
+            if inner.closing || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
             }
         }
@@ -798,12 +1221,13 @@ impl Session {
     /// drains any child workers owned by this Session.
     pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
         let session_id = self.session_id();
-        let (active_handle, active_task) = {
+        let (active_handle, active_task, compaction) = {
             let mut inner = self.shared.inner.lock().unwrap();
             let active_handle = inner.active.as_ref().map(|active| active.handle.clone());
             let active_task = inner.active.as_ref().and_then(|active| active.task.clone());
+            let compaction = inner.compaction.clone();
             inner.closing = true;
-            (active_handle, active_task)
+            (active_handle, active_task, compaction)
         };
         let mut first_error = None;
         if let Some(handle) = active_handle {
@@ -821,6 +1245,21 @@ impl Session {
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
             {
                 inner.active = None;
+            }
+        }
+        if let Some(compaction) = compaction {
+            let _ = compaction.cancel();
+            if compaction.join().await.is_err() && first_error.is_none() {
+                first_error = Some(AgentError::Internal);
+            }
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &compaction))
+            {
+                inner.compaction = None;
+                inner.compaction_progress = None;
             }
         }
         self.shared.subagents.drain_session(session_id).await;
@@ -841,6 +1280,308 @@ impl Session {
             },
             state,
         });
+    }
+
+    async fn commit_compaction(
+        &self,
+        reservation: &CompactionReservation,
+        source: &crate::store::HistoryPrefix,
+        bytes: &[u8],
+        summary: &minicore_runtime::value::BoundedText,
+    ) -> Result<CompactionCommit, StoreError> {
+        if reservation.operation.cancellation_requested() {
+            return Ok(CompactionCommit::Cancelled);
+        }
+        let Some(remaining) = reservation
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return Ok(CompactionCommit::Deadline);
+        };
+        let _io = match tokio::time::timeout(remaining, self.shared.io.lock()).await {
+            Ok(io) => io,
+            Err(_) => return Ok(CompactionCommit::Deadline),
+        };
+        let operation = Arc::clone(&reservation.operation);
+        let expected_history = Arc::clone(&reservation.history);
+        {
+            let inner = self.shared.inner.lock().unwrap();
+            if operation.cancellation_requested() {
+                return Ok(CompactionCommit::Cancelled);
+            }
+            if Instant::now() >= reservation.deadline {
+                return Ok(CompactionCommit::Deadline);
+            }
+            let current = inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &operation));
+            if inner.closing || !current || !Arc::ptr_eq(&inner.history, &expected_history) {
+                return Ok(CompactionCommit::Rejected);
+            }
+        }
+
+        let session = self.clone();
+        let deadline = reservation.deadline;
+        let callback_operation = Arc::clone(&operation);
+        let callback_history = Arc::clone(&expected_history);
+        let commit = self
+            .shared
+            .store
+            .commit_summary(
+                session.session_id(),
+                source,
+                expected_history.as_ref(),
+                bytes,
+                reservation.deadline,
+                move || {
+                    let inner = session.shared.inner.lock().unwrap();
+                    let current = inner
+                        .compaction
+                        .as_ref()
+                        .is_some_and(|candidate| Arc::ptr_eq(candidate, &callback_operation));
+                    if inner.closing
+                        || !current
+                        || !Arc::ptr_eq(&inner.history, &callback_history)
+                        || callback_operation.cancellation_requested()
+                        || Instant::now() >= deadline
+                    {
+                        return false;
+                    }
+                    callback_operation.try_begin_commit()
+                },
+            )
+            .await?;
+
+        match commit {
+            SummaryCommit::Committed => {
+                // The write is definite. Publish only if the Session still
+                // owns the same settled history and operation at this
+                // boundary; otherwise the disk result stays known but the
+                // old in-memory projection remains authoritative.
+                let publish = {
+                    let inner = self.shared.inner.lock().unwrap();
+                    let current = inner
+                        .compaction
+                        .as_ref()
+                        .is_some_and(|candidate| Arc::ptr_eq(candidate, &operation));
+                    !inner.closing && current && Arc::ptr_eq(&inner.history, &expected_history)
+                };
+                if publish {
+                    self.shared
+                        .compaction
+                        .publish(summary.clone(), expected_history.len());
+                }
+                Ok(CompactionCommit::Store(SummaryCommit::Committed))
+            }
+            SummaryCommit::Rejected if operation.cancellation_requested() => {
+                Ok(CompactionCommit::Cancelled)
+            }
+            SummaryCommit::Rejected if Instant::now() >= reservation.deadline => {
+                Ok(CompactionCommit::Deadline)
+            }
+            SummaryCommit::Rejected => Ok(CompactionCommit::Store(SummaryCommit::Rejected)),
+            SummaryCommit::Unknown => Ok(CompactionCommit::Store(SummaryCommit::Unknown)),
+        }
+    }
+}
+
+enum CompactionCommit {
+    Cancelled,
+    Deadline,
+    Rejected,
+    Store(SummaryCommit),
+}
+
+async fn run_compaction(session: Session, reservation: CompactionReservation) {
+    let operation = Arc::clone(&reservation.operation);
+    let mut completion = CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation));
+    let result = run_compaction_inner(&session, &reservation).await;
+    completion.publish(result);
+    #[cfg(test)]
+    if let Some(gate) = take_pause_after_compaction_result(session.session_id()) {
+        gate.started.notify_one();
+        gate.release.notified().await;
+    }
+}
+
+async fn run_compaction_inner(
+    session: &Session,
+    reservation: &CompactionReservation,
+) -> CompactionResult {
+    let history_len = reservation.history.len();
+    let retained_item_count = history_len.saturating_sub(reservation.previous_covered_item_count);
+    if reservation.operation.cancellation_requested() {
+        return failed_compaction(&reservation.operation, "cancelled", history_len);
+    }
+    if history_len == 0 || retained_item_count == 0 {
+        return CompactionResult {
+            operation_id: reservation.operation.operation_id.clone(),
+            status: CompactionStatus::Noop,
+            before_tokens: None,
+            after_tokens: None,
+            covered_loop_count: 0,
+            covered_item_count: reservation.previous_covered_item_count,
+            retained_item_count: 0,
+            failure_kind: None,
+        };
+    }
+
+    let Some(remaining) = reservation
+        .deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return failed_compaction(&reservation.operation, "timeout", history_len);
+    };
+    let source = match tokio::time::timeout(
+        remaining,
+        session
+            .shared
+            .store
+            .capture_history_anchor(session.session_id(), reservation.history.as_ref()),
+    )
+    .await
+    {
+        Ok(Ok(Some(source))) => source,
+        Ok(Ok(None)) => {
+            return failed_compaction(&reservation.operation, "history_changed", history_len);
+        }
+        Ok(Err(_)) => return failed_compaction(&reservation.operation, "store", history_len),
+        Err(_) => return failed_compaction(&reservation.operation, "timeout", history_len),
+    };
+
+    if reservation.operation.cancellation_requested() {
+        return failed_compaction(&reservation.operation, "cancelled", history_len);
+    }
+    let Some(remaining) = reservation
+        .deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return failed_compaction(&reservation.operation, "timeout", history_len);
+    };
+    let agents = match tokio::time::timeout(
+        remaining,
+        reservation
+            .workspace
+            .read_prefix(crate::prompt::AGENTS_PATH, crate::prompt::MAX_AGENTS_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(prefix)) => match crate::prompt::decode_agents(&prefix) {
+            Ok(content) => (!content.is_empty()).then_some(content),
+            Err(_) => return failed_compaction(&reservation.operation, "workspace", history_len),
+        },
+        Ok(Err(WorkspaceError::NotFound)) => None,
+        Ok(Err(_)) => return failed_compaction(&reservation.operation, "workspace", history_len),
+        Err(_) => return failed_compaction(&reservation.operation, "timeout", history_len),
+    };
+    let system_prompt =
+        match minicore_runtime::value::BoundedText::new(reservation.record.system_prompt.clone())
+            .ok()
+            .and_then(|system| crate::prompt::build_system_prompt(&system, agents).ok())
+        {
+            Some(system_prompt) => system_prompt,
+            None => return failed_compaction(&reservation.operation, "prompt", history_len),
+        };
+
+    let input = CompactionInput {
+        model: Arc::clone(&reservation.model),
+        descriptor: reservation.descriptor.clone(),
+        reasoning: reservation.record.reasoning,
+        history: Arc::clone(&reservation.history),
+        previous_summary: reservation.previous_summary.clone(),
+        previous_covered_item_count: reservation.previous_covered_item_count,
+        project_instructions: system_prompt,
+        tool_schemas: reservation.tool_schemas.clone(),
+        operation_deadline: reservation.deadline,
+    };
+    session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
+    let mut mark_merging =
+        || session.set_compaction_phase(&reservation.operation, CompactionPhase::Merging);
+    let generated = match generate_summary(
+        &input,
+        &reservation.operation.cancellation,
+        &mut mark_merging,
+    )
+    .await
+    {
+        Ok(generated) => generated,
+        Err(error) => {
+            return failed_compaction(&reservation.operation, error.kind(), history_len);
+        }
+    };
+    if reservation.operation.cancellation_requested() {
+        return failed_compaction(&reservation.operation, "cancelled", history_len);
+    }
+    if Instant::now() >= reservation.deadline {
+        return failed_compaction(&reservation.operation, "timeout", history_len);
+    }
+    session.set_compaction_phase(&reservation.operation, CompactionPhase::Committing);
+    let Some(bytes) = crate::compaction::encode_snapshot(
+        session.session_id(),
+        &reservation.record,
+        &source,
+        &generated.content,
+    ) else {
+        return failed_compaction(&reservation.operation, "too_large", history_len);
+    };
+    let commit = match session
+        .commit_compaction(reservation, &source, &bytes, &generated.content)
+        .await
+    {
+        Ok(commit) => commit,
+        Err(_) => return failed_compaction(&reservation.operation, "store", history_len),
+    };
+    match commit {
+        CompactionCommit::Store(SummaryCommit::Committed) => CompactionResult {
+            operation_id: reservation.operation.operation_id.clone(),
+            status: CompactionStatus::Compacted,
+            before_tokens: Some(generated.before_tokens),
+            after_tokens: Some(generated.after_tokens),
+            covered_loop_count: source.covered_loop_count,
+            covered_item_count: history_len,
+            retained_item_count: 0,
+            failure_kind: None,
+        },
+        CompactionCommit::Cancelled => {
+            failed_compaction(&reservation.operation, "cancelled", history_len)
+        }
+        CompactionCommit::Deadline => {
+            failed_compaction(&reservation.operation, "timeout", history_len)
+        }
+        CompactionCommit::Rejected | CompactionCommit::Store(SummaryCommit::Rejected) => {
+            failed_compaction(&reservation.operation, "history_changed", history_len)
+        }
+        CompactionCommit::Store(SummaryCommit::Unknown) => CompactionResult {
+            operation_id: reservation.operation.operation_id.clone(),
+            status: CompactionStatus::UnknownWrite,
+            before_tokens: Some(generated.before_tokens),
+            after_tokens: Some(generated.after_tokens),
+            covered_loop_count: source.covered_loop_count,
+            covered_item_count: reservation.previous_covered_item_count,
+            retained_item_count,
+            failure_kind: Some("write_outcome_unknown".to_owned()),
+        },
+    }
+}
+
+fn failed_compaction(
+    operation: &CompactionOperation,
+    failure_kind: &'static str,
+    history_len: usize,
+) -> CompactionResult {
+    CompactionResult {
+        operation_id: operation.operation_id.clone(),
+        status: CompactionStatus::Failed,
+        before_tokens: None,
+        after_tokens: None,
+        covered_loop_count: 0,
+        covered_item_count: 0,
+        retained_item_count: history_len,
+        failure_kind: Some(failure_kind.to_owned()),
     }
 }
 
@@ -1310,6 +2051,22 @@ pub(crate) async fn await_turn_completion(
                     TurnCompletion::Finished(result) => Ok(Arc::clone(result)),
                     TurnCompletion::Internal => Err(AgentError::Internal),
                 };
+            }
+        }
+        if receiver.changed().await.is_err() {
+            return Err(AgentError::Internal);
+        }
+    }
+}
+
+pub(crate) async fn await_compaction_completion(
+    mut receiver: watch::Receiver<Option<CompactionResult>>,
+) -> Result<CompactionResult, AgentError> {
+    loop {
+        {
+            let value = receiver.borrow();
+            if let Some(result) = value.as_ref() {
+                return Ok(result.clone());
             }
         }
         if receiver.changed().await.is_err() {

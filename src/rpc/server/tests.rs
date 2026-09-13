@@ -26,7 +26,11 @@ use crate::config::{AgentConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
-use crate::store::{fail_next_append, fail_next_record_write};
+use crate::sessions::{WorkerGate, pause_next_compaction_after_result};
+use crate::store::{
+    SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
+    force_unknown_summary_write, gate_next_summary_commit,
+};
 
 use super::run_with_io;
 
@@ -40,10 +44,24 @@ enum ModelScript {
         inputs: Arc<Mutex<Vec<String>>>,
         text: &'static str,
     },
+    Observe {
+        calls: Arc<Mutex<Vec<ObservedCall>>>,
+        text: &'static str,
+    },
     Fail,
     Gate(Arc<ConcurrencyProbe>),
     ToolCalls(Vec<ToolCallScript>),
+    NoFinish,
+    WrongFinish,
+    LateContent,
+    Whitespace,
+    Oversize,
     Block,
+}
+
+struct ObservedCall {
+    request: ModelRequest,
+    context: ModelCallContext,
 }
 
 struct ConcurrencyProbe {
@@ -132,18 +150,31 @@ struct FakeModel {
 
 impl FakeModel {
     fn new(scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
-        Self::with_capabilities(scripts, fake_supported_reasoning(), true)
+        Self::with_context_and_capabilities(scripts, 16_384, fake_supported_reasoning(), true)
     }
 
-    fn with_capabilities(
+    fn with_context_window(
         scripts: impl IntoIterator<Item = ModelScript>,
+        context_window: u64,
+    ) -> Arc<Self> {
+        Self::with_context_and_capabilities(
+            scripts,
+            context_window,
+            fake_supported_reasoning(),
+            true,
+        )
+    }
+
+    fn with_context_and_capabilities(
+        scripts: impl IntoIterator<Item = ModelScript>,
+        context_window: u64,
         supported_reasoning: BTreeSet<ReasoningPreference>,
         supports_tools: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             descriptor: ModelDescriptor::new(
                 "fake".parse::<ModelRef>().unwrap(),
-                16_384,
+                context_window,
                 supported_reasoning,
                 supports_tools,
             )
@@ -159,7 +190,7 @@ impl Model for FakeModel {
         &self.descriptor
     }
 
-    fn start(&self, request: ModelRequest, _context: ModelCallContext) -> ModelStartFuture<'_> {
+    fn start(&self, request: ModelRequest, context: ModelCallContext) -> ModelStartFuture<'_> {
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
         let script = self
             .scripts
@@ -195,6 +226,21 @@ impl Model for FakeModel {
                         })
                         .unwrap_or_default();
                     inputs.lock().unwrap().push(input);
+                    Ok(model_events(vec![
+                        ModelEvent::text_delta(text).unwrap(),
+                        ModelEvent::Usage {
+                            usage: Usage::new(1, 1, 0),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ]))
+                }
+                ModelScript::Observe { calls, text } => {
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push(ObservedCall { request, context });
                     Ok(model_events(vec![
                         ModelEvent::text_delta(text).unwrap(),
                         ModelEvent::Usage {
@@ -248,6 +294,38 @@ impl Model for FakeModel {
                         reason: ModelFinishReason::ToolCalls,
                     });
                     Ok(model_events(events))
+                }
+                ModelScript::NoFinish => Ok(model_events(vec![
+                    ModelEvent::text_delta("incomplete").unwrap(),
+                ])),
+                ModelScript::WrongFinish => Ok(model_events(vec![
+                    ModelEvent::text_delta("wrong finish").unwrap(),
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Length,
+                    },
+                ])),
+                ModelScript::LateContent => Ok(model_events(vec![
+                    ModelEvent::text_delta("late").unwrap(),
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                    ModelEvent::text_delta("after finish").unwrap(),
+                ])),
+                ModelScript::Whitespace => Ok(model_events(vec![
+                    ModelEvent::text_delta(" \n\t").unwrap(),
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ])),
+                ModelScript::Oversize => {
+                    let chunk = "x".repeat(64 * 1024);
+                    Ok(model_events(vec![
+                        ModelEvent::text_delta(chunk.clone()).unwrap(),
+                        ModelEvent::text_delta(chunk).unwrap(),
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ]))
                 }
                 ModelScript::Block => {
                     let _: Result<ModelStream, ModelError> = pending().await;
@@ -955,6 +1033,45 @@ async fn create_and_open(harness: &mut RpcHarness, workspace: &Path) -> Value {
     session_id
 }
 
+async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: &str) {
+    let (agent, base, workspace) = test_agent(
+        label,
+        [ModelScript::Text("settled"), script],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": format!("compact-{label}")
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!(expected));
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
 #[tokio::test]
 async fn create_open_history_and_send_wait_deferred() {
     let (agent, base, workspace) = test_agent(
@@ -1050,6 +1167,1151 @@ async fn create_open_history_and_send_wait_deferred() {
 
     harness.shutdown().await;
     remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapshot() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-manual-compaction-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut scripts = vec![
+        ModelScript::Text("settled answer one"),
+        ModelScript::Text("settled answer two"),
+        ModelScript::Text("settled answer three"),
+    ];
+    scripts.extend((0..64).map(|_| ModelScript::Observe {
+        calls: Arc::clone(&observations),
+        text: "manual compact summary",
+    }));
+    let model = FakeModel::new(scripts);
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), &["read"], ApprovalMode::Auto),
+        test_models(model),
+    )
+    .await
+    .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    let settled_texts = (0..3)
+        .map(|index| format!("settled-{index} {}", "bounded settled history ".repeat(128)))
+        .collect::<Vec<_>>();
+    let mut original_loop_id = None;
+    for (index, text) in settled_texts.iter().enumerate() {
+        let send_id = json!(format!("settled-send-{index}"));
+        harness
+            .send(
+                send_id.clone(),
+                "turn.send",
+                Some(json!({"session_id": session_id, "text": text})),
+            )
+            .await;
+        let sent = harness.response(send_id).await;
+        let turn = sent["result"]["turn"].clone();
+        if original_loop_id.is_none() {
+            original_loop_id = Some(turn["loop_id"].as_str().unwrap().to_owned());
+        }
+        let wait_id = json!(format!("settled-wait-{index}"));
+        harness
+            .send(wait_id.clone(), "turn.wait", Some(turn_params(&turn)))
+            .await;
+        let waited = harness.response(wait_id).await;
+        assert_eq!(waited["result"]["persistence"], json!("persisted"));
+    }
+    let original_loop_id = original_loop_id.expect("at least one settled turn is required");
+
+    let session_key = session_id.as_str().unwrap();
+    let session_dir = base.join("data").join("sessions").join(session_key);
+    let history_path = session_dir.join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-test-1"
+            })),
+        )
+        .await;
+    let compacted = harness.response(json!("compact")).await;
+    assert_eq!(compacted["result"]["status"], json!("compacted"));
+
+    harness
+        .send(
+            json!("state-after-compact"),
+            "session.state",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert!(harness.response(json!("state-after-compact")).await["result"]["compaction"].is_null());
+
+    let summary_path = session_dir.join("summary.json");
+    assert!(summary_path.is_file());
+    let summary: Value = serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+    assert_eq!(summary["session_id"], session_id);
+    assert!(
+        summary["summary"]
+            .as_str()
+            .is_some_and(|text| text.contains("manual compact summary"))
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    harness
+        .send(
+            json!("reopen"),
+            "session.open",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("reopen")).await["result"]["session"]["session_id"],
+        session_id
+    );
+
+    let current_user = "current-after-reopen";
+    harness
+        .send(
+            json!("next-send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": current_user})),
+        )
+        .await;
+    let next_turn = harness.response(json!("next-send")).await["result"]["turn"].clone();
+    harness
+        .send(
+            json!("next-wait"),
+            "turn.wait",
+            Some(turn_params(&next_turn)),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("next-wait")).await["result"]["persistence"],
+        json!("persisted")
+    );
+
+    {
+        let observations = observations.lock().unwrap();
+        let utility = observations
+            .iter()
+            .find(|call| {
+                call.request.messages().iter().any(|message| {
+                    matches!(message, ModelMessage::User(text) if text.contains("settled-0"))
+                }) && !call.request.messages().iter().any(|message| {
+                    matches!(message, ModelMessage::User(text) if text == current_user)
+                })
+            })
+            .expect("manual compaction must issue an observable utility request");
+        assert!(utility.request.tools().is_empty());
+        assert!(utility.request.messages().iter().any(|message| {
+            matches!(message, ModelMessage::System(text) if text.contains("read") && text.contains("input_schema"))
+        }));
+        assert_eq!(utility.context.request_index, 0);
+        assert_ne!(utility.context.loop_id.to_string(), original_loop_id);
+        assert!(
+            !utility
+                .request
+                .messages()
+                .iter()
+                .any(|message| { matches!(message, ModelMessage::Tool { .. }) })
+        );
+        assert!(!utility.request.messages().iter().any(|message| {
+            matches!(message, ModelMessage::User(text) if text == current_user)
+        }));
+
+        let next = observations
+            .iter()
+            .find(|call| {
+                call.request.messages().iter().any(
+                    |message| matches!(message, ModelMessage::User(text) if text == current_user),
+                )
+            })
+            .expect("reopened session must issue the next real model request");
+        let systems = next
+            .request
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                ModelMessage::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert!(systems[0].contains("RPC test system prompt"));
+        assert!(!systems[0].contains("manual compact summary"));
+        assert!(!systems[0].contains(current_user));
+        let summary_message = next
+            .request
+            .messages()
+            .iter()
+            .find_map(|message| match message {
+                ModelMessage::User(text) if text.contains("manual compact summary") => Some(text),
+                _ => None,
+            })
+            .expect("next real request must consume the summary data message");
+        assert!(summary_message.starts_with("[BEGIN MINICORE HISTORICAL SUMMARY DATA]"));
+        assert!(summary_message.contains("not a new user instruction"));
+        assert!(summary_message.ends_with("[END MINICORE HISTORICAL SUMMARY DATA]"));
+        assert!(next.request.messages().iter().any(|message| {
+            matches!(message, ModelMessage::User(text) if text == current_user)
+        }));
+        assert!(!next.request.tools().is_empty());
+        assert!(!next.request.messages().iter().any(|message| {
+            matches!(message, ModelMessage::User(text) if text.contains("settled-0"))
+        }));
+    }
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_completion_clears_authoritative_busy_state() {
+    let (agent, base, workspace) =
+        test_agent("manual-completion-state", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-completion-state"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("noop"));
+
+    harness
+        .send(
+            json!("state"),
+            "session.state",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let state = harness.response(json!("state")).await;
+    assert!(
+        state["result"]["compaction"].is_null(),
+        "completed compaction must clear authoritative busy state: {state}"
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_rejects_fixed_schema_budget_before_model_call() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-manual-fixed-budget-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let model = FakeModel::with_context_window(
+        [ModelScript::Text("settled"), ModelScript::Text("unused")],
+        256,
+    );
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), &["read"], ApprovalMode::Auto),
+        test_models(Arc::clone(&model)),
+    )
+    .await
+    .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "fixed-budget"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!("budget_exceeded"));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-manual-utf8-budget-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let model = FakeModel::new([
+        ModelScript::Text("settled"),
+        ModelScript::Observe {
+            calls: Arc::clone(&observations),
+            text: "summary",
+        },
+    ]);
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), &[], ApprovalMode::Auto),
+        test_models(Arc::clone(&model)),
+    )
+    .await
+    .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let text = "é🙂\n\t\\\" escaped ".repeat(2_000);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utf8-budget"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("compacted"));
+    {
+        let observations = observations.lock().unwrap();
+        assert!(observations.iter().any(|call| {
+            call.request.messages().iter().any(|message| {
+                matches!(message, ModelMessage::User(text) if text.contains("é🙂") && text.contains("\\n") && text.contains("\\\\"))
+            })
+        }));
+        assert!(
+            observations
+                .iter()
+                .all(|call| call.request.tools().is_empty())
+        );
+    }
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_chunks_large_source_and_merges_within_call_bound() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-manual-chunk-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let mut scripts = vec![ModelScript::Text("settled")];
+    scripts.extend((0..32).map(|_| ModelScript::Observe {
+        calls: Arc::clone(&observations),
+        text: "partial summary",
+    }));
+    let model = FakeModel::new(scripts);
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), &[], ApprovalMode::Auto),
+        test_models(model),
+    )
+    .await
+    .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let large_text = format!("large-history {}", "utf8 source ".repeat(4_000));
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": large_text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-chunk"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("compacted"));
+    assert!(result["result"]["before_tokens"].is_number());
+    assert!(result["result"]["after_tokens"].is_number());
+    assert!(
+        result["result"]["after_tokens"].as_u64().unwrap()
+            < result["result"]["before_tokens"].as_u64().unwrap()
+    );
+    {
+        let observations = observations.lock().unwrap();
+        assert!(observations.len() >= 2);
+        assert!(observations.len() <= 32);
+        assert!(observations.iter().all(|call| {
+            call.request.tools().is_empty()
+                && call.context.request_index == 0
+                && !call
+                    .request
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, ModelMessage::Tool { .. }))
+        }));
+        assert!(observations.iter().any(|call| {
+            call.request.messages().iter().any(|message| {
+                matches!(message, ModelMessage::User(text) if text.contains("MINICORE HISTORICAL SOURCE DATA"))
+            })
+        }));
+        assert!(observations.iter().any(|call| {
+            call.request.messages().iter().any(|message| {
+                matches!(message, ModelMessage::User(text) if text.contains("MINICORE SUMMARY PARTS DATA"))
+            })
+        }));
+    }
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_empty_history_is_a_noop_without_a_model_call() {
+    let (agent, base, workspace) = test_agent("manual-noop", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("invalid"),
+            "session.compact",
+            Some(json!({"session_id": session_id, "operation_id": ""})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("invalid")).await["error"]["data"]["kind"],
+        json!("invalid_params")
+    );
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-noop"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("noop"));
+    assert_eq!(result["result"]["covered_item_count"], json!(0));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_rejects_busy_and_blocked_sessions() {
+    let (agent, base, workspace) = test_agent(
+        "manual-admission",
+        [ModelScript::Block],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "busy"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-busy"
+            })),
+        )
+        .await;
+    let busy = harness.response(json!("compact")).await;
+    assert_eq!(busy["error"]["data"]["kind"], json!("session_busy"));
+
+    harness
+        .send(json!("cancel"), "turn.cancel", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel")).await["result"]["cancelled"],
+        json!(true)
+    );
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    // A persistence failure blocks the Session, and compaction must preserve
+    // the existing blocked admission semantics.
+    let (agent, base2, workspace2) = test_agent(
+        "manual-blocked",
+        [ModelScript::Text("done")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut blocked = RpcHarness::spawn(agent);
+    let blocked_id = create_and_open(&mut blocked, &workspace2).await;
+    fail_next_append(blocked_id.as_str().unwrap().parse().unwrap());
+    blocked
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": blocked_id, "text": "block"})),
+        )
+        .await;
+    let blocked_turn = blocked.response(json!("send")).await["result"]["turn"].clone();
+    blocked
+        .send(json!("wait"), "turn.wait", Some(turn_params(&blocked_turn)))
+        .await;
+    let _ = blocked.response(json!("wait")).await;
+    blocked
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": blocked_id,
+                "operation_id": "compact-blocked"
+            })),
+        )
+        .await;
+    let rejected = blocked.response(json!("compact")).await;
+    assert_eq!(rejected["error"]["data"]["kind"], json!("session_blocked"));
+
+    harness.shutdown().await;
+    blocked.shutdown().await;
+    remove_base(&base).await;
+    remove_base(&base2).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
+    let (agent, base, workspace) = test_agent(
+        "manual-cancel",
+        [
+            ModelScript::Text("settled"),
+            ModelScript::Block,
+            ModelScript::Text("summary"),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled_text = "settled history ".repeat(4_000);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled_text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-cancel-1"
+            })),
+        )
+        .await;
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    harness
+        .send(
+            json!("duplicate"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-cancel-2"
+            })),
+        )
+        .await;
+    let duplicate = harness.response(json!("duplicate")).await;
+    assert_eq!(duplicate["error"]["data"]["kind"], json!("session_busy"));
+
+    harness
+        .send(
+            json!("busy-send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "not admitted"})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("busy-send")).await["error"]["data"]["kind"],
+        json!("session_busy")
+    );
+    harness
+        .send(
+            json!("busy-update"),
+            "session.update",
+            Some(json!({"session_id": session_id, "reasoning": "high"})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("busy-update")).await["error"]["data"]["kind"],
+        json!("session_busy")
+    );
+
+    harness
+        .send(
+            json!("wrong"),
+            "session.compact.cancel",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-cancel-old"
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("wrong")).await["result"]["cancelled"],
+        json!(false)
+    );
+    harness
+        .send(
+            json!("cancel"),
+            "session.compact.cancel",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-cancel-1"
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel")).await["result"]["cancelled"],
+        json!(true)
+    );
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!("cancelled"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
+    let (agent, base, workspace) = test_agent(
+        "manual-owned-handle",
+        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    let gate = Arc::new(WorkerGate::new());
+    pause_next_compaction_after_result(
+        session_id.as_str().unwrap().parse().unwrap(),
+        Arc::clone(&gate),
+    );
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-owned-handle"
+            })),
+        )
+        .await;
+    gate.wait_started().await;
+    assert_eq!(
+        harness.response(json!("compact")).await["result"]["status"],
+        json!("compacted")
+    );
+
+    harness
+        .send(
+            json!("send-busy"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "must wait"})),
+        )
+        .await;
+    let pending = tokio::time::timeout(
+        Duration::from_millis(25),
+        harness.response(json!("send-busy")),
+    )
+    .await;
+    assert!(
+        pending.is_err(),
+        "next work must wait for the owned worker join"
+    );
+    gate.release();
+    assert!(harness.response(json!("send-busy")).await["result"]["turn"].is_object());
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
+    let (agent, base, workspace) = test_agent(
+        "manual-write-failure",
+        [
+            ModelScript::Text("settled"),
+            ModelScript::Text("initial summary"),
+            ModelScript::Text("new turn answer"),
+            ModelScript::Text("new summary"),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled_text = "settled history ".repeat(128);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled_text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    let session_dir = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap());
+    let history_path = session_dir.join("history.jsonl");
+    harness
+        .send(
+            json!("compact-initial"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-initial"
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("compact-initial")).await["result"]["status"],
+        json!("compacted")
+    );
+    let summary_path = session_dir.join("summary.json");
+    let summary_before = std::fs::read(&summary_path).unwrap();
+
+    harness
+        .send(
+            json!("next-send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "new turn"})),
+        )
+        .await;
+    let next_turn = harness.response(json!("next-send")).await["result"]["turn"].clone();
+    harness
+        .send(
+            json!("next-wait"),
+            "turn.wait",
+            Some(turn_params(&next_turn)),
+        )
+        .await;
+    let _ = harness.response(json!("next-wait")).await;
+    let history_before = std::fs::read(&history_path).unwrap();
+    let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
+    fail_next_summary_write(typed_id);
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-write-failure"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!("store"));
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+    assert_eq!(std::fs::read(&summary_path).unwrap(), summary_before);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_rejects_model_failures_and_tool_events() {
+    let (agent, base, workspace) = test_agent(
+        "manual-model-failure",
+        [ModelScript::Text("settled"), ModelScript::Fail],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-model-failure"
+            })),
+        )
+        .await;
+    let failure = harness.response(json!("compact")).await;
+    assert_eq!(failure["result"]["status"], json!("failed"));
+    assert_eq!(failure["result"]["failure_kind"], json!("model_failure"));
+    harness.shutdown().await;
+    remove_base(&base).await;
+
+    let (agent, base, workspace) = test_agent(
+        "manual-tool-event",
+        [
+            ModelScript::Text("settled"),
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "read",
+                arguments: json!({}),
+            }]),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-tool-event"
+            })),
+        )
+        .await;
+    let failure = harness.response(json!("compact")).await;
+    assert_eq!(failure["result"]["status"], json!("failed"));
+    assert_eq!(
+        failure["result"]["failure_kind"],
+        json!("tool_call_rejected")
+    );
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_reports_unknown_write_without_publishing_state() {
+    let (agent, base, workspace) = test_agent(
+        "manual-unknown-write",
+        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    force_unknown_summary_write(session_id.as_str().unwrap().parse().unwrap());
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-unknown-write"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("unknown_write"));
+    assert_eq!(
+        result["result"]["failure_kind"],
+        json!("write_outcome_unknown")
+    );
+    assert!(
+        !base
+            .join("data")
+            .join("sessions")
+            .join(session_id.as_str().unwrap())
+            .join("summary.json")
+            .exists()
+    );
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_revalidates_history_before_commit() {
+    let (agent, base, workspace) = test_agent(
+        "manual-revalidate",
+        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    let history_path = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap())
+        .join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+    let newline = history_before
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("settled history has one complete line");
+    let first_line = history_before[..=newline].to_vec();
+    let gate = Arc::new(SummaryCommitGate::new());
+    gate_next_summary_commit(
+        session_id.as_str().unwrap().parse().unwrap(),
+        Arc::clone(&gate),
+    );
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-revalidate"
+            })),
+        )
+        .await;
+    gate.wait_started().await;
+    let mut mutated = history_before.clone();
+    mutated.extend(first_line);
+    std::fs::write(&history_path, mutated).unwrap();
+    gate.release();
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!("history_changed"));
+    assert!(!history_path.parent().unwrap().join("summary.json").exists());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_deadline_covers_commit_wait() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-manual-deadline-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
+    config.loop_options.model_timeout_seconds = Some(1);
+    let model = FakeModel::new([ModelScript::Text("settled"), ModelScript::Text("summary")]);
+    let agent = Agent::open_with_models(config, test_models(model))
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled_text = "settled history ".repeat(128);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled_text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    let gate = Arc::new(SummaryCommitGate::new());
+    gate_next_summary_commit(
+        session_id.as_str().unwrap().parse().unwrap(),
+        Arc::clone(&gate),
+    );
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-deadline"
+            })),
+        )
+        .await;
+    gate.wait_started().await;
+    let result = tokio::time::timeout(Duration::from_secs(3), harness.response(json!("compact")))
+        .await
+        .expect("commit wait must be bounded by the operation deadline");
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!("timeout"));
+    gate.release();
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_rejects_incomplete_late_empty_and_oversize_output() {
+    assert_manual_failure_case(
+        "manual-no-finish",
+        ModelScript::NoFinish,
+        "invalid_model_response",
+    )
+    .await;
+    assert_manual_failure_case(
+        "manual-wrong-finish",
+        ModelScript::WrongFinish,
+        "invalid_model_response",
+    )
+    .await;
+    assert_manual_failure_case(
+        "manual-late-content",
+        ModelScript::LateContent,
+        "invalid_model_response",
+    )
+    .await;
+    assert_manual_failure_case("manual-whitespace", ModelScript::Whitespace, "no_progress").await;
+    assert_manual_failure_case("manual-oversize", ModelScript::Oversize, "too_large").await;
 }
 
 #[tokio::test]
