@@ -583,9 +583,12 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let session = self
             .sessions
-            .remove(session_id)
+            .get(session_id)
+            .cloned()
             .ok_or(AgentError::SessionNotLoaded)?;
         let result = session.shutdown().await;
+        // Retain ownership until shutdown has joined every Session worker.
+        self.sessions.remove(session_id);
         self.event_sink.try_send(AgentEvent::SessionClosed {
             session_id,
             meta: EventMeta {
