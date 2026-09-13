@@ -1,22 +1,33 @@
 # Long-Conversation Compaction Plan
 
-Status: **Task 1 snapshot-loading foundation implemented and remotely verified;
-summary generation/manual RPC and Tasks 2–4 remain in progress or pending**.
-Current baseline: Agent `63540ee`, TUI `6ecd736`, Runtime 0.4.1 revision
+Status: **The Task 1 snapshot foundation is accepted. The manual Agent/RPC
+draft is committed at `5397a65` but unaccepted; implementation and builds remain
+paused following the September 13, 2026 execution-boundary incident. Ordinary
+worker lifecycle changes are checkpointed separately at `1771898`.
+Tasks 2–4 remain pending**. See the
+[manual execution audit](verification/compaction-manual-audit.md) before resuming.
+Foundation acceptance baseline: Agent `eec636a`, TUI `6ecd736`, Runtime 0.4.1 revision
 `6cd2bdbc634437dea925495c61c7eb0be10ba171`. Runtime source, its pin, existing
 package versions and user data stay unchanged. The slice uses the authorized
 direct `sha2 = "=0.10.9"` dependency; the parent owns remote lock regeneration.
-The `cus-resp/gpt-5.6-luna:max` source-only helper performs development;
-the parent performs review, orchestration, remote verification and staging/commits.
-Each independently verified task is committed immediately, without push.
+The intended workflow restricts `cus-resp/gpt-5.6-luna:max` to source development;
+the parent owns review, remote verification and commits. The helper violated that
+restriction during R1 and is now stopped.
+Implementation acceptance remains independently gated per task. On September 13,
+2026 the user separately authorized grouped source-checkpoint commits and push of
+the existing draft. This Git-only authorization does not accept the code, resume
+builds, restart the helper, or authorize private-copy cleanup.
 
-The active slice only loads and validates an existing bounded `summary.json`
-and projects it into the next real model request as a non-system user-data
-message. It also preserves the session-scoped projection state through open,
-reload, and model update. Summary generation, manual compaction RPC, automatic
-compaction, worker ownership/cancellation, and persistence writes are not yet
-implemented and must not be described as complete. The parent reviews the code
-and runs verification on the authorized builder; SSH access is restored.
+The active slice adds the bounded manual summary utility and the deferred
+`session.compact` / `session.compact.cancel` RPC on top of the snapshot loader.
+It captures the selected raw model and future-turn inputs, uses fresh utility
+loop identities with no tools, bounds source chunks/merge/output, and commits
+only after a second complete-history anchor check. The complete
+`history.jsonl` remains authoritative. Automatic compaction, TUI `/compact`,
+and upstream overflow recovery are not part of this slice. Final release review and
+acceptance remain parent-owned. Child-run results are unaccepted and
+must not be used as gates. The private-copy cleanup decision requires user
+confirmation before work resumes.
 
 ## Goals
 
@@ -45,12 +56,16 @@ The snapshot format must not require new fields in strict `SessionRecord`.
 
 Snapshot writes use existing per-session IO ownership and atomic file replacement.
 Generate the summary without holding Session locks; validate the captured source
-again before committing. Publish new in-memory state only after a successful
-write. Cancellation/transport loss during persistence may leave an unknown result,
-not a rollback guarantee. Never discard full history or automatically retry an
-uncertain write. Prefer existing primitives; do not invent a global cache or
-storage-transaction framework. Choose a stable integrity mechanism before coding;
-process-dependent hashes are unsuitable for persisted anchors.
+again before committing. The commit point is the serialized operation/state
+check immediately before the write: cancellation may prevent the write before
+that point, but cannot cancel the bounded write after it. Publish new in-memory
+state only after a successful write. A failed or cancelled operation before the
+point is definite; a failure after rename may be `unknown_write`, because disk
+may have changed while the old in-memory projection remains unpublished. Never
+discard full history, roll back, or automatically retry an uncertain write.
+Prefer existing primitives; do not invent a global cache or storage-transaction
+framework. Choose a stable integrity mechanism before coding; process-dependent
+hashes are unsuitable for persisted anchors.
 
 ## Request-Time Composition
 
@@ -144,10 +159,13 @@ or concurrent turn admission. Use the existing RPC `Dispatch::Deferred`/waiter
 pattern so a model call cannot block stdin, `agent.ping`, other sessions or
 shutdown. The waiter observes completion; it does not own an orphan worker.
 
-The Session owns the operation's cancellation and completion. Summary utilities
-inherit their caller's cancellation/deadline and have explicit lifetime ownership.
-Close/shutdown cancel and join owned work. A raw utility loop dropped by an outer
-timeout must not escape cleanup. No Session `inner` or IO lock spans a model await.
+The Session owns the operation's cancellation, watch result, and join handle
+slot. Summary utilities use the selected raw model with a fresh child token and
+one operation deadline no longer than the configured model timeout, and reject
+tool events, incomplete/non-stop finishes, late content, empty output, no
+progress, and bound violations. Close/shutdown cancel and join owned work;
+ordinary drop only cancels. A raw utility loop dropped by an outer timeout must
+not escape cleanup. No Session `inner` or IO lock spans a model await.
 A cancellation-safe, observable busy state must also protect lifecycle operations.
 
 TUI uses only RPC, never direct Store/config reads. It shows manual/automatic
@@ -159,11 +177,13 @@ late-response tombstones, selection and history-reconciliation rules.
 ## Independent Tasks And Commit Gates
 
 1. **Agent manual compaction + RPC**: semantic no-tools summary utility,
-   settled-prefix snapshot persistence/loading, prompt projection, asynchronous
-   admission/cancellation and typed `session.compact` result. Test history bytes
-   unchanged, actual next model request uses summary, restart reuse, corrupt
-   snapshot fallback, failure rollback boundaries, ping/shutdown responsiveness,
-   busy/blocked/duplicate rejection and no tool execution. Review and commit.
+   bounded streaming UTF-8 source serialization, source/merge/output bounds,
+   settled-prefix snapshot persistence/loading, prompt projection, Session-owned
+   asynchronous admission/cancellation and
+   typed deferred `session.compact` result. Source coverage includes unchanged
+   history bytes, actual next model request uses summary, reopen reuse, no-op,
+   failure retention, ping responsiveness, busy/blocked/cancel admission and
+   no tool execution. Remote review and full gates remain pending.
 2. **TUI `/compact`**: command parsing/completion/help, typed RPC, progress/result,
    lifecycle guards, no blind retry and late-response isolation. Test fake App
    and real-Agent loopback behavior, transcript preservation, narrow layout and
@@ -187,14 +207,16 @@ real upstream/TLS and proxy-specific diagnostics need separate evidence.
 
 ## Current Verification State
 
-Authorized SSH access is restored. The parent performed a bounded incremental-cache
-cleanup before Rust work, preserving 1,542 executable/library/symbol hashes and the
-unrelated Runtime build. Snapshot loading/projection passed 375 tests / 2 ignored
-on stable and Rust 1.85, strict stable Clippy/fmt/rustdoc/build gates, and 18 paired
-real-Agent E2E tests on each toolchain. Real REDs cover the missing projection and
-mismatched same-count loaded history. A string-literal compile error and a test lock
-lint were fixed separately, not counted as behavioral REDs.
+The accepted foundation at `eec636a` passed Agent stable/MSRV 375/2 and paired
+TUI E2E 18 each through parent-owned remote verification. The manual draft is now committed as a source checkpoint but has
+not completed parent-owned acceptance. A child-run verification and broad
+working-directory transfer violated its source-only restriction and copied
+private configuration/Session data to the builder. These results are retained
+as unaccepted exploratory evidence. The parent stopped the identified hung
+child-run test while preserving the unrelated Runtime build; remote private
+copies remain pending the user's cleanup authorization. No new native artifact
+or installation was made.
 
-See [staged compaction verification](verification/compaction.md). This acceptance
-does not claim semantic summary generation, manual RPC/UI, automatic compaction,
-overflow recovery or new native/macOS artifacts.
+See [staged compaction verification](verification/compaction.md). TUI
+`/compact`, automatic compaction, overflow recovery, and persistent subagents
+remain separate work.

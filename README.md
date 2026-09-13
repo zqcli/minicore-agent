@@ -171,6 +171,15 @@ the bounded summary sidecar is derived. An uncertain atomic replacement may
 have changed disk while leaving the old in-memory projection unpublished, so
 clients must reread before retrying.
 
+The R1 manual-compaction draft is committed as source checkpoint `5397a65`,
+following ordinary worker lifecycle checkpoint `1771898`, but remains unaccepted
+and uninstalled. The user authorized these grouped commits and their push;
+implementation and build acceptance remain paused following a source-only
+execution violation and unauthorized private-data copies to the builder. See the
+[execution audit](docs/verification/compaction-manual-audit.md).
+The [foundation verification](docs/verification/compaction.md) remains separate;
+there is no new release, installation or native-artifact acceptance.
+
 `session.presentation` is a read-only footer/tool-card projection. It returns
 the configured Session model label, a fixed-argument Git branch lookup, the
 last-loop activity timestamps, and explicit unknown/null context, cost, and

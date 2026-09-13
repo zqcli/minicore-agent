@@ -5,10 +5,18 @@ historical; current paired TUI `a604e55` adds the separately verified
 [public reload correction](reload-refresh.md). Existing manifests, raw evidence
 and checksums below are preserved, not relabeled as corrective runs.
 
+The R1 manual-compaction source checkpoint `5397a65` is not part of the accepted binaries
+or native evidence described below. Its child-run exploratory results are
+unaccepted, and work is paused following an
+[execution-boundary incident](compaction-manual-audit.md). They do not change the
+accepted commit, installation, or native-artifact claims in this document.
+
 Accepted source: **`f1697f78ce48c8f5f3fde0dc9903c153022bfd9e`**, paired with TUI
 **`30ea7ca828f59cab895486beebc98e4e4f4ecf2e`**. Agent **0.3.3**, TUI **0.2.8**,
 and Runtime **0.4.1** revision `6cd2bdbc634437dea925495c61c7eb0be10ba171` remain
-unchanged. These are separate local commits, not a new tag, push or hosted-CI run.
+unchanged. At acceptance these were separate local commits, not a new tag, push
+or hosted-CI run. Subsequent user-authorized Git checkpointing and publishing do
+not replace these acceptance records.
 
 | Commit | Independently reviewed scope |
 |---|---|
@@ -70,7 +78,10 @@ Session/Agent drain. Reliable Runtime watch state detects unserviceable child
 approval/input waits independently of best-effort events.
 
 Persistent alias/target, Session adoption/fork/exclusive, steer/followUp controls,
-and a manager panel are **not implemented**. Compaction remains planning-only.
+and a manager panel are **not implemented**. TUI `/compact`, automatic
+compaction, and upstream overflow recovery remain planning-only; the current R1
+manual Agent compaction is committed but unaccepted and is not present in these
+accepted binaries.
 `apply_patch` supports a single existing file, not full Add/Delete/Move or every
 Git preamble. Original user failure payloads were not read; the native and process
 fixtures establish synthetic format compatibility, not the unique original cause.

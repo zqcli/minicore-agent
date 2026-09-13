@@ -2,7 +2,19 @@
 
 Date: September 13, 2026. Times below are UTC.
 
-## Status
+## Subsequent Git Checkpoint
+
+Later on September 13, 2026 the user authorized grouped commits and push of the
+existing source draft. Ordinary worker lifecycle changes are recorded at
+`1771898`; manual compaction and RPC are recorded at `5397a65`. They remain
+unaccepted and uninstalled. This Git-only authorization does not resume builds
+or the stopped helper and does not authorize deletion of private copies.
+
+The following sections retain the incident-time state. Their references to an
+uncommitted draft, installed binaries and no push describe that earlier point,
+not the subsequent Git checkpoints or separate TUI scrollbar delivery.
+
+## Incident-Time Status
 
 The accepted compaction implementation is still the snapshot-loading foundation
 at `eec636a53100f2d1b704715b1aee74d422d40629`. The manual-compaction draft is

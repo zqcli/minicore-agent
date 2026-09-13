@@ -7,7 +7,9 @@ that division during the later manual-compaction draft and copied private files
 to the build host. That work is paused and unaccepted; see the
 [manual execution audit](compaction-manual-audit.md). Package versions and Runtime
 0.4.1 revision `6cd2bdbc634437dea925495c61c7eb0be10ba171` are unchanged.
-Previously installed binaries were not replaced. No push or tag was performed.
+No compaction artifact was installed. Foundation acceptance involved no push or
+tag. The user subsequently authorized grouped commits and push of the existing
+source draft; this does not add build/test acceptance or authorize a release.
 
 ## Snapshot Loading Foundation
 
@@ -76,10 +78,14 @@ claim new hosted CI, Windows, native iTerm2, macOS artifacts or real-upstream
 acceptance. Historical MSRV strict-Clippy limitations are not suppressed or
 relabeled as fixed.
 
-## Manual Draft — Paused
+## Manual Draft — Committed, Acceptance Paused
 
-The working tree contains a manual summary utility, Session-owned operation and
-deferred RPC draft. The parent obtained an initial public-RPC behavioral RED,
+The user authorized Git checkpointing and push on September 13, 2026. Ordinary
+worker lifecycle changes are committed at `1771898`; the remaining manual
+summary utility, Session-owned operation, deferred RPC and accompanying tests
+are committed at `5397a65`. Only static split/dependency and whitespace checks
+were performed during this Git operation; no new Rust build or test was run.
+These commits preserve the existing draft and do not establish acceptance. The parent obtained an initial public-RPC behavioral RED,
 one happy-path GREEN against an earlier draft, and a subsequent genuine RED
 showing completed compaction remained wire-visible as busy. Review corrections
 are present but have not completed parent-owned review and remote acceptance.
