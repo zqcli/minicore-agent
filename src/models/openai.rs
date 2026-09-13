@@ -594,6 +594,15 @@ impl<'a> ResponsesRequest<'a> {
     }
 }
 
+pub(super) fn serialize_request_for_budget(
+    request: &ModelRequest,
+    writer: &mut dyn std::io::Write,
+) -> Result<(), ModelError> {
+    let model = "m".repeat(256);
+    let (body, _) = ResponsesRequest::from_runtime(&model, u32::MAX, request, &[])?;
+    serde_json::to_writer(writer, &body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum InputItem {

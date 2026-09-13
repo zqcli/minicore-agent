@@ -13,8 +13,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::agent::{Agent, AnswerInteraction, SendMessage};
 use crate::error::AgentError;
 use crate::event::{AgentEventStream, HistoryPageView, SessionStateView, TurnResultView};
-use crate::sessions::TurnRef;
-use crate::sessions::await_turn_completion;
+use crate::sessions::{TurnRef, await_compaction_completion, await_turn_completion};
 
 use super::protocol::{
     AgentEventNotification, CancelledResult, EmptyParams, HISTORY_TOO_LARGE, INTERACTION_NOT_FOUND,
@@ -22,10 +21,11 @@ use super::protocol::{
     InteractionAnswerParams, METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult,
     PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE,
     RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY,
-    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionCreateParams,
-    SessionHistoryParams, SessionParams, SessionRenameParams, SessionResult, SessionUpdateParams,
-    SessionUpdateResult, SessionsResult, SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult,
-    TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params, parse_request, request_id,
+    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionCompactParams,
+    SessionCreateParams, SessionHistoryParams, SessionParams, SessionRenameParams, SessionResult,
+    SessionUpdateParams, SessionUpdateResult, SessionsResult, SteerResult, TURN_NOT_FOUND,
+    TurnParams, TurnResult, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params,
+    parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -313,6 +313,37 @@ impl RpcServer {
                     .agent()
                     .session_state(params.session_id)
                     .map(|state| SessionStateView::from(&state));
+                Dispatch::Response(agent_result(&id, result))
+            }
+            "session.compact" => {
+                let params: SessionCompactParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                match self.agent_mut().compact_session(params.into()).await {
+                    Ok(receiver) => {
+                        let outbound = self.outbound_tx.clone();
+                        self.waiters.spawn(async move {
+                            let response = match await_compaction_completion(receiver).await {
+                                Ok(result) => success(&id, result),
+                                Err(error) => agent_error(id, &error),
+                            };
+                            let _ = outbound.send(RpcOutbound::Response(response)).await;
+                        });
+                        Dispatch::Deferred
+                    }
+                    Err(error) => Dispatch::Response(agent_error(id, &error)),
+                }
+            }
+            "session.compact.cancel" => {
+                let params: SessionCompactParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self
+                    .agent()
+                    .cancel_compaction(params.into())
+                    .map(|cancelled| CancelledResult { cancelled });
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.update" => {
@@ -755,6 +786,8 @@ fn canonical_method(method: &str) -> &'static str {
         "session.close" => "session.close",
         "session.delete" => "session.delete",
         "session.state" => "session.state",
+        "session.compact" => "session.compact",
+        "session.compact.cancel" => "session.compact.cancel",
         "session.update" => "session.update",
         "session.rename" => "session.rename",
         "session.history" => "session.history",

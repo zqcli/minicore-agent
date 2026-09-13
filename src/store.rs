@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +46,45 @@ static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static APPEND_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 #[cfg(test)]
 static RECORD_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+#[cfg(test)]
+static SUMMARY_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+#[cfg(test)]
+type SummaryCommitGateEntry = (SessionId, Arc<SummaryCommitGate>);
+#[cfg(test)]
+static SUMMARY_COMMIT_GATES: OnceLock<Mutex<Vec<SummaryCommitGateEntry>>> = OnceLock::new();
+#[cfg(test)]
+static SUMMARY_UNKNOWN_WRITES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct SummaryCommitGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SummaryCommitGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) async fn wait_started(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SummaryCommit {
+    Committed,
+    Rejected,
+    Unknown,
+}
 
 /// Persistent per-session product state owned by the Agent. Creating a session
 /// copies the profile's defaults into this record, so later profile edits (or
@@ -117,6 +157,7 @@ pub(crate) struct StoredSession {
     pub(crate) user_times: std::collections::HashMap<(LoopId, usize), String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HistoryPrefix {
     pub(crate) prefix_bytes: u64,
     pub(crate) covered_loop_count: u64,
@@ -517,6 +558,127 @@ impl Store {
             .await
             .map_err(|_| StoreError::Unavailable)?;
         scan_history_prefix(file, prefix_bytes, expected_history).await
+    }
+
+    /// Captures the complete raw history anchor without tail repair. The
+    /// loaded sanitized history must account for every stored item before an
+    /// anchor can be used for a derived snapshot write.
+    pub(crate) async fn capture_history_anchor(
+        &self,
+        session_id: SessionId,
+        expected_history: &[HistoryItem],
+    ) -> Result<Option<HistoryPrefix>, StoreError> {
+        let directory = self.require_session_directory(session_id).await?;
+        let path = directory.join(HISTORY_FILE);
+        match path_state(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+        {
+            PathState::RegularFile => {}
+            PathState::Missing | PathState::Directory | PathState::Symlink | PathState::Other => {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        let metadata = fs::metadata(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let file = File::open(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        let length = metadata.len();
+        let Some(anchor) = scan_history_prefix(file, length, expected_history).await? else {
+            return Ok(None);
+        };
+        let final_length = fs::metadata(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+            .len();
+        if final_length != length {
+            return Ok(None);
+        }
+        if anchor.covered_item_count != u64::try_from(expected_history.len()).unwrap_or(u64::MAX) {
+            return Ok(None);
+        }
+        Ok(Some(anchor))
+    }
+
+    /// Revalidates the complete settled-history anchor immediately before an
+    /// atomic derived snapshot replacement. A changed source rejects the
+    /// commit without touching the existing summary.
+    pub(crate) async fn commit_summary(
+        &self,
+        session_id: SessionId,
+        expected_anchor: &HistoryPrefix,
+        expected_history: &[HistoryItem],
+        bytes: &[u8],
+        deadline: Instant,
+        commit_point: impl FnOnce() -> bool + Send,
+    ) -> Result<SummaryCommit, StoreError> {
+        if bytes.len() > MAX_SUMMARY_FILE_BYTES {
+            return Ok(SummaryCommit::Rejected);
+        }
+        #[cfg(test)]
+        if let Some(gate) = take_summary_commit_gate(session_id) {
+            gate.entered.notify_one();
+            let Some(remaining) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+            else {
+                return Ok(SummaryCommit::Rejected);
+            };
+            if tokio::time::timeout(remaining, gate.release.notified())
+                .await
+                .is_err()
+            {
+                return Ok(SummaryCommit::Rejected);
+            }
+        }
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return Ok(SummaryCommit::Rejected);
+        };
+        let actual_anchor = match tokio::time::timeout(
+            remaining,
+            self.capture_history_anchor(session_id, expected_history),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Ok(SummaryCommit::Rejected),
+        };
+        let Some(actual_anchor) = actual_anchor else {
+            return Ok(SummaryCommit::Rejected);
+        };
+        if &actual_anchor != expected_anchor {
+            return Ok(SummaryCommit::Rejected);
+        }
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            return Ok(SummaryCommit::Rejected);
+        };
+        let directory =
+            match tokio::time::timeout(remaining, self.require_session_directory(session_id)).await
+            {
+                Ok(result) => result?,
+                Err(_) => return Ok(SummaryCommit::Rejected),
+            };
+        if !commit_point() {
+            return Ok(SummaryCommit::Rejected);
+        }
+        #[cfg(test)]
+        if should_force_unknown_summary_write(session_id) {
+            return Ok(SummaryCommit::Unknown);
+        }
+        #[cfg(test)]
+        if should_fail_summary_write(session_id) {
+            return Err(StoreError::Unavailable);
+        }
+        let path = directory.join(SUMMARY_FILE);
+        atomic_write_status(&path, bytes).await
     }
 
     pub(crate) async fn write_record(&self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -1040,6 +1202,13 @@ fn map_io_store_error(error: io::Error) -> StoreError {
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    match atomic_write_status(path, bytes).await? {
+        SummaryCommit::Committed => Ok(()),
+        SummaryCommit::Rejected | SummaryCommit::Unknown => Err(StoreError::Unavailable),
+    }
+}
+
+async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit, StoreError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     match path_state(parent)
         .await
@@ -1091,9 +1260,9 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     drop(file);
     if fs::rename(&temp_path, path).await.is_err() {
         let _ = fs::remove_file(&temp_path).await;
-        return Err(StoreError::Unavailable);
+        return Ok(SummaryCommit::Unknown);
     }
-    Ok(())
+    Ok(SummaryCommit::Committed)
 }
 
 fn unique_temp_path(path: &Path) -> PathBuf {
@@ -1315,6 +1484,77 @@ fn should_fail_record_write(session_id: SessionId) -> bool {
         .position(|candidate| *candidate == session_id)
         .map(|position| {
             failures.remove(position);
+            true
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_summary_write(session_id: SessionId) {
+    SUMMARY_WRITE_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(session_id);
+}
+
+#[cfg(test)]
+fn should_fail_summary_write(session_id: SessionId) -> bool {
+    let mut failures = SUMMARY_WRITE_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    failures
+        .iter()
+        .position(|candidate| *candidate == session_id)
+        .map(|position| {
+            failures.remove(position);
+            true
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn gate_next_summary_commit(session_id: SessionId, gate: Arc<SummaryCommitGate>) {
+    SUMMARY_COMMIT_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, gate));
+}
+
+#[cfg(test)]
+fn take_summary_commit_gate(session_id: SessionId) -> Option<Arc<SummaryCommitGate>> {
+    let mut gates = SUMMARY_COMMIT_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|(candidate, _)| *candidate == session_id)
+        .map(|position| gates.remove(position).1)
+}
+
+#[cfg(test)]
+pub(crate) fn force_unknown_summary_write(session_id: SessionId) {
+    SUMMARY_UNKNOWN_WRITES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(session_id);
+}
+
+#[cfg(test)]
+fn should_force_unknown_summary_write(session_id: SessionId) -> bool {
+    let mut writes = SUMMARY_UNKNOWN_WRITES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    writes
+        .iter()
+        .position(|candidate| *candidate == session_id)
+        .map(|position| {
+            writes.remove(position);
             true
         })
         .unwrap_or(false)
