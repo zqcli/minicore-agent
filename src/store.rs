@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
@@ -25,6 +26,8 @@ pub(crate) const SESSION_FORMAT_VERSION: u32 = 1;
 const SESSIONS_DIR: &str = "sessions";
 pub(crate) const SESSION_RECORD_FILE: &str = "session.json";
 const HISTORY_FILE: &str = "history.jsonl";
+pub(crate) const SUMMARY_FILE: &str = "summary.json";
+pub(crate) const MAX_SUMMARY_FILE_BYTES: usize = 256 * 1024;
 const LEGACY_MANIFEST_FILE: &str = "manifest.json";
 const LEGACY_CONVERSATION_FILE: &str = "conversation.log";
 const METADATA_TEMP_SUFFIX: &str = ".tmp";
@@ -112,6 +115,14 @@ pub(crate) struct StoredSession {
     /// `(loop_id, occurrence)` -> RFC3339 acceptance time, collected from the
     /// loop records so history views can show persisted user timestamps.
     pub(crate) user_times: std::collections::HashMap<(LoopId, usize), String>,
+}
+
+pub(crate) struct HistoryPrefix {
+    pub(crate) prefix_bytes: u64,
+    pub(crate) covered_loop_count: u64,
+    pub(crate) covered_item_count: u64,
+    pub(crate) last_loop_id: Option<LoopId>,
+    pub(crate) sha256: String,
 }
 
 /// One completed agent loop, stored as a single JSON line.
@@ -428,6 +439,84 @@ impl Store {
             history,
             user_times,
         })
+    }
+
+    /// Reads only the bounded derived snapshot file. A missing, non-regular,
+    /// oversized, or unreadable derived file is ignored; core session data is
+    /// never made unreadable by this optional file.
+    pub(crate) async fn read_summary_bytes(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let directory = self.require_session_directory(session_id).await?;
+        let path = directory.join(SUMMARY_FILE);
+        match path_state(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+        {
+            PathState::Missing | PathState::Symlink | PathState::Directory | PathState::Other => {
+                return Ok(None);
+            }
+            PathState::RegularFile => {}
+        }
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        };
+        // Metadata is only a fast rejection; the bounded reader remains
+        // authoritative if the file grows after this check.
+        if metadata.len() > MAX_SUMMARY_FILE_BYTES as u64 {
+            return Ok(None);
+        }
+        let file = match File::open(&path).await {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        if file
+            .take((MAX_SUMMARY_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if bytes.len() > MAX_SUMMARY_FILE_BYTES {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Scans one raw history prefix without invoking the normal tail repair.
+    /// The result exists only when the requested byte offset ends immediately
+    /// after a complete StoredLoopRecord line.
+    pub(crate) async fn read_history_prefix(
+        &self,
+        session_id: SessionId,
+        prefix_bytes: u64,
+        expected_history: &[HistoryItem],
+    ) -> Result<Option<HistoryPrefix>, StoreError> {
+        let directory = self.require_session_directory(session_id).await?;
+        let path = directory.join(HISTORY_FILE);
+        match path_state(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+        {
+            PathState::RegularFile => {}
+            PathState::Missing | PathState::Directory | PathState::Symlink | PathState::Other => {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        let metadata = fs::metadata(&path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if prefix_bytes > metadata.len() {
+            return Ok(None);
+        }
+        let file = File::open(path)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        scan_history_prefix(file, prefix_bytes, expected_history).await
     }
 
     pub(crate) async fn write_record(&self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -757,6 +846,113 @@ impl Store {
     }
 }
 
+async fn scan_history_prefix(
+    file: File,
+    prefix_bytes: u64,
+    expected_history: &[HistoryItem],
+) -> Result<Option<HistoryPrefix>, StoreError> {
+    let mut reader = BufReader::new(file);
+    let mut remaining = prefix_bytes;
+    let mut hasher = Sha256::new();
+    let mut line = Vec::new();
+    let mut covered_loop_count = 0_u64;
+    let mut covered_item_count = 0_u64;
+    let mut last_loop_id = None;
+    // Bind the raw scan to the already-loaded sanitized history without
+    // constructing a second history-sized collection.
+    let mut expected_item_index = 0_usize;
+
+    while remaining > 0 {
+        let chunk = reader
+            .fill_buf()
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        let take = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let bytes = &chunk[..take];
+        hasher.update(bytes);
+
+        let mut segment_start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let segment = &bytes[segment_start..index];
+            let line_length = line
+                .len()
+                .checked_add(segment.len())
+                .ok_or(StoreError::Corrupt)?;
+            if line_length > MAX_LOOP_RECORD_BYTES {
+                return Err(StoreError::Corrupt);
+            }
+            line.extend_from_slice(segment);
+            if line.is_empty() {
+                return Err(StoreError::Corrupt);
+            }
+            let record: StoredLoopRecord =
+                serde_json::from_slice(&line).map_err(|_| StoreError::Corrupt)?;
+            let normalized = sanitize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
+            for item in normalized.iter() {
+                let Some(expected) = expected_history.get(expected_item_index) else {
+                    return Ok(None);
+                };
+                let actual_bytes = serde_json::to_vec(item).map_err(|_| StoreError::Corrupt)?;
+                let expected_bytes =
+                    serde_json::to_vec(expected).map_err(|_| StoreError::Corrupt)?;
+                if actual_bytes != expected_bytes {
+                    return Ok(None);
+                }
+                expected_item_index = expected_item_index
+                    .checked_add(1)
+                    .ok_or(StoreError::Corrupt)?;
+            }
+            covered_loop_count = covered_loop_count
+                .checked_add(1)
+                .ok_or(StoreError::Corrupt)?;
+            covered_item_count = covered_item_count
+                .checked_add(u64::try_from(normalized.len()).map_err(|_| StoreError::Corrupt)?)
+                .ok_or(StoreError::Corrupt)?;
+            last_loop_id = Some(record.loop_id);
+            line.clear();
+            segment_start = index + 1;
+        }
+        if segment_start < bytes.len() {
+            let segment = &bytes[segment_start..];
+            let line_length = line
+                .len()
+                .checked_add(segment.len())
+                .ok_or(StoreError::Corrupt)?;
+            if line_length > MAX_LOOP_RECORD_BYTES {
+                return Err(StoreError::Corrupt);
+            }
+            line.extend_from_slice(segment);
+        }
+        reader.consume(take);
+        remaining -= u64::try_from(take).map_err(|_| StoreError::Corrupt)?;
+    }
+
+    if !line.is_empty() {
+        return Ok(None);
+    }
+    let digest = hasher.finalize();
+    let mut sha256 = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(sha256, "{byte:02x}").expect("writing digest cannot fail");
+    }
+    Ok(Some(HistoryPrefix {
+        prefix_bytes,
+        covered_loop_count,
+        covered_item_count,
+        last_loop_id,
+        sha256,
+    }))
+}
+
 /// If the file ends without a newline, truncate it back to the last complete
 /// line. Returns whether a repair happened.
 async fn tail_repair(path: &Path, complete_offset: u64) -> Result<bool, StoreError> {
@@ -824,11 +1020,11 @@ async fn path_state(path: &Path) -> io::Result<PathState> {
 async fn reject_symlink_entries(directory: &Path) -> io::Result<()> {
     let mut entries = fs::read_dir(directory).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if fs::symlink_metadata(entry.path())
+        let is_symlink = fs::symlink_metadata(entry.path())
             .await?
             .file_type()
-            .is_symlink()
-        {
+            .is_symlink();
+        if is_symlink && entry.file_name().to_str() != Some(SUMMARY_FILE) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "symlink entry"));
         }
     }

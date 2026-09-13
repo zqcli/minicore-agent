@@ -1,0 +1,6 @@
+cwd=/root/minicore-compaction.j5Jaqn/source/minicore-agent
+command=rustup run stable cargo clippy -j4 --locked --offline --all-targets -- -D warnings 
+    Checking minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.39s
+
+exit=0

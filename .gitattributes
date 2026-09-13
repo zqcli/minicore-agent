@@ -1,2 +1,3 @@
 # Preserve checksummed raw evidence bytes on every checkout platform.
 /docs/verification/followups/** -text
+/docs/verification/compaction/** -text

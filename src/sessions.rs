@@ -17,6 +17,7 @@ use minicore_runtime::{
 use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
+use crate::compaction::CompactionState;
 use crate::config::map_loop_start_error;
 use crate::error::{AgentError, StoreError};
 use crate::event::{
@@ -239,6 +240,7 @@ struct SessionShared {
     store: Store,
     events: AgentEventSink,
     subagents: Arc<SubagentService>,
+    compaction: Arc<CompactionState>,
 }
 
 struct SessionInner {
@@ -325,6 +327,7 @@ impl Session {
         config: ExecutionConfig,
         options: LoopOptions,
         subagents: Arc<SubagentService>,
+        compaction: Arc<CompactionState>,
         store: Store,
         events: AgentEventSink,
     ) -> Self {
@@ -346,6 +349,7 @@ impl Session {
                 store,
                 events,
                 subagents,
+                compaction,
             }),
         }
     }
@@ -363,6 +367,10 @@ impl Session {
     pub(crate) fn workspace(&self) -> Arc<Workspace> {
         let inner = self.shared.inner.lock().unwrap();
         Arc::clone(&inner.workspace)
+    }
+
+    pub(crate) fn compaction_state(&self) -> Arc<CompactionState> {
+        Arc::clone(&self.shared.compaction)
     }
 
     pub(crate) fn info(&self, loaded: bool) -> SessionInfo {

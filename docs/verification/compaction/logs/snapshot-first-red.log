@@ -1,0 +1,22 @@
+   Compiling minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.32s
+     Running unittests src/lib.rs (/root/minicore-tui-027-RXdxEP/target-linux/debug/deps/minicore_agent-b0bccf8727e203b6)
+
+running 1 test
+test agent::tests::reopened_session_projects_external_summary_as_bounded_user_data ... FAILED
+
+failures:
+
+---- agent::tests::reopened_session_projects_external_summary_as_bounded_user_data stdout ----
+
+thread 'agent::tests::reopened_session_projects_external_summary_as_bounded_user_data' (1271281) panicked at src/agent/tests.rs:1028:10:
+valid summary snapshot must become a non-system data message
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    agent::tests::reopened_session_projects_external_summary_as_bounded_user_data
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 345 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`

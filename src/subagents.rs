@@ -19,6 +19,7 @@ use minicore_runtime::tools::{
 };
 use minicore_runtime::{AgentLoop, LoopEvent, LoopOptions, LoopOutcome, LoopRequest, LoopStatus};
 
+use crate::compaction::CompactionState;
 use crate::event::AgentEventSink;
 use crate::ids::SessionId;
 use crate::models::Models;
@@ -286,8 +287,12 @@ impl SubagentFactory {
                 as Arc<dyn minicore_runtime::tools::ToolPolicy>)
         };
         let prompt: Arc<dyn minicore_runtime::prompt::PromptProvider> = Arc::new(
-            ProjectPromptProvider::new(Arc::clone(&workspace), self.system_prompt.clone())
-                .map_err(|_| ToolError::InvalidInvocation)?,
+            ProjectPromptProvider::new(
+                Arc::clone(&workspace),
+                self.system_prompt.clone(),
+                CompactionState::new(),
+            )
+            .map_err(|_| ToolError::InvalidInvocation)?,
         );
         let model = PresentationModel::new(model, Arc::clone(&presentation));
         let config = ExecutionConfig::new(model, reasoning, tools, policy, prompt)

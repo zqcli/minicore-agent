@@ -1,0 +1,4 @@
+cwd=/root/minicore-compaction.j5Jaqn/source/minicore-agent
+command=rustup run stable cargo fmt --all -- --check 
+
+exit=0

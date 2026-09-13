@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
+use minicore_runtime::history::HistoryView;
+use minicore_runtime::model::ModelMessage;
 use minicore_runtime::prompt::{
     DefaultPromptProvider, PromptError, PromptFuture, PromptProvider, PromptRequest,
 };
 use minicore_runtime::value::BoundedText;
 
+use crate::compaction::{CompactionState, summary_data_message};
 use crate::workspace::{ReadPrefix, Workspace, WorkspaceError};
 
 pub(crate) const AGENTS_PATH: &str = "AGENTS.md";
@@ -13,8 +16,9 @@ const PROJECT_ENVELOPE: &str = "[minicore-project-instructions source=AGENTS.md]
 const TRUNCATED: &str = "[truncated]";
 
 /// Request-level prompt provider that merges the session system prompt with a
-/// freshly read workspace `AGENTS.md` and delegates history projection to the
-/// runtime `DefaultPromptProvider`.
+/// freshly read workspace `AGENTS.md`, applies the session-local derived
+/// snapshot projection, and delegates the remaining history to the runtime
+/// `DefaultPromptProvider`.
 ///
 /// `AGENTS.md` is re-read for every model request, so edits become visible at
 /// the next request boundary without a file cache or watcher. Token fitting is
@@ -23,6 +27,7 @@ const TRUNCATED: &str = "[truncated]";
 pub(crate) struct ProjectPromptProvider {
     workspace: Arc<Workspace>,
     system_prompt: BoundedText,
+    compaction: Arc<CompactionState>,
     #[cfg(test)]
     read_gate: Option<Arc<PromptReadGate>>,
 }
@@ -31,12 +36,14 @@ impl ProjectPromptProvider {
     pub(crate) fn new(
         workspace: Arc<Workspace>,
         system_prompt: String,
+        compaction: Arc<CompactionState>,
     ) -> Result<Self, AgentPromptError> {
         let system_prompt =
             BoundedText::new(system_prompt).map_err(|_| AgentPromptError::InvalidSystemPrompt)?;
         Ok(Self {
             workspace,
             system_prompt,
+            compaction,
             #[cfg(test)]
             read_gate: None,
         })
@@ -46,9 +53,10 @@ impl ProjectPromptProvider {
     fn new_with_read_gate(
         workspace: Arc<Workspace>,
         system_prompt: String,
+        compaction: Arc<CompactionState>,
         read_gate: Arc<PromptReadGate>,
     ) -> Result<Self, AgentPromptError> {
-        let mut provider = Self::new(workspace, system_prompt)?;
+        let mut provider = Self::new(workspace, system_prompt, compaction)?;
         provider.read_gate = Some(read_gate);
         Ok(provider)
     }
@@ -69,6 +77,13 @@ impl PromptProvider for ProjectPromptProvider {
         let system_base = self.system_prompt.clone();
         let cancellation = request.cancellation.clone();
         let deadline = request.deadline;
+        let loop_id = request.loop_id;
+        let request_index = request.request_index;
+        let history = request.history;
+        let model = request.model;
+        let reasoning = request.reasoning;
+        let tools = request.tools;
+        let compaction = Arc::clone(&self.compaction);
         #[cfg(test)]
         let read_gate = self.read_gate.clone();
         Box::pin(async move {
@@ -96,7 +111,38 @@ impl PromptProvider for ProjectPromptProvider {
             let system = build_system_prompt(&system_base, agents)
                 .map_err(|_| PromptError::InvalidHistory)?;
             let provider = DefaultPromptProvider::new(Some(system));
-            provider.prepare(request).await
+            let (projected_base, summary) = match compaction.project(history.base()) {
+                Some(projection) => (Some(projection.suffix), Some(projection.summary)),
+                None => (None, None),
+            };
+            let projected_history = projected_base.map_or_else(
+                || HistoryView::new(history.base(), history.appended()),
+                |base| HistoryView::new(base, history.appended()),
+            );
+            let prepared = provider
+                .prepare(PromptRequest {
+                    loop_id,
+                    request_index,
+                    history: projected_history,
+                    model,
+                    reasoning,
+                    tools,
+                    cancellation,
+                    deadline,
+                })
+                .await?;
+            let Some(summary) = summary else {
+                return Ok(prepared);
+            };
+            let summary_message =
+                summary_data_message(&summary).map_err(|_| PromptError::InvalidHistory)?;
+            let mut messages = prepared.messages;
+            let insert_at = messages
+                .iter()
+                .position(|message| matches!(message, ModelMessage::System(_)))
+                .map_or(0, |index| index + 1);
+            messages.insert(insert_at, summary_message);
+            Ok(minicore_runtime::prompt::PreparedPrompt { messages })
         })
     }
 }
@@ -334,7 +380,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let provider = ProjectPromptProvider::new(workspace, "system".to_owned()).unwrap();
+        let provider =
+            ProjectPromptProvider::new(workspace, "system".to_owned(), CompactionState::new())
+                .unwrap();
         let model = ModelDescriptor::new(
             "test".parse::<ModelRef>().unwrap(),
             16_384,
@@ -366,7 +414,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let provider = ProjectPromptProvider::new(workspace, "system".to_owned()).unwrap();
+        let provider =
+            ProjectPromptProvider::new(workspace, "system".to_owned(), CompactionState::new())
+                .unwrap();
         let model = ModelDescriptor::new(
             "test".parse::<ModelRef>().unwrap(),
             16_384,
@@ -400,6 +450,7 @@ mod tests {
         let provider = ProjectPromptProvider::new_with_read_gate(
             workspace,
             "system".to_owned(),
+            CompactionState::new(),
             Arc::clone(&gate),
         )
         .unwrap();
@@ -440,6 +491,7 @@ mod tests {
         let provider = ProjectPromptProvider::new_with_read_gate(
             workspace,
             "system".to_owned(),
+            CompactionState::new(),
             Arc::clone(&gate),
         )
         .unwrap();

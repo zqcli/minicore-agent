@@ -1,0 +1,22 @@
+   Compiling minicore-agent v0.3.3 (/root/minicore-compaction.j5Jaqn/source/minicore-agent)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.47s
+     Running unittests src/lib.rs (/root/minicore-tui-027-RXdxEP/target-linux/debug/deps/minicore_agent-edce81dfaf7671a9)
+
+running 1 test
+test agent::tests::snapshot_with_same_count_different_loaded_history_is_ignored ... FAILED
+
+failures:
+
+---- agent::tests::snapshot_with_same_count_different_loaded_history_is_ignored stdout ----
+
+thread 'agent::tests::snapshot_with_same_count_different_loaded_history_is_ignored' (1303514) panicked at src/agent/tests.rs:1203:5:
+assertion failed: state.project(&different_history).is_none()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    agent::tests::snapshot_with_same_count_different_loaded_history_is_ignored
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 350 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`
