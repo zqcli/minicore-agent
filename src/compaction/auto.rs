@@ -28,9 +28,44 @@ use super::{
 #[derive(Clone)]
 pub(crate) struct AutoContext {
     pub(crate) model: Arc<dyn Model>,
+    pub(crate) budget: Arc<dyn crate::models::ProviderBudget>,
     pub(crate) policy: CompactionPolicy,
     pub(crate) max_prompt_messages: usize,
     pub(crate) state: Arc<CompactionState>,
+}
+
+/// The `AutoContext` fields that do not point back at `CompactionState`. The
+/// Session keeps the full context; the state stores only this binding so
+/// `CompactionState -> auto binding -> CompactionState` cannot form a strong
+/// reference cycle. The recovery wrapper rebuilds a full `AutoContext` for
+/// one reconstruction with the state it already owns.
+#[derive(Clone)]
+pub(crate) struct AutoContextBinding {
+    pub(crate) model: Arc<dyn Model>,
+    pub(crate) budget: Arc<dyn crate::models::ProviderBudget>,
+    pub(crate) policy: CompactionPolicy,
+    pub(crate) max_prompt_messages: usize,
+}
+
+impl AutoContext {
+    pub(crate) fn binding(&self) -> AutoContextBinding {
+        AutoContextBinding {
+            model: Arc::clone(&self.model),
+            budget: Arc::clone(&self.budget),
+            policy: self.policy,
+            max_prompt_messages: self.max_prompt_messages,
+        }
+    }
+
+    pub(crate) fn from_binding(binding: &AutoContextBinding, state: Arc<CompactionState>) -> Self {
+        Self {
+            model: Arc::clone(&binding.model),
+            budget: Arc::clone(&binding.budget),
+            policy: binding.policy,
+            max_prompt_messages: binding.max_prompt_messages,
+            state,
+        }
+    }
 }
 
 /// The result of one request-time compaction decision. Every failure is
@@ -142,7 +177,7 @@ fn group_key(
 /// Returns complete tool exchanges and ordinary settled base items that may
 /// be summarized. Current-loop User/Steer messages, ToolResults without a
 /// complete exchange, and incomplete tool calls are deliberately excluded.
-fn compressible_ranges(
+pub(crate) fn compressible_ranges(
     base_len: usize,
     items: &[&HistoryItem],
     loop_id: LoopId,
@@ -215,7 +250,7 @@ fn group_bytes(items: &[&HistoryItem], range: (usize, usize)) -> usize {
 
 /// The current loop's initial Prompt and every applied Steer, in history
 /// order. These are preserved verbatim and never folded.
-fn current_user_texts<'a>(
+pub(crate) fn current_user_texts<'a>(
     base: &'a [HistoryItem],
     appended: &'a [HistoryItem],
     loop_id: LoopId,
@@ -233,7 +268,7 @@ fn current_user_texts<'a>(
 /// one labeled historical summary data message. `fixed` (system and durable
 /// summary) is preserved exactly; `history` has exactly one entry per
 /// base-then-appended item.
-fn fold_history(
+pub(crate) fn fold_history(
     fixed: &[ModelMessage],
     history: &[ModelMessage],
     base: &[HistoryItem],
@@ -274,7 +309,7 @@ fn fold_history(
 /// Prompt/Steer messages, and the active tool schemas. History, summaries, and
 /// tool exchanges are excluded, so exceeding this proves compaction cannot
 /// help without dropping user constraints.
-fn minimal_messages(
+pub(crate) fn minimal_messages(
     system: &BoundedText,
     current_users: &[&str],
 ) -> Result<Vec<ModelMessage>, UtilityError> {
@@ -358,13 +393,14 @@ pub(crate) fn estimate_startup_exact(
     current_input: &str,
     tools: &[ToolSpec],
     reasoning: ReasoningPreference,
+    budget: &dyn crate::models::ProviderBudget,
 ) -> Result<u64, UtilityError> {
     let (mut fixed, history) = compose(system, summary, base, &[])?;
     fixed.extend(history);
     if !current_input.is_empty() {
         fixed.push(ModelMessage::user(current_input.to_owned()).map_err(invalid)?);
     }
-    estimate_tokens(fixed, tools, reasoning)
+    estimate_tokens_with_budget(budget, fixed, tools, reasoning, None, None)
 }
 
 /// Estimates the irreducible startup minimum: system text, the pending User
@@ -374,19 +410,25 @@ pub(crate) fn estimate_minimal(
     current_inputs: &[&str],
     tools: &[ToolSpec],
     reasoning: ReasoningPreference,
+    budget: &dyn crate::models::ProviderBudget,
 ) -> Result<u64, UtilityError> {
     let messages = minimal_messages(system, current_inputs)?;
-    estimate_tokens(messages, tools, reasoning)
+    estimate_tokens_with_budget(budget, messages, tools, reasoning, None, None)
 }
 
-fn estimate_tokens(
+pub(crate) fn estimate_tokens_with_budget(
+    budget: &dyn crate::models::ProviderBudget,
     messages: Vec<ModelMessage>,
     tools: &[ToolSpec],
     reasoning: ReasoningPreference,
+    loop_id: Option<LoopId>,
+    request_index: Option<u32>,
 ) -> Result<u64, UtilityError> {
     let request = ModelRequest::new(messages, tools.to_vec(), ModelLimits::default(), reasoning)
         .map_err(invalid)?;
-    utility::estimate_request_tokens(&request)
+    budget
+        .estimate_request_tokens(&request, loop_id, request_index)
+        .map_err(|_| UtilityError::Serialization)
 }
 
 /// Applies the automatic policy to one prepared request. It returns the exact
@@ -427,7 +469,14 @@ pub(crate) async fn plan(
             observation.finish("invalid_history", None);
             PlanError::Utility(error)
         })?;
-    let mut tokens = match estimate_tokens(current.clone(), tools, reasoning) {
+    let mut tokens = match estimate_tokens_with_budget(
+        &*auto.budget,
+        current.clone(),
+        tools,
+        reasoning,
+        Some(loop_id),
+        Some(request_index),
+    ) {
         Ok(tokens) => tokens,
         Err(_) => {
             observation.finish("context_uncompressible", None);
@@ -450,7 +499,15 @@ pub(crate) async fn plan(
     let users = current_user_texts(base, appended, loop_id);
     let minimal = minimal_messages(system, &users).map_err(PlanError::Utility)?;
     let minimal_message_count = minimal.len();
-    let minimal_tokens = estimate_tokens(minimal, tools, reasoning).map_err(|error| {
+    let minimal_tokens = estimate_tokens_with_budget(
+        &*auto.budget,
+        minimal,
+        tools,
+        reasoning,
+        Some(loop_id),
+        Some(request_index),
+    )
+    .map_err(|error| {
         observation.finish("invalid_minimum", Some(tokens));
         PlanError::Utility(error)
     })?;
@@ -574,7 +631,14 @@ pub(crate) async fn plan(
                 observation.finish("invalid_history", Some(tokens));
                 PlanError::Utility(error)
             })?;
-        tokens = match estimate_tokens(current.clone(), tools, reasoning) {
+        tokens = match estimate_tokens_with_budget(
+            &*auto.budget,
+            current.clone(),
+            tools,
+            reasoning,
+            Some(loop_id),
+            Some(request_index),
+        ) {
             Ok(tokens) => tokens,
             Err(_) => {
                 observation.finish("context_uncompressible", Some(tokens));
@@ -695,7 +759,7 @@ impl Drop for PlanObservation {
     }
 }
 
-fn merge_utility_usage(
+pub(crate) fn merge_utility_usage(
     total: &mut Option<super::CompactionUtilityUsage>,
     next: Option<super::CompactionUtilityUsage>,
 ) {
@@ -718,7 +782,7 @@ fn merge_utility_usage(
     };
 }
 
-struct GroupSummaryRequest<'a> {
+pub(crate) struct GroupSummaryRequest<'a> {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) reasoning: ReasoningPreference,
     pub(crate) system: &'a BoundedText,
@@ -733,7 +797,7 @@ struct GroupSummaryRequest<'a> {
 /// with the raw no-tools utility identity. Empty, oversized,
 /// no-progress, or timeout outcomes propagate as clear errors rather than a
 /// truncated success.
-async fn summarize_group(
+pub(crate) async fn summarize_group(
     request: GroupSummaryRequest<'_>,
     cancellation: &CancellationToken,
 ) -> Result<utility::SummaryGeneration, SummaryGenerationError> {
@@ -767,7 +831,7 @@ fn raw_fit_fallback_allowed(error: UtilityError) -> bool {
     )
 }
 
-fn invalid(_: ModelValueError) -> UtilityError {
+pub(crate) fn invalid(_: ModelValueError) -> UtilityError {
     UtilityError::InvalidResponse
 }
 
@@ -899,6 +963,7 @@ mod tests {
         let state = CompactionState::new();
         let context = AutoContext {
             model: Arc::clone(&model) as Arc<dyn Model>,
+            budget: Arc::new(crate::models::DefaultProviderBudget),
             policy: CompactionPolicy {
                 enabled: true,
                 trigger_percent: 80,
@@ -1301,6 +1366,7 @@ mod tests {
             &["current"],
             &[] as &[ToolSpec],
             ReasoningPreference::Auto,
+            &crate::models::DefaultProviderBudget,
         )
         .unwrap();
         assert!(tokens > 0);

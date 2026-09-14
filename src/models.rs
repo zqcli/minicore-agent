@@ -6,7 +6,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use minicore_runtime::model::{Model, ModelRef, ModelRequest, ReasoningPreference};
+use minicore_runtime::LoopId;
+use minicore_runtime::model::{Model, ModelError, ModelRef, ModelRequest, ReasoningPreference};
 
 mod openai;
 
@@ -141,8 +142,74 @@ pub struct ModelInfo {
     pub supported_reasoning: Vec<ReasoningPreference>,
 }
 
+pub(crate) trait ProviderBudget: Send + Sync {
+    fn estimate_request_tokens(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<u64, ModelError>;
+
+    fn estimate_request_bytes(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<usize, ModelError>;
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DefaultProviderBudget;
+
+#[cfg(test)]
+impl ProviderBudget for DefaultProviderBudget {
+    fn estimate_request_tokens(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<u64, ModelError> {
+        let bytes = self.estimate_request_bytes(request, loop_id, request_index)?;
+        Ok(bytes.div_ceil(4) as u64)
+    }
+
+    fn estimate_request_bytes(
+        &self,
+        request: &ModelRequest,
+        _loop_id: Option<LoopId>,
+        _request_index: Option<u32>,
+    ) -> Result<usize, ModelError> {
+        let mut bytes = 0usize;
+        let mut writer = BudgetCountingWriter(&mut bytes);
+        openai::serialize_request_for_budget(request, &mut writer)?;
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+struct BudgetCountingWriter<'a>(&'a mut usize);
+
+#[cfg(test)]
+impl std::io::Write for BudgetCountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        *self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ModelEntry {
+    pub(crate) model: Arc<dyn Model>,
+    pub(crate) budget: Arc<dyn ProviderBudget>,
+}
+
 pub(crate) struct Models {
-    values: BTreeMap<String, Arc<dyn Model>>,
+    values: BTreeMap<String, ModelEntry>,
 }
 
 impl Clone for Models {
@@ -151,7 +218,7 @@ impl Clone for Models {
             values: self
                 .values
                 .iter()
-                .map(|(id, model)| (id.clone(), Arc::clone(model)))
+                .map(|(id, entry)| (id.clone(), entry.clone()))
                 .collect(),
         }
     }
@@ -171,7 +238,7 @@ impl Models {
         let mut values = BTreeMap::new();
         for (id, value) in config {
             value.validate()?;
-            let model: Arc<dyn Model> = match value {
+            let entry = match value {
                 ModelConfig::OpenAiResponses {
                     model,
                     base_url,
@@ -204,31 +271,54 @@ impl Models {
                         supports_tools: *supports_tools,
                         request_timeout: request_timeout_seconds.map(Duration::from_secs),
                     };
-                    Arc::new(openai::OpenAiResponsesModel::new(settings)?)
+                    let openai_model = Arc::new(openai::OpenAiResponsesModel::new(settings)?);
+                    ModelEntry {
+                        model: Arc::clone(&openai_model) as Arc<dyn Model>,
+                        budget: Arc::clone(&openai_model) as Arc<dyn ProviderBudget>,
+                    }
                 }
             };
-            values.insert(id.clone(), model);
+            values.insert(id.clone(), entry);
         }
         Ok(Self { values })
     }
 
     #[cfg(test)]
     pub(crate) fn from_values(values: BTreeMap<String, Arc<dyn Model>>) -> Self {
-        Self { values }
+        let entries = values
+            .into_iter()
+            .map(|(id, model)| {
+                (
+                    id,
+                    ModelEntry {
+                        model,
+                        budget: Arc::new(DefaultProviderBudget),
+                    },
+                )
+            })
+            .collect();
+        Self { values: entries }
     }
 
     pub(crate) fn get(&self, id: &str) -> Result<Arc<dyn Model>, ModelConfigError> {
         self.values
             .get(id)
-            .map(Arc::clone)
+            .map(|entry| Arc::clone(&entry.model))
+            .ok_or(ModelConfigError::NotFound)
+    }
+
+    pub(crate) fn get_budget(&self, id: &str) -> Result<Arc<dyn ProviderBudget>, ModelConfigError> {
+        self.values
+            .get(id)
+            .map(|entry| Arc::clone(&entry.budget))
             .ok_or(ModelConfigError::NotFound)
     }
 
     pub(crate) fn list(&self) -> Vec<ModelInfo> {
         self.values
             .iter()
-            .map(|(id, model)| {
-                let descriptor = model.descriptor();
+            .map(|(id, entry)| {
+                let descriptor = entry.model.descriptor();
                 ModelInfo {
                     id: id.clone(),
                     model_ref: descriptor.model_ref.clone(),

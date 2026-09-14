@@ -40,6 +40,8 @@ use super::{
     UpdateSession,
 };
 
+use crate::openai_mock::{CapturedRequest, MockResponse, MockServer};
+
 struct TestDirectoryGuard {
     path: PathBuf,
 }
@@ -116,6 +118,9 @@ enum ModelScript {
     /// request with one tool call so the loop runs a tool (with an await)
     /// before its next request.
     BurstTextThenTool(&'static str, usize, &'static str, serde_json::Value),
+    ContextOverflowNotStarted,
+    Error(ModelError),
+    StreamErrorAfterText(&'static str, ModelError),
 }
 
 struct FakeModel {
@@ -123,6 +128,7 @@ struct FakeModel {
     descriptor: ModelDescriptor,
     scripts: Arc<Mutex<VecDeque<ModelScript>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
+    contexts: Arc<Mutex<Vec<ModelCallContext>>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -136,25 +142,40 @@ impl FakeModel {
         context_window: u64,
         scripts: impl IntoIterator<Item = ModelScript>,
     ) -> Arc<Self> {
-        let model_ref: ModelRef = model_ref.parse().unwrap();
-        let descriptor = ModelDescriptor::new(
-            model_ref.clone(),
+        Self::with_reasoning(
+            model_ref,
             context_window,
             fake_supported_reasoning(),
-            true,
+            scripts,
         )
-        .unwrap();
+    }
+
+    fn with_reasoning(
+        model_ref: &str,
+        context_window: u64,
+        supported_reasoning: BTreeSet<ReasoningPreference>,
+        scripts: impl IntoIterator<Item = ModelScript>,
+    ) -> Arc<Self> {
+        let model_ref: ModelRef = model_ref.parse().unwrap();
+        let descriptor =
+            ModelDescriptor::new(model_ref.clone(), context_window, supported_reasoning, true)
+                .unwrap();
         Arc::new(Self {
             model_ref,
             descriptor,
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
             requests: Arc::new(Mutex::new(Vec::new())),
+            contexts: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     fn requests(&self) -> Arc<Mutex<Vec<ModelRequest>>> {
         Arc::clone(&self.requests)
+    }
+
+    fn contexts(&self) -> Arc<Mutex<Vec<ModelCallContext>>> {
+        Arc::clone(&self.contexts)
     }
 }
 
@@ -163,9 +184,10 @@ impl Model for FakeModel {
         &self.descriptor
     }
 
-    fn start(&self, request: ModelRequest, _context: ModelCallContext) -> ModelStartFuture<'_> {
+    fn start(&self, request: ModelRequest, context: ModelCallContext) -> ModelStartFuture<'_> {
         let model_ref = self.model_ref.clone();
         self.requests.lock().unwrap().push(request);
+        self.contexts.lock().unwrap().push(context);
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
         let script = self
             .scripts
@@ -308,6 +330,26 @@ impl Model for FakeModel {
                         reason: ModelFinishReason::Stop,
                     },
                 ]),
+                ModelScript::ContextOverflowNotStarted => {
+                    let diagnostic = minicore_runtime::error::DiagnosticSummary::new(
+                        minicore_runtime::error::DiagnosticCode::InvalidConfiguration,
+                        minicore_runtime::error::DiagnosticCategory::Model,
+                        minicore_runtime::value::BoundedText::new("context window exceeded")
+                            .unwrap(),
+                        false,
+                    );
+                    Err(ModelError::permanent(
+                        minicore_runtime::model::ModelErrorKind::ContextOverflow,
+                        minicore_runtime::model::DeliveryState::NotStarted,
+                        diagnostic,
+                    ))
+                }
+                ModelScript::Error(err) => Err(err),
+                ModelScript::StreamErrorAfterText(text, err) => {
+                    let event_rows = vec![Ok(ModelEvent::text_delta(text).unwrap()), Err(err)];
+                    let stream: ModelStream = Box::pin(stream::iter(event_rows));
+                    Ok(stream)
+                }
             }
         })
     }
@@ -5831,4 +5873,891 @@ async fn rejected_tool_input_never_fabricates_a_file_operation() {
     );
     assert!(invocation.input.preview.contains("out.txt"));
     assert!(!invocation.input.preview.contains("content"));
+}
+
+// ---------------------------------------------------------------------------
+// P3b2: Provider Replay Budget And ContextOverflow Recovery Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_provider_overflow_recovery_success() {
+    let (data_dir, _guard) = fixture_dir("p3b2-recovery-success");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // A tool result large enough that replacing the whole exchange with the
+    // labeled summary envelope strictly shrinks the provider body.
+    std::fs::write(workspace.join("note.txt"), "recovery note ".repeat(400)).unwrap();
+
+    let profile = read_profile();
+
+    // One loop: request 0 runs the tool batch, request 1 rejects with
+    // ContextOverflowNotStarted, utility summarizes the exchange, and the
+    // same logical request is retried once with the clean projection.
+    let model = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("Summary of prior read tool exchange"),
+            ModelScript::Text("recovered answer"),
+        ],
+    );
+
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        profile,
+    )
+    .await;
+
+    let info = create_session(&mut agent, &workspace).await;
+
+    let turn = send_text(&mut agent, info.session_id, "read note").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+
+    let history = read_store_history(&data_dir, info.session_id).await;
+    let texts = flatten_texts(&history);
+    assert!(texts.iter().any(|t| t == "recovered answer"));
+    let user_messages: Vec<_> = history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::User(u) => Some(u.input.as_text().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_messages, vec!["read note"]);
+    // The original tool exchange stays in durable history exactly once even
+    // though the retried request projected a summary instead.
+    let tool_results = history
+        .iter()
+        .filter(|item| matches!(item, HistoryItem::ToolResult(_)))
+        .count();
+    assert_eq!(tool_results, 1);
+
+    let context = agent.session_context(info.session_id).unwrap();
+    let recovery = context
+        .recovery
+        .expect("recovery observation must be recorded");
+    assert_eq!(recovery.outcome, "recovered");
+    assert!(recovery.before_tokens.is_some());
+    assert!(recovery.after_tokens.is_some());
+    assert!(recovery.utility_usage.is_some());
+}
+
+#[tokio::test]
+async fn test_provider_overflow_stops_on_second_failure() {
+    let (data_dir, _guard) = fixture_dir("p3b2-second-overflow");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("note.txt"), "recovery note ".repeat(400)).unwrap();
+
+    let profile = read_profile();
+
+    let model = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("Summary of prior read exchange"),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("should not be reached"),
+        ],
+    );
+
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        profile,
+    )
+    .await;
+
+    let info = create_session(&mut agent, &workspace).await;
+
+    let turn = send_text(&mut agent, info.session_id, "read note").await;
+    let result = wait_text(&agent, turn).await;
+    assert!(matches!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Failed(_)
+    ));
+    // overflow, summary, second overflow: the retry never runs a third raw
+    // start and the unused script is not consumed.
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
+
+    let context = agent.session_context(info.session_id).unwrap();
+    let recovery = context
+        .recovery
+        .expect("recovery observation must be recorded");
+    assert_eq!(recovery.outcome, "recovery_failed");
+    assert_eq!(recovery.failure_kind.as_deref(), Some("context_overflow"));
+    // The utility usage of the failed recovery attempt is retained.
+    assert!(recovery.utility_usage.is_some());
+}
+
+#[tokio::test]
+async fn test_recovery_refuses_when_summary_cannot_shrink() {
+    let (data_dir, _guard) = fixture_dir("p3b2-no-shrink");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // A tiny exchange is smaller than the labeled summary envelope, so the
+    // utility can never produce a strictly smaller projection for it. The
+    // first summary starts the reduce loop, the second shrinks the content
+    // without winning the budget, and the third cannot shrink further.
+    std::fs::write(workspace.join("tiny.txt"), "x").unwrap();
+
+    let model = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ToolCall("read", json!({"path": "tiny.txt"})),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("Summary of the tiny read exchange"),
+            ModelScript::Text("S"),
+            ModelScript::Text("never"),
+        ],
+    );
+
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read tiny").await;
+    let result = wait_text(&agent, turn).await;
+    assert!(matches!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Failed(_)
+    ));
+    // overflow plus three utility calls; no second raw start happens.
+    assert_eq!(model.calls.load(Ordering::SeqCst), 5);
+
+    let context = agent.session_context(info.session_id).unwrap();
+    let recovery = context
+        .recovery
+        .expect("recovery observation must be recorded");
+    assert_eq!(recovery.outcome, "recovery_failed");
+    assert_eq!(recovery.failure_kind.as_deref(), Some("no_progress"));
+    assert!(recovery.utility_usage.is_some());
+}
+
+#[tokio::test]
+async fn non_recoverable_model_failures_are_not_retried_as_recovery() {
+    let cases = [
+        (
+            "unknown-provider-unavailable",
+            minicore_runtime::model::ModelErrorKind::ProviderUnavailable,
+            minicore_runtime::model::DeliveryState::Unknown,
+            false,
+        ),
+        (
+            "started-provider-unavailable",
+            minicore_runtime::model::ModelErrorKind::ProviderUnavailable,
+            minicore_runtime::model::DeliveryState::Started,
+            false,
+        ),
+        (
+            "unknown-context-overflow",
+            minicore_runtime::model::ModelErrorKind::ContextOverflow,
+            minicore_runtime::model::DeliveryState::Unknown,
+            false,
+        ),
+        (
+            "started-context-overflow",
+            minicore_runtime::model::ModelErrorKind::ContextOverflow,
+            minicore_runtime::model::DeliveryState::Started,
+            false,
+        ),
+        (
+            "started-mid-stream-context-overflow",
+            minicore_runtime::model::ModelErrorKind::ContextOverflow,
+            minicore_runtime::model::DeliveryState::Started,
+            true,
+        ),
+    ];
+    for (label, kind, delivery, mid_stream) in cases {
+        let (data_dir, _guard) = fixture_dir(label);
+        let workspace = data_dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("note.txt"), "provider note ".repeat(200)).unwrap();
+
+        let diagnostic = minicore_runtime::error::DiagnosticSummary::new(
+            minicore_runtime::error::DiagnosticCode::InvalidConfiguration,
+            minicore_runtime::error::DiagnosticCategory::Model,
+            minicore_runtime::value::BoundedText::new("injected model failure").unwrap(),
+            false,
+        );
+        let error = match delivery {
+            minicore_runtime::model::DeliveryState::Unknown => {
+                ModelError::unknown(kind, diagnostic)
+            }
+            minicore_runtime::model::DeliveryState::Started => {
+                ModelError::started(kind, diagnostic)
+            }
+            _ => unreachable!("only unknown and started deliveries are exercised"),
+        };
+
+        // The failing request follows a real tool exchange, so a compressible
+        // recovery source exists; only `ContextOverflow + NotStarted` may use
+        // it.
+        let failing = if mid_stream {
+            ModelScript::StreamErrorAfterText("partial text", error)
+        } else {
+            ModelScript::Error(error)
+        };
+        let model = FakeModel::with_window(
+            "main",
+            16_384,
+            [
+                ModelScript::ToolCall("read", json!({"path": "note.txt"})),
+                failing,
+                ModelScript::Text("must not be reached"),
+            ],
+        );
+
+        let mut agent = open_agent_auto(
+            &data_dir,
+            BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+            read_profile(),
+        )
+        .await;
+
+        let info = create_session(&mut agent, &workspace).await;
+
+        let turn = send_text(&mut agent, info.session_id, "read note").await;
+        let res = wait_text(&agent, turn).await;
+        assert!(
+            matches!(res.report.outcome, minicore_runtime::LoopOutcome::Failed(_)),
+            "{label} must fail the turn"
+        );
+        // Tool request plus the injected failure; recovery never starts.
+        assert_eq!(model.calls.load(Ordering::SeqCst), 2, "{label}");
+        let context = agent.session_context(info.session_id).unwrap();
+        assert!(context.recovery.is_none(), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn test_driver_retry_reentry_does_not_reset_recovery_quota() {
+    let (data_dir, _guard) = fixture_dir("p3b2-retry-reentry");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("note.txt"), "recovery note ".repeat(400)).unwrap();
+
+    let profile = read_profile();
+
+    let retryable = ModelError::not_started(
+        minicore_runtime::model::ModelErrorKind::RateLimited,
+        Some(std::time::Duration::from_millis(1)),
+        minicore_runtime::error::DiagnosticSummary::new(
+            minicore_runtime::error::DiagnosticCode::ModelUnavailable,
+            minicore_runtime::error::DiagnosticCategory::Model,
+            minicore_runtime::value::BoundedText::new("retry shortly").unwrap(),
+            true,
+        ),
+    );
+
+    // The second start fails with a Driver-retryable error, so the Driver
+    // re-enters the same logical request. That retry must not grant another
+    // ContextOverflow recovery even though the next attempt overflows again.
+    let model = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("Summary of prior read exchange"),
+            ModelScript::Error(retryable),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("never reached"),
+        ],
+    );
+
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        profile,
+    )
+    .await;
+
+    let info = create_session(&mut agent, &workspace).await;
+
+    let turn = send_text(&mut agent, info.session_id, "read note").await;
+    let result = wait_text(&agent, turn).await;
+    assert!(matches!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Failed(_)
+    ));
+    // tool call, overflow, summary, retryable start failure, re-entered
+    // overflow: the unused script is never consumed by a second recovery.
+    assert_eq!(model.calls.load(Ordering::SeqCst), 5);
+
+    // Main requests keep one logical identity (loop id + request index) and
+    // one deadline across the recovery retry and the Driver retry; the utility
+    // runs on its own loop with its own attempt window.
+    let contexts = model.contexts();
+    let contexts = contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 5);
+    let loop_id = contexts[0].loop_id;
+    assert_eq!(contexts[0].request_index, 0);
+    for index in [1, 3, 4] {
+        assert_eq!(contexts[index].loop_id, loop_id);
+        assert_eq!(contexts[index].request_index, 1);
+        assert_eq!(contexts[index].deadline, contexts[1].deadline);
+    }
+    assert_ne!(contexts[2].loop_id, loop_id);
+    assert_eq!(contexts[2].request_index, 0);
+
+    let context = agent.session_context(info.session_id).unwrap();
+    let recovery = context
+        .recovery
+        .expect("recovery observation must be recorded");
+    assert_eq!(recovery.outcome, "recovery_failed");
+    // The observation belongs to the failed recovery attempt, not to a new one.
+    assert_eq!(recovery.failure_kind.as_deref(), Some("rate_limited"));
+    assert!(recovery.utility_usage.is_some());
+}
+
+#[tokio::test]
+async fn test_model_update_before_turn_uses_new_model() {
+    let (data_dir, _guard) = fixture_dir("p3b2-stale-ticket-update");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let profile = read_profile();
+
+    let model_a = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("not reached because stale"),
+        ],
+    );
+    let model_b = FakeModel::with_window("other", 16_384, [ModelScript::Text("from model b")]);
+
+    let mut models_map = BTreeMap::new();
+    models_map.insert("main".to_owned(), model_config("PATH"));
+    models_map.insert("other".to_owned(), model_config("PATH"));
+
+    let config = auto_config(data_dir.to_path_buf(), models_map, profile);
+
+    let runtime_models = BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a) as Arc<dyn Model>),
+        ("other".to_owned(), Arc::clone(&model_b) as Arc<dyn Model>),
+    ]);
+
+    let mut agent = Agent::open_with_models(config, Models::from_values(runtime_models))
+        .await
+        .unwrap();
+
+    let info = create_session(&mut agent, &workspace).await;
+
+    let updated = agent
+        .update_session(UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: Some(ReasoningPreference::Auto),
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated.active_revision, None);
+
+    let turn = send_text(&mut agent, info.session_id, "hello").await;
+    let res = wait_text(&agent, turn).await;
+    assert_eq!(res.report.outcome, minicore_runtime::LoopOutcome::Completed);
+    let history = read_store_history(&data_dir, info.session_id).await;
+    let texts = flatten_texts(&history);
+    assert!(texts.iter().any(|t| t == "from model b"));
+}
+
+#[tokio::test]
+async fn test_failed_update_does_not_publish_a_new_recovery_binding() {
+    let (data_dir, _guard) = fixture_dir("p3b2-failed-update");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("note.txt"), "note ".repeat(200)).unwrap();
+
+    let profile = read_profile();
+
+    // Model A serves the session and its recovery utility.
+    let model_a = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("summary from a"),
+            ModelScript::Text("recovered by a"),
+        ],
+    );
+    // Model B cannot serve High reasoning, so the update fails inside the
+    // config factory after the model lookup succeeded.
+    let model_b = FakeModel::with_reasoning(
+        "other",
+        16_384,
+        BTreeSet::from([ReasoningPreference::Auto]),
+        [ModelScript::Text("summary from b")],
+    );
+
+    let mut models_map = BTreeMap::new();
+    models_map.insert("main".to_owned(), model_config("PATH"));
+    models_map.insert("other".to_owned(), model_config("PATH"));
+    let config = auto_config(data_dir.to_path_buf(), models_map, profile);
+
+    let runtime_models = BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a) as Arc<dyn Model>),
+        ("other".to_owned(), Arc::clone(&model_b) as Arc<dyn Model>),
+    ]);
+    let mut agent = Agent::open_with_models(config, Models::from_values(runtime_models))
+        .await
+        .unwrap();
+
+    let info = create_session(&mut agent, &workspace).await;
+    let failed = agent
+        .update_session(UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: Some(ReasoningPreference::High),
+        })
+        .await;
+    assert!(failed.is_err(), "the update must fail");
+
+    // The session keeps model A and its recovery binding: the overflow
+    // recovery must be summarized by A, never by the failed update's model.
+    let turn = send_text(&mut agent, info.session_id, "read note").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    let history = read_store_history(&data_dir, info.session_id).await;
+    let texts = flatten_texts(&history);
+    assert!(texts.iter().any(|t| t == "recovered by a"));
+    assert_eq!(model_b.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_recovery_two_sessions_isolated() {
+    let (data_dir, _guard) = fixture_dir("p3b2-sessions-isolated");
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("a.txt"), "content a ".repeat(400)).unwrap();
+
+    let profile = read_profile();
+
+    // Session A overflows inside the same loop that ran its tool batch;
+    // session B must see no recovery observation and no shared ticket.
+    let model = FakeModel::with_window(
+        "main",
+        16_384,
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt"})),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("Summary for A"),
+            ModelScript::Text("recovered a"),
+            ModelScript::Text("session b answer"),
+        ],
+    );
+
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        profile,
+    )
+    .await;
+
+    let info_a = create_session(&mut agent, &workspace).await;
+    let info_b = create_session(&mut agent, &workspace).await;
+
+    let turn_a = send_text(&mut agent, info_a.session_id, "read a").await;
+    let result_a = wait_text(&agent, turn_a).await;
+    assert_eq!(
+        result_a.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+
+    let turn_b = send_text(&mut agent, info_b.session_id, "hello from b").await;
+    let result_b = wait_text(&agent, turn_b).await;
+    assert_eq!(
+        result_b.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+
+    let context_a = agent.session_context(info_a.session_id).unwrap();
+    let recovery_a = context_a.recovery.expect("session A has recovery");
+    assert_eq!(recovery_a.outcome, "recovered");
+
+    let context_b = agent.session_context(info_b.session_id).unwrap();
+    assert!(context_b.recovery.is_none());
+
+    let history_a = read_store_history(&data_dir, info_a.session_id).await;
+    let history_b = read_store_history(&data_dir, info_b.session_id).await;
+    assert!(
+        flatten_texts(&history_a)
+            .iter()
+            .any(|text| text == "recovered a")
+    );
+    assert!(
+        !flatten_texts(&history_b)
+            .iter()
+            .any(|text| text == "recovered a")
+    );
+}
+
+/// Marker carried by every opaque provider replay item in the loopback
+/// fixture.
+const REPLAY_MARKER: &str = "provider-replay-opaque-";
+
+/// Real-HTTP loopback for provider replay budgeting.
+///
+/// Both modes answer the tool round with the same opaque replay item. With
+/// `preflight` the replay alone exceeds the effective hard budget, so the
+/// preparation plan must summarize before sending and the server sees
+/// tool -> utility -> recovered. Without it the replaying request is sent and
+/// the provider itself rejects it with a structured 400 before recovery
+/// summarizes.
+async fn openai_overflow_loopback(preflight: bool) -> MockServer {
+    let replay_units = if preflight { 3_000 } else { 120 };
+    let opaque_replay = REPLAY_MARKER.repeat(replay_units);
+
+    let tool_call_event = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "id": "fc_001",
+            "call_id": "call_read_1",
+            "name": "read",
+            "arguments": "{\"path\":\"file.txt\"}",
+            "status": "in_progress"
+        }
+    });
+    let tool_call_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "id": "fc_001",
+            "call_id": "call_read_1",
+            "name": "read",
+            "arguments": "{\"path\":\"file.txt\"}",
+            "status": "completed",
+            "provider": {"opaque": opaque_replay}
+        }
+    });
+    let tool_turn_done = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_001",
+                "call_id": "call_read_1",
+                "name": "read",
+                "arguments": "{\"path\":\"file.txt\"}",
+                "status": "completed",
+                "provider": {"opaque": opaque_replay}
+            }]
+        }
+    });
+
+    let overflow_error_body = json!({
+        "error": {
+            "message": "This model's maximum context length is 16384 tokens. However, your messages resulted in 17000 tokens.",
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded"
+        }
+    });
+
+    let summary_events = vec![
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Summary of prior read execution"
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Summary of prior read execution"}]
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Summary of prior read execution"}]
+                }]
+            }
+        }),
+    ];
+
+    let recovered_events = vec![
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "Recovered: file contains hello"
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Recovered: file contains hello"}]
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Recovered: file contains hello"}]
+                }]
+            }
+        }),
+    ];
+
+    let tool_move = MockResponse::sse(&[tool_call_event, tool_call_done, tool_turn_done]);
+    let responses = if preflight {
+        // No over-budget replay body is ever expected on the wire.
+        vec![
+            tool_move,
+            MockResponse::sse(&summary_events),
+            MockResponse::sse(&recovered_events),
+        ]
+    } else {
+        vec![
+            tool_move,
+            MockResponse::json(400, serde_json::to_vec(&overflow_error_body).unwrap()),
+            MockResponse::sse(&summary_events),
+            MockResponse::sse(&recovered_events),
+        ]
+    };
+    MockServer::spawn(responses).await
+}
+
+/// Extracts the JSON-lines history records embedded in one utility source
+/// chunk message. `compaction/utility.rs` frames each chunk as the source
+/// prefix, a fixed instruction line, `chunk=<index>`, the records, and the
+/// source suffix; only the bytes between the chunk header and the suffix are
+/// returned, so consecutive chunks concatenate back into one record stream.
+fn utility_source_payload(text: &str) -> Option<String> {
+    const BEGIN: &str = "[BEGIN MINICORE HISTORICAL SOURCE DATA]";
+    const END: &str = "[END MINICORE HISTORICAL SOURCE DATA]";
+    let start = text.find(BEGIN)? + BEGIN.len();
+    let end = text.rfind(END)?;
+    let inner = text.get(start..end)?;
+    let header = inner.find("chunk=")?;
+    let newline = inner[header..].find('\n')?;
+    inner.get(header + newline + 1..).map(str::to_owned)
+}
+
+/// Drives one agent turn through the loopback fixture and asserts the
+/// provider-aware budget invariants shared by both modes.
+async fn run_openai_overflow_loopback(preflight: bool) {
+    let label = if preflight {
+        "p3b2-openai-preflight"
+    } else {
+        "p3b2-openai-real-loop"
+    };
+    let (data_dir, _guard) = fixture_dir(label);
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file_content = "hello ".repeat(800);
+    std::fs::write(workspace.join("file.txt"), &file_content).unwrap();
+
+    let server = openai_overflow_loopback(preflight).await;
+
+    let mut m_config = model_config("PATH");
+    let ModelConfig::OpenAiResponses {
+        base_url,
+        physical_context_window,
+        ..
+    } = &mut m_config;
+    *base_url = server.base_url().to_owned();
+    *physical_context_window = 16_384;
+
+    let config = auto_config(
+        data_dir.to_path_buf(),
+        BTreeMap::from([("main".to_owned(), m_config)]),
+        read_profile(),
+    );
+
+    let mut agent = Agent::open(config).await.unwrap();
+
+    let info = create_session(&mut agent, &workspace).await;
+
+    let turn = send_text(&mut agent, info.session_id, "read file").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+
+    let history = read_store_history(&data_dir, info.session_id).await;
+    let texts = flatten_texts(&history);
+    assert!(texts.iter().any(|t| t == "Recovered: file contains hello"));
+    // Provider-owned metadata stays in the request continuation and is never
+    // persisted into durable history.
+    assert!(
+        !serde_json::to_string(&history)
+            .unwrap()
+            .contains(REPLAY_MARKER)
+    );
+
+    let context = agent.session_context(info.session_id).unwrap();
+    if preflight {
+        // No provider rejection is needed: the plan compressed the over-budget
+        // replaying request before it was sent.
+        assert!(context.recovery.is_none());
+        let automatic = context
+            .automatic
+            .last
+            .expect("preflight plan observation must be retained");
+        assert_eq!(automatic.outcome, "compacted");
+        let before = automatic.before_tokens.expect("plan before tokens");
+        let after = automatic.after_tokens.expect("plan after tokens");
+        assert!(after < before, "preflight body must strictly shrink");
+        assert!(
+            after <= automatic.hard_tokens,
+            "preflight body must fit the hard window"
+        );
+        assert!(automatic.utility_usage.is_some());
+    } else {
+        let recovery = context.recovery.expect("recovery observation must exist");
+        assert_eq!(recovery.outcome, "recovered");
+        let before = recovery.before_tokens.expect("recovery before tokens");
+        let after = recovery.after_tokens.expect("recovery after tokens");
+        assert!(after < before, "recovered body must strictly shrink");
+        assert!(recovery.utility_usage.is_some());
+    }
+
+    let captured = server.finish().await;
+    assert_eq!(captured.len(), if preflight { 3 } else { 4 });
+    let bodies = captured
+        .iter()
+        .map(CapturedRequest::json_body)
+        .collect::<Vec<_>>();
+    let encoded = |index: usize| serde_json::to_string(&bodies[index]).unwrap();
+    // The utility summarizer is the only tool-free request; it carries the
+    // source data but never a provider replay.
+    let utility = bodies
+        .iter()
+        .position(|body| body.get("tools").is_none())
+        .expect("utility request must be tool-free");
+    assert_eq!(utility, if preflight { 1 } else { 2 });
+    assert!(encoded(utility).contains("MINICORE HISTORICAL SOURCE DATA"));
+    assert!(!encoded(utility).contains(REPLAY_MARKER));
+    // The utility summarizer embeds real Runtime history records as JSON lines
+    // inside its source messages, so check that stream structurally instead of
+    // looking for provider wire items there.
+    let utility_payload = bodies[utility]["input"]
+        .as_array()
+        .expect("utility input array")
+        .iter()
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter_map(|content| content["text"].as_str())
+        .filter_map(utility_source_payload)
+        .collect::<String>();
+    let utility_records = utility_payload
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<HistoryItem>(line)
+                .expect("utility source records must be serialized history items")
+        })
+        .collect::<Vec<_>>();
+    let tool_results = utility_records
+        .iter()
+        .filter_map(|record| match record {
+            HistoryItem::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_results.len(),
+        1,
+        "the utility source must contain the real tool result exactly once"
+    );
+    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Success);
+    assert_eq!(tool_results[0].call_id.as_str(), "call_read_1");
+    assert_eq!(tool_results[0].tool_name.as_str(), "read");
+    assert_eq!(
+        tool_results[0].output.content().as_str(),
+        format!("1: {file_content}")
+    );
+    let matching_calls = utility_records
+        .iter()
+        .filter_map(|record| match record {
+            HistoryItem::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .flat_map(|assistant| assistant.content.iter())
+        .filter_map(AssistantPart::as_tool_call)
+        .filter(|call| call.tool_call_id().as_str() == "call_read_1")
+        .count();
+    assert_eq!(matching_calls, 1, "the matching tool call must appear once");
+
+    let folded = encoded(bodies.len() - 1);
+    assert!(folded.contains("MINICORE HISTORICAL SUMMARY DATA"));
+    assert!(!folded.contains(REPLAY_MARKER));
+    assert!(!folded.contains("\"function_call_output\""));
+    // The folded request retains the original user prompt exactly once and
+    // does not resend the summarized tool result.
+    let folded_input = bodies[bodies.len() - 1]["input"]
+        .as_array()
+        .expect("input array")
+        .clone();
+    let repeated_prompt = folded_input
+        .iter()
+        .filter(|item| item["type"] == json!("message") && item["role"] == json!("user"))
+        .flat_map(|item| item["content"].as_array().cloned().unwrap_or_default())
+        .filter(|content| content["text"] == json!("read file"))
+        .count();
+    assert_eq!(
+        repeated_prompt, 1,
+        "the original user prompt must appear once"
+    );
+    if preflight {
+        // The over-budget replay body was never sent: only the tool request,
+        // the utility call, and the folded request reached the provider.
+        assert!(bodies[0].get("tools").is_some());
+    } else {
+        // The rejected attempt replayed the provider-owned raw item exactly as
+        // the provider returned it, and the folded retry strictly shrank.
+        let replayed = encoded(1);
+        assert!(replayed.contains(REPLAY_MARKER));
+        assert!(replayed.contains("\"function_call_output\""));
+        let rejected_len = serde_json::to_vec(&bodies[1]).unwrap().len();
+        let folded_len = serde_json::to_vec(&bodies[bodies.len() - 1]).unwrap().len();
+        assert!(
+            folded_len < rejected_len,
+            "folded body must strictly shrink"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_openai_loopback_http_overflow_recovery_real_loop() {
+    run_openai_overflow_loopback(false).await;
+}
+
+#[tokio::test]
+async fn test_openai_loopback_preflight_compresses_over_budget_replay() {
+    run_openai_overflow_loopback(true).await;
 }

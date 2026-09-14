@@ -25,9 +25,7 @@ use crate::sessions::TurnRef;
 
 use super::*;
 
-#[path = "../../../tests/support/openai_mock.rs"]
-mod openai_mock;
-use openai_mock::{ConcurrentMockServer, MockResponse, MockServer, sse_body};
+use crate::openai_mock::{ConcurrentMockServer, MockResponse, MockServer, sse_body};
 
 fn settings(base_url: &str) -> OpenAiResponsesSettings {
     OpenAiResponsesSettings {
@@ -6157,6 +6155,84 @@ async fn reasoning_missing_identity_recovers_known_part_with_single_newline() {
         text, "Planning phase\nDetail",
         "live stream must flatten to exactly one newline at the real boundary"
     );
+}
+
+#[tokio::test]
+async fn budget_estimator_shares_continuation_replay_selection_with_the_sender() {
+    const CALL_ID: &str = "call-budget-replay";
+    let opaque = "opaque-budget-".repeat(64);
+    let function_call_item = json!({
+        "type": "function_call",
+        "id": "fc_budget_replay",
+        "call_id": CALL_ID,
+        "name": "read",
+        "arguments": "{\"path\":\"a.txt\"}",
+        "status": "completed",
+        "provider": {"opaque": opaque}
+    });
+    let server = MockServer::spawn([MockResponse::sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": function_call_item
+        }),
+        completed(usage()),
+    ])])
+    .await;
+    let model = model(server.base_url());
+    let loop_id: LoopId = "lup_00000000000000000000000000000002".parse().unwrap();
+    let call_id = ToolCallId::new(CALL_ID).unwrap();
+    let call = ToolCall::new(
+        call_id.clone(),
+        "read".parse().unwrap(),
+        json!({"path": "a.txt"}),
+        0,
+    )
+    .unwrap();
+    let request0 = ModelRequest::new(
+        vec![ModelMessage::user("read a").unwrap()],
+        vec![read_tool()],
+        ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+        ReasoningPreference::High,
+    )
+    .unwrap();
+    run_model(
+        &model,
+        request0,
+        context_for_loop(loop_id, 0, CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+
+    let request1 = ModelRequest::new(
+        vec![
+            ModelMessage::user("read a").unwrap(),
+            ModelMessage::assistant(vec![AssistantPart::ToolCall(call)]).unwrap(),
+            ModelMessage::tool_with_outcome(
+                call_id,
+                ToolOutput::new("a contents").unwrap(),
+                ToolResultOutcome::Success,
+            )
+            .unwrap(),
+        ],
+        vec![read_tool()],
+        ModelLimits::new(Some(8_000), Some(1_024)).unwrap(),
+        ReasoningPreference::High,
+    )
+    .unwrap();
+
+    // Consecutive request 1 selects the stored continuation, so the estimator
+    // sees the provider-owned raw item exactly as the sender would.
+    let with_replay = model
+        .estimate_budget_bytes(&request1, Some(loop_id), Some(1))
+        .unwrap();
+    let without_replay = model.estimate_budget_bytes(&request1, None, None).unwrap();
+    assert!(with_replay > without_replay);
+    // A non-consecutive index is the same clean request as no continuation.
+    let skipped = model
+        .estimate_budget_bytes(&request1, Some(loop_id), Some(2))
+        .unwrap();
+    assert_eq!(skipped, without_replay);
 }
 
 #[tokio::test]

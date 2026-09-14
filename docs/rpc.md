@@ -411,7 +411,15 @@ When automatic compaction is enabled, `input_budget_tokens`,
 context window and the active policy thresholds; they are `null` when the
 policy is disabled. `last_prepare_failure` is the most recent
 request-preparation failure kind (or `null`, for example before any failure)
-and is cleared by a successful preparation. `last_result` is the latest manual
+and is cleared by a successful preparation. `recovery` describes the latest
+provider `ContextOverflow + NotStarted` recovery observation (loop ID, request index,
+before/after tokens, independent utility usage, outcome, and failure kind) when
+an in-flight recovery has been attempted; the field is omitted when the loaded
+Session has no such observation.
+The recovery source is retained only up to 512 KiB; a larger source does not
+receive a recovery ticket. Token counts are estimates, and recovery never
+re-runs tools or duplicates the current User/Steer messages. P3b2 has passed
+parent-owned remote verification; see `0914-progress.md`. `last_result` is the latest manual
 compaction result retained by this loaded Session process; it is not a durable
 history record.
 

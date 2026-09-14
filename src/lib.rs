@@ -21,6 +21,13 @@ mod tool_data;
 mod tools;
 mod workspace;
 
+// The loopback HTTP mock is shared by unit tests and by the process test
+// crates under `tests/`; load it once here so within this crate it is a
+// single module instead of a `#[path]` module in every test subtree.
+#[cfg(test)]
+#[path = "../tests/support/openai_mock.rs"]
+pub(crate) mod openai_mock;
+
 pub use agent::{
     Agent, AnswerInteraction, CompactSession, CreateSession, GetHistory, HistoryPage, PingResponse,
     RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk, ReadSession,
@@ -31,7 +38,7 @@ pub use agent::{
 };
 pub use compaction::{
     AutomaticCompactionObservation, AutomaticCompactionView, CompactionResult, CompactionStatus,
-    CompactionUtilityUsage,
+    CompactionUtilityUsage, RecoveryObservation,
 };
 pub use config::{
     AgentConfig, ApprovalMode, CompactionConfig, ConfigError, LoopOverrides, Profile,

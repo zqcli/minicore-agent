@@ -200,12 +200,31 @@ impl ExecutionConfigFactory<'_> {
             .models
             .get(&record.model)
             .map_err(map_model_config_error)?;
+        let budget = self
+            .models
+            .get_budget(&record.model)
+            .map_err(map_model_config_error)?;
         let auto = self.policy.enabled.then(|| AutoContext {
             model: Arc::clone(&model),
+            budget: Arc::clone(&budget),
             policy: self.policy,
             max_prompt_messages: options.limits.max_prompt_messages,
             state: Arc::clone(&self.compaction),
         });
+        // The binding is published only when the Session actually installs
+        // this config (`Session::new`/`update`/`replace_future_config`).
+        // Publishing here would bind the shared state to a config that may
+        // still fail later in this build or be rejected before commit.
+        //
+        // With automatic compaction disabled no recovery ticket can ever
+        // exist, so keep the raw model (and its established cancellation
+        // behavior) instead of paying the wrapper's per-request content and
+        // ticket hashing for nothing.
+        let model: Arc<dyn minicore_runtime::model::Model> = if auto.is_some() {
+            crate::compaction::CompactingModel::new(model, budget, Arc::clone(&self.compaction))
+        } else {
+            model
+        };
         let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
         let subagent = record
             .tools
