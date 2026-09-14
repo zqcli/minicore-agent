@@ -50,6 +50,8 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "tool.output",
     "session.history",
     "workspace.read",
+    "workspace.files",
+    "workspace.search",
     "deferred.waiter_limit",
 ];
 
@@ -541,6 +543,52 @@ impl Agent {
         )
         .await
         .map_err(|_| AgentError::QueryLimit)?
+    }
+
+    /// Lists one bounded page of Workspace entries. Only a loaded Session
+    /// locates its Workspace, and closing that Session cancels the scan. The
+    /// scan owns one retained blocking worker and enforces its own deadline,
+    /// so this call is never wrapped in an outer timeout that could drop the
+    /// worker join.
+    pub async fn workspace_files(
+        &self,
+        request: crate::WorkspaceFilesRequest,
+    ) -> Result<crate::WorkspaceFilesResult, AgentError> {
+        request.validate()?;
+        let session = self
+            .loaded_session(request.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let session_cancellation = session.query_cancellation();
+        let workspace = session.workspace();
+        crate::workspace::listing::files(
+            workspace,
+            request,
+            session_cancellation,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Searches one bounded page of literal matches in Workspace files. Only a
+    /// loaded Session locates its Workspace, and closing that Session cancels
+    /// the scan.
+    pub async fn workspace_search(
+        &self,
+        request: crate::WorkspaceSearchRequest,
+    ) -> Result<crate::WorkspaceSearchResult, AgentError> {
+        request.validate()?;
+        let session = self
+            .loaded_session(request.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let session_cancellation = session.query_cancellation();
+        let workspace = session.workspace();
+        crate::workspace::search::search(
+            workspace,
+            request,
+            session_cancellation,
+            CancellationToken::new(),
+        )
+        .await
     }
 
     /// Read-only structured facts for one tool call. The record is held in

@@ -14,7 +14,8 @@ policy, startup admission preparation, request-time compaction, exact provider
 replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
 P3b2 passed parent review and remote verification. P4 is the next, separate
 Workspace slice; its read-only query (P4a) has passed parent review and remote
-verification. Files/search/status remain pending.
+verification, as have its listing and search queries (P4b). Workspace status
+remains pending.
 
 ## Execution
 
@@ -39,7 +40,7 @@ stored in source.
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
-| P4 | Bounded Workspace files/read/search/status | P4a `workspace.read` verified (528 stable/MSRV passed, 2 Live ignored); files/search/status pending |
+| P4 | Bounded Workspace files/read/search/status | P4a read and P4b files/search verified; 576 stable/MSRV passed, 2 Live ignored; status pending |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
@@ -271,6 +272,119 @@ The parent generated the lockfile remotely with `cargo update --offline
 --workspace`; only the root package's dependency on already-locked libc 0.2.189
 was added. No dependency was upgraded. No local compilation, native cross-platform
 test execution, Live Provider test, installation, version bump or push occurred.
+
+## P4b Workspace Listing And Search
+
+P4b implements `workspace.files` and `workspace.search`; `workspace.status`,
+change scopes, versioned diffs, and P5+ are not started. Both queries reuse the
+P4a ownership, cancellation, capacity, and result-budget contracts.
+
+- **Shared bounded traversal**: `src/workspace/scan.rs` owns one depth-first
+  `std::fs::read_dir` walk with the entry, byte, depth, and rule ceilings, the
+  cancellation and deadline checks, the encoded-record accounting, and the
+  per-query blocking worker; `src/workspace/listing.rs` and
+  `src/workspace/search.rs` only add the per-entry action. Rules come from
+  `ignore::gitignore` matchers built from bounded reads of `.ignore`,
+  `.gitignore`, and `.git/info/exclude`, never from a hand-written pattern
+  parser and never from the global git configuration. `.ignore` outranks
+  `.gitignore` outranks `.git/info/exclude`, the closest directory wins inside a
+  category, and a rule file only ever matches a strict descendant of its own
+  directory, so rules cannot leak onto ancestors or siblings and a requested
+  root is never filtered by its own file. `.git` metadata is never returned or
+  expanded; requested subdirectories and explicitly named paths inherit every
+  ancestor rule up to the Workspace root; symlinked directories are never
+  followed and a requested root that resolves outside the Workspace is rejected
+  before any walk. A Workspace that is not a git repository also
+  excludes a documented default list of build and dependency directories, and
+  local rules still win over it.
+- **Real work accounting**: the entry ceiling is shared by every root of one
+  query and counts every raw directory entry, including entries consumed while
+  positioning at a cursor, while a cursor's ordinal is local to its own
+  requested root and starts at zero. Positioning replays raw entries, including
+  rule-excluded ones, and still descends into directories, so a resumed page
+  never loses a subtree. `read_dir` failures, unreadable entries, and non-UTF-8
+  paths are counted; ignore files are read in bounded chunks with a per-query
+  128-file / 1 MiB / 256 KiB-per-file budget charged as bytes are read, and
+  exceeding it stops the scan with `stopped_by: rules` instead of applying
+  partial rules. Exhausting the entry budget before reaching a cursor stops
+  without a continuation rather than returning a cursor that would not advance,
+  so a returned cursor always moves forward.
+- **Owned blocking worker**: each scan runs on one `spawn_blocking` worker that
+  checks the Session token, the RPC shutdown token, and the deadline at every
+  examined entry and read chunk. The awaiter selects on those tokens and on the
+  worker; cancellation cancels the worker's own token and joins the handle before
+  returning, and a drop guard cancels the worker when the awaiting future is
+  dropped by its caller. The deadline is applied by the worker itself, which
+  stops with `stopped_by: deadline`, keeps the partial result, and returns no
+  cursor, so the awaiter joining that worker is what preserves the partial;
+  cancellation is never turned into a stop. RPC dispatch never wraps a scan in an
+  outer timeout that would drop that join, and the existing four-query /
+  32-deferred pool is reused without a new manager or service. The deadline is
+  checked between bounded operations, not as hard preemption: a single blocking
+  read on a stalled remote filesystem can outlast it.
+- **Bounded, honest pages**: `workspace.files` returns entry kind and optional
+  size, requires `directory` to be a directory, and filters entry paths only.
+  `workspace.search` matches one literal single-line query (case-insensitive by
+  default), returns per-line UTF-8 byte ranges inside a returned slice plus the
+  slice's own offset in the original line, and pages a line that does not fit by
+  returning a bounded slice that still contains its matches (up to 64 bytes of
+  leading context) and stopping before the next match. A page that cannot hold an
+  entry or a match even when empty skips and counts it and marks the response
+  incomplete, so nothing is silently dropped and no empty record is returned in
+  place of a match. Both cap raw entries (100,000), path or content bytes
+  (16 MiB), depth (64), and the encoded page (`max_bytes`, 1024..=262144).
+  `stopped_by` distinguishes `end`, `page`, `entries`, `bytes`, `depth`, `rules`,
+  and `deadline`; `truncated` and `scan_complete` are always explicit, no global
+  total is ever invented, and `end`, `depth`, `entries`, `rules`, and `deadline`
+  end without a continuation cursor. A deadline keeps whatever the page already
+  found, reports `truncated` with `scan_complete: false`, and asks for a narrower
+  request instead of a resumption; an already expired budget returns that empty
+  partial rather than a false end. Search also keeps the difference between a scope that was
+  enumerated and files that were searched: binary, oversized, non-UTF-8, special,
+  and out-of-boundary files are counted in `skipped_files` without making the
+  result incomplete, while read failures and unrepresentable matches do make it
+  incomplete.
+- **Live cursors**: a cursor is a small structured record that binds the method,
+  Session, query or directory, recursion or case mode, and root list through a
+  truncated SHA-256 scope, carries the traversal ordinal (and, for search, the
+  line and byte offset inside a file), and is rejected with `-32602` before a
+  query slot is reserved when it belongs to another request. Search paths are
+  normalized and de-duplicated, and overlapping roots are rejected so no file is
+  searched twice. Each page is a fresh live observation with `consistency: live`
+  and `observed_at_unix_ms`; a resumed request re-walks to its cursor within the
+  same budget, so no index, watcher, or Workspace snapshot is created.
+
+Known limits: ordering within a directory is the filesystem's enumeration order,
+so an ordinal cursor is only exact while the tree and that order are unchanged;
+positioning a resumed request is bounded by the deadline and the entry ceiling
+rather than by the per-page limits; rule-excluded descendants are not reported
+as skipped because they are not part of the visible tree; files over the 512 KiB
+whole-file bound, binary files, invalid UTF-8 files, and non-UTF-8 paths are
+skipped and counted rather than partially searched.
+
+Verified tests include rule inheritance and
+`.git` exclusion, non-repository defaults with local overrides, explicit-root
+rule enforcement, a rules over-budget stop, positioning charged to the entry
+ceiling, symlink and special-file boundaries, lossless pagination and cursor
+binding for both methods, a 1024-byte page budget with an exact entry set, a
+match far into a 300 KiB line, escaping inflation that does not overflow the
+budget, an unrepresentable match reported as incomplete, byte-budget paging with
+matches rebuilt exactly across pages, a timeout that keeps a found match without
+a cursor, an already expired budget that returns an empty partial instead of an
+end, session-close/shutdown cancellation that still fails the query, and a drop
+guard that stops a dropped query's worker.
+
+Parent-owned remote verification: stable and Rust 1.85.0 all-target suites each
+passed 576 tests (550 library, 26 integration), with 2 Live tests ignored.
+Strict Clippy, fmt, rustdoc and Windows/macOS all-target cross-compilation checks
+passed. The existing Windows `write_reload_config` test-helper warning remains.
+Logs: `/root/minicore-agent-0914/logs/p4b-{tests,clippy,msrv,fmt,doc,windows,macos}.log`.
+The parent generated Cargo.lock remotely: 10 packages added for pinned
+`ignore = 0.4.23` and `regex = 1.11.1`, with no existing package upgrades.
+Resolution selected MSRV-compatible globset 0.4.19 instead of the newer
+Rust-1.88-only version; Rust 1.85 verification passed with the resulting lock.
+No local compilation, native Windows/macOS test execution, Live Provider test,
+installation, version bump or push occurred. Runtime source and pin are unchanged.
 
 ## P0 Verification
 

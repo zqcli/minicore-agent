@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::fs::{self as std_fs, File as StdFile, OpenOptions as StdOpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -14,7 +16,10 @@ use thiserror::Error;
 use tokio::fs::{self, File};
 use tokio::io::AsyncReadExt;
 
+pub(crate) mod listing;
 pub(crate) mod query;
+pub(crate) mod scan;
+pub(crate) mod search;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -199,6 +204,52 @@ impl Workspace {
         Ok(file)
     }
 
+    /// Canonicalizes a workspace-relative path and rejects anything outside
+    /// the canonical root. Used by blocking scan workers before they open or
+    /// walk a path.
+    pub(crate) fn resolve_inside_sync(
+        &self,
+        path: &str,
+        allow_empty: bool,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let relative = normalize_relative(path, allow_empty)?;
+        let resolved = std_fs::canonicalize(self.root.join(relative)).map_err(map_io_error)?;
+        if !resolved.starts_with(self.root.as_path()) {
+            return Err(WorkspaceError::Escape);
+        }
+        Ok(resolved)
+    }
+
+    /// Synchronous twin of `resolve_existing` for blocking scan workers. It
+    /// enforces the same boundary: canonical inside the root, regular file.
+    pub(crate) fn resolve_existing_sync(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
+        let resolved = self.resolve_inside_sync(path, false)?;
+        let metadata = std_fs::metadata(&resolved).map_err(map_io_error)?;
+        if !metadata.is_file() {
+            return Err(WorkspaceError::NotFile);
+        }
+        Ok(resolved)
+    }
+
+    /// Synchronous twin of `open_regular_file` for blocking scan workers. It
+    /// applies the same regular-file checks, and on Unix the same non-blocking
+    /// no-follow open.
+    pub(crate) fn open_regular_file_sync(&self, path: &str) -> Result<StdFile, WorkspaceError> {
+        let resolved = self.resolve_existing_sync(path)?;
+        let metadata = std_fs::symlink_metadata(&resolved).map_err(map_io_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::Escape);
+        }
+        if !metadata.is_file() {
+            return Err(WorkspaceError::NotFile);
+        }
+        let file = open_read_only_sync(&resolved)?;
+        if !file.metadata().map_err(map_io_error)?.is_file() {
+            return Err(WorkspaceError::NotFile);
+        }
+        Ok(file)
+    }
+
     pub(crate) async fn resolve_directory(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
         let relative = normalize_relative(path, true)?;
         let resolved = self.canonicalize_inside(&self.root.join(relative)).await?;
@@ -337,7 +388,7 @@ impl Workspace {
     }
 }
 
-fn normalize_relative(path: &str, allow_empty: bool) -> Result<PathBuf, WorkspaceError> {
+pub(crate) fn normalize_relative(path: &str, allow_empty: bool) -> Result<PathBuf, WorkspaceError> {
     if path.contains('\0') {
         return Err(WorkspaceError::InvalidPath);
     }
@@ -595,6 +646,15 @@ async fn open_read_only(path: &Path) -> Result<File, WorkspaceError> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     options.open(path).await.map_err(map_open_error)
+}
+
+/// Synchronous twin of `open_read_only` for blocking scan workers.
+pub(crate) fn open_read_only_sync(path: &Path) -> Result<StdFile, WorkspaceError> {
+    let mut options = std_fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    options.open(path).map_err(map_open_error)
 }
 
 fn map_open_error(error: io::Error) -> WorkspaceError {

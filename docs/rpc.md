@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -71,9 +71,13 @@ be recovered.
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
 requests are dispatched sequentially. `turn.wait`, `session.compact`,
-`session.read`, `workspace.read`, and `turn.result` are exceptions: the server
-registers one bounded owned task and immediately continues reading requests. A
-deferred query/waiter does not own the underlying Session operation.
+`session.read`, `workspace.read`, `workspace.files`, `workspace.search`, and
+`turn.result` are exceptions: the server registers one bounded owned task and
+immediately continues reading requests. A deferred query/waiter does not own
+the underlying Session operation. The two workspace scan queries each own one
+retained blocking worker and join it before their response; a drop guard also
+cancels that worker immediately when the query task itself is dropped, so a
+detached scan stops walking instead of running on.
 
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
@@ -82,8 +86,9 @@ The following orderings are not guaranteed:
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
 - a deferred `turn.wait` response before responses to later requests;
-- a deferred `session.compact`, `session.read`, `workspace.read`, or
-  `turn.result` response before responses to later requests.
+- a deferred `session.compact`, `session.read`, `workspace.read`,
+  `workspace.files`, `workspace.search`, or `turn.result` response before
+  responses to later requests.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -113,6 +118,8 @@ protocol version, and ordered capability names:
     "tool.output",
     "session.history",
     "workspace.read",
+    "workspace.files",
+    "workspace.search",
     "deferred.waiter_limit"
   ]
 }
@@ -299,10 +306,11 @@ The result has a `session` member containing the created SessionInfo.
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
 
-The manual compaction methods, startup summary projection, and automatic
-compaction described here are source-handoff APIs. They are not available in
-the previously installed Agent binary and remain subject to parent acceptance.
-P3b2 provider overflow recovery is separate pending work.
+The manual compaction methods, startup summary projection, automatic compaction
+and P3b2 one-shot provider overflow recovery have passed parent-owned remote
+verification on this development branch. They are not available in the
+previously installed Agent binary; no new installation or release is claimed.
+See `0914-progress.md` for acceptance evidence and limits.
 
 The deferred compact result has this shape:
 
@@ -1037,6 +1045,220 @@ shutdown, and the shared 10 s query deadline each interrupt a pending open,
 read, or metadata call and return retryable `-32020` (`query_limit`). Finishing
 or cancelling a query releases its slot, and shutdown cancels and joins all
 owned queries before the shutdown response.
+
+### `workspace.files`
+
+`workspace.files` lists one bounded page of Workspace entries. It shares the
+loaded-Session ownership, the ignore-aware traversal, the four read-query
+slots, and the cancellation rules of `workspace.read`. The P4b files/search
+slice has passed parent-owned remote verification; see `0914-progress.md`.
+
+```json
+{
+  "session_id": "ses_...",
+  "directory": "src",
+  "recursive": false,
+  "query": "main",
+  "cursor": null,
+  "limit": 200,
+  "max_bytes": 65536
+}
+```
+
+`directory` is a workspace-relative directory of at most 4096 bytes and
+defaults to the Workspace root. Absolute paths, `..`, NUL, and a path that names
+a file are rejected: lexical problems fail with `-32602` before a query slot is
+reserved, and a directory that does not exist, is not a directory, or resolves
+outside the Workspace fails with `-32010`. `recursive` defaults to `false` (one
+level); recursive listings stop descending at a depth of 64 and report that as
+`stopped_by: depth`. `query` filters entry paths only and never looks at file
+contents; directories that do not match are still traversed so matching
+descendants are found. `limit` accepts `1..=1000` and defaults to `200`;
+`max_bytes` accepts `1024..=262144`, defaults to 64 KiB, and bounds the encoded
+page including metadata and JSON escaping.
+
+```json
+{
+  "directory": "src",
+  "entries": [
+    {"path": "src/main.rs", "kind": "file", "size": 4096}
+  ],
+  "next_cursor": {"entry": 12, "scope": "3f2a91c4d0b7e615"},
+  "truncated": false,
+  "scan_complete": true,
+  "stopped_by": "end",
+  "skipped_count": 0,
+  "consistency": "live",
+  "observed_at_unix_ms": 1760000000000
+}
+```
+
+The traversal is a depth-first walk in the filesystem's directory order; entries
+are not sorted. `.git` metadata is never returned or expanded. `.ignore`,
+`.gitignore`, and `.git/info/exclude` files inside the Workspace are applied
+whether or not the Workspace is a git repository, with `.ignore` outranking
+`.gitignore` outranking `.git/info/exclude`, and the closest directory winning
+inside a category. A rule file only ever matches a strict descendant of the
+directory it was loaded from, so a rule cannot leak onto an ancestor or a
+sibling and a requested root is never filtered by its own file. A requested
+subdirectory inherits the rules of every ancestor up to the Workspace root, so
+an explicit `directory` cannot bypass them. Ignore files above the
+Workspace root and the global git configuration are never read, so a parent
+`.gitignore` outside the Workspace has no effect. A Workspace that is not a git
+repository additionally excludes directories named `node_modules`,
+`bower_components`, `vendor`, `target`, `dist`, `build`, `.venv`, `venv`,
+`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `.gradle`, `.next`, and
+`.nuxt` at any depth; local rules still take precedence over that list. Rule
+reading is bounded per query at 128 files, 1 MiB in total, and 256 KiB per file,
+with bytes charged as they are read: an oversized or over-budget rule set stops
+the scan with `stopped_by: rules` instead of applying partial rules. A symlinked
+ignore file is read only when it resolves inside the Workspace; a rule file that
+exists but cannot be read, or that resolves outside it, is counted as skipped
+and makes the response incomplete instead of being treated as absent. Symlinks are listed as `symlink` entries but
+never followed: a requested root that is itself a symlinked directory is
+rejected instead of being expanded through the alias, and a requested directory
+that resolves outside the Workspace is rejected.
+
+`kind` is `file`, `directory`, `symlink`, or `other`, and `size` is present for
+regular files only. `skipped_count` counts visited entries that were not
+returned: entries filtered out by `query`, entries whose path is not valid
+UTF-8, entries that could not be read, explicitly requested roots excluded by
+the rules, and single entries that cannot fit the result budget. Rule-excluded
+descendants are not counted; they are not part of the visible tree.
+
+Results are live observations, never filesystem snapshots: `consistency` is
+`live` and `observed_at_unix_ms` records when the scan started. Concurrent
+changes may require a fresh request. `stopped_by` explains why the scan ended:
+
+| Stop | Meaning | Continues |
+|---|---|---|
+| `end` | The traversal reached the end of the requested scope. | No |
+| `page` | `limit` or `max_bytes` filled the page. | Yes |
+| `entries` | The 100,000-entry ceiling was reached. | No |
+| `bytes` | The 16 MiB path-byte ceiling was reached. | Yes |
+| `depth` | A directory at the 64-level depth ceiling was not expanded. | No |
+| `rules` | The ignore-rule budget was exceeded. | No |
+| `deadline` | The 10 s query deadline passed. The page keeps what it found. | No |
+
+The entry ceiling is per query and counts every raw directory entry every root
+consumes, including entries consumed while positioning at a cursor, so a resumed
+request cannot sidestep it. A cursor's `entry` is an ordinal inside its own
+requested root, starting at zero, while that ceiling is shared by all roots of
+the query. Positioning replays raw entries, including rule-excluded ones, and
+still descends into directories, so a resumed page never loses a subtree; when
+positioning cannot reach the cursor, or the rule budget stops the scan, no
+continuation is returned. The 10 s deadline is checked between bounded
+operations. When it expires the scan stops with `stopped_by: deadline`, keeps the
+entries already found, reports `truncated` with `scan_complete: false`, and
+returns no `next_cursor` on purpose: a timeout is answered with a narrower
+request or a later retry, never with a continuation. Session close, RPC shutdown,
+and caller cancellation are not stops: they fail the query with `-32020`, and the
+worker is joined before that error is returned. A single blocking read on a
+stalled remote filesystem can outlast the deadline, so the timeout is enforced
+at operation granularity rather than as a hard preemption guarantee; results
+already produced still appear in the partial page. `truncated` is true whenever
+the response is a partial view (`page`, `entries`, `bytes`, `depth`, `rules`,
+`deadline`, or a skipped entry), and `scan_complete` is true only for a complete
+traversal in which nothing was skipped or unreadable.
+`next_cursor` is an exact continuation point bound to the Session, method, and
+traversal parameters, and it is present only when the scan can advance: `end`,
+`depth`, `entries`, `rules`, and `deadline` stop without one, and a resumed
+request whose positioning exhausts the entry budget also stops without one, so a
+returned cursor always moves forward. Paging a static tree with it never skips or
+duplicates entries; a cursor from a different request or Session is rejected
+with `-32602` before a query slot is reserved. A resumed request re-walks to its
+cursor within the same budget instead of caching an index, so no snapshot,
+index, or watcher is ever created.
+
+### `workspace.search`
+
+`workspace.search` returns one bounded page of literal matches. It shares the
+traversal, ignore rules, bounds, result budget, ownership, and cancellation
+contract of `workspace.files`.
+
+```json
+{
+  "session_id": "ses_...",
+  "query": "needle",
+  "paths": ["src", "docs/rpc.md"],
+  "case_sensitive": false,
+  "cursor": null,
+  "max_matches": 100,
+  "max_bytes": 65536
+}
+```
+
+`query` is a single literal line of at most 1024 bytes and is never interpreted
+as a regular expression: metacharacters match themselves. Newlines and carriage
+returns are rejected with `-32602`. `case_sensitive` defaults to `false`; a
+case-insensitive search escapes the query and matches it with a case-folding
+expression over the original line text, so reported ranges always fall on UTF-8
+boundaries of the returned `line_text`. `paths` restricts the search to at most
+32 workspace-relative files or directories and defaults to the whole Workspace.
+The list is normalized and de-duplicated, and overlapping roots such as `src`
+together with `src/main.rs` are rejected with `-32602` so no file is searched
+twice; each path is validated lexically before a query slot is reserved, a path
+that does not exist or resolves outside the Workspace fails with `-32010`, and
+explicitly named paths are still subject to the same ignore rules as a walk from
+the Workspace root. `max_matches` accepts `1..=1000` and defaults to `100`;
+`max_bytes` has the same range and default as `workspace.files`.
+
+```json
+{
+  "matches": [
+    {
+      "path": "src/main.rs",
+      "line_number": 12,
+      "line_text_byte_offset": 0,
+      "match_byte_ranges": [{"start": 4, "end": 10}],
+      "line_text": "let needle = 1;",
+      "line_truncated": false
+    }
+  ],
+  "next_cursor": {"path_index": 0, "entry": 3, "line": 12, "line_byte_offset": 0, "scope": "3f2a91c4d0b7e615"},
+  "truncated": false,
+  "scan_complete": true,
+  "stopped_by": "end",
+  "skipped_files": 0,
+  "consistency": "live",
+  "observed_at_unix_ms": 1760000000000
+}
+```
+
+Line numbers are one-based and a match is one record per matching line segment.
+`line_text` is raw line text without its `
+` or `
+` terminator, starting at
+`line_text_byte_offset` inside the original line; `match_byte_ranges` are
+half-open UTF-8 byte offsets inside `line_text`, so adding
+`line_text_byte_offset` yields offsets in the original line. When the whole line
+fits the result budget it is returned whole with `line_truncated: false`.
+Otherwise the record carries a bounded slice that still contains every match of
+that record plus up to 64 bytes of leading context, and `line_truncated` is
+true. A page that cannot hold the next match stops before it and resumes there,
+so paging a static tree yields every match exactly once across the returned
+slices, and a line whose occurrences are cut by `max_matches` or the result
+budget continues through the cursor. A match that cannot be represented in an
+otherwise empty page is skipped, counted in `skipped_files`, and marks the
+response incomplete instead of returning an empty record or a complete-looking
+one.
+
+Files larger than the 512 KiB whole-file bound, binary or non-UTF-8 files,
+special files, files outside the Workspace boundary, and files with non-UTF-8
+paths are skipped and counted in `skipped_files` without making the result
+incomplete: the scope was enumerated, but those files were not searched. A file
+that could not be opened, typed, or read, and a match that could not be
+represented, are also counted and make the response incomplete. Content bytes
+are charged against the 16 MiB ceiling as they are read, so a file that is read
+and then skipped is still accounted for. The total searched
+content is capped at 16 MiB, the raw entry ceiling at 100,000, the depth at 64
+levels, and the rule budget as for `workspace.files`; `stopped_by`, `truncated`,
+`scan_complete`, and `next_cursor` follow the same rules and table, so a deadline
+keeps the matches already found, reports `deadline`, and returns no cursor.
+Files are read through the same Workspace boundary as `workspace.read`, in
+bounded chunks that re-check cancellation and the deadline between chunks, lines,
+and matches, so a timeout never discards committed matches and never asks for a
+continuation.
 
 ## Interactions
 

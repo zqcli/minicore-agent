@@ -61,8 +61,16 @@ pub use tool_data::{
     ToolInvocationData, ToolOutputPage, ToolOutputRequest, ToolPhase, ToolReadRequest,
     ToolReadResult, ToolRef, ToolSubject,
 };
+pub use workspace::listing::{
+    WorkspaceFileEntry, WorkspaceFilesRequest, WorkspaceFilesResult, WorkspaceListCursor,
+};
 pub use workspace::query::{
     WorkspaceReadEncoding, WorkspaceReadRange, WorkspaceReadRequest, WorkspaceReadResult,
     WorkspaceReadStatus,
+};
+pub use workspace::scan::{WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop};
+pub use workspace::search::{
+    WorkspaceByteRange, WorkspaceSearchCursor, WorkspaceSearchMatch, WorkspaceSearchRequest,
+    WorkspaceSearchResult,
 };
 pub use workspace::{Workspace, WorkspaceError};
