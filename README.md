@@ -42,7 +42,10 @@ ignored), strict Clippy/fmt/rustdoc, and Windows/macOS compile checks.
 P4's `workspace.read` slice is also verified (528 stable/MSRV tests passed,
 2 Live tests ignored); `workspace.files` and `workspace.search` are verified too
 (576 stable/MSRV tests passed, 2 Live ignored; strict and cross-platform compile
-gates passed). Workspace status and later slices remain pending. These changes are not a new installed
+gates passed). `workspace.status` completes P4 with 613 stable/MSRV tests
+passed and 2 Live ignored; the same strict and cross-platform compile gates
+passed. Bash streaming/control, change review and final integration remain
+pending. These changes are not a new installed
 Agent release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
@@ -160,7 +163,7 @@ session.compact        session.compact.cancel
 session.update         session.rename        session.history
 session.presentation
 session.read           workspace.read
-workspace.files        workspace.search
+workspace.files        workspace.search        workspace.status
 turn.send              turn.cancel            turn.wait
 turn.steer             interaction.answer
 ```
@@ -197,7 +200,8 @@ also passed parent review and remote verification; see
 TUI `/compact` is outside this backend scope; subsequent work proceeds to P4
 Workspace, whose first read-only `workspace.read` slice has also passed parent
 review and remote verification, together with `workspace.files` and
-`workspace.search`. The
+`workspace.search` and `workspace.status`. P4 is verified; P5 Bash
+streaming/control and P6 change review remain separate work. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

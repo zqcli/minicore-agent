@@ -12,10 +12,10 @@ startup projection from a validated summary, same-loop model-update binding,
 `session.context`, independent manual utility usage, the Agent-global automatic
 policy, startup admission preparation, request-time compaction, exact provider
 replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
-P3b2 passed parent review and remote verification. P4 is the next, separate
-Workspace slice; its read-only query (P4a) has passed parent review and remote
-verification, as have its listing and search queries (P4b). Workspace status
-remains pending.
+P3b2 passed parent review and remote verification. P4 is also verified: bounded
+file reads (P4a), listing and literal search (P4b), and isolated Git status
+queries (P4c). P5 Bash streams/control, P6 change review and P7 integration
+remain pending.
 
 ## Execution
 
@@ -40,7 +40,7 @@ stored in source.
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
-| P4 | Bounded Workspace files/read/search/status | P4a read and P4b files/search verified; 576 stable/MSRV passed, 2 Live ignored; status pending |
+| P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
@@ -214,8 +214,8 @@ bump or push was performed. Runtime remains pinned to the revision above.
 
 ## P4a Workspace Read
 
-P4a implements only the read-only workspace file query; files/search/status and
-later P4/P5+ slices are not started.
+P4a implements the read-only workspace file query; listing/search and status
+are separate P4b/P4c slices documented below.
 
 - **Ownership**: `workspace.read` is a loaded-Session query. `Agent::workspace_read`
   and the RPC arm resolve the Session first, then borrow its canonical
@@ -256,8 +256,8 @@ Known limits: the revision is a live hash of the bytes that were read, not a
 lock or snapshot; the path sandbox is not an adversarial same-user defense; a
 `line_byte_offset` must be a character boundary inside the requested line
 (checked against the file, not lexically); and `too_large` is a whole-file
-bound rather than a per-page limit. Search/status, change scopes and versioned
-diffs remain pending.
+bound rather than a per-page limit. Change scopes and versioned diffs remain
+outside this read-only slice.
 
 Parent-owned remote verification: stable and Rust 1.85.0 each passed 528 tests
 (502 library and 26 integration), with 2 Live tests ignored. Strict Clippy, fmt,
@@ -275,9 +275,10 @@ test execution, Live Provider test, installation, version bump or push occurred.
 
 ## P4b Workspace Listing And Search
 
-P4b implements `workspace.files` and `workspace.search`; `workspace.status`,
-change scopes, versioned diffs, and P5+ are not started. Both queries reuse the
-P4a ownership, cancellation, capacity, and result-budget contracts.
+P4b implements `workspace.files` and `workspace.search` (P4c separately adds
+`workspace.status`); change scopes, versioned diffs, and P5+ are not started.
+Both queries reuse the P4a ownership, cancellation, capacity, and result-budget
+contracts.
 
 - **Shared bounded traversal**: `src/workspace/scan.rs` owns one depth-first
   `std::fs::read_dir` walk with the entry, byte, depth, and rule ceilings, the
@@ -385,6 +386,126 @@ Resolution selected MSRV-compatible globset 0.4.19 instead of the newer
 Rust-1.88-only version; Rust 1.85 verification passed with the resulting lock.
 No local compilation, native Windows/macOS test execution, Live Provider test,
 installation, version bump or push occurred. Runtime source and pin are unchanged.
+
+## P4c Workspace Status
+
+`workspace.status` is the only interface in this slice: `changes.list`,
+`changes.diff`, and later phases are not implemented.
+
+- **Fixed, shell-free Git observation**: one query runs at most three
+  commands, `rev-parse --show-toplevel`, at most one
+  `rev-parse --is-bare-repository` when no work tree was resolved, and
+  `status --porcelain=v2 -z --branch` with `--no-optional-locks`,
+  `--literal-pathspecs`, `--no-ahead-behind`, `--ignore-submodules=dirty`, and
+  `--untracked-files=normal`, plus fixed `-c` values for
+  `core.fsmonitor=false`, `submodule.recurse=false`, `color.ui=false`,
+  `core.quotePath=false`, and rename detection. Pathspecs are passed as
+  arguments, never assembled by a shell, and no terminal-coloured text is
+  parsed. Submodule internals are a documented coverage boundary: the comparison
+  uses the commits recorded in the superproject, so a gitlink recorded in the
+  index that differs from the committed one is an ordinary entry, but no
+  submodule work tree is scanned for modifications or untracked files, nothing
+  recurses into it, and no monitor or hook configured inside a submodule runs.
+- **Isolated environment and configuration**: every inherited `GIT_*` name is
+  dropped before the child starts by ASCII case-insensitive name comparison, so
+  no inherited git directory, work tree, index file, config count, or trace
+  variable can redirect or instrument the query; names are filtered, values are
+  never recorded. System and user configuration are disabled explicitly with
+  `GIT_CONFIG_NOSYSTEM=1` and an empty `GIT_CONFIG_GLOBAL`, so an inherited
+  `HOME` or `XDG_CONFIG_HOME` cannot include another file or start an external
+  program. Git's stderr is counted and discarded, so nothing git prints there
+  reaches a response, a log, or an error message, and a child that floods it is
+  stopped instead of drained without bound.
+- **Session-owned process**: a query never starts a process for a cancelled or
+  already-expired budget, and the whole run (spawn, both readers, and every
+  wait) is under one deadline. Cancellation and the deadline stop the child and
+  the owner waits until the operating system reports its exit, so the reap is
+  never inferred from elapsed time; a system that does not report the exit can
+  therefore delay a query or a Session close past the deadline, which is
+  documented like a blocking filesystem read. A failed read, a failed wait, or
+  an unconfirmed kill is recorded as a failed observation instead of a complete
+  one. The loaded Session owns the worker that holds the child, the caller only
+  awaits the worker's result, dropping that caller cancels that one child through
+  its own token, and closing the Session cancels every owner first and then
+  joins the workers, so a slow status cleanup cannot delay cancelling the active
+  loop, admission, or compaction. Both the public Agent method and the RPC arm
+  use this same Session-owned path; the RPC arm never wraps the query in an
+  outer timeout that would drop that ownership.
+- **Bounded observation**: captured stdout is capped at 1 MiB and stops the
+  child when the ceiling is crossed, keeping the prefix of the chunk that
+  crossed it; parsed records are capped at 100,000 and the encoded response by
+  `max_bytes` (`1024..=262144`, default 64 KiB). Exceeding a bound keeps what was
+  observed, reports `output_truncated`, and clears `complete`; an already
+  expired deadline returns an empty `repo_available: false` observation with
+  `deadline` rather than a false clean result. The encoded budget reserves room
+  for the widest form of the summary, so a result including its warnings never
+  exceeds `max_bytes`.
+- **Explicit states, no false clean**: a bare repository or a git directory
+  without a work tree is a definite `repo_available: false` answer, an unborn
+  `HEAD`, a detached `HEAD`, and merge conflicts are ordinary answers with their
+  own fields, and a workspace git refuses to read for an unexplained reason
+  (dubious ownership, corrupt configuration, permission, signal death, or an
+  unusable work tree root) is incomplete with `status_failed` rather than a
+  claimed missing repository. `complete` is true only when nothing was cut short
+  or skipped; `warnings` carries codes only. Missing git is `git_unavailable`.
+  Header values are validated: an object id must be 40 or 64 hex digits, `XY`
+  codes must be git's documented status characters, both branch headers must be
+  present, and a rename record without its previous name is malformed.
+- **Scoped to the Workspace**: when the workspace sits inside a larger
+  repository, git is run from the work tree root with the workspace as a literal
+  pathspec, and every porcelain path is mapped through the canonical workspace
+  root, so entries, counts, and skipped counts cover only paths inside the
+  workspace. A nested repository adds the `nested_repository` warning.
+- **Observation only**: results carry `consistency: live` and
+  `observed_at_unix_ms`, claim no author, and never touch history, the model, or
+  the Turn completion path. There is no watcher and no cache, and a query is
+  read-only: `--no-optional-locks` plus `GIT_OPTIONAL_LOCKS=0` keep the index
+  bytes and mtime unchanged.
+
+Verified tests cover clean/staged/
+unstaged/untracked/conflict/rename/unborn/detached/non-repository/conservative-
+nonrepo/bare/missing-git fixtures, a nested workspace that must not report or
+count outside paths including a rename that crosses into it and a staged
+deletion whose file is gone, a crafted stream with undocumented `XY` codes, a
+non-hash object id, and a rename without its previous name, odd paths (spaces,
+leading dash, newline, non-UTF-8), the stdout and record and encoded-budget
+ceilings with a chunk that crosses the ceiling and with JSON escapes, an expired
+deadline, cancellation that must stop the owned child, a child that closes both
+pipes and keeps running, a child that dies from a signal, a child that floods
+standard error, an unusable work tree root answer, an inherited
+`GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_CONFIG_*`/`GIT_TRACE`
+environment, an inherited `HOME`/`XDG_CONFIG_HOME` global configuration and
+system/config-count overrides that must not run a monitor, a repository-local
+`core.fsmonitor` hook that must not run, a staged gitlink whose submodule place
+holds a real repository with an untracked file and monitor/hook traps that must
+not run, an unchanged index and unchanged file
+bytes/mtime, Agent-owned worker evidence that a dropped awaiter's child is
+reaped, and a reap-gated worker proving that `session.close` cannot return while
+its owner still waits for the child and returns with the process reaped (process
+listing, not elapsed time); RPC coverage covers the capability, the invalid
+budget, and capacity reuse after a Session close.
+
+Parent-owned remote verification: stable and Rust 1.85.0 all-target suites each
+passed 613 tests (587 library, 26 integration), with 2 Live tests ignored.
+Strict Clippy, fmt, rustdoc and Windows/macOS all-target cross-compilation checks
+passed. Unix-only PID/reap helpers are excluded from Windows builds; only the
+existing `write_reload_config` integration-test helper warning remains.
+Logs: `/root/minicore-agent-0914/logs/p4c-{tests,clippy,msrv,fmt,doc,windows,macos}.log`.
+No dependencies or Runtime pins changed in this slice. No local compilation,
+native Windows/macOS test execution, Live Provider test, installation, version
+bump or push occurred. P4 is complete; Bash process/stream work and change
+review remain separate P5/P6 work.
+
+Known limits: the work tree root reported by git must be resolvable to a
+directory; a workspace without any resolvable git answer is reported as an
+incomplete failure rather than a definite missing repository; paths inside a
+workspace whose own directory name git escapes are not attributed; untracked
+directories are reported collapsed, as git reports them; the deadline remains
+operation-granular, so one blocking read on a stalled filesystem can outlast it;
+submodule internals (their work tree changes, their untracked files, and any
+monitor or hook configured inside them) are not covered while commit-level
+gitlink changes are; a query returns one live observation with no cursor, so a
+caller that needs a stable view must re-query.
 
 ## P0 Verification
 

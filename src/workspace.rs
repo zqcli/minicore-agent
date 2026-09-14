@@ -20,6 +20,7 @@ pub(crate) mod listing;
 pub(crate) mod query;
 pub(crate) mod scan;
 pub(crate) mod search;
+pub(crate) mod status;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 

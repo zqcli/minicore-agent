@@ -52,6 +52,7 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "workspace.read",
     "workspace.files",
     "workspace.search",
+    "workspace.status",
     "deferred.waiter_limit",
 ];
 
@@ -589,6 +590,26 @@ impl Agent {
             CancellationToken::new(),
         )
         .await
+    }
+
+    /// Observes the Workspace's Git status. Only a loaded Session locates its
+    /// Workspace, and closing that Session cancels the query. The query owns
+    /// its git child and enforces its own deadline, so this call is never
+    /// wrapped in an outer timeout that could drop that ownership.
+    pub async fn workspace_status(
+        &self,
+        request: crate::WorkspaceStatusRequest,
+    ) -> Result<crate::WorkspaceStatusResult, AgentError> {
+        request.validate()?;
+        let session = self
+            .loaded_session(request.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let workspace = session.workspace();
+        // The Session owns the worker that runs the query, so closing the
+        // Session stops and reaps this query's child even if this caller goes
+        // away first.
+        let query = session.spawn_status_query(workspace, request, CancellationToken::new())?;
+        query.wait().await
     }
 
     /// Read-only structured facts for one tool call. The record is held in

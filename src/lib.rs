@@ -73,4 +73,8 @@ pub use workspace::search::{
     WorkspaceByteRange, WorkspaceSearchCursor, WorkspaceSearchMatch, WorkspaceSearchRequest,
     WorkspaceSearchResult,
 };
+pub use workspace::status::{
+    WorkspaceStatusEntry, WorkspaceStatusEntryKind, WorkspaceStatusRequest, WorkspaceStatusResult,
+    WorkspaceStatusWarning,
+};
 pub use workspace::{Workspace, WorkspaceError};
