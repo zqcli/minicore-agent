@@ -80,6 +80,8 @@ pub enum AgentError {
     RpcSerialization,
     #[error("history query exceeded its scan budget")]
     QueryLimit,
+    #[error("tool reference is unknown or was evicted")]
+    ToolNotFound,
     #[error("I/O failure")]
     Io(#[from] io::Error),
 }

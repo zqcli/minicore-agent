@@ -18,6 +18,7 @@ use crate::history::GetHistory;
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
 use crate::read::{ReadCursor, ReadSession, TurnResultRequest};
+use crate::tool_data::{ToolDataStream, ToolOutputRequest, ToolReadRequest, ToolRef};
 
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
 pub(crate) const PARSE_ERROR: i32 = -32_700;
@@ -44,6 +45,7 @@ pub(crate) const RELOAD_REQUIRES_RESTART: i32 = -32_017;
 pub(crate) const RELOAD_UNAVAILABLE: i32 = -32_018;
 pub(crate) const RESOURCE_EXHAUSTED: i32 = -32_019;
 pub(crate) const QUERY_LIMIT: i32 = -32_020;
+pub(crate) const TOOL_NOT_FOUND: i32 = -32_021;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -260,6 +262,61 @@ impl From<TurnResultParams> for TurnResultRequest {
             },
             cursor: value.cursor,
             limit: value.limit,
+            max_bytes: value.max_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolReadParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) loop_id: LoopId,
+    pub(crate) request_index: u32,
+    pub(crate) tool_call_id: minicore_runtime::ToolCallId,
+    #[serde(default)]
+    pub(crate) max_bytes: Option<usize>,
+}
+
+impl From<ToolReadParams> for ToolReadRequest {
+    fn from(value: ToolReadParams) -> Self {
+        Self {
+            tool_ref: ToolRef {
+                session_id: value.session_id,
+                loop_id: value.loop_id,
+                request_index: value.request_index,
+                tool_call_id: value.tool_call_id,
+            },
+            max_bytes: value.max_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolOutputParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) loop_id: LoopId,
+    pub(crate) request_index: u32,
+    pub(crate) tool_call_id: minicore_runtime::ToolCallId,
+    pub(crate) stream: ToolDataStream,
+    #[serde(default)]
+    pub(crate) offset: u64,
+    #[serde(default)]
+    pub(crate) max_bytes: Option<usize>,
+}
+
+impl From<ToolOutputParams> for ToolOutputRequest {
+    fn from(value: ToolOutputParams) -> Self {
+        Self {
+            tool_ref: ToolRef {
+                session_id: value.session_id,
+                loop_id: value.loop_id,
+                request_index: value.request_index,
+                tool_call_id: value.tool_call_id,
+            },
+            stream: value.stream,
+            offset: value.offset,
             max_bytes: value.max_bytes,
         }
     }

@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::{Workspace, WorkspaceError};
 
 use super::{
-    MAX_PATCH_BYTES, escape_control_characters, map_workspace_error, precheck_control,
+    MAX_PATCH_BYTES, emit_phase, escape_control_characters, map_workspace_error, precheck_control,
     run_controlled, wait_for_test_io,
 };
 
@@ -96,16 +96,19 @@ impl Tool for EditTool {
 
             run_controlled(&context, async {
                 wait_for_test_io(TOOL_NAME, &input.path).await;
+                emit_phase(&context, "reading");
                 let source = self
                     .workspace
                     .read_text(&input.path, MAX_PATCH_BYTES)
                     .await
                     .map_err(map_source_error)?;
+                emit_phase(&context, "matching");
                 let (result, replacements) = edit_text(&source, &input)?;
                 let output = ToolOutput::new(format!(
                     "replaced {replacements} occurrence(s) in {path_display}"
                 ))
                 .map_err(|_| ToolError::Internal)?;
+                emit_phase(&context, "committing");
                 self.workspace
                     .write_atomic(&input.path, result.as_bytes())
                     .await

@@ -26,9 +26,9 @@ use super::protocol::{
     RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED,
     STEER_QUEUE_FULL, STORE_ERROR, SessionCompactParams, SessionCreateParams, SessionHistoryParams,
     SessionParams, SessionReadParams, SessionRenameParams, SessionResult, SessionUpdateParams,
-    SessionUpdateResult, SessionsResult, SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult,
-    TurnResultParams, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params,
-    parse_request, request_id,
+    SessionUpdateResult, SessionsResult, SteerResult, TOOL_NOT_FOUND, TURN_NOT_FOUND,
+    ToolOutputParams, ToolReadParams, TurnParams, TurnResult, TurnResultParams, TurnSendParams,
+    TurnSteerParams, WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -452,6 +452,22 @@ impl RpcServer {
                 let result = self.agent().session_presentation(params.session_id);
                 Dispatch::Response(agent_result(&id, result))
             }
+            "tool.read" => {
+                let params: ToolReadParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self.agent().tool_read(params.into());
+                Dispatch::Response(agent_result(&id, result))
+            }
+            "tool.output" => {
+                let params: ToolOutputParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self.agent().tool_output(params.into());
+                Dispatch::Response(agent_result(&id, result))
+            }
             "turn.send" => {
                 let params: TurnSendParams = match params_or_error(&id, params) {
                     Ok(params) => params,
@@ -841,6 +857,12 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             false,
         ),
         AgentError::TurnNotFound => (TURN_NOT_FOUND, "turn not found", "turn_not_found", false),
+        AgentError::ToolNotFound => (
+            TOOL_NOT_FOUND,
+            "tool reference not found",
+            "tool_not_found",
+            false,
+        ),
         AgentError::ProfileNotFound => (
             PROFILE_NOT_FOUND,
             "profile not found",
@@ -921,6 +943,8 @@ fn canonical_method(method: &str) -> &'static str {
         "session.history" => "session.history",
         "session.read" => "session.read",
         "session.presentation" => "session.presentation",
+        "tool.read" => "tool.read",
+        "tool.output" => "tool.output",
         "turn.send" => "turn.send",
         "turn.steer" => "turn.steer",
         "turn.cancel" => "turn.cancel",

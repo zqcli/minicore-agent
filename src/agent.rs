@@ -41,6 +41,8 @@ pub const RPC_PROTOCOL_VERSION: u32 = 1;
 pub const RPC_CAPABILITIES: &[&str] = &[
     "session.read",
     "turn.result",
+    "tool.read",
+    "tool.output",
     "session.history",
     "deferred.waiter_limit",
 ];
@@ -221,7 +223,10 @@ impl ExecutionConfigFactory<'_> {
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
             None
         } else {
-            Some(Arc::new(Policy::new(record.approval)))
+            Some(crate::presentation::PresentationPolicy::new(
+                Arc::new(Policy::new(record.approval)),
+                Arc::clone(&presentation),
+            ))
         };
         let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
             Arc::new(
@@ -458,6 +463,46 @@ impl Agent {
         )
         .await
         .map_err(|_| AgentError::QueryLimit)?
+    }
+
+    /// Read-only structured facts for one tool call. The record is held in
+    /// memory for the loaded Session only; unloaded Sessions have no tool
+    /// records to query and return `ToolNotFound`, never a guessed one.
+    pub fn tool_read(
+        &self,
+        request: crate::tool_data::ToolReadRequest,
+    ) -> Result<crate::tool_data::ToolReadResult, AgentError> {
+        request.validate()?;
+        let tool_data = self.tool_data(request.tool_ref.session_id)?;
+        let max_bytes = request
+            .max_bytes
+            .unwrap_or(crate::read::DEFAULT_READ_MAX_BYTES);
+        tool_data.read(&request, max_bytes)
+    }
+
+    /// Bounded raw input or result bytes for one tool call, addressed by
+    /// offset. Returned bytes are the recorded original text: they are never
+    /// rewritten through `escape_default`, and offsets are UTF-8 bytes.
+    pub fn tool_output(
+        &self,
+        request: crate::tool_data::ToolOutputRequest,
+    ) -> Result<crate::tool_data::ToolOutputPage, AgentError> {
+        request.validate()?;
+        let tool_data = self.tool_data(request.tool_ref.session_id)?;
+        let max_bytes = request
+            .max_bytes
+            .unwrap_or(crate::read::DEFAULT_READ_MAX_BYTES);
+        tool_data.output(&request, max_bytes)
+    }
+
+    pub(crate) fn tool_data(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<Arc<crate::tool_data::ToolData>, AgentError> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.tool_data())
+            .ok_or(AgentError::SessionNotLoaded)
     }
 
     pub fn list_profiles(&self) -> Vec<ProfileInfo> {
