@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","turn.result","session.history","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","turn.result","tool.read","tool.output","session.history","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -108,6 +108,8 @@ protocol version, and ordered capability names:
   "capabilities": [
     "session.read",
     "turn.result",
+    "tool.read",
+    "tool.output",
     "session.history",
     "deferred.waiter_limit"
   ]
@@ -678,6 +680,133 @@ with optional `accepted_at`. The timestamp is the Agent acceptance time for
 that Steer, not its later application to a model request. A full steer queue is
 reported with `-32016`.
 
+## Tool Data
+
+`tool.read` and `tool.output` expose the structured facts the Agent recorded
+for one tool call. Both address a call by the complete identity, never by tool
+name or "most recent call":
+
+```json
+{
+  "session_id": "ses_...",
+  "loop_id": "lup_...",
+  "request_index": 0,
+  "tool_call_id": "..."
+}
+```
+
+All four values come from real Runtime boundaries: the session id, the
+`ModelCallContext` request at `Model::start`, and the Runtime tool-call id. A
+query whose identity was never recorded returns `-32021` (`tool_not_found`,
+non-retryable) rather than a nearby match. Records are held in memory for a
+loaded Session only, under a fixed per-session record and byte budget; a call
+whose bytes were evicted is reported through `availability` instead of being
+dropped silently.
+
+### `tool.read`
+
+```json
+{
+  "session_id": "ses_...",
+  "loop_id": "lup_...",
+  "request_index": 0,
+  "tool_call_id": "...",
+  "max_bytes": 262144
+}
+```
+
+`max_bytes` uses the same `1..=1 MiB` rule and defaults to 256 KiB. The result
+contains `execution` and, once the call reached its real execution boundary,
+an `invocation`. Invocation data is recorded when the validated request reaches
+the policy boundary, before the approval decision and before the tool's own
+parse/validation, so it is already obtainable while the call awaits approval.
+The recorded arguments are the *requested* input; they are not proof that the
+tool accepted them.
+
+```json
+{
+  "invocation": {
+    "tool_ref": { "session_id": "ses_...", "loop_id": "lup_...", "request_index": 0, "tool_call_id": "..." },
+    "name": "write",
+    "subject": { "kind": "file", "path": "src/main.rs" },
+    "subject_truncated": false,
+    "input": { "total_bytes": 42, "preview": "{\"path\":\"src/main.rs\",...}", "truncated": false, "encoding": "utf8_json" }
+  },
+  "execution": {
+    "tool_ref": { "session_id": "ses_...", "loop_id": "lup_...", "request_index": 0, "tool_call_id": "..." },
+    "name": "write",
+    "state": "succeeded",
+    "phase": "writing",
+    "started_at": "2026-09-14T00:00:00.000Z",
+    "finished_at": "2026-09-14T00:00:01.000Z",
+    "outcome": "success",
+    "input_availability": "available",
+    "output_availability": "available",
+    "input_bytes": 42,
+    "result_bytes": 21,
+    "input_truncated": false,
+    "result_truncated": false
+  }
+}
+```
+
+`state` is one of `requested`, `awaiting_policy`, `running`, `succeeded`,
+`failed`, `denied`, `cancelled`, `input_provided`. `awaiting_policy` is never
+reported as `running`, and `started_at` is set only when the tool actually
+runs: the tool has not been invoked before the decision. `phase` is the last
+real, whitelisted execution stage (`reading`, `writing`, `matching`,
+`committing`, `running`) — arbitrary `ToolContext.progress` text is ignored.
+`outcome` is the authoritative Runtime result outcome.
+
+Availability is per stream, so evicting an input does not make a later result
+unqueryable. Each of `input_availability`/`output_availability` is `pending`
+(still running, no bytes observed), `unavailable` (terminal, but no bytes were
+observed in this process), `available`, `partial` (a prefix only), or `expired`
+(retained bytes were evicted). `*_truncated` reports whether the retained bytes
+are only a prefix.
+
+`subject` is structured: `{"kind":"file","path":...}` for the file tools,
+`{"kind":"command","script":...,"cwd":...}` for Bash, and `{"kind":"other"}`
+for unknown tools. Raw arguments remain readable through
+`tool.output` on the `input` stream.
+
+### `tool.output`
+
+```json
+{
+  "session_id": "ses_...",
+  "loop_id": "lup_...",
+  "request_index": 0,
+  "tool_call_id": "...",
+  "stream": "output",
+  "offset": 0,
+  "max_bytes": 8192
+}
+```
+
+`stream` is `input` (canonical JSON of the requested invocation arguments) or
+`output` (the recorded tool result text). `encoding` is `utf8_json` for `input`
+and `utf8` for `output`. `offset`, `next_offset`, and `observed_end` are UTF-8
+byte offsets; `base_offset` is always the retained window start. Continue with
+`next_offset` until `eof`. `truncated` marks a page cut short or a stream larger
+than the retained cap.
+
+`availability` is per stream: `pending` while the call is still running and
+that stream has no observed bytes (with `observed_end: 0` and `eof: false`),
+`unavailable` once the call is terminal but no bytes were observed this
+process, then `available`, `partial`, or `expired`. `eof` is true only when the
+stream can no longer yield bytes: the retained prefix was fully delivered, or
+the bytes were evicted/truncated. A non-zero `offset` on an unobserved stream,
+or an `offset` past `observed_end`, is rejected with `invalid_params`;
+`next_offset` never moves backwards. An evicted stream returns an empty `data`
+with `availability: expired` rather than claiming no output.
+
+Returned bytes are the recorded original text. They are never rewritten
+through `escape_default`, and offsets always refer to the raw bytes. Clients
+remain responsible for not executing ANSI/control characters as terminal
+instructions. A requested `max_bytes` outside the supported range is rejected
+with `invalid_params`; it is never silently raised.
+
 ## Interactions
 
 ### `interaction.answer`
@@ -742,6 +871,13 @@ Loop-scoped events:
 - `request_started` (`turn`, `request_index`, `config_revision`, `model`, `reasoning`)
 - `output_delta` (`turn`, `request_index`, `channel` `text`/`reasoning`, `delta`, `meta`)
 - `tool_started` (`turn`, `request_index`, `tool_call_id`, `tool_name`, `meta`)
+- `tool_invocation` (`turn`, `data`, `meta`); `data` is the same structured
+  invocation record `tool.read` returns, emitted once the validated request
+  reaches the policy boundary (before the approval decision and before the
+  work). Best effort; use `tool.read` to reconcile a missed event.
+- `tool_execution` (`turn`, `data`, `meta`); terminal structured execution
+  facts from the Runtime `tool_finished` boundary, from the same record as
+  `tool.read`.
 - `tool_progress` (`turn`, `request_index`, `tool_call_id`, `progress`, `meta`)
 - `tool_presentation` (`turn`, `request_index`, `tool_call_id`, `tool_name`,
   `display`, `meta`); it is best effort and may arrive before or after
@@ -781,6 +917,7 @@ errors:
 | `-32018` | `reload_unavailable` |
 | `-32019` | `resource_exhausted` |
 | `-32020` | `query_limit` |
+| `-32021` | `tool_not_found` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or

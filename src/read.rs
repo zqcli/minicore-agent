@@ -843,7 +843,7 @@ fn records_for_chunks(
         .collect()
 }
 
-fn validate_max_bytes(value: Option<usize>) -> Result<(), AgentError> {
+pub(crate) fn validate_max_bytes(value: Option<usize>) -> Result<(), AgentError> {
     if value.is_some_and(|value| value == 0 || value > MAX_READ_MAX_BYTES) {
         Err(AgentError::InvalidArguments)
     } else {

@@ -17,6 +17,7 @@ use crate::ids::SessionId;
 use crate::sessions::{
     CompactionProgress, SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef,
 };
+use crate::tool_data::{ToolExecutionData, ToolInvocationData};
 
 /// Identity and drop accounting attached to every agent event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -75,6 +76,22 @@ pub enum AgentEvent {
         request_index: u32,
         tool_call_id: ToolCallId,
         tool_name: String,
+        meta: EventMeta,
+    },
+    /// Structured invocation facts for one tool call, published when the
+    /// validated request reaches the policy boundary (before the approval
+    /// decision and before the work). Same ToolRef-keyed data source as
+    /// `tool.read`; read-only.
+    ToolInvocation {
+        turn: TurnRef,
+        data: ToolInvocationData,
+        meta: EventMeta,
+    },
+    /// Terminal structured execution facts for one tool call, emitted from the
+    /// Runtime `ToolFinished` boundary. Same data source as `tool.read`.
+    ToolExecution {
+        turn: TurnRef,
+        data: ToolExecutionData,
         meta: EventMeta,
     },
     /// Bounded display for one tool call, emitted when that call finishes
@@ -149,6 +166,8 @@ impl AgentEvent {
             | Self::RequestUsage { meta, .. }
             | Self::OutputDelta { meta, .. }
             | Self::ToolStarted { meta, .. }
+            | Self::ToolInvocation { meta, .. }
+            | Self::ToolExecution { meta, .. }
             | Self::ToolPresentation { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
@@ -169,6 +188,8 @@ impl AgentEvent {
             | Self::RequestUsage { meta, .. }
             | Self::OutputDelta { meta, .. }
             | Self::ToolStarted { meta, .. }
+            | Self::ToolInvocation { meta, .. }
+            | Self::ToolExecution { meta, .. }
             | Self::ToolPresentation { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
@@ -732,6 +753,24 @@ impl Serialize for AgentEvent {
                     meta: *meta,
                 },
             ),
+            Self::ToolInvocation { turn, data, meta } => serialize_event(
+                serializer,
+                "tool_invocation",
+                ToolInvocationDataWire {
+                    turn,
+                    data,
+                    meta: *meta,
+                },
+            ),
+            Self::ToolExecution { turn, data, meta } => serialize_event(
+                serializer,
+                "tool_execution",
+                ToolExecutionDataWire {
+                    turn,
+                    data,
+                    meta: *meta,
+                },
+            ),
             Self::ToolPresentation {
                 turn,
                 request_index,
@@ -918,6 +957,20 @@ struct ToolStartedData<'a> {
     request_index: u32,
     tool_call_id: &'a ToolCallId,
     tool_name: &'a str,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
+struct ToolInvocationDataWire<'a> {
+    turn: &'a TurnRef,
+    data: &'a ToolInvocationData,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
+struct ToolExecutionDataWire<'a> {
+    turn: &'a TurnRef,
+    data: &'a ToolExecutionData,
     meta: EventMeta,
 }
 

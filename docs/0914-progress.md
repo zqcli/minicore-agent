@@ -27,7 +27,7 @@ configuration and real Session data are excluded. Git commits use repository-loc
 | --- | --- | --- |
 | P0 | Cancellation-safe RPC framing; bounded deferred admission | Verified, see below |
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
-| P2 | Structured tool identity, invocation and query records | Pending |
+| P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Pending |
 | P4 | Bounded Workspace files/read/search/status | Pending |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
@@ -88,3 +88,46 @@ Parent-run remote verification on 2026-09-14:
 Unpersisted results are retained only while the existing completed ActiveLoop
 is held (until the next turn or Session close). Reads beyond the scan ceiling
 are explicitly rejected; no full-history index or snapshot service is added.
+
+## P2 Verification
+
+P2 adds a narrow, non-authoritative tool-fact layer without a new service
+architecture, reusing the existing per-Session `Presentation` ownership and the
+Runtime's real boundaries:
+
+- `src/tool_data.rs` holds `ToolRef {session_id, loop_id, request_index,
+  tool_call_id}`, `ToolInvocationData` (structured `subject` plus a bounded raw
+  input preview), `ToolExecutionData` (state, whitelisted `ToolPhase`, real
+  start time, authoritative Runtime outcome, per-stream availability), and the
+  `tool.read`/`tool.output` queries. Records are bounded per loaded Session
+  (1024 records, 8 MiB of retained data plus counted metadata); eviction frees
+  the backing `String` capacity, reports `available`/`partial`/`expired`, and
+  keeps input and output availability independent. `tool.output` pages raw
+  bytes by UTF-8 offset with an encoded-JSON byte cap, never uses
+  `escape_default`, and distinguishes `pending` (still running) from
+  `unavailable` (terminal, never observed) from a real empty result.
+- Identity comes only from real Runtime values: `ModelCallContext` at
+  `Model::start` and the Runtime tool-call id. A new `PresentationPolicy`
+  wrapper publishes the requested invocation before an approval decision, so
+  approval-time data is obtainable while a call is `awaiting_policy` and never
+  reported as `running`; `started_at` is stamped only when the tool truly runs.
+  `PresentationTool` retains the raw result; the joined loop report
+  unconditionally reconciles state/outcome and captures result text for every
+  outcome (including failed/denied), without resurrecting evicted bytes.
+- New RPC methods `tool.read`/`tool.output` (capability-declared in
+  `agent.ping`) and best-effort `tool_invocation`/`tool_execution` events come
+  from the same record source as the queries. `ToolRef` rejects unknown fields.
+  The legacy `ToolDisplay` presentation path is retained unchanged for
+  compatibility; the new contract has no UI fields. No tool identity is
+  guessed from the most recent call.
+- Real phases are emitted through `ToolContext.progress` for read/write/edit/
+  apply_patch/bash and mapped to a known-stage whitelist. Raw stdout/stderr
+  streaming, process ownership, and durable auxiliary files remain P5; change
+  references remain P6.
+
+Parent-run remote verification: Linux stable and Rust 1.85.0 full suites each
+passed 442 tests, with 2 Live tests ignored. Strict stable Clippy, rustdoc,
+formatting, Windows and macOS all-target compile checks passed. The existing
+Windows test-helper warning remains. Logs are `logs/p2-tests.log`,
+`p2-msrv.log`, `p2-clippy.log`, `p2-doc.log`, `p2-windows.log`, and `p2-macos.log`.
+No local compilation, native cross-platform test execution, installation or push.

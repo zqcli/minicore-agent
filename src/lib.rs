@@ -17,6 +17,7 @@ mod rpc;
 mod sessions;
 pub(crate) mod store;
 mod subagents;
+mod tool_data;
 mod tools;
 mod workspace;
 
@@ -41,5 +42,10 @@ pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use sessions::{
     CompactionPhase, CompactionProgress, LoopAccepted, SessionBlockReason, SteerAccepted,
+};
+pub use tool_data::{
+    ToolDataAvailability, ToolDataStream, ToolExecutionData, ToolExecutionState, ToolInputSummary,
+    ToolInvocationData, ToolOutputPage, ToolOutputRequest, ToolPhase, ToolReadRequest,
+    ToolReadResult, ToolRef, ToolSubject,
 };
 pub use workspace::{Workspace, WorkspaceError};

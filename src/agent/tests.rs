@@ -4258,3 +4258,549 @@ async fn invalid_session_json_skipped_by_list_and_fails_open() {
 
     agent.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// P2: structured tool invocation/execution data (spec 3.1 and 7)
+// ---------------------------------------------------------------------------
+
+/// Authoritative ToolRefs derived from persisted history, so tests never guess
+/// a tool-call id or request index.
+fn history_tool_refs(agent: &Agent, session_id: SessionId) -> Vec<crate::tool_data::ToolRef> {
+    let page = agent
+        .history(GetHistory {
+            session_id,
+            offset: 0,
+            limit: 100,
+        })
+        .unwrap();
+    page.items
+        .iter()
+        .filter_map(|item| match &item.item {
+            crate::history::HistoryItemView::ToolResult(result) => {
+                Some(crate::tool_data::ToolRef {
+                    session_id,
+                    loop_id: result.loop_id,
+                    request_index: result.request_index,
+                    tool_call_id: result.tool_call_id.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn read_tool(
+    agent: &Agent,
+    tool_ref: crate::tool_data::ToolRef,
+) -> crate::tool_data::ToolReadResult {
+    agent
+        .tool_read(crate::tool_data::ToolReadRequest {
+            tool_ref,
+            max_bytes: None,
+        })
+        .unwrap()
+}
+
+fn read_output(agent: &Agent, tool_ref: crate::tool_data::ToolRef) -> String {
+    let mut collected = String::new();
+    let mut offset = 0_u64;
+    loop {
+        let page = agent
+            .tool_output(crate::tool_data::ToolOutputRequest {
+                tool_ref: tool_ref.clone(),
+                stream: crate::tool_data::ToolDataStream::Output,
+                offset,
+                max_bytes: Some(4096),
+            })
+            .unwrap();
+        collected.push_str(&page.data);
+        offset = page.next_offset;
+        if page.eof {
+            break;
+        }
+        assert!(page.next_offset > 0, "a non-eof page must advance");
+    }
+    collected
+}
+
+#[tokio::test]
+async fn tool_invocation_separates_requests_not_just_names() {
+    use crate::tool_data::{ToolExecutionState, ToolSubject};
+
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-identity-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-identity-ws", "a.txt", b"alpha");
+    std::fs::write(workspace.join("b.txt"), b"beta").unwrap();
+    // The same tool name runs in two different requests within one loop.
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            ModelScript::ToolCall("read", json!({"path": "b.txt", "limit": 8})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read both").await;
+    wait_text(&agent, turn).await;
+
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert_eq!(refs.len(), 2, "both reads must be recorded: {refs:?}");
+    assert_ne!(refs[0].request_index, refs[1].request_index);
+    let first = read_tool(&agent, refs[0].clone());
+    let second = read_tool(&agent, refs[1].clone());
+    assert_eq!(first.execution.state, ToolExecutionState::Succeeded);
+    assert_eq!(second.execution.state, ToolExecutionState::Succeeded);
+    let first_subject = first.invocation.expect("first invocation").subject;
+    let second_subject = second.invocation.expect("second invocation").subject;
+    assert_ne!(
+        first_subject, second_subject,
+        "each request keeps its own subject"
+    );
+    assert!(matches!(first_subject, ToolSubject::File { .. }));
+    assert!(matches!(second_subject, ToolSubject::File { .. }));
+
+    // A wrong request index is a distinct unknown identity, never a fallback
+    // to the most recent read of the same name.
+    let guessed = crate::tool_data::ToolRef {
+        request_index: refs[0].request_index + 100,
+        ..refs[0].clone()
+    };
+    assert!(matches!(
+        agent.tool_read(crate::tool_data::ToolReadRequest {
+            tool_ref: guessed,
+            max_bytes: None,
+        }),
+        Err(AgentError::ToolNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn tool_invocation_is_isolated_across_sessions() {
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-sessions-{}", next_id()));
+    let (workspace_a, _guard_a) = workspace_file("tool-data-session-a", "a.txt", b"alpha");
+    let base = workspace_a.parent().unwrap();
+    let workspace_b = base.join("session-b");
+    std::fs::create_dir_all(&workspace_b).unwrap();
+    std::fs::write(workspace_b.join("b.txt"), b"beta").unwrap();
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            ModelScript::Text("a done"),
+            ModelScript::ToolCall("read", json!({"path": "b.txt", "limit": 8})),
+            ModelScript::Text("b done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let session_a = create_session(&mut agent, &workspace_a).await;
+    let turn_a = send_text(&mut agent, session_a.session_id, "read a").await;
+    wait_text(&agent, turn_a).await;
+    let session_b = create_session(&mut agent, &workspace_b).await;
+    let turn_b = send_text(&mut agent, session_b.session_id, "read b").await;
+    wait_text(&agent, turn_b).await;
+
+    let ref_a = history_tool_refs(&agent, session_a.session_id);
+    let ref_b = history_tool_refs(&agent, session_b.session_id);
+    assert_eq!(ref_a.len(), 1);
+    assert_eq!(ref_b.len(), 1);
+    assert_eq!(ref_a[0].session_id, session_a.session_id);
+    assert_eq!(ref_b[0].session_id, session_b.session_id);
+    let invocation_a = read_tool(&agent, ref_a[0].clone())
+        .invocation
+        .expect("session-a invocation");
+    let invocation_b = read_tool(&agent, ref_b[0].clone())
+        .invocation
+        .expect("session-b invocation");
+    assert!(invocation_a.input.preview.contains("a.txt"));
+    assert!(invocation_b.input.preview.contains("b.txt"));
+    // The session is part of the identity: a lookup that keeps the loop-local
+    // values but swaps the session must not resolve to the other session's
+    // record. A session-insensitive key would find `ref_a` here.
+    let cross_session = crate::tool_data::ToolRef {
+        session_id: session_b.session_id,
+        ..ref_a[0].clone()
+    };
+    assert!(matches!(
+        agent.tool_read(crate::tool_data::ToolReadRequest {
+            tool_ref: cross_session,
+            max_bytes: None,
+        }),
+        Err(AgentError::ToolNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn tool_read_exposes_approval_time_data_without_running() {
+    use crate::tool_data::{ToolExecutionState, ToolSubject};
+
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-policy-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-policy-ws", "a.txt", b"hello");
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["write".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Ask,
+    };
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("write", json!({"path": "out.txt", "content": "written"})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "write it").await;
+
+    // Wait until the runtime reports the approval request, then query while
+    // the tool is still blocked before execution.
+    let interaction = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("interaction event must arrive")
+            .expect("event stream must remain open");
+        if let AgentEvent::InteractionRequested { interaction, .. } = event {
+            break interaction;
+        }
+    };
+    let tool_ref = crate::tool_data::ToolRef {
+        session_id: info.session_id,
+        loop_id: turn.loop_id,
+        request_index: 0,
+        tool_call_id: interaction.tool_call_id.clone(),
+    };
+    let waiting = read_tool(&agent, tool_ref.clone());
+    assert_eq!(waiting.execution.state, ToolExecutionState::AwaitingPolicy);
+    assert_ne!(
+        waiting.execution.state,
+        ToolExecutionState::Running,
+        "policy wait must never report running"
+    );
+    // Approval-time data is obtainable before the tool executes.
+    let waiting_invocation = waiting.invocation.expect("approval-time invocation data");
+    assert_eq!(
+        waiting_invocation.subject,
+        ToolSubject::File {
+            path: "out.txt".to_owned()
+        }
+    );
+    assert!(waiting_invocation.input.preview.contains("written"));
+
+    agent
+        .answer(crate::agent::AnswerInteraction {
+            turn,
+            interaction_id: interaction.interaction_id,
+            answer: minicore_runtime::interaction::InteractionAnswer::Approval(
+                minicore_runtime::tools::ApprovalDecision::AllowOnce,
+            ),
+        })
+        .await
+        .unwrap();
+    wait_text(&agent, turn).await;
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert_eq!(refs.len(), 1);
+    let finished = read_tool(&agent, refs[0].clone());
+    assert_eq!(finished.execution.state, ToolExecutionState::Succeeded);
+    let invocation = finished.invocation.expect("invocation after approval");
+    assert_eq!(
+        invocation.subject,
+        ToolSubject::File {
+            path: "out.txt".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
+async fn tool_execution_event_matches_the_tool_read_query() {
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-events-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-events-ws", "a.txt", b"alpha\nbeta");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 2})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read it").await;
+    wait_text(&agent, turn).await;
+
+    let mut invocation_event = None;
+    let mut execution_event = None;
+    while execution_event.is_none() {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("tool data events must arrive")
+            .expect("event stream must remain open");
+        match event {
+            AgentEvent::ToolInvocation { data, .. } => invocation_event = Some(data),
+            AgentEvent::ToolExecution { data, .. } => execution_event = Some(data),
+            AgentEvent::TurnFinished { .. } => break,
+            _ => {}
+        }
+    }
+    let invocation_event = invocation_event.expect("tool_invocation event");
+    let execution_event = execution_event.expect("tool_execution event");
+    let queried = read_tool(&agent, execution_event.tool_ref.clone());
+    assert_eq!(execution_event.tool_ref, queried.execution.tool_ref);
+    assert_eq!(execution_event.state, queried.execution.state);
+    assert_eq!(execution_event.outcome, queried.execution.outcome);
+    assert_eq!(invocation_event.tool_ref, execution_event.tool_ref);
+    assert_eq!(
+        invocation_event.subject,
+        queried.invocation.expect("queried invocation").subject
+    );
+}
+
+#[tokio::test]
+async fn tool_result_raw_text_is_readable_by_offset_without_escaping() {
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-offset-{}", next_id()));
+    let expected = (1..=24)
+        .map(|line| format!("line-{line}: 你好 café"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (workspace, _guard) = workspace_file("tool-data-offset-ws", "a.txt", expected.as_bytes());
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 64})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read it").await;
+    wait_text(&agent, turn).await;
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert_eq!(refs.len(), 1);
+
+    // `read` renders each source line with a "N: " prefix; reassembling the
+    // paged original must be byte-exact, including non-ASCII and newlines.
+    let expected_rendered = (1..=24)
+        .map(|line| format!("{line}: line-{line}: 你好 café"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(read_output(&agent, refs[0].clone()), expected_rendered);
+}
+
+#[tokio::test]
+async fn tool_read_answers_without_consuming_live_events() {
+    // A capacity-1 Agent event queue drops nearly every best-effort event, yet
+    // the authoritative join report still reconciles terminal tool state.
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-lost-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-lost-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent_with(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+        AgentOptions {
+            agent_event_capacity: 1,
+            loop_event_capacity: Some(1),
+        },
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read it").await;
+    wait_text(&agent, turn).await;
+    // The live stream is never consumed: events were dropped, not delivered.
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert_eq!(refs.len(), 1);
+    let result = read_tool(&agent, refs[0].clone());
+    assert_eq!(
+        result.execution.state,
+        crate::tool_data::ToolExecutionState::Succeeded
+    );
+    assert!(read_output(&agent, refs[0].clone()).starts_with("1: hello"));
+}
+
+#[tokio::test]
+async fn failed_tool_result_text_is_queryable_from_the_authoritative_report() {
+    use crate::tool_data::{ToolDataAvailability, ToolExecutionState};
+
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-failed-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-failed-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "missing.txt"})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read missing").await;
+    wait_text(&agent, turn).await;
+
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert_eq!(refs.len(), 1);
+    let result = read_tool(&agent, refs[0].clone());
+    assert_eq!(result.execution.state, ToolExecutionState::Failed);
+    assert_eq!(
+        result.execution.outcome,
+        Some(minicore_runtime::tools::ToolResultOutcome::Failed)
+    );
+    assert_eq!(
+        result.execution.output_availability,
+        ToolDataAvailability::Available
+    );
+    // The failed call's real text is recorded from the report, not left empty.
+    let output = read_output(&agent, refs[0].clone());
+    assert_eq!(output, "tool failed");
+    assert!(!output.contains("missing.txt"));
+}
+
+#[tokio::test]
+async fn running_tool_output_stream_is_never_a_false_empty_eof() {
+    use crate::tool_data::{ToolDataAvailability, ToolExecutionState};
+
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-pending-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-pending-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read it").await;
+
+    // Wait for the invocation event, then query while the tool may still be
+    // running. The page must never claim an empty, complete (`eof`) available
+    // stream: an unobserved output is `pending`.
+    let data = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("tool invocation event must arrive")
+            .expect("event stream must remain open");
+        if let AgentEvent::ToolInvocation { data, .. } = event {
+            break data;
+        }
+    };
+    let page = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: data.tool_ref.clone(),
+            stream: crate::tool_data::ToolDataStream::Output,
+            offset: 0,
+            max_bytes: None,
+        })
+        .unwrap();
+    match page.availability {
+        ToolDataAvailability::Pending => {
+            assert_eq!(page.observed_end, 0);
+            assert!(!page.eof);
+            assert!(page.data.is_empty());
+        }
+        ToolDataAvailability::Available => {
+            assert!(page.eof);
+            assert!(!page.data.is_empty());
+        }
+        other => panic!("unexpected early output availability: {other:?}"),
+    }
+
+    wait_text(&agent, turn).await;
+    let finished = read_tool(&agent, data.tool_ref);
+    assert_eq!(finished.execution.state, ToolExecutionState::Succeeded);
+}
+
+#[tokio::test]
+async fn rejected_tool_input_never_fabricates_a_file_operation() {
+    use crate::tool_data::{ToolExecutionState, ToolSubject};
+
+    let (data_dir, _guard) = fixture_dir(&format!("tool-data-invalid-{}", next_id()));
+    let (workspace, _guard) = workspace_file("tool-data-invalid-ws", "a.txt", b"hello");
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["write".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+    // The schema requires `content`; the arguments are structurally valid JSON
+    // but the tool's own parse rejects them.
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("write", json!({"path": "out.txt"})),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "write it").await;
+    wait_text(&agent, turn).await;
+
+    // The file was never created, and the recorded facts say the call failed
+    // rather than claiming a write happened.
+    assert!(!workspace.join("out.txt").exists());
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert_eq!(refs.len(), 1);
+    let result = read_tool(&agent, refs[0].clone());
+    assert_eq!(result.execution.state, ToolExecutionState::Failed);
+    // The requested input is recorded as requested, not as applied.
+    let invocation = result.invocation.expect("requested input is recorded");
+    assert_eq!(
+        invocation.subject,
+        ToolSubject::File {
+            path: "out.txt".to_owned()
+        }
+    );
+    assert!(invocation.input.preview.contains("out.txt"));
+    assert!(!invocation.input.preview.contains("content"));
+}

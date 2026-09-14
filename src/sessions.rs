@@ -1167,6 +1167,10 @@ impl Session {
         Arc::clone(&inner.presentation)
     }
 
+    pub(crate) fn tool_data(&self) -> Arc<crate::tool_data::ToolData> {
+        self.presentation().tool_data()
+    }
+
     pub(crate) fn presentation_view(&self) -> crate::presentation::PresentationView {
         self.presentation().snapshot()
     }
@@ -1704,6 +1708,13 @@ async fn run_active_loop(
     // append succeeds. Keep live footer state honest on both outcomes.
     refresh_branch(&session).await;
     session.presentation().note_loop_finished();
+    // The joined report is authoritative: reconcile terminal tool state even
+    // when the wrapper future was dropped by an outer Runtime deadline/cancel
+    // or its best-effort events were lost.
+    session
+        .presentation()
+        .tool_data()
+        .reconcile(turn.session_id, &sanitized);
     let user_item_count = sanitized
         .iter()
         .filter(|item| matches!(item, HistoryItem::User(_)))
@@ -1835,9 +1846,58 @@ pub(crate) fn forward_loop_event(
         .shared
         .events
         .record_core_drops(envelope.dropped_before);
+    // The terminal structured facts are read from the same ToolRef-keyed data
+    // source as `tool.read`, before the envelope is consumed below.
+    let execution = tool_execution_event(session_id, &envelope.event, session);
     if let Some(event) = map_loop_event(session_id, envelope.event, session) {
         session.shared.events.try_send(event);
     }
+    if let Some(event) = execution {
+        session.shared.events.try_send(event);
+    }
+}
+
+/// Best-effort `tool_execution` event built from the same structured record
+/// `tool.read` returns, so live and query clients cannot disagree.
+fn tool_execution_event(
+    session_id: SessionId,
+    event: &minicore_runtime::LoopEvent,
+    session: &Session,
+) -> Option<AgentEvent> {
+    let minicore_runtime::LoopEvent::ToolFinished {
+        loop_id,
+        request_index,
+        call_id,
+        outcome,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let tool_ref = crate::tool_data::ToolRef {
+        session_id,
+        loop_id: *loop_id,
+        request_index: *request_index,
+        tool_call_id: call_id.clone(),
+    };
+    // Record the authoritative terminal state before reading it back, so the
+    // event never reports a stale non-terminal state.
+    let data = session
+        .presentation()
+        .tool_data()
+        .finish_and_snapshot(&tool_ref, *outcome)?;
+    Some(AgentEvent::ToolExecution {
+        turn: TurnRef {
+            session_id,
+            loop_id: *loop_id,
+        },
+        data,
+        meta: EventMeta {
+            session_id,
+            loop_id: Some(*loop_id),
+            dropped_before: 0,
+        },
+    })
 }
 
 async fn forward_loop_event_and_refresh(
@@ -1938,25 +1998,52 @@ fn map_loop_event(
             call_id,
             tool_name,
             ..
-        } => Some(AgentEvent::ToolStarted {
-            turn,
-            request_index,
-            tool_call_id: call_id,
-            tool_name: tool_name.to_string(),
-            meta,
-        }),
+        } => {
+            // Runtime accepted the call; arguments are not available yet.
+            session.presentation().tool_data().note_requested(
+                &crate::tool_data::ToolRef {
+                    session_id,
+                    loop_id,
+                    request_index,
+                    tool_call_id: call_id.clone(),
+                },
+                tool_name.as_str(),
+            );
+            Some(AgentEvent::ToolStarted {
+                turn,
+                request_index,
+                tool_call_id: call_id,
+                tool_name: tool_name.to_string(),
+                meta,
+            })
+        }
         minicore_runtime::LoopEvent::ToolProgress {
             request_index,
             call_id,
             progress,
             ..
-        } => Some(AgentEvent::ToolProgress {
-            turn,
-            request_index,
-            tool_call_id: call_id,
-            progress: ToolProgressView::from(&progress),
-            meta,
-        }),
+        } => {
+            // A real `ToolContext.progress` phase is the only thing recorded
+            // here; raw stream bytes never travel through progress messages.
+            if let Some(message) = progress.message.as_ref() {
+                session.presentation().tool_data().note_phase(
+                    &crate::tool_data::ToolRef {
+                        session_id,
+                        loop_id,
+                        request_index,
+                        tool_call_id: call_id.clone(),
+                    },
+                    message.as_str(),
+                );
+            }
+            Some(AgentEvent::ToolProgress {
+                turn,
+                request_index,
+                tool_call_id: call_id,
+                progress: ToolProgressView::from(&progress),
+                meta,
+            })
+        }
         minicore_runtime::LoopEvent::ToolFinished {
             request_index,
             call_id,
@@ -1966,7 +2053,8 @@ fn map_loop_event(
         } => {
             // The wrapper normally finishes before Runtime emits this event;
             // the lookup remains best-effort because the event and presentation
-            // channels have independent delivery/drop semantics.
+            // channels have independent delivery/drop semantics. Terminal
+            // structured facts are recorded once by `tool_execution_event`.
             let presentation_result = session.presentation().tool_result(
                 crate::presentation::RequestKey {
                     loop_id,
@@ -1990,6 +2078,9 @@ fn map_loop_event(
             })
         }
         minicore_runtime::LoopEvent::InteractionRequested { interaction, .. } => {
+            // `awaiting_policy` is recorded by the policy wrapper from the
+            // exact ToolRef; the best-effort interaction event is not used to
+            // guess which call is waiting.
             Some(AgentEvent::InteractionRequested {
                 turn,
                 interaction: (&interaction).into(),

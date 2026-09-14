@@ -15,7 +15,7 @@ use crate::{Workspace, WorkspaceError};
 
 use super::{
     DEFAULT_READ_LIMIT, DEFAULT_READ_OFFSET, MAX_DIRECTORY_ENTRIES, MAX_READ_BYTES, MAX_READ_LINES,
-    map_workspace_error, precheck_control, run_controlled, wait_for_test_io,
+    emit_phase, map_workspace_error, precheck_control, run_controlled, wait_for_test_io,
 };
 
 const TOOL_NAME: &str = "read";
@@ -90,6 +90,7 @@ impl Tool for ReadTool {
             }
             let output = run_controlled(&context, async {
                 wait_for_test_io(TOOL_NAME, &input.path).await;
+                emit_phase(&context, "reading");
                 read_path(&self.workspace, &input).await
             })
             .await?;

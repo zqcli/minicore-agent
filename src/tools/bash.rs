@@ -205,6 +205,7 @@ async fn run_command(
     }
 
     let spawned = spawn_with_output_capture(command, cwd, invocation, environment).await?;
+    super::emit_phase(context, "running");
     let mut child = spawned.child;
     let stdout = spawned.stdout;
     let stderr = spawned.stderr;

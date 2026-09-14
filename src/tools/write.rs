@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::Workspace;
 
 use super::{
-    MAX_WRITE_BYTES, escape_control_characters, map_workspace_error, precheck_control,
+    MAX_WRITE_BYTES, emit_phase, escape_control_characters, map_workspace_error, precheck_control,
     run_controlled, wait_for_test_io,
 };
 
@@ -80,6 +80,7 @@ impl Tool for WriteTool {
                 .map_err(|_| ToolError::Internal)?;
             run_controlled(&context, async {
                 wait_for_test_io(TOOL_NAME, &input.path).await;
+                emit_phase(&context, "writing");
                 self.workspace
                     .write_atomic(&input.path, input.content.as_bytes())
                     .await

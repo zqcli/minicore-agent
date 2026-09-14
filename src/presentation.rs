@@ -30,6 +30,7 @@ use minicore_runtime::{LoopId, ToolCallId};
 use crate::event::{AgentEvent, AgentEventSink, EventMeta};
 use crate::ids::SessionId;
 use crate::sessions::TurnRef;
+use crate::tool_data::{ToolData, ToolInvocationData, ToolRef};
 
 /// Display text limits. Aligned with the existing per-argument/output caps so
 /// the expanded view can never promise rows that the Agent cannot show.
@@ -311,6 +312,7 @@ impl PresentationInner {
 pub(crate) struct Presentation {
     session_id: SessionId,
     events: AgentEventSink,
+    tool_data: Arc<ToolData>,
     inner: Mutex<PresentationInner>,
 }
 
@@ -319,8 +321,49 @@ impl Presentation {
         Arc::new(Self {
             session_id,
             events,
+            tool_data: Arc::new(ToolData::new()),
             inner: Mutex::new(PresentationInner::default()),
         })
+    }
+
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// Per-Session structured tool facts. Separate from the legacy UI display
+    /// caches above: the new contract never depends on presentation fields.
+    pub(crate) fn tool_data(&self) -> Arc<ToolData> {
+        Arc::clone(&self.tool_data)
+    }
+
+    /// Publishes the validated invocation to the structured store at the real
+    /// execution boundary and emits the best-effort `tool_invocation` event on
+    /// first publish. Runtime calls `Tool::execute` only after the policy
+    /// decision and approval, so this is where `Running` becomes true; the
+    /// policy wrapper may already have published the same data while the call
+    /// awaited approval.
+    pub(crate) fn publish_tool_invocation(&self, tool_ref: &ToolRef, invocation: &ToolInvocation) {
+        let data = self.tool_data.note_invocation(tool_ref, invocation);
+        self.tool_data.mark_running(tool_ref);
+        if let Some(data) = data {
+            self.emit_tool_invocation(data);
+        }
+    }
+
+    pub(crate) fn emit_tool_invocation(&self, data: ToolInvocationData) {
+        let loop_id = data.tool_ref.loop_id;
+        let _ = self.events.try_send(AgentEvent::ToolInvocation {
+            turn: TurnRef {
+                session_id: self.session_id,
+                loop_id,
+            },
+            data,
+            meta: EventMeta {
+                session_id: self.session_id,
+                loop_id: Some(loop_id),
+                dropped_before: 0,
+            },
+        });
     }
 
     pub(crate) fn set_branch(&self, branch: Option<String>) {
@@ -721,6 +764,21 @@ impl Tool for PresentationTool {
         );
         self.presentation.begin_tool(key, &invocation, display);
 
+        // Complete identity: only a real `Model::start` request key plus the
+        // Runtime's tool-call id. When no request identity has been observed
+        // yet, no ToolRef is invented and only the legacy display is kept.
+        let tool_ref = key.map(|key| ToolRef {
+            session_id: self.presentation.session_id(),
+            loop_id: key.loop_id,
+            request_index: key.request_index,
+            tool_call_id: invocation.tool_call_id().clone(),
+        });
+        if let Some(tool_ref) = &tool_ref {
+            // Published before the work starts, never after it returns.
+            self.presentation
+                .publish_tool_invocation(tool_ref, &invocation);
+        }
+
         let presentation = Arc::clone(&self.presentation);
         let request_key = key;
         let tool_call_id = invocation.tool_call_id().clone();
@@ -728,6 +786,16 @@ impl Tool for PresentationTool {
 
         Box::pin(async move {
             let result = inner.execute(invocation, context).await;
+            // Raw result bytes are retained unchanged for `tool.output`; the
+            // authoritative terminal state still comes from the Runtime
+            // `ToolFinished` event or the joined loop report.
+            if let (Some(tool_ref), Ok(ToolExecutionOutcome::Completed(output))) =
+                (&tool_ref, &result)
+            {
+                presentation
+                    .tool_data()
+                    .note_result(tool_ref, output.content().as_str());
+            }
             // Best-effort display bookkeeping after execution; the outcome and
             // error below are forwarded unchanged. Runtime errors are static
             // enum variants, but map them explicitly so a future diagnostic
@@ -743,6 +811,65 @@ impl Tool for PresentationTool {
             };
             presentation.finish_tool(request_key, &tool_call_id, result_text);
             result
+        })
+    }
+}
+
+/// Fixes the current request identity at the policy boundary and publishes
+/// the validated invocation before any approval decision. This is what makes
+/// invocation data obtainable while a tool is still waiting for approval;
+/// `Running` is not set here, because the tool has not been invoked yet.
+/// Delegation, fallback decisions, and error paths are unchanged.
+pub(crate) struct PresentationPolicy {
+    inner: Arc<dyn minicore_runtime::tools::ToolPolicy>,
+    presentation: Arc<Presentation>,
+}
+
+impl PresentationPolicy {
+    pub(crate) fn new(
+        inner: Arc<dyn minicore_runtime::tools::ToolPolicy>,
+        presentation: Arc<Presentation>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            presentation,
+        })
+    }
+}
+
+impl minicore_runtime::tools::ToolPolicy for PresentationPolicy {
+    fn decide<'a>(
+        &'a self,
+        request: minicore_runtime::tools::ToolPolicyRequest,
+    ) -> minicore_runtime::tools::ToolPolicyFuture<'a> {
+        let tool_ref = self.presentation.request_key().map(|key| ToolRef {
+            session_id: self.presentation.session_id(),
+            loop_id: key.loop_id,
+            request_index: key.request_index,
+            tool_call_id: request.invocation.tool_call_id().clone(),
+        });
+        if let Some(tool_ref) = &tool_ref {
+            if let Some(data) = self
+                .presentation
+                .tool_data()
+                .note_invocation(tool_ref, &request.invocation)
+            {
+                self.presentation.emit_tool_invocation(data);
+            }
+        }
+        let presentation = Arc::clone(&self.presentation);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let decision = inner.decide(request).await;
+            if let (Some(tool_ref), Ok(decision)) = (&tool_ref, &decision) {
+                if matches!(
+                    decision,
+                    minicore_runtime::tools::ToolDecision::RequireApproval { .. }
+                ) {
+                    presentation.tool_data().mark_awaiting_policy(tool_ref);
+                }
+            }
+            decision
         })
     }
 }

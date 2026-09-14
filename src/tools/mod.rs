@@ -180,6 +180,19 @@ pub(super) fn precheck_control(
     Ok(())
 }
 
+/// Emits one real execution phase through the Runtime `ToolContext.progress`.
+/// The phase is a static stage name, never raw stdout/stderr or file content;
+/// streamed bytes have their own typed channel (P5). Best-effort: a full
+/// progress queue is ignored.
+pub(super) fn emit_phase(context: &minicore_runtime::tools::ToolContext, phase: &'static str) {
+    let message = minicore_runtime::value::BoundedText::new(phase)
+        .expect("static phase name fits the bounded text limit");
+    let _ = context.progress.emit(
+        minicore_runtime::tools::ToolProgress::new(Some(message), None, None)
+            .expect("phase progress carries no completed/total pair"),
+    );
+}
+
 pub(super) async fn run_controlled<T, F>(
     context: &minicore_runtime::tools::ToolContext,
     future: F,
