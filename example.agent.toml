@@ -29,6 +29,13 @@ approval = "auto"
 # model_retry_attempts = 2
 # model_retry_base_delay_millis = 100
 
+# Agent-global automatic compaction policy. Manual session.compact stays
+# available when disabled. Requires 0 < target_percent < trigger_percent <= 100.
+# [compaction]
+# enabled = true
+# trigger_percent = 80
+# target_percent = 50
+
 [models.main]
 provider = "open_ai_responses"
 model = "your-model-id"

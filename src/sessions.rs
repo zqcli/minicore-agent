@@ -25,7 +25,8 @@ use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
 use crate::compaction::{
-    CompactionInput, CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage,
+    AutoContext, AutomaticCompactionObservation, AutomaticCompactionView, CompactionInput,
+    CompactionPolicy, CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage,
     generate_summary,
 };
 use crate::config::map_loop_start_error;
@@ -53,6 +54,8 @@ type WorkerGateEntry = (SessionId, Arc<WorkerGate>);
 static PAUSE_BEFORE_JOIN: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 static PAUSE_AFTER_COMPACTION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
+#[cfg(test)]
+static PAUSE_AFTER_ADMISSION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct WorkerGate {
@@ -134,8 +137,29 @@ pub(crate) fn pause_next_compaction_after_result(session_id: SessionId, gate: Ar
 }
 
 #[cfg(test)]
+pub(crate) fn pause_next_admission_after_result(session_id: SessionId, gate: Arc<WorkerGate>) {
+    PAUSE_AFTER_ADMISSION_RESULT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, gate));
+}
+
+#[cfg(test)]
 fn take_pause_after_compaction_result(session_id: SessionId) -> Option<Arc<WorkerGate>> {
     let mut gates = PAUSE_AFTER_COMPACTION_RESULT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|(candidate, _)| *candidate == session_id)
+        .map(|position| gates.remove(position).1)
+}
+
+#[cfg(test)]
+fn take_pause_after_admission_result(session_id: SessionId) -> Option<Arc<WorkerGate>> {
+    let mut gates = PAUSE_AFTER_ADMISSION_RESULT
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap();
@@ -241,9 +265,18 @@ pub struct ContextBudget {
     /// `estimated_history_bytes / 4`; this is not a full request-context token
     /// estimate and does not represent provider-reported usage.
     pub estimated_history_tokens: Option<u64>,
-    /// Reserved for the full prepared request estimate. P3a does not calculate
-    /// system, summary, tool-schema, framing, or current-input costs.
+    /// The latest full prepared-request estimate observed by automatic
+    /// preparation. While a request is preparing this is its current estimate;
+    /// while idle it is the last completed estimate.
     pub estimated_request_context_tokens: Option<u64>,
+    /// The model's effective input budget after its own output allowance and
+    /// safety margin were already subtracted. `None` when automatic compaction
+    /// is disabled or no model descriptor is bound.
+    pub input_budget_tokens: Option<u64>,
+    /// Automatic-compaction trigger and target thresholds derived from the
+    /// effective input budget and the active `[compaction]` policy.
+    pub trigger_tokens: Option<u64>,
+    pub target_tokens: Option<u64>,
     pub max_history_items: usize,
     pub max_history_bytes: usize,
     /// `None` means the byte estimate was not available; it never guesses that
@@ -258,6 +291,13 @@ pub struct SessionContext {
     pub coverage: SummaryCoverage,
     pub last_result: Option<CompactionResult>,
     pub budget: ContextBudget,
+    /// Bounded process-local observations for the current and last automatic
+    /// preparation operation. Summary bodies are intentionally not exposed.
+    pub automatic: AutomaticCompactionView,
+    /// The most recent request-preparation failure kind observed in this
+    /// process, e.g. `context_uncompressible`. Cleared by a successful
+    /// preparation. It is observation, never durable session state.
+    pub last_prepare_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,9 +363,10 @@ impl Sessions {
 
 impl Drop for Sessions {
     fn drop(&mut self) {
-        // Ordinary Agent drop is intentionally non-blocking. Manual workers
-        // still receive cancellation through their Session-owned token; the
-        // async shutdown path above is the complete join barrier.
+        // Ordinary Agent drop is intentionally non-blocking. Manual and
+        // startup-admission workers still receive cancellation through their
+        // Session-owned token; the async shutdown path above is the complete
+        // join barrier.
         for session in self.loaded.values() {
             session.cancel_active_on_drop();
             session.cancel_compaction_on_drop();
@@ -364,13 +405,20 @@ struct SessionInner {
     user_times: std::collections::HashMap<(LoopId, usize), String>,
     presentation: Arc<crate::presentation::Presentation>,
     config: ExecutionConfig,
+    /// Automatic-compaction binding for the current execution config. It is
+    /// replaced together with `config` so the prompt provider always sees the
+    /// matching policy/state; `None` when automatic compaction is disabled.
+    auto: Option<AutoContext>,
     options: LoopOptions,
     active: Option<ActiveLoop>,
     blocked: Option<SessionBlockReason>,
     closing: bool,
     compaction: Option<Arc<CompactionOperation>>,
     compaction_progress: Option<CompactionProgress>,
+    admission: Option<Arc<AdmissionOperation>>,
     last_compaction_result: Option<CompactionResult>,
+    policy: CompactionPolicy,
+    next_admission_id: u64,
     // Operation IDs stay reserved for this loaded Session so stale cancel
     // requests cannot target a later operation with the same identity.
     used_compaction_ids: BTreeSet<String>,
@@ -388,6 +436,79 @@ pub(crate) struct ExecutionInput {
     pub(crate) request: LoopRequest,
     pub(crate) options: LoopOptions,
     pub(crate) summary: Option<BoundedText>,
+}
+
+/// One accepted submission: either a live loop, or an admission preparation
+/// that still owes its loop. The deferred waiter observes the preparation.
+pub(crate) enum LoopSubmission {
+    Accepted(LoopAccepted),
+    Preparing(PreparationWaiter),
+}
+
+/// Deferred submission receiver. Dropping it cancels a still-running startup
+/// preparation, so an embedded caller that abandons `Agent::send` cannot leave
+/// a summary worker running without an owner waiting for its result.
+pub(crate) struct PreparationWaiter {
+    session: Session,
+    operation_id: String,
+    receiver: watch::Receiver<Option<PreparedLoop>>,
+}
+
+impl PreparationWaiter {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+impl Drop for PreparationWaiter {
+    fn drop(&mut self) {
+        let _ = self.session.cancel_compaction(&self.operation_id);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationFailure {
+    Cancelled,
+    ContextUncompressible,
+    HistoryTooLarge,
+    SessionBlocked,
+    SessionBusy,
+    Compaction(&'static str),
+    Internal,
+}
+
+/// Result of one startup admission preparation: the loop it finally created,
+/// or the honest failure kind that prevented it. It never fabricates a LoopId
+/// before the summary work succeeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PreparedLoop {
+    Started(LoopAccepted),
+    Failed(PreparationFailure),
+}
+
+/// Whether one submission needs a startup summary preparation.
+enum AdmissionNeed {
+    /// The request fits; start the loop directly.
+    None,
+    /// The request exceeds the runtime limits or the automatic trigger.
+    Compact,
+    /// System plus current User/Steer plus tool schemas already exceed the
+    /// hard input ceiling; no summary can help without dropping constraints.
+    Uncompressible,
+}
+
+/// Frozen tool schemas for the current execution config, derived only from the
+/// record's enabled tools and the live `ToolSet`.
+fn frozen_tool_specs(
+    config: &ExecutionConfig,
+    record: &crate::store::SessionRecord,
+) -> Vec<ToolSpec> {
+    let enabled = record
+        .tools
+        .iter()
+        .filter_map(|name| name.parse::<ToolName>().ok())
+        .collect();
+    config.tools().specs_for(&enabled)
 }
 
 /// Owns one Agent worker without taking its JoinHandle into a local across an
@@ -441,14 +562,77 @@ const MAX_USED_COMPACTION_IDS: usize = 4_096;
 struct CompactionReservation {
     operation: Arc<CompactionOperation>,
     model: Arc<dyn Model>,
-    descriptor: ModelDescriptor,
     record: crate::store::SessionRecord,
     history: Arc<[HistoryItem]>,
     workspace: Arc<Workspace>,
     tool_schemas: Vec<ToolSpec>,
     previous_summary: Option<minicore_runtime::value::BoundedText>,
     previous_covered_item_count: usize,
+    /// Effective input token target for this operation. Automatic admission
+    /// uses the active policy; explicit manual compaction keeps its original
+    /// half-window target.
+    target_tokens: u64,
+    /// Effective model input ceiling for utility requests. Unlike the target,
+    /// this is a hard boundary for deciding whether a result is usable.
+    hard_tokens: u64,
+    /// Startup admission must avoid constructing an invalid full request before
+    /// the utility replaces over-limit history; manual compaction keeps exact
+    /// before-request accounting.
+    safe_before_estimate: bool,
+    /// Automatic admission may refresh an existing durable summary when a new
+    /// budget makes that summary too large. Manual compaction retains its
+    /// established no-op behavior once every history item is covered.
+    refresh_summary: bool,
     deadline: Instant,
+}
+
+/// Snapshot captured when automatic startup admission is reserved. Reloads
+/// and other future-turn updates must not change the model/configuration of a
+/// request that is already waiting for its admission decision.
+struct AdmissionReservation {
+    compaction: CompactionReservation,
+    config: ExecutionConfig,
+    options: LoopOptions,
+    auto: AutoContext,
+    system_prompt: Option<BoundedText>,
+    /// The raw projected request was known to fit the hard model window before
+    /// a trigger-started durable compaction attempt. It is a safe fallback if
+    /// the optional summary attempt makes no progress.
+    raw_fits_hard: bool,
+}
+
+/// Publishes and owns the outcome of one admission preparation. The wait
+/// receiver is created before work starts so no completion can be lost.
+struct AdmissionOperation {
+    result: watch::Sender<Option<PreparedLoop>>,
+    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    operation: Arc<CompactionOperation>,
+}
+
+impl AdmissionOperation {
+    fn new(
+        operation: Arc<CompactionOperation>,
+    ) -> (Arc<Self>, watch::Receiver<Option<PreparedLoop>>) {
+        let (result, receiver) = watch::channel(None);
+        (
+            Arc::new(Self {
+                result,
+                join: tokio::sync::Mutex::new(None),
+                operation,
+            }),
+            receiver,
+        )
+    }
+
+    async fn join(&self) -> Result<(), AgentError> {
+        let mut slot = self.join.lock().await;
+        let Some(handle) = slot.as_mut() else {
+            return Ok(());
+        };
+        let result = std::pin::Pin::new(handle).await;
+        slot.take();
+        result.map_err(|_| AgentError::Internal)
+    }
 }
 
 struct CompactionCompletionGuard {
@@ -490,6 +674,13 @@ impl CompactionOperation {
     fn cancellation_requested(&self) -> bool {
         self.state.load(Ordering::Acquire) == COMPACTION_CANCELLED
             || self.cancellation.is_cancelled()
+    }
+
+    /// Marks the operation terminal without publishing a manual result. Used
+    /// by a startup admission after it has taken ownership of its loop, so a
+    /// later cancel finds nothing to cancel.
+    fn finish(&self) {
+        self.state.store(COMPACTION_COMPLETED, Ordering::Release);
     }
 
     fn try_begin_commit(&self) -> bool {
@@ -644,6 +835,17 @@ impl CompletionGuard {
     }
 }
 
+struct EphemeralSummaryCleanup {
+    state: Arc<CompactionState>,
+    loop_id: LoopId,
+}
+
+impl Drop for EphemeralSummaryCleanup {
+    fn drop(&mut self) {
+        self.state.clear_ephemeral(self.loop_id);
+    }
+}
+
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -672,9 +874,11 @@ impl Session {
         user_times: std::collections::HashMap<(LoopId, usize), String>,
         presentation: Arc<crate::presentation::Presentation>,
         config: ExecutionConfig,
+        auto: Option<AutoContext>,
         options: LoopOptions,
         subagents: Arc<SubagentService>,
         compaction: Arc<CompactionState>,
+        policy: CompactionPolicy,
         store: Store,
         events: AgentEventSink,
     ) -> Self {
@@ -685,13 +889,17 @@ impl Session {
             user_times,
             presentation,
             config,
+            auto,
             options,
             active: None,
             blocked: None,
             closing: false,
             compaction: None,
             compaction_progress: None,
+            admission: None,
             last_compaction_result: None,
+            policy,
+            next_admission_id: 0,
             used_compaction_ids: BTreeSet::new(),
         };
         Self {
@@ -723,6 +931,14 @@ impl Session {
 
     pub(crate) fn compaction_state(&self) -> Arc<CompactionState> {
         Arc::clone(&self.shared.compaction)
+    }
+
+    pub(crate) fn policy(&self) -> CompactionPolicy {
+        self.shared.inner.lock().unwrap().policy
+    }
+
+    pub(crate) fn automatic_compaction_enabled(&self) -> bool {
+        self.shared.inner.lock().unwrap().auto.is_some()
     }
 
     pub(crate) fn info(&self, loaded: bool) -> SessionInfo {
@@ -800,6 +1016,20 @@ impl Session {
             } else {
                 estimated_history_bytes.map(|bytes| bytes <= inner.options.limits.max_history_bytes)
             };
+        let automatic = self.shared.compaction.automatic_view();
+        let estimated_request_context_tokens = self.shared.compaction.latest_request_tokens();
+        let (input_budget_tokens, trigger_tokens, target_tokens) =
+            match (&inner.auto, inner.config.descriptor().context_window) {
+                (Some(auto), window) => {
+                    let budget = auto.policy.budget(window);
+                    (
+                        Some(window),
+                        Some(budget.trigger_tokens),
+                        Some(budget.target_tokens),
+                    )
+                }
+                _ => (None, None, None),
+            };
         SessionContext {
             session_id: inner.record.session_id,
             current_operation: inner.compaction_progress.clone(),
@@ -809,15 +1039,20 @@ impl Session {
                 retained_item_count,
             },
             last_result: inner.last_compaction_result.clone(),
+            last_prepare_failure: self.shared.compaction.prepare_failure(),
             budget: ContextBudget {
                 estimated_history_items,
                 estimated_history_tokens: estimated_history_bytes.map(bytes_to_tokens),
                 estimated_history_bytes,
-                estimated_request_context_tokens: None,
+                estimated_request_context_tokens,
+                input_budget_tokens,
+                trigger_tokens,
+                target_tokens,
                 max_history_items: inner.options.limits.max_history_items,
                 max_history_bytes: inner.options.limits.max_history_bytes,
                 within_runtime_limits,
             },
+            automatic,
         }
     }
 
@@ -826,12 +1061,28 @@ impl Session {
         config: ExecutionConfig,
         summary: Option<BoundedText>,
         system_prompt: String,
+        auto: Option<AutoContext>,
     ) -> Result<ExecutionConfig, AgentError> {
-        let Some(summary) = summary else {
+        if summary.is_none() && auto.is_none() {
             return Ok(config);
-        };
-        let prompt = ProjectPromptProvider::new_bound(self.workspace(), system_prompt, summary)
-            .map_err(|_| AgentError::InvalidSessionSettings)?;
+        }
+        let workspace = self.workspace();
+        let prompt = match summary {
+            Some(summary) => ProjectPromptProvider::new_bound(
+                workspace,
+                system_prompt,
+                summary,
+                auto,
+                Arc::clone(&self.shared.compaction),
+            ),
+            None => ProjectPromptProvider::with_auto(
+                workspace,
+                system_prompt,
+                Arc::clone(&self.shared.compaction),
+                auto,
+            ),
+        }
+        .map_err(|_| AgentError::InvalidSessionSettings)?;
         let prompt = SteerReceiptPrompt::new(Arc::new(prompt), self.presentation());
         ExecutionConfig::new(
             Arc::clone(config.model()),
@@ -844,12 +1095,28 @@ impl Session {
     }
 
     pub(crate) fn execution_input(&self, input: UserInput) -> Result<ExecutionInput, AgentError> {
-        let (history, config, options, system_prompt) = {
+        self.build_execution_input(input, false)
+    }
+
+    /// Builds the startup projection for an admission worker that already owns
+    /// the Session's compaction slot; that ownership replaces the usual busy
+    /// rejection.
+    fn build_execution_input(
+        &self,
+        input: UserInput,
+        owned_admission: bool,
+    ) -> Result<ExecutionInput, AgentError> {
+        let (history, config, options, system_prompt, auto) = {
             let inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
+            let busy = if owned_admission {
+                inner.closing || inner.active.is_some()
+            } else {
+                inner.closing || inner.active.is_some() || inner.compaction.is_some()
+            };
+            if busy {
                 return Err(AgentError::SessionBusy);
             }
             (
@@ -857,6 +1124,7 @@ impl Session {
                 inner.config.clone(),
                 inner.options.clone(),
                 inner.record.system_prompt.clone(),
+                inner.auto.clone(),
             )
         };
         let (history, summary) = match self.shared.compaction.project(&history) {
@@ -866,7 +1134,7 @@ impl Session {
         if !history_fits_runtime_limits(&history, &options.limits) {
             return Err(AgentError::HistoryTooLarge);
         }
-        let config = self.bind_execution_config(config, summary.clone(), system_prompt)?;
+        let config = self.bind_execution_config(config, summary.clone(), system_prompt, auto)?;
         Ok(ExecutionInput {
             request: LoopRequest::new(history, input, config),
             options,
@@ -879,29 +1147,462 @@ impl Session {
     pub(crate) async fn start_loop(&self, input: UserInput) -> Result<LoopAccepted, AgentError> {
         self.cleanup_finished().await?;
         let execution = self.execution_input(input)?;
-        let mut agent_loop =
-            AgentLoop::start(execution.request, execution.options).map_err(map_loop_start_error)?;
-        let handle = agent_loop.handle();
-        let turn = TurnRef {
-            session_id: self.session_id(),
-            loop_id: handle.id(),
+        self.install_loop(execution, None)
+    }
+
+    /// Admits one user submission. Automatic-enabled sessions first use a
+    /// Session-owned preparation to perform the bounded startup decision; the
+    /// worker either starts the loop directly or creates a compliant summary
+    /// before any `AgentLoop` exists. The caller receives a real `TurnRef` only
+    /// after that decision succeeds.
+    pub(crate) async fn submit(&self, input: UserInput) -> Result<LoopSubmission, AgentError> {
+        self.cleanup_finished().await?;
+        let automatic = {
+            let inner = self.shared.inner.lock().unwrap();
+            if inner.blocked.is_some() {
+                return Err(AgentError::SessionBlocked);
+            }
+            inner.auto.is_some()
         };
-        let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
-        let (completion_tx, completion_rx) = watch::channel(None);
-        // Mark the new current loop before spawning its worker. Otherwise a
-        // very fast model/tool could populate the presentation cache and then
-        // lose its identity when `note_loop_started` clears stale state. Keep
-        // the synchronous state publication and JoinHandle ownership in one
-        // lock section so close cannot observe an active loop without its
-        // retained worker handle.
-        let accepted_at = crate::store::utc_timestamp().ok();
+        if !automatic {
+            return Ok(LoopSubmission::Accepted(self.start_loop(input).await?));
+        }
+        // Reserve the Session slot before any workspace read or model work.
+        // The admission worker makes the eventual decision, which keeps the
+        // RPC reader responsive even when AGENTS.md is slow to read.
+        let waiter = self.start_admission(input).await?;
+        Ok(LoopSubmission::Preparing(waiter))
+    }
+
+    /// Decides whether the next submission must compact its settled history
+    /// before a loop can start. The reservation has already captured the
+    /// model/configuration, so reloads cannot change this request mid-flight.
+    /// The irreducible minimum is checked with the real current input before a
+    /// futile summary model call is started.
+    async fn admission_needed(
+        &self,
+        input: &UserInput,
+        reservation: &mut AdmissionReservation,
+    ) -> Result<AdmissionNeed, PreparationFailure> {
+        let operation = &reservation.compaction.operation;
+        if operation.cancellation_requested() {
+            return Err(PreparationFailure::Cancelled);
+        }
+        let deadline = reservation.compaction.deadline;
+        if Instant::now() >= deadline {
+            return Err(PreparationFailure::Compaction("timeout"));
+        }
+        let history = &reservation.compaction.history;
+        let (projected, summary) = match self.shared.compaction.project(history) {
+            Some(projection) => (projection.suffix.to_vec(), Some(projection.summary)),
+            None => (history.to_vec(), None),
+        };
+        let read = reservation
+            .compaction
+            .workspace
+            .read_prefix(crate::prompt::AGENTS_PATH, crate::prompt::MAX_AGENTS_BYTES);
+        tokio::pin!(read);
+        let prefix = tokio::select! {
+            biased;
+            _ = operation.cancellation.cancelled() => {
+                return Err(PreparationFailure::Cancelled);
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(PreparationFailure::Compaction("timeout"));
+            }
+            result = &mut read => result,
+        };
+        let agents = match prefix {
+            Ok(prefix) => Some(
+                crate::prompt::decode_agents(&prefix).map_err(|_| PreparationFailure::Internal)?,
+            ),
+            Err(WorkspaceError::NotFound) => None,
+            Err(_) => return Err(PreparationFailure::Internal),
+        };
+        if operation.cancellation_requested() {
+            return Err(PreparationFailure::Cancelled);
+        }
+        let system_base = minicore_runtime::value::BoundedText::new(
+            reservation.compaction.record.system_prompt.clone(),
+        )
+        .map_err(|_| PreparationFailure::Internal)?;
+        let system = crate::prompt::build_system_prompt(&system_base, agents)
+            .map_err(|_| PreparationFailure::Internal)?;
+        reservation.system_prompt = Some(system.clone());
+        let budget = reservation
+            .auto
+            .policy
+            .budget(reservation.config.descriptor().context_window);
+        let tools = &reservation.compaction.tool_schemas;
+        // The irreducible request alone may already exceed the budget; no
+        // summary could make it fit without dropping current user constraints.
+        let minimal_tokens = crate::compaction::estimate_minimal(
+            &system,
+            &[input.as_text()],
+            tools,
+            reservation.compaction.record.reasoning,
+        )
+        .map_err(|_| PreparationFailure::Internal)?;
+        let minimal_message_count =
+            ((!system.is_empty()) as usize).saturating_add((!input.as_text().is_empty()) as usize);
+        if Instant::now() >= deadline {
+            return Err(PreparationFailure::Compaction("timeout"));
+        }
+        if minimal_tokens > budget.hard_tokens
+            || minimal_message_count > reservation.options.limits.max_prompt_messages
         {
+            return Ok(AdmissionNeed::Uncompressible);
+        }
+
+        let runtime_over_limit =
+            !history_fits_runtime_limits(&projected, &reservation.options.limits);
+        let projected_message_count = projected
+            .len()
+            .saturating_add((!system.is_empty()) as usize)
+            .saturating_add(summary.is_some() as usize)
+            .saturating_add((!input.as_text().is_empty()) as usize);
+        let compacted_message_count =
+            (!system.is_empty()) as usize + 1 + (!input.as_text().is_empty()) as usize;
+        if (runtime_over_limit
+            || projected_message_count > reservation.options.limits.max_prompt_messages)
+            && compacted_message_count > reservation.options.limits.max_prompt_messages
+        {
+            return Ok(AdmissionNeed::Uncompressible);
+        }
+        // Do not compose/estimate a full request when the Runtime history
+        // itself is already outside its structural admission limits. The
+        // bounded utility summary is the recovery path for that history.
+        if runtime_over_limit {
+            return Ok(AdmissionNeed::Compact);
+        }
+        if projected_message_count > reservation.options.limits.max_prompt_messages {
+            return Ok(AdmissionNeed::Compact);
+        }
+
+        // With no settled history there is nothing automatic compaction can
+        // reduce. A request between trigger and hard is valid and must start
+        // normally without a utility call.
+        if projected.is_empty() && summary.is_none() {
+            let estimate = crate::compaction::estimate_startup_exact(
+                &system,
+                None,
+                &projected,
+                input.as_text(),
+                tools,
+                reservation.compaction.record.reasoning,
+            )
+            .map_err(|_| PreparationFailure::Internal)?;
+            self.shared
+                .compaction
+                .update_automatic(&operation.operation_id, |observation| {
+                    observation.before_tokens = Some(estimate);
+                    observation.after_tokens = Some(estimate);
+                });
+            self.shared.compaction.note_request_estimate(estimate);
+            if estimate > budget.hard_tokens {
+                return Ok(AdmissionNeed::Uncompressible);
+            }
+            if Instant::now() >= deadline {
+                return Err(PreparationFailure::Compaction("timeout"));
+            }
+            return Ok(AdmissionNeed::None);
+        }
+
+        let request_safe = crate::compaction::startup_history_is_request_safe(&projected);
+        let estimate = if request_safe {
+            match crate::compaction::estimate_startup_exact(
+                &system,
+                summary.as_ref(),
+                &projected,
+                input.as_text(),
+                tools,
+                reservation.compaction.record.reasoning,
+            ) {
+                Ok(estimate) => estimate,
+                // A request-safe history can still fail ModelRequest
+                // validation because of an invalid value. Let compaction
+                // replace it rather than sending it to Runtime.
+                Err(_) => return Ok(AdmissionNeed::Compact),
+            }
+        } else {
+            // A malformed/structurally invalid full history is not sent. A
+            // durable summary can replace it, provided the minimum above
+            // still fits the hard boundary.
+            crate::compaction::estimate_startup(
+                &system,
+                summary.as_ref(),
+                &projected,
+                input.as_text(),
+                tools,
+                reservation.compaction.record.reasoning,
+            )
+            .map_err(|_| PreparationFailure::Internal)?
+        };
+        self.shared
+            .compaction
+            .update_automatic(&operation.operation_id, |observation| {
+                observation.before_tokens = Some(estimate);
+                observation.after_tokens = Some(estimate);
+            });
+        self.shared.compaction.note_request_estimate(estimate);
+        if operation.cancellation_requested() {
+            return Err(PreparationFailure::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(PreparationFailure::Compaction("timeout"));
+        }
+        if request_safe && estimate <= budget.hard_tokens {
+            reservation.raw_fits_hard = true;
+        }
+        if !request_safe {
+            return Ok(AdmissionNeed::Compact);
+        }
+        if estimate <= budget.trigger_tokens {
+            Ok(AdmissionNeed::None)
+        } else {
+            Ok(AdmissionNeed::Compact)
+        }
+    }
+
+    fn build_admission_execution(
+        &self,
+        input: UserInput,
+        reservation: &AdmissionReservation,
+        admission: &Arc<AdmissionOperation>,
+    ) -> Result<ExecutionInput, AgentError> {
+        {
+            let inner = self.shared.inner.lock().unwrap();
+            if inner.blocked.is_some() {
+                return Err(AgentError::SessionBlocked);
+            }
+            if inner.closing
+                || inner.active.is_some()
+                || !inner
+                    .admission
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, admission))
+                || !Arc::ptr_eq(&inner.history, &reservation.compaction.history)
+            {
+                return Err(AgentError::SessionBusy);
+            }
+        }
+        let (history, summary) = match self
+            .shared
+            .compaction
+            .project(&reservation.compaction.history)
+        {
+            Some(projection) => (projection.suffix.to_vec().into(), Some(projection.summary)),
+            None => (Arc::clone(&reservation.compaction.history), None),
+        };
+        if !history_fits_runtime_limits(&history, &reservation.options.limits) {
+            return Err(AgentError::HistoryTooLarge);
+        }
+        let system = reservation
+            .system_prompt
+            .as_ref()
+            .ok_or(AgentError::InvalidState)?;
+        let message_count = history
+            .len()
+            .saturating_add((!system.is_empty()) as usize)
+            .saturating_add(summary.is_some() as usize)
+            .saturating_add((!input.as_text().is_empty()) as usize);
+        if message_count > reservation.options.limits.max_prompt_messages {
+            return Err(AgentError::ContextUncompressible);
+        }
+        let estimate = crate::compaction::estimate_startup_exact(
+            system,
+            summary.as_ref(),
+            &history,
+            input.as_text(),
+            &reservation.compaction.tool_schemas,
+            reservation.compaction.record.reasoning,
+        )
+        .map_err(|_| AgentError::ContextUncompressible)?;
+        if estimate > reservation.compaction.hard_tokens {
+            return Err(AgentError::ContextUncompressible);
+        }
+        self.shared.compaction.update_automatic(
+            &reservation.compaction.operation.operation_id,
+            |observation| {
+                observation.after_tokens = Some(estimate);
+            },
+        );
+        self.shared.compaction.note_request_estimate(estimate);
+        let config = self.bind_execution_config(
+            reservation.config.clone(),
+            summary.clone(),
+            reservation.compaction.record.system_prompt.clone(),
+            Some(reservation.auto.clone()),
+        )?;
+        Ok(ExecutionInput {
+            request: LoopRequest::new(history, input, config),
+            options: reservation.options.clone(),
+            summary,
+        })
+    }
+
+    /// Reserves a Session-owned admission preparation, spawning the summary
+    /// worker. The returned receiver yields the loop it finally created.
+    async fn start_admission(&self, input: UserInput) -> Result<PreparationWaiter, AgentError> {
+        let operation_id = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            let Some(next) = inner.next_admission_id.checked_add(1) else {
+                return Err(AgentError::InvalidState);
+            };
+            let operation_id = format!("admission-{}-{}", inner.record.session_id, next);
+            inner.next_admission_id = next;
+            operation_id
+        };
+        let (operation, _receiver) = CompactionOperation::new(operation_id.clone());
+        let (admission, result_receiver) = AdmissionOperation::new(Arc::clone(&operation));
+        let mut join_slot = admission.join.lock().await;
+        let reservation = {
             let mut inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
+            if inner.closing
+                || inner.active.is_some()
+                || inner.compaction.is_some()
+                || inner.admission.is_some()
+            {
                 return Err(AgentError::SessionBusy);
+            }
+            let auto = inner.auto.clone().ok_or(AgentError::SessionBusy)?;
+            // The automatic binding always carries the raw configured model,
+            // never the presentation-wrapped one, so the summary utility has
+            // its own no-tools identity.
+            let model = Arc::clone(&auto.model);
+            let descriptor = inner.config.descriptor().clone();
+            let history = Arc::clone(&inner.history);
+            // Reuse an already-validated durable summary as the fold starting
+            // point instead of re-summarizing its covered prefix.
+            let previous = self.shared.compaction.project(&history);
+            let (previous_summary, previous_covered_item_count) = previous
+                .map(|projection| {
+                    let covered = history.len().saturating_sub(projection.suffix.len());
+                    (Some(projection.summary), covered)
+                })
+                .unwrap_or((None, 0));
+            let retained_item_count = history.len().saturating_sub(previous_covered_item_count);
+            let budget = auto.policy.budget(descriptor.context_window);
+            self.shared
+                .compaction
+                .begin_automatic(AutomaticCompactionObservation {
+                    operation_id: operation.operation_id.clone(),
+                    loop_id: None,
+                    request_index: None,
+                    before_tokens: None,
+                    after_tokens: None,
+                    utility_before_tokens: None,
+                    utility_after_tokens: None,
+                    hard_tokens: budget.hard_tokens,
+                    trigger_tokens: budget.trigger_tokens,
+                    target_tokens: budget.target_tokens,
+                    utility_usage: None,
+                    outcome: "preparing".to_owned(),
+                });
+            let options = inner.options.clone();
+            let compaction = CompactionReservation {
+                operation: Arc::clone(&operation),
+                model,
+                record: inner.record.clone(),
+                history,
+                workspace: Arc::clone(&inner.workspace),
+                tool_schemas: frozen_tool_specs(&inner.config, &inner.record),
+                previous_summary,
+                previous_covered_item_count,
+                hard_tokens: budget.hard_tokens,
+                target_tokens: budget.target_tokens,
+                safe_before_estimate: true,
+                refresh_summary: true,
+                // Startup compaction has its own operation deadline. The
+                // effective automatic preparation budget covers the configured
+                // model/prompt timeout floor and is shared by all utility
+                // chunks; no individual chunk gets a fresh timeout.
+                deadline: Instant::now()
+                    .checked_add(options.prompt_timeout.max(options.model_timeout))
+                    .unwrap_or_else(Instant::now),
+            };
+            inner.compaction = Some(Arc::clone(&operation));
+            inner.admission = Some(Arc::clone(&admission));
+            inner.compaction_progress = Some(CompactionProgress {
+                operation_id: operation.operation_id.clone(),
+                phase: CompactionPhase::Preparing,
+                covered_item_count: previous_covered_item_count,
+                retained_item_count,
+            });
+            AdmissionReservation {
+                compaction,
+                config: inner.config.clone(),
+                options,
+                auto,
+                system_prompt: None,
+                raw_fits_hard: false,
+            }
+        };
+        // Publish the reservation before spawning a worker that may complete
+        // synchronously (for example, an already-fitting request). This keeps
+        // SessionState notifications in causal order.
+        self.emit_state();
+        // Do not let a very fast worker finish and clear the Session slot
+        // before its JoinHandle has been stored. The gate closes that small
+        // shutdown/ownership window without adding an await to admission.
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let worker_session = self.clone();
+        let worker_admission = Arc::clone(&admission);
+        let task = tokio::spawn(async move {
+            if start_rx.await.is_ok() {
+                run_admission(worker_session, worker_admission, reservation, input).await;
+            }
+        });
+        *join_slot = Some(task);
+        drop(join_slot);
+        let _ = start_tx.send(());
+        Ok(PreparationWaiter {
+            session: self.clone(),
+            operation_id,
+            receiver: result_receiver,
+        })
+    }
+
+    /// Installs a successfully created loop. When `admission` is given, the
+    /// admission is re-validated before the loop starts and its terminal state
+    /// plus the active loop are published under one lock, so an admission can
+    /// never be observed as both busy and started.
+    fn install_loop(
+        &self,
+        execution: ExecutionInput,
+        admission: Option<&Arc<AdmissionOperation>>,
+    ) -> Result<LoopAccepted, AgentError> {
+        let accepted_at = crate::store::utc_timestamp().ok();
+        let turn = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            Self::validate_install_state(&inner, admission)?;
+            // AgentLoop::start only validates and spawns the Runtime task; it
+            // does not await model work. Keeping this short lock held closes
+            // the cancellation/close race between validation and ownership.
+            let mut agent_loop = AgentLoop::start(execution.request, execution.options)
+                .map_err(map_loop_start_error)?;
+            let handle = agent_loop.handle();
+            let turn = TurnRef {
+                session_id: inner.record.session_id,
+                loop_id: handle.id(),
+            };
+            let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
+            let (completion_tx, completion_rx) = watch::channel(None);
+            if let Some(admission) = admission {
+                inner.compaction_progress = None;
+                admission.operation.finish();
+                // Commit the admission observation before the loop task can
+                // begin a request-time observation. This preserves startup
+                // utility usage when the first request itself merely fits.
+                self.shared.compaction.finish_automatic(
+                    &admission.operation.operation_id,
+                    "started",
+                    None,
+                    None,
+                );
             }
             inner.active = Some(ActiveLoop {
                 turn,
@@ -926,13 +1627,72 @@ impl Session {
                 .as_mut()
                 .expect("newly inserted active loop")
                 .task = Some(task);
-        }
+            turn
+        };
         tracing::info!(
             session_id = %turn.session_id,
             loop_id = %turn.loop_id,
             "turn submitted"
         );
         Ok(LoopAccepted { turn, accepted_at })
+    }
+
+    /// Pre-flight for `install_loop`: fails before any `AgentLoop` is created
+    /// when the session is blocked, closing, already active, or the admission
+    /// was cancelled or replaced.
+    fn validate_install_state(
+        inner: &SessionInner,
+        admission: Option<&Arc<AdmissionOperation>>,
+    ) -> Result<(), AgentError> {
+        if inner.blocked.is_some() {
+            return Err(AgentError::SessionBlocked);
+        }
+        if inner.closing || inner.active.is_some() {
+            return Err(AgentError::SessionBusy);
+        }
+        match admission {
+            Some(admission) => {
+                let current = inner
+                    .admission
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, admission));
+                if !current {
+                    return Err(AgentError::SessionBusy);
+                }
+                if admission.operation.cancellation_requested() {
+                    // A preparation cancelled after its summary finished must
+                    // not install the loop.
+                    return Err(AgentError::InvalidState);
+                }
+                if !inner
+                    .compaction
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission.operation))
+                {
+                    return Err(AgentError::SessionBusy);
+                }
+            }
+            None => {
+                if inner.compaction.is_some() || inner.admission.is_some() {
+                    return Err(AgentError::SessionBusy);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears only the wire-visible progress for one admission. The admission
+    /// and its JoinHandle remain Session-owned until the worker has actually
+    /// been joined by cleanup or shutdown.
+    fn clear_admission(&self, admission: &Arc<AdmissionOperation>) {
+        let mut inner = self.shared.inner.lock().unwrap();
+        let current = inner
+            .admission
+            .as_ref()
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, admission));
+        if current {
+            inner.compaction_progress = None;
+        }
     }
 
     pub(crate) async fn cleanup_finished(&self) -> Result<(), AgentError> {
@@ -979,10 +1739,71 @@ impl Session {
                 inner.active = None;
             }
         }
+        if self.reap_finished_admission().await? {
+            return Ok(());
+        }
         if self.reap_finished_compaction().await? {
             return Ok(());
         }
         Err(AgentError::SessionBusy)
+    }
+
+    async fn reap_finished_admission(&self) -> Result<bool, AgentError> {
+        let admission = {
+            let inner = self.shared.inner.lock().unwrap();
+            inner.admission.clone()
+        };
+        let Some(admission) = admission else {
+            return Ok(false);
+        };
+        if admission.result.borrow().is_none() {
+            return Ok(false);
+        }
+        if admission.join().await.is_err() {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner
+                .admission
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission))
+            {
+                inner.admission = None;
+            }
+            if inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission.operation))
+            {
+                inner.compaction = None;
+                inner.compaction_progress = None;
+            }
+            inner.blocked = Some(SessionBlockReason::Internal);
+            drop(inner);
+            self.emit_state();
+            return Err(AgentError::SessionBlocked);
+        }
+        let cleared = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            let same_admission = inner
+                .admission
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission));
+            if same_admission {
+                inner.admission = None;
+            }
+            let same_compaction = inner
+                .compaction
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission.operation));
+            if same_compaction {
+                inner.compaction = None;
+            }
+            let progress_cleared = inner.compaction_progress.take().is_some();
+            same_admission || same_compaction || progress_cleared
+        };
+        if cleared {
+            self.emit_state();
+        }
+        Ok(true)
     }
 
     pub(crate) async fn start_compaction(
@@ -1022,17 +1843,15 @@ impl Session {
                     (Some(projection.summary), covered_item_count)
                 })
                 .unwrap_or((None, 0));
-            let enabled = inner
-                .record
-                .tools
-                .iter()
-                .filter_map(|name| name.parse::<ToolName>().ok())
-                .collect();
-            let tool_schemas = inner.config.tools().specs_for(&enabled);
+            let tool_schemas = frozen_tool_specs(&inner.config, &inner.record);
             let retained_item_count = inner
                 .history
                 .len()
                 .saturating_sub(previous_covered_item_count);
+            // Explicit manual compaction keeps its original half-window
+            // target. The Agent-global policy controls automatic compaction;
+            // changing it must not silently change manual behavior.
+            let target_tokens = descriptor.context_window / 2;
             inner.compaction = Some(Arc::clone(&operation));
             inner.used_compaction_ids.insert(operation_id.clone());
             inner.compaction_progress = Some(CompactionProgress {
@@ -1044,13 +1863,16 @@ impl Session {
             CompactionReservation {
                 operation: Arc::clone(&operation),
                 model,
-                descriptor,
                 record: inner.record.clone(),
                 history: Arc::clone(&inner.history),
                 workspace: Arc::clone(&inner.workspace),
                 tool_schemas,
                 previous_summary,
                 previous_covered_item_count,
+                hard_tokens: descriptor.context_window,
+                target_tokens,
+                safe_before_estimate: false,
+                refresh_summary: false,
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
                     .unwrap_or_else(Instant::now),
@@ -1065,6 +1887,9 @@ impl Session {
     }
 
     pub(crate) fn cancel_compaction(&self, operation_id: &str) -> Result<bool, AgentError> {
+        // A startup preparation reserves the same `compaction` slot and
+        // operation id, so this cancels both a manual operation and a
+        // preparation that has not started its loop.
         let operation = {
             let inner = self.shared.inner.lock().unwrap();
             inner
@@ -1318,9 +2143,17 @@ impl Session {
 
     /// Replaces only the future-turn execution snapshot. This never persists
     /// Session metadata and never forwards a config update to an active loop.
-    pub(crate) fn replace_future_config(&self, config: ExecutionConfig, options: LoopOptions) {
+    pub(crate) fn replace_future_config(
+        &self,
+        config: ExecutionConfig,
+        auto: Option<AutoContext>,
+        policy: CompactionPolicy,
+        options: LoopOptions,
+    ) {
         let mut inner = self.shared.inner.lock().unwrap();
         inner.config = config;
+        inner.auto = auto;
+        inner.policy = policy;
         inner.options = options;
     }
 
@@ -1331,6 +2164,7 @@ impl Session {
         &self,
         record: crate::store::SessionRecord,
         config: ExecutionConfig,
+        auto: Option<AutoContext>,
     ) -> Result<Option<ConfigRevision>, AgentError> {
         let _io = self.shared.io.lock().await;
         let active_summary = {
@@ -1338,7 +2172,10 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || inner.compaction.is_some() {
+            if inner.closing
+                || (inner.active.is_none()
+                    && (inner.compaction.is_some() || inner.admission.is_some()))
+            {
                 return Err(AgentError::SessionBusy);
             }
             inner
@@ -1346,8 +2183,12 @@ impl Session {
                 .as_ref()
                 .and_then(|active| active.execution_summary.clone())
         };
-        let config =
-            self.bind_execution_config(config, active_summary, record.system_prompt.clone())?;
+        let config = self.bind_execution_config(
+            config,
+            active_summary,
+            record.system_prompt.clone(),
+            auto.clone(),
+        )?;
         self.shared
             .store
             .write_record(&record)
@@ -1358,6 +2199,7 @@ impl Session {
             inner.record = record;
             let update_config = config.clone();
             inner.config = config;
+            inner.auto = auto;
             (
                 inner.active.as_ref().map(|active| active.handle.clone()),
                 update_config,
@@ -1402,13 +2244,14 @@ impl Session {
     /// drains any child workers owned by this Session.
     pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
         let session_id = self.session_id();
-        let (active_handle, active_task, compaction) = {
+        let (active_handle, active_task, compaction, admission) = {
             let mut inner = self.shared.inner.lock().unwrap();
             let active_handle = inner.active.as_ref().map(|active| active.handle.clone());
             let active_task = inner.active.as_ref().and_then(|active| active.task.clone());
             let compaction = inner.compaction.clone();
+            let admission = inner.admission.clone();
             inner.closing = true;
-            (active_handle, active_task, compaction)
+            (active_handle, active_task, compaction, admission)
         };
         let mut first_error = None;
         if let Some(handle) = active_handle {
@@ -1426,6 +2269,20 @@ impl Session {
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
             {
                 inner.active = None;
+            }
+        }
+        if let Some(admission) = admission {
+            let _ = admission.operation.cancel();
+            if admission.join().await.is_err() && first_error.is_none() {
+                first_error = Some(AgentError::Internal);
+            }
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner
+                .admission
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission))
+            {
+                inner.admission = None;
             }
         }
         if let Some(compaction) = compaction {
@@ -1662,6 +2519,208 @@ async fn run_compaction(session: Session, reservation: CompactionReservation) {
     }
 }
 
+/// The single startup-admission worker: it folds the settled prefix into a
+/// durable summary, then creates the loop. It never fabricates a `TurnRef`
+/// before the summary is committed, and a cancelled preparation terminates
+/// without starting any loop. A drop guard guarantees the waiter always sees a
+/// terminal outcome even if the worker panics.
+async fn run_admission(
+    session: Session,
+    admission: Arc<AdmissionOperation>,
+    mut reservation: AdmissionReservation,
+    input: UserInput,
+) {
+    let mut guard = AdmissionCompletionGuard {
+        session: session.clone(),
+        admission: Arc::clone(&admission),
+        operation_id: reservation.compaction.operation.operation_id.clone(),
+        outcome: None,
+    };
+    let operation = Arc::clone(&reservation.compaction.operation);
+    let outcome = if operation.cancellation_requested() {
+        PreparedLoop::Failed(PreparationFailure::Cancelled)
+    } else {
+        match session.admission_needed(&input, &mut reservation).await {
+            Err(failure) => PreparedLoop::Failed(failure),
+            Ok(AdmissionNeed::Uncompressible) => {
+                PreparedLoop::Failed(PreparationFailure::ContextUncompressible)
+            }
+            Ok(AdmissionNeed::None) => {
+                install_admitted_loop(&session, &admission, input, &reservation)
+            }
+            Ok(AdmissionNeed::Compact) => {
+                let result = run_compaction_inner(&session, &reservation.compaction).await;
+                session.shared.compaction.update_automatic(
+                    &operation.operation_id,
+                    |observation| {
+                        if observation.before_tokens.is_none() {
+                            observation.before_tokens = result.before_tokens;
+                        }
+                        if observation.after_tokens.is_none() {
+                            observation.after_tokens = result.after_tokens;
+                        }
+                        if result.before_tokens.is_some() {
+                            observation.utility_before_tokens = result.before_tokens;
+                        }
+                        if result.after_tokens.is_some() {
+                            observation.utility_after_tokens = result.after_tokens;
+                        }
+                        if result.utility_usage.is_some() {
+                            observation.utility_usage = result.utility_usage.clone();
+                        }
+                    },
+                );
+                match result.status {
+                    CompactionStatus::Compacted | CompactionStatus::Noop => {
+                        if operation.cancellation_requested() {
+                            PreparedLoop::Failed(PreparationFailure::Cancelled)
+                        } else {
+                            install_admitted_loop(&session, &admission, input, &reservation)
+                        }
+                    }
+                    CompactionStatus::Failed => {
+                        if reservation.raw_fits_hard
+                            && !operation.cancellation_requested()
+                            && Instant::now() < reservation.compaction.deadline
+                        {
+                            install_admitted_loop(&session, &admission, input, &reservation)
+                        } else {
+                            PreparedLoop::Failed(admission_failure_kind(
+                                result.failure_kind.as_deref(),
+                            ))
+                        }
+                    }
+                    CompactionStatus::UnknownWrite => {
+                        PreparedLoop::Failed(admission_failure_kind(result.failure_kind.as_deref()))
+                    }
+                }
+            }
+        }
+    };
+    guard.outcome = Some(outcome);
+    drop(guard);
+    #[cfg(test)]
+    if let Some(gate) = take_pause_after_admission_result(session.session_id()) {
+        gate.started.notify_one();
+        gate.release.notified().await;
+    }
+}
+
+/// Publishes exactly one terminal outcome for an admission. If the worker is
+/// dropped without publishing (panic or task abort), a later admission cannot
+/// hang on a sender that will never send.
+struct AdmissionCompletionGuard {
+    session: Session,
+    admission: Arc<AdmissionOperation>,
+    operation_id: String,
+    outcome: Option<PreparedLoop>,
+}
+
+impl Drop for AdmissionCompletionGuard {
+    fn drop(&mut self) {
+        let mut outcome = self
+            .outcome
+            .take()
+            .unwrap_or(PreparedLoop::Failed(PreparationFailure::Internal));
+        if !matches!(&outcome, PreparedLoop::Started(_))
+            && self.admission.operation.cancellation_requested()
+        {
+            outcome = PreparedLoop::Failed(PreparationFailure::Cancelled);
+        }
+        if matches!(
+            &outcome,
+            PreparedLoop::Failed(PreparationFailure::ContextUncompressible)
+        ) {
+            self.session
+                .shared
+                .compaction
+                .note_prepare_failure(crate::compaction::CONTEXT_UNCOMPRESSIBLE);
+        } else if let PreparedLoop::Failed(PreparationFailure::Compaction(kind)) = &outcome {
+            self.session.shared.compaction.note_prepare_failure(kind);
+        } else if matches!(&outcome, PreparedLoop::Started(_)) {
+            self.session.shared.compaction.clear_prepare_failure();
+        }
+        let observation_outcome = match &outcome {
+            PreparedLoop::Started(_) => "started",
+            PreparedLoop::Failed(PreparationFailure::Cancelled) => "cancelled",
+            PreparedLoop::Failed(PreparationFailure::ContextUncompressible) => {
+                "context_uncompressible"
+            }
+            PreparedLoop::Failed(PreparationFailure::HistoryTooLarge) => "history_too_large",
+            PreparedLoop::Failed(PreparationFailure::SessionBlocked) => "session_blocked",
+            PreparedLoop::Failed(PreparationFailure::SessionBusy) => "session_busy",
+            PreparedLoop::Failed(PreparationFailure::Compaction(kind)) => kind,
+            PreparedLoop::Failed(PreparationFailure::Internal) => "internal",
+        };
+        self.session.shared.compaction.finish_automatic(
+            &self.operation_id,
+            observation_outcome,
+            None,
+            None,
+        );
+        if !matches!(&outcome, PreparedLoop::Started(_)) {
+            self.admission.operation.finish();
+            self.session.clear_admission(&self.admission);
+        }
+        self.admission.result.send_replace(Some(outcome));
+        self.session.emit_state();
+    }
+}
+
+fn install_admitted_loop(
+    session: &Session,
+    admission: &Arc<AdmissionOperation>,
+    input: UserInput,
+    reservation: &AdmissionReservation,
+) -> PreparedLoop {
+    if reservation.compaction.operation.cancellation_requested() {
+        return PreparedLoop::Failed(PreparationFailure::Cancelled);
+    }
+    if Instant::now() >= reservation.compaction.deadline {
+        return PreparedLoop::Failed(PreparationFailure::Compaction("timeout"));
+    }
+    match session.build_admission_execution(input, reservation, admission) {
+        Ok(execution) => match session.install_loop(execution, Some(admission)) {
+            Ok(accepted) => PreparedLoop::Started(accepted),
+            Err(error) => PreparedLoop::Failed(admission_failure(&error)),
+        },
+        Err(error) => PreparedLoop::Failed(admission_failure(&error)),
+    }
+}
+
+fn admission_failure(error: &AgentError) -> PreparationFailure {
+    match error {
+        AgentError::HistoryTooLarge => PreparationFailure::HistoryTooLarge,
+        AgentError::SessionBlocked => PreparationFailure::SessionBlocked,
+        AgentError::SessionBusy => PreparationFailure::SessionBusy,
+        AgentError::InvalidState => PreparationFailure::Cancelled,
+        AgentError::ContextUncompressible => PreparationFailure::ContextUncompressible,
+        _ => PreparationFailure::Internal,
+    }
+}
+
+fn admission_failure_kind(kind: Option<&str>) -> PreparationFailure {
+    match kind {
+        Some("cancelled") => PreparationFailure::Cancelled,
+        Some("history_too_large") => PreparationFailure::HistoryTooLarge,
+        Some("context_uncompressible") => PreparationFailure::ContextUncompressible,
+        Some("timeout") => PreparationFailure::Compaction("timeout"),
+        Some("workspace") => PreparationFailure::Compaction("workspace"),
+        Some("prompt") => PreparationFailure::Compaction("prompt"),
+        Some("store") => PreparationFailure::Compaction("store"),
+        Some("history_changed") => PreparationFailure::Compaction("history_changed"),
+        Some("too_large") => PreparationFailure::Compaction("too_large"),
+        Some("budget_exceeded") => PreparationFailure::Compaction("budget_exceeded"),
+        Some("no_progress") => PreparationFailure::Compaction("no_progress"),
+        Some("model_failure") => PreparationFailure::Compaction("model_failure"),
+        Some("invalid_model_response") => PreparationFailure::Compaction("invalid_model_response"),
+        Some("tool_call_rejected") => PreparationFailure::Compaction("tool_call_rejected"),
+        Some("serialization_failure") => PreparationFailure::Compaction("serialization_failure"),
+        Some("write_outcome_unknown") => PreparationFailure::Compaction("write_outcome_unknown"),
+        _ => PreparationFailure::Compaction("compaction_failure"),
+    }
+}
+
 async fn run_compaction_inner(
     session: &Session,
     reservation: &CompactionReservation,
@@ -1671,7 +2730,10 @@ async fn run_compaction_inner(
     if reservation.operation.cancellation_requested() {
         return failed_compaction(&reservation.operation, "cancelled", history_len);
     }
-    if history_len == 0 || retained_item_count == 0 {
+    if history_len == 0
+        || (retained_item_count == 0
+            && (!reservation.refresh_summary || reservation.previous_summary.is_none()))
+    {
         return CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
             status: CompactionStatus::Noop,
@@ -1746,13 +2808,15 @@ async fn run_compaction_inner(
 
     let input = CompactionInput {
         model: Arc::clone(&reservation.model),
-        descriptor: reservation.descriptor.clone(),
         reasoning: reservation.record.reasoning,
         history: Arc::clone(&reservation.history),
         previous_summary: reservation.previous_summary.clone(),
         previous_covered_item_count: reservation.previous_covered_item_count,
         project_instructions: system_prompt,
         tool_schemas: reservation.tool_schemas.clone(),
+        hard_tokens: reservation.hard_tokens,
+        target_tokens: reservation.target_tokens,
+        safe_before_estimate: reservation.safe_before_estimate,
         operation_deadline: reservation.deadline,
     };
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
@@ -1902,6 +2966,11 @@ async fn run_active_loop(
     mut events: minicore_runtime::LoopEventStream,
     mut completion: CompletionGuard,
 ) {
+    session.shared.compaction.begin_ephemeral_loop(turn.loop_id);
+    let _ephemeral_cleanup = EphemeralSummaryCleanup {
+        state: Arc::clone(&session.shared.compaction),
+        loop_id: turn.loop_id,
+    };
     #[cfg(test)]
     if should_panic_worker(turn.session_id) {
         panic!("injected Agent worker panic");
@@ -2469,6 +3538,37 @@ pub(crate) async fn await_compaction_completion(
     }
 }
 
+/// Awaits one startup admission preparation. It resolves only after the
+/// Session published either a real loop or an explicit failure kind.
+pub(crate) async fn await_loop_preparation(
+    mut waiter: PreparationWaiter,
+) -> Result<LoopAccepted, AgentError> {
+    loop {
+        {
+            let value = waiter.receiver.borrow();
+            if let Some(prepared) = value.as_ref() {
+                return match prepared {
+                    PreparedLoop::Started(accepted) => Ok(accepted.clone()),
+                    PreparedLoop::Failed(failure) => Err(match failure {
+                        PreparationFailure::Cancelled => AgentError::InvalidState,
+                        PreparationFailure::ContextUncompressible => {
+                            AgentError::ContextUncompressible
+                        }
+                        PreparationFailure::HistoryTooLarge => AgentError::HistoryTooLarge,
+                        PreparationFailure::SessionBlocked => AgentError::SessionBlocked,
+                        PreparationFailure::SessionBusy => AgentError::SessionBusy,
+                        PreparationFailure::Compaction(_) => AgentError::Internal,
+                        PreparationFailure::Internal => AgentError::Internal,
+                    }),
+                };
+            }
+        }
+        if waiter.receiver.changed().await.is_err() {
+            return Err(AgentError::Internal);
+        }
+    }
+}
+
 pub(crate) fn map_store_error(error: StoreError) -> AgentError {
     match error {
         StoreError::SessionNotFound => AgentError::SessionNotFound,
@@ -2506,6 +3606,7 @@ fn map_answer_error(error: AnswerError) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::EphemeralGroupKey;
     use crate::event::{AgentEvent, AgentEventSink, EventMeta, LoopOutcomeView};
     use crate::ids::SessionId;
 
@@ -2539,5 +3640,36 @@ mod tests {
             panic!("expected a turn finished event");
         };
         assert_eq!(meta.dropped_before, 7);
+    }
+
+    #[test]
+    fn an_old_loop_cleanup_cannot_clear_a_new_loop_summary() {
+        let state = CompactionState::new();
+        let old_loop = LoopId::new().unwrap();
+        let new_loop = LoopId::new().unwrap();
+        let cleanup = EphemeralSummaryCleanup {
+            state: Arc::clone(&state),
+            loop_id: old_loop,
+        };
+        assert!(state.cache_ephemeral(
+            old_loop,
+            EphemeralGroupKey {
+                start: 0,
+                end: 1,
+                source_hash: [1; 32],
+            },
+            BoundedText::new("old").unwrap(),
+        ));
+        assert!(state.cache_ephemeral(
+            new_loop,
+            EphemeralGroupKey {
+                start: 0,
+                end: 1,
+                source_hash: [2; 32],
+            },
+            BoundedText::new("new").unwrap(),
+        ));
+        drop(cleanup);
+        assert!(state.ephemeral(new_loop).is_some());
     }
 }

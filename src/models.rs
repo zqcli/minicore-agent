@@ -107,6 +107,15 @@ impl ModelConfig {
             Self::OpenAiResponses { supports_tools, .. } => *supports_tools,
         }
     }
+
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        match self {
+            Self::OpenAiResponses {
+                request_timeout_seconds,
+                ..
+            } => request_timeout_seconds.map(Duration::from_secs),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

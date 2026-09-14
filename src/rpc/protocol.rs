@@ -46,6 +46,7 @@ pub(crate) const RELOAD_UNAVAILABLE: i32 = -32_018;
 pub(crate) const RESOURCE_EXHAUSTED: i32 = -32_019;
 pub(crate) const QUERY_LIMIT: i32 = -32_020;
 pub(crate) const TOOL_NOT_FOUND: i32 = -32_021;
+pub(crate) const CONTEXT_UNCOMPRESSIBLE: i32 = -32_022;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {

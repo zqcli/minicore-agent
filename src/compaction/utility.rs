@@ -5,8 +5,8 @@ use std::time::Instant;
 use futures_util::{FutureExt, StreamExt};
 use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelEvent, ModelFinishReason, ModelLimits,
-    ModelMessage, ModelRequest, ReasoningPreference, Usage,
+    Model, ModelCallContext, ModelEvent, ModelFinishReason, ModelLimits, ModelMessage,
+    ModelRequest, ReasoningPreference, Usage,
 };
 use minicore_runtime::tools::ToolSpec;
 use minicore_runtime::value::BoundedText;
@@ -54,13 +54,25 @@ const PROVIDER_ESTIMATE_MARGIN_BYTES: usize = 512;
 #[derive(Clone)]
 pub(crate) struct CompactionInput {
     pub(crate) model: Arc<dyn Model>,
-    pub(crate) descriptor: ModelDescriptor,
     pub(crate) reasoning: ReasoningPreference,
     pub(crate) history: Arc<[HistoryItem]>,
     pub(crate) previous_summary: Option<BoundedText>,
     pub(crate) previous_covered_item_count: usize,
     pub(crate) project_instructions: BoundedText,
     pub(crate) tool_schemas: Vec<ToolSpec>,
+    /// Hard effective input ceiling for utility requests. The target is a
+    /// preferred reduced size, not a reason to reject a request that still
+    /// fits the model.
+    pub(crate) hard_tokens: u64,
+    /// Effective input token target for the reduced summary. Automatic
+    /// admission supplies the active policy target; manual compaction supplies
+    /// its established half-window target.
+    pub(crate) target_tokens: u64,
+    /// Startup admission may have a history that cannot be represented as one
+    /// `ModelRequest` yet. Its before estimate must then stay item-wise until
+    /// the utility replaces that history; manual/request-time groups retain
+    /// the precise request estimate used by the original compaction flow.
+    pub(crate) safe_before_estimate: bool,
     pub(crate) operation_deadline: Instant,
 }
 
@@ -107,7 +119,7 @@ impl UtilityError {
 
 struct FixedPrompt {
     system: BoundedText,
-    target_input_bytes: usize,
+    hard_input_bytes: usize,
     reasoning: ReasoningPreference,
 }
 
@@ -128,12 +140,12 @@ impl FixedPrompt {
         text.push_str(UTILITY_TOOLS_PREFIX);
         text.push_str(&tool_json);
         let system = BoundedText::new(text).map_err(|_| UtilityError::TooLarge)?;
-        let target_input_bytes = tokens_to_bytes(input.descriptor.context_window / 2)
+        let hard_input_bytes = tokens_to_bytes(input.hard_tokens)
             .filter(|bytes| *bytes > PROVIDER_ESTIMATE_MARGIN_BYTES)
             .ok_or(UtilityError::Budget)?;
         let fixed = Self {
             system,
-            target_input_bytes,
+            hard_input_bytes,
             reasoning: input.reasoning,
         };
 
@@ -151,12 +163,12 @@ impl FixedPrompt {
         normal_messages.push(probe);
         let normal_request =
             make_request(normal_messages, input.tool_schemas.clone(), input.reasoning)?;
-        if estimate_request_bytes(&normal_request)? > fixed.target_input_bytes {
+        if estimate_request_bytes(&normal_request)? > fixed.hard_input_bytes {
             return Err(UtilityError::Budget);
         }
 
         let empty_source = source_message(String::new(), MAX_SOURCE_CALLS - 1)?;
-        if fixed.utility_request_bytes(&empty_source)? > fixed.target_input_bytes {
+        if fixed.utility_request_bytes(&empty_source)? > fixed.hard_input_bytes {
             return Err(UtilityError::Budget);
         }
         Ok(fixed)
@@ -178,17 +190,20 @@ impl FixedPrompt {
         estimate_request_bytes(&self.utility_request(user_message.clone())?)
     }
 
-    fn source_payload_bytes(&self) -> Result<usize, UtilityError> {
+    fn source_payload_bytes(&self, deadline: Instant) -> Result<usize, UtilityError> {
         let maximum = BoundedText::MAX_BYTES
             .saturating_sub(SOURCE_PREFIX.len() + SOURCE_SUFFIX.len() + 32)
-            .min(self.target_input_bytes);
+            .min(self.hard_input_bytes);
         let mut low = 0usize;
         let mut high = maximum;
         while low < high {
+            if Instant::now() >= deadline {
+                return Err(UtilityError::Timeout);
+            }
             let candidate = low + (high - low).div_ceil(2);
             let payload = "\\".repeat(candidate);
             let message = source_message(payload, MAX_SOURCE_CALLS - 1)?;
-            if self.utility_request_bytes(&message)? <= self.target_input_bytes {
+            if self.utility_request_bytes(&message)? <= self.hard_input_bytes {
                 low = candidate;
             } else {
                 high = candidate - 1;
@@ -197,16 +212,19 @@ impl FixedPrompt {
         (low >= 4).then_some(low).ok_or(UtilityError::Budget)
     }
 
-    fn summary_output_bytes(&self) -> Result<usize, UtilityError> {
+    fn summary_output_bytes(&self, deadline: Instant) -> Result<usize, UtilityError> {
         let mut low = 0usize;
         let mut high = MAX_SUMMARY_CONTENT_BYTES;
         while low < high {
+            if Instant::now() >= deadline {
+                return Err(UtilityError::Timeout);
+            }
             let candidate = low + (high - low).div_ceil(2);
             let text = "\\".repeat(candidate);
             let summary = BoundedText::new_with_max_bytes(&text, MAX_SUMMARY_CONTENT_BYTES)
                 .map_err(|_| UtilityError::TooLarge)?;
             let message = merge_message(&summary, Some(&summary), false)?;
-            if self.utility_request_bytes(&message)? <= self.target_input_bytes {
+            if self.utility_request_bytes(&message)? <= self.hard_input_bytes {
                 low = candidate;
             } else {
                 high = candidate - 1;
@@ -248,13 +266,13 @@ where
         });
     }
     let payload_bytes = fixed
-        .source_payload_bytes()
+        .source_payload_bytes(input.operation_deadline)
         .map_err(|error| SummaryGenerationError {
             error,
             utility_usage: utility_usage.snapshot(false),
         })?;
     let output_bytes = fixed
-        .summary_output_bytes()
+        .summary_output_bytes(input.operation_deadline)
         .map_err(|error| SummaryGenerationError {
             error,
             utility_usage: utility_usage.snapshot(false),
@@ -331,7 +349,8 @@ where
     if Instant::now() >= input.operation_deadline {
         return Err(UtilityError::Timeout);
     }
-    let target_tokens = input.descriptor.context_window / 2;
+    let target_tokens = input.target_tokens;
+    let hard_tokens = input.hard_tokens;
     let mut partials = Vec::new();
     let mut intermediate_bytes = 0usize;
     let mut calls = 0usize;
@@ -345,9 +364,15 @@ where
             return Err(UtilityError::Budget);
         }
         let message = source_message(payload, chunk_index)?;
-        utility_usage.start_call();
-        let partial = call_model(input, fixed, message, output_bytes, cancellation).await?;
-        utility_usage.finish_call(partial.usage);
+        let partial = call_model_accounted(
+            input,
+            fixed,
+            message,
+            output_bytes,
+            cancellation,
+            utility_usage,
+        )
+        .await?;
         let Some(next_intermediate_bytes) =
             intermediate_bytes.checked_add(partial.content.byte_len())
         else {
@@ -375,9 +400,15 @@ where
             return Err(UtilityError::Budget);
         }
         let message = merge_message(&merged, Some(&partial), false)?;
-        utility_usage.start_call();
-        let next = call_model(input, fixed, message, output_bytes, cancellation).await?;
-        utility_usage.finish_call(next.usage);
+        let next = call_model_accounted(
+            input,
+            fixed,
+            message,
+            output_bytes,
+            cancellation,
+            utility_usage,
+        )
+        .await?;
         if next.content.byte_len() >= merged.byte_len().saturating_add(partial.byte_len()) {
             return Err(UtilityError::NoProgress);
         }
@@ -393,10 +424,19 @@ where
             merge_started = true;
         }
         let message = merge_message(&merged, None, true)?;
-        utility_usage.start_call();
-        let reduced = call_model(input, fixed, message, output_bytes, cancellation).await?;
-        utility_usage.finish_call(reduced.usage);
+        let reduced = call_model_accounted(
+            input,
+            fixed,
+            message,
+            output_bytes,
+            cancellation,
+            utility_usage,
+        )
+        .await?;
         if reduced.content.byte_len() >= merged.byte_len() {
+            if after_tokens <= hard_tokens && after_tokens < before_tokens {
+                break;
+            }
             return Err(UtilityError::NoProgress);
         }
         merged = reduced.content;
@@ -404,7 +444,7 @@ where
         after_tokens = estimate_after_tokens(input, &merged)?;
     }
 
-    if after_tokens >= before_tokens || after_tokens > target_tokens {
+    if after_tokens >= before_tokens || after_tokens > hard_tokens {
         return Err(if calls >= MAX_MODEL_CALLS {
             UtilityError::Budget
         } else {
@@ -469,106 +509,181 @@ async fn call_model(
     user_message: ModelMessage,
     max_output_bytes: usize,
     cancellation: &CancellationToken,
-) -> Result<UtilityModelResponse, UtilityError> {
+) -> Result<UtilityModelResponse, CallError> {
     if cancellation.is_cancelled() {
-        return Err(UtilityError::Cancelled);
+        return Err(CallError::new(UtilityError::Cancelled));
     }
-    let request = fixed.utility_request(user_message)?;
-    if estimate_request_bytes(&request)? > fixed.target_input_bytes {
-        return Err(UtilityError::Budget);
+    let request = match fixed.utility_request(user_message) {
+        Ok(request) => request,
+        Err(error) => return Err(CallError::new(error)),
+    };
+    match estimate_request_bytes(&request) {
+        Ok(bytes) if bytes <= fixed.hard_input_bytes => {}
+        Ok(_) => return Err(CallError::new(UtilityError::Budget)),
+        Err(error) => return Err(CallError::new(error)),
     }
     let child = cancellation.child_token();
     let _guard = CancelOnDrop(child.clone());
-    let remaining = input
+    let Some(remaining) = input
         .operation_deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or(UtilityError::Timeout)?;
+    else {
+        return Err(CallError::new(UtilityError::Timeout));
+    };
     let context = ModelCallContext::new(
-        minicore_runtime::LoopId::new().map_err(|_| UtilityError::Model)?,
+        match minicore_runtime::LoopId::new() {
+            Ok(loop_id) => loop_id,
+            Err(_) => return Err(CallError::new(UtilityError::Model)),
+        },
         0,
         child.clone(),
         input.operation_deadline,
     );
     let mut stream = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Err(UtilityError::Cancelled),
+        _ = cancellation.cancelled() => return Err(CallError::new(UtilityError::Cancelled)),
         result = tokio::time::timeout(remaining, input.model.start(request, context)) => {
-            result.map_err(|_| UtilityError::Timeout)?.map_err(|_| UtilityError::Model)?
+            match result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(_)) => return Err(CallError::new(UtilityError::Model)),
+                Err(_) => return Err(CallError::new(UtilityError::Timeout)),
+            }
         }
     };
 
     let mut text = String::new();
     let mut reasoning_bytes = 0usize;
     let mut finished = false;
+    // Usage observed before an error on this stream is retained so a known
+    // partial total is reported instead of being dropped as unknown.
     let mut usage = None;
     loop {
         if cancellation.is_cancelled() {
-            return Err(UtilityError::Cancelled);
+            return Err(CallError::with_usage(UtilityError::Cancelled, usage));
         }
-        let remaining = input
+        let Some(remaining) = input
             .operation_deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or(UtilityError::Timeout)?;
+        else {
+            return Err(CallError::with_usage(UtilityError::Timeout, usage));
+        };
         let event = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(UtilityError::Cancelled),
+            _ = cancellation.cancelled() => {
+                return Err(CallError::with_usage(UtilityError::Cancelled, usage));
+            }
             result = tokio::time::timeout(remaining, stream.next()) => {
-                result.map_err(|_| UtilityError::Timeout)?
+                match result {
+                    Ok(event) => event,
+                    Err(_) => return Err(CallError::with_usage(UtilityError::Timeout, usage)),
+                }
             }
         };
         let Some(event) = event else {
             return if finished {
                 if text.trim().is_empty() {
-                    Err(UtilityError::NoProgress)
+                    Err(CallError::with_usage(UtilityError::NoProgress, usage))
                 } else {
-                    let content = BoundedText::new_with_max_bytes(&text, max_output_bytes)
-                        .map_err(|_| UtilityError::TooLarge)?;
-                    Ok(UtilityModelResponse { content, usage })
+                    match BoundedText::new_with_max_bytes(&text, max_output_bytes) {
+                        Ok(content) => Ok(UtilityModelResponse { content, usage }),
+                        Err(_) => Err(CallError::with_usage(UtilityError::TooLarge, usage)),
+                    }
                 }
             } else {
-                Err(UtilityError::InvalidResponse)
+                Err(CallError::with_usage(UtilityError::InvalidResponse, usage))
             };
         };
-        let event = event.map_err(|_| UtilityError::Model)?;
+        let event = match event {
+            Ok(event) => event,
+            Err(_) => return Err(CallError::with_usage(UtilityError::Model, usage)),
+        };
         if finished {
-            return Err(UtilityError::InvalidResponse);
+            return Err(CallError::with_usage(UtilityError::InvalidResponse, usage));
         }
         match event {
             ModelEvent::TextDelta { delta } => {
-                let next_len = text
-                    .len()
-                    .checked_add(delta.byte_len())
-                    .ok_or(UtilityError::TooLarge)?;
+                let Some(next_len) = text.len().checked_add(delta.byte_len()) else {
+                    return Err(CallError::with_usage(UtilityError::TooLarge, usage));
+                };
                 if next_len > max_output_bytes {
-                    return Err(UtilityError::TooLarge);
+                    return Err(CallError::with_usage(UtilityError::TooLarge, usage));
                 }
                 text.push_str(delta.as_str());
             }
             ModelEvent::ReasoningDelta { delta } => {
-                reasoning_bytes = reasoning_bytes
-                    .checked_add(delta.byte_len())
-                    .ok_or(UtilityError::TooLarge)?;
+                let Some(next_len) = reasoning_bytes.checked_add(delta.byte_len()) else {
+                    return Err(CallError::with_usage(UtilityError::TooLarge, usage));
+                };
+                reasoning_bytes = next_len;
                 if reasoning_bytes > MAX_SUMMARY_CONTENT_BYTES {
-                    return Err(UtilityError::TooLarge);
+                    return Err(CallError::with_usage(UtilityError::TooLarge, usage));
                 }
             }
             ModelEvent::ToolCallStart { .. }
             | ModelEvent::ToolCallArgumentsDelta { .. }
-            | ModelEvent::ToolCallEnd { .. } => return Err(UtilityError::ToolCall),
+            | ModelEvent::ToolCallEnd { .. } => {
+                return Err(CallError::with_usage(UtilityError::ToolCall, usage));
+            }
             ModelEvent::Usage { usage: value } => {
-                if usage.replace(value).is_some() {
-                    return Err(UtilityError::InvalidResponse);
+                if usage.is_some() {
+                    // A duplicate usage event makes the call's total
+                    // ambiguous; do not expose either event as a complete
+                    // partial total.
+                    return Err(CallError::new(UtilityError::InvalidResponse));
                 }
+                usage = Some(value);
             }
             ModelEvent::Finish { reason } => {
                 if reason != ModelFinishReason::Stop {
-                    return Err(UtilityError::InvalidResponse);
+                    return Err(CallError::with_usage(UtilityError::InvalidResponse, usage));
                 }
                 finished = true;
             }
         }
+    }
+}
+
+/// One utility call failure with any usage already observed on its stream.
+/// Runs one utility call while keeping the accumulator consistent with the
+/// stream's real outcome. Usage already emitted by a failed stream is added to
+/// the known partial total before the error propagates.
+async fn call_model_accounted(
+    input: &CompactionInput,
+    fixed: &FixedPrompt,
+    user_message: ModelMessage,
+    max_output_bytes: usize,
+    cancellation: &CancellationToken,
+    utility_usage: &mut UtilityUsageAccumulator,
+) -> Result<UtilityModelResponse, UtilityError> {
+    utility_usage.start_call();
+    match call_model(input, fixed, user_message, max_output_bytes, cancellation).await {
+        Ok(response) => {
+            utility_usage.finish_call(response.usage);
+            Ok(response)
+        }
+        Err(error) => {
+            // A failed call never counts as complete, but any usage its stream
+            // already emitted is still a known partial total.
+            utility_usage.fail_call(error.usage);
+            Err(error.error)
+        }
+    }
+}
+
+struct CallError {
+    error: UtilityError,
+    usage: Option<Usage>,
+}
+
+impl CallError {
+    fn new(error: UtilityError) -> Self {
+        Self { error, usage: None }
+    }
+
+    fn with_usage(error: UtilityError, usage: Option<Usage>) -> Self {
+        Self { error, usage }
     }
 }
 
@@ -609,13 +724,21 @@ impl UtilityUsageAccumulator {
         };
         self.value = Some(match self.value {
             Some(value) => {
-                if usage_sum_overflow(value, usage) {
+                if usage_sum_overflow(&value, &usage) {
                     self.complete = false;
                 }
                 sum_usage(value, usage)
             }
             None => usage,
         });
+    }
+
+    /// Records the known usage of a call that ultimately failed. Any fields the
+    /// failed stream already emitted stay in the total; the call is never
+    /// counted as complete.
+    fn fail_call(&mut self, usage: Option<Usage>) {
+        self.finish_call(usage);
+        self.complete = false;
     }
 
     fn snapshot(&self, generation_complete: bool) -> Option<CompactionUtilityUsage> {
@@ -636,7 +759,7 @@ fn is_empty_usage(usage: &Usage) -> bool {
         && usage.provider_total_tokens().is_none()
 }
 
-fn sum_usage(left: Usage, right: Usage) -> Usage {
+pub(crate) fn sum_usage(left: Usage, right: Usage) -> Usage {
     Usage::from_optional(
         sum_usage_field(left.input_tokens(), right.input_tokens()),
         sum_usage_field(left.output_tokens(), right.output_tokens()),
@@ -656,7 +779,7 @@ fn sum_usage(left: Usage, right: Usage) -> Usage {
     ))
 }
 
-fn usage_sum_overflow(left: Usage, right: Usage) -> bool {
+pub(crate) fn usage_sum_overflow(left: &Usage, right: &Usage) -> bool {
     usage_field_overflow(left.input_tokens(), right.input_tokens())
         || usage_field_overflow(left.output_tokens(), right.output_tokens())
         || usage_field_overflow(left.reasoning_tokens(), right.reasoning_tokens())
@@ -680,12 +803,42 @@ fn estimate_before_tokens(input: &CompactionInput) -> Result<u64, UtilityError> 
     if input.previous_covered_item_count > input.history.len() {
         return Err(UtilityError::InvalidResponse);
     }
-    let request = normal_request(
-        input,
-        input.previous_summary.as_ref(),
-        &input.history[input.previous_covered_item_count..],
-    )?;
-    Ok(bytes_to_tokens(estimate_request_bytes(&request)?))
+    if !input.safe_before_estimate {
+        let request = normal_request(
+            input,
+            input.previous_summary.as_ref(),
+            &input.history[input.previous_covered_item_count..],
+        )?;
+        return Ok(bytes_to_tokens(estimate_request_bytes(&request)?));
+    }
+    // The source may be over Runtime's history limit or contain an exchange
+    // that cannot be represented as one ModelRequest. Estimate its bounded
+    // serialized payload item-by-item instead of constructing that invalid
+    // full request before the utility has had a chance to replace it.
+    let mut bytes = 128usize
+        .saturating_add(input.project_instructions.byte_len())
+        .saturating_add(
+            input
+                .previous_summary
+                .as_ref()
+                .map_or(0, BoundedText::byte_len),
+        )
+        .saturating_add(
+            serde_json::to_vec(&input.tool_schemas)
+                .map_err(|_| UtilityError::Serialization)?
+                .len(),
+        );
+    for item in &input.history[input.previous_covered_item_count..] {
+        if Instant::now() >= input.operation_deadline {
+            return Err(UtilityError::Timeout);
+        }
+        bytes = bytes.saturating_add(
+            serde_json::to_vec(item)
+                .map_err(|_| UtilityError::Serialization)?
+                .len(),
+        );
+    }
+    Ok(bytes_to_tokens(bytes))
 }
 
 fn estimate_after_tokens(
@@ -717,7 +870,7 @@ fn normal_request(
     make_request(messages, input.tool_schemas.clone(), input.reasoning)
 }
 
-fn history_message(item: &HistoryItem) -> Result<ModelMessage, UtilityError> {
+pub(super) fn history_message(item: &HistoryItem) -> Result<ModelMessage, UtilityError> {
     match item {
         HistoryItem::User(user) => {
             ModelMessage::user(user.input.as_text()).map_err(|_| UtilityError::TooLarge)
@@ -765,6 +918,14 @@ fn estimate_request_bytes(request: &ModelRequest) -> Result<usize, UtilityError>
         .bytes
         .checked_add(PROVIDER_ESTIMATE_MARGIN_BYTES)
         .ok_or(UtilityError::TooLarge)
+}
+
+/// Estimates the serialized provider request in tokens using the same
+/// bytes/4 heuristic the OpenAI adapter applies after building its Responses
+/// body. This includes tool schemas and provider framing, but it is a
+/// heuristic, never a tokenizer measurement or provider-reported usage.
+pub(crate) fn estimate_request_tokens(request: &ModelRequest) -> Result<u64, UtilityError> {
+    Ok(bytes_to_tokens(estimate_request_bytes(request)?))
 }
 
 struct CountingWriter {
@@ -970,9 +1131,11 @@ impl SourceChunkWriter {
         let length = serialized_len_io(record)?
             .checked_add(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "serialized length"))?;
-        if (length <= self.chunk_bytes
-            && self.bytes.len().saturating_add(length) > self.chunk_bytes)
-            || (length > self.chunk_bytes && !self.bytes.is_empty())
+        // Oversized records are already streamed through `Write::write`,
+        // which splits only at valid UTF-8 boundaries. Do not flush a small
+        // residual first: doing so would spend an extra source call for every
+        // large tool result and could exhaust the bounded source-call budget.
+        if length <= self.chunk_bytes && self.bytes.len().saturating_add(length) > self.chunk_bytes
         {
             self.flush_pending()?;
         }

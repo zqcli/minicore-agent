@@ -19,7 +19,7 @@ use minicore_runtime::model::{
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
 use minicore_runtime::{LoopId, ToolCallId};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::event::{AgentEvent, OutputChannel};
 use crate::history::GetHistory;
@@ -27,8 +27,8 @@ use crate::ids::SessionId;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
 use crate::sessions::{
-    WorkerGate, panic_next_worker, pause_next_compaction_after_result,
-    pause_next_worker_before_join,
+    LoopSubmission, WorkerGate, panic_next_worker, pause_next_admission_after_result,
+    pause_next_compaction_after_result, pause_next_worker_before_join,
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
@@ -108,6 +108,9 @@ enum ModelScript {
     /// Parks until `release` fires and signals `entered` when parked.
     BlockUntil(BlockGate, &'static str),
     BlockUntilDrop(BlockGate, Arc<AtomicBool>, &'static str),
+    /// Delays a response long enough to exceed the old prompt default in the
+    /// automatic-preparation timeout regression test.
+    DelayedText(u64, &'static str),
     /// Emits many text deltas back-to-back with no awaits so the runtime can
     /// saturate its best-effort event queue deterministically, then ends the
     /// request with one tool call so the loop runs a tool (with an await)
@@ -125,10 +128,22 @@ struct FakeModel {
 
 impl FakeModel {
     fn new(model_ref: &str, scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
+        Self::with_window(model_ref, 16_384, scripts)
+    }
+
+    fn with_window(
+        model_ref: &str,
+        context_window: u64,
+        scripts: impl IntoIterator<Item = ModelScript>,
+    ) -> Arc<Self> {
         let model_ref: ModelRef = model_ref.parse().unwrap();
-        let descriptor =
-            ModelDescriptor::new(model_ref.clone(), 16_384, fake_supported_reasoning(), true)
-                .unwrap();
+        let descriptor = ModelDescriptor::new(
+            model_ref.clone(),
+            context_window,
+            fake_supported_reasoning(),
+            true,
+        )
+        .unwrap();
         Arc::new(Self {
             model_ref,
             descriptor,
@@ -179,6 +194,18 @@ impl Model for FakeModel {
                     let _signal = DropSignal(dropped);
                     gate.entered.notify_one();
                     gate.release.notified().await;
+                    events(vec![
+                        ModelEvent::text_delta(text).unwrap(),
+                        ModelEvent::Usage {
+                            usage: Usage::new(1, 1, 0),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ])
+                }
+                ModelScript::DelayedText(delay_millis, text) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_millis)).await;
                     events(vec![
                         ModelEvent::text_delta(text).unwrap(),
                         ModelEvent::Usage {
@@ -314,7 +341,25 @@ fn config(
         profiles: BTreeMap::from([("test".to_owned(), profile)]),
         models,
         loop_options: Default::default(),
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        },
     }
+}
+
+fn auto_config(
+    data_dir: PathBuf,
+    models: BTreeMap<String, ModelConfig>,
+    profile: Profile,
+) -> AgentConfig {
+    let mut config = config(data_dir, models, profile);
+    config.compaction = CompactionConfig {
+        enabled: true,
+        trigger_percent: 80,
+        target_percent: 50,
+    };
+    config
 }
 
 fn read_profile() -> Profile {
@@ -338,7 +383,10 @@ fn model_config(api_key_env: &str) -> ModelConfig {
         safety_margin_tokens: 1_000,
         supported_reasoning: fake_supported_reasoning(),
         supports_tools: true,
-        request_timeout_seconds: Some(30),
+        // Fake models do not enforce a provider timeout. Leaving this unset
+        // keeps tests that configure a short automatic deadline from inheriting
+        // a synthetic 30-second provider floor.
+        request_timeout_seconds: None,
     }
 }
 
@@ -384,6 +432,25 @@ async fn open_agent_with(
     let mut config = config(data_dir.to_path_buf(), models_config, profile);
     config.event_capacity = options.agent_event_capacity;
     config.loop_options.event_capacity = options.loop_event_capacity;
+    Agent::open_with_models(config, Models::from_values(models))
+        .await
+        .unwrap()
+}
+
+async fn open_agent_auto(
+    data_dir: &Path,
+    fake_models: BTreeMap<String, Arc<FakeModel>>,
+    profile: Profile,
+) -> Agent {
+    let models = fake_models
+        .iter()
+        .map(|(id, model)| (id.clone(), Arc::clone(model) as Arc<dyn Model>))
+        .collect::<BTreeMap<_, _>>();
+    let mut models_config = BTreeMap::new();
+    for id in fake_models.keys() {
+        models_config.insert(id.clone(), model_config("MINICORE_AGENT_TEST_KEY"));
+    }
+    let config = auto_config(data_dir.to_path_buf(), models_config, profile);
     Agent::open_with_models(config, Models::from_values(models))
         .await
         .unwrap()
@@ -784,6 +851,613 @@ async fn over_runtime_history_without_valid_summary_is_rejected() {
         })
         .collect();
     assert_runtime_limit_behavior(items, false).await;
+}
+
+/// Builds a stored session whose history exceeds the runtime item limit, then
+/// opens it with automatic compaction enabled or disabled.
+async fn auto_history_fixture(
+    label: &str,
+    enabled: bool,
+) -> (
+    PathBuf,
+    TestDirectoryGuard,
+    SessionId,
+    Arc<FakeModel>,
+    Agent,
+) {
+    let loop_id = LoopId::new().unwrap();
+    let items = (0..4_097)
+        .map(|_| {
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text("x").unwrap(),
+            })
+        })
+        .collect();
+    auto_admission_fixture(
+        label,
+        enabled,
+        items,
+        [
+            ModelScript::Text("folded summary"),
+            ModelScript::Text("answer"),
+        ],
+        None,
+        None,
+    )
+    .await
+}
+
+async fn auto_admission_fixture(
+    label: &str,
+    enabled: bool,
+    items: Vec<HistoryItem>,
+    scripts: impl IntoIterator<Item = ModelScript>,
+    prompt_timeout_seconds: Option<u64>,
+    model_timeout_seconds: Option<u64>,
+) -> (
+    PathBuf,
+    TestDirectoryGuard,
+    SessionId,
+    Arc<FakeModel>,
+    Agent,
+) {
+    auto_admission_fixture_with_window(
+        label,
+        enabled,
+        1_000_000,
+        items,
+        scripts,
+        prompt_timeout_seconds,
+        model_timeout_seconds,
+    )
+    .await
+}
+
+async fn auto_admission_fixture_with_window(
+    label: &str,
+    enabled: bool,
+    context_window: u64,
+    items: Vec<HistoryItem>,
+    scripts: impl IntoIterator<Item = ModelScript>,
+    prompt_timeout_seconds: Option<u64>,
+    model_timeout_seconds: Option<u64>,
+) -> (
+    PathBuf,
+    TestDirectoryGuard,
+    SessionId,
+    Arc<FakeModel>,
+    Agent,
+) {
+    let (data_dir, guard) = fixture_dir(label);
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let session_id = SessionId::new().unwrap();
+    let record = SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title: None,
+        profile: "test".to_owned(),
+        workspace,
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["read".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+        created_at: "2026-01-02T03:04:05.000Z".to_owned(),
+        updated_at: "2026-01-02T03:04:05.000Z".to_owned(),
+    };
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    store.create_session(&record).await.unwrap();
+    let mut groups: Vec<(LoopId, Vec<HistoryItem>)> = Vec::new();
+    for item in items {
+        let loop_id = match &item {
+            HistoryItem::User(user) => user.loop_id,
+            HistoryItem::Assistant(assistant) => assistant.loop_id,
+            HistoryItem::ToolResult(result) => result.loop_id,
+            HistoryItem::Summary(_) => LoopId::new().unwrap(),
+        };
+        if groups
+            .last()
+            .is_some_and(|(candidate, _)| *candidate == loop_id)
+        {
+            groups.last_mut().unwrap().1.push(item);
+        } else {
+            groups.push((loop_id, vec![item]));
+        }
+    }
+    for (loop_id, items) in groups {
+        let request_count = items
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::Assistant(assistant) => assistant.request_index.checked_add(1),
+                HistoryItem::ToolResult(result) => result.request_index.checked_add(1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let tool_round_count = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    HistoryItem::Assistant(assistant)
+                        if assistant
+                            .content
+                            .iter()
+                            .any(|part| part.as_tool_call().is_some())
+                )
+            })
+            .count();
+        store
+            .append_loop(
+                session_id,
+                &StoredLoopRecord {
+                    loop_id,
+                    outcome: StoredLoopOutcome::Completed,
+                    items,
+                    usage: Usage::default(),
+                    requests: request_count,
+                    tool_rounds: u16::try_from(tool_round_count).unwrap(),
+                    final_config_revision: ConfigRevision::INITIAL,
+                    completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
+                    user_times: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let model = FakeModel::with_window("main", context_window, scripts);
+    let profile = read_profile();
+    let models = BTreeMap::from([("main".to_owned(), Arc::clone(&model))]);
+    let models_config =
+        BTreeMap::from([("main".to_owned(), model_config("MINICORE_AGENT_TEST_KEY"))]);
+    let mut config = if enabled {
+        auto_config(data_dir.clone(), models_config, profile)
+    } else {
+        config(data_dir.clone(), models_config, profile)
+    };
+    config.loop_options.prompt_timeout_seconds = prompt_timeout_seconds;
+    config.loop_options.model_timeout_seconds = model_timeout_seconds;
+    let mut agent = Agent::open_with_models(
+        config,
+        Models::from_values(
+            models
+                .into_iter()
+                .map(|(id, model)| (id, model as Arc<dyn Model>))
+                .collect(),
+        ),
+    )
+    .await
+    .unwrap();
+    agent.open_session(session_id).await.unwrap();
+    (data_dir, guard, session_id, model, agent)
+}
+
+#[tokio::test]
+async fn auto_compaction_starts_over_runtime_item_limit_history() {
+    let (_data_dir, _guard, session_id, model, mut agent) =
+        auto_history_fixture(&format!("auto-startup-{}", next_id()), true).await;
+    let context = agent.session_context(session_id).unwrap();
+    assert_eq!(context.budget.input_budget_tokens, Some(1_000_000));
+    assert_eq!(context.budget.trigger_tokens, Some(1_000_000 * 80 / 100));
+    assert_eq!(context.budget.target_tokens, Some(1_000_000 * 50 / 100));
+    let turn = send_text(&mut agent, session_id, "after auto summary").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    // Every utility call is a no-tools request; the final request is the real
+    // loop request and carries the folded summary instead of the raw prefix.
+    let requests = model.requests();
+    let requests = requests.lock().unwrap();
+    let utility_calls = requests
+        .iter()
+        .filter(|request| request.tools().is_empty())
+        .count();
+    let main_calls = requests
+        .iter()
+        .filter(|request| !request.tools().is_empty())
+        .count();
+    assert!(utility_calls >= 1);
+    assert_eq!(main_calls, 1);
+    assert!(
+        requests[..requests.len() - 1]
+            .iter()
+            .all(|request| request.tools().is_empty())
+    );
+    let last = requests.last().unwrap();
+    assert!(!last.tools().is_empty());
+    assert!(last.messages().iter().any(|message| {
+        matches!(message, minicore_runtime::model::ModelMessage::User(text) if text.contains("[BEGIN MINICORE HISTORICAL SUMMARY DATA]"))
+    }));
+    assert!(!last.messages().iter().any(|message| {
+        matches!(message, minicore_runtime::model::ModelMessage::User(text) if text == "x")
+    }));
+}
+
+#[tokio::test]
+async fn auto_compaction_recovers_from_runtime_bytes_with_huge_tool_results() {
+    let limits = minicore_runtime::LoopOptions::default_checked()
+        .unwrap()
+        .limits;
+    let output = "x".repeat(256 * 1024);
+    let group_count = limits.max_history_bytes / output.len() + 1;
+    let items = (0..group_count)
+        .flat_map(|index| {
+            let loop_id = LoopId::new().unwrap();
+            let call_id = ToolCallId::new(format!("huge-{index}")).unwrap();
+            let call = ToolCall::new(
+                call_id.clone(),
+                "read".parse().unwrap(),
+                json!({"path": "huge.txt"}),
+                0,
+            )
+            .unwrap();
+            [
+                HistoryItem::Assistant(AssistantHistory {
+                    loop_id,
+                    request_index: u32::try_from(index).unwrap(),
+                    model: "main".parse::<ModelRef>().unwrap(),
+                    reasoning: ReasoningPreference::Auto,
+                    content: vec![AssistantPart::ToolCall(call)],
+                    finish_reason: ModelFinishReason::ToolCalls,
+                    usage: Usage::default(),
+                }),
+                HistoryItem::ToolResult(ToolResultHistory {
+                    loop_id,
+                    request_index: u32::try_from(index).unwrap(),
+                    call_id,
+                    tool_name: "read".parse().unwrap(),
+                    outcome: ToolResultOutcome::Success,
+                    output: ToolOutput::new(output.clone()).unwrap(),
+                }),
+            ]
+        })
+        .collect();
+    let (_data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture(
+        &format!("auto-bytes-{}", next_id()),
+        true,
+        items,
+        [
+            ModelScript::Text("folded summary"),
+            ModelScript::Text("answer"),
+        ],
+        None,
+        None,
+    )
+    .await;
+    let turn = send_text(&mut agent, session_id, "after huge tool results").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    let requests = model.requests();
+    let requests = requests.lock().unwrap();
+    let last = requests.last().unwrap();
+    assert!(last.messages().iter().any(|message| {
+        matches!(message, ModelMessage::User(text) if text.contains("[BEGIN MINICORE HISTORICAL SUMMARY DATA]"))
+    }));
+    assert!(!last.messages().iter().any(|message| {
+        matches!(message, ModelMessage::Tool { output, .. } if output.content().byte_len() >= 256 * 1024)
+    }));
+    let observation = agent
+        .session_context(session_id)
+        .unwrap()
+        .automatic
+        .last
+        .expect("automatic preparation must record an observation");
+    assert_eq!(observation.outcome.as_str(), "started");
+    assert!(observation.before_tokens.is_some());
+    assert!(
+        observation
+            .utility_usage
+            .as_ref()
+            .is_some_and(|usage| usage.call_count >= 1)
+    );
+}
+
+#[tokio::test]
+async fn automatic_startup_preparation_can_outlive_the_old_prompt_timeout() {
+    let loop_id = LoopId::new().unwrap();
+    let items = (0..4_097)
+        .map(|_| {
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text("x").unwrap(),
+            })
+        })
+        .collect();
+    let (_data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture(
+        &format!("auto-prompt-timeout-{}", next_id()),
+        true,
+        items,
+        [
+            ModelScript::DelayedText(60, "folded summary"),
+            ModelScript::Text("answer"),
+        ],
+        Some(10),
+        Some(100),
+    )
+    .await;
+    let turn = send_text(&mut agent, session_id, "after delayed summary").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert!(model.requests().lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn automatic_startup_total_deadline_cancels_the_utility_worker() {
+    let loop_id = LoopId::new().unwrap();
+    let items = (0..8)
+        .map(|index| {
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text(format!(
+                    "history-{index} {}",
+                    "x".repeat(2_048)
+                ))
+                .unwrap(),
+            })
+        })
+        .collect();
+    let gate = BlockGate::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (_data_dir, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
+        &format!("auto-deadline-{}", next_id()),
+        true,
+        4_000,
+        items,
+        [ModelScript::BlockUntilDrop(
+            gate.clone(),
+            Arc::clone(&dropped),
+            "summary",
+        )],
+        Some(2),
+        Some(2),
+    )
+    .await;
+    let (result, gate_started) = tokio::join!(
+        agent.send(super::SendMessage {
+            session_id,
+            text: "deadline".to_owned(),
+        }),
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified())
+    );
+    assert!(
+        gate_started.is_ok(),
+        "automatic deadline test must reach the utility model before timing out"
+    );
+    assert!(matches!(result, Err(AgentError::Internal)));
+    agent.close_session(session_id).await.unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn automatic_request_compaction_rederives_after_a_smaller_model_update() {
+    let (data_dir, _guard) = fixture_dir(&format!("auto-hot-window-{}", next_id()));
+    let file = (0..16)
+        .map(|_| "x".repeat(1_024))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (workspace, _workspace_guard) =
+        workspace_file("auto-hot-window-ws", "a.txt", file.as_bytes());
+    let gate = BlockGate::new();
+    let model_a = FakeModel::new(
+        "main",
+        [ModelScript::ToolCallAfterGate(
+            gate.clone(),
+            "read",
+            json!({"path": "a.txt", "limit": 16}),
+        )],
+    );
+    let mut model_b_scripts =
+        std::iter::repeat_n(ModelScript::Text("folded hot summary"), 8).collect::<Vec<_>>();
+    model_b_scripts.push(ModelScript::Text("answer"));
+    let model_b = FakeModel::with_window("other", 4_000, model_b_scripts);
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("other".to_owned(), Arc::clone(&model_b)),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read the file").await;
+    gate.entered.notified().await;
+    agent
+        .update_session(UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    gate.release.notify_waiters();
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(model_a.calls.load(Ordering::SeqCst), 1);
+    let stored = read_store_history(&data_dir, info.session_id).await;
+    let tool_results = stored
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                HistoryItem::ToolResult(result) if result.output.content().byte_len() > 16 * 1024
+            )
+        })
+        .count();
+    assert_eq!(tool_results, 1);
+    let requests = model_b.requests();
+    let requests = requests.lock().unwrap();
+    let utility_calls = requests
+        .iter()
+        .filter(|request| request.tools().is_empty())
+        .count();
+    let main_requests = requests
+        .iter()
+        .filter(|request| !request.tools().is_empty())
+        .collect::<Vec<_>>();
+    assert!(utility_calls >= 1);
+    assert_eq!(
+        model_b.calls.load(Ordering::SeqCst),
+        utility_calls + main_requests.len()
+    );
+    assert_eq!(main_requests.len(), 1);
+    assert!(main_requests[0].messages().iter().any(|message| {
+        matches!(message, ModelMessage::User(text) if text.contains("folded hot summary"))
+    }));
+    let observation = agent
+        .session_context(info.session_id)
+        .unwrap()
+        .automatic
+        .last
+        .expect("model update must record automatic preparation");
+    assert!(observation.before_tokens.unwrap() > observation.trigger_tokens);
+    assert!(
+        observation
+            .utility_usage
+            .as_ref()
+            .is_some_and(|usage| usage.call_count >= 1)
+    );
+}
+
+#[tokio::test]
+async fn automatic_request_compaction_preserves_a_steer_alongside_tool_summary() {
+    let (data_dir, _guard) = fixture_dir(&format!("auto-steer-compress-{}", next_id()));
+    let file = (0..16)
+        .map(|_| "x".repeat(1_024))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (workspace, _workspace_guard) =
+        workspace_file("auto-steer-compress-ws", "a.txt", file.as_bytes());
+    let gate = BlockGate::new();
+    let mut model_scripts = vec![ModelScript::ToolCallAfterGate(
+        gate.clone(),
+        "read",
+        json!({"path": "a.txt", "limit": 16}),
+    )];
+    model_scripts.extend(std::iter::repeat_n(
+        ModelScript::Text("folded steer summary"),
+        8,
+    ));
+    model_scripts.push(ModelScript::Text("answer"));
+    let model = FakeModel::with_window("main", 4_000, model_scripts);
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "read then steer").await;
+    gate.entered.notified().await;
+    agent
+        .steer(super::SteerMessage {
+            turn,
+            text: "keep the final answer concise".to_owned(),
+        })
+        .unwrap();
+    gate.release.notify_waiters();
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    let stored = read_store_history(&data_dir, info.session_id).await;
+    let tool_results = stored
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                HistoryItem::ToolResult(result) if result.output.content().byte_len() > 16 * 1024
+            )
+        })
+        .count();
+    assert_eq!(tool_results, 1);
+    let requests = model.requests();
+    let requests = requests.lock().unwrap();
+    let utility_calls = requests
+        .iter()
+        .filter(|request| request.tools().is_empty())
+        .count();
+    let main_requests = requests
+        .iter()
+        .filter(|request| !request.tools().is_empty())
+        .collect::<Vec<_>>();
+    assert!(utility_calls >= 1);
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        utility_calls + main_requests.len()
+    );
+    assert_eq!(main_requests.len(), 2);
+    let final_request = main_requests.last().unwrap();
+    assert!(final_request.messages().iter().any(|message| {
+        matches!(message, ModelMessage::User(text) if text == "keep the final answer concise")
+    }));
+    assert!(final_request.messages().iter().any(|message| {
+        matches!(message, ModelMessage::User(text) if text.contains("folded steer summary"))
+    }));
+    let observation = agent
+        .session_context(info.session_id)
+        .unwrap()
+        .automatic
+        .last
+        .expect("steer compaction must record an automatic observation");
+    assert!(observation.before_tokens.unwrap() > observation.trigger_tokens);
+    assert!(
+        observation
+            .utility_usage
+            .as_ref()
+            .is_some_and(|usage| usage.call_count >= 1)
+    );
+}
+
+#[tokio::test]
+async fn disabled_auto_keeps_over_runtime_history_rejected() {
+    let (data_dir, _guard, session_id, model, mut agent) =
+        auto_history_fixture(&format!("auto-disabled-{}", next_id()), false).await;
+    let context = agent.session_context(session_id).unwrap();
+    assert_eq!(context.budget.input_budget_tokens, None);
+    assert_eq!(context.budget.trigger_tokens, None);
+    assert_eq!(context.budget.target_tokens, None);
+    let history_path = data_dir
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("history.jsonl");
+    let before = std::fs::read(&history_path).unwrap();
+    assert!(matches!(
+        agent
+            .send(super::SendMessage {
+                session_id,
+                text: "should be rejected".to_owned(),
+            })
+            .await,
+        Err(AgentError::HistoryTooLarge)
+    ));
+    assert_eq!(model.requests().lock().unwrap().len(), 0);
+    assert_eq!(std::fs::read(&history_path).unwrap(), before);
+    assert!(
+        !data_dir
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("summary.json")
+            .exists()
+    );
 }
 
 fn workspace_file(label: &str, file: &str, content: &[u8]) -> (PathBuf, TestDirectoryGuard) {
@@ -2505,6 +3179,95 @@ async fn active_shutdown_waits_for_the_session_owned_worker() {
 }
 
 #[tokio::test]
+async fn close_after_admission_result_still_joins_the_preparation_worker() {
+    let (data_dir, _guard) = fixture_dir(&format!("shutdown-admission-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("shutdown-admission-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let gate = Arc::new(WorkerGate::new());
+    pause_next_admission_after_result(info.session_id, Arc::clone(&gate));
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let submission = session
+        .submit(minicore_runtime::execution::UserInput::text("wait").unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(&submission, LoopSubmission::Preparing(_)));
+    gate.wait_started().await;
+
+    let mut close = tokio::spawn(async move { agent.close_session(info.session_id).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut close)
+            .await
+            .is_err()
+    );
+    gate.release();
+    assert!(close.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn dropping_an_admission_waiter_cancels_its_worker() {
+    let loop_id = LoopId::new().unwrap();
+    let items = (0..4_097)
+        .map(|_| {
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text("x").unwrap(),
+            })
+        })
+        .collect();
+    let gate = BlockGate::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (_data_dir, _guard, session_id, _model, mut agent) = auto_admission_fixture(
+        &format!("drop-admission-waiter-{}", next_id()),
+        true,
+        items,
+        [ModelScript::BlockUntilDrop(
+            gate.clone(),
+            Arc::clone(&dropped),
+            "summary",
+        )],
+        None,
+        None,
+    )
+    .await;
+    let session = agent.loaded_session(session_id).unwrap();
+    let submission = session
+        .submit(minicore_runtime::execution::UserInput::text("cancel").unwrap())
+        .await
+        .unwrap();
+    let operation_id = match &submission {
+        LoopSubmission::Preparing(waiter) => waiter.operation_id().to_owned(),
+        LoopSubmission::Accepted(_) => panic!("automatic admission must defer"),
+    };
+    gate.entered.notified().await;
+    drop(submission);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("dropping the waiter must cancel the utility model future");
+    assert!(
+        agent
+            .cancel_compaction(CompactSession {
+                session_id,
+                operation_id,
+            })
+            .is_ok()
+    );
+    gate.release.notify_waiters();
+    agent.close_session(session_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
     let (data_dir, _guard) = fixture_dir(&format!("close-cancel-owned-{}", next_id()));
     let (workspace, _guard) = workspace_file("close-cancel-owned-ws", "a.txt", b"hello");
@@ -2560,7 +3323,8 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let turn = send_text(&mut agent, info.session_id, "settled").await;
+    let settled_text = "settled history ".repeat(128);
+    let turn = send_text(&mut agent, info.session_id, &settled_text).await;
     wait_text(&agent, turn).await;
 
     let gate = Arc::new(WorkerGate::new());
@@ -2574,7 +3338,8 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
         .unwrap();
     assert_eq!(
         result.status,
-        crate::compaction::CompactionStatus::Compacted
+        crate::compaction::CompactionStatus::Compacted,
+        "unexpected manual compaction result: {result:?}"
     );
     gate.wait_started().await;
 

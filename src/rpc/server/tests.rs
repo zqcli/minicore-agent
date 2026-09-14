@@ -28,7 +28,7 @@ use minicore_runtime::model::{
 };
 
 use crate::agent::Agent;
-use crate::config::{AgentConfig, LoopOverrides, Profile};
+use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
@@ -60,12 +60,16 @@ enum ModelScript {
         text: &'static str,
     },
     Fail,
+    /// Emits usage, then fails. The observed usage must be retained as a
+    /// known partial total rather than reported as unknown.
+    UsageThenFail(u64, u64),
     Gate(Arc<ConcurrencyProbe>),
     ToolCalls(Vec<ToolCallScript>),
     NoFinish,
     WrongFinish,
     LateContent,
     Whitespace,
+    BlockWithSignal(Arc<Notify>),
     Oversize,
     Block,
 }
@@ -284,6 +288,12 @@ impl Model for FakeModel {
                     ]))
                 }
                 ModelScript::Fail => Err(fake_model_error()),
+                ModelScript::UsageThenFail(input, output) => Ok(Box::pin(stream::iter(vec![
+                    Ok(ModelEvent::Usage {
+                        usage: Usage::new(input, output, 0),
+                    }),
+                    Err(fake_model_error()),
+                ])) as ModelStream),
                 ModelScript::Gate(probe) => {
                     probe.started.fetch_add(1, Ordering::SeqCst);
                     let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -363,6 +373,11 @@ impl Model for FakeModel {
                     let _: Result<ModelStream, ModelError> = pending().await;
                     unreachable!()
                 }
+                ModelScript::BlockWithSignal(started) => {
+                    started.notify_one();
+                    let _: Result<ModelStream, ModelError> = pending().await;
+                    unreachable!()
+                }
             }
         })
     }
@@ -397,6 +412,10 @@ fn test_config(data_dir: PathBuf, tools: &[&str], approval: ApprovalMode) -> Age
             ),
         )]),
         loop_options: LoopOverrides::default(),
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        },
     }
 }
 
@@ -424,6 +443,31 @@ async fn test_agent(
     )
     .await
     .unwrap();
+    (agent, base, workspace)
+}
+
+async fn test_agent_with_auto(
+    label: &str,
+    scripts: impl IntoIterator<Item = ModelScript>,
+    tools: &[&str],
+    approval: ApprovalMode,
+) -> (Agent, PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-{label}-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let model = FakeModel::new(scripts);
+    let mut config = test_config(base.join("data"), tools, approval);
+    config.compaction = CompactionConfig {
+        enabled: true,
+        trigger_percent: 80,
+        target_percent: 50,
+    };
+    let agent = Agent::open_with_models(config, test_models(model))
+        .await
+        .unwrap();
     (agent, base, workspace)
 }
 
@@ -1647,6 +1691,62 @@ async fn manual_compaction_reports_independent_utility_usage() {
 }
 
 #[tokio::test]
+async fn failed_manual_utility_stream_keeps_known_partial_usage() {
+    let (agent, base, workspace) = test_agent(
+        "context-utility-partial",
+        [
+            ModelScript::TextWithUsage("settled", 41, 43),
+            ModelScript::UsageThenFail(7, 11),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled = "settled history ".repeat(128);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utility-partial"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(false));
+    // The failed stream's own usage is a known partial total, not unknown.
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["input_tokens"],
+        json!(7)
+    );
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["output_tokens"],
+        json!(11)
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
 async fn missing_manual_utility_usage_remains_unknown() {
     let (agent, base, workspace) = test_agent(
         "context-utility-unknown",
@@ -2270,11 +2370,12 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
     .await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled_text = "settled history ".repeat(128);
     harness
         .send(
             json!("send"),
             "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            Some(json!({"session_id": session_id, "text": settled_text})),
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
@@ -2299,9 +2400,11 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
         )
         .await;
     gate.wait_started().await;
+    let result = harness.response(json!("compact")).await;
     assert_eq!(
-        harness.response(json!("compact")).await["result"]["status"],
-        json!("compacted")
+        result["result"]["status"],
+        json!("compacted"),
+        "unexpected manual compaction result: {result}"
     );
 
     harness
@@ -2382,18 +2485,21 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
             })),
         )
         .await;
+    let initial = harness.response(json!("compact-initial")).await;
     assert_eq!(
-        harness.response(json!("compact-initial")).await["result"]["status"],
-        json!("compacted")
+        initial["result"]["status"],
+        json!("compacted"),
+        "unexpected initial compaction result: {initial}"
     );
     let summary_path = session_dir.join("summary.json");
     let summary_before = std::fs::read(&summary_path).unwrap();
 
+    let new_turn_text = "new turn history ".repeat(128);
     harness
         .send(
             json!("next-send"),
             "turn.send",
-            Some(json!({"session_id": session_id, "text": "new turn"})),
+            Some(json!({"session_id": session_id, "text": new_turn_text})),
         )
         .await;
     let next_turn = harness.response(json!("next-send")).await["result"]["turn"].clone();
@@ -2420,7 +2526,11 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
         )
         .await;
     let result = harness.response(json!("compact")).await;
-    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(
+        result["result"]["status"],
+        json!("failed"),
+        "unexpected write-failure compaction result: {result}"
+    );
     assert_eq!(result["result"]["failure_kind"], json!("store"));
     assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
     assert_eq!(result["result"]["utility_usage"]["complete"], json!(true));
@@ -2532,11 +2642,12 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
     .await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled_text = "settled history ".repeat(128);
     harness
         .send(
             json!("send"),
             "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            Some(json!({"session_id": session_id, "text": settled_text})),
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
@@ -2556,7 +2667,11 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
         )
         .await;
     let result = harness.response(json!("compact")).await;
-    assert_eq!(result["result"]["status"], json!("unknown_write"));
+    assert_eq!(
+        result["result"]["status"],
+        json!("unknown_write"),
+        "unexpected unknown-write compaction result: {result}"
+    );
     assert_eq!(
         result["result"]["failure_kind"],
         json!("write_outcome_unknown")
@@ -2584,11 +2699,12 @@ async fn manual_compaction_revalidates_history_before_commit() {
     .await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled_text = "settled history ".repeat(128);
     harness
         .send(
             json!("send"),
             "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            Some(json!({"session_id": session_id, "text": settled_text})),
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
@@ -2623,13 +2739,24 @@ async fn manual_compaction_revalidates_history_before_commit() {
             })),
         )
         .await;
-    gate.wait_started().await;
+    if tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .is_err()
+    {
+        gate.release();
+        let response = tokio::time::timeout(TIMEOUT, harness.response(json!("compact"))).await;
+        panic!("manual compaction did not reach commit gate: {response:?}");
+    }
     let mut mutated = history_before.clone();
     mutated.extend(first_line);
     std::fs::write(&history_path, mutated).unwrap();
     gate.release();
     let result = harness.response(json!("compact")).await;
-    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(
+        result["result"]["status"],
+        json!("failed"),
+        "unexpected history revalidation result: {result}"
+    );
     assert_eq!(result["result"]["failure_kind"], json!("history_changed"));
     assert!(!history_path.parent().unwrap().join("summary.json").exists());
 
@@ -4572,9 +4699,13 @@ async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair(
 
 #[tokio::test]
 async fn turn_result_reports_pending_and_stored_availability() {
+    let model_started = Arc::new(Notify::new());
     let (agent, base, workspace) = test_agent(
         "turn-result-lifecycle",
-        [ModelScript::Block, ModelScript::Text("stored answer")],
+        [
+            ModelScript::BlockWithSignal(Arc::clone(&model_started)),
+            ModelScript::Text("stored answer"),
+        ],
         &[],
         ApprovalMode::Auto,
     )
@@ -4589,6 +4720,9 @@ async fn turn_result_reports_pending_and_stored_availability() {
         )
         .await;
     let blocked_turn = harness.response(json!("send-blocked")).await["result"]["turn"].clone();
+    tokio::time::timeout(TIMEOUT, model_started.notified())
+        .await
+        .expect("blocked model request must be started before querying its result");
 
     harness
         .send(
@@ -5098,6 +5232,176 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
     let finished = harness.response(json!("read2")).await;
     assert_eq!(finished["result"]["execution"]["state"], json!("succeeded"));
 
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_context_reports_effective_input_budget_when_auto_enabled() {
+    let (agent, base, workspace) = test_agent_with_auto(
+        "context-budget",
+        [ModelScript::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("context"),
+            "session.context",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let context = harness.response(json!("context")).await;
+    assert_eq!(
+        context["result"]["budget"]["input_budget_tokens"],
+        json!(16_384)
+    );
+    assert_eq!(
+        context["result"]["budget"]["trigger_tokens"],
+        json!(16_384 * 80 / 100)
+    );
+    assert_eq!(
+        context["result"]["budget"]["target_tokens"],
+        json!(16_384 * 50 / 100)
+    );
+    assert!(context["result"]["last_prepare_failure"].is_null());
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_context_omits_budget_when_auto_disabled() {
+    let (agent, base, workspace) = test_agent(
+        "context-disabled",
+        [ModelScript::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("context"),
+            "session.context",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let context = harness.response(json!("context")).await;
+    assert!(context["result"]["budget"]["input_budget_tokens"].is_null());
+    assert!(context["result"]["budget"]["trigger_tokens"].is_null());
+    assert!(context["result"]["budget"]["target_tokens"].is_null());
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+/// An uncompressible request is rejected with a distinct domain error before
+/// any model call. The system prompt plus the current input alone exceed the
+/// tiny effective budget.
+#[tokio::test]
+async fn turn_send_reports_context_uncompressible_for_oversized_current_input() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-uncompressible-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let model = FakeModel::with_context_window([ModelScript::Text("answer")], 1_000);
+    let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
+    config.compaction = CompactionConfig {
+        enabled: true,
+        trigger_percent: 80,
+        target_percent: 50,
+    };
+    let agent = Agent::open_with_models(config, test_models(model))
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let oversized = "x".repeat(20_000);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": oversized})),
+        )
+        .await;
+    let response = harness.response(json!("send")).await;
+    assert_eq!(response["error"]["code"], json!(-32022));
+    assert_eq!(
+        response["error"]["data"]["kind"],
+        json!("context_uncompressible")
+    );
+    assert_eq!(response["error"]["data"]["retryable"], json!(false));
+    // The reader still serves control methods and the session is idle.
+    harness
+        .send(
+            json!("state"),
+            "session.state",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let state = harness.response(json!("state")).await;
+    assert_eq!(state["result"]["status"], json!("idle"));
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn automatic_startup_accepts_minimum_between_trigger_and_hard_limit() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-minimum-window-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let model = FakeModel::with_context_window([ModelScript::Text("answer")], 1_000);
+    let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
+    config.compaction = CompactionConfig {
+        enabled: true,
+        trigger_percent: 80,
+        target_percent: 50,
+    };
+    let system = minicore_runtime::value::BoundedText::new("test system prompt").unwrap();
+    let text = (1..10_000)
+        .map(|size| "x".repeat(size))
+        .find(|candidate| {
+            crate::compaction::estimate_minimal(
+                &system,
+                &[candidate.as_str()],
+                &[],
+                ReasoningPreference::Auto,
+            )
+            .is_ok_and(|tokens| (801..=900).contains(&tokens))
+        })
+        .expect("test input must land above trigger and below hard limit");
+    let agent = Agent::open_with_models(config, test_models(Arc::clone(&model)))
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": text})),
+        )
+        .await;
+    let response = harness.response(json!("send")).await;
+    assert!(response["result"]["turn"]["loop_id"].is_string());
+    let turn = response["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let wait = harness.response(json!("wait")).await;
+    assert_eq!(wait["result"]["outcome"]["type"], json!("completed"));
+    assert_eq!(wait["result"]["persistence"], json!("persisted"));
+    // turn.send promises loop creation, not that the model has started yet.
+    // The call count is meaningful only after the turn has completed.
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     harness.shutdown().await;
     remove_base(&base).await;
 }

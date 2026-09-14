@@ -29,8 +29,13 @@ pub use agent::{
     TurnResult, TurnResultAvailability, TurnResultPage, TurnResultRequest, UpdateSession,
     agent_version,
 };
-pub use compaction::{CompactionResult, CompactionStatus, CompactionUtilityUsage};
-pub use config::{AgentConfig, ApprovalMode, ConfigError, LoopOverrides, Profile};
+pub use compaction::{
+    AutomaticCompactionObservation, AutomaticCompactionView, CompactionResult, CompactionStatus,
+    CompactionUtilityUsage,
+};
+pub use config::{
+    AgentConfig, ApprovalMode, CompactionConfig, ConfigError, LoopOverrides, Profile,
+};
 pub use error::{AgentError, RuntimeErrorView};
 pub use event::{
     AgentEvent, AgentEventStream, EventMeta, OutputChannel, ToolProgressView, ToolResultView,
