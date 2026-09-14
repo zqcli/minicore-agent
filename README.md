@@ -34,14 +34,13 @@ minicore-agent --config ./example.agent.toml --stdio
 The Agent is the local backend for one client TUI. The TUI communicates with it
 exclusively through the stdio JSON-RPC interface (see
 [docs/rpc.md](docs/rpc.md)); it does not call the Rust library API directly.
-This repository does not ship a real TUI, plugin system, MCP integration,
-or upstream overflow recovery. The bounded manual and startup-projection
-slice is remotely verified on the development branch; the current P3b1 automatic
-threshold slice is also remotely verified (484 stable/MSRV tests passed,
-2 Live tests ignored). P3b2 is reserved
-for the narrow provider replay adapter/wrapper and exact request-budget gate;
-P4 remains the bounded Workspace slice. Neither is part of a new installed Agent
-release. It also includes a native, stateless `subagent` Tool for explicitly
+This repository does not ship a real TUI, plugin system or MCP integration.
+The development branch includes verified manual, startup and request-time
+compaction, provider replay budgeting and one-shot context overflow recovery.
+P3b2 passed parent-owned remote stable/MSRV suites (511 passed, 2 Live tests
+ignored), strict Clippy/fmt/rustdoc, and Windows/macOS compile checks.
+P4 remains the bounded Workspace slice. These changes are not a new installed
+Agent release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
 Profile `system_prompt` keeps its existing inline string form and also accepts
@@ -187,7 +186,11 @@ usage. P3b1 automatic threshold compaction has passed parent-owned remote
 verification: the `[compaction]` policy, a bounded deferred
 startup preparation, per-request budget estimation and ephemeral tool-exchange
 summaries, bounded automatic observations, and `context_uncompressible`
-reporting. P3b2 provider overflow recovery and the TUI command remain pending. The
+reporting. P3b2 provider replay budgeting and one-shot overflow recovery have
+also passed parent review and remote verification; see
+[development progress](docs/0914-progress.md) for evidence and limits.
+TUI `/compact` is outside this backend scope; subsequent work proceeds to P4
+Workspace. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

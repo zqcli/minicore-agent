@@ -6,14 +6,16 @@ are parent-reviewed and remotely verified: 451 stable/MSRV tests passed, 2 Live
 tests ignored, strict Clippy/fmt/rustdoc passed. P3b1 automatic compaction is
 parent-reviewed and remotely verified: 484 stable/MSRV tests passed, 2 Live
 tests ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
-Provider replay budgeting and overflow recovery remain pending (P3b2)**. See the
+P3b2 provider replay budgeting and one-shot overflow recovery are also
+parent-reviewed and remotely verified: 511 stable/MSRV tests passed, 2 Live
+ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed**. See the
 [manual execution audit](verification/compaction-manual-audit.md) for historical
 incident context. Foundation acceptance baseline: Agent `eec636a`, TUI `6ecd736`,
 Runtime 0.4.1 revision
 `6cd2bdbc634437dea925495c61c7eb0be10ba171`. Runtime source, its pin, existing
 package versions and user data stay unchanged. The slice uses the authorized
 direct `sha2 = "=0.10.9"` dependency; the parent owns remote lock regeneration.
-The current source handoff uses `cus-resp/gpt-5.6-luna:max`; the parent owns
+The current source handoff uses `cus-resp/deepseek-v4.1-flash:max`; the parent owns
 review, remote verification and commits. This handoff permits source, focused
 tests, documentation and formatting only; no local build/test/check or remote
 operation is part of it.
@@ -155,9 +157,9 @@ target_percent = 50
 ```
 
 `enabled` controls the P3b1 automatic compaction paths; explicit manual
-compaction remains available. P3b2 is reserved for the narrow provider replay
-adapter/wrapper and exact `requestContextBudget` acceptance gate; it is not part
-of this P3b1 handoff. Validate `0 < target < trigger <= 100`.
+compaction remains available. P3b2 adds the provider replay adapter/wrapper and
+normalized request-body budget gate; tokens remain an estimate. The same
+`enabled` policy controls overflow recovery. Validate `0 < target < trigger <= 100`.
 Use the currently selected model's effective budget. Apply threshold checks at
 **every request boundary**, including requests after tools, not only at turn
 admission. Defaults and config placement remain subject to focused validation,
@@ -209,7 +211,10 @@ Do not infer context overflow from arbitrary provider message substrings.
 The OpenAI adapter clears replay state after permanent start failures. Recovery
 must therefore fold all replay-dependent old complete tool groups, including a
 huge latest group, or use a separately validated clean reconstruction. Do not
-assume opaque reasoning survives the failure. This needs a real loopback test.
+assume opaque reasoning survives the failure. Real loopback tests now cover
+both rejection followed by clean recovery and oversized replay compressed
+before sending. The 512 KiB recovery-source cap refuses oversized tickets;
+source serialization stops at the cap before copying retained history.
 
 ## Admission, Cancellation And RPC
 
@@ -272,6 +277,11 @@ regressions. Existing MSRV lint limitations must stay explicit. Native pixels,
 real upstream/TLS and proxy-specific diagnostics need separate evidence.
 
 ## Current Verification State
+
+P3a, P3b1 and P3b2 now have parent-owned remote acceptance as summarized above
+and in [development progress](0914-progress.md). Native cross-platform and Live
+Provider tests were not performed. The following original checkpoint account
+remains historical evidence, not the acceptance status of the current branch.
 
 The accepted foundation at `eec636a` passed Agent stable/MSRV 375/2 and paired
 TUI E2E 18 each through parent-owned remote verification. The manual draft is now committed as a source checkpoint but has

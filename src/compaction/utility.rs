@@ -920,14 +920,6 @@ fn estimate_request_bytes(request: &ModelRequest) -> Result<usize, UtilityError>
         .ok_or(UtilityError::TooLarge)
 }
 
-/// Estimates the serialized provider request in tokens using the same
-/// bytes/4 heuristic the OpenAI adapter applies after building its Responses
-/// body. This includes tool schemas and provider framing, but it is a
-/// heuristic, never a tokenizer measurement or provider-reported usage.
-pub(crate) fn estimate_request_tokens(request: &ModelRequest) -> Result<u64, UtilityError> {
-    Ok(bytes_to_tokens(estimate_request_bytes(request)?))
-}
-
 struct CountingWriter {
     bytes: usize,
 }

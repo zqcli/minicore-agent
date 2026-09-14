@@ -6,26 +6,29 @@ Agent starting HEAD: `8b8bbcb33dd692f023e89a0eefcbbb6f2c7a87c0`.
 Runtime remains pinned to 0.4.1, `6cd2bdbc634437dea925495c61c7eb0be10ba171`.
 
 Historical audit reports remain historical evidence and previous unaccepted
-results are not acceptance gates. The current source handoff includes the P3a foundation and the P3b1 automatic
-compaction slice: startup projection from a validated summary, same-loop
-model-update binding, `session.context`, independent manual utility usage, the
-Agent-global automatic policy, startup admission preparation, and request-time
-compaction. P3a source, tests and documentation passed parent review and remote
-acceptance; P3b1 also passed parent review and remote verification.
-P3b2 provider overflow recovery remains pending; P4 is the separate
+results are not acceptance gates. The current source handoff includes the P3a foundation, the P3b1 automatic
+compaction slice, and the P3b2 provider replay budget and overflow recovery slice:
+startup projection from a validated summary, same-loop model-update binding,
+`session.context`, independent manual utility usage, the Agent-global automatic
+policy, startup admission preparation, request-time compaction, exact provider
+replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
+P3b2 passed parent review and remote verification. P4 is the next, separate
 Workspace slice.
 
 ## Execution
 
-Implementation prefers `cus-resp/deepseek-v4.1-flash:high`; three consecutive
-helper failures permit `cus-resp/gpt-5.6-luna:max`. P3a used that fallback after
-three DeepSeek context-compaction failures. Only one helper implements at a
-time; the parent owns
-review, remote verification and commits. This handoff permits source, focused
-tests, documentation and formatting only. No local build/test/check or remote
-operation is part of the handoff. Transfers of private configuration and real
-Session data are excluded; the prior execution-boundary incident remains in the
-historical audit. No credentials are stored in source.
+The current model preference is the user's latest
+`cus-resp/deepseek-v4.1-flash:max`; the earlier model-role compatibility
+mismatch is fixed. The P3a implementation preferred
+`cus-resp/deepseek-v4.1-flash:high`, with three consecutive helper failures
+permitting `cus-resp/gpt-5.6-luna:max`; P3a used that fallback after three
+DeepSeek context-compaction failures. Only one helper implements at a time; the
+parent owns review, remote verification and commits. This handoff permits
+source, focused tests, documentation and formatting only. No local
+build/test/check or remote operation is part of the handoff. Transfers of
+private configuration and real Session data are excluded; the prior
+execution-boundary incident remains in the historical audit. No credentials are
+stored in source.
 
 ## Stages
 
@@ -34,7 +37,7 @@ historical audit. No credentials are stored in source.
 | P0 | Cancellation-safe RPC framing; bounded deferred admission | Verified, see below |
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
-| P3 | Manual acceptance, startup/request compaction, one overflow recovery | P3a/P3b1 verified; P3b2 replay budget/overflow pending |
+| P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Pending |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
@@ -128,6 +131,84 @@ Logs: `/root/minicore-agent-0914/logs/p3b1-{tests,msrv,clippy,doc,windows,macos}
 P3b1 does not add upstream `ContextOverflow` recovery, TUI `/compact`, or any
 new AgentLoop/Service architecture. P3b2 is the narrow provider replay
 adapter/wrapper and exact request-budget gate; P4 remains Workspace.
+
+## P3b2 Provider Replay Budget And ContextOverflow Recovery
+
+P3b2 implements the provider replay budgeting and one-shot overflow recovery
+slice. Current design:
+
+- **Topology**: `Runtime -> readonly PresentationModel -> CompactingModel ->
+  rawModel`, plus the existing P3b1 plan/utility/sessions structures. The
+  factory installs `CompactingModel` only when automatic compaction is enabled,
+  so a disabled session keeps the raw model's established cancellation behavior
+  and pays no per-request content/ticket hashing. No new AgentLoop or Service
+  architecture.
+- **Provider replay budget**: the OpenAI Responses budget is the actual
+  normalized serialized body produced by `build_request_with_replay` (provider
+  model, reasoning format, opaque replay items, tool schemas, framing), and the
+  sender and the estimator share replay selection. Real-HTTP loopback tests
+  cover both the provider-rejected path (a structured 400 clears the
+  continuation and the retry is a clean folded request) and the preflight path
+  (a replay exceeding the effective hard budget is summarized before sending:
+  tool -> utility -> folded request, so the over-budget replay body is never
+  sent).
+- **Structured one-shot recovery**: only `ContextOverflow + NotStarted` from a
+  raw `Model::start` is recovered, at most once per logical request. The ticket
+  binds `loop_id`, `request_index`, content and ticket hashes, actual
+  `ModelLimits`, the normalized pre-start body bytes/tokens, and the utility
+  binding captured by the preparing provider. A per-loop high-water mark
+  records the highest index that consumed recovery, so a Driver retry re-entry
+  and every older index stay blocked while a new loop starts with fresh quota.
+  `Unknown` and `Started` deliveries, network interruptions, substrings, and a
+  second overflow never auto-retry.
+- **Settings ownership**: the ticket stores its own `AutoContextBinding`;
+  `ExecutionConfigFactory::build` publishes nothing, and `Session::new`,
+  `Session::update`, and `replace_future_config` bump the config generation at
+  their commit point. `claim_recovery_ticket` reads the current generations
+  itself, so a config or summary change before or during the raw start fails
+  closed with zero calls on the newer utility, and a failed update cannot
+  republish a stale binding. The state holds no strong reference back to the
+  auto context, so no reference cycle exists.
+- **Cancellation, deadline, delivery**: recovery shares the remaining
+  `ModelCallContext` deadline and cancellation token without resetting timeout.
+  Cancellation or deadline observed before the raw future exists reports
+  `NotStarted`; any in-flight interruption reports `Unknown`, matching the
+  Runtime driver.
+- **Measured shrink and budget ordering**: the retained recovery source is
+  bounded by a capped serde write (512 KiB, structure and identifiers counted,
+  no intermediate copy). Each candidate folds the real sources and measures the
+  provider-normalized body; a retry is returned only when it is strictly
+  smaller than the failed body, fits the hard window and message ceiling, and
+  keeps complete tool pairs. The irreducible floor is rejected before any
+  utility call, the utility target leaves room above that floor, an empty cache
+  always folds at least one group, and retained summaries are reused only while
+  the projection fits.
+- **State accounting and isolation**: `session.context` exposes recovery
+  observations (`outcome`, `before_tokens`, `after_tokens`, `utility_usage`,
+  `failure_kind`) and the retained automatic plan observation. Utility usage
+  stays independently categorized, loop-bound caches and tickets are cleaned up
+  on loop completion, and sessions remain strictly isolated.
+
+Known limits: replay budgeting, preflight, and recovery are covered by unit and
+agent-level loopback HTTP tests with a mock provider, not by a live provider.
+Tokens remain a bytes/4 estimate, not a tokenizer measurement. Sources over the
+512 KiB recovery-ticket cap are not retained for overflow recovery; ordinary
+startup and request-time fitting keep their existing bounded paths. In-flight
+cancellation/deadline tests synchronize on actual model starts; the high-water
+quota proof beyond the first few indices is unit-level. Disabled-compaction
+passthrough is asserted by construction rather than by a dedicated agent test.
+
+Parent-owned remote verification passed after review corrections: stable and
+Rust 1.85.0 full all-target suites each passed 511 tests (485 library and 26
+integration), with 2 Live tests ignored. Strict Clippy, fmt and rustdoc passed;
+Windows GNU and macOS all-target cross-compilation checks passed. Windows
+retains the existing unused `write_reload_config` integration-test helper
+warning. Logs: `/root/minicore-agent-0914/logs/p3b2-deepseek-{tests,clippy,msrv,fmt,doc,windows,macos}.log`.
+The final suite includes real replay preflight, structured overflow delivery
+cases with recoverable sources, same logical request/deadline across Driver
+re-entry, and synchronized manual-cancel accounting. No local compilation,
+native Windows/macOS test execution, Live Provider test, installation, version
+bump or push was performed. Runtime remains pinned to the revision above.
 
 ## P0 Verification
 

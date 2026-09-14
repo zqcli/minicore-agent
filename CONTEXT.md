@@ -23,8 +23,10 @@ deferred `turn.send`, per-request budget estimation, loop/source-bound ephemeral
 summaries, bounded automatic observations, and `context_uncompressible`
 reporting. Parent-run stable/MSRV suites each passed 484 tests (2 Live tests
 ignored); strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
-P3b2 provider overflow recovery
-remains pending; P4 is the separate Workspace slice.
+P3b2 provider replay budgeting and one-shot overflow recovery have passed parent
+review and remote verification: 511 stable/MSRV tests passed, 2 Live ignored;
+strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed. P4 is the
+next, separate Workspace slice.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,
@@ -38,8 +40,9 @@ The September 13, 2026 source-only execution violation and private-data-copy
 incident remains historical audit context; do not use its child-run claims as
 acceptance gates. No new compaction installation or native artifact is claimed.
 P3b1 automatic compaction has parent-owned remote verification;
-P3b2 provider overflow recovery and TUI `/compact`
-remain pending. A snapshot anchor binds raw JSONL prefix bytes and complete loop
+P3b2 provider overflow recovery now has the same parent-owned verification.
+TUI `/compact` remains outside this backend scope. A snapshot anchor binds raw
+JSONL prefix bytes and complete loop
 boundaries to the sanitized in-memory history; its covered-item count is not the
 raw record item count. See
 `docs/verification/compaction-manual-audit.md` for the historical incident scope

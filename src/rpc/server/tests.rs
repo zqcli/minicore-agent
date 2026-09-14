@@ -1520,9 +1520,13 @@ async fn manual_compaction_completion_clears_authoritative_busy_state() {
 
 #[tokio::test]
 async fn session_context_reports_manual_busy_state_and_last_result() {
+    let utility_started = Arc::new(Notify::new());
     let (agent, base, workspace) = test_agent(
         "context-manual-busy",
-        [ModelScript::Text("settled"), ModelScript::Block],
+        [
+            ModelScript::Text("settled"),
+            ModelScript::BlockWithSignal(Arc::clone(&utility_started)),
+        ],
         &[],
         ApprovalMode::Auto,
     )
@@ -1553,6 +1557,12 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
             })),
         )
         .await;
+    // Wait until the manual utility call has really started; otherwise the
+    // cancel races the utility and the observed usage total is not
+    // deterministic.
+    tokio::time::timeout(TIMEOUT, utility_started.notified())
+        .await
+        .expect("manual utility call must be started before cancelling");
     harness
         .send(
             json!("context-busy"),
@@ -1592,7 +1602,11 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
     );
     let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("failed"));
-    assert!(result["result"]["utility_usage"].is_null());
+    // The utility call really started before the cancel, so it is counted as
+    // one incomplete call and its yet-unknown usage stays absent.
+    assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(false));
+    assert!(result["result"]["utility_usage"]["usage"].is_null());
 
     harness
         .send(
@@ -1607,7 +1621,12 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
         context["result"]["last_result"]["operation_id"],
         json!("context-busy-operation")
     );
-    assert!(context["result"]["last_result"]["utility_usage"].is_null());
+    // `session.context` must expose exactly the utility accounting returned by
+    // the compact result.
+    assert_eq!(
+        context["result"]["last_result"]["utility_usage"],
+        result["result"]["utility_usage"]
+    );
 
     harness.shutdown().await;
     remove_base(&base).await;
@@ -5374,6 +5393,7 @@ async fn automatic_startup_accepts_minimum_between_trigger_and_hard_limit() {
                 &[candidate.as_str()],
                 &[],
                 ReasoningPreference::Auto,
+                &crate::models::DefaultProviderBudget,
             )
             .is_ok_and(|tokens| (801..=900).contains(&tokens))
         })

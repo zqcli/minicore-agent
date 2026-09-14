@@ -124,6 +124,51 @@ pub(super) struct OpenAiResponsesModel {
     continuations: ContinuationStore,
 }
 
+fn get_valid_replay(
+    continuations: &HashMap<LoopId, LoopContinuation>,
+    loop_id: LoopId,
+    request_index: u32,
+    enabled: bool,
+) -> Result<Option<Vec<ProviderRequestReplay>>, ModelError> {
+    if !enabled || request_index == 0 {
+        return Ok(None);
+    }
+    let Some(continuation) = continuations.get(&loop_id) else {
+        return Ok(None);
+    };
+    if continuation.cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let next_request_index = continuation
+        .requests
+        .iter()
+        .map(|replay| replay.request_index)
+        .max()
+        .and_then(|highest| highest.checked_add(1));
+    if next_request_index != Some(request_index) {
+        return Ok(None);
+    }
+    let recomputed_total = continuation
+        .requests
+        .iter()
+        .try_fold(0_usize, |total, replay| {
+            total.checked_add(replay.output_item_bytes).ok_or(())
+        });
+    if recomputed_total != Ok(continuation.total_output_item_bytes)
+        || continuation.total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_LOOP
+    {
+        return Err(local_error(ModelErrorKind::Internal));
+    }
+    let mut snapshot = continuation
+        .requests
+        .iter()
+        .filter(|replay| replay.request_index < request_index)
+        .cloned()
+        .collect::<Vec<_>>();
+    snapshot.sort_by_key(|replay| replay.request_index);
+    Ok(Some(snapshot))
+}
+
 impl OpenAiResponsesModel {
     pub(super) fn new(settings: OpenAiResponsesSettings) -> Result<Self, ModelConfigError> {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {}", settings.api_key))
@@ -203,42 +248,54 @@ impl OpenAiResponsesModel {
         if !enabled {
             return Ok(Vec::new());
         }
-        let Some(continuation) = continuations.get(&loop_id) else {
-            return Ok(Vec::new());
+        match get_valid_replay(&continuations, loop_id, request_index, enabled)? {
+            Some(replays) => Ok(replays),
+            None => {
+                if request_index > 0 {
+                    continuations.remove(&loop_id);
+                }
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    pub(super) fn estimate_budget_bytes(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<usize, ModelError> {
+        let continuation_enabled = request.reasoning() != ReasoningPreference::Disabled;
+        let replay = match (loop_id, request_index) {
+            (Some(loop_id), Some(request_index)) => {
+                let continuations = self
+                    .continuations
+                    .lock()
+                    .map_err(|_| local_error(ModelErrorKind::Internal))?;
+                get_valid_replay(&continuations, loop_id, request_index, continuation_enabled)?
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
         };
-        let next_request_index = continuation
-            .requests
-            .iter()
-            .map(|replay| replay.request_index)
-            .max()
-            .and_then(|highest| highest.checked_add(1));
-        if next_request_index != Some(request_index) {
-            // A non-consecutive index (model switch, stale continue) starts
-            // a clean request; old continuation is discarded.
-            continuations.remove(&loop_id);
-            return Ok(Vec::new());
-        }
-        let recomputed_total = continuation
-            .requests
-            .iter()
-            .try_fold(0_usize, |total, replay| {
-                total.checked_add(replay.output_item_bytes).ok_or(())
-            });
-        if recomputed_total != Ok(continuation.total_output_item_bytes)
-            || continuation.total_output_item_bytes > MAX_CONTINUATION_BYTES_PER_LOOP
-        {
-            continuations.remove(&loop_id);
-            return Err(local_error(ModelErrorKind::Internal));
-        }
-        let mut snapshot = continuations
-            .get(&loop_id)
-            .into_iter()
-            .flat_map(|continuation| continuation.requests.iter())
-            .filter(|replay| replay.request_index < request_index)
-            .cloned()
-            .collect::<Vec<_>>();
-        snapshot.sort_by_key(|replay| replay.request_index);
-        Ok(snapshot)
+        let (body, _) = ResponsesRequest::from_runtime(
+            &self.provider_model,
+            self.output_budget_tokens,
+            request,
+            &replay,
+        )?;
+        let encoded =
+            serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
+        Ok(encoded.len())
+    }
+
+    pub(super) fn estimate_budget_tokens(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<u64, ModelError> {
+        let bytes = self.estimate_budget_bytes(request, loop_id, request_index)?;
+        Ok(bytes.div_ceil(4) as u64)
     }
 
     fn remove_continuation(&self, loop_id: LoopId) {
@@ -402,6 +459,26 @@ impl Model for OpenAiResponsesModel {
             }
             result
         })
+    }
+}
+
+impl super::ProviderBudget for OpenAiResponsesModel {
+    fn estimate_request_tokens(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<u64, ModelError> {
+        self.estimate_budget_tokens(request, loop_id, request_index)
+    }
+
+    fn estimate_request_bytes(
+        &self,
+        request: &ModelRequest,
+        loop_id: Option<LoopId>,
+        request_index: Option<u32>,
+    ) -> Result<usize, ModelError> {
+        self.estimate_budget_bytes(request, loop_id, request_index)
     }
 }
 

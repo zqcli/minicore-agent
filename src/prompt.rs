@@ -223,6 +223,54 @@ impl PromptProvider for ProjectPromptProvider {
             {
                 Ok(messages) => {
                     auto.state.clear_prepare_failure();
+                    // Bound the retained recovery source before cloning any
+                    // history item; an over-cap source is never copied.
+                    let source_safe = crate::compaction::recovery_source_is_safe(
+                        &system,
+                        summary.as_ref(),
+                        projected_base,
+                        history.appended(),
+                        tools,
+                    );
+                    let settings = auto.state.request_settings();
+                    let ticket = if source_safe {
+                        crate::compaction::compute_content_hash(
+                            loop_id,
+                            request_index,
+                            &messages,
+                            tools,
+                            model,
+                            reasoning,
+                            settings.config_generation,
+                            settings.summary_generation,
+                        )
+                        .ok()
+                        .map(|content_hash| {
+                            crate::compaction::ActiveRecoveryTicket {
+                                loop_id,
+                                request_index,
+                                content_hash,
+                                ticket_hash: None,
+                                original_body_bytes: 0,
+                                original_tokens: 0,
+                                system: system.clone(),
+                                summary: summary.clone(),
+                                base: projected_base.to_vec(),
+                                appended: history.appended().to_vec(),
+                                tools: tools.to_vec(),
+                                limits: minicore_runtime::model::ModelLimits::default(),
+                                reasoning,
+                                // The utility binding is the one this provider
+                                // is preparing the request with. It is never
+                                // replaced by a later global settings read.
+                                auto_binding: Some(auto.binding()),
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    auto.state
+                        .register_recovery_ticket(loop_id, request_index, ticket);
                     Ok(minicore_runtime::prompt::PreparedPrompt { messages })
                 }
                 Err(PlanError::Cancelled) => Err(PromptError::Cancelled),

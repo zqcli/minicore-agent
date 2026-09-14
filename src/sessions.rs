@@ -298,6 +298,9 @@ pub struct SessionContext {
     /// process, e.g. `context_uncompressible`. Cleared by a successful
     /// preparation. It is observation, never durable session state.
     pub last_prepare_failure: Option<String>,
+    /// Bounded observation of provider context overflow recovery, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::compaction::RecoveryObservation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -882,6 +885,7 @@ impl Session {
         store: Store,
         events: AgentEventSink,
     ) -> Self {
+        compaction.note_settings_installed();
         let inner = SessionInner {
             record,
             workspace,
@@ -1053,6 +1057,7 @@ impl Session {
                 within_runtime_limits,
             },
             automatic,
+            recovery: self.shared.compaction.recovery_observation(),
         }
     }
 
@@ -1241,6 +1246,7 @@ impl Session {
             &[input.as_text()],
             tools,
             reservation.compaction.record.reasoning,
+            &*reservation.auto.budget,
         )
         .map_err(|_| PreparationFailure::Internal)?;
         let minimal_message_count =
@@ -1290,6 +1296,7 @@ impl Session {
                 input.as_text(),
                 tools,
                 reservation.compaction.record.reasoning,
+                &*reservation.auto.budget,
             )
             .map_err(|_| PreparationFailure::Internal)?;
             self.shared
@@ -1317,6 +1324,7 @@ impl Session {
                 input.as_text(),
                 tools,
                 reservation.compaction.record.reasoning,
+                &*reservation.auto.budget,
             ) {
                 Ok(estimate) => estimate,
                 // A request-safe history can still fail ModelRequest
@@ -1416,6 +1424,7 @@ impl Session {
             input.as_text(),
             &reservation.compaction.tool_schemas,
             reservation.compaction.record.reasoning,
+            &*reservation.auto.budget,
         )
         .map_err(|_| AgentError::ContextUncompressible)?;
         if estimate > reservation.compaction.hard_tokens {
@@ -2152,9 +2161,12 @@ impl Session {
     ) {
         let mut inner = self.shared.inner.lock().unwrap();
         inner.config = config;
-        inner.auto = auto;
+        inner.auto = auto.clone();
         inner.policy = policy;
         inner.options = options;
+        // A reload is a settings change: bumping the config generation in one
+        // step invalidates tickets bound to the previous configuration.
+        self.shared.compaction.note_settings_installed();
     }
 
     /// Persists the new record and swaps the long-lived execution config.
@@ -2199,7 +2211,8 @@ impl Session {
             inner.record = record;
             let update_config = config.clone();
             inner.config = config;
-            inner.auto = auto;
+            inner.auto = auto.clone();
+            self.shared.compaction.note_settings_installed();
             (
                 inner.active.as_ref().map(|active| active.handle.clone()),
                 update_config,
