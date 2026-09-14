@@ -17,6 +17,7 @@ use crate::event::AgentEvent;
 use crate::history::GetHistory;
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
+use crate::read::{ReadCursor, ReadSession, TurnResultRequest};
 
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
 pub(crate) const PARSE_ERROR: i32 = -32_700;
@@ -42,6 +43,7 @@ pub(crate) const STEER_QUEUE_FULL: i32 = -32_016;
 pub(crate) const RELOAD_REQUIRES_RESTART: i32 = -32_017;
 pub(crate) const RELOAD_UNAVAILABLE: i32 = -32_018;
 pub(crate) const RESOURCE_EXHAUSTED: i32 = -32_019;
+pub(crate) const QUERY_LIMIT: i32 = -32_020;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -205,6 +207,62 @@ impl From<SessionHistoryParams> for GetHistory {
 
 fn default_history_limit() -> usize {
     100
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionReadParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    #[serde(default)]
+    pub(crate) cursor: Option<ReadCursor>,
+    #[serde(default = "default_history_limit")]
+    pub(crate) limit: usize,
+    #[serde(default)]
+    pub(crate) max_bytes: Option<usize>,
+    #[serde(default)]
+    pub(crate) captured_end: Option<u64>,
+    #[serde(default)]
+    pub(crate) history_revision: Option<String>,
+}
+
+impl From<SessionReadParams> for ReadSession {
+    fn from(value: SessionReadParams) -> Self {
+        Self {
+            session_id: value.session_id,
+            cursor: value.cursor,
+            limit: value.limit,
+            max_bytes: value.max_bytes,
+            captured_end: value.captured_end,
+            history_revision: value.history_revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TurnResultParams {
+    pub(crate) session_id: crate::ids::SessionId,
+    pub(crate) loop_id: LoopId,
+    #[serde(default)]
+    pub(crate) cursor: Option<ReadCursor>,
+    #[serde(default = "default_history_limit")]
+    pub(crate) limit: usize,
+    #[serde(default)]
+    pub(crate) max_bytes: Option<usize>,
+}
+
+impl From<TurnResultParams> for TurnResultRequest {
+    fn from(value: TurnResultParams) -> Self {
+        Self {
+            turn: TurnRef {
+                session_id: value.session_id,
+                loop_id: value.loop_id,
+            },
+            cursor: value.cursor,
+            limit: value.limit,
+            max_bytes: value.max_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

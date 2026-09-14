@@ -9,32 +9,36 @@ use tokio::io::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AnswerInteraction, SendMessage};
 use crate::error::AgentError;
 use crate::event::{AgentEventStream, HistoryPageView, SessionStateView, TurnResultView};
+use crate::read::{ReadSession, TurnResultRequest};
 use crate::sessions::{TurnRef, await_compaction_completion, await_turn_completion};
 
 use super::protocol::{
     AgentEventNotification, CancelledResult, EmptyParams, HISTORY_TOO_LARGE, INTERACTION_NOT_FOUND,
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE,
     InteractionAnswerParams, METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult,
-    PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE,
-    RESOURCE_EXHAUSTED, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse,
-    SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STEER_QUEUE_FULL,
-    STORE_ERROR, SessionCompactParams, SessionCreateParams, SessionHistoryParams, SessionParams,
-    SessionRenameParams, SessionResult, SessionUpdateParams, SessionUpdateResult, SessionsResult,
-    SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult, TurnSendParams, TurnSteerParams,
-    WORKSPACE_ERROR, decode_params, parse_request, request_id,
+    PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult, QUERY_LIMIT, RELOAD_REQUIRES_RESTART,
+    RELOAD_UNAVAILABLE, RESOURCE_EXHAUSTED, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest,
+    RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED,
+    STEER_QUEUE_FULL, STORE_ERROR, SessionCompactParams, SessionCreateParams, SessionHistoryParams,
+    SessionParams, SessionReadParams, SessionRenameParams, SessionResult, SessionUpdateParams,
+    SessionUpdateResult, SessionsResult, SteerResult, TURN_NOT_FOUND, TurnParams, TurnResult,
+    TurnResultParams, TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params,
+    parse_request, request_id,
 };
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 const OUTBOUND_CAPACITY: usize = 128;
-/// Upper bound on concurrently registered deferred waiters. Waiter tasks are
-/// cheap but client-driven, so an unbounded count is a resource leak. Reaching
-/// this limit rejects only `turn.wait` and `session.compact`; the reader keeps
-/// serving ping, cancel, and shutdown.
+/// Upper bound on concurrently registered deferred waiters and read queries.
+/// These tasks are client-driven, so an unbounded count is a resource leak.
 const MAX_DEFERRED_WAITERS: usize = 32;
+/// Read scans are heavier than wait notifications, so keep a smaller query
+/// subset while retaining the shared deferred admission ceiling above.
+const MAX_DEFERRED_QUERIES: usize = 4;
 
 pub async fn run_stdio(agent: Agent) -> Result<(), AgentError> {
     run_with_io(
@@ -66,6 +70,8 @@ where
         agent: Some(agent),
         outbound_tx,
         waiters: JoinSet::new(),
+        queries: JoinSet::new(),
+        query_cancellation: CancellationToken::new(),
     };
     server
         .run(
@@ -82,6 +88,8 @@ struct RpcServer {
     agent: Option<Agent>,
     outbound_tx: mpsc::Sender<RpcOutbound>,
     waiters: JoinSet<()>,
+    queries: JoinSet<()>,
+    query_cancellation: CancellationToken,
 }
 
 enum Dispatch {
@@ -145,6 +153,12 @@ impl RpcServer {
                 waiter = self.waiters.join_next(), if !self.waiters.is_empty() => {
                     if waiter.is_some_and(|result| result.is_err()) {
                         tracing::warn!(kind = "waiter_join", "rpc waiter failed");
+                        break StopReason::Error(AgentError::Internal);
+                    }
+                }
+                query = self.queries.join_next(), if !self.queries.is_empty() => {
+                    if query.is_some_and(|result| result.is_err()) {
+                        tracing::warn!(kind = "query_join", "rpc query failed");
                         break StopReason::Error(AgentError::Internal);
                     }
                 }
@@ -332,7 +346,7 @@ impl RpcServer {
                 // Reserve waiter capacity before starting the Session-owned
                 // operation, so a full waiter set never launches a compaction
                 // that cannot be awaited.
-                if self.waiters.len() >= MAX_DEFERRED_WAITERS {
+                if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
                     return Dispatch::Response(resource_exhausted(id));
                 }
                 match self.agent_mut().compact_session(params.into()).await {
@@ -399,6 +413,37 @@ impl RpcServer {
                     .map(|page| HistoryPageView::from(&page));
                 Dispatch::Response(agent_result(&id, result))
             }
+            "session.read" => {
+                let params: SessionReadParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let request: ReadSession = params.into();
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let store = self.agent().store_handle();
+                let loaded = self.agent().loaded_session(request.session_id);
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    let response = match tokio::time::timeout(
+                        crate::read::READ_DEADLINE,
+                        crate::read::read_session(store, loaded, request, cancellation),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => success(&id, result),
+                        Ok(Err(error)) => query_error(id, &error),
+                        Err(_) => agent_error(id, &AgentError::QueryLimit),
+                    };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
+            }
             "session.presentation" => {
                 let params: SessionParams = match params_or_error(&id, params) {
                     Ok(params) => params,
@@ -458,7 +503,7 @@ impl RpcServer {
                 };
                 match self.agent().wait_turn_receiver(params.into()) {
                     Ok(receiver) => {
-                        if self.waiters.len() >= MAX_DEFERRED_WAITERS {
+                        if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
                             return Dispatch::Response(resource_exhausted(id));
                         }
                         let outbound = self.outbound_tx.clone();
@@ -475,6 +520,37 @@ impl RpcServer {
                     }
                     Err(error) => Dispatch::Response(agent_error(id, &error)),
                 }
+            }
+            "turn.result" => {
+                let params: TurnResultParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let request: TurnResultRequest = params.into();
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let store = self.agent().store_handle();
+                let loaded = self.agent().loaded_session(request.turn.session_id);
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    let response = match tokio::time::timeout(
+                        crate::read::READ_DEADLINE,
+                        crate::read::turn_result(store, loaded, request, cancellation),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => success(&id, result),
+                        Ok(Err(error)) => query_error(id, &error),
+                        Err(_) => agent_error(id, &AgentError::QueryLimit),
+                    };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
             }
             "interaction.answer" => {
                 let params: InteractionAnswerParams = match params_or_error(&id, params) {
@@ -541,6 +617,7 @@ impl RpcServer {
             StopReason::Eof | StopReason::Signal | StopReason::WriterStopped => (None, None),
         };
 
+        self.query_cancellation.cancel();
         let shutdown_result = self
             .agent
             .take()
@@ -549,6 +626,11 @@ impl RpcServer {
             .await;
 
         while let Some(result) = self.waiters.join_next().await {
+            if result.is_err() && primary_error.is_none() {
+                primary_error = Some(AgentError::Internal);
+            }
+        }
+        while let Some(result) = self.queries.join_next().await {
             if result.is_err() && primary_error.is_none() {
                 primary_error = Some(AgentError::Internal);
             }
@@ -592,6 +674,11 @@ impl RpcServer {
 
     fn agent_mut(&mut self) -> &mut Agent {
         self.agent.as_mut().expect("Agent is present while serving")
+    }
+
+    fn query_capacity_available(&self) -> bool {
+        self.queries.len() < MAX_DEFERRED_QUERIES
+            && self.waiters.len() + self.queries.len() < MAX_DEFERRED_WAITERS
     }
 }
 
@@ -704,15 +791,23 @@ fn invalid_params(id: Option<RpcId>) -> RpcResponse {
 fn resource_exhausted(id: RpcId) -> RpcResponse {
     tracing::warn!(
         kind = "resource_exhausted",
-        "rpc deferred waiter limit reached"
+        "rpc deferred request limit reached"
     );
     RpcResponse::error(
         Some(id),
         RESOURCE_EXHAUSTED,
-        "too many deferred waiters",
+        "too many deferred requests",
         "resource_exhausted",
         true,
     )
+}
+
+fn query_error(id: RpcId, error: &AgentError) -> RpcResponse {
+    if matches!(error, AgentError::InvalidArguments) {
+        invalid_params(Some(id))
+    } else {
+        agent_error(id, error)
+    }
 }
 
 fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
@@ -794,6 +889,7 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
         AgentError::InvalidInput => {
             return invalid_params(Some(id));
         }
+        AgentError::QueryLimit => (QUERY_LIMIT, "query limit reached", "query_limit", true),
         AgentError::Config(_)
         | AgentError::Internal
         | AgentError::EventStreamTaken
@@ -823,11 +919,13 @@ fn canonical_method(method: &str) -> &'static str {
         "session.update" => "session.update",
         "session.rename" => "session.rename",
         "session.history" => "session.history",
+        "session.read" => "session.read",
         "session.presentation" => "session.presentation",
         "turn.send" => "turn.send",
         "turn.steer" => "turn.steer",
         "turn.cancel" => "turn.cancel",
         "turn.wait" => "turn.wait",
+        "turn.result" => "turn.result",
         "interaction.answer" => "interaction.answer",
         _ => "unknown",
     }

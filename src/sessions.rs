@@ -296,6 +296,12 @@ pub(crate) struct Session {
     shared: Arc<SessionShared>,
 }
 
+pub(crate) struct ReadSnapshot {
+    pub(crate) info: SessionInfo,
+    pub(crate) history: Arc<[HistoryItem]>,
+    pub(crate) user_times: HashMap<(LoopId, usize), String>,
+}
+
 struct SessionShared {
     /// Short critical sections; never holds across an await, I/O, or join.
     inner: Mutex<SessionInner>,
@@ -1069,6 +1075,30 @@ impl Session {
             .filter(|active| active.turn == turn)
             .map(|active| active.completion.clone())
             .ok_or(AgentError::TurnNotFound)
+    }
+
+    pub(crate) fn read_snapshot(&self) -> ReadSnapshot {
+        let inner = self.shared.inner.lock().unwrap();
+        ReadSnapshot {
+            info: SessionInfo::from_record(&inner.record, true),
+            history: Arc::clone(&inner.history),
+            user_times: inner.user_times.clone(),
+        }
+    }
+
+    pub(crate) fn turn_result_snapshot(
+        &self,
+        turn: TurnRef,
+    ) -> Result<Option<Option<Arc<TurnResult>>>, AgentError> {
+        let inner = self.shared.inner.lock().unwrap();
+        let Some(active) = inner.active.as_ref().filter(|active| active.turn == turn) else {
+            return Ok(None);
+        };
+        match active.completion.borrow().as_ref() {
+            None => Ok(Some(None)),
+            Some(TurnCompletion::Finished(result)) => Ok(Some(Some(Arc::clone(result)))),
+            Some(TurnCompletion::Internal) => Err(AgentError::Internal),
+        }
     }
 
     pub(crate) async fn wait(&self, turn: TurnRef) -> Result<Arc<TurnResult>, AgentError> {
@@ -2085,6 +2115,9 @@ pub(crate) fn map_store_error(error: StoreError) -> AgentError {
         | StoreError::Corrupt
         | StoreError::RecordTooLarge
         | StoreError::Unavailable => AgentError::Store,
+        StoreError::HistoryChanged => AgentError::InvalidState,
+        StoreError::QueryLimit => AgentError::QueryLimit,
+        StoreError::InvalidArguments => AgentError::InvalidArguments,
     }
 }
 

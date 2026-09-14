@@ -406,6 +406,15 @@ impl ModelErrorView {
             retry_after_millis,
         }
     }
+
+    pub(crate) fn from_stored(error: &crate::store::StoredModelError) -> Self {
+        Self {
+            kind: error.kind.clone(),
+            delivery: error.delivery.clone(),
+            retryable: error.retryable,
+            retry_after_millis: error.retry_after_millis,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -429,6 +438,28 @@ impl TurnResultView {
             tool_rounds: result.report.tool_rounds,
             final_config_revision: result.report.final_config_revision,
             persistence: result.persistence,
+        }
+    }
+}
+
+impl LoopOutcomeView {
+    pub(crate) fn from_stored(outcome: &crate::store::StoredLoopOutcome) -> Self {
+        match outcome {
+            crate::store::StoredLoopOutcome::Completed => Self::Completed,
+            crate::store::StoredLoopOutcome::Cancelled { reason } => Self::Cancelled {
+                reason: match reason {
+                    crate::store::StoredCancelReason::User => CancelReasonView::User,
+                    crate::store::StoredCancelReason::OwnerDropped => {
+                        CancelReasonView::OwnerDropped
+                    }
+                    crate::store::StoredCancelReason::Shutdown => CancelReasonView::Shutdown,
+                    crate::store::StoredCancelReason::Deadline => CancelReasonView::Deadline,
+                },
+            },
+            crate::store::StoredLoopOutcome::Failed { kind, model_error } => Self::Failed {
+                kind: kind.clone(),
+                model_error: model_error.as_ref().map(ModelErrorView::from_stored),
+            },
         }
     }
 }

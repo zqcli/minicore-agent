@@ -38,7 +38,10 @@ use crate::store::{
     force_unknown_summary_write, gate_next_summary_commit,
 };
 
-use super::{Frame, MAX_DEFERRED_WAITERS, MAX_RPC_LINE_BYTES, read_frame, run_with_io};
+use super::{
+    Frame, MAX_DEFERRED_QUERIES, MAX_DEFERRED_WAITERS, MAX_RPC_LINE_BYTES, RpcServer, read_frame,
+    run_with_io,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -553,6 +556,16 @@ async fn capability_discovery_returns_ordered_lists() {
         .await;
     let ping = harness.response(json!("p")).await;
     assert_eq!(ping["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(ping["result"]["protocol_version"], json!(1));
+    assert_eq!(
+        ping["result"]["capabilities"],
+        json!([
+            "session.read",
+            "turn.result",
+            "session.history",
+            "deferred.waiter_limit"
+        ])
+    );
 
     harness
         .send(json!("profiles"), "profile.list", Some(json!({})))
@@ -3571,4 +3584,890 @@ async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
 
     harness.shutdown().await;
     remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
+    let (agent, base, workspace) = test_agent(
+        "session-read-pages",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "read",
+                arguments: json!({"path": "huge.txt", "limit": 400}),
+            }]),
+            ModelScript::Oversize,
+        ],
+        &["read"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let tool_text = (0..400)
+        .map(|index| format!("tool {index} é🙂 \\\"\n"))
+        .collect::<String>();
+    tokio::fs::write(workspace.join("huge.txt"), &tool_text)
+        .await
+        .unwrap();
+    let text = "prefix é🙂\n\t\\\" ".repeat(2_000);
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["persistence"],
+        json!("persisted")
+    );
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    let session_dir = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap());
+    let session_path = session_dir.join("session.json");
+    let mut metadata: Value =
+        serde_json::from_slice(&std::fs::read(&session_path).unwrap()).unwrap();
+    metadata["model"] = json!("vendor/model-name:v1.0");
+    std::fs::write(&session_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let metadata_before = std::fs::read(&session_path).unwrap();
+    let history_before = std::fs::read(session_dir.join("history.jsonl")).unwrap();
+    std::fs::remove_dir_all(&workspace).unwrap();
+
+    let mut cursor = None;
+    let mut captured_end = None;
+    let mut revision = None;
+    let mut reconstructed = BTreeMap::<usize, String>::new();
+    let mut complete = BTreeSet::new();
+    for page_index in 0..128 {
+        let request_id = json!(format!("read-{page_index}"));
+        let mut params = json!({
+            "session_id": session_id,
+            "limit": 100,
+            "max_bytes": 4_096,
+        });
+        if let Some(page_cursor) = cursor.clone() {
+            params["cursor"] = page_cursor;
+            params["captured_end"] = json!(captured_end.unwrap());
+            params["history_revision"] = json!(revision.clone().unwrap());
+        }
+        harness
+            .send(request_id.clone(), "session.read", Some(params))
+            .await;
+        let response = harness.response(request_id).await;
+        assert!(
+            response.get("error").is_none(),
+            "unexpected read error: {response}"
+        );
+        let result = &response["result"];
+        assert!(serde_json::to_vec(result).unwrap().len() <= 4_096);
+        if captured_end.is_none() {
+            captured_end = result["captured_end"].as_u64();
+            revision = result["history_revision"].as_str().map(str::to_owned);
+        } else {
+            assert_eq!(result["captured_end"].as_u64(), captured_end);
+            assert_eq!(result["history_revision"].as_str(), revision.as_deref());
+        }
+        for item in result["items"].as_array().unwrap() {
+            let index = item["index"].as_u64().unwrap() as usize;
+            let offset = item["offset"].as_u64().unwrap() as usize;
+            let data = item["data"].as_str().unwrap();
+            let entry = reconstructed.entry(index).or_default();
+            assert_eq!(entry.len(), offset);
+            entry.push_str(data);
+            if item["complete"].as_bool().unwrap() {
+                assert_eq!(
+                    offset + data.len(),
+                    item["total_bytes"].as_u64().unwrap() as usize
+                );
+                complete.insert(index);
+            }
+        }
+        if result["next_cursor"].is_null() {
+            break;
+        }
+        cursor = Some(result["next_cursor"].clone());
+        assert!(page_index < 127, "read pagination did not make progress");
+    }
+    assert_eq!(complete.len(), reconstructed.len());
+    let user = reconstructed
+        .values()
+        .map(|item| serde_json::from_str::<Value>(item).unwrap())
+        .find(|item| item.pointer("/item/type").and_then(Value::as_str) == Some("user"))
+        .expect("the user item must be present");
+    assert_eq!(user["item"]["data"]["input"]["text"], json!(text));
+    let tool = reconstructed
+        .values()
+        .map(|item| serde_json::from_str::<Value>(item).unwrap())
+        .find(|item| item.pointer("/item/type").and_then(Value::as_str) == Some("tool_result"))
+        .expect("the tool result must be present");
+    let expected_tool = tool_text
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("{}: {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        tool["item"]["data"]["output"]["content"],
+        json!(expected_tool)
+    );
+    let tool_call = reconstructed
+        .values()
+        .map(|item| serde_json::from_str::<Value>(item).unwrap())
+        .filter(|item| item.pointer("/item/type").and_then(Value::as_str) == Some("assistant"))
+        .flat_map(|item| {
+            item["item"]["data"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .find(|part| part["type"] == json!("tool_call"))
+        .expect("the structured tool call must be present");
+    assert_eq!(tool_call["data"]["arguments"]["path"], json!("huge.txt"));
+    let assistant_text_bytes = reconstructed
+        .values()
+        .map(|item| serde_json::from_str::<Value>(item).unwrap())
+        .filter(|item| item.pointer("/item/type").and_then(Value::as_str) == Some("assistant"))
+        .flat_map(|item| {
+            item["item"]["data"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|part| part["type"] == json!("text"))
+        .filter_map(|part| part["data"].as_str().map(str::len))
+        .sum::<usize>();
+    assert_eq!(assistant_text_bytes, 128 * 1024);
+    assert_eq!(
+        std::fs::read(session_dir.join("session.json")).unwrap(),
+        metadata_before
+    );
+    assert_eq!(
+        std::fs::read(session_dir.join("history.jsonl")).unwrap(),
+        history_before
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn unloaded_session_read_pages_short_turns_under_small_budget() {
+    let (agent, base, workspace) =
+        test_agent("session-read-short-pages", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    for index in 0..100 {
+        let send_id = json!(format!("short-send-{index}"));
+        harness
+            .send(
+                send_id.clone(),
+                "turn.send",
+                Some(json!({
+                    "session_id": session_id,
+                    "text": format!("short prompt {index}"),
+                })),
+            )
+            .await;
+        let turn = harness.response(send_id).await["result"]["turn"].clone();
+        let wait_id = json!(format!("short-wait-{index}"));
+        harness
+            .send(wait_id.clone(), "turn.wait", Some(turn_params(&turn)))
+            .await;
+        assert_eq!(
+            harness.response(wait_id).await["result"]["persistence"],
+            json!("persisted")
+        );
+    }
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let _ = harness.response(json!("close")).await;
+
+    let mut cursor = None;
+    let mut captured_end = None;
+    let mut history_revision = None;
+    let mut pages = 0;
+    loop {
+        let request_id = json!(format!("short-read-{pages}"));
+        let mut params = json!({
+            "session_id": session_id,
+            "limit": 100,
+            "max_bytes": 4_096,
+        });
+        if let Some(next) = cursor.clone() {
+            params["cursor"] = next;
+            params["captured_end"] = json!(captured_end.unwrap());
+            params["history_revision"] = json!(history_revision.clone().unwrap());
+        }
+        harness
+            .send(request_id.clone(), "session.read", Some(params))
+            .await;
+        let response = harness.response(request_id).await;
+        assert!(
+            response["error"].is_null(),
+            "unexpected read error: {response}"
+        );
+        assert!(serde_json::to_vec(&response["result"]).unwrap().len() <= 4_096);
+        assert!(
+            response["result"]["records"].as_array().unwrap().len()
+                <= response["result"]["items"].as_array().unwrap().len()
+        );
+        if captured_end.is_none() {
+            captured_end = response["result"]["captured_end"].as_u64();
+            history_revision = response["result"]["history_revision"]
+                .as_str()
+                .map(str::to_owned);
+        }
+        pages += 1;
+        if response["result"]["next_cursor"].is_null() {
+            break;
+        }
+        cursor = Some(response["result"]["next_cursor"].clone());
+        assert!(pages < 128, "short-turn pagination did not make progress");
+    }
+    assert!(pages > 1);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_read_rejects_same_length_prefix_replacement() {
+    let (agent, base, workspace) = test_agent(
+        "session-read-revision",
+        [ModelScript::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let text = "prefix-".to_owned() + &"é🙂 escaped ".repeat(2_000);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": text})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let _ = harness.response(json!("close")).await;
+
+    let first_id = json!("read-first");
+    harness
+        .send(
+            first_id.clone(),
+            "session.read",
+            Some(json!({
+                "session_id": session_id,
+                "limit": 100,
+                "max_bytes": 4_096,
+            })),
+        )
+        .await;
+    let first = harness.response(first_id).await;
+    assert!(first["result"]["next_cursor"].is_object());
+
+    let history_path = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap())
+        .join("history.jsonl");
+    let mut history = std::fs::read(&history_path).unwrap();
+    let prefix = history
+        .windows(b"prefix".len())
+        .position(|window| window == b"prefix")
+        .expect("test history must contain the selected prefix");
+    history[prefix] = b'P';
+    std::fs::write(&history_path, &history).unwrap();
+
+    harness
+        .send(
+            json!("read-second"),
+            "session.read",
+            Some(json!({
+                "session_id": session_id,
+                "cursor": first["result"]["next_cursor"],
+                "limit": 100,
+                "max_bytes": 4_096,
+                "captured_end": first["result"]["captured_end"],
+                "history_revision": first["result"]["history_revision"],
+            })),
+        )
+        .await;
+    let second = harness.response(json!("read-second")).await;
+    assert_eq!(second["error"]["code"], json!(-32_005));
+    assert_eq!(second["error"]["data"]["kind"], json!("invalid_state"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn loaded_session_read_does_not_expose_a_disk_tail() {
+    let (agent, base, workspace) = test_agent(
+        "session-read-loaded-prefix",
+        [ModelScript::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "committed"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    let history_path = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap())
+        .join("history.jsonl");
+    let original = std::fs::read(&history_path).unwrap();
+    let newline = original
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("a persisted turn must have one JSONL line");
+    let mut with_tail = original.clone();
+    with_tail.extend_from_slice(&original[..=newline]);
+    std::fs::write(&history_path, with_tail).unwrap();
+
+    harness
+        .send(
+            json!("read"),
+            "session.read",
+            Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
+        )
+        .await;
+    let read = harness.response(json!("read")).await;
+    assert_eq!(read["result"]["session"]["loaded"], json!(true));
+    assert_eq!(read["result"]["total"], json!(2));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
+    let (agent, base, workspace) = test_agent(
+        "session-read-loaded-pagination",
+        [ModelScript::Oversize, ModelScript::Text("new answer")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send-first"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "first"})),
+        )
+        .await;
+    let first_turn = harness.response(json!("send-first")).await["result"]["turn"].clone();
+    harness
+        .send(
+            json!("wait-first"),
+            "turn.wait",
+            Some(turn_params(&first_turn)),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("wait-first")).await["result"]["persistence"],
+        json!("persisted")
+    );
+
+    harness
+        .send(
+            json!("read-first"),
+            "session.read",
+            Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
+        )
+        .await;
+    let first_page = harness.response(json!("read-first")).await;
+    assert!(first_page["result"]["next_cursor"].is_object());
+    let captured_end = first_page["result"]["captured_end"].as_u64().unwrap();
+    let history_revision = first_page["result"]["history_revision"].clone();
+    let captured_total = first_page["result"]["total"].as_u64().unwrap();
+    let mut cursor = first_page["result"]["next_cursor"].clone();
+    let mut response_text = first_page["result"].to_string();
+    let mut page_count = 1;
+
+    harness
+        .send(
+            json!("send-second"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "second"})),
+        )
+        .await;
+    let second_turn = harness.response(json!("send-second")).await["result"]["turn"].clone();
+    harness
+        .send(
+            json!("wait-second"),
+            "turn.wait",
+            Some(turn_params(&second_turn)),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("wait-second")).await["result"]["persistence"],
+        json!("persisted")
+    );
+
+    while !cursor.is_null() {
+        let request_id = json!(format!("read-next-{page_count}"));
+        harness
+            .send(
+                request_id.clone(),
+                "session.read",
+                Some(json!({
+                    "session_id": session_id,
+                    "cursor": cursor,
+                    "limit": 100,
+                    "max_bytes": 4_096,
+                    "captured_end": captured_end,
+                    "history_revision": history_revision,
+                })),
+            )
+            .await;
+        let page = harness.response(request_id).await;
+        assert!(
+            page["error"].is_null(),
+            "unexpected continuation error: {page}"
+        );
+        assert_eq!(page["result"]["total"].as_u64(), Some(captured_total));
+        assert_eq!(page["result"]["captured_end"].as_u64(), Some(captured_end));
+        assert_eq!(page["result"]["history_revision"], history_revision);
+        assert!(!page.to_string().contains("new answer"));
+        response_text.push_str(&page["result"].to_string());
+        cursor = page["result"]["next_cursor"].clone();
+        page_count += 1;
+        assert!(page_count < 128, "loaded pagination did not make progress");
+    }
+    assert!(page_count > 1);
+    assert!(!response_text.contains("new answer"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair() {
+    let (agent, base, workspace) = test_agent(
+        "session-read-integrity",
+        [ModelScript::Text("first"), ModelScript::Text("second")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    for (index, text) in ["one", "two"].into_iter().enumerate() {
+        let send_id = json!(format!("send-{index}"));
+        harness
+            .send(
+                send_id.clone(),
+                "turn.send",
+                Some(json!({"session_id": session_id, "text": text})),
+            )
+            .await;
+        let turn = harness.response(send_id).await["result"]["turn"].clone();
+        let wait_id = json!(format!("wait-{index}"));
+        harness
+            .send(wait_id.clone(), "turn.wait", Some(turn_params(&turn)))
+            .await;
+        assert_eq!(
+            harness.response(wait_id).await["result"]["persistence"],
+            json!("persisted")
+        );
+    }
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let _ = harness.response(json!("close")).await;
+
+    let history_path = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap())
+        .join("history.jsonl");
+    let original = std::fs::read(&history_path).unwrap();
+    let mut with_tail = original.clone();
+    with_tail.extend_from_slice(b"{\"incomplete\"");
+    std::fs::write(&history_path, &with_tail).unwrap();
+
+    harness
+        .send(
+            json!("tail"),
+            "session.read",
+            Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
+        )
+        .await;
+    let tail = harness.response(json!("tail")).await;
+    assert_eq!(tail["result"]["trailing_incomplete"], json!(true));
+    assert_eq!(tail["result"]["total"], json!(4));
+    assert_eq!(std::fs::read(&history_path).unwrap(), with_tail);
+
+    let second_line = original
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| offset + 1)
+        .expect("two turns must produce a second JSONL line");
+    assert_eq!(original[second_line], b'{');
+    let mut corrupt = with_tail;
+    corrupt[second_line] = b'X';
+    std::fs::write(&history_path, &corrupt).unwrap();
+    harness
+        .send(
+            json!("corrupt"),
+            "session.read",
+            Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
+        )
+        .await;
+    let corrupt_response = harness.response(json!("corrupt")).await;
+    assert_eq!(corrupt_response["error"]["code"], json!(-32_011));
+    assert_eq!(
+        corrupt_response["error"]["data"]["kind"],
+        json!("store_error")
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), corrupt);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn turn_result_reports_pending_and_stored_availability() {
+    let (agent, base, workspace) = test_agent(
+        "turn-result-lifecycle",
+        [ModelScript::Block, ModelScript::Text("stored answer")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send-blocked"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "wait"})),
+        )
+        .await;
+    let blocked_turn = harness.response(json!("send-blocked")).await["result"]["turn"].clone();
+
+    harness
+        .send(
+            json!("pending"),
+            "turn.result",
+            Some(json!({
+                "session_id": blocked_turn["session_id"],
+                "loop_id": blocked_turn["loop_id"],
+                "limit": 100,
+                "max_bytes": 4_096,
+            })),
+        )
+        .await;
+    let pending = harness.response(json!("pending")).await;
+    assert_eq!(pending["result"]["availability"], json!("pending"));
+
+    harness
+        .send(
+            json!("cancel-blocked"),
+            "turn.cancel",
+            Some(turn_params(&blocked_turn)),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel-blocked")).await["result"]["cancelled"],
+        json!(true)
+    );
+    harness
+        .send(
+            json!("wait-blocked"),
+            "turn.wait",
+            Some(turn_params(&blocked_turn)),
+        )
+        .await;
+    let _ = harness.response(json!("wait-blocked")).await;
+
+    harness
+        .send(
+            json!("send-stored"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "persist"})),
+        )
+        .await;
+    let stored_turn = harness.response(json!("send-stored")).await["result"]["turn"].clone();
+    harness
+        .send(
+            json!("wait-stored"),
+            "turn.wait",
+            Some(turn_params(&stored_turn)),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("wait-stored")).await["result"]["persistence"],
+        json!("persisted")
+    );
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let _ = harness.response(json!("close")).await;
+
+    harness
+        .send(
+            json!("stored-result"),
+            "turn.result",
+            Some(json!({
+                "session_id": stored_turn["session_id"],
+                "loop_id": stored_turn["loop_id"],
+                "limit": 100,
+                "max_bytes": 4_096,
+            })),
+        )
+        .await;
+    let stored = harness.response(json!("stored-result")).await;
+    assert_eq!(stored["result"]["availability"], json!("stored"));
+    assert_eq!(stored["result"]["persistence"], json!("persisted"));
+    assert!(stored["result"]["items"].as_array().unwrap().len() >= 2);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn turn_result_can_continue_from_live_to_stored_items() {
+    let (agent, base, workspace) = test_agent(
+        "turn-result-live-stored-pages",
+        [ModelScript::Oversize],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "live"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("live-first"),
+            "turn.result",
+            Some(json!({
+                "session_id": turn["session_id"],
+                "loop_id": turn["loop_id"],
+                "limit": 100,
+                "max_bytes": 4_096,
+            })),
+        )
+        .await;
+    let first = harness.response(json!("live-first")).await;
+    assert_eq!(first["result"]["availability"], json!("live"));
+    assert!(first["result"]["next_cursor"].is_object());
+
+    let mut cursor = first["result"]["next_cursor"].clone();
+    let mut reconstructed = BTreeMap::<usize, String>::new();
+    for item in first["result"]["items"].as_array().unwrap() {
+        let index = item["index"].as_u64().unwrap() as usize;
+        let offset = item["offset"].as_u64().unwrap() as usize;
+        let entry = reconstructed.entry(index).or_default();
+        assert_eq!(entry.len(), offset);
+        entry.push_str(item["data"].as_str().unwrap());
+    }
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let _ = harness.response(json!("close")).await;
+
+    let mut pages = 1;
+    while !cursor.is_null() {
+        let request_id = json!(format!("stored-{pages}"));
+        harness
+            .send(
+                request_id.clone(),
+                "turn.result",
+                Some(json!({
+                    "session_id": turn["session_id"],
+                    "loop_id": turn["loop_id"],
+                    "cursor": cursor,
+                    "limit": 100,
+                    "max_bytes": 4_096,
+                })),
+            )
+            .await;
+        let page = harness.response(request_id).await;
+        assert_eq!(page["result"]["availability"], json!("stored"));
+        for item in page["result"]["items"].as_array().unwrap() {
+            let index = item["index"].as_u64().unwrap() as usize;
+            let offset = item["offset"].as_u64().unwrap() as usize;
+            let entry = reconstructed.entry(index).or_default();
+            assert_eq!(entry.len(), offset);
+            entry.push_str(item["data"].as_str().unwrap());
+            if item["complete"].as_bool().unwrap() {
+                assert_eq!(entry.len(), item["total_bytes"].as_u64().unwrap() as usize);
+            }
+        }
+        cursor = page["result"]["next_cursor"].clone();
+        pages += 1;
+        assert!(pages < 128, "turn result pagination did not make progress");
+    }
+    assert!(pages > 1);
+    assert_eq!(reconstructed.len(), 2);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn turn_result_reads_failed_live_report_without_history() {
+    let (agent, base, workspace) = test_agent(
+        "turn-result-failed-append",
+        [ModelScript::Text("answer retained in memory")],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let typed_session_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
+    fail_next_append(typed_session_id);
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "failed persistence"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let waited = harness.response(json!("wait")).await;
+    assert_eq!(waited["result"]["persistence"], json!("failed"));
+
+    let history_path = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap())
+        .join("history.jsonl");
+    std::fs::remove_file(history_path).unwrap();
+    harness
+        .send(
+            json!("result"),
+            "turn.result",
+            Some(json!({
+                "session_id": turn["session_id"],
+                "loop_id": turn["loop_id"],
+                "limit": 100,
+                "max_bytes": 4_096,
+            })),
+        )
+        .await;
+    let result = harness.response(json!("result")).await;
+    assert_eq!(result["result"]["availability"], json!("live"));
+    assert_eq!(result["result"]["persistence"], json!("failed"));
+    assert_eq!(result["result"]["outcome"]["type"], json!("completed"));
+    assert!(result.to_string().contains("answer retained in memory"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn deferred_query_capacity_is_four_with_shared_total_limit() {
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+    let mut server = RpcServer {
+        agent: None,
+        outbound_tx,
+        waiters: tokio::task::JoinSet::new(),
+        queries: tokio::task::JoinSet::new(),
+        query_cancellation: CancellationToken::new(),
+    };
+    for _ in 0..MAX_DEFERRED_QUERIES {
+        server.queries.spawn(async { pending::<()>().await });
+    }
+    assert!(!server.query_capacity_available());
+
+    server.queries.abort_all();
+    while server.queries.join_next().await.is_some() {}
+
+    for _ in 0..(MAX_DEFERRED_QUERIES - 1) {
+        server.queries.spawn(async { pending::<()>().await });
+    }
+    for _ in 0..(MAX_DEFERRED_WAITERS - (MAX_DEFERRED_QUERIES - 1)) {
+        server.waiters.spawn(async { pending::<()>().await });
+    }
+    assert!(!server.query_capacity_available());
+
+    server.queries.abort_all();
+    server.waiters.abort_all();
+    while server.queries.join_next().await.is_some() {}
+    while server.waiters.join_next().await.is_some() {}
 }

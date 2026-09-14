@@ -78,6 +78,8 @@ pub enum AgentError {
     InvalidArguments,
     #[error("RPC response serialization failed")]
     RpcSerialization,
+    #[error("history query exceeded its scan budget")]
+    QueryLimit,
     #[error("I/O failure")]
     Io(#[from] io::Error),
 }
@@ -100,6 +102,12 @@ pub(crate) enum StoreError {
     RecordTooLarge,
     #[error("store is unavailable")]
     Unavailable,
+    #[error("history changed while it was being read")]
+    HistoryChanged,
+    #[error("history query exceeded its scan budget")]
+    QueryLimit,
+    #[error("invalid history query arguments")]
+    InvalidArguments,
 }
 
 impl StoreError {
@@ -113,6 +121,9 @@ impl StoreError {
             Self::Corrupt => "corrupt",
             Self::RecordTooLarge => "record_too_large",
             Self::Unavailable => "unavailable",
+            Self::HistoryChanged => "history_changed",
+            Self::QueryLimit => "query_limit",
+            Self::InvalidArguments => "invalid_arguments",
         }
     }
 }

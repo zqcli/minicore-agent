@@ -12,6 +12,7 @@ mod policy;
 mod presentation;
 mod profiles;
 mod prompt;
+mod read;
 mod rpc;
 mod sessions;
 pub(crate) mod store;
@@ -21,8 +22,10 @@ mod workspace;
 
 pub use agent::{
     Agent, AnswerInteraction, CompactSession, CreateSession, GetHistory, HistoryPage, PingResponse,
-    ReloadResult, RenameSession, SendMessage, SessionInfo, SessionState, SessionStatus,
-    SessionUpdateResult, SteerMessage, TurnPersistence, TurnRef, TurnResult, UpdateSession,
+    RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk, ReadSession,
+    ReadSessionResult, ReadTurnSummary, ReloadResult, RenameSession, SendMessage, SessionInfo,
+    SessionState, SessionStatus, SessionUpdateResult, SteerMessage, TurnPersistence, TurnRef,
+    TurnResult, TurnResultAvailability, TurnResultPage, TurnResultRequest, UpdateSession,
     agent_version,
 };
 pub use compaction::{CompactionResult, CompactionStatus};
