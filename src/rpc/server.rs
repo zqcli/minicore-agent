@@ -18,7 +18,9 @@ use crate::read::{ReadSession, TurnResultRequest};
 use crate::sessions::{
     TurnRef, await_compaction_completion, await_loop_preparation, await_turn_completion,
 };
+use crate::workspace::listing::WorkspaceFilesRequest;
 use crate::workspace::query::{WORKSPACE_READ_DEADLINE, WorkspaceReadRequest};
+use crate::workspace::search::WorkspaceSearchRequest;
 
 use super::protocol::{
     AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, EmptyParams,
@@ -490,6 +492,80 @@ impl RpcServer {
                         Ok(Ok(result)) => success(&id, result),
                         Ok(Err(error)) => query_error(id, &error),
                         Err(_) => agent_error(id, &AgentError::QueryLimit),
+                    };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
+            }
+            "workspace.files" => {
+                let request: WorkspaceFilesRequest = match params_or_error(&id, params) {
+                    Ok(request) => request,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                let Some(session) = self.agent().loaded_session(request.session_id) else {
+                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                };
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let session_cancellation = session.query_cancellation();
+                let workspace = session.workspace();
+                drop(session);
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    // The scan owns one retained blocking worker and enforces
+                    // its own deadline, so an outer timeout here would drop
+                    // the worker join instead of cancelling it.
+                    let response = match crate::workspace::listing::files(
+                        workspace,
+                        request,
+                        session_cancellation,
+                        cancellation,
+                    )
+                    .await
+                    {
+                        Ok(result) => success(&id, result),
+                        Err(error) => query_error(id, &error),
+                    };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
+            }
+            "workspace.search" => {
+                let request: WorkspaceSearchRequest = match params_or_error(&id, params) {
+                    Ok(request) => request,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                let Some(session) = self.agent().loaded_session(request.session_id) else {
+                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                };
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let session_cancellation = session.query_cancellation();
+                let workspace = session.workspace();
+                drop(session);
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    // Same retained-worker contract as `workspace.files`.
+                    let response = match crate::workspace::search::search(
+                        workspace,
+                        request,
+                        session_cancellation,
+                        cancellation,
+                    )
+                    .await
+                    {
+                        Ok(result) => success(&id, result),
+                        Err(error) => query_error(id, &error),
                     };
                     let _ = outbound.send(RpcOutbound::Response(response)).await;
                 });
@@ -1050,6 +1126,8 @@ fn canonical_method(method: &str) -> &'static str {
         "session.read" => "session.read",
         "session.presentation" => "session.presentation",
         "workspace.read" => "workspace.read",
+        "workspace.files" => "workspace.files",
+        "workspace.search" => "workspace.search",
         "tool.read" => "tool.read",
         "tool.output" => "tool.output",
         "turn.send" => "turn.send",

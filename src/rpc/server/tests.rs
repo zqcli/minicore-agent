@@ -38,6 +38,7 @@ use crate::store::{
     force_unknown_summary_write, gate_next_summary_commit,
 };
 use crate::workspace::query::{WorkspaceReadGate, gate_next_workspace_read};
+use crate::workspace::scan::{ScanHold, hold_next_scan};
 
 use super::{
     Frame, MAX_DEFERRED_QUERIES, MAX_DEFERRED_WAITERS, MAX_RPC_LINE_BYTES, RpcServer, read_frame,
@@ -635,6 +636,8 @@ async fn capability_discovery_returns_ordered_lists() {
             "tool.output",
             "session.history",
             "workspace.read",
+            "workspace.files",
+            "workspace.search",
             "deferred.waiter_limit"
         ])
     );
@@ -5715,6 +5718,314 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
         .await;
     let reuse = harness.response(json!("cap-reuse")).await;
     assert_eq!(reuse["result"]["content"], json!("fresh\n"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn workspace_files_and_search_serve_entries_and_literal_matches() {
+    let (agent, base, workspace) = test_agent("workspace-scan", [], &[], ApprovalMode::Auto).await;
+    tokio::fs::write(workspace.join("note.txt"), b"alpha\nneedle here\n")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(workspace.join("sub"))
+        .await
+        .unwrap();
+    tokio::fs::write(workspace.join("sub/deep.txt"), b"needle too\n")
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("files"),
+            "workspace.files",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let files = harness.response(json!("files")).await;
+    let result = &files["result"];
+    assert_eq!(result["directory"], json!(""));
+    assert_eq!(result["consistency"], json!("live"));
+    assert_eq!(result["scan_complete"], json!(true));
+    assert_eq!(result["truncated"], json!(false));
+    assert_eq!(result["stopped_by"], json!("end"));
+    assert_eq!(result["skipped_count"], json!(0));
+    assert_eq!(result["next_cursor"], json!(null));
+    assert!(result["observed_at_unix_ms"].as_u64().unwrap() > 0);
+    let entries = result["entries"].as_array().unwrap();
+    let mut paths: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, vec!["note.txt", "sub"]);
+    let note = entries
+        .iter()
+        .find(|entry| entry["path"] == json!("note.txt"))
+        .unwrap();
+    assert_eq!(note["kind"], json!("file"));
+    assert_eq!(note["size"], json!(18));
+    let directory = entries
+        .iter()
+        .find(|entry| entry["path"] == json!("sub"))
+        .unwrap();
+    assert_eq!(directory["kind"], json!("directory"));
+    assert_eq!(directory["size"], json!(null));
+
+    // A recursive query filters entry paths and still descends.
+    harness
+        .send(
+            json!("files-recursive"),
+            "workspace.files",
+            Some(json!({
+                "session_id": session_id,
+                "recursive": true,
+                "query": "deep",
+            })),
+        )
+        .await;
+    let nested = harness.response(json!("files-recursive")).await;
+    assert_eq!(
+        nested["result"]["entries"][0]["path"],
+        json!("sub/deep.txt")
+    );
+    assert!(nested["result"]["skipped_count"].as_u64().unwrap() > 0);
+
+    // A literal, case-insensitive search reports line metadata, not contents
+    // spliced into the text.
+    harness
+        .send(
+            json!("search"),
+            "workspace.search",
+            Some(json!({"session_id": session_id, "query": "NEEDLE"})),
+        )
+        .await;
+    let search = harness.response(json!("search")).await;
+    let result = &search["result"];
+    assert_eq!(result["consistency"], json!("live"));
+    assert_eq!(result["scan_complete"], json!(true));
+    assert_eq!(result["skipped_files"], json!(0));
+    let matches = result["matches"].as_array().unwrap();
+    let mut matched: Vec<&str> = matches
+        .iter()
+        .map(|record| record["path"].as_str().unwrap())
+        .collect();
+    matched.sort();
+    assert_eq!(matched, vec!["note.txt", "sub/deep.txt"]);
+    let record = matches
+        .iter()
+        .find(|record| record["path"] == json!("note.txt"))
+        .unwrap();
+    assert_eq!(record["line_number"], json!(2));
+    assert_eq!(record["line_text"], json!("needle here"));
+    assert_eq!(record["match_byte_ranges"], json!([{"start": 0, "end": 6}]));
+    assert_eq!(record["line_truncated"], json!(false));
+
+    // Lexical errors are rejected before a query slot is reserved, and a
+    // missing root is a workspace error.
+    harness
+        .send(
+            json!("files-escape"),
+            "workspace.files",
+            Some(json!({"session_id": session_id, "directory": "../escape"})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("files-escape")).await["error"]["code"],
+        json!(-32602)
+    );
+    harness
+        .send(
+            json!("search-empty"),
+            "workspace.search",
+            Some(json!({"session_id": session_id, "query": ""})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("search-empty")).await["error"]["code"],
+        json!(-32602)
+    );
+    harness
+        .send(
+            json!("files-missing"),
+            "workspace.files",
+            Some(json!({"session_id": session_id, "directory": "missing"})),
+        )
+        .await;
+    let missing = harness.response(json!("files-missing")).await;
+    assert_eq!(missing["error"]["code"], json!(-32010));
+    assert_eq!(missing["error"]["data"]["kind"], json!("workspace_error"));
+    let unloaded = SessionId::new().unwrap();
+    harness
+        .send(
+            json!("search-unloaded"),
+            "workspace.search",
+            Some(json!({"session_id": unloaded, "query": "needle"})),
+        )
+        .await;
+    let unloaded = harness.response(json!("search-unloaded")).await;
+    assert_eq!(unloaded["error"]["code"], json!(-32002));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
+    let (agent, base, workspace) =
+        test_agent("workspace-scan-pending", [], &[], ApprovalMode::Auto).await;
+    tokio::fs::write(workspace.join("a.txt"), b"pending hit\n")
+        .await
+        .unwrap();
+    let root = std::fs::canonicalize(&workspace).unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    let files_hold = Arc::new(ScanHold::new());
+    hold_next_scan(root.clone(), Arc::clone(&files_hold));
+    harness
+        .send(
+            json!("files"),
+            "workspace.files",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    tokio::time::timeout(TIMEOUT, files_hold.wait_started())
+        .await
+        .expect("gated files scan did not start");
+
+    let search_hold = Arc::new(ScanHold::new());
+    hold_next_scan(root, Arc::clone(&search_hold));
+    harness
+        .send(
+            json!("search"),
+            "workspace.search",
+            Some(json!({"session_id": session_id, "query": "hit"})),
+        )
+        .await;
+    tokio::time::timeout(TIMEOUT, search_hold.wait_started())
+        .await
+        .expect("gated search scan did not start");
+
+    // Both scans are genuinely pending while control methods stay live.
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    // Shutdown cancels both scans, joins their blocking workers, and still
+    // queues its own response last.
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() {
+    let (agent, base, workspace) =
+        test_agent("workspace-scan-capacity", [], &[], ApprovalMode::Auto).await;
+    for index in 0..MAX_DEFERRED_QUERIES {
+        tokio::fs::write(
+            workspace.join(format!("cap-{index}.txt")),
+            format!("cap-{index}\n"),
+        )
+        .await
+        .unwrap();
+    }
+    tokio::fs::write(workspace.join("cap-fresh.txt"), b"fresh\n")
+        .await
+        .unwrap();
+    let root = std::fs::canonicalize(&workspace).unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let closing = create_and_open(&mut harness, &workspace).await;
+    let surviving = create_and_open(&mut harness, &workspace).await;
+
+    let mut holds = Vec::new();
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let hold = Arc::new(ScanHold::new());
+        hold_next_scan(root.clone(), Arc::clone(&hold));
+        holds.push(hold);
+        harness
+            .send(
+                json!(format!("scan-{index}")),
+                "workspace.files",
+                Some(json!({"session_id": closing})),
+            )
+            .await;
+    }
+
+    harness
+        .send(
+            json!("scan-over"),
+            "workspace.search",
+            Some(json!({"session_id": surviving, "query": "fresh"})),
+        )
+        .await;
+    let over = harness.response(json!("scan-over")).await;
+    assert_eq!(over["error"]["code"], json!(-32019));
+    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
+
+    for hold in &holds {
+        tokio::time::timeout(TIMEOUT, hold.wait_started())
+            .await
+            .expect("gated scan did not start");
+    }
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": closing})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+
+    // Closing the owning Session cancels the four started scans.
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let response = harness.response(json!(format!("scan-{index}"))).await;
+        assert_eq!(response["error"]["code"], json!(-32020));
+        assert_eq!(response["error"]["data"]["kind"], json!("query_limit"));
+    }
+
+    // The reader reaps the finished queries and admits a new one, and the
+    // closed Session no longer owns a Workspace.
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+    harness
+        .send(
+            json!("scan-closed"),
+            "workspace.files",
+            Some(json!({"session_id": closing})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("scan-closed")).await["error"]["code"],
+        json!(-32002)
+    );
+    harness
+        .send(
+            json!("scan-reuse"),
+            "workspace.search",
+            Some(json!({"session_id": surviving, "query": "cap"})),
+        )
+        .await;
+    let reuse = harness.response(json!("scan-reuse")).await;
+    let paths: Vec<&str> = reuse["result"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths.len(), MAX_DEFERRED_QUERIES);
+    assert!(paths.contains(&"cap-0.txt"));
+    assert!(!paths.contains(&"cap-fresh.txt"));
 
     harness.shutdown().await;
     remove_base(&base).await;

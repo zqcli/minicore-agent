@@ -30,13 +30,13 @@ pub(crate) const WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_LINES: u32 = DEFAULT_READ_LIMIT as u32;
 const MAX_MAX_LINES: u32 = MAX_READ_LINES as u32;
 /// A result budget smaller than this cannot hold any useful envelope plus
-/// content.
-const MIN_RESULT_BYTES: usize = 1024;
-const DEFAULT_RESULT_BYTES: usize = 64 * 1024;
-const MAX_RESULT_BYTES: usize = 256 * 1024;
+/// content. `workspace.files` and `workspace.search` share the same range.
+pub(crate) const MIN_RESULT_BYTES: usize = 1024;
+pub(crate) const DEFAULT_RESULT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// A request path longer than this is rejected before any query slot or
 /// serialization work. The generic workspace path checks stay uncapped.
-const MAX_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_PATH_BYTES: usize = 4096;
 
 /// One bounded read of a workspace file.
 ///

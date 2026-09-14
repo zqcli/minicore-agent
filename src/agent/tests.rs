@@ -5578,6 +5578,108 @@ async fn workspace_read_requires_a_loaded_session_and_touches_nothing_else() {
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
 }
 
+fn workspace_files_request(session_id: SessionId) -> crate::WorkspaceFilesRequest {
+    crate::WorkspaceFilesRequest {
+        session_id,
+        directory: None,
+        recursive: None,
+        query: None,
+        cursor: None,
+        limit: None,
+        max_bytes: None,
+    }
+}
+
+fn workspace_search_request(session_id: SessionId, query: &str) -> crate::WorkspaceSearchRequest {
+    crate::WorkspaceSearchRequest {
+        session_id,
+        query: query.to_owned(),
+        paths: None,
+        case_sensitive: None,
+        cursor: None,
+        max_matches: None,
+        max_bytes: None,
+    }
+}
+
+#[tokio::test]
+async fn workspace_files_and_search_require_a_loaded_session_and_touch_nothing_else() {
+    let (data_dir, _guard) = fixture_dir(&format!("workspace-scan-{}", next_id()));
+    let (workspace, _guard) = workspace_file("workspace-scan-ws", "note.txt", b"raw\nneedle\n");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session_id = info.session_id;
+
+    let history_path = data_dir
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+    let file_path = workspace.join("note.txt");
+    let file_before = std::fs::read(&file_path).unwrap();
+
+    let files = agent
+        .workspace_files(workspace_files_request(session_id))
+        .await
+        .unwrap();
+    assert_eq!(files.directory, "");
+    assert_eq!(files.entries.len(), 1);
+    assert_eq!(files.entries[0].path, "note.txt");
+    assert_eq!(files.entries[0].kind, crate::WorkspaceFileKind::File);
+    assert!(files.scan_complete);
+
+    let search = agent
+        .workspace_search(workspace_search_request(session_id, "needle"))
+        .await
+        .unwrap();
+    assert_eq!(search.matches.len(), 1);
+    assert_eq!(search.matches[0].path, "note.txt");
+    assert_eq!(search.matches[0].line_number, 2);
+    assert_eq!(search.matches[0].line_text, "needle");
+    assert!(search.scan_complete);
+
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+    assert_eq!(std::fs::read(&file_path).unwrap(), file_before);
+
+    // A closed Session no longer locates its Workspace, and an unknown Session
+    // ID is never guessed into one.
+    agent.close_session(session_id).await.unwrap();
+    assert!(matches!(
+        agent
+            .workspace_files(workspace_files_request(session_id))
+            .await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    assert!(matches!(
+        agent
+            .workspace_search(workspace_search_request(session_id, "needle"))
+            .await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    let unknown = SessionId::new().unwrap();
+    assert!(matches!(
+        agent
+            .workspace_files(workspace_files_request(unknown))
+            .await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    assert!(matches!(
+        agent
+            .workspace_search(workspace_search_request(unknown, "needle"))
+            .await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+}
+
 #[tokio::test]
 async fn tool_read_exposes_approval_time_data_without_running() {
     use crate::tool_data::{ToolExecutionState, ToolSubject};

@@ -28,7 +28,10 @@ review and remote verification: 511 stable/MSRV tests passed, 2 Live ignored;
 strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed. P4 is the
 next, separate Workspace slice; P4a `workspace.read` is verified with 528
 stable/MSRV tests passed, 2 Live ignored, and strict Clippy/fmt/rustdoc plus
-Windows/macOS compile checks passed. Files/search/status remain pending.
+Windows/macOS compile checks passed. P4b `workspace.files` and
+`workspace.search` are also verified: 576 stable/MSRV tests passed, 2 Live
+ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
+Workspace status remains pending.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,
