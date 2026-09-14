@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::InteractionId;
 use minicore_runtime::LoopOptions;
@@ -29,13 +30,26 @@ use crate::subagents::{SubagentFactory, SubagentService};
 use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
+pub use crate::read::{
+    ReadCursor, ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary,
+    TurnResultAvailability, TurnResultPage, TurnResultRequest,
+};
 pub use crate::sessions::{SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const RPC_PROTOCOL_VERSION: u32 = 1;
+pub const RPC_CAPABILITIES: &[&str] = &[
+    "session.read",
+    "turn.result",
+    "session.history",
+    "deferred.waiter_limit",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct PingResponse {
     pub version: &'static str,
+    pub protocol_version: u32,
+    pub capabilities: &'static [&'static str],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -392,7 +406,58 @@ impl Agent {
     }
 
     pub const fn ping(&self) -> PingResponse {
-        PingResponse { version: VERSION }
+        PingResponse {
+            version: VERSION,
+            protocol_version: RPC_PROTOCOL_VERSION,
+            capabilities: RPC_CAPABILITIES,
+        }
+    }
+
+    pub(crate) fn loaded_session(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Option<crate::sessions::Session> {
+        self.sessions.get(session_id).cloned()
+    }
+
+    pub(crate) fn store_handle(&self) -> Store {
+        self.store.clone()
+    }
+
+    pub async fn read_session(
+        &self,
+        request: ReadSession,
+    ) -> Result<ReadSessionResult, AgentError> {
+        let loaded = self.loaded_session(request.session_id);
+        tokio::time::timeout(
+            crate::read::READ_DEADLINE,
+            crate::read::read_session(
+                self.store.clone(),
+                loaded,
+                request,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .map_err(|_| AgentError::QueryLimit)?
+    }
+
+    pub async fn turn_result(
+        &self,
+        request: TurnResultRequest,
+    ) -> Result<TurnResultPage, AgentError> {
+        let loaded = self.loaded_session(request.turn.session_id);
+        tokio::time::timeout(
+            crate::read::READ_DEADLINE,
+            crate::read::turn_result(
+                self.store.clone(),
+                loaded,
+                request,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .map_err(|_| AgentError::QueryLimit)?
     }
 
     pub fn list_profiles(&self) -> Vec<ProfileInfo> {

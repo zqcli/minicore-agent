@@ -26,12 +26,11 @@ reports a parse error.
 
 ## Deferred Waiter Capacity
 
-At most 32 deferred waiters may be registered at once. When that limit is
-reached, further `turn.wait` and `session.compact` requests fail immediately
-with `-32019` (`resource_exhausted`, retryable) before a compaction operation is
-started. The limit applies only to those two methods: ping, cancel, shutdown,
-and every ordinary request remain serviceable so a client can always drain or
-cancel its work.
+At most 4 read queries may run at once, and at most 32 deferred waiters and
+read queries may be registered in total. When either limit is reached, further
+deferred requests fail immediately with `-32019` (`resource_exhausted`,
+retryable). The reader remains serviceable, so a client can still use ping,
+cancel, and shutdown to drain or cancel its work.
 
 A request has this shape:
 
@@ -47,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3"}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","turn.result","session.history","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -71,10 +70,10 @@ be recovered.
 
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
-requests are dispatched sequentially. `turn.wait` and `session.compact` are
-exceptions: the server registers one owned waiter and immediately continues
-reading requests. A deferred waiter does not own the underlying Session
-operation.
+requests are dispatched sequentially. `turn.wait`, `session.compact`,
+`session.read`, and `turn.result` are exceptions: the server registers one
+bounded owned task and immediately continues reading requests. A deferred
+query/waiter does not own the underlying Session operation.
 
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
@@ -83,23 +82,40 @@ The following orderings are not guaranteed:
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
 - a deferred `turn.wait` response before responses to later requests;
-- a deferred `session.compact` response before responses to later requests.
+- a deferred `session.compact`, `session.read`, or `turn.result` response before
+  responses to later requests.
 
 Output deltas and other live events are best effort and may be dropped under
-pressure. The authoritative sources are `turn.wait` and `session.history`, not
-the event stream.
+pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
+history query results, not the event stream.
 
 `agent.shutdown` waits for the Agent, its active child workers, pre-existing
-waiter tasks, and event pump, then queues its response last. EOF, Ctrl-C, writer failure, and explicit
-shutdown enter the same owned-task shutdown path. MiniCore Agent v0.3 uses the
-Runtime user-cancellation path when closing or shutting down an active Session;
+waiter/query tasks, and event pump, then queues its response last. EOF, Ctrl-C,
+writer failure, and explicit shutdown enter the same owned-task shutdown path.
+MiniCore Agent v0.3 uses the Runtime user-cancellation path when closing or
+shutting down an active Session;
 it does not currently preserve a distinct shutdown cancellation reason.
 
 ## Agent Methods
 
-`agent.ping` accepts omitted params or `{}` and returns
-`{"version":"0.3.3"}`. `agent.shutdown` accepts the same empty params, starts
-orderly shutdown, and returns `{"ok":true}` as the final frame on success.
+`agent.ping` accepts omitted params or `{}` and returns the Agent version,
+protocol version, and ordered capability names:
+
+```json
+{
+  "version": "0.3.3",
+  "protocol_version": 1,
+  "capabilities": [
+    "session.read",
+    "turn.result",
+    "session.history",
+    "deferred.waiter_limit"
+  ]
+}
+```
+
+`agent.shutdown` accepts the same empty params, starts orderly shutdown, and
+returns `{"ok":true}` as the final frame on success.
 
 ### `agent.reload`
 
@@ -348,6 +364,59 @@ identifier. Context, cost, and subscription fields are `null`/`unknown` when
 MiniCore has no reliable provider source; cumulative Usage is not treated as
 current context occupancy.
 
+### `session.read`
+
+`session.read` is a read-only query. It does not load a closed Session, open its
+Workspace, validate the configured Model, initialize Tools or PromptProvider,
+start a loop, repair `history.jsonl`, or update `session.json`. An already loaded
+Session is read from one committed in-memory snapshot and is bounded by that
+snapshot's item count. The query therefore continues to work for a closed
+Session whose Workspace was deleted or whose Model/Profile is no longer
+configured.
+
+```json
+{
+  "session_id": "ses_...",
+  "cursor": {"item": 0, "offset": 0},
+  "limit": 100,
+  "max_bytes": 262144,
+  "captured_end": null,
+  "history_revision": null
+}
+```
+
+`limit` is `1..=100` and is an upper bound; the byte budget may return fewer
+items. `max_bytes` defaults to 256 KiB and accepts `1..=1 MiB`. It is an
+encoded result-DTO budget, not a character budget. A requested budget outside
+the supported range is rejected; it is never silently raised. The entire
+encoded result, including Session metadata, record summaries, arrays, commas,
+and the next cursor, is checked against that budget. If even one item and its
+necessary metadata cannot fit, the query returns `invalid_params` rather than
+silently dropping content; raise the budget or reduce the requested range.
+
+The `items` array contains ordered `utf8_json` chunks. Each chunk's `data` is
+one UTF-8 slice of the canonical JSON encoding of one sanitized item envelope;
+concatenate chunks with the same `index` in offset order and parse the result
+when `complete` is true. `offset` and `total_bytes` are UTF-8 byte offsets and
+lengths. This permits a single huge User, Assistant, ToolResult, or structured
+Assistant part to continue across pages without truncating or skipping it.
+The envelope retains the Runtime message parts and full text; only opaque
+encrypted/signature-only reasoning is removed by the common history sanitizer.
+
+The response also includes bounded `records` summaries with outcome, usage,
+request/tool counts, final config revision, and completion time. It contains
+only summaries for turns represented by at least one item chunk in this
+response; a small byte budget therefore does not inherit summaries for items
+that were not emitted. `history_revision` is a SHA-256 of the
+captured complete prefix ending at `captured_end`. Continuation requests must
+send both values; a same-length replacement or a non-boundary prefix returns
+`invalid_state`. A final incomplete JSONL tail is reported as
+`trailing_incomplete` and is never repaired. If the read-only scan reaches its
+work/deadline/cancellation bound before establishing the requested prefix, it
+returns retryable `query_limit` rather than claiming a complete total; retrying
+with a smaller `limit` can reduce retained source work. The item chunks remain
+the continuation mechanism when one item itself is larger than the page.
+
 ### `session.update`
 
 ```json
@@ -566,6 +635,29 @@ does not provide an end-to-end crash-durability proof. A failed JSONL append
 returns the completed loop report with `persistence: failed` and blocks the
 Session from further turns.
 
+### `turn.result`
+
+```json
+{
+  "session_id": "ses_...",
+  "loop_id": "lup_...",
+  "cursor": {"item": 0, "offset": 0},
+  "limit": 100,
+  "max_bytes": 262144
+}
+```
+
+`turn.result` returns a bounded page using the same sanitized JSON item chunks
+and `1..=100`/`1..=1 MiB` budget rules as `session.read`. Its item envelope
+intentionally omits the session User timestamp, so a page sequence remains
+stable if a retained live result later falls back to its stored record.
+`availability` is `pending` while the current Runtime loop has not published a
+report, `live` while its retained completion report is available, and `stored`
+when the exact old Turn is read from `history.jsonl`. A live report is preferred
+to Store, so an append failure still exposes the retained report with
+`persistence: failed`; a stored Turn reports `persistence: persisted`. Runtime
+outcome and usage are returned when known.
+
 ### `turn.cancel`
 
 ```json
@@ -688,6 +780,7 @@ errors:
 | `-32017` | `reload_requires_restart` |
 | `-32018` | `reload_unavailable` |
 | `-32019` | `resource_exhausted` |
+| `-32020` | `query_limit` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or
