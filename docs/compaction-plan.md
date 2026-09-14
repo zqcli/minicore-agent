@@ -1,33 +1,42 @@
 # Long-Conversation Compaction Plan
 
 Status: **The Task 1 snapshot foundation is accepted. The manual Agent/RPC
-draft is committed at `5397a65` but unaccepted; implementation and builds remain
-paused following the September 13, 2026 execution-boundary incident. Ordinary
-worker lifecycle changes are checkpointed separately at `1771898`.
-Tasks 2–4 remain pending**. See the
-[manual execution audit](verification/compaction-manual-audit.md) before resuming.
-Foundation acceptance baseline: Agent `eec636a`, TUI `6ecd736`, Runtime 0.4.1 revision
+draft was checkpointed at `5397a65`. P3a and its manual-compaction regressions
+are now parent-reviewed and remotely verified: 451 stable/MSRV tests passed,
+2 Live tests ignored, strict Clippy/fmt/rustdoc passed. See
+[development progress](0914-progress.md). P3b automatic/overflow work remains
+pending**. See the
+[manual execution audit](verification/compaction-manual-audit.md) for historical
+incident context. Foundation acceptance baseline: Agent `eec636a`, TUI `6ecd736`,
+Runtime 0.4.1 revision
 `6cd2bdbc634437dea925495c61c7eb0be10ba171`. Runtime source, its pin, existing
 package versions and user data stay unchanged. The slice uses the authorized
 direct `sha2 = "=0.10.9"` dependency; the parent owns remote lock regeneration.
-The intended workflow restricts `cus-resp/gpt-5.6-luna:max` to source development;
-the parent owns review, remote verification and commits. The helper violated that
-restriction during R1 and is now stopped.
-Implementation acceptance remains independently gated per task. On September 13,
-2026 the user separately authorized grouped source-checkpoint commits and push of
-the existing draft. This Git-only authorization does not accept the code, resume
-builds, restart the helper, or authorize private-copy cleanup.
+The current source handoff uses `cus-resp/gpt-5.6-luna:max`; the parent owns
+review, remote verification and commits. This handoff permits source, focused
+tests, documentation and formatting only; no local build/test/check or remote
+operation is part of it.
+Implementation acceptance remains independently gated per task. The prior
+September 13, 2026 grouped source-checkpoint commit/push authorization and
+execution-boundary incident remain historical context; they do not accept new
+code or authorize private-copy cleanup.
 
-The active slice adds the bounded manual summary utility and the deferred
+The manual slice adds the bounded no-tools summary utility and deferred
 `session.compact` / `session.compact.cancel` RPC on top of the snapshot loader.
-It captures the selected raw model and future-turn inputs, uses fresh utility
-loop identities with no tools, bounds source chunks/merge/output, and commits
-only after a second complete-history anchor check. The complete
-`history.jsonl` remains authoritative. Automatic compaction, TUI `/compact`,
-and upstream overflow recovery are not part of this slice. Final release review and
-acceptance remain parent-owned. Child-run results are unaccepted and
-must not be used as gates. The private-copy cleanup decision requires user
-confirmation before work resumes.
+P3a additionally projects a validated summary and its complete history suffix
+into a Runtime-compliant startup `LoopRequest`, binds that projection through a
+same-loop model update, exposes `session.context`, and keeps manual utility usage
+separate from ordinary turn usage. Context budget fields describe only the
+Runtime history suffix; the full prepared-request estimate remains `null` until
+later budget work, and bounded scans do not block on unbounded history. Utility
+accounting retains observed call attempts and known usage from completed calls
+on later failure with an explicit `complete` flag; usage emitted by a failed
+stream remains unknown in this slice. The complete `history.jsonl` remains
+authoritative.
+Automatic compaction, TUI `/compact`, and upstream overflow recovery are not
+part of P3a. Final release review and acceptance remain
+parent-owned; child-run results are unaccepted and must not be used as gates.
+The private-copy cleanup decision remains separate from this source handoff.
 
 ## Goals
 
@@ -179,12 +188,18 @@ late-response tombstones, selection and history-reconciliation rules.
 1. **Agent manual compaction + RPC**: semantic no-tools summary utility,
    bounded streaming UTF-8 source serialization, source/merge/output bounds,
    settled-prefix snapshot persistence/loading, prompt projection, Session-owned
-   asynchronous admission/cancellation and
-   typed deferred `session.compact` result. Source coverage includes unchanged
-   history bytes, actual next model request uses summary, reopen reuse, no-op,
-   failure retention, ping responsiveness, busy/blocked/cancel admission and
-   no tool execution. Remote review and full gates remain pending.
-2. **TUI `/compact`**: command parsing/completion/help, typed RPC, progress/result,
+   asynchronous admission/cancellation and typed deferred `session.compact`
+   result. Source coverage includes unchanged history bytes, actual next model
+   request uses summary, reopen reuse, no-op, failure retention, ping
+   responsiveness, busy/blocked/cancel admission and no tool execution. The
+   draft remains pending parent acceptance.
+2. **P3a startup projection and context**: use only a validated summary to pass a
+   compliant Runtime history suffix, preserve one summary data message across a
+   same-loop model update, expose `session.context`, and report independent
+   manual utility accounting with bounded suffix estimates and no zero-filling
+   of unknowns. Source, focused tests and documentation are pending parent
+   review.
+3. **TUI `/compact`**: command parsing/completion/help, typed RPC, progress/result,
    lifecycle guards, no blind retry and late-response isolation. Test fake App
    and real-Agent loopback behavior, transcript preservation, narrow layout and
    old-Agent errors. Review and commit.

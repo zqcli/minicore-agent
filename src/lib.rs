@@ -29,7 +29,7 @@ pub use agent::{
     TurnResult, TurnResultAvailability, TurnResultPage, TurnResultRequest, UpdateSession,
     agent_version,
 };
-pub use compaction::{CompactionResult, CompactionStatus};
+pub use compaction::{CompactionResult, CompactionStatus, CompactionUtilityUsage};
 pub use config::{AgentConfig, ApprovalMode, ConfigError, LoopOverrides, Profile};
 pub use error::{AgentError, RuntimeErrorView};
 pub use event::{
@@ -41,7 +41,8 @@ pub use presentation::{AssistantDisplayPart, PresentationView, ToolDisplay};
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use sessions::{
-    CompactionPhase, CompactionProgress, LoopAccepted, SessionBlockReason, SteerAccepted,
+    CompactionPhase, CompactionProgress, ContextBudget, LoopAccepted, SessionBlockReason,
+    SessionContext, SteerAccepted, SummaryCoverage,
 };
 pub use tool_data::{
     ToolDataAvailability, ToolDataStream, ToolExecutionData, ToolExecutionState, ToolInputSummary,

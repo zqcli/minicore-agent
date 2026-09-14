@@ -16,8 +16,8 @@ const PROJECT_ENVELOPE: &str = "[minicore-project-instructions source=AGENTS.md]
 const TRUNCATED: &str = "[truncated]";
 
 /// Request-level prompt provider that merges the session system prompt with a
-/// freshly read workspace `AGENTS.md`, applies the session-local derived
-/// snapshot projection, and delegates the remaining history to the runtime
+/// freshly read workspace `AGENTS.md`, applies the session-local or
+/// execution-bound derived snapshot projection, and delegates the remaining history to the runtime
 /// `DefaultPromptProvider`.
 ///
 /// `AGENTS.md` is re-read for every model request, so edits become visible at
@@ -27,7 +27,8 @@ const TRUNCATED: &str = "[truncated]";
 pub(crate) struct ProjectPromptProvider {
     workspace: Arc<Workspace>,
     system_prompt: BoundedText,
-    compaction: Arc<CompactionState>,
+    compaction: Option<Arc<CompactionState>>,
+    bound_summary: Option<BoundedText>,
     #[cfg(test)]
     read_gate: Option<Arc<PromptReadGate>>,
 }
@@ -43,7 +44,25 @@ impl ProjectPromptProvider {
         Ok(Self {
             workspace,
             system_prompt,
-            compaction,
+            compaction: Some(compaction),
+            bound_summary: None,
+            #[cfg(test)]
+            read_gate: None,
+        })
+    }
+
+    pub(crate) fn new_bound(
+        workspace: Arc<Workspace>,
+        system_prompt: String,
+        summary: BoundedText,
+    ) -> Result<Self, AgentPromptError> {
+        let system_prompt =
+            BoundedText::new(system_prompt).map_err(|_| AgentPromptError::InvalidSystemPrompt)?;
+        Ok(Self {
+            workspace,
+            system_prompt,
+            compaction: None,
+            bound_summary: Some(summary),
             #[cfg(test)]
             read_gate: None,
         })
@@ -83,7 +102,8 @@ impl PromptProvider for ProjectPromptProvider {
         let model = request.model;
         let reasoning = request.reasoning;
         let tools = request.tools;
-        let compaction = Arc::clone(&self.compaction);
+        let compaction = self.compaction.as_ref().map(Arc::clone);
+        let bound_summary = self.bound_summary.clone();
         #[cfg(test)]
         let read_gate = self.read_gate.clone();
         Box::pin(async move {
@@ -111,9 +131,15 @@ impl PromptProvider for ProjectPromptProvider {
             let system = build_system_prompt(&system_base, agents)
                 .map_err(|_| PromptError::InvalidHistory)?;
             let provider = DefaultPromptProvider::new(Some(system));
-            let (projected_base, summary) = match compaction.project(history.base()) {
-                Some(projection) => (Some(projection.suffix), Some(projection.summary)),
-                None => (None, None),
+            let (projected_base, summary) = if let Some(summary) = bound_summary {
+                (Some(history.base()), Some(summary))
+            } else if let Some(compaction) = compaction {
+                match compaction.project(history.base()) {
+                    Some(projection) => (Some(projection.suffix), Some(projection.summary)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
             };
             let projected_history = projected_base.map_or_else(
                 || HistoryView::new(history.base(), history.appended()),

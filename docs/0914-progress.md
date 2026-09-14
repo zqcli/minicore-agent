@@ -5,21 +5,24 @@ Branch: `feat/0914-shared-data`.
 Agent starting HEAD: `8b8bbcb33dd692f023e89a0eefcbbb6f2c7a87c0`.
 Runtime remains pinned to 0.4.1, `6cd2bdbc634437dea925495c61c7eb0be10ba171`.
 
-The user's September 14 instruction authorizes resumed source development and
-remote verification. Historical audit reports remain historical evidence;
-previous unaccepted results are not acceptance gates for this work.
+Historical audit reports remain historical evidence and previous unaccepted
+results are not acceptance gates. The current source handoff implements P3a only:
+startup projection from a validated summary, same-loop model-update binding,
+`session.context`, and independent manual utility usage reporting. P3a source,
+tests and documentation passed parent review and remote acceptance. Automatic compaction and
+upstream overflow recovery remain pending.
 
 ## Execution
 
-One `implement` helper uses `cus-resp/deepseek-v4.1-flash:high`; the parent owns
-review, remote verification and commits. Per the user's updated instruction,
-three consecutive helper failures switch implementation to
-`cus-resp/gpt-5.6-luna:max`; user cancellations do not count. P1 was completed by
-the fallback after upstream/context-compaction failures. No local compilation. Remote build root:
-`root@192.168.20.199:/root/minicore-agent-0914`.
-Transfers allow only source, tests, Cargo files and public fixtures. Private
-configuration and real Session data are excluded. Git commits use repository-local
-`zqcli <zqcli@users.noreply.github.com>`; no credentials are stored in source.
+Implementation prefers `cus-resp/deepseek-v4.1-flash:high`; three consecutive
+helper failures permit `cus-resp/gpt-5.6-luna:max`. P3a used that fallback after
+three DeepSeek context-compaction failures. Only one helper implements at a
+time; the parent owns
+review, remote verification and commits. This handoff permits source, focused
+tests, documentation and formatting only. No local build/test/check or remote
+operation is part of the handoff. Transfers of private configuration and real
+Session data are excluded; the prior execution-boundary incident remains in the
+historical audit. No credentials are stored in source.
 
 ## Stages
 
@@ -28,7 +31,7 @@ configuration and real Session data are excluded. Git commits use repository-loc
 | P0 | Cancellation-safe RPC framing; bounded deferred admission | Verified, see below |
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
-| P3 | Manual acceptance, startup/request compaction, one overflow recovery | Pending |
+| P3 | Manual acceptance, startup/request compaction, one overflow recovery | P3a verified; P3b automatic/overflow pending |
 | P4 | Bounded Workspace files/read/search/status | Pending |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
@@ -37,6 +40,40 @@ configuration and real Session data are excluded. Git commits use repository-loc
 Each stage is a vertical implementation/API/RPC/test slice, reviewed before
 commit. Shared protocols are developed serially. DTOs are introduced alongside
 their first real consumer, not as an unused framework.
+
+## P3a Verification
+
+P3a keeps the complete `history.jsonl` and the Session/Store model unchanged.
+At loop admission, only a validated `CompactionState` snapshot can project its
+covered prefix away from the Runtime `LoopRequest.history`; the summary is
+injected once as labeled user historical data. The uncovered suffix, current
+User input, accepted Steers, and complete tool pairs remain intact. Runtime item
+and byte limits are checked against the projected history, and an absent or
+invalid summary leaves an over-limit request as `history_too_large` rather than
+silently slicing it.
+
+The projected suffix and summary are bound to the active loop and reused when
+`session.update` changes the model at a request boundary, preventing a second
+slice. `session.context` responds while manual compaction is busy and reports
+operation state, validated coverage, the latest in-process manual result, and a
+conservative projected-history budget. Its history estimate is only the Runtime
+`LoopRequest.history` suffix; full prepared-request context is explicitly
+unknown in P3a. The scan is bounded and returns unknown rather than blocking on
+an unbounded history. Manual utility accounting reports observed calls,
+`complete`, and known usage fields only; missing evidence never becomes zero.
+Focused tests cover over-limit startup, reopen, unchanged history, no double
+slice, same-loop model updates, busy context, bounded context estimation,
+multiple utility calls, duplicate usage, missing usage, cancellation, and write
+failure. Utility result accounting carries observed call attempts, a `complete`
+flag, and known usage from completed calls only. A failed stream's own usage
+is currently treated as unknown; no value is filled with zero.
+
+Parent-run remote Linux stable/MSRV suites each passed 451 tests, with 2 Live
+tests ignored. Strict Clippy, rustdoc and fmt checks passed. Logs are
+`/root/minicore-agent-0914/logs/p3a-{tests,msrv,clippy,doc}.log` on the builder.
+Cross-platform checks will be repeated after P3b; P2's checks remain separate.
+P3a does not add automatic threshold compaction, current-tool ephemeral
+summaries, provider overflow recovery, or TUI `/compact`.
 
 ## P0 Verification
 

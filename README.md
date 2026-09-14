@@ -36,8 +36,8 @@ exclusively through the stdio JSON-RPC interface (see
 [docs/rpc.md](docs/rpc.md)); it does not call the Rust library API directly.
 This repository does not ship a real TUI, plugin system, MCP integration,
 automatic compaction, or upstream overflow recovery. Its bounded manual
-compaction implementation is an unaccepted source draft, not part of the installed
-Agent. It also includes a native, stateless `subagent` Tool for explicitly
+compaction and startup-projection implementation is remotely verified on the
+development branch, but is not part of a new installed Agent release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
 Profile `system_prompt` keeps its existing inline string form and also accepts
@@ -149,6 +149,7 @@ agent.ping             agent.reload             agent.shutdown
 profile.list           model.list
 session.list           session.create         session.open
 session.close          session.delete         session.state
+session.context
 session.compact        session.compact.cancel
 session.update         session.rename        session.history
 session.presentation
@@ -172,13 +173,29 @@ have changed disk while leaving the old in-memory projection unpublished, so
 clients must reread before retrying.
 
 The R1 manual-compaction draft is committed as source checkpoint `5397a65`,
-following ordinary worker lifecycle checkpoint `1771898`, but remains unaccepted
-and uninstalled. The user authorized these grouped commits and their push;
-implementation and build acceptance remain paused following a source-only
-execution violation and unauthorized private-data copies to the builder. See the
-[execution audit](docs/verification/compaction-manual-audit.md).
-The [foundation verification](docs/verification/compaction.md) remains separate;
-there is no new release, installation or native-artifact acceptance.
+following ordinary worker lifecycle checkpoint `1771898`. The current P3a slice
+has parent-owned remote acceptance (see [progress](docs/0914-progress.md)), but
+no new installation. It projects a validated summary and
+its complete history suffix into the next Runtime `LoopRequest`; it also exposes
+`session.context` and reports manual utility usage separately from ordinary turn
+usage. Automatic/overflow compaction and
+the TUI command remain pending; no automatic behavior is implied here. The
+[execution audit](docs/verification/compaction-manual-audit.md) remains
+historical evidence, not an acceptance gate. The
+[foundation verification](docs/verification/compaction.md) remains separate;
+there is no new release,
+installation or native-artifact acceptance.
+
+`session.context` is a read-only Session-owned projection of the current manual
+compaction operation, validated-summary coverage, recent manual result, and the
+estimated Runtime history budget. Its `estimated_history_*` fields cover only
+the projected history suffix (or full history when no valid summary is loaded),
+not the summary, system/AGENTS text, tools, current input, or exact provider
+tokenization. `estimated_request_context_tokens` is `null` in P3a. A manual
+result with `utility_usage.complete: false` carries incomplete accounting; its
+nested `usage` contains completed-call usage only and may be `null`. Usage
+emitted by a stream that later fails is not currently retained. It is never a
+zero-filled copy of the main turn usage.
 
 `session.presentation` is a read-only footer/tool-card projection. It returns
 the configured Session model label, a fixed-argument Git branch lookup, the
@@ -262,9 +279,10 @@ The crate exposes `AgentConfig`, `AgentError`, `LoopOverrides`, `Profile`,
 session/turn DTOs (`CreateSession`, `RenameSession`, `UpdateSession`, `SendMessage`,
 `SteerMessage`, `AnswerInteraction`, `GetHistory`, `HistoryPage`,
 `SessionState`, `SessionStatus`, `SessionUpdateResult`, `CompactSession`,
-`CompactionResult`, `CompactionStatus`, `CompactionPhase`, `CompactionProgress`,
-`TurnRef`, `TurnResult`, `TurnPersistence`, `PresentationView`, `ToolDisplay`,
-and `AssistantDisplayPart`), the single-consumer `AgentEventStream`, `AgentEvent`,
+`CompactionResult`, `CompactionUtilityUsage`, `CompactionStatus`,
+`CompactionPhase`, `CompactionProgress`, `SessionContext`, `SummaryCoverage`, `ContextBudget`, `TurnRef`, `TurnResult`,
+`TurnPersistence`, `PresentationView`, `ToolDisplay`, and
+`AssistantDisplayPart`), the single-consumer `AgentEventStream`, `AgentEvent`,
 and `run_stdio`. The crate is `#![forbid(unsafe_code)]`.
 
 `Agent` opens the local Store and manages multiple loaded Sessions. `Agent`

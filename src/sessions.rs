@@ -14,16 +14,19 @@ use tokio_util::sync::CancellationToken;
 use minicore_runtime::execution::{ConfigRevision, ExecutionConfig, UserInput};
 use minicore_runtime::history::HistoryItem;
 use minicore_runtime::interaction::InteractionAnswer;
-use minicore_runtime::model::{Model, ModelDescriptor};
+use minicore_runtime::model::{AssistantPart, Model, ModelDescriptor};
 use minicore_runtime::tools::{ToolName, ToolSpec};
+use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
-    AgentLoop, AnswerError, LoopHandle, LoopOptions, LoopReport, SteerError, UpdateError,
+    AgentLoop, AnswerError, LoopHandle, LoopOptions, LoopReport, LoopRequest, SteerError,
+    UpdateError,
 };
 use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
 use crate::compaction::{
-    CompactionInput, CompactionResult, CompactionState, CompactionStatus, generate_summary,
+    CompactionInput, CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage,
+    generate_summary,
 };
 use crate::config::map_loop_start_error;
 use crate::error::{AgentError, StoreError};
@@ -33,6 +36,8 @@ use crate::event::{
 };
 use crate::history::{GetHistory, HistoryPage, page_history, sanitize_history};
 use crate::ids::SessionId;
+use crate::presentation::SteerReceiptPrompt;
+use crate::prompt::ProjectPromptProvider;
 use crate::store::{
     Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError,
     SummaryCommit, utc_timestamp,
@@ -216,6 +221,45 @@ pub struct CompactionProgress {
     pub retained_item_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SummaryCoverage {
+    pub covered_loop_count: u64,
+    pub covered_item_count: usize,
+    pub retained_item_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ContextBudget {
+    /// Exact item count of the history passed to Runtime as `LoopRequest.history`.
+    /// It excludes the summary, system/AGENTS text, tool schemas, and current
+    /// User/Steer input.
+    pub estimated_history_items: usize,
+    /// Bounded estimate of that Runtime history input (the projected suffix,
+    /// or full history without a valid summary). `None` means the context
+    /// query stopped at its scan budget.
+    pub estimated_history_bytes: Option<usize>,
+    /// `estimated_history_bytes / 4`; this is not a full request-context token
+    /// estimate and does not represent provider-reported usage.
+    pub estimated_history_tokens: Option<u64>,
+    /// Reserved for the full prepared request estimate. P3a does not calculate
+    /// system, summary, tool-schema, framing, or current-input costs.
+    pub estimated_request_context_tokens: Option<u64>,
+    pub max_history_items: usize,
+    pub max_history_bytes: usize,
+    /// `None` means the byte estimate was not available; it never guesses that
+    /// an unscanned history is within the Runtime limits.
+    pub within_runtime_limits: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionContext {
+    pub session_id: SessionId,
+    pub current_operation: Option<CompactionProgress>,
+    pub coverage: SummaryCoverage,
+    pub last_result: Option<CompactionResult>,
+    pub budget: ContextBudget,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionState {
     pub session_id: SessionId,
@@ -326,6 +370,7 @@ struct SessionInner {
     closing: bool,
     compaction: Option<Arc<CompactionOperation>>,
     compaction_progress: Option<CompactionProgress>,
+    last_compaction_result: Option<CompactionResult>,
     // Operation IDs stay reserved for this loaded Session so stale cancel
     // requests cannot target a later operation with the same identity.
     used_compaction_ids: BTreeSet<String>,
@@ -336,6 +381,13 @@ struct ActiveLoop {
     handle: LoopHandle,
     completion: watch::Receiver<Option<TurnCompletion>>,
     task: Option<Arc<SessionTask>>,
+    execution_summary: Option<BoundedText>,
+}
+
+pub(crate) struct ExecutionInput {
+    pub(crate) request: LoopRequest,
+    pub(crate) options: LoopOptions,
+    pub(crate) summary: Option<BoundedText>,
 }
 
 /// Owns one Agent worker without taking its JoinHandle into a local across an
@@ -455,7 +507,11 @@ impl CompactionOperation {
         self.state.load(Ordering::Acquire) == COMPACTION_COMMITTING
     }
 
-    fn failed_result(&self, failure_kind: &'static str) -> CompactionResult {
+    fn failed_result(
+        &self,
+        failure_kind: &'static str,
+        utility_usage: Option<CompactionUtilityUsage>,
+    ) -> CompactionResult {
         CompactionResult {
             operation_id: self.operation_id.clone(),
             status: CompactionStatus::Failed,
@@ -464,6 +520,7 @@ impl CompactionOperation {
             covered_loop_count: 0,
             covered_item_count: 0,
             retained_item_count: 0,
+            utility_usage,
             failure_kind: Some(failure_kind.to_owned()),
         }
     }
@@ -477,11 +534,12 @@ impl CompactionOperation {
             covered_loop_count: 0,
             covered_item_count: 0,
             retained_item_count: 0,
+            utility_usage: None,
             failure_kind: Some("write_outcome_unknown".to_owned()),
         }
     }
 
-    fn publish(&self, result: CompactionResult) {
+    fn publish(&self, result: CompactionResult) -> CompactionResult {
         let result = match self.state.compare_exchange(
             COMPACTION_RUNNING,
             COMPACTION_COMPLETED,
@@ -491,7 +549,7 @@ impl CompactionOperation {
             Ok(_) => result,
             Err(COMPACTION_CANCELLED) => {
                 self.state.store(COMPACTION_COMPLETED, Ordering::Release);
-                self.failed_result("cancelled")
+                self.failed_result("cancelled", result.utility_usage.clone())
             }
             Err(COMPACTION_COMMITTING) => {
                 self.state.store(COMPACTION_COMPLETED, Ordering::Release);
@@ -500,7 +558,8 @@ impl CompactionOperation {
             Err(COMPACTION_COMPLETED) => result,
             Err(_) => result,
         };
-        self.result.send_replace(Some(result));
+        self.result.send_replace(Some(result.clone()));
+        result
     }
 
     async fn join(&self) -> Result<(), AgentError> {
@@ -541,9 +600,9 @@ impl Drop for CompactionCompletionGuard {
         let result = if self.operation.commit_started() {
             self.operation.unknown_write_result()
         } else if self.operation.cancellation_requested() {
-            self.operation.failed_result("cancelled")
+            self.operation.failed_result("cancelled", None)
         } else {
-            self.operation.failed_result("internal")
+            self.operation.failed_result("internal", None)
         };
         self.session
             .publish_compaction_result(&self.operation, result);
@@ -632,6 +691,7 @@ impl Session {
             closing: false,
             compaction: None,
             compaction_progress: None,
+            last_compaction_result: None,
             used_compaction_ids: BTreeSet::new(),
         };
         Self {
@@ -722,11 +782,69 @@ impl Session {
         }
     }
 
-    /// Starts a new `AgentLoop` for one user message. A session runs at most
-    /// one active loop; no queueing or auto-cancellation.
-    pub(crate) async fn start_loop(&self, input: UserInput) -> Result<LoopAccepted, AgentError> {
-        self.cleanup_finished().await?;
-        let (history, config, options) = {
+    pub(crate) fn context(&self) -> SessionContext {
+        let inner = self.shared.inner.lock().unwrap();
+        let (covered_loop_count, covered_item_count) =
+            self.shared.compaction.coverage().unwrap_or((0, 0));
+        let retained_item_count = inner.history.len().saturating_sub(covered_item_count);
+        let projection = self.shared.compaction.project(&inner.history);
+        let projected_history = projection
+            .as_ref()
+            .map_or(&inner.history[..], |projection| projection.suffix);
+        let estimated_history_items = projected_history.len();
+        let estimated_history_bytes =
+            estimate_history_bytes_for_context(projected_history, &inner.options.limits);
+        let within_runtime_limits =
+            if estimated_history_items > inner.options.limits.max_history_items {
+                Some(false)
+            } else {
+                estimated_history_bytes.map(|bytes| bytes <= inner.options.limits.max_history_bytes)
+            };
+        SessionContext {
+            session_id: inner.record.session_id,
+            current_operation: inner.compaction_progress.clone(),
+            coverage: SummaryCoverage {
+                covered_loop_count,
+                covered_item_count,
+                retained_item_count,
+            },
+            last_result: inner.last_compaction_result.clone(),
+            budget: ContextBudget {
+                estimated_history_items,
+                estimated_history_tokens: estimated_history_bytes.map(bytes_to_tokens),
+                estimated_history_bytes,
+                estimated_request_context_tokens: None,
+                max_history_items: inner.options.limits.max_history_items,
+                max_history_bytes: inner.options.limits.max_history_bytes,
+                within_runtime_limits,
+            },
+        }
+    }
+
+    fn bind_execution_config(
+        &self,
+        config: ExecutionConfig,
+        summary: Option<BoundedText>,
+        system_prompt: String,
+    ) -> Result<ExecutionConfig, AgentError> {
+        let Some(summary) = summary else {
+            return Ok(config);
+        };
+        let prompt = ProjectPromptProvider::new_bound(self.workspace(), system_prompt, summary)
+            .map_err(|_| AgentError::InvalidSessionSettings)?;
+        let prompt = SteerReceiptPrompt::new(Arc::new(prompt), self.presentation());
+        ExecutionConfig::new(
+            Arc::clone(config.model()),
+            config.reasoning(),
+            config.tools().clone(),
+            config.policy().cloned(),
+            prompt,
+        )
+        .map_err(|_| AgentError::InvalidSessionSettings)
+    }
+
+    pub(crate) fn execution_input(&self, input: UserInput) -> Result<ExecutionInput, AgentError> {
+        let (history, config, options, system_prompt) = {
             let inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
@@ -738,10 +856,31 @@ impl Session {
                 Arc::clone(&inner.history),
                 inner.config.clone(),
                 inner.options.clone(),
+                inner.record.system_prompt.clone(),
             )
         };
-        let request = minicore_runtime::LoopRequest::new(history, input, config);
-        let mut agent_loop = AgentLoop::start(request, options).map_err(map_loop_start_error)?;
+        let (history, summary) = match self.shared.compaction.project(&history) {
+            Some(projection) => (projection.suffix.to_vec().into(), Some(projection.summary)),
+            None => (history, None),
+        };
+        if !history_fits_runtime_limits(&history, &options.limits) {
+            return Err(AgentError::HistoryTooLarge);
+        }
+        let config = self.bind_execution_config(config, summary.clone(), system_prompt)?;
+        Ok(ExecutionInput {
+            request: LoopRequest::new(history, input, config),
+            options,
+            summary,
+        })
+    }
+
+    /// Starts a new `AgentLoop` for one user message. A session runs at most
+    /// one active loop; no queueing or auto-cancellation.
+    pub(crate) async fn start_loop(&self, input: UserInput) -> Result<LoopAccepted, AgentError> {
+        self.cleanup_finished().await?;
+        let execution = self.execution_input(input)?;
+        let mut agent_loop =
+            AgentLoop::start(execution.request, execution.options).map_err(map_loop_start_error)?;
         let handle = agent_loop.handle();
         let turn = TurnRef {
             session_id: self.session_id(),
@@ -769,6 +908,7 @@ impl Session {
                 handle: handle.clone(),
                 completion: completion_rx,
                 task: None,
+                execution_summary: execution.summary,
             });
             inner
                 .presentation
@@ -1012,7 +1152,8 @@ impl Session {
                 .as_ref()
                 .is_some_and(|candidate| std::ptr::eq(candidate.as_ref(), operation));
             let should_emit = should_clear && inner.compaction_progress.take().is_some();
-            operation.publish(result);
+            let result = operation.publish(result);
+            inner.last_compaction_result = Some(result);
             should_emit
         };
         if should_emit {
@@ -1192,7 +1333,7 @@ impl Session {
         config: ExecutionConfig,
     ) -> Result<Option<ConfigRevision>, AgentError> {
         let _io = self.shared.io.lock().await;
-        {
+        let active_summary = {
             let inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
@@ -1200,7 +1341,13 @@ impl Session {
             if inner.closing || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
             }
-        }
+            inner
+                .active
+                .as_ref()
+                .and_then(|active| active.execution_summary.clone())
+        };
+        let config =
+            self.bind_execution_config(config, active_summary, record.system_prompt.clone())?;
         self.shared
             .store
             .write_record(&record)
@@ -1403,9 +1550,11 @@ impl Session {
                     !inner.closing && current && Arc::ptr_eq(&inner.history, &expected_history)
                 };
                 if publish {
-                    self.shared
-                        .compaction
-                        .publish(summary.clone(), expected_history.len());
+                    self.shared.compaction.publish(
+                        summary.clone(),
+                        source.covered_loop_count,
+                        expected_history.len(),
+                    );
                 }
                 Ok(CompactionCommit::Store(SummaryCommit::Committed))
             }
@@ -1419,6 +1568,79 @@ impl Session {
             SummaryCommit::Unknown => Ok(CompactionCommit::Store(SummaryCommit::Unknown)),
         }
     }
+}
+
+fn history_fits_runtime_limits(
+    history: &[HistoryItem],
+    limits: &minicore_runtime::LoopLimits,
+) -> bool {
+    history.len() <= limits.max_history_items
+        && estimate_history_bytes(history) <= limits.max_history_bytes
+}
+
+/// Mirrors `minicore_runtime::history::estimate_history_bytes` at the pinned
+/// Runtime revision `6cd2bdbc634437dea925495c61c7eb0be10ba171`. This narrow
+/// copy is only for the pre-start `LoopRequest.history` admission check; it is
+/// not a full prompt or provider-context estimate. The over-item and over-byte
+/// startup tests are the contract boundary for keeping this copy aligned.
+pub(crate) fn estimate_history_bytes(history: &[HistoryItem]) -> usize {
+    history.iter().map(estimate_history_item_bytes).sum()
+}
+
+/// Produces a bounded context-query estimate. The item count is checked before
+/// scanning, and byte accumulation stops once the Runtime byte limit is known
+/// to be exceeded, so `session.context` never scans an unbounded history.
+fn estimate_history_bytes_for_context(
+    history: &[HistoryItem],
+    limits: &minicore_runtime::LoopLimits,
+) -> Option<usize> {
+    if history.len() > limits.max_history_items {
+        return None;
+    }
+    let mut total = 0usize;
+    for item in history {
+        total = total.saturating_add(estimate_history_item_bytes(item));
+        if total > limits.max_history_bytes {
+            return Some(total);
+        }
+    }
+    Some(total)
+}
+
+fn estimate_history_item_bytes(item: &HistoryItem) -> usize {
+    match item {
+        HistoryItem::User(user) => user.input.as_text().len(),
+        HistoryItem::Assistant(assistant) => assistant
+            .content
+            .iter()
+            .map(estimate_assistant_part_bytes)
+            .sum(),
+        HistoryItem::ToolResult(result) => {
+            result.call_id.as_str().len()
+                + result.tool_name.as_str().len()
+                + result.output.content().as_str().len()
+        }
+        HistoryItem::Summary(summary) => summary.content.as_str().len(),
+    }
+}
+
+fn estimate_assistant_part_bytes(part: &AssistantPart) -> usize {
+    match part {
+        AssistantPart::Text(text) => text.len(),
+        AssistantPart::Reasoning(reasoning) => reasoning
+            .text()
+            .map_or(0, str::len)
+            .saturating_add(reasoning.summary().map_or(0, str::len))
+            .saturating_add(reasoning.encrypted().map_or(0, str::len))
+            .saturating_add(reasoning.signature().map_or(0, str::len)),
+        AssistantPart::ToolCall(call) => {
+            call.name().as_str().len() + call.arguments().to_string().len()
+        }
+    }
+}
+
+fn bytes_to_tokens(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(4)
 }
 
 enum CompactionCommit {
@@ -1458,6 +1680,7 @@ async fn run_compaction_inner(
             covered_loop_count: 0,
             covered_item_count: reservation.previous_covered_item_count,
             retained_item_count: 0,
+            utility_usage: None,
             failure_kind: None,
         };
     }
@@ -1544,14 +1767,29 @@ async fn run_compaction_inner(
     {
         Ok(generated) => generated,
         Err(error) => {
-            return failed_compaction(&reservation.operation, error.kind(), history_len);
+            return failed_compaction_with_usage(
+                &reservation.operation,
+                error.error.kind(),
+                history_len,
+                error.utility_usage,
+            );
         }
     };
     if reservation.operation.cancellation_requested() {
-        return failed_compaction(&reservation.operation, "cancelled", history_len);
+        return failed_compaction_with_usage(
+            &reservation.operation,
+            "cancelled",
+            history_len,
+            generated.utility_usage.clone(),
+        );
     }
     if Instant::now() >= reservation.deadline {
-        return failed_compaction(&reservation.operation, "timeout", history_len);
+        return failed_compaction_with_usage(
+            &reservation.operation,
+            "timeout",
+            history_len,
+            generated.utility_usage.clone(),
+        );
     }
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Committing);
     let Some(bytes) = crate::compaction::encode_snapshot(
@@ -1560,14 +1798,26 @@ async fn run_compaction_inner(
         &source,
         &generated.content,
     ) else {
-        return failed_compaction(&reservation.operation, "too_large", history_len);
+        return failed_compaction_with_usage(
+            &reservation.operation,
+            "too_large",
+            history_len,
+            generated.utility_usage.clone(),
+        );
     };
     let commit = match session
         .commit_compaction(reservation, &source, &bytes, &generated.content)
         .await
     {
         Ok(commit) => commit,
-        Err(_) => return failed_compaction(&reservation.operation, "store", history_len),
+        Err(_) => {
+            return failed_compaction_with_usage(
+                &reservation.operation,
+                "store",
+                history_len,
+                generated.utility_usage.clone(),
+            );
+        }
     };
     match commit {
         CompactionCommit::Store(SummaryCommit::Committed) => CompactionResult {
@@ -1578,16 +1828,28 @@ async fn run_compaction_inner(
             covered_loop_count: source.covered_loop_count,
             covered_item_count: history_len,
             retained_item_count: 0,
+            utility_usage: generated.utility_usage,
             failure_kind: None,
         },
-        CompactionCommit::Cancelled => {
-            failed_compaction(&reservation.operation, "cancelled", history_len)
-        }
-        CompactionCommit::Deadline => {
-            failed_compaction(&reservation.operation, "timeout", history_len)
-        }
+        CompactionCommit::Cancelled => failed_compaction_with_usage(
+            &reservation.operation,
+            "cancelled",
+            history_len,
+            generated.utility_usage.clone(),
+        ),
+        CompactionCommit::Deadline => failed_compaction_with_usage(
+            &reservation.operation,
+            "timeout",
+            history_len,
+            generated.utility_usage.clone(),
+        ),
         CompactionCommit::Rejected | CompactionCommit::Store(SummaryCommit::Rejected) => {
-            failed_compaction(&reservation.operation, "history_changed", history_len)
+            failed_compaction_with_usage(
+                &reservation.operation,
+                "history_changed",
+                history_len,
+                generated.utility_usage.clone(),
+            )
         }
         CompactionCommit::Store(SummaryCommit::Unknown) => CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
@@ -1597,6 +1859,7 @@ async fn run_compaction_inner(
             covered_loop_count: source.covered_loop_count,
             covered_item_count: reservation.previous_covered_item_count,
             retained_item_count,
+            utility_usage: generated.utility_usage,
             failure_kind: Some("write_outcome_unknown".to_owned()),
         },
     }
@@ -1607,6 +1870,15 @@ fn failed_compaction(
     failure_kind: &'static str,
     history_len: usize,
 ) -> CompactionResult {
+    failed_compaction_with_usage(operation, failure_kind, history_len, None)
+}
+
+fn failed_compaction_with_usage(
+    operation: &CompactionOperation,
+    failure_kind: &'static str,
+    history_len: usize,
+    utility_usage: Option<CompactionUtilityUsage>,
+) -> CompactionResult {
     CompactionResult {
         operation_id: operation.operation_id.clone(),
         status: CompactionStatus::Failed,
@@ -1615,6 +1887,7 @@ fn failed_compaction(
         covered_loop_count: 0,
         covered_item_count: 0,
         retained_item_count: history_len,
+        utility_usage,
         failure_kind: Some(failure_kind.to_owned()),
     }
 }
