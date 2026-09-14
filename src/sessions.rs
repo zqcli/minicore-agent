@@ -395,6 +395,57 @@ pub(crate) struct ReadSnapshot {
     pub(crate) user_times: HashMap<(LoopId, usize), String>,
 }
 
+/// Owned `workspace.status` workers run at most this many at a time.
+pub(crate) const MAX_STATUS_QUERY_WORKERS: usize = 4;
+
+/// The Session owns `workspace.status` worker tasks. Each worker keeps its git
+/// child until the child is stopped and reaped, so closing the Session joins
+/// this set instead of relying on the child's drop behaviour.
+struct StatusWorkers {
+    /// Set once the Session starts closing: no new worker may register.
+    closing: bool,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl StatusWorkers {
+    fn new() -> Self {
+        Self {
+            closing: false,
+            workers: Vec::new(),
+        }
+    }
+
+    /// Drops the handles of workers that already finished and reaped.
+    fn reap_finished(&mut self) {
+        self.workers.retain(|handle| !handle.is_finished());
+    }
+}
+
+/// One owned `workspace.status` query. Awaiting it observes the worker's
+/// result only; dropping it stops that query's child through the child token,
+/// never through the Session token, so other queries keep running.
+pub(crate) struct StatusQuery {
+    receiver: tokio::sync::oneshot::Receiver<Result<crate::WorkspaceStatusResult, AgentError>>,
+    child_cancel: CancellationToken,
+}
+
+impl StatusQuery {
+    pub(crate) async fn wait(mut self) -> Result<crate::WorkspaceStatusResult, AgentError> {
+        match (&mut self.receiver).await {
+            Ok(result) => result,
+            // The worker ended without publishing a result, so nothing was
+            // observed; the failure stays inside the query boundary.
+            Err(_) => Err(AgentError::Internal),
+        }
+    }
+}
+
+impl Drop for StatusQuery {
+    fn drop(&mut self) {
+        self.child_cancel.cancel();
+    }
+}
+
 struct SessionShared {
     /// Short critical sections; never holds across an await, I/O, or join.
     inner: Mutex<SessionInner>,
@@ -403,6 +454,9 @@ struct SessionShared {
     /// Cancelled when the loaded Session is closed or dropped. In-flight
     /// workspace queries owned by this Session observe it and stop.
     close: CancellationToken,
+    /// Owned `workspace.status` workers; the `close` token stops their children
+    /// and this set is joined by the shutdown barrier.
+    status_workers: Mutex<StatusWorkers>,
     store: Store,
     events: AgentEventSink,
     subagents: Arc<SubagentService>,
@@ -925,6 +979,7 @@ impl Session {
                 inner: Mutex::new(inner),
                 io: tokio::sync::Mutex::new(()),
                 close: CancellationToken::new(),
+                status_workers: Mutex::new(StatusWorkers::new()),
                 store,
                 events,
                 subagents,
@@ -952,6 +1007,76 @@ impl Session {
     /// Session's Workspace. It fires when the Session is closed or dropped.
     pub(crate) fn query_cancellation(&self) -> CancellationToken {
         self.shared.close.clone()
+    }
+
+    /// Starts one owned `workspace.status` query. Registration and the capacity
+    /// check happen under the worker lock, so a Session that starts closing
+    /// either observes this worker or refuses it here. The worker captures only
+    /// the workspace, the request, the observed tokens, and the result sender;
+    /// it never holds the Session.
+    pub(crate) fn spawn_status_query(
+        &self,
+        workspace: Arc<Workspace>,
+        request: crate::WorkspaceStatusRequest,
+        shutdown_cancellation: CancellationToken,
+    ) -> Result<StatusQuery, AgentError> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let child_cancel = CancellationToken::new();
+        let session_cancellation = self.shared.close.clone();
+        let worker_child_cancel = child_cancel.clone();
+        let mut workers = self.shared.status_workers.lock().unwrap();
+        workers.reap_finished();
+        // The token is checked under the same lock as the closing flag, so a
+        // registration cannot slip between the flag and the cancellation.
+        if workers.closing
+            || session_cancellation.is_cancelled()
+            || workers.workers.len() >= MAX_STATUS_QUERY_WORKERS
+        {
+            return Err(AgentError::QueryLimit);
+        }
+        let handle = tokio::spawn(async move {
+            let result = crate::workspace::status::status(
+                &workspace,
+                &request,
+                &session_cancellation,
+                &shutdown_cancellation,
+                &worker_child_cancel,
+            )
+            .await;
+            let _ = sender.send(result);
+        });
+        workers.workers.push(handle);
+        Ok(StatusQuery {
+            receiver,
+            child_cancel,
+        })
+    }
+
+    /// Refuses new status workers and waits until every owned worker has
+    /// stopped and reaped its child.
+    async fn join_status_workers(&self) {
+        let workers = {
+            let mut workers = self.shared.status_workers.lock().unwrap();
+            workers.closing = true;
+            std::mem::take(&mut workers.workers)
+        };
+        for handle in workers {
+            let _ = handle.await;
+        }
+    }
+
+    /// Test-only evidence that no owned status worker is still running, used by
+    /// the process-level Unix tests.
+    #[cfg(all(test, unix))]
+    pub(crate) fn active_status_workers(&self) -> usize {
+        self.shared
+            .status_workers
+            .lock()
+            .unwrap()
+            .workers
+            .iter()
+            .filter(|handle| !handle.is_finished())
+            .count()
     }
 
     /// Stops in-flight workspace queries owned by this loaded Session.
@@ -2283,6 +2408,11 @@ impl Session {
     /// drains any child workers owned by this Session.
     pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
         let session_id = self.session_id();
+        // Every Session-owned query observes this token, so it is cancelled here
+        // with the other owners; the workers are joined further down, after
+        // every owner has been told to stop, so slow status cleanup can never
+        // delay cancelling the active loop, admission, or compaction.
+        self.shared.close.cancel();
         let (active_handle, active_task, compaction, admission) = {
             let mut inner = self.shared.inner.lock().unwrap();
             let active_handle = inner.active.as_ref().map(|active| active.handle.clone());
@@ -2339,6 +2469,7 @@ impl Session {
                 inner.compaction_progress = None;
             }
         }
+        self.join_status_workers().await;
         self.shared.subagents.drain_session(session_id).await;
         first_error.map_or(Ok(()), Err)
     }

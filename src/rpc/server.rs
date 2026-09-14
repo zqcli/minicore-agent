@@ -21,6 +21,7 @@ use crate::sessions::{
 use crate::workspace::listing::WorkspaceFilesRequest;
 use crate::workspace::query::{WORKSPACE_READ_DEADLINE, WorkspaceReadRequest};
 use crate::workspace::search::WorkspaceSearchRequest;
+use crate::workspace::status::WorkspaceStatusRequest;
 
 use super::protocol::{
     AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, EmptyParams,
@@ -564,6 +565,41 @@ impl RpcServer {
                     )
                     .await
                     {
+                        Ok(result) => success(&id, result),
+                        Err(error) => query_error(id, &error),
+                    };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
+            }
+            "workspace.status" => {
+                let request: WorkspaceStatusRequest = match params_or_error(&id, params) {
+                    Ok(request) => request,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                let Some(session) = self.agent().loaded_session(request.session_id) else {
+                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                };
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let workspace = session.workspace();
+                // The owned worker is registered on the Session, so closing the
+                // Session joins it even when this dispatcher is dropped.
+                let cancellation = self.query_cancellation.clone();
+                let query = match session.spawn_status_query(workspace, request, cancellation) {
+                    Ok(query) => query,
+                    Err(error) => return Dispatch::Response(query_error(id, &error)),
+                };
+                drop(session);
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    // The awaiter only observes the owned worker's result; the
+                    // worker owns its git child and enforces its own deadline.
+                    let response = match query.wait().await {
                         Ok(result) => success(&id, result),
                         Err(error) => query_error(id, &error),
                     };
@@ -1128,6 +1164,7 @@ fn canonical_method(method: &str) -> &'static str {
         "workspace.read" => "workspace.read",
         "workspace.files" => "workspace.files",
         "workspace.search" => "workspace.search",
+        "workspace.status" => "workspace.status",
         "tool.read" => "tool.read",
         "tool.output" => "tool.output",
         "turn.send" => "turn.send",

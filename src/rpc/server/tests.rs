@@ -638,6 +638,7 @@ async fn capability_discovery_returns_ordered_lists() {
             "workspace.read",
             "workspace.files",
             "workspace.search",
+            "workspace.status",
             "deferred.waiter_limit"
         ])
     );
@@ -6026,6 +6027,146 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     assert_eq!(paths.len(), MAX_DEFERRED_QUERIES);
     assert!(paths.contains(&"cap-0.txt"));
     assert!(!paths.contains(&"cap-fresh.txt"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn workspace_status_answers_for_the_session_workspace() {
+    let (agent, base, workspace) =
+        test_agent("workspace-status", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("status"),
+            "workspace.status",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    let status = harness.response(json!("status")).await;
+    // A temporary directory outside any repository is answered conservatively:
+    // git refused to resolve a work tree, so the observation stays incomplete
+    // instead of claiming a definite missing repository.
+    assert_eq!(status["result"]["repo_available"], json!(false));
+    assert_eq!(status["result"]["complete"], json!(false));
+    assert_eq!(status["result"]["head_oid"], json!(null));
+    assert_eq!(status["result"]["branch"], json!(null));
+    assert_eq!(status["result"]["detached"], json!(false));
+    assert_eq!(status["result"]["entries"], json!([]));
+    assert_eq!(status["result"]["warnings"], json!(["status_failed"]));
+    assert_eq!(status["result"]["consistency"], json!("live"));
+    assert!(status["result"]["observed_at_unix_ms"].is_u64());
+
+    // A status query is an observation: it appends nothing to history and
+    // never starts a model call.
+    harness
+        .send(
+            json!("history"),
+            "session.history",
+            Some(json!({"session_id": session, "offset": 0, "limit": 10})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("history")).await["result"]["total"],
+        json!(0)
+    );
+
+    harness
+        .send(
+            json!("status-bad"),
+            "workspace.status",
+            Some(json!({"session_id": session, "max_bytes": 16})),
+        )
+        .await;
+    let bad = harness.response(json!("status-bad")).await;
+    assert_eq!(bad["error"]["code"], json!(-32602));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
+    use crate::workspace::status::set_status_program;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (agent, base, workspace) =
+        test_agent("workspace-status-capacity", [], &[], ApprovalMode::Auto).await;
+    let root = std::fs::canonicalize(&workspace).unwrap();
+    let started = base.join("status-started");
+    let script = base.join("slow-git");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\n: > '{}'\nsleep 30\n", started.display()),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(root, script);
+
+    let mut harness = RpcHarness::spawn(agent);
+    let closing = create_and_open(&mut harness, &workspace).await;
+    let surviving = create_and_open(&mut harness, &workspace).await;
+
+    for index in 0..MAX_DEFERRED_QUERIES {
+        harness
+            .send(
+                json!(format!("status-{index}")),
+                "workspace.status",
+                Some(json!({"session_id": closing})),
+            )
+            .await;
+    }
+    for _ in 0..200 {
+        if started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(started.exists(), "no status query started its git child");
+
+    // Every query slot is held, so the pool refuses one more.
+    harness
+        .send(
+            json!("over"),
+            "workspace.files",
+            Some(json!({"session_id": surviving})),
+        )
+        .await;
+    let over = harness.response(json!("over")).await;
+    assert_eq!(over["error"]["code"], json!(-32019));
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": closing})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    // Closing the owning Session cancels the started status queries.
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let response = harness.response(json!(format!("status-{index}"))).await;
+        assert_eq!(response["error"]["code"], json!(-32020));
+    }
+    // The freed slots are usable again by the surviving Session.
+    harness
+        .send(
+            json!("after"),
+            "workspace.files",
+            Some(json!({"session_id": surviving})),
+        )
+        .await;
+    let after = harness.response(json!("after")).await;
+    assert_eq!(after["result"]["stopped_by"], json!("end"));
 
     harness.shutdown().await;
     remove_base(&base).await;

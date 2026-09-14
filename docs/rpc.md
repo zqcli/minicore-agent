@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -71,13 +71,18 @@ be recovered.
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
 requests are dispatched sequentially. `turn.wait`, `session.compact`,
-`session.read`, `workspace.read`, `workspace.files`, `workspace.search`, and
+`session.read`, `workspace.read`, `workspace.files`, `workspace.search`,
+`workspace.status`, and
 `turn.result` are exceptions: the server registers one bounded owned task and
 immediately continues reading requests. A deferred query/waiter does not own
 the underlying Session operation. The two workspace scan queries each own one
 retained blocking worker and join it before their response; a drop guard also
 cancels that worker immediately when the query task itself is dropped, so a
-detached scan stops walking instead of running on.
+detached scan stops walking instead of running on. A `workspace.status` query
+is different again: its owned worker is registered on the loaded Session, which
+runs at most four of them and joins every one of them on close, so a dropped
+waiting task cancels only that query's git child and never detaches a child from
+the Session that owns it.
 
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
@@ -120,6 +125,7 @@ protocol version, and ordered capability names:
     "workspace.read",
     "workspace.files",
     "workspace.search",
+    "workspace.status",
     "deferred.waiter_limit"
   ]
 }
@@ -1259,6 +1265,116 @@ Files are read through the same Workspace boundary as `workspace.read`, in
 bounded chunks that re-check cancellation and the deadline between chunks, lines,
 and matches, so a timeout never discards committed matches and never asks for a
 continuation.
+
+### `workspace.status`
+
+The P4c slice has passed parent-owned remote verification; see
+`0914-progress.md` for the gates and platform limits.
+
+```json
+{"session_id": "ses_...", "max_bytes": 65536}
+```
+
+`max_bytes` is optional and accepts `1024..=262144`, defaulting to 64 KiB; it
+bounds the encoded response, not git output. Only a loaded Session locates its
+Workspace, and closing that Session cancels the query.
+
+```json
+{
+  "repo_available": true,
+  "head_oid": "3f2a91c4d0b7e6153f2a91c4d0b7e6153f2a91c4",
+  "branch": "main",
+  "detached": false,
+  "staged": 1,
+  "unstaged": 1,
+  "untracked": 2,
+  "conflicted": 0,
+  "entries": [
+    {"path": "src/main.rs", "kind": "ordinary",
+     "index_status": "M", "worktree_status": ".", "original_path": null}
+  ],
+  "skipped_paths": 0,
+  "complete": true,
+  "warnings": [],
+  "consistency": "live",
+  "observed_at_unix_ms": 1760000000000
+}
+```
+
+One query runs at most three fixed git commands without a shell:
+`rev-parse --show-toplevel` locates the work tree, `rev-parse
+--is-bare-repository` classifies a workspace without a work tree, and `status
+--porcelain=v2 -z --branch --no-ahead-behind --ignore-submodules=dirty
+--untracked-files=normal` reads it, with `--no-optional-locks` so a status query
+never writes the optional index state, `--literal-pathspecs` so no pathspec is
+interpreted, and fixed `-c` values that disable the file system monitor,
+submodule recursion, and colour, and fix rename detection. Every
+inherited `GIT_*` variable is dropped before the child starts (by name, ASCII
+case-insensitively), and system and user configuration are disabled explicitly
+with `GIT_CONFIG_NOSYSTEM=1` and an empty `GIT_CONFIG_GLOBAL`, so no `GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, `GIT_TRACE*`, `HOME`, or
+`XDG_CONFIG_HOME` value can redirect, instrument, or start an external program
+for the query. Git's standard error is counted and discarded, so no diagnostic
+and no path from it can reach a response or a log; a child that floods it is
+stopped instead of drained without bound. The query never stages, commits,
+fetches, restores, or calls a model.
+
+Submodule internals are outside the coverage of this observation: the status
+command compares the recorded gitlink with the index but never scans a
+submodule's work tree for modifications or untracked files and never recurses
+into it, so a file modified or added inside a submodule is not reported, and no
+monitor or hook configured inside a submodule runs. Commit-level gitlink changes
+are ordinary entries: the comparison uses the commits recorded in the
+superproject, so a gitlink recorded in the index that differs from the committed
+one is reported with its `XY` codes and counted like any other recorded change.
+
+Untracked directories are reported the way git collapses them; ignored entries
+are not requested at all. `entries` is a prefix of the changed paths with git's
+own `XY` codes, and `staged`, `unstaged`, `untracked`, and `conflicted` count
+the whole observation, which may be longer than that list when `max_bytes` cut
+it short. `kind` is `ordinary`, `renamed`, `unmerged`, or `untracked`;
+`original_path` carries the previous name of a rename and is absent when that
+name lies outside the workspace. A rename record whose previous name did not
+arrive is malformed and is never reported as a complete rename.
+
+Some states are ordinary answers rather than errors: `repo_available` is false
+when the workspace is not a work tree for a definite reason (`--is-bare-repository`
+answers for a bare repository or a git directory without a work tree);
+`head_oid` is absent for an unborn `HEAD`; `branch` is absent for a detached
+`HEAD`; conflicts appear as `kind: unmerged` with `conflicted` counted. A
+workspace git cannot read for an unexplained reason (dubious ownership, a
+corrupt configuration, a permission problem, a signal death) is reported as
+`repo_available: false` with `complete: false` and the `status_failed` warning,
+never as a definite missing repository. Session close, RPC shutdown, and
+cancellation fail the query with `-32020` after the owned git process is
+stopped and reaped. The 10 s deadline keeps whatever the query already captured,
+reports `deadline`, and marks the result incomplete. Stopping a child is not a
+latency guess: the owner waits until the operating system reports the exit, so a
+system that never reports it can delay a query or a Session close past the
+deadline, exactly like a blocking filesystem read, and an unconfirmed kill or
+wait is reported as a failed observation. `complete` is true only
+when nothing was cut short or skipped, and `warnings` names each limitation
+with a code (`git_unavailable`, `status_failed`, `output_truncated`,
+`deadline`, `skipped_paths`, `nested_repository`) and never a path. The budget
+reserves room for the widest form of the summary, so a result never exceeds
+`max_bytes` even when a warning is added while entries are appended.
+
+The loaded Session owns each status worker: the worker keeps the git child
+until it is stopped and reaped, the query caller only observes the worker's
+result, and dropping that caller cancels that one child without touching the
+Session. Closing the Session stops its workers and joins them, so no child is
+left behind, and a Session runs at most four status workers at once (a fifth
+query is refused with `-32020`). Both the
+public Agent method and the RPC method go through this same Session-owned path.
+When the workspace is a subdirectory of a larger repository, git is given the
+workspace as a literal pathspec, every reported path is checked against the
+canonical workspace root, and paths outside it are neither counted nor
+returned; that case adds the `nested_repository` warning. A path that is not
+valid UTF-8 or is longer than 4096 bytes is counted in `skipped_paths` and
+makes the result incomplete. Results are live observations with no author
+attribution: changes made before, by other tools, or by other processes look
+the same, and no Turn, history entry, or model call is involved. There is no
+watcher and no cache: every result comes from the query that produced it.
 
 ## Interactions
 

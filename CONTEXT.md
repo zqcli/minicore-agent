@@ -31,7 +31,11 @@ stable/MSRV tests passed, 2 Live ignored, and strict Clippy/fmt/rustdoc plus
 Windows/macOS compile checks passed. P4b `workspace.files` and
 `workspace.search` are also verified: 576 stable/MSRV tests passed, 2 Live
 ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
-Workspace status remains pending.
+P4c `workspace.status` is verified: 613 stable/MSRV tests passed, 2 Live ignored;
+strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed. It provides
+machine-readable, workspace-scoped Git status with isolated configuration and
+Session-owned child reaping. P4 is complete; P5 Bash streams/control, P6 change
+review and P7 integration remain pending.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,

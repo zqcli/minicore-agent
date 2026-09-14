@@ -6931,3 +6931,150 @@ async fn test_openai_loopback_http_overflow_recovery_real_loop() {
 async fn test_openai_loopback_preflight_compresses_over_budget_replay() {
     run_openai_overflow_loopback(true).await;
 }
+
+/// `workspace.status` is owned by the loaded Session: the public Agent path
+/// registers an owned worker for it, dropping the awaiter leaves the worker in
+/// charge of the git child, and closing the Session joins that worker only
+/// after its child was stopped and reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() {
+    use crate::workspace::status::{StatusReapGate, set_status_program, set_status_reap_gate};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (data_dir, _data_guard) = fixture_dir(&format!("status-owner-{}", next_id()));
+    let (workspace, _workspace_guard) =
+        workspace_file("status-owner-ws", "note.txt", b"raw\ncontent\n");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session_id = info.session_id;
+
+    // The public Agent path runs through the Session-owned worker.
+    let plain = agent
+        .workspace_status(crate::WorkspaceStatusRequest {
+            session_id,
+            max_bytes: None,
+        })
+        .await
+        .expect("the public status path answers");
+    assert!(!plain.repo_available);
+    assert!(!plain.complete);
+
+    // A child that reports its own process id and then holds its pipes open.
+    let pid_path = data_dir.join("status-child-pids");
+    let script = data_dir.join("slow-status-git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nsleep 30\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+
+    let session = agent.loaded_session(session_id).unwrap();
+    let spawn = |session: &crate::sessions::Session| {
+        session
+            .spawn_status_query(
+                session.workspace(),
+                crate::WorkspaceStatusRequest {
+                    session_id,
+                    max_bytes: None,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .unwrap()
+    };
+    let first = spawn(&session);
+    let first_pid = wait_for_started_child(&pid_path, 0).await;
+    assert!(
+        process_is_listed(first_pid),
+        "the owned child is not running"
+    );
+    assert_eq!(session.active_status_workers(), 1);
+
+    // The awaiter goes away first: the Session's worker still owns the child
+    // and reaps it, so nothing is left behind by a dropped waiter.
+    drop(first);
+    for _ in 0..200 {
+        if !process_is_listed(first_pid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !process_is_listed(first_pid),
+        "a dropped status awaiter left its owned child unreaped"
+    );
+
+    // Closing the Session is the barrier for a query whose awaiter is still
+    // alive: while the owner still waits for its child, the close cannot return,
+    // and it returns only after that child was actually reaped. The reap gate
+    // parks the owner so both facts are observed without sleeping.
+    let gate = StatusReapGate::new();
+    set_status_reap_gate(
+        std::fs::canonicalize(&workspace).unwrap(),
+        Arc::clone(&gate),
+    );
+    let second = spawn(&session);
+    let second_pid = wait_for_started_child(&pid_path, 1).await;
+    assert!(
+        process_is_listed(second_pid),
+        "the second owned child is not running"
+    );
+
+    let close = agent.close_session(session_id);
+    let mut close = std::pin::pin!(close);
+    // The first poll cancels the Session's queries, including this worker.
+    assert!(futures_util::poll!(&mut close).is_pending());
+    gate.entered().await;
+    assert!(
+        process_is_listed(second_pid),
+        "the child was reaped before its owner was released"
+    );
+    gate.release();
+    close.await.unwrap();
+    assert!(
+        !process_is_listed(second_pid),
+        "the closing Session returned before its owned child was reaped"
+    );
+    assert!(matches!(second.wait().await, Err(AgentError::QueryLimit)));
+}
+
+/// Waits until a fake git child has appended its process id, and returns it.
+#[cfg(unix)]
+async fn wait_for_started_child(pid_path: &Path, index: usize) -> i32 {
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(pid_path) {
+            if let Some(pid) = text.lines().nth(index) {
+                return pid.trim().parse().unwrap();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("the status query never started child {index}");
+}
+
+/// `ps` lists a process that exists, including one that is still a zombie, so
+/// an empty listing is evidence that it was reaped rather than merely signalled.
+#[cfg(unix)]
+fn process_is_listed(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("pid=")
+        .output()
+        .expect("ps runs");
+    !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
