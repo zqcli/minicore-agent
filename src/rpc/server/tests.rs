@@ -37,6 +37,7 @@ use crate::store::{
     SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
     force_unknown_summary_write, gate_next_summary_commit,
 };
+use crate::workspace::query::{WorkspaceReadGate, gate_next_workspace_read};
 
 use super::{
     Frame, MAX_DEFERRED_QUERIES, MAX_DEFERRED_WAITERS, MAX_RPC_LINE_BYTES, RpcServer, read_frame,
@@ -633,6 +634,7 @@ async fn capability_discovery_returns_ordered_lists() {
             "tool.read",
             "tool.output",
             "session.history",
+            "workspace.read",
             "deferred.waiter_limit"
         ])
     );
@@ -5422,6 +5424,298 @@ async fn automatic_startup_accepts_minimum_between_trigger_and_hard_limit() {
     // turn.send promises loop creation, not that the model has started yet.
     // The call count is meaningful only after the turn has completed.
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() {
+    let (agent, base, workspace) = test_agent("workspace-read", [], &[], ApprovalMode::Auto).await;
+    tokio::fs::write(workspace.join("note.txt"), b"hello\nworld\n")
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("ws-read"),
+            "workspace.read",
+            Some(json!({"session_id": session_id, "path": "note.txt"})),
+        )
+        .await;
+    let read = harness.response(json!("ws-read")).await;
+    let result = &read["result"];
+    assert_eq!(result["path"], json!("note.txt"));
+    assert_eq!(result["content"], json!("hello\nworld\n"));
+    assert_eq!(result["start_line"], json!(1));
+    assert_eq!(result["returned_lines"], json!(2));
+    assert_eq!(result["status"], json!("ok"));
+    assert_eq!(result["encoding"], json!("utf8"));
+    assert_eq!(result["revision"].as_str().unwrap().len(), 64);
+    assert_eq!(result["truncated"], json!(false));
+    assert_eq!(result["line_truncated"], json!(false));
+    assert_eq!(result["next_range"], json!(null));
+    assert_eq!(result["file_bytes"], json!(12));
+
+    harness
+        .send(
+            json!("ws-range"),
+            "workspace.read",
+            Some(json!({
+                "session_id": session_id,
+                "path": "note.txt",
+                "start_line": 2,
+                "max_lines": 1,
+            })),
+        )
+        .await;
+    let ranged = harness.response(json!("ws-range")).await;
+    assert_eq!(ranged["result"]["content"], json!("world\n"));
+    assert_eq!(ranged["result"]["start_line"], json!(2));
+
+    harness
+        .send(
+            json!("ws-fresh"),
+            "workspace.read",
+            Some(json!({
+                "session_id": session_id,
+                "path": "note.txt",
+                "if_revision": result["revision"].clone(),
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("ws-fresh")).await["result"]["status"],
+        json!("ok")
+    );
+    harness
+        .send(
+            json!("ws-stale"),
+            "workspace.read",
+            Some(json!({
+                "session_id": session_id,
+                "path": "note.txt",
+                "if_revision": "0".repeat(64),
+            })),
+        )
+        .await;
+    let stale = harness.response(json!("ws-stale")).await;
+    assert_eq!(stale["result"]["status"], json!("changed"));
+    assert_eq!(stale["result"]["content"], json!(""));
+
+    // Only a loaded Session locates its Workspace.
+    let unloaded = SessionId::new().unwrap();
+    harness
+        .send(
+            json!("ws-unloaded"),
+            "workspace.read",
+            Some(json!({"session_id": unloaded, "path": "note.txt"})),
+        )
+        .await;
+    let unloaded = harness.response(json!("ws-unloaded")).await;
+    assert_eq!(unloaded["error"]["code"], json!(-32002));
+    assert_eq!(
+        unloaded["error"]["data"]["kind"],
+        json!("session_not_loaded")
+    );
+
+    harness
+        .send(
+            json!("ws-escape"),
+            "workspace.read",
+            Some(json!({"session_id": session_id, "path": "../note.txt"})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("ws-escape")).await["error"]["code"],
+        json!(-32602)
+    );
+    harness
+        .send(
+            json!("ws-lines"),
+            "workspace.read",
+            Some(json!({"session_id": session_id, "path": "note.txt", "max_lines": 0})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("ws-lines")).await["error"]["code"],
+        json!(-32602)
+    );
+    harness
+        .send(
+            json!("ws-missing"),
+            "workspace.read",
+            Some(json!({"session_id": session_id, "path": "missing.txt"})),
+        )
+        .await;
+    let missing = harness.response(json!("ws-missing")).await;
+    assert_eq!(missing["error"]["code"], json!(-32010));
+    assert_eq!(missing["error"]["data"]["kind"], json!("workspace_error"));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
+    let turn_started = Arc::new(Notify::new());
+    let (agent, base, workspace) = test_agent(
+        "workspace-read-pending",
+        [ModelScript::BlockWithSignal(Arc::clone(&turn_started))],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    tokio::fs::write(workspace.join("pending-a.txt"), b"a\n")
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "blocked turn"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    tokio::time::timeout(TIMEOUT, turn_started.notified())
+        .await
+        .expect("blocked model request did not start");
+
+    let gate = Arc::new(WorkspaceReadGate::new());
+    gate_next_workspace_read("pending-a.txt", Arc::clone(&gate));
+    harness
+        .send(
+            json!("ws-pending"),
+            "workspace.read",
+            Some(json!({"session_id": session_id, "path": "pending-a.txt"})),
+        )
+        .await;
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .expect("workspace read did not start");
+
+    // The read query is genuinely pending while control methods stay live.
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+    harness
+        .send(json!("cancel"), "turn.cancel", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel")).await["result"]["cancelled"],
+        json!(true)
+    );
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    // Shutdown cancels the pending read and still completes.
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() {
+    let (agent, base, workspace) =
+        test_agent("workspace-read-capacity", [], &[], ApprovalMode::Auto).await;
+    for index in 0..MAX_DEFERRED_QUERIES {
+        tokio::fs::write(
+            workspace.join(format!("cap-{index}.txt")),
+            format!("cap-{index}\n"),
+        )
+        .await
+        .unwrap();
+    }
+    tokio::fs::write(workspace.join("cap-fresh.txt"), b"fresh\n")
+        .await
+        .unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let closing = create_and_open(&mut harness, &workspace).await;
+    let surviving = create_and_open(&mut harness, &workspace).await;
+
+    let mut gates = Vec::new();
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let path = format!("cap-{index}.txt");
+        let gate = Arc::new(WorkspaceReadGate::new());
+        gate_next_workspace_read(&path, Arc::clone(&gate));
+        gates.push(gate);
+        harness
+            .send(
+                json!(format!("cap-{index}")),
+                "workspace.read",
+                Some(json!({"session_id": closing, "path": path})),
+            )
+            .await;
+    }
+
+    harness
+        .send(
+            json!("cap-over"),
+            "workspace.read",
+            Some(json!({"session_id": surviving, "path": "cap-fresh.txt"})),
+        )
+        .await;
+    let over = harness.response(json!("cap-over")).await;
+    assert_eq!(over["error"]["code"], json!(-32019));
+    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
+
+    // The reads really started before the Session is closed.
+    for gate in &gates {
+        tokio::time::timeout(TIMEOUT, gate.wait_started())
+            .await
+            .expect("gated workspace read did not start");
+    }
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": closing})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+
+    // Closing the owning Session cancels the four started queries.
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let response = harness.response(json!(format!("cap-{index}"))).await;
+        assert_eq!(response["error"]["code"], json!(-32020));
+        assert_eq!(response["error"]["data"]["kind"], json!("query_limit"));
+    }
+
+    // The reader reaps the finished queries and admits a new one, and the
+    // closed Session no longer owns a Workspace.
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+    harness
+        .send(
+            json!("cap-closed"),
+            "workspace.read",
+            Some(json!({"session_id": closing, "path": "cap-fresh.txt"})),
+        )
+        .await;
+    let closed = harness.response(json!("cap-closed")).await;
+    assert_eq!(closed["error"]["code"], json!(-32002));
+    harness
+        .send(
+            json!("cap-reuse"),
+            "workspace.read",
+            Some(json!({"session_id": surviving, "path": "cap-fresh.txt"})),
+        )
+        .await;
+    let reuse = harness.response(json!("cap-reuse")).await;
+    assert_eq!(reuse["result"]["content"], json!("fresh\n"));
+
     harness.shutdown().await;
     remove_base(&base).await;
 }

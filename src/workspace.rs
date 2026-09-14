@@ -14,6 +14,8 @@ use thiserror::Error;
 use tokio::fs::{self, File};
 use tokio::io::AsyncReadExt;
 
+pub(crate) mod query;
+
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 const GIT_BRANCH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -171,6 +173,32 @@ impl Workspace {
         Ok(resolved)
     }
 
+    /// Opens a workspace-relative regular file for reading. On Unix the open is
+    /// non-blocking and does not follow the final symlink, so a special file or
+    /// symlink swapped in after the path checks cannot block the caller; the
+    /// post-open metadata check still rejects non-regular files. The workspace
+    /// boundary is a sandbox for cooperative local clients, not a defense
+    /// against an adversarial process running as the same user.
+    pub(crate) async fn open_regular_file(&self, path: &str) -> Result<File, WorkspaceError> {
+        let resolved = self.resolve_existing(path).await?;
+        let metadata = fs::symlink_metadata(&resolved)
+            .await
+            .map_err(map_io_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::Escape);
+        }
+        if !metadata.is_file() {
+            return Err(WorkspaceError::NotFile);
+        }
+        #[cfg(all(test, unix))]
+        swap_open_target_with_fifo(&resolved);
+        let file = open_read_only(&resolved).await?;
+        if !file.metadata().await.map_err(map_io_error)?.is_file() {
+            return Err(WorkspaceError::NotFile);
+        }
+        Ok(file)
+    }
+
     pub(crate) async fn resolve_directory(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
         let relative = normalize_relative(path, true)?;
         let resolved = self.canonicalize_inside(&self.root.join(relative)).await?;
@@ -195,7 +223,7 @@ impl Workspace {
     }
 
     pub(crate) fn validate_write_path(&self, path: &str) -> Result<(), WorkspaceError> {
-        normalize_relative(path, false).map(|_| ())
+        validate_relative_path(path)
     }
 
     pub(crate) async fn read_bytes(
@@ -216,24 +244,9 @@ impl Workspace {
         path: &str,
         max_bytes: usize,
     ) -> Result<ReadPrefix, WorkspaceError> {
-        let resolved = self.resolve_existing(path).await?;
-        let metadata = fs::symlink_metadata(&resolved)
-            .await
-            .map_err(map_io_error)?;
-        if metadata.file_type().is_symlink() {
-            return Err(WorkspaceError::Escape);
-        }
-        if !metadata.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        let file = self.open_regular_file(path).await?;
         let read_limit = max_bytes.saturating_add(4);
         let maximum = u64::try_from(read_limit).unwrap_or(u64::MAX);
-        let file = File::open(&resolved)
-            .await
-            .map_err(|error| map_read_error(error, WorkspaceError::NotFile))?;
-        if !file.metadata().await.map_err(map_io_error)?.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
         let mut bytes = Vec::with_capacity(read_limit.min(8 * 1024));
         let mut limited = file.take(maximum);
         limited
@@ -564,6 +577,64 @@ fn map_read_error(error: io::Error, wrong_type: WorkspaceError) -> WorkspaceErro
         io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory => wrong_type,
         _ => WorkspaceError::Unavailable,
     }
+}
+
+/// Rejects a path that is not a workspace-relative lexical path (absolute,
+/// root/prefix, `..`, or NUL). This is a cheap check that needs no filesystem
+/// access, so callers can reject a request before reserving any resources.
+pub(crate) fn validate_relative_path(path: &str) -> Result<(), WorkspaceError> {
+    normalize_relative(path, false).map(|_| ())
+}
+
+/// Opens a file read-only. On Unix the open uses `O_NONBLOCK` so a special
+/// file cannot block the caller, and `O_NOFOLLOW` so a symlink swapped in after
+/// the path checks fails the open instead of escaping the workspace.
+async fn open_read_only(path: &Path) -> Result<File, WorkspaceError> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    options.open(path).await.map_err(map_open_error)
+}
+
+fn map_open_error(error: io::Error) -> WorkspaceError {
+    #[cfg(unix)]
+    {
+        // O_NOFOLLOW reports ELOOP when the final component became a symlink.
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return WorkspaceError::Escape;
+        }
+    }
+    map_read_error(error, WorkspaceError::NotFile)
+}
+
+#[cfg(all(test, unix))]
+static SWAP_OPEN_TO_FIFO: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+/// Test seam: the next regular-file open of `target` replaces the file with a
+/// FIFO after the metadata check, so the non-blocking open itself is exercised.
+#[cfg(all(test, unix))]
+pub(crate) fn swap_next_open_with_fifo(target: PathBuf) {
+    SWAP_OPEN_TO_FIFO
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(target);
+}
+
+#[cfg(all(test, unix))]
+fn swap_open_target_with_fifo(target: &Path) {
+    let mut pending = SWAP_OPEN_TO_FIFO
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    let Some(position) = pending.iter().position(|candidate| candidate == target) else {
+        return;
+    };
+    pending.remove(position);
+    drop(pending);
+    let _ = std_fs::remove_file(target);
+    let _ = std::process::Command::new("mkfifo").arg(target).status();
 }
 
 #[cfg(test)]

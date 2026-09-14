@@ -567,6 +567,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.3",
  "httpdate",
+ "libc",
  "minicore-runtime",
  "reqwest",
  "serde",

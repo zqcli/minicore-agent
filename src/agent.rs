@@ -49,6 +49,7 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "tool.read",
     "tool.output",
     "session.history",
+    "workspace.read",
     "deferred.waiter_limit",
 ];
 
@@ -509,6 +510,32 @@ impl Agent {
                 self.store.clone(),
                 loaded,
                 request,
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .map_err(|_| AgentError::QueryLimit)?
+    }
+
+    /// Reads one bounded page of a workspace file. Only a loaded Session
+    /// locates its Workspace, and closing that Session cancels the read. The
+    /// query never appends history or calls a model.
+    pub async fn workspace_read(
+        &self,
+        request: crate::WorkspaceReadRequest,
+    ) -> Result<crate::WorkspaceReadResult, AgentError> {
+        request.validate()?;
+        let session = self
+            .loaded_session(request.session_id)
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let session_cancellation = session.query_cancellation();
+        let workspace = session.workspace();
+        tokio::time::timeout(
+            crate::workspace::query::WORKSPACE_READ_DEADLINE,
+            crate::workspace::query::read(
+                workspace,
+                request,
+                session_cancellation,
                 CancellationToken::new(),
             ),
         )

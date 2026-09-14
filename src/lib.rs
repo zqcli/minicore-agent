@@ -61,4 +61,8 @@ pub use tool_data::{
     ToolInvocationData, ToolOutputPage, ToolOutputRequest, ToolPhase, ToolReadRequest,
     ToolReadResult, ToolRef, ToolSubject,
 };
+pub use workspace::query::{
+    WorkspaceReadEncoding, WorkspaceReadRange, WorkspaceReadRequest, WorkspaceReadResult,
+    WorkspaceReadStatus,
+};
 pub use workspace::{Workspace, WorkspaceError};

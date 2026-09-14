@@ -39,7 +39,8 @@ The development branch includes verified manual, startup and request-time
 compaction, provider replay budgeting and one-shot context overflow recovery.
 P3b2 passed parent-owned remote stable/MSRV suites (511 passed, 2 Live tests
 ignored), strict Clippy/fmt/rustdoc, and Windows/macOS compile checks.
-P4 remains the bounded Workspace slice. These changes are not a new installed
+P4's `workspace.read` slice is also verified (528 stable/MSRV tests passed,
+2 Live tests ignored); files/search/status and later slices remain pending. These changes are not a new installed
 Agent release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
@@ -156,6 +157,7 @@ session.context
 session.compact        session.compact.cancel
 session.update         session.rename        session.history
 session.presentation
+session.read           workspace.read
 turn.send              turn.cancel            turn.wait
 turn.steer             interaction.answer
 ```
@@ -190,7 +192,8 @@ reporting. P3b2 provider replay budgeting and one-shot overflow recovery have
 also passed parent review and remote verification; see
 [development progress](docs/0914-progress.md) for evidence and limits.
 TUI `/compact` is outside this backend scope; subsequent work proceeds to P4
-Workspace. The
+Workspace, whose first read-only `workspace.read` slice has also passed parent
+review and remote verification. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

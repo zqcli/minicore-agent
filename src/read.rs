@@ -851,7 +851,7 @@ pub(crate) fn validate_max_bytes(value: Option<usize>) -> Result<(), AgentError>
     }
 }
 
-fn valid_revision(value: &str) -> bool {
+pub(crate) fn valid_revision(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
