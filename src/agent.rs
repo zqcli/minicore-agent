@@ -34,12 +34,15 @@ pub use crate::read::{
     ReadCursor, ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary,
     TurnResultAvailability, TurnResultPage, TurnResultRequest,
 };
-pub use crate::sessions::{SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult};
+pub use crate::sessions::{
+    SessionContext, SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RPC_PROTOCOL_VERSION: u32 = 1;
 pub const RPC_CAPABILITIES: &[&str] = &[
     "session.read",
+    "session.context",
     "turn.result",
     "tool.read",
     "tool.output",
@@ -747,6 +750,16 @@ impl Agent {
         self.sessions
             .get(session_id)
             .map(|session| session.state())
+            .ok_or(AgentError::SessionNotLoaded)
+    }
+
+    pub fn session_context(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<SessionContext, AgentError> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.context())
             .ok_or(AgentError::SessionNotLoaded)
     }
 

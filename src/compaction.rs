@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use minicore_runtime::LoopId;
 use minicore_runtime::history::HistoryItem;
-use minicore_runtime::model::{ModelMessage, ModelValueError, ReasoningPreference};
+use minicore_runtime::model::{ModelMessage, ModelValueError, ReasoningPreference, Usage};
 use minicore_runtime::value::BoundedText;
 
 use crate::ids::SessionId;
@@ -23,6 +23,21 @@ pub enum CompactionStatus {
     UnknownWrite,
 }
 
+/// Accounting for the manual no-tools summary utility only; it never includes
+/// the ordinary AgentLoop request usage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CompactionUtilityUsage {
+    /// Number of utility call attempts observed, including one that failed
+    /// before returning a complete response.
+    pub call_count: u32,
+    /// True only when generation completed and every completed call returned
+    /// usage data. A failed/in-flight call makes the total incomplete.
+    pub complete: bool,
+    /// Known usage fields from completed calls only; usage emitted by a failed
+    /// stream is not currently retained, and unknown fields remain absent.
+    pub usage: Option<Usage>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompactionResult {
     pub operation_id: String,
@@ -34,6 +49,7 @@ pub struct CompactionResult {
     pub covered_loop_count: u64,
     pub covered_item_count: usize,
     pub retained_item_count: usize,
+    pub utility_usage: Option<CompactionUtilityUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<String>,
 }
@@ -71,6 +87,7 @@ struct SummarySource {
 #[derive(Clone)]
 struct LoadedSummary {
     content: BoundedText,
+    covered_loop_count: u64,
     covered_item_count: usize,
 }
 
@@ -96,11 +113,25 @@ impl CompactionState {
         *self.snapshot.lock().unwrap() = Some(summary);
     }
 
-    pub(crate) fn publish(&self, content: BoundedText, covered_item_count: usize) {
+    pub(crate) fn publish(
+        &self,
+        content: BoundedText,
+        covered_loop_count: u64,
+        covered_item_count: usize,
+    ) {
         self.install(LoadedSummary {
             content,
+            covered_loop_count,
             covered_item_count,
         });
+    }
+
+    pub(crate) fn coverage(&self) -> Option<(u64, usize)> {
+        self.snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|summary| (summary.covered_loop_count, summary.covered_item_count))
     }
 
     pub(crate) fn project<'a>(&self, base: &'a [HistoryItem]) -> Option<HistoryProjection<'a>> {
@@ -232,6 +263,7 @@ fn validate_snapshot_shape(
     let content = validate_summary_content(&snapshot.summary)?;
     Some(LoadedSummary {
         content,
+        covered_loop_count: snapshot.source.covered_loop_count,
         covered_item_count,
     })
 }

@@ -7,7 +7,6 @@ use futures_util::stream;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use minicore_runtime::ToolCallId;
 use minicore_runtime::execution::ConfigRevision;
 use minicore_runtime::history::{
     AssistantHistory, HistoryItem, ToolResultHistory, UserHistory, UserMessageKind,
@@ -18,6 +17,7 @@ use minicore_runtime::model::{
     ReasoningContent, ReasoningPreference, ToolCall, Usage,
 };
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
+use minicore_runtime::{LoopId, ToolCallId};
 
 use crate::config::AgentConfig;
 use crate::error::AgentError;
@@ -605,6 +605,187 @@ async fn synthetic_summary_session(
     )
 }
 
+async fn install_valid_summary(data_dir: &Path, session_id: SessionId) {
+    let store = Store::open(data_dir.to_path_buf()).await.unwrap();
+    let loaded = store.load_session(session_id).await.unwrap();
+    let source = store
+        .capture_history_anchor(session_id, &loaded.history)
+        .await
+        .unwrap()
+        .unwrap();
+    let summary = minicore_runtime::value::BoundedText::new("bounded historical summary").unwrap();
+    let bytes =
+        crate::compaction::encode_snapshot(session_id, &loaded.record, &source, &summary).unwrap();
+    std::fs::write(
+        data_dir
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("summary.json"),
+        bytes,
+    )
+    .unwrap();
+}
+
+async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary: bool) {
+    let (data_dir, _data_guard) = fixture_dir(&format!("summary-runtime-limit-{}", next_id()));
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let session_id = SessionId::new().unwrap();
+    let record = SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title: None,
+        profile: "test".to_owned(),
+        workspace,
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: Vec::new(),
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+        created_at: "2026-01-02T03:04:05.000Z".to_owned(),
+        updated_at: "2026-01-02T03:04:05.000Z".to_owned(),
+    };
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    store.create_session(&record).await.unwrap();
+    let loop_id = LoopId::new().unwrap();
+    store
+        .append_loop(
+            session_id,
+            &StoredLoopRecord {
+                loop_id,
+                outcome: StoredLoopOutcome::Completed,
+                items,
+                usage: Usage::default(),
+                requests: 1,
+                tool_rounds: 0,
+                final_config_revision: ConfigRevision::INITIAL,
+                completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
+                user_times: None,
+            },
+        )
+        .await
+        .unwrap();
+    let loaded = store.load_session(session_id).await.unwrap();
+    let history_len = loaded.history.len();
+    let limits = minicore_runtime::LoopOptions::default_checked()
+        .unwrap()
+        .limits;
+    assert!(
+        loaded.history.len() > limits.max_history_items
+            || crate::sessions::estimate_history_bytes(&loaded.history) > limits.max_history_bytes
+    );
+    if install_summary {
+        install_valid_summary(&data_dir, session_id).await;
+    }
+    let history_path = data_dir
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+
+    let model = FakeModel::new("main", [ModelScript::Text("started")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    agent.open_session(session_id).await.unwrap();
+    let context = agent.session_context(session_id).unwrap();
+    assert_eq!(context.budget.estimated_request_context_tokens, None);
+    if install_summary {
+        assert_eq!(context.budget.estimated_history_items, 0);
+        assert_eq!(context.budget.estimated_history_bytes, Some(0));
+        assert_eq!(context.budget.estimated_history_tokens, Some(0));
+        assert_eq!(context.budget.within_runtime_limits, Some(true));
+    } else {
+        assert_eq!(context.budget.estimated_history_items, history_len);
+        assert_eq!(context.budget.estimated_history_bytes, None);
+        assert_eq!(context.budget.estimated_history_tokens, None);
+        assert_eq!(context.budget.within_runtime_limits, Some(false));
+    }
+    if !install_summary {
+        assert!(matches!(
+            agent
+                .send(super::SendMessage {
+                    session_id,
+                    text: "current after unbounded history".to_owned(),
+                })
+                .await,
+            Err(AgentError::HistoryTooLarge)
+        ));
+        assert_eq!(model.requests().lock().unwrap().len(), 0);
+        assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+        return;
+    }
+    let turn = send_text(&mut agent, session_id, "current after bounded history").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(model.requests().lock().unwrap().len(), 1);
+    let after = std::fs::read(&history_path).unwrap();
+    assert!(after.starts_with(&history_before));
+}
+
+#[tokio::test]
+async fn valid_summary_allows_history_over_runtime_item_limit_to_start() {
+    let loop_id = LoopId::new().unwrap();
+    let items = (0..4_097)
+        .map(|index| {
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text(format!("old-{index}"))
+                    .unwrap(),
+            })
+        })
+        .collect();
+    assert_runtime_limit_behavior(items, true).await;
+}
+
+#[tokio::test]
+async fn valid_summary_allows_history_over_runtime_byte_limit_to_start() {
+    let loop_id = LoopId::new().unwrap();
+    let limits = minicore_runtime::LoopOptions::default_checked()
+        .unwrap()
+        .limits;
+    let chunk_len = limits.max_model_text_bytes / 2;
+    let item_count = limits.max_history_bytes / chunk_len + 1;
+    let items = (0..item_count)
+        .map(|index| {
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id,
+                request_index: u32::try_from(index).unwrap(),
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::Text("x".repeat(chunk_len))],
+                finish_reason: ModelFinishReason::Stop,
+                usage: Usage::default(),
+            })
+        })
+        .collect();
+    assert_runtime_limit_behavior(items, true).await;
+}
+
+#[tokio::test]
+async fn over_runtime_history_without_valid_summary_is_rejected() {
+    let loop_id = LoopId::new().unwrap();
+    let items = (0..4_097)
+        .map(|index| {
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text(format!("old-{index}"))
+                    .unwrap(),
+            })
+        })
+        .collect();
+    assert_runtime_limit_behavior(items, false).await;
+}
+
 fn workspace_file(label: &str, file: &str, content: &[u8]) -> (PathBuf, TestDirectoryGuard) {
     let (base, _) = fixture_dir(label);
     let root = base.join("workspace");
@@ -1105,6 +1286,12 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
     .await;
     let reopened = agent.open_session(session_id).await.unwrap();
     assert_eq!(reopened.session_id, session_id);
+    let context = agent.session_context(session_id).unwrap();
+    assert_eq!(context.coverage.covered_loop_count, 1);
+    assert_eq!(context.coverage.covered_item_count, 2);
+    assert_eq!(context.coverage.retained_item_count, 2);
+    assert_eq!(context.budget.estimated_history_items, 2);
+    assert_eq!(context.budget.within_runtime_limits, Some(true));
     // Loading and projecting a derived snapshot must not rewrite core history.
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     let candidate = agent.config().clone();
@@ -1201,6 +1388,82 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
         std::fs::read(&history_path)
             .unwrap()
             .starts_with(&history_before)
+    );
+}
+
+#[tokio::test]
+async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
+    let (data_dir, _data_guard, session_id, _history_path, _history_before) =
+        synthetic_summary_session(&format!("summary-same-loop-update-{}", next_id()), true).await;
+    let gate = BlockGate::new();
+    let model_a = FakeModel::new(
+        "main",
+        [ModelScript::ToolCallAfterGate(
+            gate.clone(),
+            "read",
+            json!({"path": "suffix.txt"}),
+        )],
+    );
+    let model_b = FakeModel::new("other", [ModelScript::Text("from model b")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("other".to_owned(), Arc::clone(&model_b)),
+        ]),
+        read_profile(),
+    )
+    .await;
+    agent.open_session(session_id).await.unwrap();
+
+    let turn = send_text(&mut agent, session_id, "same loop current").await;
+    gate.entered.notified().await;
+    let updated = agent
+        .update_session(UpdateSession {
+            session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    assert!(updated.active_revision.is_some());
+    gate.release.notify_waiters();
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+
+    let requests = model_b.requests();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0].messages();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                matches!(message, ModelMessage::User(text) if text.contains(SUMMARY_CONTENT))
+            })
+            .count(),
+        1
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, ModelMessage::User(text) if text == "suffix user"))
+    );
+    assert!(messages.iter().any(|message| {
+        matches!(message, ModelMessage::Tool { tool_call_id, .. } if tool_call_id.as_str() == "suffix-read-call")
+    }));
+    assert!(
+        messages.iter().any(
+            |message| matches!(message, ModelMessage::User(text) if text == "same loop current")
+        )
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, ModelMessage::User(text) if text == "covered user"))
     );
 }
 

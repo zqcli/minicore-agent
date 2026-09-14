@@ -6,7 +6,7 @@ use futures_util::{FutureExt, StreamExt};
 use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::{
     Model, ModelCallContext, ModelDescriptor, ModelEvent, ModelFinishReason, ModelLimits,
-    ModelMessage, ModelRequest, ReasoningPreference,
+    ModelMessage, ModelRequest, ReasoningPreference, Usage,
 };
 use minicore_runtime::tools::ToolSpec;
 use minicore_runtime::value::BoundedText;
@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{MAX_SUMMARY_CONTENT_BYTES, summary_data_message, validate_summary_content};
+use super::{
+    CompactionUtilityUsage, MAX_SUMMARY_CONTENT_BYTES, summary_data_message,
+    validate_summary_content,
+};
 
 pub(crate) const MAX_MODEL_CALLS: usize = 32;
 
@@ -65,6 +68,12 @@ pub(crate) struct SummaryGeneration {
     pub(crate) content: BoundedText,
     pub(crate) before_tokens: u64,
     pub(crate) after_tokens: u64,
+    pub(crate) utility_usage: Option<CompactionUtilityUsage>,
+}
+
+pub(crate) struct SummaryGenerationError {
+    pub(crate) error: UtilityError,
+    pub(crate) utility_usage: Option<CompactionUtilityUsage>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,24 +220,50 @@ pub(crate) async fn generate_summary<F>(
     input: &CompactionInput,
     cancellation: &CancellationToken,
     on_merge: &mut F,
-) -> Result<SummaryGeneration, UtilityError>
+) -> Result<SummaryGeneration, SummaryGenerationError>
 where
     F: FnMut() + Send,
 {
+    let mut utility_usage = UtilityUsageAccumulator::default();
     if cancellation.is_cancelled() {
-        return Err(UtilityError::Cancelled);
+        return Err(SummaryGenerationError {
+            error: UtilityError::Cancelled,
+            utility_usage: None,
+        });
     }
     if Instant::now() >= input.operation_deadline {
-        return Err(UtilityError::Timeout);
+        return Err(SummaryGenerationError {
+            error: UtilityError::Timeout,
+            utility_usage: None,
+        });
     }
-    let fixed = FixedPrompt::new(input)?;
+    let fixed = FixedPrompt::new(input).map_err(|error| SummaryGenerationError {
+        error,
+        utility_usage: utility_usage.snapshot(false),
+    })?;
     if Instant::now() >= input.operation_deadline {
-        return Err(UtilityError::Timeout);
+        return Err(SummaryGenerationError {
+            error: UtilityError::Timeout,
+            utility_usage: utility_usage.snapshot(false),
+        });
     }
-    let payload_bytes = fixed.source_payload_bytes()?;
-    let output_bytes = fixed.summary_output_bytes()?;
+    let payload_bytes = fixed
+        .source_payload_bytes()
+        .map_err(|error| SummaryGenerationError {
+            error,
+            utility_usage: utility_usage.snapshot(false),
+        })?;
+    let output_bytes = fixed
+        .summary_output_bytes()
+        .map_err(|error| SummaryGenerationError {
+            error,
+            utility_usage: utility_usage.snapshot(false),
+        })?;
     if Instant::now() >= input.operation_deadline {
-        return Err(UtilityError::Timeout);
+        return Err(SummaryGenerationError {
+            error: UtilityError::Timeout,
+            utility_usage: utility_usage.snapshot(false),
+        });
     }
     let (receiver, serializer) = spawn_source_serializer(
         Arc::clone(&input.history),
@@ -244,22 +279,32 @@ where
         on_merge,
         &mut source,
         output_bytes,
+        &mut utility_usage,
     ))
     .catch_unwind()
     .await;
     let serializer_result = source.close_and_join().await;
     match result {
-        Ok(Ok(generation)) => {
-            serializer_result?;
-            Ok(generation)
-        }
+        Ok(Ok(generation)) => match serializer_result {
+            Ok(()) => Ok(generation),
+            Err(error) => Err(SummaryGenerationError {
+                error,
+                utility_usage: utility_usage.snapshot(false),
+            }),
+        },
         Ok(Err(error)) => {
             let _ = serializer_result;
-            Err(error)
+            Err(SummaryGenerationError {
+                error,
+                utility_usage: utility_usage.snapshot(false),
+            })
         }
         Err(_) => {
             let _ = serializer_result;
-            Err(UtilityError::Serialization)
+            Err(SummaryGenerationError {
+                error: UtilityError::Serialization,
+                utility_usage: utility_usage.snapshot(false),
+            })
         }
     }
 }
@@ -271,6 +316,7 @@ async fn generate_summary_inner<F>(
     on_merge: &mut F,
     source: &mut SourcePump,
     output_bytes: usize,
+    utility_usage: &mut UtilityUsageAccumulator,
 ) -> Result<SummaryGeneration, UtilityError>
 where
     F: FnMut() + Send,
@@ -290,7 +336,6 @@ where
     let mut intermediate_bytes = 0usize;
     let mut calls = 0usize;
     let mut chunk_index = 0usize;
-
     loop {
         let payload = source.recv(cancellation, input.operation_deadline).await?;
         let Some(payload) = payload else {
@@ -300,8 +345,11 @@ where
             return Err(UtilityError::Budget);
         }
         let message = source_message(payload, chunk_index)?;
+        utility_usage.start_call();
         let partial = call_model(input, fixed, message, output_bytes, cancellation).await?;
-        let Some(next_intermediate_bytes) = intermediate_bytes.checked_add(partial.byte_len())
+        utility_usage.finish_call(partial.usage);
+        let Some(next_intermediate_bytes) =
+            intermediate_bytes.checked_add(partial.content.byte_len())
         else {
             return Err(UtilityError::TooLarge);
         };
@@ -309,7 +357,7 @@ where
         if intermediate_bytes > MAX_INTERMEDIATE_SUMMARY_BYTES {
             return Err(UtilityError::TooLarge);
         }
-        partials.push(partial);
+        partials.push(partial.content);
         calls += 1;
         chunk_index += 1;
     }
@@ -327,11 +375,13 @@ where
             return Err(UtilityError::Budget);
         }
         let message = merge_message(&merged, Some(&partial), false)?;
+        utility_usage.start_call();
         let next = call_model(input, fixed, message, output_bytes, cancellation).await?;
-        if next.byte_len() >= merged.byte_len().saturating_add(partial.byte_len()) {
+        utility_usage.finish_call(next.usage);
+        if next.content.byte_len() >= merged.byte_len().saturating_add(partial.byte_len()) {
             return Err(UtilityError::NoProgress);
         }
-        merged = next;
+        merged = next.content;
         calls += 1;
     }
 
@@ -343,11 +393,13 @@ where
             merge_started = true;
         }
         let message = merge_message(&merged, None, true)?;
+        utility_usage.start_call();
         let reduced = call_model(input, fixed, message, output_bytes, cancellation).await?;
-        if reduced.byte_len() >= merged.byte_len() {
+        utility_usage.finish_call(reduced.usage);
+        if reduced.content.byte_len() >= merged.byte_len() {
             return Err(UtilityError::NoProgress);
         }
-        merged = reduced;
+        merged = reduced.content;
         calls += 1;
         after_tokens = estimate_after_tokens(input, &merged)?;
     }
@@ -364,6 +416,7 @@ where
         content,
         before_tokens,
         after_tokens,
+        utility_usage: utility_usage.snapshot(true),
     })
 }
 
@@ -416,7 +469,7 @@ async fn call_model(
     user_message: ModelMessage,
     max_output_bytes: usize,
     cancellation: &CancellationToken,
-) -> Result<BoundedText, UtilityError> {
+) -> Result<UtilityModelResponse, UtilityError> {
     if cancellation.is_cancelled() {
         return Err(UtilityError::Cancelled);
     }
@@ -448,6 +501,7 @@ async fn call_model(
     let mut text = String::new();
     let mut reasoning_bytes = 0usize;
     let mut finished = false;
+    let mut usage = None;
     loop {
         if cancellation.is_cancelled() {
             return Err(UtilityError::Cancelled);
@@ -469,8 +523,9 @@ async fn call_model(
                 if text.trim().is_empty() {
                     Err(UtilityError::NoProgress)
                 } else {
-                    BoundedText::new_with_max_bytes(&text, max_output_bytes)
-                        .map_err(|_| UtilityError::TooLarge)
+                    let content = BoundedText::new_with_max_bytes(&text, max_output_bytes)
+                        .map_err(|_| UtilityError::TooLarge)?;
+                    Ok(UtilityModelResponse { content, usage })
                 }
             } else {
                 Err(UtilityError::InvalidResponse)
@@ -502,7 +557,11 @@ async fn call_model(
             ModelEvent::ToolCallStart { .. }
             | ModelEvent::ToolCallArgumentsDelta { .. }
             | ModelEvent::ToolCallEnd { .. } => return Err(UtilityError::ToolCall),
-            ModelEvent::Usage { .. } => {}
+            ModelEvent::Usage { usage: value } => {
+                if usage.replace(value).is_some() {
+                    return Err(UtilityError::InvalidResponse);
+                }
+            }
             ModelEvent::Finish { reason } => {
                 if reason != ModelFinishReason::Stop {
                     return Err(UtilityError::InvalidResponse);
@@ -510,6 +569,110 @@ async fn call_model(
                 finished = true;
             }
         }
+    }
+}
+
+struct UtilityModelResponse {
+    content: BoundedText,
+    usage: Option<Usage>,
+}
+
+struct UtilityUsageAccumulator {
+    value: Option<Usage>,
+    complete: bool,
+    call_count: u32,
+    pending_calls: u32,
+}
+
+impl Default for UtilityUsageAccumulator {
+    fn default() -> Self {
+        Self {
+            value: None,
+            complete: true,
+            call_count: 0,
+            pending_calls: 0,
+        }
+    }
+}
+
+impl UtilityUsageAccumulator {
+    fn start_call(&mut self) {
+        self.call_count = self.call_count.saturating_add(1);
+        self.pending_calls = self.pending_calls.saturating_add(1);
+    }
+
+    fn finish_call(&mut self, usage: Option<Usage>) {
+        self.pending_calls = self.pending_calls.saturating_sub(1);
+        let Some(usage) = usage.filter(|usage| !is_empty_usage(usage)) else {
+            self.complete = false;
+            return;
+        };
+        self.value = Some(match self.value {
+            Some(value) => {
+                if usage_sum_overflow(value, usage) {
+                    self.complete = false;
+                }
+                sum_usage(value, usage)
+            }
+            None => usage,
+        });
+    }
+
+    fn snapshot(&self, generation_complete: bool) -> Option<CompactionUtilityUsage> {
+        (self.call_count > 0).then_some(CompactionUtilityUsage {
+            call_count: self.call_count,
+            complete: generation_complete && self.complete && self.pending_calls == 0,
+            usage: self.value,
+        })
+    }
+}
+
+fn is_empty_usage(usage: &Usage) -> bool {
+    usage.input_tokens().is_none()
+        && usage.output_tokens().is_none()
+        && usage.reasoning_tokens().is_none()
+        && usage.cache_read_tokens().is_none()
+        && usage.cache_write_tokens().is_none()
+        && usage.provider_total_tokens().is_none()
+}
+
+fn sum_usage(left: Usage, right: Usage) -> Usage {
+    Usage::from_optional(
+        sum_usage_field(left.input_tokens(), right.input_tokens()),
+        sum_usage_field(left.output_tokens(), right.output_tokens()),
+        sum_usage_field(left.reasoning_tokens(), right.reasoning_tokens()),
+    )
+    .with_cache_read_tokens(sum_usage_field(
+        left.cache_read_tokens(),
+        right.cache_read_tokens(),
+    ))
+    .with_cache_write_tokens(sum_usage_field(
+        left.cache_write_tokens(),
+        right.cache_write_tokens(),
+    ))
+    .with_provider_total_tokens(sum_usage_field(
+        left.provider_total_tokens(),
+        right.provider_total_tokens(),
+    ))
+}
+
+fn usage_sum_overflow(left: Usage, right: Usage) -> bool {
+    usage_field_overflow(left.input_tokens(), right.input_tokens())
+        || usage_field_overflow(left.output_tokens(), right.output_tokens())
+        || usage_field_overflow(left.reasoning_tokens(), right.reasoning_tokens())
+        || usage_field_overflow(left.cache_read_tokens(), right.cache_read_tokens())
+        || usage_field_overflow(left.cache_write_tokens(), right.cache_write_tokens())
+        || usage_field_overflow(left.provider_total_tokens(), right.provider_total_tokens())
+}
+
+fn usage_field_overflow(left: Option<u64>, right: Option<u64>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left.checked_add(right).is_none())
+}
+
+fn sum_usage_field(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => left.checked_add(right),
+        _ => None,
     }
 }
 

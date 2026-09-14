@@ -338,6 +338,14 @@ impl RpcServer {
                     .map(|state| SessionStateView::from(&state));
                 Dispatch::Response(agent_result(&id, result))
             }
+            "session.context" => {
+                let params: SessionParams = match params_or_error(&id, params) {
+                    Ok(params) => params,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                let result = self.agent().session_context(params.session_id);
+                Dispatch::Response(agent_result(&id, result))
+            }
             "session.compact" => {
                 let params: SessionCompactParams = match params_or_error(&id, params) {
                     Ok(params) => params,
@@ -936,6 +944,7 @@ fn canonical_method(method: &str) -> &'static str {
         "session.close" => "session.close",
         "session.delete" => "session.delete",
         "session.state" => "session.state",
+        "session.context" => "session.context",
         "session.compact" => "session.compact",
         "session.compact.cancel" => "session.compact.cancel",
         "session.update" => "session.update",

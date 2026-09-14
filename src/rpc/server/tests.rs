@@ -48,6 +48,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 enum ModelScript {
     Text(&'static str),
+    TextWithUsage(&'static str, u64, u64),
+    DuplicateUsage(&'static str),
     NoUsage(&'static str),
     Capture {
         inputs: Arc<Mutex<Vec<String>>>,
@@ -213,6 +215,27 @@ impl Model for FakeModel {
                     ModelEvent::text_delta(text).unwrap(),
                     ModelEvent::Usage {
                         usage: Usage::new(1, 1, 0),
+                    },
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ])),
+                ModelScript::TextWithUsage(text, input, output) => Ok(model_events(vec![
+                    ModelEvent::text_delta(text).unwrap(),
+                    ModelEvent::Usage {
+                        usage: Usage::new(input, output, 0),
+                    },
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ])),
+                ModelScript::DuplicateUsage(text) => Ok(model_events(vec![
+                    ModelEvent::text_delta(text).unwrap(),
+                    ModelEvent::Usage {
+                        usage: Usage::new(7, 11, 0),
+                    },
+                    ModelEvent::Usage {
+                        usage: Usage::new(13, 17, 0),
                     },
                     ModelEvent::Finish {
                         reason: ModelFinishReason::Stop,
@@ -561,6 +584,7 @@ async fn capability_discovery_returns_ordered_lists() {
         ping["result"]["capabilities"],
         json!([
             "session.read",
+            "session.context",
             "turn.result",
             "tool.read",
             "tool.output",
@@ -1063,7 +1087,7 @@ async fn create_and_open(harness: &mut RpcHarness, workspace: &Path) -> Value {
     session_id
 }
 
-async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: &str) {
+async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: &str) -> Value {
     let (agent, base, workspace) = test_agent(
         label,
         [ModelScript::Text("settled"), script],
@@ -1100,6 +1124,7 @@ async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: 
     assert_eq!(result["result"]["failure_kind"], json!(expected));
     harness.shutdown().await;
     remove_base(&base).await;
+    result
 }
 
 #[tokio::test]
@@ -1443,6 +1468,349 @@ async fn manual_compaction_completion_clears_authoritative_busy_state() {
     assert!(
         state["result"]["compaction"].is_null(),
         "completed compaction must clear authoritative busy state: {state}"
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn session_context_reports_manual_busy_state_and_last_result() {
+    let (agent, base, workspace) = test_agent(
+        "context-manual-busy",
+        [ModelScript::Text("settled"), ModelScript::Block],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": "settled"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "context-busy-operation"
+            })),
+        )
+        .await;
+    harness
+        .send(
+            json!("context-busy"),
+            "session.context",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let context = harness.response(json!("context-busy")).await;
+    assert_eq!(
+        context["result"]["current_operation"]["operation_id"],
+        json!("context-busy-operation")
+    );
+    assert_eq!(
+        context["result"]["coverage"]["covered_item_count"],
+        json!(0)
+    );
+    assert!(context["result"]["last_result"].is_null());
+    assert!(context["result"]["budget"]["estimated_history_items"].is_number());
+    assert_eq!(
+        context["result"]["budget"]["within_runtime_limits"],
+        json!(true)
+    );
+
+    harness
+        .send(
+            json!("cancel"),
+            "session.compact.cancel",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "context-busy-operation"
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel")).await["result"]["cancelled"],
+        json!(true)
+    );
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert!(result["result"]["utility_usage"].is_null());
+
+    harness
+        .send(
+            json!("context-after"),
+            "session.context",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let context = harness.response(json!("context-after")).await;
+    assert!(context["result"]["current_operation"].is_null());
+    assert_eq!(
+        context["result"]["last_result"]["operation_id"],
+        json!("context-busy-operation")
+    );
+    assert!(context["result"]["last_result"]["utility_usage"].is_null());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_reports_independent_utility_usage() {
+    let (agent, base, workspace) = test_agent(
+        "context-utility-usage",
+        [
+            ModelScript::TextWithUsage("settled", 41, 43),
+            ModelScript::TextWithUsage("summary", 7, 11),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled = "settled history ".repeat(128);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let waited = harness.response(json!("wait")).await;
+    assert_eq!(waited["result"]["usage"]["input_tokens"], json!(41));
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utility-usage"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("compacted"));
+    assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(true));
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["input_tokens"],
+        json!(7)
+    );
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["output_tokens"],
+        json!(11)
+    );
+
+    harness
+        .send(
+            json!("context"),
+            "session.context",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let context = harness.response(json!("context")).await;
+    assert_eq!(
+        context["result"]["last_result"]["utility_usage"]["call_count"],
+        json!(1)
+    );
+    assert_eq!(
+        context["result"]["last_result"]["utility_usage"]["usage"]["input_tokens"],
+        json!(7)
+    );
+    assert_eq!(
+        context["result"]["last_result"]["utility_usage"]["usage"]["output_tokens"],
+        json!(11)
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn missing_manual_utility_usage_remains_unknown() {
+    let (agent, base, workspace) = test_agent(
+        "context-utility-unknown",
+        [
+            ModelScript::TextWithUsage("settled", 41, 43),
+            ModelScript::NoUsage("summary"),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled = "settled history ".repeat(128);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utility-unknown"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("compacted"));
+    assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(false));
+    assert!(result["result"]["utility_usage"]["usage"].is_null());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_aggregates_usage_across_multiple_utility_calls() {
+    let mut scripts = vec![ModelScript::Text("settled")];
+    scripts.extend((0..32).map(|_| ModelScript::TextWithUsage("summary-part", 7, 11)));
+    let (agent, base, workspace) =
+        test_agent("context-utility-multiple", scripts, &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled = "settled history ".repeat(7_000);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utility-multiple"
+            })),
+        )
+        .await;
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("compacted"));
+    let call_count = result["result"]["utility_usage"]["call_count"]
+        .as_u64()
+        .expect("utility call count must be reported");
+    assert!(call_count > 1);
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(true));
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["input_tokens"],
+        json!(call_count * 7)
+    );
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["output_tokens"],
+        json!(call_count * 11)
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
+    let (agent, base, workspace) = test_agent(
+        "context-utility-cancel",
+        [
+            ModelScript::TextWithUsage("settled", 2, 3),
+            ModelScript::TextWithUsage("summary", 7, 11),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+    let settled = "settled history ".repeat(128);
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session_id, "text": settled})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let _ = harness.response(json!("wait")).await;
+
+    let gate = Arc::new(SummaryCommitGate::new());
+    let typed_session_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
+    gate_next_summary_commit(typed_session_id, Arc::clone(&gate));
+    harness
+        .send(
+            json!("compact"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utility-cancel"
+            })),
+        )
+        .await;
+    gate.wait_started().await;
+    harness
+        .send(
+            json!("cancel"),
+            "session.compact.cancel",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "utility-cancel"
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("cancel")).await["result"]["cancelled"],
+        json!(true)
+    );
+    gate.release();
+    let result = harness.response(json!("compact")).await;
+    assert_eq!(result["result"]["status"], json!("failed"));
+    assert_eq!(result["result"]["failure_kind"], json!("cancelled"));
+    assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(true));
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["input_tokens"],
+        json!(7)
     );
 
     harness.shutdown().await;
@@ -1975,10 +2343,10 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
     let (agent, base, workspace) = test_agent(
         "manual-write-failure",
         [
-            ModelScript::Text("settled"),
-            ModelScript::Text("initial summary"),
-            ModelScript::Text("new turn answer"),
-            ModelScript::Text("new summary"),
+            ModelScript::TextWithUsage("settled", 2, 3),
+            ModelScript::TextWithUsage("initial summary", 5, 7),
+            ModelScript::TextWithUsage("new turn answer", 11, 13),
+            ModelScript::TextWithUsage("new summary", 17, 19),
         ],
         &[],
         ApprovalMode::Auto,
@@ -2054,6 +2422,12 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
     let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("failed"));
     assert_eq!(result["result"]["failure_kind"], json!("store"));
+    assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(result["result"]["utility_usage"]["complete"], json!(true));
+    assert_eq!(
+        result["result"]["utility_usage"]["usage"]["input_tokens"],
+        json!(17)
+    );
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     assert_eq!(std::fs::read(&summary_path).unwrap(), summary_before);
 
@@ -2340,6 +2714,18 @@ async fn manual_compaction_rejects_incomplete_late_empty_and_oversize_output() {
         "invalid_model_response",
     )
     .await;
+    let duplicate = assert_manual_failure_case(
+        "manual-duplicate-usage",
+        ModelScript::DuplicateUsage("duplicate usage"),
+        "invalid_model_response",
+    )
+    .await;
+    assert_eq!(duplicate["result"]["utility_usage"]["call_count"], json!(1));
+    assert_eq!(
+        duplicate["result"]["utility_usage"]["complete"],
+        json!(false)
+    );
+    assert!(duplicate["result"]["utility_usage"]["usage"].is_null());
     assert_manual_failure_case("manual-whitespace", ModelScript::Whitespace, "no_progress").await;
     assert_manual_failure_case("manual-oversize", ModelScript::Oversize, "too_large").await;
 }

@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","turn.result","tool.read","tool.output","session.history","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -107,6 +107,7 @@ protocol version, and ordered capability names:
   "protocol_version": 1,
   "capabilities": [
     "session.read",
+    "session.context",
     "turn.result",
     "tool.read",
     "tool.output",
@@ -273,6 +274,10 @@ The result has a `session` member containing the created SessionInfo.
   `compaction` member reports only its safe operation ID, phase, and item counts;
   clients use its presence, rather than the ordinary loop `status`, to observe
   compaction busy.
+- `session.context` takes a loaded Session ID and returns the current manual
+  compaction operation, validated-summary coverage, latest manual result, and
+  the estimated Runtime history budget. It is read-only and responds
+  immediately, including while manual compaction is busy.
 - `session.compact` takes `{"session_id":"ses_...","operation_id":"..."}`
   and returns one deferred result after manual compaction finishes. The
   operation ID is non-empty printable ASCII and at most 128 bytes, and cannot
@@ -293,9 +298,10 @@ The result has a `session` member containing the created SessionInfo.
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
 
-The manual compaction methods described here are source-draft APIs. Final
-acceptance and installation remain pending; they are not available in the
-previously installed Agent binary.
+The manual compaction methods and startup summary projection described here are
+source-draft APIs. Final P3a acceptance and installation remain pending; they
+are not available in the previously installed Agent binary. Automatic
+compaction and overflow recovery are separate pending work.
 
 The deferred compact result has this shape:
 
@@ -307,7 +313,16 @@ The deferred compact result has this shape:
   "after_tokens": 900,
   "covered_loop_count": 6,
   "covered_item_count": 12,
-  "retained_item_count": 0
+  "retained_item_count": 0,
+  "utility_usage": {
+    "call_count": 6,
+    "complete": true,
+    "usage": {
+      "input_tokens": 3600,
+      "output_tokens": 900,
+      "reasoning_tokens": 0
+    }
+  }
 }
 ```
 
@@ -320,6 +335,15 @@ the write or rename, while the old in-memory projection remains unpublished.
 Clients must reread the Session and snapshot before deciding what to do; they
 must not retry blindly.
 
+`utility_usage` is non-null once a utility call attempt has been observed. Its
+`call_count` includes an attempt that failed before returning a complete
+response. `complete` is true only when generation completed and every completed
+call returned usage data; a failed/in-flight call or missing usage makes it
+false. The nested `usage` aggregates completed calls only. If a stream fails
+after emitting its own `Usage` event, that event is not currently retained and
+the total remains incomplete. This accounting is independent of ordinary turn
+usage; missing fields remain unknown rather than being filled with zero.
+
 The summary utility calls the selected raw model directly with a fresh loop
 identity, `request_index: 0`, an empty tool list, and the selected reasoning
 preference. History is sent as explicitly labeled data. The complete
@@ -327,6 +351,51 @@ preference. History is sent as explicitly labeled data. The complete
 `summary.json` is a separately validated derived snapshot. On reopen, the
 summary is consumed as a non-system historical-data message and the next
 current User message remains a separate input.
+
+### `session.context`
+
+```json
+{"session_id":"ses_..."}
+```
+
+The result is returned directly:
+
+```json
+{
+  "session_id": "ses_...",
+  "current_operation": null,
+  "coverage": {
+    "covered_loop_count": 6,
+    "covered_item_count": 12,
+    "retained_item_count": 3
+  },
+  "last_result": null,
+  "budget": {
+    "estimated_history_items": 3,
+    "estimated_history_bytes": 1480,
+    "estimated_history_tokens": 370,
+    "estimated_request_context_tokens": null,
+    "max_history_items": 4096,
+    "max_history_bytes": 1048576,
+    "within_runtime_limits": true
+  }
+}
+```
+
+`current_operation`, when non-null, has the same safe progress shape exposed
+by `session.state`. `coverage` is non-zero only for a currently validated
+summary snapshot; `retained_item_count` is calculated against the complete
+loaded history. `estimated_history_items`, `estimated_history_bytes`, and
+`estimated_history_tokens` describe only the history suffix passed to Runtime
+as `LoopRequest.history` (or full history when no valid summary is loaded).
+They exclude the summary, system/AGENTS text, tool schemas, current User/Steer
+input, framing, and provider tokenization. The byte scan is bounded; bytes and
+tokens are `null` when the query cannot finish within that bound, and
+`within_runtime_limits` is then also `null` unless the item count already proves
+an over-limit history. `estimated_request_context_tokens` is explicitly
+`null` in P3a; a full prepared-request estimate is deferred to P3b. `last_result`
+is the latest manual compaction result retained by this loaded Session process;
+it is not a durable history record.
 
 ### `session.presentation`
 
