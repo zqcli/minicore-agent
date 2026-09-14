@@ -14,8 +14,17 @@ projects a validated summary plus the complete history suffix into a
 Runtime-compliant `LoopRequest`, preserves the projection through same-loop
 model updates, and exposes the read-only `session.context` capability. Its
 history estimate is bounded to the Runtime input suffix (or full history when
-no valid summary is loaded); full request-context budget and provider usage
-remain explicitly unknown where not observed.
+no valid summary is loaded); automatic preparation additionally records bounded
+current/last full-request and utility estimates without mixing main-turn usage.
+
+P3b1 (automatic threshold compaction, not overflow recovery) is implemented in
+this working tree: the `[compaction]` policy, startup preparation with a bounded
+deferred `turn.send`, per-request budget estimation, loop/source-bound ephemeral
+summaries, bounded automatic observations, and `context_uncompressible`
+reporting. Parent-run stable/MSRV suites each passed 484 tests (2 Live tests
+ignored); strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
+P3b2 provider overflow recovery
+remains pending; P4 is the separate Workspace slice.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,
@@ -28,8 +37,9 @@ manual-compaction regressions now have parent-owned remote verification; see
 The September 13, 2026 source-only execution violation and private-data-copy
 incident remains historical audit context; do not use its child-run claims as
 acceptance gates. No new compaction installation or native artifact is claimed.
-Automatic compaction, upstream overflow recovery and TUI `/compact` remain
-pending. A snapshot anchor binds raw JSONL prefix bytes and complete loop
+P3b1 automatic compaction has parent-owned remote verification;
+P3b2 provider overflow recovery and TUI `/compact`
+remain pending. A snapshot anchor binds raw JSONL prefix bytes and complete loop
 boundaries to the sanitized in-memory history; its covered-item count is not the
 raw record item count. See
 `docs/verification/compaction-manual-audit.md` for the historical incident scope

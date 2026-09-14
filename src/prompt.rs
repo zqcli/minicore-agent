@@ -7,7 +7,9 @@ use minicore_runtime::prompt::{
 };
 use minicore_runtime::value::BoundedText;
 
-use crate::compaction::{CompactionState, summary_data_message};
+use crate::compaction::{
+    AutoContext, CompactionState, PlanError, UtilityError, plan as plan_auto, summary_data_message,
+};
 use crate::workspace::{ReadPrefix, Workspace, WorkspaceError};
 
 pub(crate) const AGENTS_PATH: &str = "AGENTS.md";
@@ -17,18 +19,21 @@ const TRUNCATED: &str = "[truncated]";
 
 /// Request-level prompt provider that merges the session system prompt with a
 /// freshly read workspace `AGENTS.md`, applies the session-local or
-/// execution-bound derived snapshot projection, and delegates the remaining history to the runtime
-/// `DefaultPromptProvider`.
+/// execution-bound derived snapshot projection, and delegates the remaining
+/// history to the runtime `DefaultPromptProvider`.
 ///
 /// `AGENTS.md` is re-read for every model request, so edits become visible at
-/// the next request boundary without a file cache or watcher. Token fitting is
-/// intentionally not implemented; a history too large for the target model
-/// surfaces as a structured `ContextOverflow` model failure.
+/// the next request boundary without a file cache or watcher. With automatic
+/// compaction enabled, the same request also performs a bounded context
+/// estimate and folds complete tool exchanges or settled base items into
+/// ephemeral semantic summaries when needed. The disabled path retains Runtime's normal prompt
+/// preparation behavior.
 pub(crate) struct ProjectPromptProvider {
     workspace: Arc<Workspace>,
     system_prompt: BoundedText,
     compaction: Option<Arc<CompactionState>>,
     bound_summary: Option<BoundedText>,
+    auto: Option<AutoContext>,
     #[cfg(test)]
     read_gate: Option<Arc<PromptReadGate>>,
 }
@@ -39,6 +44,15 @@ impl ProjectPromptProvider {
         system_prompt: String,
         compaction: Arc<CompactionState>,
     ) -> Result<Self, AgentPromptError> {
+        Self::with_auto(workspace, system_prompt, compaction, None)
+    }
+
+    pub(crate) fn with_auto(
+        workspace: Arc<Workspace>,
+        system_prompt: String,
+        compaction: Arc<CompactionState>,
+        auto: Option<AutoContext>,
+    ) -> Result<Self, AgentPromptError> {
         let system_prompt =
             BoundedText::new(system_prompt).map_err(|_| AgentPromptError::InvalidSystemPrompt)?;
         Ok(Self {
@@ -46,6 +60,7 @@ impl ProjectPromptProvider {
             system_prompt,
             compaction: Some(compaction),
             bound_summary: None,
+            auto,
             #[cfg(test)]
             read_gate: None,
         })
@@ -55,14 +70,17 @@ impl ProjectPromptProvider {
         workspace: Arc<Workspace>,
         system_prompt: String,
         summary: BoundedText,
+        auto: Option<AutoContext>,
+        compaction: Arc<CompactionState>,
     ) -> Result<Self, AgentPromptError> {
         let system_prompt =
             BoundedText::new(system_prompt).map_err(|_| AgentPromptError::InvalidSystemPrompt)?;
         Ok(Self {
             workspace,
             system_prompt,
-            compaction: None,
+            compaction: Some(compaction),
             bound_summary: Some(summary),
+            auto,
             #[cfg(test)]
             read_gate: None,
         })
@@ -104,6 +122,7 @@ impl PromptProvider for ProjectPromptProvider {
         let tools = request.tools;
         let compaction = self.compaction.as_ref().map(Arc::clone);
         let bound_summary = self.bound_summary.clone();
+        let auto = self.auto.clone();
         #[cfg(test)]
         let read_gate = self.read_gate.clone();
         Box::pin(async move {
@@ -130,45 +149,102 @@ impl PromptProvider for ProjectPromptProvider {
             };
             let system = build_system_prompt(&system_base, agents)
                 .map_err(|_| PromptError::InvalidHistory)?;
-            let provider = DefaultPromptProvider::new(Some(system));
+            let compaction_for_clear = compaction.clone();
             let (projected_base, summary) = if let Some(summary) = bound_summary {
-                (Some(history.base()), Some(summary))
+                (history.base(), Some(summary))
             } else if let Some(compaction) = compaction {
                 match compaction.project(history.base()) {
-                    Some(projection) => (Some(projection.suffix), Some(projection.summary)),
-                    None => (None, None),
+                    Some(projection) => (projection.suffix, Some(projection.summary)),
+                    None => (history.base(), None),
                 }
             } else {
-                (None, None)
+                (history.base(), None)
             };
-            let projected_history = projected_base.map_or_else(
-                || HistoryView::new(history.base(), history.appended()),
-                |base| HistoryView::new(base, history.appended()),
-            );
-            let prepared = provider
-                .prepare(PromptRequest {
-                    loop_id,
-                    request_index,
-                    history: projected_history,
-                    model,
-                    reasoning,
-                    tools,
-                    cancellation,
-                    deadline,
-                })
-                .await?;
-            let Some(summary) = summary else {
+            let Some(auto) = auto.filter(|auto| auto.policy.enabled) else {
+                // Keep the disabled path on Runtime's original provider so
+                // automatic compaction does not change established history
+                // projection semantics.
+                let provider = DefaultPromptProvider::new(Some(system));
+                let projected_history = HistoryView::new(projected_base, history.appended());
+                let mut prepared = provider
+                    .prepare(PromptRequest {
+                        loop_id,
+                        request_index,
+                        history: projected_history,
+                        model,
+                        reasoning,
+                        tools,
+                        cancellation,
+                        deadline,
+                    })
+                    .await?;
+                if let Some(summary) = summary {
+                    let summary_message =
+                        summary_data_message(&summary).map_err(|_| PromptError::InvalidHistory)?;
+                    let insert_at = prepared
+                        .messages
+                        .iter()
+                        .position(|message| matches!(message, ModelMessage::System(_)))
+                        .map_or(0, |index| index + 1);
+                    prepared.messages.insert(insert_at, summary_message);
+                }
+                if let Some(compaction) = compaction_for_clear {
+                    compaction.clear_prepare_failure();
+                }
                 return Ok(prepared);
             };
-            let summary_message =
-                summary_data_message(&summary).map_err(|_| PromptError::InvalidHistory)?;
-            let mut messages = prepared.messages;
-            let insert_at = messages
-                .iter()
-                .position(|message| matches!(message, ModelMessage::System(_)))
-                .map_or(0, |index| index + 1);
-            messages.insert(insert_at, summary_message);
-            Ok(minicore_runtime::prompt::PreparedPrompt { messages })
+            // History items are projected exactly as the runtime
+            // `DefaultPromptProvider` would, then kept separate from the
+            // system/durable-summary prefix so groups can be folded.
+            let (fixed, history_messages) = crate::compaction::auto_compose(
+                &system,
+                summary.as_ref(),
+                projected_base,
+                history.appended(),
+            )
+            .map_err(|_| PromptError::InvalidHistory)?;
+            let budget = auto.policy.budget(model.context_window);
+            match plan_auto(
+                &fixed,
+                history_messages,
+                &system,
+                projected_base,
+                history.appended(),
+                tools,
+                reasoning,
+                budget,
+                &auto,
+                deadline.into_std(),
+                &cancellation,
+                loop_id,
+                request_index,
+            )
+            .await
+            {
+                Ok(messages) => {
+                    auto.state.clear_prepare_failure();
+                    Ok(minicore_runtime::prompt::PreparedPrompt { messages })
+                }
+                Err(PlanError::Cancelled) => Err(PromptError::Cancelled),
+                Err(PlanError::Uncompressible) => {
+                    auto.state
+                        .note_prepare_failure(crate::compaction::CONTEXT_UNCOMPRESSIBLE);
+                    Err(PromptError::InvalidHistory)
+                }
+                Err(PlanError::Utility(UtilityError::Cancelled)) => Err(PromptError::Cancelled),
+                Err(PlanError::Utility(UtilityError::Timeout)) => {
+                    auto.state
+                        .note_prepare_failure(UtilityError::Timeout.kind());
+                    Err(PromptError::Cancelled)
+                }
+                // A failed semantic summary means the request cannot be
+                // prepared within budget; report it as uncompressible rather
+                // than sending a truncated or untrusted context.
+                Err(PlanError::Utility(error)) => {
+                    auto.state.note_prepare_failure(error.kind());
+                    Err(PromptError::InvalidHistory)
+                }
+            }
         })
     }
 }

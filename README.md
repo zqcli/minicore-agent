@@ -35,9 +35,13 @@ The Agent is the local backend for one client TUI. The TUI communicates with it
 exclusively through the stdio JSON-RPC interface (see
 [docs/rpc.md](docs/rpc.md)); it does not call the Rust library API directly.
 This repository does not ship a real TUI, plugin system, MCP integration,
-automatic compaction, or upstream overflow recovery. Its bounded manual
-compaction and startup-projection implementation is remotely verified on the
-development branch, but is not part of a new installed Agent release. It also includes a native, stateless `subagent` Tool for explicitly
+or upstream overflow recovery. The bounded manual and startup-projection
+slice is remotely verified on the development branch; the current P3b1 automatic
+threshold slice is also remotely verified (484 stable/MSRV tests passed,
+2 Live tests ignored). P3b2 is reserved
+for the narrow provider replay adapter/wrapper and exact request-budget gate;
+P4 remains the bounded Workspace slice. Neither is part of a new installed Agent
+release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
 Profile `system_prompt` keeps its existing inline string form and also accepts
@@ -158,9 +162,10 @@ turn.steer             interaction.answer
 ```
 
 `session.transcript` is gone; `session.history` returns the sanitized stored
-history. Errors are classified as before with domain codes `-32001` through
-`-32018`; the added reload errors are `-32017 reload_requires_restart` and
-`-32018 reload_unavailable`. The full wire contract, frame interleaving
+history. Errors are classified with domain codes `-32001` through `-32022`;
+`-32017 reload_requires_restart`, `-32018 reload_unavailable`, and
+`-32022 context_uncompressible` are the latest additions. The full wire contract,
+frame interleaving
 guarantees, event shapes, and error mapping are documented in
 [docs/rpc.md](docs/rpc.md).
 
@@ -178,8 +183,11 @@ has parent-owned remote acceptance (see [progress](docs/0914-progress.md)), but
 no new installation. It projects a validated summary and
 its complete history suffix into the next Runtime `LoopRequest`; it also exposes
 `session.context` and reports manual utility usage separately from ordinary turn
-usage. Automatic/overflow compaction and
-the TUI command remain pending; no automatic behavior is implied here. The
+usage. P3b1 automatic threshold compaction has passed parent-owned remote
+verification: the `[compaction]` policy, a bounded deferred
+startup preparation, per-request budget estimation and ephemeral tool-exchange
+summaries, bounded automatic observations, and `context_uncompressible`
+reporting. P3b2 provider overflow recovery and the TUI command remain pending. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;
@@ -187,14 +195,21 @@ there is no new release,
 installation or native-artifact acceptance.
 
 `session.context` is a read-only Session-owned projection of the current manual
-compaction operation, validated-summary coverage, recent manual result, and the
-estimated Runtime history budget. Its `estimated_history_*` fields cover only
-the projected history suffix (or full history when no valid summary is loaded),
-not the summary, system/AGENTS text, tools, current input, or exact provider
-tokenization. `estimated_request_context_tokens` is `null` in P3a. A manual
+or startup compaction operation, validated-summary coverage, recent manual
+result, and the estimated Runtime history budget. Its `estimated_history_*`
+fields cover only the projected history suffix (or full history when no valid
+summary is loaded), not the summary, system/AGENTS text, tools, current input,
+or exact provider tokenization. `estimated_request_context_tokens` is the latest
+bounded automatic full-request estimate, and the `automatic` object retains
+current/last operation metadata plus utility accounting without summary bodies.
+When automatic compaction is enabled, `input_budget_tokens`,
+`trigger_tokens`, and `target_tokens` expose the model's already-reduced context
+window and policy thresholds, and `last_prepare_failure` may report
+`context_uncompressible`. A manual
 result with `utility_usage.complete: false` carries incomplete accounting; its
-nested `usage` contains completed-call usage only and may be `null`. Usage
-emitted by a stream that later fails is not currently retained. It is never a
+nested `usage` contains known fields from completed calls and failed streams
+that emitted usage, and may be `null`. Usage emitted by a stream that later
+fails is retained as a known partial total rather than dropped. It is never a
 zero-filled copy of the main turn usage.
 
 `session.presentation` is a read-only footer/tool-card projection. It returns
@@ -287,13 +302,13 @@ and `run_stdio`. The crate is `#![forbid(unsafe_code)]`.
 
 `Agent` opens the local Store and manages multiple loaded Sessions. `Agent`
 owns the global event channel; one Session owns its own history and runs at
-most one loop or manual compaction operation at a time. `session.create` and
-`session.open` never start a loop. `session.close` cancels active work, joins
-Session-owned workers, and persists cleanly before returning.
+most one loop, manual compaction, or startup admission operation at a time.
+`session.create` and `session.open` never start a loop. `session.close` cancels
+active work, joins Session-owned workers, and persists cleanly before returning.
 
 `Agent::shutdown` is the cleanup barrier for embedded Rust callers. It cancels
-active loops and manual compaction, waits for Agent-owned workers and any
-native child workers, and awaits persistence wrap-up.
+active loops, manual compaction, and startup admission, waits for Agent-owned
+workers and any native child workers, and awaits persistence wrap-up.
 Dropping an Agent with live turns does not synchronously wait for Agent-owned
 loop tasks. MiniCore Agent v0.3 uses the Runtime user-cancellation path when
 closing or shutting down an active Session; it does not currently preserve a

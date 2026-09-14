@@ -2,10 +2,11 @@
 
 Status: **The Task 1 snapshot foundation is accepted. The manual Agent/RPC
 draft was checkpointed at `5397a65`. P3a and its manual-compaction regressions
-are now parent-reviewed and remotely verified: 451 stable/MSRV tests passed,
-2 Live tests ignored, strict Clippy/fmt/rustdoc passed. See
-[development progress](0914-progress.md). P3b automatic/overflow work remains
-pending**. See the
+are parent-reviewed and remotely verified: 451 stable/MSRV tests passed, 2 Live
+tests ignored, strict Clippy/fmt/rustdoc passed. P3b1 automatic compaction is
+parent-reviewed and remotely verified: 484 stable/MSRV tests passed, 2 Live
+tests ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
+Provider replay budgeting and overflow recovery remain pending (P3b2)**. See the
 [manual execution audit](verification/compaction-manual-audit.md) for historical
 incident context. Foundation acceptance baseline: Agent `eec636a`, TUI `6ecd736`,
 Runtime 0.4.1 revision
@@ -27,16 +28,63 @@ P3a additionally projects a validated summary and its complete history suffix
 into a Runtime-compliant startup `LoopRequest`, binds that projection through a
 same-loop model update, exposes `session.context`, and keeps manual utility usage
 separate from ordinary turn usage. Context budget fields describe only the
-Runtime history suffix; the full prepared-request estimate remains `null` until
-later budget work, and bounded scans do not block on unbounded history. Utility
-accounting retains observed call attempts and known usage from completed calls
-on later failure with an explicit `complete` flag; usage emitted by a failed
-stream remains unknown in this slice. The complete `history.jsonl` remains
+Runtime history suffix; automatic preparation also retains a bounded current/last
+full-request estimate and utility observation, while bounded scans do not block
+on unbounded history. Utility accounting retains observed call attempts and known
+usage from accepted calls
+on later failure with an explicit `complete` flag; usage a stream emitted before
+failing is retained as a known partial total, never filled with zero. The
+complete `history.jsonl` remains
 authoritative.
 Automatic compaction, TUI `/compact`, and upstream overflow recovery are not
 part of P3a. Final release review and acceptance remain
 parent-owned; child-run results are unaccepted and must not be used as gates.
 The private-copy cleanup decision remains separate from this source handoff.
+
+## P3b1 Automatic Compaction
+
+P3b1 adds the Agent-global `[compaction]` policy
+(`enabled = true`, `trigger_percent = 80`, `target_percent = 50`; the default
+is enabled and validates `0 < target < trigger <= 100`) and request-time
+threshold compaction. It does not add upstream overflow recovery; that remains
+the separate P3b2 adapter/wrapper slice.
+
+In an automatic session, admission first reserves a Session-owned
+preparation while it computes a bounded startup estimate. An over-limit projected
+history or over-trigger request then folds a settled prefix into durable
+`summary.json`; a request that fits starts directly from the same worker. No
+`AgentLoop` exists while this decision or summary work is pending, and
+`turn.send` returns a deferred RPC response that resolves with the real `TurnRef`
+only after the loop is created. `session.context` reports the preparing
+operation, and `session.compact.cancel` terminates a preparation that has not
+started its loop. A disabled policy keeps the previous
+`history_too_large` behavior; existing tests enable automatic compaction only
+explicitly.
+
+At every request boundary the effective input budget is derived from the
+model's already-reduced context window (its adapter has subtracted output and
+safety reserves, so no reserve is subtracted twice). The hard window is the only
+uncompressible boundary; the trigger only starts an attempt, and the target is
+a preferred size. The estimate covers system and AGENTS text, the durable
+summary, the history suffix, current User/Steer text, tool schemas, and bounded
+provider-style framing. Complete tool exchanges are folded as whole groups;
+settled ordinary base items may also receive temporary summaries when a hot
+smaller window requires them. Current User and Steer text are preserved
+verbatim. A request whose irreducible system/User/tool-schema minimum exceeds
+the hard window fails as `context_uncompressible` without a utility call. A
+request above the trigger but within the hard window may be accepted when the
+target is unreachable. Model hot-updates re-derive the budget while preserving
+an ephemeral summary only when its loop, source range, and source hash still
+match.
+
+Automatic request preparation raises the configured prompt timeout to at least
+the configured/raw model-operation timeout, while Runtime's overall turn
+deadline remains authoritative. Startup admission and manual compaction each
+have their own operation deadline; utility chunks share the remaining deadline
+of that operation. Semantic summary failures (no progress, empty, oversized,
+or timeout) are reported as request-preparation failures, not silently
+truncated. `session.context` retains only bounded current/last estimates and
+utility accounting; ordinary main-turn usage is never mixed into it.
 
 ## Goals
 
@@ -106,8 +154,10 @@ trigger_percent = 80
 target_percent = 50
 ```
 
-`enabled` controls automatic compaction and automatic overflow recovery; explicit
-manual compaction remains available. Validate `0 < target < trigger <= 100`.
+`enabled` controls the P3b1 automatic compaction paths; explicit manual
+compaction remains available. P3b2 is reserved for the narrow provider replay
+adapter/wrapper and exact `requestContextBudget` acceptance gate; it is not part
+of this P3b1 handoff. Validate `0 < target < trigger <= 100`.
 Use the currently selected model's effective budget. Apply threshold checks at
 **every request boundary**, including requests after tools, not only at turn
 admission. Defaults and config placement remain subject to focused validation,
@@ -133,7 +183,8 @@ Keep the existing display-only wrapper unchanged in responsibility:
 raw Model -> CompactingModel -> PresentationModel -> ExecutionConfig
 ```
 
-`CompactingModel` is separate from `PresentationModel`. It can catch a structured
+P3b2, not P3b1, is the narrow `CompactingModel` adapter/wrapper slice. It is
+separate from `PresentationModel`; it can catch a structured
 `ContextOverflow + NotStarted` from the raw `Model::start`, obtain a smaller
 request, and invoke the raw model once more with the same `ModelCallContext`.
 Runtime receives one logical request and never re-applies its boundary or tools.
@@ -207,7 +258,7 @@ late-response tombstones, selection and history-reconciliation rules.
    budget estimation and ephemeral current-tool summaries. Test below/exact/above
    threshold, model switching, giant single tool results, no-progress failure,
    cancellation and utility input bounds. Review and commit.
-4. **Upstream context recovery**: one-shot inner model wrapper, exact request
+4. **P3b2 provider context recovery**: one-shot inner model wrapper, exact request
    binding and clean tool/replay projection. Test same logical loop/request index,
    one User/Steer occurrence, tools exactly once after prior batches, new Steers
    queued for the next boundary, second rejection, unknown/started/partial errors,
@@ -233,5 +284,5 @@ copies remain pending the user's cleanup authorization. No new native artifact
 or installation was made.
 
 See [staged compaction verification](verification/compaction.md). TUI
-`/compact`, automatic compaction, overflow recovery, and persistent subagents
-remain separate work.
+`/compact`, automatic compaction, P3b2 overflow recovery, and persistent
+subagents remain separate work. P4 remains the bounded Workspace slice.

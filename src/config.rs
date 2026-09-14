@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use minicore_runtime::{LoopOptions, LoopStartError};
 
+use crate::compaction::CompactionPolicy;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::Profiles;
 pub use crate::profiles::{ApprovalMode, Profile};
@@ -34,6 +35,64 @@ pub struct AgentConfig {
     pub models: BTreeMap<String, ModelConfig>,
     #[serde(default, rename = "loop")]
     pub loop_options: LoopOverrides,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+}
+
+/// Agent-global automatic compaction policy. This is runtime policy, not
+/// persisted Session state; a reload replaces the future-turn policy.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionConfig {
+    #[serde(default = "default_compaction_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_compaction_trigger_percent")]
+    pub trigger_percent: u8,
+    #[serde(default = "default_compaction_target_percent")]
+    pub target_percent: u8,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_compaction_enabled(),
+            trigger_percent: default_compaction_trigger_percent(),
+            target_percent: default_compaction_target_percent(),
+        }
+    }
+}
+
+impl CompactionConfig {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if self.target_percent == 0
+            || self.trigger_percent == 0
+            || self.trigger_percent > 100
+            || self.target_percent >= self.trigger_percent
+        {
+            return Err(ConfigError::InvalidCompaction);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn policy(&self) -> CompactionPolicy {
+        CompactionPolicy {
+            enabled: self.enabled,
+            trigger_percent: self.trigger_percent,
+            target_percent: self.target_percent,
+        }
+    }
+}
+
+fn default_compaction_enabled() -> bool {
+    true
+}
+
+fn default_compaction_trigger_percent() -> u8 {
+    80
+}
+
+fn default_compaction_target_percent() -> u8 {
+    50
 }
 
 impl AgentConfig {
@@ -125,6 +184,7 @@ impl AgentConfig {
                 return Err(ConfigError::ToolsNotSupported);
             }
         }
+        self.compaction.validate()?;
         self.loop_options(32).map(|_| ())
     }
 
@@ -167,6 +227,42 @@ impl AgentConfig {
         options
             .validate()
             .map_err(|_| ConfigError::InvalidLoopOptions)?;
+        Ok(options)
+    }
+
+    /// Returns loop options with the automatic prompt-preparation budget
+    /// widened to cover at least one configured model operation. The regular
+    /// `loop_options` path remains unchanged for disabled/manual behavior.
+    pub(crate) fn loop_options_for_automatic(
+        &self,
+        max_tool_rounds: u16,
+    ) -> Result<LoopOptions, ConfigError> {
+        let mut options = self.loop_options(max_tool_rounds)?;
+        if self.compaction.enabled {
+            options.prompt_timeout = options.prompt_timeout.max(options.model_timeout);
+            options
+                .validate()
+                .map_err(|_| ConfigError::InvalidLoopOptions)?;
+        }
+        Ok(options)
+    }
+
+    pub(crate) fn loop_options_for_model(
+        &self,
+        max_tool_rounds: u16,
+        model_id: &str,
+    ) -> Result<LoopOptions, ConfigError> {
+        let mut options = self.loop_options_for_automatic(max_tool_rounds)?;
+        if self.compaction.enabled {
+            if let Some(model) = self.models.get(model_id) {
+                if let Some(timeout) = model.request_timeout() {
+                    options.prompt_timeout = options.prompt_timeout.max(timeout);
+                }
+            }
+            options
+                .validate()
+                .map_err(|_| ConfigError::InvalidLoopOptions)?;
+        }
         Ok(options)
     }
 }
@@ -334,6 +430,8 @@ pub enum ConfigError {
     ToolsNotSupported,
     #[error("configuration loop overrides are invalid")]
     InvalidLoopOptions,
+    #[error("configuration compaction policy is invalid")]
+    InvalidCompaction,
 }
 
 #[cfg(test)]
@@ -344,6 +442,13 @@ mod tests {
 
     use crate::models::ModelConfig;
     use crate::profiles::ApprovalMode;
+
+    fn disabled_compaction() -> CompactionConfig {
+        CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        }
+    }
 
     fn model_config(
         supported_reasoning: BTreeSet<ReasoningPreference>,
@@ -384,6 +489,7 @@ mod tests {
                 model_config(BTreeSet::from([ReasoningPreference::Auto]), true),
             )]),
             loop_options: LoopOverrides::default(),
+            compaction: disabled_compaction(),
         }
     }
 
@@ -506,6 +612,50 @@ request_timeout_seconds = 30
     }
 
     #[test]
+    fn compaction_policy_bounds_are_enforced() {
+        for (target, trigger, valid) in [
+            (50u8, 80u8, true),
+            (0, 80, false),
+            (80, 80, false),
+            (81, 80, false),
+            (50, 0, false),
+            (50, 101, false),
+        ] {
+            let mut config = valid_config();
+            config.compaction = CompactionConfig {
+                enabled: true,
+                trigger_percent: trigger,
+                target_percent: target,
+            };
+            if valid {
+                assert!(config.validate().is_ok());
+            } else {
+                assert_eq!(config.validate(), Err(ConfigError::InvalidCompaction));
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_defaults_are_enabled_at_eighty_fifty() {
+        let config = AgentConfig::from_toml(&config_with_prompt_spec(r#""system""#)).unwrap();
+        assert!(config.compaction.enabled);
+        assert_eq!(config.compaction.trigger_percent, 80);
+        assert_eq!(config.compaction.target_percent, 50);
+    }
+
+    #[test]
+    fn explicit_compaction_table_overrides_defaults() {
+        let text = format!(
+            "{}\n[compaction]\nenabled = false\ntrigger_percent = 90\ntarget_percent = 60\n",
+            config_with_prompt_spec(r#""system""#)
+        );
+        let config = AgentConfig::from_toml(&text).unwrap();
+        assert!(!config.compaction.enabled);
+        assert_eq!(config.compaction.trigger_percent, 90);
+        assert_eq!(config.compaction.target_percent, 60);
+    }
+
+    #[test]
     fn loop_overrides_are_validated() {
         let mut config = valid_config();
         config.loop_options.event_capacity = Some(0);
@@ -541,6 +691,28 @@ request_timeout_seconds = 30
         assert_eq!(options.max_pending_steers, 8);
         assert_eq!(options.model_retry_attempts, 3);
         assert_eq!(options.model_retry_base_delay, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn automatic_options_give_prompt_preparation_a_model_timeout_floor() {
+        let mut config = valid_config();
+        config.compaction.enabled = true;
+        config.loop_options.prompt_timeout_seconds = Some(5);
+        config.loop_options.model_timeout_seconds = Some(17);
+        let options = config.loop_options_for_automatic(7).unwrap();
+        assert_eq!(options.prompt_timeout, Duration::from_secs(17));
+        assert_eq!(options.model_timeout, Duration::from_secs(17));
+        let options = config.loop_options_for_model(7, "main").unwrap();
+        assert_eq!(options.prompt_timeout, Duration::from_secs(30));
+
+        config.loop_options.prompt_timeout_seconds = Some(30);
+        let options = config.loop_options_for_automatic(7).unwrap();
+        assert_eq!(options.prompt_timeout, Duration::from_secs(30));
+
+        config.compaction.enabled = false;
+        config.loop_options.prompt_timeout_seconds = Some(5);
+        let options = config.loop_options_for_automatic(7).unwrap();
+        assert_eq!(options.prompt_timeout, Duration::from_secs(5));
     }
 
     #[test]

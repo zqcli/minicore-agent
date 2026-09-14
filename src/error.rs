@@ -82,6 +82,8 @@ pub enum AgentError {
     QueryLimit,
     #[error("tool reference is unknown or was evicted")]
     ToolNotFound,
+    #[error("the request context cannot be reduced without dropping user constraints")]
+    ContextUncompressible,
     #[error("I/O failure")]
     Io(#[from] io::Error),
 }

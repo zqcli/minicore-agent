@@ -16,7 +16,7 @@ use minicore_runtime::tools::{ToolOutput, ToolResultOutcome, ToolSpec};
 use minicore_runtime::{LoopId, ToolCallId};
 
 use crate::agent::{Agent, CreateSession, SendMessage};
-use crate::config::{AgentConfig, LoopOverrides, Profile};
+use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::event::{AgentEvent, OutputChannel};
 use crate::history::{GetHistory, HistoryItemView};
 use crate::models::{ModelConfig, Models};
@@ -5472,6 +5472,10 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
         )]),
         models: BTreeMap::from([("main".to_owned(), agent_model_config(server.base_url()))]),
         loop_options: LoopOverrides::default(),
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        },
     };
     let mut agent = Agent::open_with_models(config, models).await.unwrap();
     let session = agent
@@ -5812,6 +5816,10 @@ async fn openai_live_reasoning_tool_smoke() {
         )]),
         models: BTreeMap::from([("main".to_owned(), live_model_config(&live))]),
         loop_options: LoopOverrides::default(),
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        },
     };
     let mut agent = Agent::open(config)
         .await

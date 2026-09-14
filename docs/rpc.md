@@ -298,10 +298,10 @@ The result has a `session` member containing the created SessionInfo.
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
 
-The manual compaction methods and startup summary projection described here are
-source-draft APIs. Final P3a acceptance and installation remain pending; they
-are not available in the previously installed Agent binary. Automatic
-compaction and overflow recovery are separate pending work.
+The manual compaction methods, startup summary projection, and automatic
+compaction described here are source-handoff APIs. They are not available in
+the previously installed Agent binary and remain subject to parent acceptance.
+P3b2 provider overflow recovery is separate pending work.
 
 The deferred compact result has this shape:
 
@@ -339,9 +339,9 @@ must not retry blindly.
 `call_count` includes an attempt that failed before returning a complete
 response. `complete` is true only when generation completed and every completed
 call returned usage data; a failed/in-flight call or missing usage makes it
-false. The nested `usage` aggregates completed calls only. If a stream fails
-after emitting its own `Usage` event, that event is not currently retained and
-the total remains incomplete. This accounting is independent of ordinary turn
+false. The nested `usage` aggregates known fields from completed calls and
+from failed streams that emitted a `Usage` event; fields that were not observed
+remain unknown. This accounting is independent of ordinary turn
 usage; missing fields remain unknown rather than being filled with zero.
 
 The summary utility calls the selected raw model directly with a fresh loop
@@ -375,27 +375,45 @@ The result is returned directly:
     "estimated_history_bytes": 1480,
     "estimated_history_tokens": 370,
     "estimated_request_context_tokens": null,
+    "input_budget_tokens": 16384,
+    "trigger_tokens": 13107,
+    "target_tokens": 8192,
     "max_history_items": 4096,
     "max_history_bytes": 1048576,
     "within_runtime_limits": true
-  }
+  },
+  "automatic": {
+    "current": null,
+    "last": null
+  },
+  "last_prepare_failure": null
 }
 ```
 
 `current_operation`, when non-null, has the same safe progress shape exposed
-by `session.state`. `coverage` is non-zero only for a currently validated
-summary snapshot; `retained_item_count` is calculated against the complete
-loaded history. `estimated_history_items`, `estimated_history_bytes`, and
-`estimated_history_tokens` describe only the history suffix passed to Runtime
-as `LoopRequest.history` (or full history when no valid summary is loaded).
-They exclude the summary, system/AGENTS text, tool schemas, current User/Steer
-input, framing, and provider tokenization. The byte scan is bounded; bytes and
-tokens are `null` when the query cannot finish within that bound, and
-`within_runtime_limits` is then also `null` unless the item count already proves
-an over-limit history. `estimated_request_context_tokens` is explicitly
-`null` in P3a; a full prepared-request estimate is deferred to P3b. `last_result`
-is the latest manual compaction result retained by this loaded Session process;
-it is not a durable history record.
+by `session.state`; it also names a startup admission preparation. `coverage` is
+non-zero only for a currently validated summary snapshot; `retained_item_count`
+is calculated against the complete loaded history. `estimated_history_items`,
+`estimated_history_bytes`, and `estimated_history_tokens` describe only the
+history suffix passed to Runtime as `LoopRequest.history` (or full history when
+no valid summary is loaded). They exclude the summary, system/AGENTS text, tool
+schemas, current User/Steer input, framing, and provider tokenization. The byte
+scan is bounded; bytes and tokens are `null` when the query cannot finish within
+that bound, and `within_runtime_limits` is then also `null` unless the item
+count already proves an over-limit history. `estimated_request_context_tokens`
+is the latest bounded full-request estimate observed by automatic preparation
+(the current estimate while preparing, otherwise the last completed estimate);
+it is `null` before any automatic preparation. The `automatic` object retains
+only current/last operation metadata, fitting estimates, and bounded utility
+accounting; it does not expose summary bodies or ordinary model-report usage.
+When automatic compaction is enabled, `input_budget_tokens`,
+`trigger_tokens`, and `target_tokens` describe the model's already-reduced
+context window and the active policy thresholds; they are `null` when the
+policy is disabled. `last_prepare_failure` is the most recent
+request-preparation failure kind (or `null`, for example before any failure)
+and is cleared by a successful preparation. `last_result` is the latest manual
+compaction result retained by this loaded Session process; it is not a durable
+history record.
 
 ### `session.presentation`
 
@@ -673,8 +691,26 @@ The successful result preserves the original `turn` member and may add
 {"turn":{"session_id":"ses_...","loop_id":"lup_..."},"accepted_at":"2026-01-02T03:04:05.006Z"}
 ```
 
-The timestamp is when the Agent accepted the Prompt, not when the loop or
-provider request completed. It may be omitted if the clock was unavailable.
+The timestamp is when the Agent accepted the Prompt (for a deferred automatic
+submission, when its prepared loop is installed), not when the loop or provider
+request completes. It may be omitted if the clock was unavailable.
+
+When automatic compaction is enabled, `turn.send` is deferred while the
+Session computes a bounded startup estimate after checking the irreducible
+minimum and Runtime structural limits. If the projected history exceeds
+the Runtime limits or the request exceeds the trigger, the Session first folds
+a settled prefix into a bounded `summary.json`; a fitting request creates its
+loop directly from the same preparation worker. The deferred response carries
+the same result shape once the loop exists; `session.context` reports the
+preparing operation while it runs, and `session.compact.cancel` terminates a
+preparation that has not started its loop. If the waiter pool is full, the
+just-started preparation is cancelled and the request fails with `-32019`
+(`resource_exhausted`) rather than running an unawaitable operation. A request
+whose irreducible system/current-input/tool-schema minimum still exceeds the
+hard model window fails with `-32022` (`context_uncompressible`); semantic summary
+failures return an internal error and do not start a loop, while their stable
+failure kind is retained in `session.context.last_prepare_failure`. A disabled
+policy keeps the previous immediate `-32015` (`history_too_large`).
 
 ### `turn.wait`
 
@@ -987,6 +1023,7 @@ errors:
 | `-32019` | `resource_exhausted` |
 | `-32020` | `query_limit` |
 | `-32021` | `tool_not_found` |
+| `-32022` | `context_uncompressible` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or

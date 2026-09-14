@@ -6,11 +6,14 @@ Agent starting HEAD: `8b8bbcb33dd692f023e89a0eefcbbb6f2c7a87c0`.
 Runtime remains pinned to 0.4.1, `6cd2bdbc634437dea925495c61c7eb0be10ba171`.
 
 Historical audit reports remain historical evidence and previous unaccepted
-results are not acceptance gates. The current source handoff implements P3a only:
-startup projection from a validated summary, same-loop model-update binding,
-`session.context`, and independent manual utility usage reporting. P3a source,
-tests and documentation passed parent review and remote acceptance. Automatic compaction and
-upstream overflow recovery remain pending.
+results are not acceptance gates. The current source handoff includes the P3a foundation and the P3b1 automatic
+compaction slice: startup projection from a validated summary, same-loop
+model-update binding, `session.context`, independent manual utility usage, the
+Agent-global automatic policy, startup admission preparation, and request-time
+compaction. P3a source, tests and documentation passed parent review and remote
+acceptance; P3b1 also passed parent review and remote verification.
+P3b2 provider overflow recovery remains pending; P4 is the separate
+Workspace slice.
 
 ## Execution
 
@@ -31,7 +34,7 @@ historical audit. No credentials are stored in source.
 | P0 | Cancellation-safe RPC framing; bounded deferred admission | Verified, see below |
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
-| P3 | Manual acceptance, startup/request compaction, one overflow recovery | P3a verified; P3b automatic/overflow pending |
+| P3 | Manual acceptance, startup/request compaction, one overflow recovery | P3a/P3b1 verified; P3b2 replay budget/overflow pending |
 | P4 | Bounded Workspace files/read/search/status | Pending |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
@@ -65,8 +68,9 @@ Focused tests cover over-limit startup, reopen, unchanged history, no double
 slice, same-loop model updates, busy context, bounded context estimation,
 multiple utility calls, duplicate usage, missing usage, cancellation, and write
 failure. Utility result accounting carries observed call attempts, a `complete`
-flag, and known usage from completed calls only. A failed stream's own usage
-is currently treated as unknown; no value is filled with zero.
+flag, and known usage from accepted calls. The utility layer now also retains
+usage that a stream emitted before failing as a known partial total; the
+`complete` flag stays `false`, and no value is filled with zero.
 
 Parent-run remote Linux stable/MSRV suites each passed 451 tests, with 2 Live
 tests ignored. Strict Clippy, rustdoc and fmt checks passed. Logs are
@@ -74,6 +78,56 @@ tests ignored. Strict Clippy, rustdoc and fmt checks passed. Logs are
 Cross-platform checks will be repeated after P3b; P2's checks remain separate.
 P3a does not add automatic threshold compaction, current-tool ephemeral
 summaries, provider overflow recovery, or TUI `/compact`.
+
+## P3b1 Automatic Compaction
+
+P3b1 implements automatic threshold compaction only. It adds:
+
+- `[compaction]` Agent-global policy (`enabled`, `trigger_percent`,
+  `target_percent`) with `0 < target < trigger <= 100` validated at config
+  load and reload. The default is enabled at `80`/`50`; existing tests opt out
+  with an explicit disabled fixture rather than changing existing assertions.
+- Startup admission preparation: an automatic Session first reserves a
+  preparation while it computes a bounded projected request estimate. It
+  checks Runtime structural limits and the irreducible hard-window minimum
+  before composing a full request. When the Runtime item/byte limits or trigger are exceeded, it runs the no-tools
+  summary utility before any `AgentLoop` exists; a fitting request starts from
+  that same worker without a summary. `turn.send` is a deferred RPC that
+  resolves with the real `TurnRef` only after the loop is installed; a
+  preparation the reader cannot await is cancelled rather than left running.
+  `session.context`
+  addresses the preparing operation and `session.compact.cancel` terminates a
+  preparation that has not started a loop. Same-session turn admission stays
+  single; shutdown cancels and joins the preparation worker.
+- Request-time budget: the effective input budget is the model's already
+  reduced context window (output allowance and safety margin already removed,
+  never subtracted twice). It counts system and AGENTS text, the durable
+  summary, the history suffix, current User/Steer text, tool schemas and
+  provider-style framing. The hard window is the only failure boundary; the
+  trigger starts an attempt and the target is preferred. Complete tool
+  exchanges are folded as whole groups, and settled ordinary base items may be
+  folded when a smaller hot-swapped model requires it. Current User and Steer
+  text is preserved verbatim, no tool is re-run, no fake summary history is
+  written, and the summary is never promoted to system.
+- Uncompressible detection: a request whose irreducible system/current-input/
+  tool-schema minimum exceeds the hard window returns `context_uncompressible`
+  (`-32022`) without starting a summary loop. Semantic summary failures
+  (no progress, empty, oversized, timeout) are explicit preparation failures.
+- Deadline alignment: automatic summaries run inside the Runtime
+  operation deadline; startup/manual operations have independent deadlines,
+  and request-time utility chunks share the remaining turn
+  deadline, and model hot-updates re-derive the budget while preserving only
+  source-matching ephemeral summaries. Automatic options raise prompt
+  preparation to the model-operation timeout floor.
+
+Parent-run remote verification: Linux stable and Rust 1.85.0 each passed 484
+tests, with 2 Live tests ignored. Strict Clippy, rustdoc, fmt, and Windows/macOS
+all-target compile checks passed (existing Windows test-helper warning only).
+Logs: `/root/minicore-agent-0914/logs/p3b1-{tests,msrv,clippy,doc,windows,macos}.log`.
+
+P3b1 does not add upstream `ContextOverflow` recovery, TUI `/compact`, or any
+new AgentLoop/Service architecture. P3b2 is the narrow provider replay
+adapter/wrapper and exact request-budget gate; P4 remains Workspace.
 
 ## P0 Verification
 

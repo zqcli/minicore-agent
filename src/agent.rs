@@ -16,7 +16,9 @@ use minicore_runtime::prompt::PromptProvider;
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
-use crate::compaction::{CompactionResult, CompactionState, load_state, valid_operation_id};
+use crate::compaction::{
+    AutoContext, CompactionResult, CompactionState, load_state, valid_operation_id,
+};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
@@ -183,6 +185,7 @@ struct ExecutionConfigFactory<'a> {
     command_environment: &'a CommandEnvironment,
     subagents: Arc<SubagentService>,
     compaction: Arc<CompactionState>,
+    policy: crate::compaction::CompactionPolicy,
 }
 
 impl ExecutionConfigFactory<'_> {
@@ -192,11 +195,17 @@ impl ExecutionConfigFactory<'_> {
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
         options: LoopOptions,
-    ) -> Result<ExecutionConfig, AgentError> {
+    ) -> Result<(ExecutionConfig, Option<AutoContext>), AgentError> {
         let model = self
             .models
             .get(&record.model)
             .map_err(map_model_config_error)?;
+        let auto = self.policy.enabled.then(|| AutoContext {
+            model: Arc::clone(&model),
+            policy: self.policy,
+            max_prompt_messages: options.limits.max_prompt_messages,
+            state: Arc::clone(&self.compaction),
+        });
         let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
         let subagent = record
             .tools
@@ -233,17 +242,19 @@ impl ExecutionConfigFactory<'_> {
         };
         let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
             Arc::new(
-                ProjectPromptProvider::new(
+                ProjectPromptProvider::with_auto(
                     workspace,
                     record.system_prompt.clone(),
                     Arc::clone(&self.compaction),
+                    auto.clone(),
                 )
                 .map_err(|_| AgentError::InvalidSessionSettings)?,
             ),
             presentation,
         );
-        ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
-            .map_err(|_| AgentError::InvalidSessionSettings)
+        let config = ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
+            .map_err(|_| AgentError::InvalidSessionSettings)?;
+        Ok((config, auto))
     }
 }
 
@@ -383,24 +394,32 @@ impl Agent {
             let workspace = session.workspace();
             let presentation = session.presentation();
             let options = candidate
-                .loop_options(record.max_tool_rounds)
+                .loop_options_for_model(record.max_tool_rounds, &record.model)
                 .map_err(AgentError::Config)?;
             let factory = ExecutionConfigFactory {
                 models: &models,
                 command_environment: &command_environment,
                 subagents: Arc::clone(&self.subagents),
                 compaction: session.compaction_state(),
+                policy: candidate.compaction.policy(),
             };
-            let config = factory.build(&record, workspace, presentation, options.clone())?;
-            session_candidates.push((session.clone(), config, options));
+            let (config, auto) =
+                factory.build(&record, workspace, presentation, options.clone())?;
+            session_candidates.push((
+                session.clone(),
+                config,
+                auto,
+                candidate.compaction.policy(),
+                options,
+            ));
         }
 
         self.config = candidate;
         self.profiles = profiles;
         self.models = models;
         self.command_environment = command_environment;
-        for (session, config, options) in session_candidates {
-            session.replace_future_config(config, options);
+        for (session, config, auto, policy, options) in session_candidates {
+            session.replace_future_config(config, auto, policy, options);
         }
         tracing::info!("agent configuration reloaded");
         Ok(ReloadResult { ok: true })
@@ -426,6 +445,16 @@ impl Agent {
         session_id: crate::ids::SessionId,
     ) -> Option<crate::sessions::Session> {
         self.sessions.get(session_id).cloned()
+    }
+
+    pub(crate) fn automatic_compaction_enabled(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<bool, AgentError> {
+        self.sessions
+            .get(session_id)
+            .map(crate::sessions::Session::automatic_compaction_enabled)
+            .ok_or(AgentError::SessionNotLoaded)
     }
 
     pub(crate) fn store_handle(&self) -> Store {
@@ -565,15 +594,16 @@ impl Agent {
             .await;
         let options = self
             .config
-            .loop_options(record.max_tool_rounds)
+            .loop_options_for_model(record.max_tool_rounds, &record.model)
             .map_err(AgentError::Config)?;
         let compaction = CompactionState::new();
-        let config = self.execution_config(
+        let (config, auto) = self.execution_config(
             &record,
             Arc::clone(&workspace),
             Arc::clone(&presentation),
             options.clone(),
             Arc::clone(&compaction),
+            self.config.compaction.policy(),
         )?;
         self.store
             .create_session(&record)
@@ -586,9 +616,11 @@ impl Agent {
             std::collections::HashMap::new(),
             presentation,
             config,
+            auto,
             options,
             Arc::clone(&self.subagents),
             compaction,
+            self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
         );
@@ -650,15 +682,16 @@ impl Agent {
             .await;
         let options = self
             .config
-            .loop_options(stored.record.max_tool_rounds)
+            .loop_options_for_model(stored.record.max_tool_rounds, &stored.record.model)
             .map_err(AgentError::Config)?;
         let compaction = load_state(&self.store, session_id, &stored.history).await;
-        let config = self.execution_config(
+        let (config, auto) = self.execution_config(
             &stored.record,
             Arc::clone(&workspace),
             Arc::clone(&presentation),
             options.clone(),
             Arc::clone(&compaction),
+            self.config.compaction.policy(),
         )?;
         let session = crate::sessions::Session::new(
             stored.record.clone(),
@@ -667,9 +700,11 @@ impl Agent {
             stored.user_times,
             presentation,
             config,
+            auto,
             options,
             Arc::clone(&self.subagents),
             compaction,
+            self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
         );
@@ -786,16 +821,17 @@ impl Agent {
         }
         let options = self
             .config
-            .loop_options(candidate.max_tool_rounds)
+            .loop_options_for_model(candidate.max_tool_rounds, &candidate.model)
             .map_err(AgentError::Config)?;
-        let config = self.execution_config(
+        let (config, auto) = self.execution_config(
             &candidate,
             workspace,
             session.presentation(),
             options,
             session.compaction_state(),
+            session.policy(),
         )?;
-        let active_revision = session.update(candidate.clone(), config).await?;
+        let active_revision = session.update(candidate.clone(), config, auto).await?;
         session
             .presentation()
             .set_model_label(candidate.model.clone());
@@ -835,23 +871,41 @@ impl Agent {
         Ok(SessionInfo::from_record(&record, false))
     }
 
-    /// Sends a prompt and preserves the original public return type. RPC uses
-    /// `send_accepted` when it also needs the optional acceptance timestamp.
+    /// Sends a prompt and preserves the original public return type. A startup
+    /// preparation is awaited here so embedded callers still receive a real
+    /// `TurnRef`; RPC uses `submit_accepted` to defer instead of blocking the
+    /// reader.
     pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
-        Ok(self.send_accepted(request).await?.turn)
-    }
-
-    pub(crate) async fn send_accepted(
-        &mut self,
-        request: SendMessage,
-    ) -> Result<crate::sessions::LoopAccepted, AgentError> {
         let session = self
             .sessions
             .get(request.session_id)
             .cloned()
             .ok_or(AgentError::SessionNotLoaded)?;
         let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
-        session.start_loop(input).await
+        match session.submit(input).await? {
+            crate::sessions::LoopSubmission::Accepted(accepted) => Ok(accepted.turn),
+            crate::sessions::LoopSubmission::Preparing(waiter) => {
+                crate::sessions::await_loop_preparation(waiter)
+                    .await
+                    .map(|accepted| accepted.turn)
+            }
+        }
+    }
+
+    /// Admits one submission for the RPC server. An automatic session returns
+    /// a preparation the server observes as a deferred waiter; a disabled
+    /// session returns the loop immediately.
+    pub(crate) async fn submit_accepted(
+        &mut self,
+        request: SendMessage,
+    ) -> Result<crate::sessions::LoopSubmission, AgentError> {
+        let session = self
+            .sessions
+            .get(request.session_id)
+            .cloned()
+            .ok_or(AgentError::SessionNotLoaded)?;
+        let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
+        session.submit(input).await
     }
 
     pub(crate) async fn compact_session(
@@ -1078,12 +1132,14 @@ impl Agent {
         presentation: Arc<crate::presentation::Presentation>,
         options: minicore_runtime::LoopOptions,
         compaction: Arc<CompactionState>,
-    ) -> Result<ExecutionConfig, AgentError> {
+        policy: crate::compaction::CompactionPolicy,
+    ) -> Result<(ExecutionConfig, Option<AutoContext>), AgentError> {
         let factory = ExecutionConfigFactory {
             models: &self.models,
             command_environment: &self.command_environment,
             subagents: Arc::clone(&self.subagents),
             compaction,
+            policy,
         };
         factory.build(record, workspace, presentation, options)
     }
