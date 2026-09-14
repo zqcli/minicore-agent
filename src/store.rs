@@ -1403,7 +1403,7 @@ fn finish_empty_history_page(
     })
 }
 
-fn digest_hex(hasher: Sha256) -> String {
+pub(crate) fn digest_hex(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let mut value = String::with_capacity(64);
     for byte in digest {

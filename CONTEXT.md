@@ -26,7 +26,9 @@ ignored); strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
 P3b2 provider replay budgeting and one-shot overflow recovery have passed parent
 review and remote verification: 511 stable/MSRV tests passed, 2 Live ignored;
 strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed. P4 is the
-next, separate Workspace slice.
+next, separate Workspace slice; P4a `workspace.read` is verified with 528
+stable/MSRV tests passed, 2 Live ignored, and strict Clippy/fmt/rustdoc plus
+Windows/macOS compile checks passed. Files/search/status remain pending.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,

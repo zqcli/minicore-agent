@@ -5510,6 +5510,74 @@ async fn tool_invocation_is_isolated_across_sessions() {
     ));
 }
 
+fn workspace_read_request(session_id: SessionId, path: &str) -> crate::WorkspaceReadRequest {
+    crate::WorkspaceReadRequest {
+        session_id,
+        path: path.to_owned(),
+        start_line: None,
+        line_byte_offset: None,
+        max_lines: None,
+        max_bytes: None,
+        if_revision: None,
+    }
+}
+
+#[tokio::test]
+async fn workspace_read_requires_a_loaded_session_and_touches_nothing_else() {
+    let (data_dir, _guard) = fixture_dir(&format!("workspace-read-{}", next_id()));
+    let (workspace, _guard) = workspace_file("workspace-read-ws", "note.txt", b"raw\ncontent\n");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session_id = info.session_id;
+
+    let history_path = data_dir
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("history.jsonl");
+    let history_before = std::fs::read(&history_path).unwrap();
+    let file_path = workspace.join("note.txt");
+    let file_before = std::fs::read(&file_path).unwrap();
+
+    let result = agent
+        .workspace_read(workspace_read_request(session_id, "note.txt"))
+        .await
+        .unwrap();
+    assert_eq!(result.status, crate::WorkspaceReadStatus::Ok);
+    assert_eq!(result.content, "raw\ncontent\n");
+    assert_eq!(result.returned_lines, 2);
+    assert_eq!(result.revision.as_deref().map(str::len), Some(64));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+    assert_eq!(std::fs::read(&file_path).unwrap(), file_before);
+
+    // A closed Session no longer locates its Workspace, and an unknown Session
+    // ID is never guessed into one.
+    agent.close_session(session_id).await.unwrap();
+    assert!(matches!(
+        agent
+            .workspace_read(workspace_read_request(session_id, "note.txt"))
+            .await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    assert!(matches!(
+        agent
+            .workspace_read(workspace_read_request(
+                SessionId::new().unwrap(),
+                "note.txt"
+            ))
+            .await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+}
+
 #[tokio::test]
 async fn tool_read_exposes_approval_time_data_without_running() {
     use crate::tool_data::{ToolExecutionState, ToolSubject};

@@ -18,6 +18,7 @@ use crate::read::{ReadSession, TurnResultRequest};
 use crate::sessions::{
     TurnRef, await_compaction_completion, await_loop_preparation, await_turn_completion,
 };
+use crate::workspace::query::{WORKSPACE_READ_DEADLINE, WorkspaceReadRequest};
 
 use super::protocol::{
     AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, EmptyParams,
@@ -442,6 +443,47 @@ impl RpcServer {
                     let response = match tokio::time::timeout(
                         crate::read::READ_DEADLINE,
                         crate::read::read_session(store, loaded, request, cancellation),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => success(&id, result),
+                        Ok(Err(error)) => query_error(id, &error),
+                        Err(_) => agent_error(id, &AgentError::QueryLimit),
+                    };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
+            }
+            "workspace.read" => {
+                let request: WorkspaceReadRequest = match params_or_error(&id, params) {
+                    Ok(request) => request,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                // Lexical path/range validation happens before a query slot is
+                // reserved; the offset itself is checked against the file.
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                let Some(session) = self.agent().loaded_session(request.session_id) else {
+                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                };
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let session_cancellation = session.query_cancellation();
+                let workspace = session.workspace();
+                drop(session);
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    let response = match tokio::time::timeout(
+                        WORKSPACE_READ_DEADLINE,
+                        crate::workspace::query::read(
+                            workspace,
+                            request,
+                            session_cancellation,
+                            cancellation,
+                        ),
                     )
                     .await
                     {
@@ -1007,6 +1049,7 @@ fn canonical_method(method: &str) -> &'static str {
         "session.history" => "session.history",
         "session.read" => "session.read",
         "session.presentation" => "session.presentation",
+        "workspace.read" => "workspace.read",
         "tool.read" => "tool.read",
         "tool.output" => "tool.output",
         "turn.send" => "turn.send",

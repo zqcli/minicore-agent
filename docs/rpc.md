@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -71,9 +71,9 @@ be recovered.
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
 requests are dispatched sequentially. `turn.wait`, `session.compact`,
-`session.read`, and `turn.result` are exceptions: the server registers one
-bounded owned task and immediately continues reading requests. A deferred
-query/waiter does not own the underlying Session operation.
+`session.read`, `workspace.read`, and `turn.result` are exceptions: the server
+registers one bounded owned task and immediately continues reading requests. A
+deferred query/waiter does not own the underlying Session operation.
 
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
@@ -82,8 +82,8 @@ The following orderings are not guaranteed:
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
 - a deferred `turn.wait` response before responses to later requests;
-- a deferred `session.compact`, `session.read`, or `turn.result` response before
-  responses to later requests.
+- a deferred `session.compact`, `session.read`, `workspace.read`, or
+  `turn.result` response before responses to later requests.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -112,6 +112,7 @@ protocol version, and ordered capability names:
     "tool.read",
     "tool.output",
     "session.history",
+    "workspace.read",
     "deferred.waiter_limit"
   ]
 }
@@ -919,6 +920,123 @@ through `escape_default`, and offsets always refer to the raw bytes. Clients
 remain responsible for not executing ANSI/control characters as terminal
 instructions. A requested `max_bytes` outside the supported range is rejected
 with `invalid_params`; it is never silently raised.
+
+## Workspace
+
+### `workspace.read`
+
+`workspace.read` is a bounded, read-only query over the Workspace of a loaded
+Session. It does not create, open, or load a Session, does not start a model
+call, does not append history, and does not mutate the file, so a frontend can
+page through a file while a turn is in flight. A closed or unknown Session is
+rejected with `-32002` (`session_not_loaded`); closing the owning Session
+cancels its in-flight reads with `-32020` (`query_limit`). The query never
+derives a root from a path. It holds one of the 4 concurrent read-query slots
+described above. P4a has passed parent review and remote verification; see
+`0914-progress.md` for the gates and platform limits.
+
+```json
+{
+  "session_id": "ses_...",
+  "path": "src/main.rs",
+  "start_line": 1,
+  "line_byte_offset": 0,
+  "max_lines": 400,
+  "max_bytes": 65536,
+  "if_revision": null
+}
+```
+
+`path` is a workspace-relative path of a regular file, at most 4096 bytes;
+absolute paths, `..`, and NUL are rejected with `-32602` before a read-query
+slot is reserved. The path is resolved against the canonical Workspace root, and
+the open is non-blocking on Unix and does not follow a final symlink, so a
+special file cannot block the query. That boundary is a sandbox for cooperative
+local clients, not a defense against an adversarial process running as the same
+user.
+
+`start_line` is one-based and defaults to `1`. `line_byte_offset` is a UTF-8
+byte offset inside that line and defaults to `0`; it must be sent together with
+`start_line`, fall inside the line, land on a character boundary, and not
+exceed the 512 KiB whole-file bound. It exists to continue a line that a
+previous page cut. `max_lines` accepts `1..=2000` and defaults to `400`,
+matching the read Tool's line window. `max_bytes` is an
+encoded result budget like `session.read`'s: it accepts `1024..=262144`,
+defaults to 64 KiB, and covers this result's metadata and JSON escaping rather
+than the content length. A value outside these ranges, an offset outside the
+requested line, or a budget that cannot hold the metadata envelope plus one
+character is rejected with `-32602`; the budget is never silently raised.
+
+```json
+{
+  "path": "src/main.rs",
+  "content": "fn main() {}\n",
+  "start_line": 1,
+  "returned_lines": 1,
+  "revision": "536e506bb90914c243a12b397b9a998f85ae2cbd9ba02dfd03a9e155ca5ca0f4",
+  "truncated": false,
+  "line_truncated": false,
+  "next_range": null,
+  "encoding": "utf8",
+  "status": "ok",
+  "file_bytes": 13,
+  "file_modified_unix_ms": 1760000000000
+}
+```
+
+One read performs a single bounded read: it uses the read Tool's 512 KiB
+whole-file bound (`MAX_READ_BYTES`), one open, one read, and metadata before and
+after. The UTF-8/NUL check, `revision`, and the returned page all describe those
+same bytes, so a response can never combine an older hash with newer content. A
+file larger than the bound returns `status: too_large` with empty `content` and
+`revision: null`; there is no partial preview and no partial revision.
+`revision` is the whole-file SHA-256 in lowercase hex of the bytes that were
+read, present only when they form one consistent whole file. When the file
+changes while it is read (size or full modification time differs before and
+after), the response is `status: changed` with empty content and no revision.
+Reads describe a live observation of those bytes: they never promise a
+filesystem snapshot or lock out a concurrent writer.
+
+`content` is the raw file text exactly as stored: line numbers are never
+prepended, CRLF is preserved, and escaping is never applied. This differs
+intentionally from the numbered rendering of the `read` Tool, and reading a
+workspace file adds nothing to history. `returned_lines` counts the lines the
+content touches; a final line without a trailing newline still counts once, and
+a trailing newline does not create an extra line. `file_bytes` and
+`file_modified_unix_ms` are the metadata observed after the read, and the latter
+is `null` when the filesystem does not report a modification time.
+
+`status` describes what the response contains:
+
+| Status | Meaning |
+|---|---|
+| `ok` | `content` holds the requested page. |
+| `binary` | The whole file contains NUL or is not valid UTF-8; `content` is empty and `encoding` is `unknown`. |
+| `changed` | The bytes did not form one consistent whole file, or `if_revision` no longer matches; `content` is empty. |
+| `too_large` | The file is larger than the whole-file bound; `content` is empty and `revision` is `null`. |
+
+`if_revision` is compared case-insensitively against `revision`; a mismatch
+returns `changed` with no content, and `revision` carries the revision that was
+observed so a client can adopt it instead of silently reading a newer file.
+
+Pagination is byte-exact. `next_range` carries the next `start_line` and
+`line_byte_offset`, and it always advances. A page that ends inside a line
+(`line_truncated: true`) continues that same line at the byte offset after the
+returned content, so the remainder is never skipped. Carry `if_revision` on
+continuation requests: concatenating pages of the same revision reproduces the
+file bytes exactly, and a CRLF may be split across pages. Without that condition,
+each page is an independent live observation and a concurrent edit may change it.
+`truncated` is true when the content does not reach the end of the requested
+range. Both the line window and the encoded byte budget can cut a page, and a
+single line longer than the budget is returned across as many pages as it
+needs. `truncated` and `next_range` describe an `ok` page; `binary`, `changed`,
+and `too_large` return empty content, no next range, and `truncated: false`.
+
+Cancellation and deadlines wrap the actual IO: the session close token, RPC
+shutdown, and the shared 10 s query deadline each interrupt a pending open,
+read, or metadata call and return retryable `-32020` (`query_limit`). Finishing
+or cancelling a query releases its slot, and shutdown cancels and joins all
+owned queries before the shutdown response.
 
 ## Interactions
 

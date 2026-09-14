@@ -13,7 +13,8 @@ startup projection from a validated summary, same-loop model-update binding,
 policy, startup admission preparation, request-time compaction, exact provider
 replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
 P3b2 passed parent review and remote verification. P4 is the next, separate
-Workspace slice.
+Workspace slice; its read-only query (P4a) has passed parent review and remote
+verification. Files/search/status remain pending.
 
 ## Execution
 
@@ -38,7 +39,7 @@ stored in source.
 | P1 | Read-only session pages; retained turn-result queries | Linux stable/MSRV verified; Windows/macOS compile checks passed |
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
-| P4 | Bounded Workspace files/read/search/status | Pending |
+| P4 | Bounded Workspace files/read/search/status | P4a `workspace.read` verified (528 stable/MSRV passed, 2 Live ignored); files/search/status pending |
 | P5 | Owned Bash streaming, cancellation, result retention | Pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
@@ -209,6 +210,67 @@ cases with recoverable sources, same logical request/deadline across Driver
 re-entry, and synchronized manual-cancel accounting. No local compilation,
 native Windows/macOS test execution, Live Provider test, installation, version
 bump or push was performed. Runtime remains pinned to the revision above.
+
+## P4a Workspace Read
+
+P4a implements only the read-only workspace file query; files/search/status and
+later P4/P5+ slices are not started.
+
+- **Ownership**: `workspace.read` is a loaded-Session query. `Agent::workspace_read`
+  and the RPC arm resolve the Session first, then borrow its canonical
+  `Workspace` plus a Session-owned cancellation token. A closed or unknown
+  Session returns `session_not_loaded`; closing the Session (or dropping it)
+  cancels its in-flight reads with `query_limit`, and the RPC `queries` JoinSet
+  owns and joins the task without a new service or manager.
+- **One bounded read, live observation**: the query opens the regular file
+  through a shared `Workspace::open_regular_file` helper (also used by the read
+  Tool's `read_prefix`), takes the read Tool's 512 KiB whole-file bound, and
+  reads once. The UTF-8/NUL check, the whole-file SHA-256 revision, and the
+  returned page all describe the same bytes, so an old hash can never accompany
+  newer content. Files over the bound are `too_large` with no preview and no
+  revision; a size or full modification-time change across the read is
+  `changed` with empty content. The result is an observation of the bytes that
+  were read, not a filesystem snapshot, and it never locks out a concurrent
+  writer.
+- **Lossless pagination**: pages are cut by the requested line window and by
+  the encoded byte budget, and a cut inside a line returns `line_truncated`
+  with `next_range {start_line, line_byte_offset}` that continues the same line
+  at the byte offset after the returned content. Nothing is skipped, CRLF may
+  split across pages, and concatenating pages from the same revision reproduces
+  the file bytes exactly. Clients carry `if_revision` on continuation pages to
+  detect intervening changes. `max_bytes` is an encoded result budget (metadata plus JSON
+  escaping) with `1024..=262144` and a 64 KiB default; a budget that cannot
+  hold the metadata envelope and one character is an argument error rather than
+  a silent truncation.
+- **IO and platform boundaries**: path/range validation is lexical (a
+  `4096`-byte path cap, a `line_byte_offset` inside the whole-file bound) and
+  happens before a query slot is reserved. On Unix the open uses
+  `O_NONBLOCK | O_NOFOLLOW` (via the `libc` constants in a `cfg(unix)`
+  dependency) and the post-open metadata still requires a regular file, so a
+  FIFO swapped in after the metadata check cannot block the open; Windows keeps
+  the existing regular-file checks. Cancellation and the 10 s deadline wrap
+  each open/read/metadata await, so a pending IO step cannot outlive either.
+
+Known limits: the revision is a live hash of the bytes that were read, not a
+lock or snapshot; the path sandbox is not an adversarial same-user defense; a
+`line_byte_offset` must be a character boundary inside the requested line
+(checked against the file, not lexically); and `too_large` is a whole-file
+bound rather than a per-page limit. Search/status, change scopes and versioned
+diffs remain pending.
+
+Parent-owned remote verification: stable and Rust 1.85.0 each passed 528 tests
+(502 library and 26 integration), with 2 Live tests ignored. Strict Clippy, fmt,
+rustdoc and Windows/macOS all-target cross-compilation passed; the existing
+Windows `write_reload_config` test-helper warning remains. Tests cover whole-file
+revision consistency, encoded size accounting, lossless long unicode/control/
+CRLF pagination, limits and binary data, post-metadata FIFO replacement,
+Session-close/shutdown/deadline cancellation, no model/history side effects,
+and RPC responsiveness/capacity reuse. The shared read Tool regressions passed.
+Logs: `/root/minicore-agent-0914/logs/p4a-{tests,clippy,msrv,fmt,doc,windows,macos}.log`.
+The parent generated the lockfile remotely with `cargo update --offline
+--workspace`; only the root package's dependency on already-locked libc 0.2.189
+was added. No dependency was upgraded. No local compilation, native cross-platform
+test execution, Live Provider test, installation, version bump or push occurred.
 
 ## P0 Verification
 

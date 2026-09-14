@@ -336,7 +336,11 @@ impl Sessions {
     }
 
     pub(crate) fn remove(&mut self, session_id: SessionId) -> Option<Session> {
-        self.loaded.remove(&session_id)
+        let session = self.loaded.remove(&session_id)?;
+        // Workspace queries are owned by the loaded Session; closing it stops
+        // them instead of reading a Workspace whose Session is gone.
+        session.cancel_queries();
+        Some(session)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Session> {
@@ -358,7 +362,7 @@ impl Sessions {
             }
             // Keep the Session in the map until its shutdown barrier has
             // joined every owned worker, including manual compaction.
-            self.loaded.remove(&session_id);
+            self.remove(session_id);
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -373,6 +377,7 @@ impl Drop for Sessions {
         for session in self.loaded.values() {
             session.cancel_active_on_drop();
             session.cancel_compaction_on_drop();
+            session.cancel_queries();
         }
     }
 }
@@ -395,10 +400,19 @@ struct SessionShared {
     inner: Mutex<SessionInner>,
     /// Serializes history appends and session.json updates for one session.
     io: tokio::sync::Mutex<()>,
+    /// Cancelled when the loaded Session is closed or dropped. In-flight
+    /// workspace queries owned by this Session observe it and stop.
+    close: CancellationToken,
     store: Store,
     events: AgentEventSink,
     subagents: Arc<SubagentService>,
     compaction: Arc<CompactionState>,
+}
+
+impl Drop for SessionShared {
+    fn drop(&mut self) {
+        self.close.cancel();
+    }
 }
 
 struct SessionInner {
@@ -910,6 +924,7 @@ impl Session {
             shared: Arc::new(SessionShared {
                 inner: Mutex::new(inner),
                 io: tokio::sync::Mutex::new(()),
+                close: CancellationToken::new(),
                 store,
                 events,
                 subagents,
@@ -931,6 +946,17 @@ impl Session {
     pub(crate) fn workspace(&self) -> Arc<Workspace> {
         let inner = self.shared.inner.lock().unwrap();
         Arc::clone(&inner.workspace)
+    }
+
+    /// Cancellation observed by read queries that are owned by this loaded
+    /// Session's Workspace. It fires when the Session is closed or dropped.
+    pub(crate) fn query_cancellation(&self) -> CancellationToken {
+        self.shared.close.clone()
+    }
+
+    /// Stops in-flight workspace queries owned by this loaded Session.
+    pub(crate) fn cancel_queries(&self) {
+        self.shared.close.cancel();
     }
 
     pub(crate) fn compaction_state(&self) -> Arc<CompactionState> {
