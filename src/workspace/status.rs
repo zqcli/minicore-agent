@@ -2055,7 +2055,7 @@ mod tests {
         cleanup(&fixture);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[tokio::test]
     async fn a_non_utf8_path_is_skipped_and_marked_incomplete() {
         use std::os::unix::ffi::OsStrExt;
@@ -2232,7 +2232,7 @@ mod tests {
         executable(
             &script,
             &format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) printf '%s\\n' '{}' ;;\nesac\ndd if=/dev/zero bs=1024 count=4096 1>&2 2>/dev/null\n: > '{}'\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) printf '%s\\n' '{}' ;;\nesac\ndd if=/dev/zero bs=1024 count=4096 1>&2 2>/dev/null\nsleep 30\n: > '{}'\n",
                 fixture.root.display(),
                 survived.display()
             ),

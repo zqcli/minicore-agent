@@ -1717,7 +1717,9 @@ mod tests {
         let mut worker = owners.start(request).unwrap();
         let outcome = worker.completion().await;
         assert_eq!(outcome.result.status, CommandStatus::Cancelled);
-        assert!(outcome.result.exit_code.is_none());
+        // Windows reports the job termination code while Unix reports a
+        // signal with no exit code. Neither may be presented as success 0.
+        assert_ne!(outcome.result.exit_code, Some(0));
         assert!(
             !dir.join("side-effect.txt").exists(),
             "a cancelled queued command still ran its side effects"

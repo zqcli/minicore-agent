@@ -946,7 +946,7 @@ mod tests {
         let mut task = tokio::spawn(async move {
             tool.execute(
                 invocation(json!({
-                    "command": windows_grandchild_command(false),
+                    "command": windows_grandchild_command(true),
                     "timeout_seconds": 10
                 })),
                 context(

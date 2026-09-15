@@ -26,6 +26,8 @@ impl Fixture {
         fixture.git(&["init", "-q"]);
         fixture.git(&["config", "user.name", "Test"]);
         fixture.git(&["config", "user.email", "test@example.invalid"]);
+        fixture.git(&["config", "core.autocrlf", "false"]);
+        fixture.git(&["config", "core.safecrlf", "false"]);
         fixture
     }
     fn git(&self, args: &[&str]) {
