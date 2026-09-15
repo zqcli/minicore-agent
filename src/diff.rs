@@ -44,7 +44,7 @@ const DEFAULT_DIFF_MAX_BYTES: usize = 64 * 1024;
 /// rejection rather than a page that could never continue.
 const MIN_DIFF_MAX_BYTES: usize = 2048;
 const MAX_DIFF_MAX_BYTES: usize = 256 * 1024;
-const MAX_CHANGE_REF_BYTES: usize = 128;
+const MAX_CHANGE_REF_BYTES: usize = 16384;
 
 pub(crate) fn diff_deadline() -> Instant {
     Instant::now()
@@ -52,7 +52,7 @@ pub(crate) fn diff_deadline() -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffComparison {
     /// The tool's captured before and after snapshots of one file.
@@ -132,6 +132,8 @@ pub struct ChangesDiffRequest {
     pub session_id: SessionId,
     pub change_ref: String,
     #[serde(default)]
+    pub comparison: Option<DiffComparison>,
+    #[serde(default)]
     pub context_lines: Option<usize>,
     #[serde(default)]
     pub cursor: Option<DiffCursor>,
@@ -148,11 +150,15 @@ impl ChangesDiffRequest {
             .change_ref
             .strip_prefix("tool:")
             .is_some_and(valid_sha256)
-            || self
-                .change_ref
-                .strip_prefix("workspace:")
-                .is_some_and(valid_sha256);
+            || crate::changes::parse_workspace_ref(&self.change_ref, self.session_id).is_ok();
         if !well_formed {
+            return Err(AgentError::InvalidArguments);
+        }
+        if self.comparison.is_some_and(|comparison| {
+            (self.change_ref.starts_with("tool:") && comparison != DiffComparison::ToolBeforeAfter)
+                || (self.change_ref.starts_with("workspace:")
+                    && comparison == DiffComparison::ToolBeforeAfter)
+        }) {
             return Err(AgentError::InvalidArguments);
         }
         if self
@@ -208,6 +214,8 @@ pub struct DiffResult {
     pub coverage: ChangeCoverage,
     pub binary: bool,
     pub stale: bool,
+    /// Workspace comparisons explicitly refresh list-time observations.
+    pub versions_refreshed: bool,
     pub availability: DiffAvailability,
     pub hunks: Vec<DiffHunk>,
     pub complete: bool,
@@ -718,7 +726,6 @@ pub(crate) async fn changes_diff(
     if cancellation.is_cancelled() || Instant::now() >= deadline {
         return Err(AgentError::QueryLimit);
     }
-    let context_lines = request.context_lines();
     let max_bytes = request.max_bytes();
     if request.change_ref.starts_with("workspace:") {
         return encoded_result(workspace_unavailable(&request), max_bytes);
@@ -755,6 +762,7 @@ pub(crate) async fn changes_diff(
         coverage: change.coverage,
         binary: false,
         stale: false,
+        versions_refreshed: false,
         availability: DiffAvailability::Unavailable,
         hunks: Vec::new(),
         complete: false,
@@ -770,13 +778,68 @@ pub(crate) async fn changes_diff(
     let Some(after_bytes) = side_bytes(&change.after, change.after_bytes.take()) else {
         return encoded_result(base, max_bytes);
     };
+    compare_sources(
+        store,
+        request,
+        base,
+        before_bytes,
+        after_bytes,
+        cancellation,
+        deadline,
+    )
+    .await
+}
+
+type DiffBytes = (Arc<[u8]>, Arc<[u8]>);
+
+pub(crate) struct DiffSources {
+    pub base: DiffResult,
+    pub bytes: Option<DiffBytes>,
+}
+
+pub(crate) async fn workspace_diff(
+    store: Store,
+    request: ChangesDiffRequest,
+    sources: DiffSources,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<DiffResult, AgentError> {
+    match sources.bytes {
+        Some((before, after)) => {
+            compare_sources(
+                store,
+                request,
+                sources.base,
+                before,
+                after,
+                cancellation,
+                deadline,
+            )
+            .await
+        }
+        None => encoded_result(sources.base, request.max_bytes()),
+    }
+}
+
+async fn compare_sources(
+    store: Store,
+    request: ChangesDiffRequest,
+    base: DiffResult,
+    before_bytes: Arc<[u8]>,
+    after_bytes: Arc<[u8]>,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<DiffResult, AgentError> {
+    let context_lines = request.context_lines();
+    let max_bytes = request.max_bytes();
     let query = store
-        .spawn_diff_query(
+        .spawn_cancellable_diff_query(
             request.session_id,
             Arc::clone(&before_bytes),
             Arc::clone(&after_bytes),
             context_lines,
             deadline,
+            &cancellation,
         )
         .map_err(crate::sessions::map_store_error)?;
     let outcome = tokio::select! {
@@ -791,13 +854,25 @@ pub(crate) async fn changes_diff(
         DiffOutcome::Binary => encoded_result(
             DiffResult {
                 binary: true,
+                stale: request.cursor.is_some(),
                 availability: DiffAvailability::Binary,
                 complete: true,
                 ..clone_base(&base)
             },
             max_bytes,
         ),
-        DiffOutcome::Plan(plan) => {
+        DiffOutcome::Plan(mut plan) => {
+            if base.versions_refreshed {
+                plan.fingerprint = crate::store::hash_bytes(
+                    &serde_json::to_vec(&(
+                        &plan.fingerprint,
+                        &base.base_version,
+                        &base.target_version,
+                        base.comparison,
+                    ))
+                    .map_err(|_| AgentError::RpcSerialization)?,
+                );
+            }
             if let Some(cursor) = &request.cursor {
                 if cursor.ops_fingerprint != plan.fingerprint {
                     return encoded_result(
@@ -851,7 +926,7 @@ pub(crate) async fn changes_diff(
     }
 }
 
-fn workspace_unavailable(request: &ChangesDiffRequest) -> DiffResult {
+pub(crate) fn workspace_unavailable(request: &ChangesDiffRequest) -> DiffResult {
     DiffResult {
         change_ref: request.change_ref.clone(),
         path: String::new(),
@@ -865,6 +940,7 @@ fn workspace_unavailable(request: &ChangesDiffRequest) -> DiffResult {
         coverage: ChangeCoverage::Unavailable,
         binary: false,
         stale: false,
+        versions_refreshed: true,
         availability: DiffAvailability::Unavailable,
         hunks: Vec::new(),
         complete: false,
@@ -887,6 +963,7 @@ fn clone_base(base: &DiffResult) -> DiffResult {
         coverage: base.coverage,
         binary: false,
         stale: false,
+        versions_refreshed: base.versions_refreshed,
         availability: DiffAvailability::Unavailable,
         hunks: Vec::new(),
         complete: false,
@@ -1483,6 +1560,7 @@ mod tests {
 
     fn page_base(tool_ref: Option<ToolRef>) -> DiffResult {
         DiffResult {
+            versions_refreshed: false,
             change_ref: format!("tool:{}", "a".repeat(64)),
             path: "value.txt".to_owned(),
             kind: ChangeKind::Modified,
@@ -1527,6 +1605,7 @@ mod tests {
             session_id: base.session_id_for_test(),
             change_ref: base.change_ref.clone(),
             context_lines: Some(context),
+            comparison: None,
             cursor: None,
             max_bytes: Some(max_bytes),
         };
@@ -1647,6 +1726,7 @@ mod tests {
             session_id: base.session_id_for_test(),
             change_ref: base.change_ref.clone(),
             context_lines: Some(0),
+            comparison: None,
             cursor: None,
             max_bytes: Some(MIN_DIFF_MAX_BYTES),
         };
@@ -1722,6 +1802,7 @@ mod tests {
             session_id: base.session_id_for_test(),
             change_ref: base.change_ref.clone(),
             context_lines: Some(0),
+            comparison: None,
             cursor: None,
             max_bytes: Some(MIN_DIFF_MAX_BYTES),
         };
@@ -1763,6 +1844,7 @@ mod tests {
         let request = ChangesDiffRequest {
             session_id,
             change_ref: base.change_ref.clone(),
+            comparison: None,
             context_lines: Some(0),
             cursor: None,
             max_bytes: Some(MIN_DIFF_MAX_BYTES),

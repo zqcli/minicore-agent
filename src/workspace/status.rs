@@ -48,6 +48,11 @@ use crate::workspace::scan::{
     READ_CHUNK_BYTES, WorkspaceScanConsistency, encoded_len, now_unix_ms,
 };
 
+mod diff;
+pub(crate) use diff::diff_sources;
+#[cfg(test)]
+mod diff_tests;
+
 /// Wall-clock budget for one workspace status query, matching the other
 /// workspace queries. It is checked between bounded operations, so one blocking
 /// read on a stalled remote filesystem can outlast it.
@@ -126,7 +131,7 @@ pub enum WorkspaceStatusWarning {
 }
 
 /// Which kind of porcelain record produced an entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceStatusEntryKind {
     /// An ordinary changed entry, staged or unstaged.
@@ -144,7 +149,8 @@ pub enum WorkspaceStatusEntryKind {
 /// `index_status` and `worktree_status` are git's own `XY` codes; they are
 /// absent for untracked entries. `original_path` is the previous name of a
 /// rename or copy.
-#[derive(Clone, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceStatusEntry {
     pub path: String,
     pub kind: WorkspaceStatusEntryKind,
@@ -1062,6 +1068,8 @@ async fn run_git(run: &GitRun<'_>, args: &[OsString]) -> Result<GitOutput, Agent
     command.env("GIT_CONFIG_NOSYSTEM", "1");
     command.env("GIT_CONFIG_GLOBAL", null_device());
     command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
     // A query never inherits the Agent's RPC input pipe.
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());

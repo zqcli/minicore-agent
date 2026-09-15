@@ -1437,8 +1437,7 @@ watcher and no cache: every result comes from the query that produced it.
 
 The P6a change-review query lists bounded file-change records. It is read-only
 and does not call a model, write History, create a Session, or run a garbage
-collector. `changes.diff` is not implemented or advertised by this protocol
-version.
+collector. `changes.diff` resolves the references this method returns.
 
 ```json
 {
@@ -1518,49 +1517,85 @@ persistence failure do not change the native tool result.
 Workspace records report Git `modified`, `renamed`, `unmerged`, and
 `untracked` entries, subject to the same bounded status observation. A rename
 carries `original_path` when Git provided a safe workspace-relative old name.
-They use unknown content revisions because P6a does not yet provide
-version-bound diffs.
+List records use unknown content revisions; `changes.diff` reads and reports the
+actual compared versions with `versions_refreshed: true`.
 
 ### `changes.diff`
 
 `changes.diff` returns one bounded, read-only comparison for a retained
-`tool:` change reference. The workspace-Git scope is not implemented yet: a
-`workspace:` reference is answered with `availability: "unavailable"` rather
-than a fabricated comparison.
+`tool:` change reference or a `workspace:` reference from `changes.list`. A
+tool reference compares the real captured before/after buffers; a workspace
+reference compares Git objects and the worktree as described below.
 
 ```json
 {
   "session_id": "ses_...",
-  "change_ref": "tool:<sha256>",
+  "change_ref": "workspace:<opaque-token-from-changes.list>",
+  "comparison": "head_to_index",
   "context_lines": 3,
   "cursor": null,
   "max_bytes": 65536
 }
 ```
 
-The reference is resolved with an in-memory change when the Session is loaded,
-and otherwise through the same bounded metadata scan as `changes.list`; only
-the matched record's snapshots are read. A warm change with retained bytes
+A `tool:` reference is resolved with an in-memory change when the Session is
+loaded, and otherwise through the same bounded metadata scan as `changes.list`;
+only the matched record's snapshots are read. A warm change with retained bytes
 answers without disk I/O, and a warm record missing bytes is only completed
 from disk when the disk metadata is identical, so a different revision is never
-substituted. An unknown reference is `tool_not_found`.
+substituted. An unknown reference is `tool_not_found`. A cold `tool:` diff is
+resolved without loading the Session or its Workspace. A `workspace:` reference,
+by contrast, requires the Session to be loaded because its sources come from the
+Session's Workspace; an unloaded Session is `session_not_loaded`.
 
-The comparison is `comparison: "tool_before_after"` over the actual captured
-before and after buffers, never Git `HEAD`. A missing before is a genuine
-addition (`base_version: {"kind":"missing"}`). `unknown`, expired, or corrupt
-snapshots report `availability: "unavailable"`; NUL or invalid UTF-8 reports
-`binary: true` with no hunks. Each result carries `base_version`,
-`target_version`, `commit_state`, `coverage`, `binary`, `stale`,
-`availability`, structured `hunks`, `complete`, `truncated`, and an optional
-`next_cursor`.
+The tool comparison is `comparison: "tool_before_after"` over the actual
+captured before and after buffers, never Git `HEAD`. A missing before is a
+genuine addition (`base_version: {"kind":"missing"}`). `unknown`, expired, or
+corrupt snapshots report `availability: "unavailable"`; NUL or invalid UTF-8
+reports `binary: true` with no hunks.
+
+A `workspace:` reference is an opaque base64url token that only `changes.list`
+mints and `changes.diff` decodes. Clients must not parse or construct it. It
+carries the Session, the list-time `HEAD` OID, and the observed status entry.
+
+This token replaces the earlier hashed form, a development-protocol change with
+no Runtime version bump: a saved `workspace:` reference from before that change
+must be re-listed, and a reference's long-term liveness is not promised because
+it pins a list-time `HEAD` OID and status entry. The diff compares real Git
+objects and the worktree, never a list-time cached content:
+
+- `comparison` defaults to `index_to_worktree` when the entry has an unstaged
+  change or is untracked, otherwise `head_to_index`. An explicit `comparison`
+  must be `head_to_index`, `index_to_worktree`, or `head_to_worktree`; a
+  `tool:`/`tool_before_after` mismatch is rejected as invalid arguments.
+- The three sides are read each query with fixed, shell-free, read-only Git
+  arguments: `ls-files --stage -z` for the index OID, `ls-tree -z <head>` for
+  the `HEAD` OID, and `cat-file blob <oid>` for object bytes; the worktree side
+  is one bounded `capture_file`. Paths are literal pathspecs; no diff driver,
+  clean filter, textconv, external diff, lazy fetch, or replacement object runs.
+- `HEAD` is the list-time OID from the reference, so a concurrent commit is not
+  silently folded in; index and worktree are fresh observations, not a CAS.
+- Each side is bounded to 512 KiB. An untracked regular file is compared against a missing base as a
+  genuine addition; a removed worktree file is a genuine deletion. Unmerged,
+  gitlink, directory, symlink, oversized, or otherwise unreadable sides report
+  `availability: "unavailable"` rather than a fabricated file.
+- `versions_refreshed: true` means the reported `base_version`/`target_version`
+  are the versions actually compared this query, not the list-time snapshot.
+- When the workspace is a nested subdirectory, the reference path is resolved
+  against the repository top level and must stay inside the workspace.
+
+Each Workspace result carries `origin: "workspace_unknown"` (attribution is never
+claimed), `base_version`, `target_version`, `commit_state`, `coverage`,
+`binary`, `stale`, `availability`, `versions_refreshed`, structured `hunks`,
+`complete`, `truncated`, and an optional `next_cursor`.
 
 Each hunk has `old_start`/`old_count`/`new_start`/`new_count` and `lines`.
 Every line reports `kind` (`context`/`added`/`removed`), optional `old_index`
 and `new_index`, `line_byte_offset` inside `line_byte_len`, `text`, and
 `line_complete`. Concatenating fragments in offset order reconstructs the exact
 original bytes, including CRLF, a bare CR, and a missing final newline. The
-response is charged by encoded JSON bytes within `4096..=262144` (default
-64 KiB) and reserves room for a continuation cursor.
+response is charged by encoded JSON bytes within `2048..=262144` (default
+64 KiB) and reserves the actual measured room for a continuation cursor.
 
 The cursor binds the session, change reference, the actual diff-op fingerprint,
 context, and hunk/line/offset; `base_version` and `target_version` are carried

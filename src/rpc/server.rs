@@ -746,6 +746,41 @@ impl RpcServer {
                 }
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.session_id);
+                if request.change_ref.starts_with("workspace:") {
+                    let Some(session) = loaded else {
+                        return Dispatch::Response(query_error(id, &AgentError::SessionNotLoaded));
+                    };
+                    let deadline = diff_deadline();
+                    let cancellation = self.query_cancellation.clone();
+                    let session_cancel = session.query_cancellation();
+                    let query = match session.spawn_workspace_diff(
+                        request.clone(),
+                        cancellation.clone(),
+                        deadline,
+                    ) {
+                        Ok(query) => query,
+                        Err(error) => return Dispatch::Response(query_error(id, &error)),
+                    };
+                    let outbound = self.outbound_tx.clone();
+                    self.queries.spawn(async move {
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+                            _ = session_cancel.cancelled() => Err(AgentError::QueryLimit),
+                            _ = tokio::time::sleep_until(deadline.into()) => Err(AgentError::QueryLimit),
+                            result = async {
+                                let sources = query.wait().await?;
+                                crate::diff::workspace_diff(store, request, sources, session_cancel.clone(), deadline).await
+                            } => result,
+                        };
+                        let response = match result {
+                            Ok(result) => success(&id, result),
+                            Err(error) => query_error(id, &error),
+                        };
+                        let _ = outbound.send(RpcOutbound::Response(response)).await;
+                    });
+                    return Dispatch::Deferred;
+                }
                 let session_cancellation = loaded
                     .as_ref()
                     .map(|session| session.query_cancellation())
@@ -772,7 +807,7 @@ impl RpcServer {
                             store,
                             tool_data,
                             request,
-                            cancellation.clone(),
+                            session_cancellation.clone(),
                             deadline,
                         ) => match result {
                             Ok(result) => success(&id, result),
