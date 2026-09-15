@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,12 +18,17 @@ use minicore_runtime::LoopId;
 use minicore_runtime::execution::ConfigRevision;
 use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::{ModelError, ModelErrorKind, RetryHint, Usage};
+use minicore_runtime::tools::ToolResultOutcome;
 
 use crate::error::StoreError;
 use crate::history::sanitize_history;
 use crate::ids::SessionId;
 use crate::models::Models;
 use crate::profiles::ApprovalMode;
+use crate::tool_data::{
+    CommandResult, ToolExecutionState, ToolPersistenceSnapshot, ToolPhase, ToolRecord, ToolRef,
+    ToolSubject,
+};
 use crate::tools::KNOWN_TOOL_NAMES;
 
 pub(crate) const SESSION_FORMAT_VERSION: u32 = 1;
@@ -43,6 +49,30 @@ const MAX_TITLE_BYTES: usize = 4_096;
 const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 128 * 1024;
 
+pub(crate) const AUX_TOOLS_DIR: &str = "tools";
+pub(crate) const TOOL_RECORD_FILE: &str = "record.json";
+pub(crate) const TOOL_INPUT_FILE: &str = "input.bin";
+pub(crate) const TOOL_RESULT_FILE: &str = "result.bin";
+pub(crate) const TOOL_STDOUT_FILE: &str = "stdout.bin";
+pub(crate) const TOOL_STDERR_FILE: &str = "stderr.bin";
+pub(crate) const ALLOWED_AUX_FILES: [&str; 5] = [
+    TOOL_RECORD_FILE,
+    TOOL_INPUT_FILE,
+    TOOL_RESULT_FILE,
+    TOOL_STDOUT_FILE,
+    TOOL_STDERR_FILE,
+];
+pub(crate) const TOOL_RECORD_FORMAT_VERSION: u32 = 1;
+pub(crate) const MAX_TOOL_METADATA_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TOOL_INPUT_PERSIST_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TOOL_RESULT_PERSIST_BYTES: usize = 256 * 1024;
+pub(crate) const DEFAULT_SESSION_AUX_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_SESSION_AUX_RECORDS: usize = 1024;
+pub(crate) const DEFAULT_GLOBAL_AUX_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const DEFAULT_GLOBAL_AUX_RECORDS: usize = 8192;
+pub(crate) const MAX_AUX_SCAN_ENTRIES: usize = 65536;
+pub(crate) const AUX_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
+
 static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(test)]
@@ -52,11 +82,97 @@ static RECORD_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 #[cfg(test)]
 static SUMMARY_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 #[cfg(test)]
+static AUX_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+#[cfg(test)]
+static FAIL_REMOVE_TEMP_SESSIONS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+#[cfg(test)]
+type AuxCommitGateEntry = (SessionId, Arc<AuxCommitGate>);
+#[cfg(test)]
+static AUX_COMMIT_GATES: OnceLock<Mutex<Vec<AuxCommitGateEntry>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct AuxCommitGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AuxCommitGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_aux_commit_gate(session_id: SessionId, gate: Arc<AuxCommitGate>) {
+    let mutex = AUX_COMMIT_GATES.get_or_init(|| Mutex::new(Vec::new()));
+    mutex.lock().unwrap().push((session_id, gate));
+}
+
+#[cfg(test)]
+async fn wait_aux_commit_gate(session_id: SessionId) {
+    let gate = {
+        let Some(mutex) = AUX_COMMIT_GATES.get() else {
+            return;
+        };
+        let mut entries = mutex.lock().unwrap();
+        let Some(pos) = entries.iter().position(|(s, _)| *s == session_id) else {
+            return;
+        };
+        entries.remove(pos).1
+    };
+    gate.entered.notify_one();
+    gate.release.notified().await;
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_remove_temp(session_id: SessionId) {
+    let mutex = FAIL_REMOVE_TEMP_SESSIONS.get_or_init(|| Mutex::new(Vec::new()));
+    mutex.lock().unwrap().push(session_id);
+}
+
+#[cfg(test)]
+fn should_fail_remove_temp(session_id: SessionId) -> bool {
+    let Some(mutex) = FAIL_REMOVE_TEMP_SESSIONS.get() else {
+        return false;
+    };
+    let mut failures = mutex.lock().unwrap();
+    if let Some(pos) = failures.iter().position(|&s| s == session_id) {
+        failures.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+#[cfg(test)]
 type SummaryCommitGateEntry = (SessionId, Arc<SummaryCommitGate>);
 #[cfg(test)]
 static SUMMARY_COMMIT_GATES: OnceLock<Mutex<Vec<SummaryCommitGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 static SUMMARY_UNKNOWN_WRITES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn fail_next_aux_write(session_id: SessionId) {
+    let mutex = AUX_WRITE_FAILURES.get_or_init(|| Mutex::new(Vec::new()));
+    mutex.lock().unwrap().push(session_id);
+}
+
+#[cfg(test)]
+fn should_fail_aux_write(session_id: SessionId) -> bool {
+    let Some(mutex) = AUX_WRITE_FAILURES.get() else {
+        return false;
+    };
+    let mut failures = mutex.lock().unwrap();
+    if let Some(pos) = failures.iter().position(|item| *item == session_id) {
+        failures.remove(pos);
+        true
+    } else {
+        false
+    }
+}
 
 #[cfg(test)]
 pub(crate) struct SummaryCommitGate {
@@ -373,7 +489,87 @@ pub(crate) fn delivery_state(delivery: minicore_runtime::model::DeliveryState) -
 #[derive(Default, Clone)]
 pub(crate) struct Store {
     root: PathBuf,
+    aux_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    aux_limits: Option<AuxLimits>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredToolRecord {
+    pub(crate) version: u32,
+    pub(crate) tool_ref: ToolRef,
+    pub(crate) name: String,
+    pub(crate) subject: ToolSubject,
+    pub(crate) subject_truncated: bool,
+    pub(crate) state: ToolExecutionState,
+    pub(crate) phase: Option<ToolPhase>,
+    pub(crate) started_at: Option<String>,
+    pub(crate) finished_at: Option<String>,
+    pub(crate) outcome: Option<ToolResultOutcome>,
+    pub(crate) input: StoredInputSummary,
+    pub(crate) result: StoredResultSummary,
+    pub(crate) stdout: StoredStreamWindow,
+    pub(crate) stderr: StoredStreamWindow,
+    pub(crate) command: Option<CommandResult>,
+}
+
+struct ReadToolRecord {
+    metadata: StoredToolRecord,
+    record: ToolRecord,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredInputSummary {
+    pub(crate) total_bytes: usize,
+    pub(crate) seen: bool,
+    pub(crate) truncated: bool,
+    pub(crate) expired: bool,
+    pub(crate) file_bytes: usize,
+    pub(crate) file_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredResultSummary {
+    pub(crate) total_bytes: usize,
+    pub(crate) seen: bool,
+    pub(crate) truncated: bool,
+    pub(crate) expired: bool,
+    pub(crate) file_bytes: usize,
+    pub(crate) file_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredStreamWindow {
+    pub(crate) start_offset: u64,
+    pub(crate) observed_end: u64,
+    pub(crate) seen: bool,
+    pub(crate) complete: bool,
+    pub(crate) truncated: bool,
+    pub(crate) expired: bool,
+    pub(crate) file_bytes: usize,
+    pub(crate) file_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuxLimits {
+    pub(crate) session_bytes: u64,
+    pub(crate) session_records: usize,
+    pub(crate) global_bytes: u64,
+    pub(crate) global_records: usize,
+    pub(crate) max_scan_entries: usize,
+}
+
+pub(crate) const DEFAULT_AUX_LIMITS: AuxLimits = AuxLimits {
+    session_bytes: DEFAULT_SESSION_AUX_BYTES,
+    session_records: DEFAULT_SESSION_AUX_RECORDS,
+    global_bytes: DEFAULT_GLOBAL_AUX_BYTES,
+    global_records: DEFAULT_GLOBAL_AUX_RECORDS,
+    max_scan_entries: MAX_AUX_SCAN_ENTRIES,
+};
 
 impl Store {
     pub(crate) async fn open(root: PathBuf) -> Result<Self, StoreError> {
@@ -411,7 +607,12 @@ impl Store {
                 return Err(StoreError::InvalidRoot);
             }
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            aux_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            aux_limits: None,
+        })
     }
 
     pub(crate) async fn list_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
@@ -727,6 +928,668 @@ impl Store {
         let path = directory.join(SESSION_RECORD_FILE);
         let bytes = serde_json::to_vec(record).map_err(|_| StoreError::Corrupt)?;
         atomic_write(&path, &bytes).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_aux_limits(mut self, limits: AuxLimits) -> Self {
+        self.aux_limits = Some(limits);
+        self
+    }
+
+    fn aux_limits(&self) -> AuxLimits {
+        #[cfg(test)]
+        if let Some(limits) = self.aux_limits {
+            return limits;
+        }
+        DEFAULT_AUX_LIMITS
+    }
+
+    /// Atomically persists one completed tool call's metadata and retained
+    /// raw stream windows to the auxiliary directory.
+    #[cfg(test)]
+    pub(crate) async fn commit_tool_record(
+        &self,
+        snapshot: &ToolPersistenceSnapshot,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if should_fail_aux_write(snapshot.tool_ref.session_id) {
+            return Err(StoreError::Unavailable);
+        }
+        let _guard = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        self.commit_tool_record_locked(snapshot, deadline).await
+    }
+
+    async fn commit_tool_record_locked(
+        &self,
+        snapshot: &ToolPersistenceSnapshot,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        if Instant::now() >= deadline {
+            return Err(StoreError::Unavailable);
+        }
+        validate_stored_tool_record(&snapshot.record, &snapshot.tool_ref)?;
+
+        let input_len = snapshot.input_bytes.as_ref().map_or(0, |b| b.len());
+        let result_len = snapshot.result_bytes.as_ref().map_or(0, |b| b.len());
+        let stdout_len = snapshot.stdout_bytes.as_ref().map_or(0, |b| b.len());
+        let stderr_len = snapshot.stderr_bytes.as_ref().map_or(0, |b| b.len());
+
+        if input_len != snapshot.record.input.file_bytes
+            || result_len != snapshot.record.result.file_bytes
+            || stdout_len != snapshot.record.stdout.file_bytes
+            || stderr_len != snapshot.record.stderr.file_bytes
+        {
+            return Err(StoreError::Corrupt);
+        }
+
+        if let Some(bytes) = &snapshot.input_bytes {
+            if snapshot.record.input.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        if let Some(bytes) = &snapshot.result_bytes {
+            if snapshot.record.result.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        if let Some(bytes) = &snapshot.stdout_bytes {
+            if snapshot.record.stdout.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        if let Some(bytes) = &snapshot.stderr_bytes {
+            if snapshot.record.stderr.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+
+        let session_dir = self
+            .require_session_directory(snapshot.tool_ref.session_id)
+            .await?;
+        let session_meta = fs::symlink_metadata(&session_dir)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if session_meta.file_type().is_symlink() || !session_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let tools_dir = session_dir.join(AUX_TOOLS_DIR);
+        match path_state(&tools_dir)
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+        {
+            PathState::Directory | PathState::Missing => {}
+            _ => return Err(StoreError::Corrupt),
+        }
+
+        let hash = tool_ref_hash(&snapshot.tool_ref);
+        let target_dir = tools_dir.join(&hash);
+        if target_dir.exists() {
+            let target_meta = fs::symlink_metadata(&target_dir)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            if target_meta.file_type().is_symlink() || !target_meta.is_dir() {
+                return Err(StoreError::Corrupt);
+            }
+            match self
+                .read_tool_record_details(&snapshot.tool_ref, deadline)
+                .await
+            {
+                Ok(Some(existing)) => {
+                    if existing.record.has_corrupt_streams() {
+                        return Err(StoreError::Corrupt);
+                    }
+                    let existing_record_bytes =
+                        serde_json::to_vec(&existing.metadata).map_err(|_| StoreError::Corrupt)?;
+                    let incoming_record_bytes =
+                        serde_json::to_vec(&snapshot.record).map_err(|_| StoreError::Corrupt)?;
+                    if existing_record_bytes != incoming_record_bytes {
+                        return Err(StoreError::Corrupt);
+                    }
+                    return Ok(());
+                }
+                _ => return Err(StoreError::Corrupt),
+            }
+        }
+
+        let record_bytes = serde_json::to_vec(&snapshot.record).map_err(|_| StoreError::Corrupt)?;
+        if record_bytes.len() > MAX_TOOL_METADATA_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+
+        let item_bytes =
+            (record_bytes.len() + input_len + result_len + stdout_len + stderr_len) as u64;
+        let reserve = item_bytes.saturating_mul(2);
+
+        let limits = self.aux_limits();
+        self.enforce_aux_budget_locked(snapshot.tool_ref.session_id, reserve, limits, deadline)
+            .await?;
+
+        if Instant::now() >= deadline {
+            return Err(StoreError::Unavailable);
+        }
+        match fs::create_dir(&tools_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !matches!(path_state(&tools_dir).await, Ok(PathState::Directory)) {
+                    return Err(StoreError::Corrupt);
+                }
+            }
+            Err(_) => return Err(StoreError::Unavailable),
+        }
+        let temp_dir = unique_temp_path(&target_dir);
+        if Instant::now() >= deadline {
+            let _ = fs::remove_dir(&tools_dir).await;
+            return Err(StoreError::Unavailable);
+        }
+        if fs::create_dir(&temp_dir).await.is_err() {
+            let _ = fs::remove_dir(&tools_dir).await;
+            return Err(StoreError::Unavailable);
+        }
+
+        let write_res = async {
+            if let Some(bytes) = &snapshot.input_bytes {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Unavailable);
+                }
+                write_sync_file(&temp_dir.join(TOOL_INPUT_FILE), bytes).await?;
+            }
+            if let Some(bytes) = &snapshot.result_bytes {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Unavailable);
+                }
+                write_sync_file(&temp_dir.join(TOOL_RESULT_FILE), bytes).await?;
+            }
+            if let Some(bytes) = &snapshot.stdout_bytes {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Unavailable);
+                }
+                write_sync_file(&temp_dir.join(TOOL_STDOUT_FILE), bytes).await?;
+            }
+            if let Some(bytes) = &snapshot.stderr_bytes {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Unavailable);
+                }
+                write_sync_file(&temp_dir.join(TOOL_STDERR_FILE), bytes).await?;
+            }
+            if Instant::now() >= deadline {
+                return Err(StoreError::Unavailable);
+            }
+            write_sync_file(&temp_dir.join(TOOL_RECORD_FILE), &record_bytes).await?;
+            if Instant::now() >= deadline {
+                return Err(StoreError::Unavailable);
+            }
+            sync_directory(&temp_dir)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            Ok::<(), StoreError>(())
+        }
+        .await;
+
+        if write_res.is_err() {
+            let _ = remove_aux_directory(&temp_dir).await;
+            return Err(StoreError::Unavailable);
+        }
+
+        if Instant::now() >= deadline {
+            let _ = remove_aux_directory(&temp_dir).await;
+            return Err(StoreError::Unavailable);
+        }
+
+        if fs::rename(&temp_dir, &target_dir).await.is_err() {
+            let _ = remove_aux_directory(&temp_dir).await;
+            return Err(StoreError::Unavailable);
+        }
+
+        if sync_directory(&tools_dir).await.is_err() {
+            return Err(StoreError::Unavailable);
+        }
+
+        Ok(())
+    }
+
+    /// Persists completed tool records of a loop under a shared lock and deadline.
+    pub(crate) async fn persist_loop_tool_records(
+        &self,
+        tool_refs: &[ToolRef],
+        tool_data: &crate::tool_data::ToolData,
+        deadline: Instant,
+    ) -> Vec<(ToolRef, Result<(), StoreError>)> {
+        if tool_refs.is_empty() {
+            return Vec::new();
+        }
+
+        #[cfg(test)]
+        if let Some(first) = tool_refs.first() {
+            if should_fail_aux_write(first.session_id) {
+                return tool_refs
+                    .iter()
+                    .cloned()
+                    .map(|r| (r, Err(StoreError::Unavailable)))
+                    .collect();
+            }
+        }
+
+        let _guard = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return tool_refs
+                    .iter()
+                    .cloned()
+                    .map(|r| (r, Err(StoreError::Unavailable)))
+                    .collect();
+            }
+        };
+
+        #[cfg(test)]
+        if let Some(first) = tool_refs.first() {
+            wait_aux_commit_gate(first.session_id).await;
+        }
+
+        let mut results = Vec::with_capacity(tool_refs.len().min(DEFAULT_SESSION_AUX_RECORDS));
+        let mut expired = false;
+
+        for tool_ref in tool_refs {
+            if expired || Instant::now() >= deadline {
+                expired = true;
+                results.push((tool_ref.clone(), Err(StoreError::Unavailable)));
+                continue;
+            }
+
+            let snapshot = match tool_data.snapshot_for_persistence(tool_ref) {
+                Some(snap) => snap,
+                None => {
+                    results.push((tool_ref.clone(), Err(StoreError::Corrupt)));
+                    continue;
+                }
+            };
+
+            let res = self.commit_tool_record_locked(&snapshot, deadline).await;
+            if matches!(res, Err(StoreError::QueryLimit)) || Instant::now() >= deadline {
+                expired = true;
+            }
+            results.push((tool_ref.clone(), res));
+        }
+
+        results
+    }
+
+    /// Reads one stored tool record and its retained raw blobs from the auxiliary
+    /// directory, returning an in-memory `ToolRecord` projection. Returns `Ok(None)`
+    /// when the record or auxiliary directory does not exist.
+    #[cfg(test)]
+    pub(crate) async fn read_tool_record(
+        &self,
+        tool_ref: &ToolRef,
+    ) -> Result<Option<ToolRecord>, StoreError> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        self.read_tool_record_with_deadline(tool_ref, deadline)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_tool_record_with_deadline(
+        &self,
+        tool_ref: &ToolRef,
+        deadline: Instant,
+    ) -> Result<Option<ToolRecord>, StoreError> {
+        self.read_tool_record_details(tool_ref, deadline)
+            .await
+            .map(|loaded| loaded.map(|loaded| loaded.record))
+    }
+
+    async fn read_tool_record_details(
+        &self,
+        tool_ref: &ToolRef,
+        deadline: Instant,
+    ) -> Result<Option<ReadToolRecord>, StoreError> {
+        match tokio::time::timeout_at(deadline.into(), self.read_tool_record_inner(tool_ref)).await
+        {
+            Ok(res) => res,
+            Err(_) => Err(StoreError::Unavailable),
+        }
+    }
+
+    async fn read_tool_record_inner(
+        &self,
+        tool_ref: &ToolRef,
+    ) -> Result<Option<ReadToolRecord>, StoreError> {
+        let root_meta = fs::symlink_metadata(&self.root)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let sessions_dir = self.sessions_directory();
+        let sessions_meta = fs::symlink_metadata(&sessions_dir)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if sessions_meta.file_type().is_symlink() || !sessions_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let session_dir = self.session_directory(tool_ref.session_id);
+        let session_meta = match fs::symlink_metadata(&session_dir).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::SessionNotFound);
+            }
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        if session_meta.file_type().is_symlink() || !session_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let tools_dir = session_dir.join(AUX_TOOLS_DIR);
+        let tools_meta = match fs::symlink_metadata(&tools_dir).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        if tools_meta.file_type().is_symlink() || !tools_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let hash = tool_ref_hash(tool_ref);
+        let target_dir = tools_dir.join(&hash);
+        let target_meta = match fs::symlink_metadata(&target_dir).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        if target_meta.file_type().is_symlink() || !target_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let record_path = target_dir.join(TOOL_RECORD_FILE);
+        let file = match safe_open_read(&record_path).await {
+            Ok(f) => f,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+
+        let mut bytes = Vec::new();
+        if file
+            .take((MAX_TOOL_METADATA_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+        {
+            return Err(StoreError::Unavailable);
+        }
+        if bytes.len() > MAX_TOOL_METADATA_BYTES {
+            return Err(StoreError::Corrupt);
+        }
+
+        let stored: StoredToolRecord = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return Err(StoreError::Corrupt),
+        };
+
+        validate_stored_tool_record(&stored, tool_ref)?;
+
+        let (input_bytes, input_corrupt) = read_blob(
+            &target_dir.join(TOOL_INPUT_FILE),
+            stored.input.file_bytes,
+            stored.input.file_sha256.as_deref(),
+            MAX_TOOL_INPUT_PERSIST_BYTES,
+        )
+        .await;
+
+        let (result_bytes, result_corrupt) = read_blob(
+            &target_dir.join(TOOL_RESULT_FILE),
+            stored.result.file_bytes,
+            stored.result.file_sha256.as_deref(),
+            MAX_TOOL_RESULT_PERSIST_BYTES,
+        )
+        .await;
+
+        let (stdout_bytes, stdout_corrupt) = read_blob(
+            &target_dir.join(TOOL_STDOUT_FILE),
+            stored.stdout.file_bytes,
+            stored.stdout.file_sha256.as_deref(),
+            crate::tool_data::MAX_TOOL_STREAM_BYTES,
+        )
+        .await;
+
+        let (stderr_bytes, stderr_corrupt) = read_blob(
+            &target_dir.join(TOOL_STDERR_FILE),
+            stored.stderr.file_bytes,
+            stored.stderr.file_sha256.as_deref(),
+            crate::tool_data::MAX_TOOL_STREAM_BYTES,
+        )
+        .await;
+
+        let record = ToolRecord::from_stored(
+            stored.clone(),
+            (input_bytes, input_corrupt),
+            (result_bytes, result_corrupt),
+            (stdout_bytes, stdout_corrupt),
+            (stderr_bytes, stderr_corrupt),
+        );
+
+        Ok(Some(ReadToolRecord {
+            metadata: stored,
+            record,
+        }))
+    }
+
+    async fn enforce_aux_budget_locked(
+        &self,
+        target_session: SessionId,
+        reserve: u64,
+        limits: AuxLimits,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        let sessions_dir = self.sessions_directory();
+        let sessions_meta = fs::symlink_metadata(&sessions_dir)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if sessions_meta.file_type().is_symlink() || !sessions_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+
+        let mut session_entries = fs::read_dir(&sessions_dir)
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+
+        let mut total_scanned = 0usize;
+        let mut global_bytes = 0u64;
+        let mut global_records = 0usize;
+        let mut session_bytes = 0u64;
+        let mut session_records = 0usize;
+        let mut all_entries = Vec::new();
+        let mut target_entries = Vec::new();
+
+        while let Some(ses_entry) = {
+            if Instant::now() >= deadline {
+                return Err(StoreError::QueryLimit);
+            }
+            session_entries
+                .next_entry()
+                .await
+                .map_err(|_| StoreError::Unavailable)?
+        } {
+            total_scanned = total_scanned.saturating_add(1);
+            if total_scanned > limits.max_scan_entries || Instant::now() >= deadline {
+                return Err(StoreError::QueryLimit);
+            }
+            let ses_path = ses_entry.path();
+            let ses_meta = fs::symlink_metadata(&ses_path)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            if ses_meta.file_type().is_symlink() {
+                return Err(StoreError::Corrupt);
+            }
+            if !ses_meta.is_dir() {
+                global_bytes = global_bytes.saturating_add(ses_meta.len());
+                continue;
+            }
+            let file_name = ses_entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                return Err(StoreError::Corrupt);
+            };
+            let Ok(current_ses_id) = name_str.parse::<SessionId>() else {
+                return Err(StoreError::Corrupt);
+            };
+            let tools_dir = ses_path.join(AUX_TOOLS_DIR);
+            let tools_meta = match fs::symlink_metadata(&tools_dir).await {
+                Ok(m) => m,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(StoreError::Unavailable),
+            };
+            if tools_meta.file_type().is_symlink() || !tools_meta.is_dir() {
+                return Err(StoreError::Corrupt);
+            }
+
+            let mut tool_dir_entries = fs::read_dir(&tools_dir)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+
+            while let Some(tool_entry) = {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::QueryLimit);
+                }
+                tool_dir_entries
+                    .next_entry()
+                    .await
+                    .map_err(|_| StoreError::Unavailable)?
+            } {
+                total_scanned = total_scanned.saturating_add(1);
+                if total_scanned > limits.max_scan_entries || Instant::now() >= deadline {
+                    return Err(StoreError::QueryLimit);
+                }
+                let tool_path = tool_entry.path();
+                let tool_meta = fs::symlink_metadata(&tool_path)
+                    .await
+                    .map_err(|_| StoreError::Unavailable)?;
+                if tool_meta.file_type().is_symlink() {
+                    return Err(StoreError::Corrupt);
+                }
+                let tool_name = tool_entry.file_name();
+                let Some(name_str) = tool_name.to_str() else {
+                    return Err(StoreError::Corrupt);
+                };
+
+                if is_valid_temp_name(name_str) {
+                    if !tool_meta.is_dir() {
+                        return Err(StoreError::Corrupt);
+                    }
+                    match verify_and_scan_temp_dir(
+                        &tool_path,
+                        &mut total_scanned,
+                        limits.max_scan_entries,
+                        deadline,
+                    )
+                    .await?
+                    {
+                        Some(temp_bytes) => {
+                            global_bytes = global_bytes.saturating_add(temp_bytes);
+                            if current_ses_id == target_session {
+                                session_bytes = session_bytes.saturating_add(temp_bytes);
+                            }
+
+                            #[cfg(test)]
+                            let fail_remove = should_fail_remove_temp(current_ses_id);
+                            #[cfg(not(test))]
+                            let fail_remove = false;
+
+                            if fail_remove || remove_aux_directory(&tool_path).await.is_err() {
+                                return Err(StoreError::Unavailable);
+                            }
+
+                            global_bytes = global_bytes.saturating_sub(temp_bytes);
+                            if current_ses_id == target_session {
+                                session_bytes = session_bytes.saturating_sub(temp_bytes);
+                            }
+                            continue;
+                        }
+                        None => {
+                            return Err(StoreError::Corrupt);
+                        }
+                    }
+                }
+
+                if !valid_sha256(name_str) || !tool_meta.is_dir() {
+                    return Err(StoreError::Corrupt);
+                }
+
+                let (dir_bytes, _mtime, verified_entry) = scan_and_verify_tool_dir(
+                    &tool_path,
+                    current_ses_id,
+                    name_str,
+                    &mut total_scanned,
+                    limits.max_scan_entries,
+                    deadline,
+                )
+                .await?;
+
+                global_bytes = global_bytes.saturating_add(dir_bytes);
+                global_records = global_records.saturating_add(1);
+                if current_ses_id == target_session {
+                    session_bytes = session_bytes.saturating_add(dir_bytes);
+                    session_records = session_records.saturating_add(1);
+                    target_entries.push(verified_entry.clone());
+                }
+                all_entries.push(verified_entry);
+            }
+        }
+
+        // Evict session-level oldest records if exceeding session bounds
+        target_entries.sort_by_key(|e| e.mtime);
+        while (session_bytes.saturating_add(reserve) > limits.session_bytes
+            || session_records.saturating_add(1) > limits.session_records)
+            && !target_entries.is_empty()
+        {
+            if Instant::now() >= deadline {
+                return Err(StoreError::QueryLimit);
+            }
+            let victim = target_entries.remove(0);
+            remove_aux_directory(&victim.path).await?;
+            session_bytes = session_bytes.saturating_sub(victim.bytes);
+            session_records = session_records.saturating_sub(1);
+            global_bytes = global_bytes.saturating_sub(victim.bytes);
+            global_records = global_records.saturating_sub(1);
+            if let Some(pos) = all_entries.iter().position(|e| e.path == victim.path) {
+                all_entries.remove(pos);
+            }
+        }
+        if session_bytes.saturating_add(reserve) > limits.session_bytes
+            || session_records.saturating_add(1) > limits.session_records
+        {
+            return Err(StoreError::Unavailable);
+        }
+
+        // Evict global oldest records if exceeding global bounds
+        all_entries.sort_by_key(|e| e.mtime);
+        while (global_bytes.saturating_add(reserve) > limits.global_bytes
+            || global_records.saturating_add(1) > limits.global_records)
+            && !all_entries.is_empty()
+        {
+            if Instant::now() >= deadline {
+                return Err(StoreError::QueryLimit);
+            }
+            let victim = all_entries.remove(0);
+            remove_aux_directory(&victim.path).await?;
+            global_bytes = global_bytes.saturating_sub(victim.bytes);
+            global_records = global_records.saturating_sub(1);
+            if victim.session_id == target_session {
+                session_bytes = session_bytes.saturating_sub(victim.bytes);
+                session_records = session_records.saturating_sub(1);
+            }
+        }
+        if global_bytes.saturating_add(reserve) > limits.global_bytes
+            || global_records.saturating_add(1) > limits.global_records
+        {
+            return Err(StoreError::Unavailable);
+        }
+
+        Ok(())
     }
 
     /// Appends one completed loop as a single JSON line. On success the file
@@ -1413,6 +2276,12 @@ pub(crate) fn digest_hex(hasher: Sha256) -> String {
     value
 }
 
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    digest_hex(hasher)
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -1686,6 +2555,474 @@ fn unique_temp_path(path: &Path) -> PathBuf {
             ".{name}{METADATA_TEMP_SUFFIX}-{}-{id}",
             std::process::id()
         ))
+}
+
+pub(crate) fn tool_ref_hash(tool_ref: &ToolRef) -> String {
+    let mut hasher = Sha256::new();
+    let json = serde_json::to_vec(tool_ref).expect("serializing ToolRef cannot fail");
+    hasher.update(&json);
+    digest_hex(hasher)
+}
+
+#[derive(Clone)]
+struct AuxDirectoryEntry {
+    session_id: SessionId,
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    bytes: u64,
+}
+
+async fn remove_aux_directory(path: &Path) -> Result<(), StoreError> {
+    let parent = path.parent().ok_or(StoreError::Corrupt)?;
+    if parent.file_name() != Some(std::ffi::OsStr::new(AUX_TOOLS_DIR)) {
+        return Err(StoreError::Corrupt);
+    }
+    fs::remove_dir_all(path)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+    match fs::remove_dir(parent).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(StoreError::Unavailable),
+    }
+}
+
+async fn write_sync_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+    if file.write_all(bytes).await.is_err()
+        || file.flush().await.is_err()
+        || file.sync_all().await.is_err()
+    {
+        return Err(StoreError::Unavailable);
+    }
+    Ok(())
+}
+
+async fn safe_open_read(path: &Path) -> io::Result<File> {
+    let symlink_meta = fs::symlink_metadata(path).await?;
+    if symlink_meta.file_type().is_symlink() || !symlink_meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "symlink or not a regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let file = options.open(path).await?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+async fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+            .await
+            .map_err(|_| io::Error::other("sync_directory worker panicked"))?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn is_valid_temp_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 73 || bytes[0] != b'.' {
+        return false;
+    }
+    let hex_part = &bytes[1..65];
+    if !hex_part
+        .iter()
+        .all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return false;
+    }
+    if &bytes[65..70] != b".tmp-" {
+        return false;
+    }
+    let remainder = &bytes[70..];
+    let Some(dash_pos) = remainder.iter().position(|&b| b == b'-') else {
+        return false;
+    };
+    if dash_pos == 0 || dash_pos == remainder.len() - 1 {
+        return false;
+    }
+    let pid_part = &remainder[..dash_pos];
+    let id_part = &remainder[dash_pos + 1..];
+    pid_part.iter().all(u8::is_ascii_digit) && id_part.iter().all(u8::is_ascii_digit)
+}
+
+fn validate_stored_tool_record(
+    stored: &StoredToolRecord,
+    tool_ref: &ToolRef,
+) -> Result<(), StoreError> {
+    if stored.version != TOOL_RECORD_FORMAT_VERSION {
+        return Err(StoreError::UnsupportedFormat);
+    }
+    if stored.tool_ref != *tool_ref {
+        return Err(StoreError::Corrupt);
+    }
+    if !stored.state.is_terminal() {
+        return Err(StoreError::Corrupt);
+    }
+    if let Some(outcome) = stored.outcome {
+        if !stored.state.matches_outcome(outcome) {
+            return Err(StoreError::Corrupt);
+        }
+    }
+
+    if !stored.input.seen {
+        if stored.input.total_bytes != 0
+            || stored.input.file_bytes != 0
+            || stored.input.file_sha256.is_some()
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else {
+        if stored.input.file_bytes > stored.input.total_bytes {
+            return Err(StoreError::Corrupt);
+        }
+        if stored.input.expired
+            && (stored.input.file_bytes != 0 || stored.input.file_sha256.is_some())
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    if stored.input.file_bytes > MAX_TOOL_INPUT_PERSIST_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
+
+    if !stored.result.seen {
+        if stored.result.total_bytes != 0
+            || stored.result.file_bytes != 0
+            || stored.result.file_sha256.is_some()
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else {
+        if stored.result.file_bytes > stored.result.total_bytes {
+            return Err(StoreError::Corrupt);
+        }
+        if stored.result.expired
+            && (stored.result.file_bytes != 0 || stored.result.file_sha256.is_some())
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    if stored.result.file_bytes > MAX_TOOL_RESULT_PERSIST_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
+
+    if stored.stdout.start_offset > stored.stdout.observed_end {
+        return Err(StoreError::Corrupt);
+    }
+    if !stored.stdout.seen {
+        if stored.stdout.start_offset != 0
+            || stored.stdout.observed_end != 0
+            || stored.stdout.file_bytes != 0
+            || stored.stdout.file_sha256.is_some()
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else if stored.stdout.expired {
+        if stored.stdout.start_offset != stored.stdout.observed_end
+            || stored.stdout.file_bytes != 0
+            || stored.stdout.file_sha256.is_some()
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else {
+        let diff = stored
+            .stdout
+            .observed_end
+            .checked_sub(stored.stdout.start_offset)
+            .ok_or(StoreError::Corrupt)?;
+        if diff != stored.stdout.file_bytes as u64 {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    if stored.stdout.file_bytes > crate::tool_data::MAX_TOOL_STREAM_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
+
+    if stored.stderr.start_offset > stored.stderr.observed_end {
+        return Err(StoreError::Corrupt);
+    }
+    if !stored.stderr.seen {
+        if stored.stderr.start_offset != 0
+            || stored.stderr.observed_end != 0
+            || stored.stderr.file_bytes != 0
+            || stored.stderr.file_sha256.is_some()
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else if stored.stderr.expired {
+        if stored.stderr.start_offset != stored.stderr.observed_end
+            || stored.stderr.file_bytes != 0
+            || stored.stderr.file_sha256.is_some()
+        {
+            return Err(StoreError::Corrupt);
+        }
+    } else {
+        let diff = stored
+            .stderr
+            .observed_end
+            .checked_sub(stored.stderr.start_offset)
+            .ok_or(StoreError::Corrupt)?;
+        if diff != stored.stderr.file_bytes as u64 {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    if stored.stderr.file_bytes > crate::tool_data::MAX_TOOL_STREAM_BYTES {
+        return Err(StoreError::RecordTooLarge);
+    }
+
+    let total_file_bytes = stored
+        .input
+        .file_bytes
+        .saturating_add(stored.result.file_bytes)
+        .saturating_add(stored.stdout.file_bytes)
+        .saturating_add(stored.stderr.file_bytes);
+    if total_file_bytes > 3 * 1024 * 1024 {
+        return Err(StoreError::RecordTooLarge);
+    }
+
+    let check_sha256 = |bytes: usize, hash: Option<&str>| -> bool {
+        if bytes == 0 {
+            hash.is_none()
+        } else {
+            hash.is_some_and(valid_sha256)
+        }
+    };
+    if !check_sha256(stored.input.file_bytes, stored.input.file_sha256.as_deref())
+        || !check_sha256(
+            stored.result.file_bytes,
+            stored.result.file_sha256.as_deref(),
+        )
+        || !check_sha256(
+            stored.stdout.file_bytes,
+            stored.stdout.file_sha256.as_deref(),
+        )
+        || !check_sha256(
+            stored.stderr.file_bytes,
+            stored.stderr.file_sha256.as_deref(),
+        )
+    {
+        return Err(StoreError::Corrupt);
+    }
+
+    if let Some(cmd) = &stored.command {
+        if !cmd.status.is_terminal() {
+            return Err(StoreError::Corrupt);
+        }
+        if cmd.stdout_base_offset != stored.stdout.start_offset
+            || cmd.stdout_observed_end != stored.stdout.observed_end
+            || cmd.stderr_base_offset != stored.stderr.start_offset
+            || cmd.stderr_observed_end != stored.stderr.observed_end
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_blob(
+    path: &Path,
+    expected_bytes: usize,
+    expected_sha256: Option<&str>,
+    max_cap: usize,
+) -> (Option<Vec<u8>>, bool) {
+    if expected_bytes == 0 {
+        return (None, false);
+    }
+    if expected_bytes > max_cap {
+        return (None, true);
+    }
+    let Some(expected_hash) = expected_sha256 else {
+        return (None, true);
+    };
+    let Ok(file) = safe_open_read(path).await else {
+        return (None, true);
+    };
+    let mut bytes = Vec::with_capacity(expected_bytes);
+    if file
+        .take((expected_bytes.saturating_add(1)) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .is_err()
+    {
+        return (None, true);
+    }
+    if bytes.len() != expected_bytes {
+        return (None, true);
+    }
+    let actual_hash = hash_bytes(&bytes);
+    if actual_hash != expected_hash {
+        return (None, true);
+    }
+    (Some(bytes), false)
+}
+
+async fn verify_and_scan_temp_dir(
+    path: &Path,
+    total_scanned: &mut usize,
+    max_scan_entries: usize,
+    deadline: Instant,
+) -> Result<Option<u64>, StoreError> {
+    let mut read_dir = fs::read_dir(path)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+    let mut temp_bytes = 0u64;
+    while let Some(entry) = {
+        if Instant::now() >= deadline {
+            return Err(StoreError::QueryLimit);
+        }
+        read_dir
+            .next_entry()
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+    } {
+        *total_scanned = total_scanned.saturating_add(1);
+        if *total_scanned > max_scan_entries || Instant::now() >= deadline {
+            return Err(StoreError::QueryLimit);
+        }
+        let meta = fs::symlink_metadata(entry.path())
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Ok(None);
+        }
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            return Ok(None);
+        };
+        if !ALLOWED_AUX_FILES.contains(&name_str) {
+            return Ok(None);
+        }
+        temp_bytes = temp_bytes.saturating_add(meta.len());
+    }
+    Ok(Some(temp_bytes))
+}
+
+async fn scan_and_verify_tool_dir(
+    path: &Path,
+    session_id: SessionId,
+    expected_hash: &str,
+    total_scanned: &mut usize,
+    max_scan_entries: usize,
+    deadline: Instant,
+) -> Result<(u64, std::time::SystemTime, AuxDirectoryEntry), StoreError> {
+    let dir_meta = fs::symlink_metadata(path)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+        return Err(StoreError::Corrupt);
+    }
+    let mtime = dir_meta
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    let mut read_dir = fs::read_dir(path)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+    let mut dir_bytes = 0u64;
+    let mut has_record = false;
+
+    while let Some(entry) = {
+        if Instant::now() >= deadline {
+            return Err(StoreError::QueryLimit);
+        }
+        read_dir
+            .next_entry()
+            .await
+            .map_err(|_| StoreError::Unavailable)?
+    } {
+        *total_scanned = total_scanned.saturating_add(1);
+        if *total_scanned > max_scan_entries || Instant::now() >= deadline {
+            return Err(StoreError::QueryLimit);
+        }
+        let file_meta = fs::symlink_metadata(entry.path())
+            .await
+            .map_err(|_| StoreError::Unavailable)?;
+        if file_meta.file_type().is_symlink() || !file_meta.is_file() {
+            return Err(StoreError::Corrupt);
+        }
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            return Err(StoreError::Corrupt);
+        };
+        if !ALLOWED_AUX_FILES.contains(&name_str) {
+            return Err(StoreError::Corrupt);
+        }
+        if name_str == TOOL_RECORD_FILE {
+            has_record = true;
+        }
+        dir_bytes = dir_bytes.saturating_add(file_meta.len());
+    }
+
+    if !has_record {
+        return Err(StoreError::Corrupt);
+    }
+
+    let record_path = path.join(TOOL_RECORD_FILE);
+    let file = safe_open_read(&record_path)
+        .await
+        .map_err(|_| StoreError::Unavailable)?;
+    let mut bytes = Vec::new();
+    if file
+        .take((MAX_TOOL_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .is_err()
+    {
+        return Err(StoreError::Unavailable);
+    }
+    if bytes.len() > MAX_TOOL_METADATA_BYTES {
+        return Err(StoreError::Corrupt);
+    }
+    let stored: StoredToolRecord =
+        serde_json::from_slice(&bytes).map_err(|_| StoreError::Corrupt)?;
+    if stored.version != TOOL_RECORD_FORMAT_VERSION
+        || stored.tool_ref.session_id != session_id
+        || tool_ref_hash(&stored.tool_ref) != expected_hash
+    {
+        return Err(StoreError::Corrupt);
+    }
+
+    Ok((
+        dir_bytes,
+        mtime,
+        AuxDirectoryEntry {
+            session_id,
+            path: path.to_path_buf(),
+            mtime,
+            bytes: dir_bytes,
+        },
+    ))
 }
 
 fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
@@ -1971,6 +3308,7 @@ fn should_force_unknown_summary_write(session_id: SessionId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use minicore_runtime::ToolCallId;
     use minicore_runtime::execution::ConfigRevision;
     use minicore_runtime::history::{AssistantHistory, UserHistory};
@@ -1979,6 +3317,8 @@ mod tests {
     };
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
+
+    use crate::tool_data::{ToolDataAvailability, ToolDataStream, ToolOutputRequest};
 
     use super::*;
 
@@ -3249,6 +4589,1911 @@ mod tests {
                 .await,
             Err(StoreError::QueryLimit)
         ));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_aux_budget_does_not_create_an_auxiliary_directory() {
+        let (base, store, session_id) = fixture("aux-rejected-directory").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let store = store.with_aux_limits(AuxLimits {
+            global_bytes: 0,
+            ..DEFAULT_AUX_LIMITS
+        });
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("rejected").unwrap(),
+        };
+        let data = crate::tool_data::ToolData::new();
+        data.note_requested(&tool_ref, "read");
+        data.note_result(&tool_ref, "ok");
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success);
+        let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+        assert!(
+            store
+                .commit_tool_record(&snapshot, Instant::now() + AUX_PERSIST_DEADLINE)
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .session_directory(session_id)
+                .join(AUX_TOOLS_DIR)
+                .exists()
+        );
+        assert!(
+            fs::read(store.session_directory(session_id).join(HISTORY_FILE))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(base).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_and_utf8_empty_eof_auxiliary_tool_persistence() {
+        let (base, store, session_id) = fixture("aux-binary-utf8").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("bash-call-1").unwrap(),
+        };
+
+        let input_bytes = b"echo hello\n".to_vec();
+        let result_bytes = b"hello\n".to_vec();
+        let stdout_bytes: Vec<u8> = (0..50_000u32).map(|b| (b % 256) as u8).collect();
+
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Command {
+                    script: "echo hello".to_owned(),
+                    cwd: "/tmp".to_owned(),
+                },
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: Some(ToolPhase::Running),
+                started_at: Some("2026-09-15T00:00:00Z".to_owned()),
+                finished_at: Some("2026-09-15T00:00:01Z".to_owned()),
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: input_bytes.len(),
+                    seen: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: input_bytes.len(),
+                    file_sha256: Some(hash_bytes(&input_bytes)),
+                },
+                result: StoredResultSummary {
+                    total_bytes: result_bytes.len(),
+                    seen: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: result_bytes.len(),
+                    file_sha256: Some(hash_bytes(&result_bytes)),
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: stdout_bytes.len() as u64,
+                    seen: true,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: stdout_bytes.len(),
+                    file_sha256: Some(hash_bytes(&stdout_bytes)),
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: true,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: Some(CommandResult {
+                    status: crate::tool_data::CommandStatus::Exited,
+                    exit_code: Some(0),
+                    signal: None,
+                    termination_confirmed: true,
+                    stdout_base_offset: 0,
+                    stdout_observed_end: stdout_bytes.len() as u64,
+                    stderr_base_offset: 0,
+                    stderr_observed_end: 0,
+                    output_complete: true,
+                    output_truncated: false,
+                }),
+            },
+            input_bytes: Some(input_bytes),
+            result_bytes: Some(result_bytes),
+            stdout_bytes: Some(stdout_bytes.clone()),
+            stderr_bytes: None,
+        };
+
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let recovered = store
+            .read_tool_record(&tool_ref)
+            .await
+            .unwrap()
+            .expect("stored tool record must exist");
+
+        let read_res = recovered.project_read(&tool_ref, 4096).unwrap();
+        assert_eq!(read_res.execution.tool_ref, tool_ref);
+        assert_eq!(read_res.execution.name, "bash");
+        assert_eq!(read_res.execution.state, ToolExecutionState::Succeeded);
+
+        let stdout_page = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stdout,
+                    offset: 0,
+                    max_bytes: Some(100_000),
+                },
+                100_000,
+            )
+            .unwrap();
+        assert_eq!(stdout_page.encoding, "base64");
+        assert!(stdout_page.eof);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&stdout_page.data)
+            .unwrap();
+        assert_eq!(decoded, stdout_bytes);
+
+        let stderr_page = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stderr,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        assert_eq!(stderr_page.encoding, "base64");
+        assert!(stderr_page.eof);
+        assert_eq!(stderr_page.observed_end, 0);
+        assert!(stderr_page.data.is_empty());
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn complete_identity_and_path_traversal_protection() {
+        let (base, store, session_id) = fixture("aux-identity-path").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-1").unwrap(),
+        };
+
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        };
+
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let hash = tool_ref_hash(&tool_ref);
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Check directory exists strictly under tools/
+        let expected_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash);
+        assert!(expected_dir.is_dir());
+
+        // Mismatched ToolRef query on different loop or call returns None
+        let other_tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-1").unwrap(),
+        };
+        assert!(
+            store
+                .read_tool_record(&other_tool_ref)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_publishing_idempotent_overwrite_and_cleanup_on_failure() {
+        let (base, store, session_id) = fixture("aux-atomic-idempotent").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-idempotent").unwrap(),
+        };
+
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "read".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        };
+
+        // First commit succeeds
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // Second commit of identical record succeeds idempotently
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // Injected failure cleans up temporary directory without corrupting target
+        fail_next_aux_write(session_id);
+        assert!(matches!(
+            store
+                .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+                .await,
+            Err(StoreError::Unavailable)
+        ));
+
+        // Read still succeeds
+        assert!(store.read_tool_record(&tool_ref).await.unwrap().is_some());
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn metadata_and_blob_corruption_handling() {
+        let (base, store, session_id) = fixture("aux-corrupt").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-corrupt").unwrap(),
+        };
+
+        let stdout_bytes = b"authoritative stdout tail".to_vec();
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: stdout_bytes.len() as u64,
+                    seen: true,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: stdout_bytes.len(),
+                    file_sha256: Some(hash_bytes(&stdout_bytes)),
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: Some(stdout_bytes),
+            stderr_bytes: None,
+        };
+
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // 1. Missing blob: remove stdout.bin
+        let hash = tool_ref_hash(&tool_ref);
+        let blob_path = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash)
+            .join(TOOL_STDOUT_FILE);
+        fs::remove_file(&blob_path).await.unwrap();
+
+        let recovered = store
+            .read_tool_record(&tool_ref)
+            .await
+            .unwrap()
+            .expect("metadata should still load");
+        let page = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stdout,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        // Missing blob must report Unavailable and retain observed_end, not a clean empty EOF
+        assert_eq!(page.availability, ToolDataAvailability::Unavailable);
+        assert_eq!(page.observed_end, 25);
+        assert!(page.data.is_empty());
+        assert!(page.truncated);
+
+        // 2. Hash mismatch / corrupt bytes: write wrong content
+        fs::write(&blob_path, b"corrupted bytes!").await.unwrap();
+        let recovered2 = store
+            .read_tool_record(&tool_ref)
+            .await
+            .unwrap()
+            .expect("metadata should still load");
+        let page2 = recovered2
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stdout,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        assert_eq!(page2.availability, ToolDataAvailability::Unavailable);
+        assert_eq!(page2.observed_end, 25);
+        assert!(page2.data.is_empty());
+
+        // 3. Unsupported format version
+        let record_path = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash)
+            .join(TOOL_RECORD_FILE);
+        let mut corrupted_record = snapshot.record.clone();
+        corrupted_record.version = 999;
+        fs::write(&record_path, serde_json::to_vec(&corrupted_record).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.read_tool_record(&tool_ref).await,
+            Err(StoreError::UnsupportedFormat)
+        ));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_gc_and_scan_limits() {
+        let (base, store, session_id) = fixture("aux-gc-limits").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        // Set small limits: session max 2 records / 50 KiB; global max 3 records / 80 KiB
+        let store = store.with_aux_limits(AuxLimits {
+            session_bytes: 50 * 1024,
+            session_records: 2,
+            global_bytes: 80 * 1024,
+            global_records: 3,
+            max_scan_entries: 50,
+        });
+
+        let make_snap = |idx: u32, call_name: &'static str| {
+            let tool_ref = ToolRef {
+                session_id,
+                loop_id: LoopId::new().unwrap(),
+                request_index: idx,
+                tool_call_id: ToolCallId::new(call_name).unwrap(),
+            };
+            ToolPersistenceSnapshot {
+                tool_ref: tool_ref.clone(),
+                record: StoredToolRecord {
+                    version: TOOL_RECORD_FORMAT_VERSION,
+                    tool_ref: tool_ref.clone(),
+                    name: "bash".to_owned(),
+                    subject: ToolSubject::Other,
+                    subject_truncated: false,
+                    state: ToolExecutionState::Succeeded,
+                    phase: None,
+                    started_at: None,
+                    finished_at: None,
+                    outcome: Some(ToolResultOutcome::Success),
+                    input: StoredInputSummary {
+                        total_bytes: 0,
+                        seen: false,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    result: StoredResultSummary {
+                        total_bytes: 0,
+                        seen: false,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    stdout: StoredStreamWindow {
+                        start_offset: 0,
+                        observed_end: 0,
+                        seen: false,
+                        complete: true,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    stderr: StoredStreamWindow {
+                        start_offset: 0,
+                        observed_end: 0,
+                        seen: false,
+                        complete: true,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    command: None,
+                },
+                input_bytes: None,
+                result_bytes: None,
+                stdout_bytes: None,
+                stderr_bytes: None,
+            }
+        };
+
+        let snap1 = make_snap(0, "call-gc-1");
+        store
+            .commit_tool_record(&snap1, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let snap2 = make_snap(1, "call-gc-2");
+        store
+            .commit_tool_record(&snap2, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Both records exist
+        assert!(
+            store
+                .read_tool_record(&snap1.tool_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .read_tool_record(&snap2.tool_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Third record exceeds session_records (2) -> snap1 must be evicted!
+        let snap3 = make_snap(2, "call-gc-3");
+        store
+            .commit_tool_record(&snap3, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .read_tool_record(&snap1.tool_ref)
+                .await
+                .unwrap()
+                .is_none(),
+            "oldest record must be evicted"
+        );
+        assert!(
+            store
+                .read_tool_record(&snap2.tool_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .read_tool_record(&snap3.tool_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_session_without_tools_directory() {
+        let (base, store, session_id) = fixture("aux-legacy").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-old").unwrap(),
+        };
+
+        // No tools directory exists yet; read returns Ok(None), not StoreError::Corrupt
+        assert!(store.read_tool_record(&tool_ref).await.unwrap().is_none());
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn scan_limit_hit_in_inner_files_returns_query_limit() {
+        let (base, store, session_id) = fixture("aux-inner-limit").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-scan-inner").unwrap(),
+        };
+
+        let stdout_bytes = b"testing inner scan limit".to_vec();
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: stdout_bytes.len() as u64,
+                    seen: true,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: stdout_bytes.len(),
+                    file_sha256: Some(hash_bytes(&stdout_bytes)),
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: Some(stdout_bytes),
+            stderr_bytes: None,
+        };
+
+        // First commit with normal limits
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Second commit with max_scan_entries: 1 -> scanning sessions/tools/inner_files
+        // will exceed scan limit inside directory scan!
+        let store_restricted = store.with_aux_limits(AuxLimits {
+            session_bytes: 16 * 1024 * 1024,
+            session_records: 1024,
+            global_bytes: 256 * 1024 * 1024,
+            global_records: 8192,
+            max_scan_entries: 1,
+        });
+
+        let tool_ref2 = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-scan-inner-2").unwrap(),
+        };
+        let mut snap2 = snapshot.clone();
+        snap2.tool_ref = tool_ref2.clone();
+        snap2.record.tool_ref = tool_ref2;
+
+        let res = store_restricted
+            .commit_tool_record(&snap2, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(matches!(res, Err(StoreError::QueryLimit)));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_session_id_dir_is_rejected_and_not_scanned() {
+        use std::os::unix::fs::symlink;
+
+        let (base, store, session_id) = fixture("aux-symlink-ses").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        // Create an outside directory
+        let outside = base.join("outside_dir");
+        fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a symlink named as a valid SessionId pointing to outside_dir
+        let fake_ses_id = SessionId::new().unwrap();
+        let symlink_path = store.sessions_directory().join(fake_ses_id.to_string());
+        symlink(&outside, &symlink_path).unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-sym-ses").unwrap(),
+        };
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        };
+
+        // Budget enforcement scanning encounters the symlink session entry and must fail closed
+        let res = store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(matches!(res, Err(StoreError::Corrupt)));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn temp_dir_removal_failure_rejects_aux_commit() {
+        let (base, store, session_id) = fixture("aux-temp-fail").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-temp-fail").unwrap(),
+        };
+
+        let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
+        fs::create_dir_all(&tools_dir).await.unwrap();
+        let valid_hash = "0".repeat(64);
+        let temp_dir = tools_dir.join(format!(".{valid_hash}.tmp-1234-1"));
+        fs::create_dir(&temp_dir).await.unwrap();
+        fs::write(temp_dir.join(TOOL_RECORD_FILE), b"{}")
+            .await
+            .unwrap();
+
+        fail_next_remove_temp(session_id);
+
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        };
+
+        let res = store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(matches!(res, Err(StoreError::Unavailable)));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn private_temp_directory_with_unknown_files_is_not_deleted_and_rejects_commit() {
+        let (base, store, session_id) = fixture("aux-private-temp").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-private-temp").unwrap(),
+        };
+
+        let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
+        fs::create_dir_all(&tools_dir).await.unwrap();
+
+        // 1. Directory with name ".private.tmp-not-owned"
+        let private_dir = tools_dir.join(".private.tmp-not-owned");
+        fs::create_dir(&private_dir).await.unwrap();
+        let user_file = private_dir.join("user_secret.txt");
+        fs::write(&user_file, b"secret user content").await.unwrap();
+        let nested_dir = private_dir.join("nested");
+        fs::create_dir(&nested_dir).await.unwrap();
+        fs::write(nested_dir.join("nested.txt"), b"nested content")
+            .await
+            .unwrap();
+
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        };
+
+        // Budget enforcement fails closed because of unknown directory
+        let res = store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(matches!(res, Err(StoreError::Corrupt)));
+
+        // Critical safety verification: user file and nested directory are NEVER deleted!
+        assert!(user_file.exists(), "user file must not be deleted");
+        assert!(nested_dir.exists(), "nested directory must not be deleted");
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_crashed_temp_directory_is_converged_and_evicted() {
+        let (base, store, session_id) = fixture("aux-crashed-temp").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-crashed-temp").unwrap(),
+        };
+
+        let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
+        fs::create_dir_all(&tools_dir).await.unwrap();
+
+        // Legitimate temp directory format with only allowed aux files
+        let valid_hash = "a".repeat(64);
+        let crashed_temp_dir = tools_dir.join(format!(".{valid_hash}.tmp-9999-1"));
+        fs::create_dir(&crashed_temp_dir).await.unwrap();
+        fs::write(crashed_temp_dir.join(TOOL_RECORD_FILE), b"{}")
+            .await
+            .unwrap();
+        fs::write(crashed_temp_dir.join(TOOL_INPUT_FILE), b"crash input")
+            .await
+            .unwrap();
+
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+        };
+
+        // Commit succeeds and cleans up the orphaned legitimate temp directory
+        let res = store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(res.is_ok());
+        assert!(
+            !crashed_temp_dir.exists(),
+            "orphaned temp dir converged and removed"
+        );
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_metadata_file_bytes_rejected_without_alloc() {
+        let (base, store, session_id) = fixture("aux-oversized-meta").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-oversized").unwrap(),
+        };
+
+        let hash = tool_ref_hash(&tool_ref);
+        let target_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash);
+        fs::create_dir_all(&target_dir).await.unwrap();
+
+        // Write a malicious record claiming 100 MiB input file_bytes
+        let malicious_record = StoredToolRecord {
+            version: TOOL_RECORD_FORMAT_VERSION,
+            tool_ref: tool_ref.clone(),
+            name: "bash".to_owned(),
+            subject: ToolSubject::Other,
+            subject_truncated: false,
+            state: ToolExecutionState::Succeeded,
+            phase: None,
+            started_at: None,
+            finished_at: None,
+            outcome: Some(ToolResultOutcome::Success),
+            input: StoredInputSummary {
+                total_bytes: 100 * 1024 * 1024,
+                seen: true,
+                truncated: false,
+                expired: false,
+                file_bytes: 100 * 1024 * 1024,
+                file_sha256: Some("00".repeat(32)),
+            },
+            result: StoredResultSummary {
+                total_bytes: 0,
+                seen: false,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            stdout: StoredStreamWindow {
+                start_offset: 0,
+                observed_end: 0,
+                seen: false,
+                complete: true,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            stderr: StoredStreamWindow {
+                start_offset: 0,
+                observed_end: 0,
+                seen: false,
+                complete: true,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            command: None,
+        };
+
+        fs::write(
+            target_dir.join(TOOL_RECORD_FILE),
+            serde_json::to_vec(&malicious_record).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Must reject without allocating 100 MiB
+        let res = store.read_tool_record(&tool_ref).await;
+        assert!(matches!(res, Err(StoreError::RecordTooLarge)));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_metadata_ranges_and_hashes_rejected() {
+        let (base, store, session_id) = fixture("aux-bad-ranges").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-bad-range").unwrap(),
+        };
+
+        let hash = tool_ref_hash(&tool_ref);
+        let target_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash);
+        fs::create_dir_all(&target_dir).await.unwrap();
+
+        // 1. Range start > end
+        let bad_range_record = StoredToolRecord {
+            version: TOOL_RECORD_FORMAT_VERSION,
+            tool_ref: tool_ref.clone(),
+            name: "bash".to_owned(),
+            subject: ToolSubject::Other,
+            subject_truncated: false,
+            state: ToolExecutionState::Succeeded,
+            phase: None,
+            started_at: None,
+            finished_at: None,
+            outcome: Some(ToolResultOutcome::Success),
+            input: StoredInputSummary {
+                total_bytes: 0,
+                seen: false,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            result: StoredResultSummary {
+                total_bytes: 0,
+                seen: false,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            stdout: StoredStreamWindow {
+                start_offset: 50,
+                observed_end: 10, // start > end
+                seen: true,
+                complete: true,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            stderr: StoredStreamWindow {
+                start_offset: 0,
+                observed_end: 0,
+                seen: false,
+                complete: true,
+                truncated: false,
+                expired: false,
+                file_bytes: 0,
+                file_sha256: None,
+            },
+            command: None,
+        };
+        fs::write(
+            target_dir.join(TOOL_RECORD_FILE),
+            serde_json::to_vec(&bad_range_record).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.read_tool_record(&tool_ref).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        // 2. Retained len mismatch (file_bytes != observed_end - start_offset)
+        let mut bad_len_record = bad_range_record.clone();
+        bad_len_record.stdout.start_offset = 0;
+        bad_len_record.stdout.observed_end = 10;
+        bad_len_record.stdout.file_bytes = 20; // mismatch: 20 != 10
+        bad_len_record.stdout.file_sha256 = Some("00".repeat(32));
+        fs::write(
+            target_dir.join(TOOL_RECORD_FILE),
+            serde_json::to_vec(&bad_len_record).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.read_tool_record(&tool_ref).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        // 3. Invalid sha256 format (non-hex)
+        let mut bad_hash_record = bad_len_record;
+        bad_hash_record.stdout.file_bytes = 10;
+        bad_hash_record.stdout.file_sha256 = Some("not-a-valid-hex-hash".to_owned());
+        fs::write(
+            target_dir.join(TOOL_RECORD_FILE),
+            serde_json::to_vec(&bad_hash_record).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.read_tool_record(&tool_ref).await,
+            Err(StoreError::Corrupt)
+        ));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_blob_symlink_only_marks_stream_unavailable() {
+        use std::os::unix::fs::symlink;
+
+        let (base, store, session_id) = fixture("aux-blob-symlink").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-blob-symlink").unwrap(),
+        };
+
+        let stdout_bytes = b"safe output".to_vec();
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: stdout_bytes.len() as u64,
+                    seen: true,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: stdout_bytes.len(),
+                    file_sha256: Some(hash_bytes(&stdout_bytes)),
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: Some(stdout_bytes),
+            stderr_bytes: None,
+        };
+
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Replace stdout.bin with a symlink to an outside file
+        let hash = tool_ref_hash(&tool_ref);
+        let blob_path = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash)
+            .join(TOOL_STDOUT_FILE);
+        fs::remove_file(&blob_path).await.unwrap();
+        let outside = base.join("outside_target.bin");
+        fs::write(&outside, b"secret").await.unwrap();
+        symlink(&outside, &blob_path).unwrap();
+
+        // Reading the record succeeds; only stdout is Unavailable!
+        let recovered = store
+            .read_tool_record(&tool_ref)
+            .await
+            .unwrap()
+            .expect("record should load");
+        let page = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stdout,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        assert_eq!(page.availability, ToolDataAvailability::Unavailable);
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn idempotent_commit_with_corrupt_existing_fails() {
+        let (base, store, session_id) = fixture("aux-idempotent-corrupt").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-idempotent-corrupt").unwrap(),
+        };
+
+        let stdout_bytes = b"valid content".to_vec();
+        let snapshot = ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: StoredToolRecord {
+                version: TOOL_RECORD_FORMAT_VERSION,
+                tool_ref: tool_ref.clone(),
+                name: "bash".to_owned(),
+                subject: ToolSubject::Other,
+                subject_truncated: false,
+                state: ToolExecutionState::Succeeded,
+                phase: None,
+                started_at: None,
+                finished_at: None,
+                outcome: Some(ToolResultOutcome::Success),
+                input: StoredInputSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                result: StoredResultSummary {
+                    total_bytes: 0,
+                    seen: false,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                stdout: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: stdout_bytes.len() as u64,
+                    seen: true,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: stdout_bytes.len(),
+                    file_sha256: Some(hash_bytes(&stdout_bytes)),
+                },
+                stderr: StoredStreamWindow {
+                    start_offset: 0,
+                    observed_end: 0,
+                    seen: false,
+                    complete: true,
+                    truncated: false,
+                    expired: false,
+                    file_bytes: 0,
+                    file_sha256: None,
+                },
+                command: None,
+            },
+            input_bytes: None,
+            result_bytes: None,
+            stdout_bytes: Some(stdout_bytes),
+            stderr_bytes: None,
+        };
+
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Corrupt stdout.bin
+        let hash = tool_ref_hash(&tool_ref);
+        let blob_path = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(&hash)
+            .join(TOOL_STDOUT_FILE);
+        fs::write(&blob_path, b"corrupted bytes!").await.unwrap();
+
+        // Idempotent retry must not return Ok(()); it must fail because published record is corrupt!
+        let res = store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(matches!(res, Err(StoreError::Corrupt)));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_global_quota() {
+        let (base, store, session_id1) = fixture("aux-concurrent-quota").await;
+        let session_id2 = SessionId::new().unwrap();
+
+        store
+            .create_session(&record(&store, session_id1))
+            .await
+            .unwrap();
+        let mut rec2 = record(&store, session_id2);
+        rec2.session_id = session_id2;
+        store.create_session(&rec2).await.unwrap();
+
+        // Global limits: max 2 records total across all sessions
+        let store = store.with_aux_limits(AuxLimits {
+            session_bytes: 16 * 1024 * 1024,
+            session_records: 1024,
+            global_bytes: 256 * 1024 * 1024,
+            global_records: 2,
+            max_scan_entries: 65536,
+        });
+
+        let make_snap = |ses: SessionId, name: &str| {
+            let tool_ref = ToolRef {
+                session_id: ses,
+                loop_id: LoopId::new().unwrap(),
+                request_index: 0,
+                tool_call_id: ToolCallId::new(name).unwrap(),
+            };
+            ToolPersistenceSnapshot {
+                tool_ref: tool_ref.clone(),
+                record: StoredToolRecord {
+                    version: TOOL_RECORD_FORMAT_VERSION,
+                    tool_ref: tool_ref.clone(),
+                    name: "bash".to_owned(),
+                    subject: ToolSubject::Other,
+                    subject_truncated: false,
+                    state: ToolExecutionState::Succeeded,
+                    phase: None,
+                    started_at: None,
+                    finished_at: None,
+                    outcome: Some(ToolResultOutcome::Success),
+                    input: StoredInputSummary {
+                        total_bytes: 0,
+                        seen: false,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    result: StoredResultSummary {
+                        total_bytes: 0,
+                        seen: false,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    stdout: StoredStreamWindow {
+                        start_offset: 0,
+                        observed_end: 0,
+                        seen: false,
+                        complete: true,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    stderr: StoredStreamWindow {
+                        start_offset: 0,
+                        observed_end: 0,
+                        seen: false,
+                        complete: true,
+                        truncated: false,
+                        expired: false,
+                        file_bytes: 0,
+                        file_sha256: None,
+                    },
+                    command: None,
+                },
+                input_bytes: None,
+                result_bytes: None,
+                stdout_bytes: None,
+                stderr_bytes: None,
+            }
+        };
+
+        let snap1 = make_snap(session_id1, "call-concurrent-1");
+        let snap2 = make_snap(session_id2, "call-concurrent-2");
+
+        // Concurrently commit from both sessions using tokio::spawn
+        let store1 = store.clone();
+        let snap1_clone = snap1.clone();
+        let h1 = tokio::spawn(async move {
+            store1
+                .commit_tool_record(&snap1_clone, Instant::now() + Duration::from_secs(5))
+                .await
+        });
+
+        let store2 = store.clone();
+        let snap2_clone = snap2.clone();
+        let h2 = tokio::spawn(async move {
+            store2
+                .commit_tool_record(&snap2_clone, Instant::now() + Duration::from_secs(5))
+                .await
+        });
+
+        let (r1, r2) = tokio::join!(h1, h2);
+        r1.unwrap().unwrap();
+        r2.unwrap().unwrap();
+
+        // Both records exist (total = 2)
+        assert!(
+            store
+                .read_tool_record(&snap1.tool_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .read_tool_record(&snap2.tool_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Third commit exceeds global quota (2) -> oldest must be evicted
+        let snap3 = make_snap(session_id1, "call-concurrent-3");
+        store
+            .commit_tool_record(&snap3, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // At most 2 records survive globally
+        let remaining_records = [
+            store
+                .read_tool_record(&snap1.tool_ref)
+                .await
+                .unwrap()
+                .is_some(),
+            store
+                .read_tool_record(&snap2.tool_ref)
+                .await
+                .unwrap()
+                .is_some(),
+            store
+                .read_tool_record(&snap3.tool_ref)
+                .await
+                .unwrap()
+                .is_some(),
+        ]
+        .iter()
+        .filter(|&&exists| exists)
+        .count();
+
+        assert_eq!(remaining_records, 2);
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn command_record_stdout_evicted_by_pressure_snapshot_commit_and_cold_project_consistency()
+     {
+        let (base, store, session_id) = fixture("aux-cmd-evict").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-evict-cmd").unwrap(),
+        };
+
+        let tool_data = crate::tool_data::ToolData::new();
+        tool_data.note_requested(&tool_ref, "bash");
+        tool_data.note_invocation(
+            &tool_ref,
+            &minicore_runtime::tools::ToolInvocation {
+                tool_call_id: tool_ref.tool_call_id.clone(),
+                tool_name: "bash".parse().unwrap(),
+                arguments: serde_json::json!({"command": "echo test"}),
+            },
+        );
+        tool_data.mark_running(&tool_ref);
+
+        // Push stdout and stderr chunks
+        let stdout_bytes = b"long stdout output that will be evicted under pressure".to_vec();
+        let stderr_bytes = b"stderr retained".to_vec();
+        tool_data
+            .note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &stdout_bytes)
+            .unwrap();
+        tool_data
+            .note_stream_chunk(&tool_ref, ToolDataStream::Stderr, &stderr_bytes)
+            .unwrap();
+        tool_data.note_stream_end(&tool_ref, ToolDataStream::Stdout);
+        tool_data.note_stream_end(&tool_ref, ToolDataStream::Stderr);
+
+        let cmd = CommandResult {
+            status: crate::tool_data::CommandStatus::Exited,
+            exit_code: Some(0),
+            signal: None,
+            termination_confirmed: true,
+            stdout_base_offset: 0,
+            stdout_observed_end: stdout_bytes.len() as u64,
+            stderr_base_offset: 0,
+            stderr_observed_end: stderr_bytes.len() as u64,
+            output_complete: true,
+            output_truncated: false,
+        };
+        tool_data.note_command(&tool_ref, cmd);
+        tool_data.finish_and_snapshot(
+            &tool_ref,
+            minicore_runtime::tools::ToolResultOutcome::Success,
+        );
+
+        // Simulate global/session budget pressure that evicts stdout of this record
+        // (In tool_data, an eviction empties bytes and sets start_offset = observed_end)
+        let evict_snap = {
+            let snap = tool_data.snapshot_for_persistence(&tool_ref).unwrap();
+            let mut snap_modified = snap.clone();
+            snap_modified.record.stdout.expired = true;
+            snap_modified.record.stdout.truncated = true;
+            snap_modified.record.stdout.start_offset = snap.record.stdout.observed_end;
+            snap_modified.record.stdout.file_bytes = 0;
+            snap_modified.record.stdout.file_sha256 = None;
+            snap_modified.stdout_bytes = None;
+            // Update the command ranges using the live stream overlay principle
+            if let Some(mut command) = snap_modified.record.command {
+                command.stdout_base_offset = snap_modified.record.stdout.start_offset;
+                command.stdout_observed_end = snap_modified.record.stdout.observed_end;
+                command.output_truncated = true;
+                snap_modified.record.command = Some(command);
+            }
+            snap_modified
+        };
+
+        // Persistence commit with strict metadata validator must succeed
+        store
+            .commit_tool_record(&evict_snap, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Cold project from disk
+        let recovered = store
+            .read_tool_record(&tool_ref)
+            .await
+            .unwrap()
+            .expect("record must exist");
+
+        // Metadata projection shows Saved
+        let read_res = recovered.project_read(&tool_ref, 4096).unwrap();
+        assert_eq!(
+            read_res.execution.recording,
+            crate::tool_data::ToolRecordingState::Saved
+        );
+
+        // Evicted stdout projection returns Expired while retaining observed_end
+        let stdout_page = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stdout,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        assert_eq!(stdout_page.availability, ToolDataAvailability::Expired);
+        assert_eq!(stdout_page.observed_end, stdout_bytes.len() as u64);
+        assert!(stdout_page.truncated);
+
+        // Stderr stream was not evicted and remains Available
+        let stderr_page = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref: tool_ref.clone(),
+                    stream: ToolDataStream::Stderr,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        assert_eq!(stderr_page.availability, ToolDataAvailability::Available);
+        assert!(!stderr_page.data.is_empty());
 
         let _ = fs::remove_dir_all(base).await;
     }

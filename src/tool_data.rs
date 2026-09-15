@@ -28,6 +28,10 @@ use minicore_runtime::{LoopId, ToolCallId};
 
 use crate::error::AgentError;
 use crate::ids::SessionId;
+use crate::store::{
+    StoredInputSummary, StoredResultSummary, StoredStreamWindow, StoredToolRecord,
+    TOOL_RECORD_FORMAT_VERSION,
+};
 
 /// Maximum retained records for one loaded Session.
 pub(crate) const MAX_TOOL_RECORDS: usize = 1024;
@@ -151,13 +155,23 @@ pub enum ToolExecutionState {
 }
 
 impl ToolExecutionState {
-    const fn from_outcome(outcome: ToolResultOutcome) -> Self {
+    pub(crate) const fn from_outcome(outcome: ToolResultOutcome) -> Self {
         match outcome {
             ToolResultOutcome::Success => Self::Succeeded,
             ToolResultOutcome::Failed => Self::Failed,
             ToolResultOutcome::Denied => Self::Denied,
             ToolResultOutcome::Cancelled => Self::Cancelled,
             ToolResultOutcome::InputProvided => Self::InputProvided,
+        }
+    }
+
+    pub(crate) const fn matches_outcome(self, outcome: ToolResultOutcome) -> bool {
+        match outcome {
+            ToolResultOutcome::Success => matches!(self, Self::Succeeded),
+            ToolResultOutcome::Failed => matches!(self, Self::Failed),
+            ToolResultOutcome::Denied => matches!(self, Self::Denied),
+            ToolResultOutcome::Cancelled => matches!(self, Self::Cancelled),
+            ToolResultOutcome::InputProvided => matches!(self, Self::InputProvided),
         }
     }
 
@@ -276,7 +290,7 @@ impl CommandStatus {
 /// Structured facts about one owned command, kept separately from the Runtime
 /// tool outcome: a non-zero exit is a fact, not an RPC error, and a cancelled
 /// command is not a successful one.
-#[derive(Clone, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandResult {
     pub status: CommandStatus,
     /// Only set when an exit code was really observed.
@@ -321,7 +335,7 @@ impl fmt::Debug for CommandResult {
 /// instead of renumbering bytes; `observed_end` counts every byte the owner
 /// really read, whether or not it is still retained.
 #[derive(Default)]
-struct StreamWindow {
+pub(crate) struct StreamWindow {
     bytes: Vec<u8>,
     start_offset: u64,
     observed_end: u64,
@@ -332,6 +346,8 @@ struct StreamWindow {
     truncated: bool,
     /// The retained bytes were freed under the Session budget.
     expired: bool,
+    /// The backing blob was corrupt or missing on disk during cold read.
+    corrupt: bool,
 }
 
 /// What one pushed chunk changed, measured against the raw stream.
@@ -517,6 +533,18 @@ impl fmt::Debug for ToolProcessData {
     }
 }
 
+/// Durable storage state for one completed tool record's auxiliary files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRecordingState {
+    /// In-memory facts only, not yet or not eligible to be written to disk.
+    MemoryOnly,
+    /// Successfully persisted to the auxiliary store.
+    Saved,
+    /// Persistence failed or timed out; memory records remain intact.
+    Failed,
+}
+
 /// One tool call's process record. `command` is absent until a command was
 /// really owned, so a policy wait is never reported as a running process.
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -546,6 +574,7 @@ pub struct ToolExecutionData {
     pub result_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<CommandResult>,
+    pub recording: ToolRecordingState,
 }
 
 impl fmt::Debug for ToolExecutionData {
@@ -566,6 +595,7 @@ impl fmt::Debug for ToolExecutionData {
             .field("input_truncated", &self.input_truncated)
             .field("result_truncated", &self.result_truncated)
             .field("command", &self.command)
+            .field("recording", &self.recording)
             .finish()
     }
 }
@@ -653,7 +683,7 @@ impl fmt::Debug for ToolOutputPage {
     }
 }
 
-struct ToolRecord {
+pub(crate) struct ToolRecord {
     name: String,
     subject: ToolSubject,
     subject_truncated: bool,
@@ -678,9 +708,16 @@ struct ToolRecord {
     stderr: StreamWindow,
     /// The structured process record; absent until a command was owned.
     command: Option<CommandResult>,
+    input_corrupt: bool,
+    result_corrupt: bool,
+    recording: ToolRecordingState,
 }
 
 impl ToolRecord {
+    pub(crate) fn has_corrupt_streams(&self) -> bool {
+        self.input_corrupt || self.result_corrupt || self.stdout.corrupt || self.stderr.corrupt
+    }
+
     fn new(name: String) -> Self {
         Self {
             name,
@@ -704,6 +741,9 @@ impl ToolRecord {
             stdout: StreamWindow::default(),
             stderr: StreamWindow::default(),
             command: None,
+            input_corrupt: false,
+            result_corrupt: false,
+            recording: ToolRecordingState::MemoryOnly,
         }
     }
 
@@ -742,6 +782,9 @@ impl ToolRecord {
     }
 
     fn input_availability(&self) -> ToolDataAvailability {
+        if self.input_corrupt {
+            return ToolDataAvailability::Unavailable;
+        }
         stream_availability(
             self.input_seen,
             self.input_expired,
@@ -753,6 +796,9 @@ impl ToolRecord {
     }
 
     fn output_availability(&self) -> ToolDataAvailability {
+        if self.result_corrupt {
+            return ToolDataAvailability::Unavailable;
+        }
         stream_availability(
             self.result_seen,
             self.result_expired,
@@ -783,6 +829,9 @@ impl ToolRecord {
         let Some(window) = self.stream(stream) else {
             return ToolDataAvailability::Unavailable;
         };
+        if window.corrupt {
+            return ToolDataAvailability::Unavailable;
+        }
         if window.expired {
             return ToolDataAvailability::Expired;
         }
@@ -829,6 +878,7 @@ impl ToolRecord {
                 .command
                 .clone()
                 .map(|command| self.live_command(command)),
+            recording: self.recording,
         }
     }
 
@@ -853,6 +903,296 @@ impl ToolRecord {
             || self.stdout.expired
             || self.stderr.expired;
         command
+    }
+
+    pub(crate) fn project_read(
+        &self,
+        tool_ref: &ToolRef,
+        max_bytes: usize,
+    ) -> Result<ToolReadResult, AgentError> {
+        let execution = self.execution_data(tool_ref);
+        let invocation = (self.input_seen || self.input_expired).then(|| {
+            let (preview, cut) = truncate_prefix(&self.input, MAX_INVOCATION_PREVIEW_BYTES);
+            ToolInvocationData {
+                tool_ref: tool_ref.clone(),
+                name: self.name.clone(),
+                subject: self.subject.clone(),
+                subject_truncated: self.subject_truncated,
+                input: ToolInputSummary {
+                    total_bytes: self.input_total,
+                    preview,
+                    truncated: cut
+                        || self.input_truncated
+                        || self.input_expired
+                        || self.input_corrupt,
+                    encoding: INPUT_ENCODING,
+                },
+            }
+        });
+        let mut result = ToolReadResult {
+            invocation,
+            execution,
+        };
+        if encoded_len(&result)? > max_bytes {
+            let Some(source) = result.invocation.as_ref().map(|i| i.input.preview.clone()) else {
+                return Err(AgentError::InvalidArguments);
+            };
+            let mut template = result.clone();
+            if let Some(invocation) = template.invocation.as_mut() {
+                invocation.input.preview.clear();
+                invocation.input.truncated = true;
+            }
+            let template_len = encoded_len(&template)?;
+            if template_len > max_bytes {
+                return Err(AgentError::InvalidArguments);
+            }
+            // The template already encodes the empty preview's two quotes.
+            let available = max_bytes.saturating_sub(template_len).saturating_add(2);
+            let (preview, _) = fit_encoded_string(&source, available);
+            if let Some(invocation) = result.invocation.as_mut() {
+                invocation.input.preview = preview;
+                invocation.input.truncated = true;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn project_output(
+        &self,
+        request: &ToolOutputRequest,
+        max_bytes: usize,
+    ) -> Result<ToolOutputPage, AgentError> {
+        let stream = request.stream;
+        if stream.is_process() {
+            return output_process(self, request, max_bytes);
+        }
+        let (content, observed, seen, expired, truncated) = match stream {
+            ToolDataStream::Input => (
+                self.input.as_str(),
+                self.input_total,
+                self.input_seen,
+                self.input_expired,
+                self.input_truncated,
+            ),
+            ToolDataStream::Output => (
+                self.result.as_str(),
+                self.result_total,
+                self.result_seen,
+                self.result_expired,
+                self.result_truncated,
+            ),
+            ToolDataStream::Stdout | ToolDataStream::Stderr => {
+                return output_process(self, request, max_bytes);
+            }
+        };
+        let availability = stream_availability(
+            seen,
+            expired,
+            self.state.is_terminal(),
+            content.len(),
+            observed,
+            truncated,
+        );
+        let base = ToolOutputPage {
+            tool_ref: request.tool_ref.clone(),
+            stream,
+            encoding: stream.encoding(),
+            base_offset: 0,
+            next_offset: 0,
+            observed_end: observed as u64,
+            eof: false,
+            truncated: false,
+            availability,
+            data: String::new(),
+        };
+        if expired {
+            return bounded_page(
+                ToolOutputPage {
+                    base_offset: observed as u64,
+                    next_offset: observed as u64,
+                    eof: true,
+                    truncated: true,
+                    ..base
+                },
+                max_bytes,
+            );
+        }
+        if !seen {
+            if request.offset != 0 {
+                return Err(AgentError::InvalidArguments);
+            }
+            return bounded_page(
+                ToolOutputPage {
+                    eof: availability != ToolDataAvailability::Pending,
+                    ..base
+                },
+                max_bytes,
+            );
+        }
+        if request.offset > observed as u64 {
+            return Err(AgentError::InvalidArguments);
+        }
+        let offset = usize::try_from(request.offset).unwrap_or(usize::MAX);
+        let retained = content.len();
+        if offset > retained {
+            return bounded_page(
+                ToolOutputPage {
+                    base_offset: request.offset,
+                    next_offset: observed as u64,
+                    eof: true,
+                    truncated: true,
+                    availability: ToolDataAvailability::Partial,
+                    ..base
+                },
+                max_bytes,
+            );
+        }
+        if !content.is_char_boundary(offset) {
+            return Err(AgentError::InvalidArguments);
+        }
+        let template = ToolOutputPage {
+            base_offset: offset as u64,
+            next_offset: u64::MAX,
+            ..base.clone()
+        };
+        let template_len = encoded_len(&template)?;
+        if template_len > max_bytes {
+            return Err(AgentError::InvalidArguments);
+        }
+        let available = max_bytes.saturating_sub(template_len).saturating_add(2);
+        let (data, _cut) = fit_encoded_string(&content[offset..], available);
+        if data.is_empty() && offset < retained {
+            return Err(AgentError::InvalidArguments);
+        }
+        let next = offset.saturating_add(data.len());
+        let lossy = retained < observed || truncated;
+        let eof = next >= retained;
+        bounded_page(
+            ToolOutputPage {
+                base_offset: offset as u64,
+                next_offset: next as u64,
+                eof,
+                truncated: lossy,
+                data,
+                ..base
+            },
+            max_bytes,
+        )
+    }
+
+    pub(crate) fn from_stored(
+        stored: StoredToolRecord,
+        (input_bytes, input_corrupt): (Option<Vec<u8>>, bool),
+        (result_bytes, result_corrupt): (Option<Vec<u8>>, bool),
+        (stdout_bytes, stdout_corrupt): (Option<Vec<u8>>, bool),
+        (stderr_bytes, stderr_corrupt): (Option<Vec<u8>>, bool),
+    ) -> Self {
+        let mut input_corrupt = input_corrupt;
+        let input = match input_bytes {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    input_corrupt = true;
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+        let mut result_corrupt = result_corrupt;
+        let result = match result_bytes {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    result_corrupt = true;
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+        let stdout = StreamWindow {
+            bytes: stdout_bytes.unwrap_or_default(),
+            start_offset: stored.stdout.start_offset,
+            observed_end: stored.stdout.observed_end,
+            seen: stored.stdout.seen,
+            complete: stored.stdout.complete,
+            truncated: stored.stdout.truncated,
+            expired: stored.stdout.expired,
+            corrupt: stdout_corrupt,
+        };
+        let stderr = StreamWindow {
+            bytes: stderr_bytes.unwrap_or_default(),
+            start_offset: stored.stderr.start_offset,
+            observed_end: stored.stderr.observed_end,
+            seen: stored.stderr.seen,
+            complete: stored.stderr.complete,
+            truncated: stored.stderr.truncated,
+            expired: stored.stderr.expired,
+            corrupt: stderr_corrupt,
+        };
+        Self {
+            name: stored.name,
+            subject: stored.subject,
+            subject_truncated: stored.subject_truncated,
+            input,
+            input_total: stored.input.total_bytes,
+            input_seen: stored.input.seen,
+            input_truncated: stored.input.truncated,
+            input_expired: stored.input.expired,
+            input_corrupt,
+            result,
+            result_total: stored.result.total_bytes,
+            result_seen: stored.result.seen,
+            result_truncated: stored.result.truncated,
+            result_expired: stored.result.expired,
+            result_corrupt,
+            state: stored.state,
+            phase: stored.phase,
+            started_at: stored.started_at,
+            finished_at: stored.finished_at,
+            outcome: stored.outcome,
+            stdout,
+            stderr,
+            command: stored.command,
+            recording: ToolRecordingState::Saved,
+        }
+    }
+}
+
+/// A snapshot of one completed tool call's metadata and retained buffers,
+/// bounded per tool to <= 3 MiB for durable storage.
+#[derive(Clone)]
+pub(crate) struct ToolPersistenceSnapshot {
+    pub(crate) tool_ref: ToolRef,
+    pub(crate) record: StoredToolRecord,
+    pub(crate) input_bytes: Option<Vec<u8>>,
+    pub(crate) result_bytes: Option<Vec<u8>>,
+    pub(crate) stdout_bytes: Option<Vec<u8>>,
+    pub(crate) stderr_bytes: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for ToolPersistenceSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolPersistenceSnapshot")
+            .field("tool_ref", &self.tool_ref)
+            .field("record", &self.record)
+            .field(
+                "input_bytes_len",
+                &self.input_bytes.as_ref().map(|b| b.len()),
+            )
+            .field(
+                "result_bytes_len",
+                &self.result_bytes.as_ref().map(|b| b.len()),
+            )
+            .field(
+                "stdout_bytes_len",
+                &self.stdout_bytes.as_ref().map(|b| b.len()),
+            )
+            .field(
+                "stderr_bytes_len",
+                &self.stderr_bytes.as_ref().map(|b| b.len()),
+            )
+            .finish()
     }
 }
 
@@ -1270,6 +1610,21 @@ impl ToolData {
             .map(|record| record.execution_data(tool_ref))
     }
 
+    /// Marks durable recording state for one tool call and returns the updated snapshot.
+    pub(crate) fn note_recording(
+        &self,
+        tool_ref: &ToolRef,
+        recording: ToolRecordingState,
+    ) -> Option<ToolExecutionData> {
+        let mut inner = self.lock();
+        if let Some(record) = inner.records.get_mut(tool_ref) {
+            record.recording = recording;
+            Some(record.execution_data(tool_ref))
+        } else {
+            None
+        }
+    }
+
     /// The retained range of one process stream, as
     /// `(base_offset, observed_end)`, so the process record and `tool.output`
     /// describe the same bytes.
@@ -1372,50 +1727,7 @@ impl ToolData {
         let Some(record) = inner.records.get(&request.tool_ref) else {
             return Err(AgentError::ToolNotFound);
         };
-        let execution = record.execution_data(&request.tool_ref);
-        // Invocation data is the requested input; expose it whenever the
-        // stream was observed or evicted, not only while bytes remain.
-        let invocation = (record.input_seen || record.input_expired).then(|| {
-            let (preview, cut) = truncate_prefix(&record.input, MAX_INVOCATION_PREVIEW_BYTES);
-            ToolInvocationData {
-                tool_ref: request.tool_ref.clone(),
-                name: record.name.clone(),
-                subject: record.subject.clone(),
-                subject_truncated: record.subject_truncated,
-                input: ToolInputSummary {
-                    total_bytes: record.input_total,
-                    preview,
-                    truncated: cut || record.input_truncated || record.input_expired,
-                    encoding: INPUT_ENCODING,
-                },
-            }
-        });
-        let mut result = ToolReadResult {
-            invocation,
-            execution,
-        };
-        if encoded_len(&result)? > max_bytes {
-            let Some(source) = result.invocation.as_ref().map(|i| i.input.preview.clone()) else {
-                return Err(AgentError::InvalidArguments);
-            };
-            let mut template = result.clone();
-            if let Some(invocation) = template.invocation.as_mut() {
-                invocation.input.preview.clear();
-                invocation.input.truncated = true;
-            }
-            let template_len = encoded_len(&template)?;
-            if template_len > max_bytes {
-                return Err(AgentError::InvalidArguments);
-            }
-            // The template already encodes the empty preview's two quotes.
-            let available = max_bytes.saturating_sub(template_len).saturating_add(2);
-            let (preview, _) = fit_encoded_string(&source, available);
-            if let Some(invocation) = result.invocation.as_mut() {
-                invocation.input.preview = preview;
-                invocation.input.truncated = true;
-            }
-        }
-        Ok(result)
+        record.project_read(&request.tool_ref, max_bytes)
     }
 
     pub(crate) fn output(
@@ -1427,133 +1739,134 @@ impl ToolData {
         let Some(record) = inner.records.get(&request.tool_ref) else {
             return Err(AgentError::ToolNotFound);
         };
-        let stream = request.stream;
-        if stream.is_process() {
-            return output_process(record, request, max_bytes);
+        record.project_output(request, max_bytes)
+    }
+
+    /// Returns all tool refs associated with a particular loop in insertion order.
+    pub(crate) fn loop_tool_refs(&self, session_id: SessionId, loop_id: LoopId) -> Vec<ToolRef> {
+        let inner = self.lock();
+        inner
+            .order
+            .iter()
+            .filter(|r| r.session_id == session_id && r.loop_id == loop_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Exports one completed tool call's facts and retained buffers for durable persistence.
+    /// Memory copying is bounded to this single record (<= 3 MiB total).
+    pub(crate) fn snapshot_for_persistence(
+        &self,
+        tool_ref: &ToolRef,
+    ) -> Option<ToolPersistenceSnapshot> {
+        let inner = self.lock();
+        let record = inner.records.get(tool_ref)?;
+
+        if !record.state.is_terminal() {
+            return None;
         }
-        let (content, observed, seen, expired, truncated) = match stream {
-            ToolDataStream::Input => (
-                record.input.as_str(),
-                record.input_total,
-                record.input_seen,
-                record.input_expired,
-                record.input_truncated,
-            ),
-            ToolDataStream::Output => (
-                record.result.as_str(),
-                record.result_total,
-                record.result_seen,
-                record.result_expired,
-                record.result_truncated,
-            ),
-            ToolDataStream::Stdout | ToolDataStream::Stderr => {
-                return output_process(record, request, max_bytes);
+        if let Some(command) = &record.command {
+            if !command.status.is_terminal() {
+                return None;
             }
+        }
+
+        let input_bytes = if !record.input_expired && !record.input.is_empty() {
+            Some(record.input.as_bytes().to_vec())
+        } else {
+            None
         };
-        let availability = stream_availability(
-            seen,
-            expired,
-            record.state.is_terminal(),
-            content.len(),
-            observed,
-            truncated,
-        );
-        let base = ToolOutputPage {
-            tool_ref: request.tool_ref.clone(),
-            stream,
-            encoding: stream.encoding(),
-            base_offset: 0,
-            next_offset: 0,
-            observed_end: observed as u64,
-            eof: false,
-            truncated: false,
-            availability,
-            data: String::new(),
+        let input_file_bytes = input_bytes.as_ref().map_or(0, |b| b.len());
+        let input_file_sha256 = input_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
+        let input_summary = StoredInputSummary {
+            total_bytes: record.input_total,
+            seen: record.input_seen,
+            truncated: record.input_truncated,
+            expired: record.input_expired,
+            file_bytes: input_file_bytes,
+            file_sha256: input_file_sha256,
         };
-        if expired {
-            // The window is empty and sits at the observed end.
-            return bounded_page(
-                ToolOutputPage {
-                    base_offset: observed as u64,
-                    next_offset: observed as u64,
-                    eof: true,
-                    truncated: true,
-                    ..base
-                },
-                max_bytes,
-            );
-        }
-        if !seen {
-            // The stream has no recorded bytes. For a terminal call that is an
-            // explicit `unavailable`; for a running call it is `pending`. A
-            // non-zero offset is invalid either way.
-            if request.offset != 0 {
-                return Err(AgentError::InvalidArguments);
-            }
-            return bounded_page(
-                ToolOutputPage {
-                    eof: availability != ToolDataAvailability::Pending,
-                    ..base
-                },
-                max_bytes,
-            );
-        }
-        if request.offset > observed as u64 {
-            return Err(AgentError::InvalidArguments);
-        }
-        let offset = usize::try_from(request.offset).unwrap_or(usize::MAX);
-        let retained = content.len();
-        if offset > retained {
-            // The bytes existed but fell outside the retained prefix. Report
-            // the loss without moving `next_offset` backwards.
-            return bounded_page(
-                ToolOutputPage {
-                    base_offset: request.offset,
-                    next_offset: observed as u64,
-                    eof: true,
-                    truncated: true,
-                    availability: ToolDataAvailability::Partial,
-                    ..base
-                },
-                max_bytes,
-            );
-        }
-        if !content.is_char_boundary(offset) {
-            return Err(AgentError::InvalidArguments);
-        }
-        // `u64::MAX` reserves the widest possible `next_offset` digits so the
-        // final page can never exceed the budget after the real value lands.
-        let template = ToolOutputPage {
-            base_offset: offset as u64,
-            next_offset: u64::MAX,
-            ..base.clone()
+
+        let result_bytes = if !record.result_expired && !record.result.is_empty() {
+            Some(record.result.as_bytes().to_vec())
+        } else {
+            None
         };
-        let template_len = encoded_len(&template)?;
-        if template_len > max_bytes {
-            return Err(AgentError::InvalidArguments);
-        }
-        let available = max_bytes.saturating_sub(template_len).saturating_add(2);
-        let (data, _cut) = fit_encoded_string(&content[offset..], available);
-        if data.is_empty() && offset < retained {
-            return Err(AgentError::InvalidArguments);
-        }
-        let next = offset.saturating_add(data.len());
-        // `truncated` means real byte loss (the stored stream is only a
-        // prefix), not page-budget pagination: an incomplete page is expressed
-        // by `next_offset` with `eof: false`.
-        let lossy = retained < observed || truncated;
-        let eof = next >= retained;
-        bounded_page(
-            ToolOutputPage {
-                base_offset: offset as u64,
-                next_offset: next as u64,
-                eof,
-                truncated: lossy,
-                data,
-                ..base
-            },
-            max_bytes,
-        )
+        let result_file_bytes = result_bytes.as_ref().map_or(0, |b| b.len());
+        let result_file_sha256 = result_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
+        let result_summary = StoredResultSummary {
+            total_bytes: record.result_total,
+            seen: record.result_seen,
+            truncated: record.result_truncated,
+            expired: record.result_expired,
+            file_bytes: result_file_bytes,
+            file_sha256: result_file_sha256,
+        };
+
+        let stdout_bytes = if !record.stdout.expired && !record.stdout.bytes.is_empty() {
+            Some(record.stdout.bytes.clone())
+        } else {
+            None
+        };
+        let stdout_file_bytes = stdout_bytes.as_ref().map_or(0, |b| b.len());
+        let stdout_file_sha256 = stdout_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
+        let stdout_summary = StoredStreamWindow {
+            start_offset: record.stdout.start_offset,
+            observed_end: record.stdout.observed_end,
+            seen: record.stdout.seen,
+            complete: record.stdout.complete,
+            truncated: record.stdout.truncated,
+            expired: record.stdout.expired,
+            file_bytes: stdout_file_bytes,
+            file_sha256: stdout_file_sha256,
+        };
+
+        let stderr_bytes = if !record.stderr.expired && !record.stderr.bytes.is_empty() {
+            Some(record.stderr.bytes.clone())
+        } else {
+            None
+        };
+        let stderr_file_bytes = stderr_bytes.as_ref().map_or(0, |b| b.len());
+        let stderr_file_sha256 = stderr_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
+        let stderr_summary = StoredStreamWindow {
+            start_offset: record.stderr.start_offset,
+            observed_end: record.stderr.observed_end,
+            seen: record.stderr.seen,
+            complete: record.stderr.complete,
+            truncated: record.stderr.truncated,
+            expired: record.stderr.expired,
+            file_bytes: stderr_file_bytes,
+            file_sha256: stderr_file_sha256,
+        };
+
+        let command = record.command.clone().map(|cmd| record.live_command(cmd));
+
+        let stored_record = StoredToolRecord {
+            version: TOOL_RECORD_FORMAT_VERSION,
+            tool_ref: tool_ref.clone(),
+            name: record.name.clone(),
+            subject: record.subject.clone(),
+            subject_truncated: record.subject_truncated,
+            state: record.state,
+            phase: record.phase,
+            started_at: record.started_at.clone(),
+            finished_at: record.finished_at.clone(),
+            outcome: record.outcome,
+            input: input_summary,
+            result: result_summary,
+            stdout: stdout_summary,
+            stderr: stderr_summary,
+            command,
+        };
+
+        Some(ToolPersistenceSnapshot {
+            tool_ref: tool_ref.clone(),
+            record: stored_record,
+            input_bytes,
+            result_bytes,
+            stdout_bytes,
+            stderr_bytes,
+        })
     }
 }
 
@@ -1595,6 +1908,17 @@ fn output_process(
         availability,
         data: String::new(),
     };
+    if window.corrupt {
+        return bounded_page(
+            ToolOutputPage {
+                eof: stream_final,
+                truncated: true,
+                availability: ToolDataAvailability::Unavailable,
+                ..base
+            },
+            max_bytes,
+        );
+    }
     if request.offset > window.observed_end {
         return Err(AgentError::InvalidArguments);
     }

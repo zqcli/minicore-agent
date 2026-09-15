@@ -41,8 +41,12 @@ registered under its complete `ToolRef` that keeps, stops, and reaps the child,
 both pipes stream into bounded 1 MiB tail windows served as base64 pages with
 raw offsets. Capacity is accounted under the 8 MiB Session budget; stale-offset
 pages can recover retained tails. Turn/close joins retain handles across dropped
-or concurrent join futures before publishing the ordinary Turn result. P5b durable process records, P6 change review and P7 integration
-remain pending.
+or concurrent join futures before publishing the ordinary Turn result.
+P5b1 auxiliary persistence is verified: stable/MSRV each 673 passed, 2 ignored;
+strict and cross-platform compile gates passed. Atomic metadata/blob directories
+have per-tool, Session and Store budgets; failed auxiliary writes preserve core
+outcomes and report recording=failed. Internal cold reads share the ToolData
+projection. P5b2 public/RPC cold reads, P6 and P7 remain pending.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,
