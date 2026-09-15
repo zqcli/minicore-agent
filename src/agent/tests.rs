@@ -53,7 +53,8 @@ impl Drop for TestDirectoryGuard {
 }
 
 fn fixture_dir(label: &str) -> (PathBuf, TestDirectoryGuard) {
-    let path = std::env::temp_dir().join(format!("minicore-agent-{label}-{}", std::process::id()));
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    let path = temp.join(format!("minicore-agent-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     (path.clone(), TestDirectoryGuard { path })
 }
