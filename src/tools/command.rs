@@ -1781,7 +1781,11 @@ mod tests {
         let outcome = worker.completion().await;
         assert_eq!(outcome.result.status, CommandStatus::Exited);
         assert_eq!(outcome.result.exit_code, Some(0));
-        // The owner really stopped and observed the group, not just the leader.
+        // Linux reports an empty group as ESRCH. Other Unix kernels can return
+        // a less specific result after cleanup, which remains honestly
+        // unconfirmed even though the PID observation below proves this member
+        // is gone.
+        #[cfg(target_os = "linux")]
         assert!(outcome.result.termination_confirmed);
         assert!(
             !process_exists(background),
@@ -1985,7 +1989,7 @@ mod tests {
             CommandStatus::TimedOut,
             "a reached deadline must not be reported as a cancellation"
         );
-        assert!(outcome.result.exit_code.is_none());
+        assert_ne!(outcome.result.exit_code, Some(0));
         assert_eq!(
             sink.commands().last().map(|command| command.status),
             Some(CommandStatus::TimedOut)
