@@ -27,6 +27,7 @@ use crate::policy::Policy;
 use crate::presentation::{Presentation, PresentationModel};
 use crate::profiles::ApprovalMode;
 use crate::prompt::ProjectPromptProvider;
+use crate::tools::command::CommandOwners;
 use crate::tools::{BuildToolsError, CommandEnvironment};
 use crate::workspace::Workspace;
 
@@ -304,6 +305,7 @@ impl SubagentFactory {
             cwd: workspace.root().to_string_lossy().into_owned(),
             config,
             options: self.options.clone(),
+            owners: Arc::clone(presentation.command_owners()),
         })
     }
 
@@ -395,6 +397,9 @@ struct PreparedTask {
     cwd: String,
     config: ExecutionConfig,
     options: LoopOptions,
+    /// Owned commands of the child loop. Joined when the stage ends, so a Bash
+    /// process cannot outlive the child that started it.
+    owners: Arc<CommandOwners>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -683,7 +688,24 @@ async fn dispatch_stage(
     Ok(stage)
 }
 
+/// Owns one child stage: the child loop, its commands, and the join that keeps
+/// both from outliving the stage.
 async fn run_child(
+    task: PreparedTask,
+    stage_index: usize,
+    deadline: Instant,
+    cancellation: CancellationToken,
+    progress: ToolProgressSink,
+) -> Result<StageResult, SubagentWorkerError> {
+    let owners = Arc::clone(&task.owners);
+    let result = run_stage(task, stage_index, deadline, cancellation, progress).await;
+    // Every exit path joins the child's command owners; the child loop already
+    // ended, so this only waits for a process that was really started.
+    owners.join_all().await;
+    result
+}
+
+async fn run_stage(
     task: PreparedTask,
     stage_index: usize,
     deadline: Instant,
@@ -1494,6 +1516,7 @@ mod tests {
             cwd: "/workspace".to_owned(),
             config,
             options,
+            owners: CommandOwners::new(),
         }
     }
 

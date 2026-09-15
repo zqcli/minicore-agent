@@ -18,6 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Mutex;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -43,26 +44,45 @@ pub(crate) const MAX_INVOCATION_PREVIEW_BYTES: usize = 8 * 1024;
 pub(crate) const EVENT_INPUT_PREVIEW_BYTES: usize = 2 * 1024;
 /// Retained subject text (path/script/cwd) per tool call.
 pub(crate) const MAX_SUBJECT_BYTES: usize = 4 * 1024;
+/// Retained tail window per process stream. This is the window a client pages
+/// through; the model-facing result prefix has its own separate budget.
+pub(crate) const MAX_TOOL_STREAM_BYTES: usize = 1024 * 1024;
+/// Largest raw chunk a process reader hands to the store in one call.
+pub(crate) const MAX_TOOL_CHUNK_BYTES: usize = 32 * 1024;
 
 const INPUT_ENCODING: &str = "utf8_json";
 const OUTPUT_ENCODING: &str = "utf8";
+const STREAM_ENCODING: &str = "base64";
+/// Bounded size one retained `CommandResult` contributes to the Session
+/// budget, so metadata is counted rather than assumed free.
+const COMMAND_METADATA_BYTES: usize = 128;
 
-/// One model-facing byte channel. P2 produces `Input` (requested invocation
-/// JSON) and `Output` (the recorded tool result text); process streams are
-/// added in P5.
+/// One model-facing byte channel. `Input` and `Output` carry the request JSON
+/// and the model-facing result text; `Stdout` and `Stderr` carry raw process
+/// bytes, so their offsets are raw byte offsets and their content is base64.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolDataStream {
     Input,
     Output,
+    Stdout,
+    Stderr,
 }
 
 impl ToolDataStream {
-    const fn encoding(self) -> &'static str {
+    /// Encoding of this stream's `data` text. `input` is canonical JSON,
+    /// `output` is recorded UTF-8 text, and the two process streams are raw
+    /// bytes carried as base64 with raw-byte offsets.
+    pub(crate) const fn encoding(self) -> &'static str {
         match self {
             Self::Input => INPUT_ENCODING,
             Self::Output => OUTPUT_ENCODING,
+            Self::Stdout | Self::Stderr => STREAM_ENCODING,
         }
+    }
+
+    pub(crate) const fn is_process(self) -> bool {
+        matches!(self, Self::Stdout | Self::Stderr)
     }
 }
 
@@ -120,6 +140,9 @@ pub enum ToolExecutionState {
     Requested,
     AwaitingPolicy,
     Running,
+    /// Cancellation was requested and the owner has not reported a terminal
+    /// state yet. Not terminal: the real cleanup completion is still pending.
+    Cancelling,
     Succeeded,
     Failed,
     Denied,
@@ -229,7 +252,273 @@ impl fmt::Debug for ToolInvocationData {
     }
 }
 
-/// Current or final execution facts for one tool call.
+/// The lifecycle state of one owned command. `Cancelling` records that
+/// cancellation was requested; it is not a terminal state, and it is never
+/// reported as one before the owner actually observed termination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus {
+    Running,
+    Cancelling,
+    Exited,
+    Cancelled,
+    TimedOut,
+    SpawnFailed,
+    Failed,
+}
+
+impl CommandStatus {
+    pub(crate) const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running | Self::Cancelling)
+    }
+}
+
+/// Structured facts about one owned command, kept separately from the Runtime
+/// tool outcome: a non-zero exit is a fact, not an RPC error, and a cancelled
+/// command is not a successful one.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct CommandResult {
+    pub status: CommandStatus,
+    /// Only set when an exit code was really observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating signal, when the platform reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// True only when real evidence that the controlled group/job is gone was
+    /// observed. A dropped handle or a requested kill is not evidence.
+    pub termination_confirmed: bool,
+    pub stdout_base_offset: u64,
+    pub stdout_observed_end: u64,
+    pub stderr_base_offset: u64,
+    pub stderr_observed_end: u64,
+    /// True when both streams reached a real end of output.
+    pub output_complete: bool,
+    /// True when bytes were dropped or the observation was cut short.
+    pub output_truncated: bool,
+}
+
+impl fmt::Debug for CommandResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandResult")
+            .field("status", &self.status)
+            .field("exit_code", &self.exit_code)
+            .field("signal", &self.signal)
+            .field("termination_confirmed", &self.termination_confirmed)
+            .field("stdout_base_offset", &self.stdout_base_offset)
+            .field("stdout_observed_end", &self.stdout_observed_end)
+            .field("stderr_base_offset", &self.stderr_base_offset)
+            .field("stderr_observed_end", &self.stderr_observed_end)
+            .field("output_complete", &self.output_complete)
+            .field("output_truncated", &self.output_truncated)
+            .finish()
+    }
+}
+
+/// A bounded tail window of one raw process stream. `start_offset` is the raw
+/// offset of the first retained byte, so eviction moves `base_offset` forward
+/// instead of renumbering bytes; `observed_end` counts every byte the owner
+/// really read, whether or not it is still retained.
+#[derive(Default)]
+struct StreamWindow {
+    bytes: Vec<u8>,
+    start_offset: u64,
+    observed_end: u64,
+    seen: bool,
+    /// The stream reached a real end of output.
+    complete: bool,
+    /// Bytes were dropped, either by the window or by an eviction.
+    truncated: bool,
+    /// The retained bytes were freed under the Session budget.
+    expired: bool,
+}
+
+/// What one pushed chunk changed, measured against the raw stream.
+struct StreamPush {
+    base_offset: u64,
+    next_offset: u64,
+    dropped: bool,
+}
+
+impl StreamWindow {
+    /// Appends one chunk and evicts the oldest bytes beyond the window.
+    fn push(&mut self, chunk: &[u8]) -> StreamPush {
+        self.seen = true;
+        if self.bytes.is_empty() {
+            // Nothing is retained (first byte, or retention was evicted), so
+            // the retained window starts where this chunk starts.
+            self.start_offset = self.observed_end;
+        }
+        let base_offset = self.observed_end;
+        self.observed_end = self.observed_end.saturating_add(chunk.len() as u64);
+        if chunk.is_empty() {
+            return StreamPush {
+                base_offset,
+                next_offset: self.observed_end,
+                dropped: false,
+            };
+        }
+        self.expired = false;
+        let old_len = self.bytes.len();
+        let total = old_len.saturating_add(chunk.len());
+        let dropped;
+        if total <= MAX_TOOL_STREAM_BYTES {
+            dropped = false;
+            if total > self.bytes.capacity() {
+                let target = (self.bytes.capacity().saturating_mul(2))
+                    .max(total)
+                    .min(MAX_TOOL_STREAM_BYTES);
+                let additional = target - old_len;
+                self.bytes.reserve_exact(additional);
+            }
+            self.bytes.extend_from_slice(chunk);
+        } else {
+            let excess = total - MAX_TOOL_STREAM_BYTES;
+            self.start_offset = self.start_offset.saturating_add(excess as u64);
+            self.truncated = true;
+            dropped = true;
+            let old_dropped = excess.min(old_len);
+            let chunk_dropped = excess - old_dropped;
+            if old_dropped == old_len {
+                self.bytes.clear();
+            } else if old_dropped > 0 {
+                self.bytes.drain(..old_dropped);
+            }
+            let chunk_slice = &chunk[chunk_dropped..];
+            if self.bytes.capacity() < MAX_TOOL_STREAM_BYTES {
+                let additional = MAX_TOOL_STREAM_BYTES - self.bytes.len();
+                self.bytes.reserve_exact(additional);
+            }
+            self.bytes.extend_from_slice(chunk_slice);
+        }
+        StreamPush {
+            base_offset,
+            next_offset: self.observed_end,
+            dropped,
+        }
+    }
+
+    fn retained(&self) -> usize {
+        if self.expired {
+            0
+        } else {
+            self.bytes.capacity()
+        }
+    }
+
+    /// The retained range as `(base_offset, observed_end)`, even when nothing
+    /// is retained or the window was evicted. The observed end never moves
+    /// backwards, so a live command record can report progress while running.
+    fn live_range(&self) -> (u64, u64) {
+        (self.start_offset, self.observed_end)
+    }
+
+    /// The retained bytes from one raw offset, when that offset is still
+    /// inside the window.
+    fn page(&self, offset: u64) -> Option<&[u8]> {
+        if self.expired || offset < self.start_offset {
+            return None;
+        }
+        let index = usize::try_from(offset - self.start_offset).ok()?;
+        self.bytes.get(index..)
+    }
+
+    fn evict(&mut self) {
+        self.bytes = Vec::new();
+        self.start_offset = self.observed_end;
+        self.expired = true;
+        self.truncated = true;
+    }
+}
+
+/// What one accepted chunk changed, so a live consumer and a later `tool.output`
+/// page describe the same bytes without re-reading anything.
+#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
+pub(crate) struct ToolStreamNotice {
+    pub(crate) stream: ToolDataStream,
+    /// Raw offset of the first byte of this chunk.
+    pub(crate) base_offset: u64,
+    pub(crate) next_offset: u64,
+    pub(crate) observed_end: u64,
+    /// True when this chunk pushed earlier bytes out of the window.
+    pub(crate) dropped: bool,
+    pub(crate) expired: bool,
+}
+
+impl fmt::Debug for ToolStreamNotice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolStreamNotice")
+            .field("stream", &self.stream)
+            .field("base_offset", &self.base_offset)
+            .field("next_offset", &self.next_offset)
+            .field("observed_end", &self.observed_end)
+            .field("dropped", &self.dropped)
+            .field("expired", &self.expired)
+            .finish()
+    }
+}
+
+/// One accepted chunk as a live event. The bytes were already stored in the
+/// authoritative window, so a consumer that misses this event loses a
+/// notification only, never the data itself.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ToolProcessChunk {
+    pub stream: ToolDataStream,
+    /// Always `base64` for process streams: the payload is raw bytes and the
+    /// offsets count raw bytes, never base64 positions.
+    pub encoding: &'static str,
+    /// Base64 of exactly the bytes this notice describes; raw offsets are in
+    /// `base_offset`/`next_offset` and never count base64 positions.
+    pub data: String,
+    pub base_offset: u64,
+    pub next_offset: u64,
+    pub observed_end: u64,
+    pub dropped: bool,
+    pub expired: bool,
+}
+
+impl fmt::Debug for ToolProcessChunk {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolProcessChunk")
+            .field("stream", &self.stream)
+            .field("encoding", &self.encoding)
+            .field("base_offset", &self.base_offset)
+            .field("next_offset", &self.next_offset)
+            .field("observed_end", &self.observed_end)
+            .field("dropped", &self.dropped)
+            .field("expired", &self.expired)
+            .field("data_bytes", &self.data.len())
+            .finish()
+    }
+}
+
+/// Live process facts for one owned command. At least one part is present; the
+/// Runtime outcome is never taken from here.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ToolProcessData {
+    pub tool_ref: ToolRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<ToolProcessChunk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandResult>,
+}
+
+impl fmt::Debug for ToolProcessData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolProcessData")
+            .field("tool_ref", &self.tool_ref)
+            .field("chunk", &self.chunk)
+            .field("command", &self.command)
+            .finish()
+    }
+}
+
+/// One tool call's process record. `command` is absent until a command was
+/// really owned, so a policy wait is never reported as a running process.
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolExecutionData {
     pub tool_ref: ToolRef,
@@ -255,6 +544,8 @@ pub struct ToolExecutionData {
     pub result_bytes: usize,
     pub input_truncated: bool,
     pub result_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandResult>,
 }
 
 impl fmt::Debug for ToolExecutionData {
@@ -274,6 +565,7 @@ impl fmt::Debug for ToolExecutionData {
             .field("result_bytes", &self.result_bytes)
             .field("input_truncated", &self.input_truncated)
             .field("result_truncated", &self.result_truncated)
+            .field("command", &self.command)
             .finish()
     }
 }
@@ -380,6 +672,12 @@ struct ToolRecord {
     started_at: Option<String>,
     finished_at: Option<String>,
     outcome: Option<ToolResultOutcome>,
+    /// Bounded tail windows of the process streams; empty until a command
+    /// really owned a process.
+    stdout: StreamWindow,
+    stderr: StreamWindow,
+    /// The structured process record; absent until a command was owned.
+    command: Option<CommandResult>,
 }
 
 impl ToolRecord {
@@ -403,17 +701,44 @@ impl ToolRecord {
             started_at: None,
             finished_at: None,
             outcome: None,
+            stdout: StreamWindow::default(),
+            stderr: StreamWindow::default(),
+            command: None,
+        }
+    }
+
+    fn stream(&self, stream: ToolDataStream) -> Option<&StreamWindow> {
+        match stream {
+            ToolDataStream::Stdout => Some(&self.stdout),
+            ToolDataStream::Stderr => Some(&self.stderr),
+            ToolDataStream::Input | ToolDataStream::Output => None,
+        }
+    }
+
+    fn stream_mut(&mut self, stream: ToolDataStream) -> Option<&mut StreamWindow> {
+        match stream {
+            ToolDataStream::Stdout => Some(&mut self.stdout),
+            ToolDataStream::Stderr => Some(&mut self.stderr),
+            ToolDataStream::Input | ToolDataStream::Output => None,
         }
     }
 
     /// Counts retained raw bytes and bounded metadata, so the Session budget
     /// matches what is actually held in memory.
     fn retained_bytes(&self) -> usize {
+        let command = if self.command.is_some() {
+            COMMAND_METADATA_BYTES
+        } else {
+            0
+        };
         self.name
             .len()
             .saturating_add(subject_len(&self.subject))
             .saturating_add(self.input.len())
             .saturating_add(self.result.len())
+            .saturating_add(self.stdout.retained())
+            .saturating_add(self.stderr.retained())
+            .saturating_add(command)
     }
 
     fn input_availability(&self) -> ToolDataAvailability {
@@ -450,6 +775,41 @@ impl ToolRecord {
         self.result_expired = true;
     }
 
+    /// Stream availability for a process stream. A running stream is `Pending`
+    /// until its first byte, and never claims an end of output it has not seen.
+    /// A stream the owner really ended is `Available` even with zero bytes (a
+    /// real empty end); one that was cut short is `Partial`.
+    fn stream_availability(&self, stream: ToolDataStream) -> ToolDataAvailability {
+        let Some(window) = self.stream(stream) else {
+            return ToolDataAvailability::Unavailable;
+        };
+        if window.expired {
+            return ToolDataAvailability::Expired;
+        }
+        if window.truncated {
+            return ToolDataAvailability::Partial;
+        }
+        if window.seen || window.complete {
+            return ToolDataAvailability::Available;
+        }
+        if self.stream_final() {
+            ToolDataAvailability::Unavailable
+        } else {
+            ToolDataAvailability::Pending
+        }
+    }
+
+    /// True when no more bytes can arrive for either process stream. A Runtime
+    /// terminal outcome alone is not enough: a dropped tool future can leave
+    /// the owner still draining, so the owner's own terminal command record (or
+    /// the absence of any command record on a terminal call) decides.
+    fn stream_final(&self) -> bool {
+        match &self.command {
+            Some(command) => command.status.is_terminal(),
+            None => self.state.is_terminal(),
+        }
+    }
+
     fn execution_data(&self, tool_ref: &ToolRef) -> ToolExecutionData {
         ToolExecutionData {
             tool_ref: tool_ref.clone(),
@@ -465,7 +825,34 @@ impl ToolRecord {
             result_bytes: self.result_total,
             input_truncated: self.input_truncated || self.input.len() < self.input_total,
             result_truncated: self.result_truncated || self.result.len() < self.result_total,
+            command: self
+                .command
+                .clone()
+                .map(|command| self.live_command(command)),
         }
+    }
+
+    /// Overlays the ranges and retention flags of the *current* stream windows
+    /// on the stored command record. A record stored at start or at the end
+    /// must not make a running command report empty ranges while
+    /// `tool.output` already returns bytes, and a complete EOF must not hide
+    /// that the retained tail was evicted.
+    fn live_command(&self, mut command: CommandResult) -> CommandResult {
+        let (stdout_base, stdout_end) = self.stdout.live_range();
+        let (stderr_base, stderr_end) = self.stderr.live_range();
+        command.stdout_base_offset = stdout_base;
+        command.stdout_observed_end = stdout_end;
+        command.stderr_base_offset = stderr_base;
+        command.stderr_observed_end = stderr_end;
+        // Real end of output and complete retention are different facts:
+        // `output_complete` is the owner's end-of-observation decision, while
+        // `output_truncated` also covers a dropped tail window.
+        command.output_truncated = command.output_truncated
+            || self.stdout.truncated
+            || self.stderr.truncated
+            || self.stdout.expired
+            || self.stderr.expired;
+        command
     }
 }
 
@@ -581,6 +968,33 @@ impl ToolDataInner {
             self.total_bytes = self.total_bytes.saturating_sub(freed);
             if let Some(record) = self.records.get_mut(&victim) {
                 record.evict_result();
+            }
+            return true;
+        }
+        // Process windows are evicted last, oldest record first, so a live
+        // stream keeps its newest bytes as long as any budget remains.
+        let victim = self.order.iter().find_map(|tool_ref| {
+            let record = self.records.get(tool_ref)?;
+            [ToolDataStream::Stdout, ToolDataStream::Stderr]
+                .into_iter()
+                .find(|stream| {
+                    record.stream(*stream).is_some_and(|window| {
+                        !window.expired && (!window.bytes.is_empty() || window.observed_end > 0)
+                    })
+                })
+                .map(|stream| (tool_ref.clone(), stream))
+        });
+        if let Some((victim, stream)) = victim {
+            let freed = self
+                .records
+                .get(&victim)
+                .and_then(|record| record.stream(stream))
+                .map_or(0, StreamWindow::retained);
+            self.total_bytes = self.total_bytes.saturating_sub(freed);
+            if let Some(record) = self.records.get_mut(&victim) {
+                if let Some(window) = record.stream_mut(stream) {
+                    window.evict();
+                }
             }
             return true;
         }
@@ -760,6 +1174,125 @@ impl ToolData {
         inner.enforce_limits();
     }
 
+    /// Marks that cancellation was requested for a still-running call. Never
+    /// terminal: the owner reports the real end separately.
+    pub(crate) fn mark_cancelling(&self, tool_ref: &ToolRef) {
+        let mut inner = self.lock();
+        if let Some(record) = inner.records.get_mut(tool_ref) {
+            if !record.state.is_terminal() {
+                record.state = ToolExecutionState::Cancelling;
+            }
+        }
+    }
+
+    /// Appends one accepted chunk of one process stream. The retained window is
+    /// authoritative: live events and every later `tool.output` page describe
+    /// these same bytes, so nothing is re-read from a file system. The notice
+    /// is built after the Session budget ran, so it reports the state a
+    /// consumer will actually observe.
+    pub(crate) fn note_stream_chunk(
+        &self,
+        tool_ref: &ToolRef,
+        stream: ToolDataStream,
+        chunk: &[u8],
+    ) -> Option<ToolStreamNotice> {
+        let mut inner = self.lock();
+        if !inner.records.contains_key(tool_ref) {
+            return None;
+        }
+        let mut pushed = None;
+        inner.resize(tool_ref, |record| {
+            let Some(window) = record.stream_mut(stream) else {
+                return;
+            };
+            pushed = Some(window.push(chunk));
+        });
+        let pushed = pushed?;
+        inner.enforce_limits();
+        let window = inner.records.get(tool_ref)?.stream(stream)?;
+        Some(ToolStreamNotice {
+            stream,
+            base_offset: pushed.base_offset,
+            next_offset: pushed.next_offset,
+            observed_end: window.observed_end,
+            // True when the retained window no longer covers every observed
+            // byte, so a live consumer knows it has to page `tool.output` for
+            // the authoritative range instead of stitching this event alone.
+            dropped: pushed.dropped || window.truncated,
+            expired: window.expired,
+        })
+    }
+
+    /// Marks a real end of output for one stream, never a failed read.
+    pub(crate) fn note_stream_end(&self, tool_ref: &ToolRef, stream: ToolDataStream) {
+        let mut inner = self.lock();
+        inner.resize(tool_ref, |record| {
+            if let Some(window) = record.stream_mut(stream) {
+                window.complete = true;
+            }
+        });
+    }
+
+    /// Marks an owner-observed end that may be missing bytes: the observation
+    /// stopped before a real end of output. `eof` becomes true (the record is
+    /// final) and the stream is truncated, never reported as a clean end.
+    pub(crate) fn note_stream_cut(&self, tool_ref: &ToolRef, stream: ToolDataStream) {
+        let mut inner = self.lock();
+        inner.resize(tool_ref, |record| {
+            if let Some(window) = record.stream_mut(stream) {
+                window.complete = true;
+                window.truncated = true;
+            }
+        });
+    }
+
+    /// Stores the current process record without touching the Runtime outcome.
+    /// The ranges and retention flags are overlaid from the current windows and
+    /// the built snapshot is returned *after* the Session budget ran, so an
+    /// event cannot publish a stale result clone that disagrees with a later
+    /// `tool.read`.
+    pub(crate) fn note_command(
+        &self,
+        tool_ref: &ToolRef,
+        command: CommandResult,
+    ) -> Option<ToolExecutionData> {
+        let mut inner = self.lock();
+        if !inner.records.contains_key(tool_ref) {
+            return None;
+        }
+        inner.resize(tool_ref, |record| {
+            record.command = Some(command);
+        });
+        inner.enforce_limits();
+        inner
+            .records
+            .get(tool_ref)
+            .map(|record| record.execution_data(tool_ref))
+    }
+
+    /// The retained range of one process stream, as
+    /// `(base_offset, observed_end)`, so the process record and `tool.output`
+    /// describe the same bytes.
+    pub(crate) fn stream_range(
+        &self,
+        tool_ref: &ToolRef,
+        stream: ToolDataStream,
+    ) -> Option<(u64, u64)> {
+        let inner = self.lock();
+        let window = inner.records.get(tool_ref)?.stream(stream)?;
+        Some((window.start_offset, window.observed_end))
+    }
+
+    /// Current structured snapshot for a live event. It is not an outcome:
+    /// only `finish_and_snapshot` records the authoritative terminal state.
+    pub(crate) fn snapshot(&self, tool_ref: &ToolRef) -> Option<ToolExecutionData> {
+        let inner = self.lock();
+        inner
+            .records
+            .get(tool_ref)
+            .map(|record| record.execution_data(tool_ref))
+    }
+
     /// Records the authoritative terminal outcome and returns the same
     /// snapshot `tool.read` would return, so the live event and the query
     /// cannot disagree.
@@ -895,6 +1428,9 @@ impl ToolData {
             return Err(AgentError::ToolNotFound);
         };
         let stream = request.stream;
+        if stream.is_process() {
+            return output_process(record, request, max_bytes);
+        }
         let (content, observed, seen, expired, truncated) = match stream {
             ToolDataStream::Input => (
                 record.input.as_str(),
@@ -910,6 +1446,9 @@ impl ToolData {
                 record.result_expired,
                 record.result_truncated,
             ),
+            ToolDataStream::Stdout | ToolDataStream::Stderr => {
+                return output_process(record, request, max_bytes);
+            }
         };
         let availability = stream_availability(
             seen,
@@ -1026,6 +1565,119 @@ fn bounded_page(page: ToolOutputPage, max_bytes: usize) -> Result<ToolOutputPage
     }
 }
 
+/// Pages one raw process stream. Offsets are raw byte offsets, `data` is
+/// base64 so any byte sequence survives unchanged, and `eof` is true only when
+/// the stream really ended at or before the returned `next_offset`.
+fn output_process(
+    record: &ToolRecord,
+    request: &ToolOutputRequest,
+    max_bytes: usize,
+) -> Result<ToolOutputPage, AgentError> {
+    let stream = request.stream;
+    let Some(window) = record.stream(stream) else {
+        return Err(AgentError::InvalidArguments);
+    };
+    let availability = record.stream_availability(stream);
+    // A page may report an end of output only when the owner's own decision is
+    // final for this stream: the owner marked it ended/cut, or it published a
+    // terminal command record. A Runtime-terminal tool call is not such a
+    // signal, because a dropped tool future can leave the owner still draining.
+    let stream_final = window.complete || record.stream_final();
+    let base = ToolOutputPage {
+        tool_ref: request.tool_ref.clone(),
+        stream,
+        encoding: STREAM_ENCODING,
+        base_offset: window.start_offset,
+        next_offset: window.observed_end,
+        observed_end: window.observed_end,
+        eof: stream_final,
+        truncated: window.truncated,
+        availability,
+        data: String::new(),
+    };
+    if request.offset > window.observed_end {
+        return Err(AgentError::InvalidArguments);
+    }
+    if window.expired {
+        // The window was freed; the observed end is the only honest anchor.
+        return bounded_page(
+            ToolOutputPage {
+                truncated: true,
+                ..base
+            },
+            max_bytes,
+        );
+    }
+    // A stream the owner has not read a single byte from has no content at all;
+    // a non-zero offset is invalid rather than a fabricated loss.
+    if !window.seen && request.offset != 0 {
+        return Err(AgentError::InvalidArguments);
+    }
+    let Some(bytes) = window.page(request.offset) else {
+        // The requested bytes were dropped from the retained window: report the
+        // loss and where the window starts now so the next page can read the tail.
+        let has_retained = !window.bytes.is_empty();
+        return bounded_page(
+            ToolOutputPage {
+                base_offset: window.start_offset,
+                next_offset: if has_retained {
+                    window.start_offset
+                } else {
+                    window.observed_end
+                },
+                eof: stream_final && !has_retained,
+                truncated: true,
+                availability: ToolDataAvailability::Partial,
+                ..base
+            },
+            max_bytes,
+        );
+    };
+    if bytes.is_empty() {
+        // Nothing is retained at or after this offset; the frame reports the
+        // real end without inventing content.
+        return bounded_page(
+            ToolOutputPage {
+                base_offset: request.offset,
+                next_offset: request.offset,
+                eof: stream_final && request.offset >= window.observed_end,
+                ..base
+            },
+            max_bytes,
+        );
+    }
+    let template = ToolOutputPage {
+        base_offset: request.offset,
+        next_offset: u64::MAX,
+        ..base.clone()
+    };
+    let template_len = encoded_len(&template)?;
+    if template_len > max_bytes {
+        return Err(AgentError::InvalidArguments);
+    }
+    let available = max_bytes.saturating_sub(template_len).saturating_add(2);
+    let take = raw_bytes_for_base64(available).min(bytes.len());
+    if take == 0 {
+        return Err(AgentError::InvalidArguments);
+    }
+    let next = request.offset.saturating_add(take as u64);
+    bounded_page(
+        ToolOutputPage {
+            base_offset: request.offset,
+            next_offset: next,
+            eof: stream_final && next >= window.observed_end,
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes[..take]),
+            ..base
+        },
+        max_bytes,
+    )
+}
+
+/// The largest raw byte count whose base64 JSON string fits `available` bytes.
+fn raw_bytes_for_base64(available: usize) -> usize {
+    available.saturating_sub(2) / 4 * 3
+}
+
 /// Structured subject extraction for the known native tools. Unknown tools
 /// expose only `Other`; their raw arguments stay readable through
 /// `tool.output(Input, ...)`.
@@ -1131,6 +1783,7 @@ fn encoded_len<T: Serialize>(value: &T) -> Result<usize, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use serde_json::json;
 
     use super::*;
@@ -1209,6 +1862,487 @@ mod tests {
         arguments: Value,
     ) {
         let _ = data.note_invocation(tool_ref, &invocation(call, name, arguments));
+    }
+
+    #[test]
+    fn session_window_bytes_are_counted_into_the_real_budget() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "window-budget");
+        data.note_requested(&tool_ref, "bash");
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &vec![b'x'; 512 * 1024]);
+        assert_accounting(&data);
+        // Many windows cannot exceed the Session budget just because each one
+        // is individually bounded.
+        for index in 0..16u32 {
+            let filler = make_tool_ref(session(1), loop_id(1), index + 1, "filler");
+            data.note_requested(&filler, "bash");
+            data.note_stream_chunk(&filler, ToolDataStream::Stdout, &vec![b'y'; 512 * 1024]);
+            assert_accounting(&data);
+        }
+        let inner = data.lock();
+        assert!(inner.total_bytes <= MAX_TOOL_TOTAL_BYTES);
+        // The oldest window was freed rather than silently retained beyond the
+        // Session budget.
+        assert!(inner.records[&tool_ref].stdout.expired);
+    }
+
+    #[test]
+    fn multi_round_push_and_multi_stream_capacity_accounting_stays_within_budget() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "capacity-test");
+        data.note_requested(&tool_ref, "bash");
+
+        // Push 200 rounds of 8 KiB chunks (~1.6 MiB total) to test repeated draining
+        // does not inflate backing capacity beyond 1 MiB.
+        let chunk = vec![b'c'; 8 * 1024];
+        for _ in 0..200 {
+            data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &chunk);
+            assert_accounting(&data);
+        }
+        {
+            let inner = data.lock();
+            let window = inner.records[&tool_ref].stdout.bytes.as_slice();
+            assert_eq!(window.len(), MAX_TOOL_STREAM_BYTES);
+            let capacity = inner.records[&tool_ref].stdout.bytes.capacity();
+            assert!(
+                capacity <= MAX_TOOL_STREAM_BYTES,
+                "single stream capacity {capacity} exceeded bound {MAX_TOOL_STREAM_BYTES}"
+            );
+        }
+
+        // Test oversized chunk: 2.5 MiB in one push must not allocate > 1 MiB
+        let oversized = vec![b'z'; 2_500_000];
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stderr, &oversized);
+        assert_accounting(&data);
+        {
+            let inner = data.lock();
+            let cap = inner.records[&tool_ref].stderr.bytes.capacity();
+            assert!(
+                cap <= MAX_TOOL_STREAM_BYTES,
+                "oversized stream capacity {cap} exceeded bound {MAX_TOOL_STREAM_BYTES}"
+            );
+            assert_eq!(
+                inner.records[&tool_ref].stderr.bytes.len(),
+                MAX_TOOL_STREAM_BYTES
+            );
+            assert_eq!(
+                inner.records[&tool_ref].stderr.start_offset,
+                (2_500_000 - MAX_TOOL_STREAM_BYTES) as u64
+            );
+        }
+
+        // Multiple streams across multiple records: verify total capacity accounting <= 8 MiB
+        for index in 1..=12 {
+            let other = make_tool_ref(session(1), loop_id(1), index, &format!("other-{index}"));
+            data.note_requested(&other, "bash");
+            // Push multi-round chunks into both stdout and stderr
+            for _ in 0..16 {
+                data.note_stream_chunk(&other, ToolDataStream::Stdout, &vec![b'o'; 64 * 1024]);
+                data.note_stream_chunk(&other, ToolDataStream::Stderr, &vec![b'e'; 64 * 1024]);
+            }
+            assert_accounting(&data);
+        }
+        let inner = data.lock();
+        assert!(
+            inner.total_bytes <= MAX_TOOL_TOTAL_BYTES,
+            "total capacity accounting {} exceeded {}",
+            inner.total_bytes,
+            MAX_TOOL_TOTAL_BYTES
+        );
+    }
+
+    #[test]
+    fn paging_from_stale_offset_zero_recovers_retained_tail_for_running_and_terminal() {
+        use base64::Engine;
+
+        let data = ToolData::new();
+
+        // 1. Running stream test with binary data
+        let running_ref = make_tool_ref(session(10), loop_id(10), 0, "running-tail");
+        data.note_requested(&running_ref, "bash");
+        // Push 1.4 MiB of binary data
+        let binary_payload: Vec<u8> = (0..1_400_000u32).map(|i| (i % 251) as u8).collect();
+        for chunk in binary_payload.chunks(128 * 1024) {
+            data.note_stream_chunk(&running_ref, ToolDataStream::Stdout, chunk);
+        }
+        let (base_offset, observed_end) = data
+            .stream_range(&running_ref, ToolDataStream::Stdout)
+            .unwrap();
+        assert_eq!(observed_end, 1_400_000);
+        assert_eq!(base_offset, 1_400_000 - MAX_TOOL_STREAM_BYTES as u64);
+
+        // Client queries from stale offset 0
+        let page_budget = 4096;
+        let notice = data
+            .output(
+                &output_request(running_ref.clone(), ToolDataStream::Stdout, 0, None),
+                page_budget,
+            )
+            .unwrap();
+        assert!(notice.data.is_empty());
+        assert_eq!(notice.base_offset, base_offset);
+        assert_eq!(notice.next_offset, base_offset);
+        assert!(!notice.eof, "running stream must not report eof");
+        assert!(notice.truncated);
+        assert_eq!(notice.availability, ToolDataAvailability::Partial);
+
+        // Resume from notice.next_offset and reconstruct retained tail
+        let mut offset = notice.next_offset;
+        let mut reconstructed_binary = Vec::new();
+        while offset < observed_end {
+            let page = data
+                .output(
+                    &output_request(running_ref.clone(), ToolDataStream::Stdout, offset, None),
+                    page_budget,
+                )
+                .unwrap();
+            let page_json_len = serde_json::to_vec(&page).unwrap().len();
+            assert!(
+                page_json_len <= page_budget,
+                "page encoded size {page_json_len} exceeded budget {page_budget}"
+            );
+            assert!(!page.eof, "running stream must not report eof before end");
+            let chunk_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&page.data)
+                .unwrap();
+            reconstructed_binary.extend_from_slice(&chunk_bytes);
+            assert!(page.next_offset > offset);
+            offset = page.next_offset;
+        }
+        assert_eq!(offset, observed_end);
+        let expected_tail = &binary_payload[base_offset as usize..];
+        assert_eq!(reconstructed_binary.as_slice(), expected_tail);
+
+        // 2. Terminal stream test with UTF-8 data
+        let terminal_ref = make_tool_ref(session(11), loop_id(11), 0, "terminal-tail");
+        data.note_requested(&terminal_ref, "bash");
+        let line = "Line content for UTF-8 test with unicode: 你好，世界！\n";
+        let mut utf8_payload = String::new();
+        while utf8_payload.len() < 1_300_000 {
+            utf8_payload.push_str(line);
+        }
+        let utf8_bytes = utf8_payload.as_bytes();
+        for chunk in utf8_bytes.chunks(128 * 1024) {
+            data.note_stream_chunk(&terminal_ref, ToolDataStream::Stdout, chunk);
+        }
+        data.note_stream_end(&terminal_ref, ToolDataStream::Stdout);
+        let (t_base, t_end) = data
+            .stream_range(&terminal_ref, ToolDataStream::Stdout)
+            .unwrap();
+        assert_eq!(t_end, utf8_bytes.len() as u64);
+        assert_eq!(t_base, (utf8_bytes.len() - MAX_TOOL_STREAM_BYTES) as u64);
+
+        // Query from stale offset 0
+        let notice = data
+            .output(
+                &output_request(terminal_ref.clone(), ToolDataStream::Stdout, 0, None),
+                page_budget,
+            )
+            .unwrap();
+        assert!(notice.data.is_empty());
+        assert_eq!(notice.base_offset, t_base);
+        assert_eq!(notice.next_offset, t_base);
+        assert!(
+            !notice.eof,
+            "stale offset 0 notice must not report eof when tail is retained"
+        );
+        assert!(notice.truncated);
+
+        // Page until eof == true
+        let mut offset = notice.next_offset;
+        let mut reconstructed_utf8 = Vec::new();
+        let mut saw_eof = false;
+        while !saw_eof {
+            let page = data
+                .output(
+                    &output_request(terminal_ref.clone(), ToolDataStream::Stdout, offset, None),
+                    page_budget,
+                )
+                .unwrap();
+            let page_json_len = serde_json::to_vec(&page).unwrap().len();
+            assert!(
+                page_json_len <= page_budget,
+                "page encoded size {page_json_len} exceeded budget {page_budget}"
+            );
+            let chunk_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&page.data)
+                .unwrap();
+            reconstructed_utf8.extend_from_slice(&chunk_bytes);
+            saw_eof = page.eof;
+            assert!(page.next_offset > offset || page.eof);
+            offset = page.next_offset;
+        }
+        assert_eq!(offset, t_end);
+        let expected_utf8_tail = &utf8_bytes[t_base as usize..];
+        assert_eq!(reconstructed_utf8.as_slice(), expected_utf8_tail);
+    }
+
+    #[test]
+    fn an_abandoned_stream_reports_truncated_and_eof_not_an_endless_page() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(2), loop_id(2), 0, "cut");
+        data.note_requested(&tool_ref, "bash");
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, b"partial");
+        // The owner stopped observing before a real end of output.
+        data.note_stream_cut(&tool_ref, ToolDataStream::Stdout);
+        let request = ToolOutputRequest {
+            tool_ref,
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: None,
+        };
+        let page = data.output(&request, 64 * 1024).unwrap();
+        assert!(page.eof, "a cut stream is final");
+        assert!(page.truncated, "a cut stream never claims a clean end");
+        assert_eq!(page.availability, ToolDataAvailability::Partial);
+    }
+
+    #[test]
+    fn offset_pages_never_return_overlapping_or_duplicate_bytes() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(5), loop_id(5), 0, "paging");
+        data.note_requested(&tool_ref, "bash");
+        // Large enough that a 4 KiB budget really forces several pages while
+        // staying well above the page frame's own JSON size.
+        let payload: Vec<u8> = (0..8192u32).map(|byte| byte as u8).collect();
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &payload);
+        data.note_stream_end(&tool_ref, ToolDataStream::Stdout);
+        let mut offset = 0u64;
+        let mut assembled = Vec::new();
+        let mut pages = 0usize;
+        while offset < payload.len() as u64 {
+            pages += 1;
+            assert!(pages < 64, "paging did not make progress");
+            let page = data
+                .output(
+                    &ToolOutputRequest {
+                        tool_ref: tool_ref.clone(),
+                        stream: ToolDataStream::Stdout,
+                        offset,
+                        max_bytes: None,
+                    },
+                    4096,
+                )
+                .unwrap();
+            assert!(page.next_offset > offset, "a page must make progress");
+            assembled.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&page.data)
+                    .unwrap(),
+            );
+            offset = page.next_offset;
+        }
+        assert!(pages > 1, "the budget did not force pagination");
+        assert_eq!(assembled, payload);
+    }
+
+    #[test]
+    fn a_running_command_reports_live_ranges_and_retention_truncation() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(7), loop_id(7), 0, "live-ranges");
+        data.note_requested(&tool_ref, "bash");
+        // The owner publishes its opening record before any byte exists.
+        data.note_command(
+            &tool_ref,
+            CommandResult {
+                status: CommandStatus::Running,
+                exit_code: None,
+                signal: None,
+                termination_confirmed: false,
+                stdout_base_offset: 0,
+                stdout_observed_end: 0,
+                stderr_base_offset: 0,
+                stderr_observed_end: 0,
+                output_complete: false,
+                output_truncated: false,
+            },
+        );
+        // Bytes arrive afterwards; the stored record is not rewritten.
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, b"hello");
+        let snapshot = data.snapshot(&tool_ref).unwrap();
+        let command = snapshot.command.expect("a running command record");
+        assert_eq!(command.status, CommandStatus::Running);
+        assert_eq!(
+            (command.stdout_base_offset, command.stdout_observed_end),
+            (0, 5),
+            "tool.read must see the live window range while streaming"
+        );
+        // The stream query reports the same range from the same source.
+        assert_eq!(
+            data.stream_range(&tool_ref, ToolDataStream::Stdout),
+            Some((0, 5))
+        );
+        assert!(!command.output_truncated);
+    }
+
+    #[test]
+    fn a_full_eof_with_a_dropped_tail_window_reports_truncated() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(8), loop_id(8), 0, "tail-loss");
+        data.note_requested(&tool_ref, "bash");
+        // More than one 1 MiB window, so the oldest tail bytes were dropped.
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &vec![b'x'; 1_200_000]);
+        data.note_stream_end(&tool_ref, ToolDataStream::Stdout);
+        let command = CommandResult {
+            status: CommandStatus::Exited,
+            exit_code: Some(0),
+            signal: None,
+            termination_confirmed: true,
+            stdout_base_offset: 0,
+            stdout_observed_end: 0,
+            stderr_base_offset: 0,
+            stderr_observed_end: 0,
+            output_complete: true,
+            output_truncated: false,
+        };
+        let snapshot = data.note_command(&tool_ref, command).unwrap();
+        let command = snapshot.command.unwrap();
+        assert!(command.output_complete, "the stream really ended");
+        assert!(
+            command.output_truncated,
+            "a dropped tail window must still be reported as truncation"
+        );
+        // The reported range is the retained window, and the observed end is
+        // the real stream end, not the retained length.
+        assert_eq!(command.stdout_observed_end, 1_200_000);
+        assert!(command.stdout_base_offset > 0);
+        assert_eq!(
+            (command.stdout_base_offset, command.stdout_observed_end),
+            data.stream_range(&tool_ref, ToolDataStream::Stdout)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_terminal_runtime_outcome_alone_never_closes_a_live_process_stream() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(6), loop_id(6), 0, "owner-finality");
+        data.note_requested(&tool_ref, "bash");
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, b"still-running");
+        // The owner published only a running command record.
+        data.note_command(
+            &tool_ref,
+            CommandResult {
+                status: CommandStatus::Running,
+                exit_code: None,
+                signal: None,
+                termination_confirmed: false,
+                stdout_base_offset: 0,
+                stdout_observed_end: 13,
+                stderr_base_offset: 0,
+                stderr_observed_end: 0,
+                output_complete: false,
+                output_truncated: false,
+            },
+        );
+        // The Runtime outcome is terminal while the owner has not finished.
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Cancelled)
+            .unwrap();
+        let request = output_request(tool_ref.clone(), ToolDataStream::Stdout, 0, None);
+        let page = data.output(&request, 64 * 1024).unwrap();
+        assert!(
+            !page.eof,
+            "a Runtime terminal outcome alone must not close a live stream"
+        );
+        assert_eq!(page.availability, ToolDataAvailability::Available);
+
+        // Only the owner's terminal record closes it.
+        data.note_command(
+            &tool_ref,
+            CommandResult {
+                status: CommandStatus::Cancelled,
+                exit_code: None,
+                signal: None,
+                termination_confirmed: true,
+                stdout_base_offset: 0,
+                stdout_observed_end: 13,
+                stderr_base_offset: 0,
+                stderr_observed_end: 0,
+                output_complete: true,
+                output_truncated: false,
+            },
+        );
+        data.note_stream_end(&tool_ref, ToolDataStream::Stdout);
+        let page = data.output(&request, 64 * 1024).unwrap();
+        assert!(page.eof);
+    }
+
+    #[test]
+    fn process_stream_pages_are_base64_with_raw_offsets() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(3), loop_id(3), 1, "call-stream");
+        data.note_requested(&tool_ref, "bash");
+        let payload = b"caf\xc3\xa9-\xff\x1b[31m";
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &payload[..5]);
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &payload[5..]);
+        let request = ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: None,
+        };
+        let page = data.output(&request, 64 * 1024).unwrap();
+        assert_eq!(page.encoding, STREAM_ENCODING);
+        assert_eq!(page.base_offset, 0);
+        assert_eq!(page.next_offset, payload.len() as u64);
+        assert!(
+            !page.eof,
+            "a running stream must never report an end of output"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&page.data)
+                .unwrap(),
+            payload.to_vec()
+        );
+        // A page cut by the budget stays honest about the next raw offset.
+        // The JSON frame has a real minimum size, so a budget that cannot hold
+        // the frame is rejected instead of silently returning an empty page.
+        assert!(data.output(&request, 64).is_err());
+        // Only the owner can end the stream, and then eof is real.
+        data.note_stream_end(&tool_ref, ToolDataStream::Stdout);
+        let ended = data.output(&request, 64 * 1024).unwrap();
+        assert!(ended.eof);
+        assert_eq!(ended.next_offset, payload.len() as u64);
+    }
+
+    #[test]
+    fn an_evicted_stream_window_anchors_at_the_observed_end() {
+        let data = ToolData::new();
+        let tool_ref = make_tool_ref(session(4), loop_id(4), 1, "call-evict");
+        data.note_requested(&tool_ref, "bash");
+        data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &vec![b'x'; 1_200_000]);
+        let (base, end) = data
+            .stream_range(&tool_ref, ToolDataStream::Stdout)
+            .unwrap();
+        assert_eq!(end, 1_200_000);
+        assert!(base > 0, "the window retained more than its bound");
+        let request = ToolOutputRequest {
+            tool_ref,
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: None,
+        };
+        let page = data.output(&request, 64 * 1024).unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.base_offset, base);
+        assert_eq!(page.availability, ToolDataAvailability::Partial);
+        {
+            let mut inner = data.lock();
+            inner.resize(&request.tool_ref, |record| record.stdout.evict());
+        }
+        let expired = data.output(&request, 64 * 1024).unwrap();
+        assert_eq!(expired.availability, ToolDataAvailability::Expired);
+        assert_eq!(expired.next_offset, end);
+        assert!(!expired.eof);
+        let past_end = ToolOutputRequest {
+            offset: end + 1,
+            ..request
+        };
+        assert!(matches!(
+            data.output(&past_end, 64 * 1024),
+            Err(AgentError::InvalidArguments)
+        ));
     }
 
     #[test]

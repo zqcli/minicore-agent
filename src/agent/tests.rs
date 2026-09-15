@@ -7078,3 +7078,359 @@ fn process_is_listed(pid: i32) -> bool {
         .expect("ps runs");
     !String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
+
+/// End-to-end Bash ownership through a real Agent Session: a running command is
+/// cancelled with its loop, the stored process record matches the live
+/// `tool_process` event and the `tool.read`/`tool.output` queries, and
+/// `close_session` returns only after the owned command was reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_owned_command_matches_events_queries_and_the_close_join() {
+    use crate::tool_data::{CommandStatus, ToolDataStream};
+
+    let (data_dir, _guard) = fixture_dir(&format!("bash-owned-turn-{}", next_id()));
+    let (workspace, _guard) = workspace_file("bash-owned-turn-ws", "a.txt", b"hello");
+    let pid_file = workspace.join("child.pid");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall(
+                "bash",
+                json!({"command": "echo $$ > child.pid; exec sleep 30"}),
+            ),
+            ModelScript::Text("cancelled"),
+        ],
+    );
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+
+    let turn = send_text(&mut agent, info.session_id, "run slowly").await;
+    // Wait for the public ToolStarted boundary, then for the pid file, so the
+    // cancel happens while a process is really owned.
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("bash events must arrive")
+            .expect("event stream must remain open");
+        if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn) {
+            break;
+        }
+    }
+    for _ in 0..500 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(pid_file.exists(), "the command really started");
+
+    assert!(agent.cancel(turn).unwrap());
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+
+    // Drain the live process events for this turn and keep the running and
+    // terminal records, which must come from the same stored source as queries.
+    let mut running = None;
+    let mut terminal = None;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await
+    {
+        if let AgentEvent::ToolProcess { data, .. } = event {
+            if let Some(command) = data.command {
+                match command.status {
+                    CommandStatus::Running => running = Some((data.tool_ref, command)),
+                    CommandStatus::Cancelled => {
+                        terminal = Some((data.tool_ref, command));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let (owner, running) = running.expect("a running record was published before the first byte");
+    let (terminal_ref, terminal) = terminal.expect("a terminal cancelled record was published");
+    assert_eq!(terminal_ref, owner);
+    assert!(!running.output_complete);
+
+    let queried = read_tool(&agent, owner.clone());
+    let command = queried.execution.command.expect("a queried command record");
+    assert_eq!(command.status, CommandStatus::Cancelled);
+    assert!(command.termination_confirmed);
+    assert!(command.exit_code.is_none());
+    assert_eq!(command.stdout_base_offset, terminal.stdout_base_offset);
+    assert_eq!(command.stdout_observed_end, terminal.stdout_observed_end);
+
+    // `tool.output` and the process record describe the same retained range.
+    let page = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: owner.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .unwrap();
+    assert_eq!(page.encoding, "base64");
+    assert!(page.eof);
+    assert_eq!(page.base_offset, command.stdout_base_offset);
+    assert_eq!(page.observed_end, command.stdout_observed_end);
+
+    // The cancelled loop already stopped and reaped its owned command.
+    let child_pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the command published its pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    assert!(
+        !process_is_listed(child_pid),
+        "the cancelled command was not reaped by its owner"
+    );
+
+    // Closing the Session is the join barrier and must return cleanly.
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+/// Two turns across model change: the first Bash command is cancelled, the
+/// second model reuses the same tool call id ("bash-call-0") under a new loop,
+/// the second Bash command actually runs without mixing up stdout/stderr/queries,
+/// and close_session reaps the active second process before returning.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active() {
+    use crate::tool_data::{CommandStatus, ToolDataStream};
+    use base64::Engine;
+
+    let (data_dir, _guard) = fixture_dir(&format!("bash-two-turns-{}", next_id()));
+    let (workspace, _guard) = workspace_file("bash-two-turns-ws", "a.txt", b"hello");
+    let first_pid_file = workspace.join("first.pid");
+    let second_pid_file = workspace.join("second.pid");
+
+    let model_a = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall(
+                "bash",
+                json!({"command": "echo $$ > first.pid; exec sleep 30"}),
+            ),
+            ModelScript::Text("first turn cancelled"),
+        ],
+    );
+
+    let model_b = FakeModel::new(
+        "other",
+        [
+            ModelScript::ToolCall(
+                "bash",
+                json!({
+                    "command": "printf 'turn2-stdout\\n'; printf 'turn2-stderr\\n' >&2; echo $$ > second.pid; exec sleep 30"
+                }),
+            ),
+            ModelScript::Text("second turn done"),
+        ],
+    );
+
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("other".to_owned(), Arc::clone(&model_b)),
+        ]),
+        profile,
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+
+    // --- Turn 1 ---
+    let turn_1 = send_text(&mut agent, info.session_id, "first run slowly").await;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("bash events must arrive")
+            .expect("event stream must remain open");
+        if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn_1)
+        {
+            break;
+        }
+    }
+    for _ in 0..500 {
+        if first_pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(first_pid_file.exists(), "first command started");
+    let first_pid: i32 = std::fs::read_to_string(&first_pid_file)
+        .expect("read first pid")
+        .trim()
+        .parse()
+        .expect("parse first pid");
+    assert!(process_is_listed(first_pid));
+
+    assert!(agent.cancel(turn_1).unwrap());
+    let result_1 = wait_text(&agent, turn_1).await;
+    assert_eq!(
+        result_1.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+    );
+    assert!(
+        !process_is_listed(first_pid),
+        "first process reaped after turn 1 cancelled"
+    );
+
+    // Drain turn 1 events to capture turn 1 tool_ref
+    let mut turn_1_ref = None;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), events.recv()).await
+    {
+        if let AgentEvent::ToolProcess { turn, data, .. } = event {
+            if turn == turn_1 {
+                turn_1_ref = Some(data.tool_ref);
+            }
+        }
+    }
+    let tool_ref_1 = turn_1_ref.expect("turn 1 produced tool process event");
+    assert_eq!(tool_ref_1.tool_call_id.as_str(), "bash-call-0");
+
+    // --- Switch model to model_b ("other") ---
+    agent
+        .update_session(crate::agent::UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+
+    // --- Turn 2 ---
+    let turn_2 = send_text(
+        &mut agent,
+        info.session_id,
+        "second run with same tool call id",
+    )
+    .await;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("bash events must arrive")
+            .expect("event stream must remain open");
+        if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn_2)
+        {
+            break;
+        }
+    }
+    for _ in 0..500 {
+        if second_pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(second_pid_file.exists(), "second command started");
+    let second_pid: i32 = std::fs::read_to_string(&second_pid_file)
+        .expect("read second pid")
+        .trim()
+        .parse()
+        .expect("parse second pid");
+    assert!(process_is_listed(second_pid));
+
+    // Drain turn 2 events until we get tool_ref for turn 2 and chunks
+    let mut turn_2_ref = None;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await
+    {
+        if let AgentEvent::ToolProcess { turn, data, .. } = event {
+            if turn == turn_2 {
+                turn_2_ref = Some(data.tool_ref);
+            }
+        }
+    }
+    let tool_ref_2 = turn_2_ref.expect("turn 2 produced tool process event");
+
+    // Both calls used the exact same tool_call_id ("bash-call-0"), but different loops!
+    assert_eq!(tool_ref_2.tool_call_id.as_str(), "bash-call-0");
+    assert_ne!(
+        tool_ref_1.loop_id, tool_ref_2.loop_id,
+        "turns must have distinct loops"
+    );
+
+    // Queries for tool_ref_2 must return turn 2's distinct stdout/stderr and not mix with turn 1
+    let stdout_page = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: tool_ref_2.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .unwrap();
+    let stdout_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&stdout_page.data)
+        .unwrap();
+    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
+    assert!(
+        stdout_str.contains("turn2-stdout"),
+        "second bash stdout must contain 'turn2-stdout', got: {stdout_str}"
+    );
+
+    let stderr_page = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: tool_ref_2.clone(),
+            stream: ToolDataStream::Stderr,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .unwrap();
+    let stderr_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&stderr_page.data)
+        .unwrap();
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    assert!(
+        stderr_str.contains("turn2-stderr"),
+        "second bash stderr must contain 'turn2-stderr', got: {stderr_str}"
+    );
+
+    let queried_2 = read_tool(&agent, tool_ref_2.clone());
+    assert_eq!(queried_2.execution.tool_ref, tool_ref_2);
+    let cmd_2 = queried_2.execution.command.expect("command record exists");
+    assert_eq!(cmd_2.status, CommandStatus::Running);
+
+    // The second command is STILL running (active). Calling close_session must reap it before returning.
+    assert!(
+        process_is_listed(second_pid),
+        "second process must still be running before close_session"
+    );
+    agent.close_session(info.session_id).await.unwrap();
+    assert!(
+        !process_is_listed(second_pid),
+        "active second command was not reaped by close_session join barrier"
+    );
+}

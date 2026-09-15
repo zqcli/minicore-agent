@@ -57,9 +57,10 @@ pub use sessions::{
     SessionContext, SteerAccepted, SummaryCoverage,
 };
 pub use tool_data::{
-    ToolDataAvailability, ToolDataStream, ToolExecutionData, ToolExecutionState, ToolInputSummary,
-    ToolInvocationData, ToolOutputPage, ToolOutputRequest, ToolPhase, ToolReadRequest,
-    ToolReadResult, ToolRef, ToolSubject,
+    CommandResult, CommandStatus, ToolDataAvailability, ToolDataStream, ToolExecutionData,
+    ToolExecutionState, ToolInputSummary, ToolInvocationData, ToolOutputPage, ToolOutputRequest,
+    ToolPhase, ToolProcessChunk, ToolProcessData, ToolReadRequest, ToolReadResult, ToolRef,
+    ToolSubject,
 };
 pub use workspace::listing::{
     WorkspaceFileEntry, WorkspaceFilesRequest, WorkspaceFilesResult, WorkspaceListCursor,
