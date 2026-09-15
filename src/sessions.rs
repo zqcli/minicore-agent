@@ -3316,6 +3316,12 @@ async fn run_active_loop(
         persistence,
     });
 
+    // Best-effort auxiliary tool persistence: save native tool facts and
+    // streams to the store's auxiliary directory before publishing turn completion.
+    // Failure is logged as a warning; it does not change TurnResult persistence
+    // or ToolOutcome, does not retry the loop, and does not touch history.jsonl.
+    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
+
     // Authoritative completion precedes best-effort events: `turn.wait` may
     // resolve before the `TurnFinished` event is observed.
     completion.publish_finished(Arc::clone(&result));
@@ -3331,6 +3337,55 @@ async fn run_active_loop(
         },
     });
     session.emit_state();
+}
+
+async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loop_id: LoopId) {
+    let tool_refs = session
+        .presentation()
+        .tool_data()
+        .loop_tool_refs(session_id, loop_id);
+    if tool_refs.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + crate::store::AUX_PERSIST_DEADLINE;
+    let results = session
+        .shared
+        .store
+        .persist_loop_tool_records(
+            &tool_refs,
+            session.presentation().tool_data().as_ref(),
+            deadline,
+        )
+        .await;
+
+    for (tool_ref, outcome) in results {
+        let turn = TurnRef {
+            session_id: tool_ref.session_id,
+            loop_id: tool_ref.loop_id,
+        };
+        match outcome {
+            Ok(()) => {
+                session.presentation().note_tool_recording(
+                    &tool_ref,
+                    crate::tool_data::ToolRecordingState::Saved,
+                    turn,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %tool_ref.session_id,
+                    loop_id = %tool_ref.loop_id,
+                    error_kind = error.kind(),
+                    "auxiliary tool record persistence failed"
+                );
+                session.presentation().note_tool_recording(
+                    &tool_ref,
+                    crate::tool_data::ToolRecordingState::Failed,
+                    turn,
+                );
+            }
+        }
+    }
 }
 
 fn mark_internal(session: &Session) {

@@ -950,6 +950,16 @@ never reports a fabricated exit code. A requested `cancel` is recorded as
 `cancelling` first; the terminal status follows only after the owner joined the
 process.
 
+`execution.recording` reports the auxiliary write result: `memory_only`,
+`saved`, or `failed`. Saving follows main History persistence and precedes Turn
+completion. A failed auxiliary save does not change the real tool outcome or
+main Turn persistence, and retained memory remains readable. `saved` is not a
+promise of indefinite retention: the Store applies per-tool (3 MiB), per-Session
+(16 MiB/1024 records), and Store-wide (256 MiB/8192 records) auxiliary budgets.
+These budgets coordinate one Store and its clones; independent writers sharing
+a data directory are not supported. Public queries currently use loaded memory;
+stored-data query access follows in P5b2.
+
 `availability` is per stream: `pending` while the call is still running and
 that stream has no observed bytes (with `observed_end: 0` and `eof: false`),
 `unavailable` when no observation is available for a terminal call, then

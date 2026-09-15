@@ -33,7 +33,7 @@ use crate::ids::SessionId;
 use crate::sessions::TurnRef;
 use crate::tool_data::{
     CommandResult, ToolData, ToolDataStream, ToolInvocationData, ToolProcessChunk, ToolProcessData,
-    ToolRef, ToolStreamNotice,
+    ToolRecordingState, ToolRef, ToolStreamNotice,
 };
 use crate::tools::command::{CommandBinding, CommandOwners, CommandStreamSink};
 
@@ -392,6 +392,27 @@ impl Presentation {
                 dropped_before: 0,
             },
         });
+    }
+
+    /// Records durable recording state and emits the authoritative ToolExecution event.
+    pub(crate) fn note_tool_recording(
+        &self,
+        tool_ref: &ToolRef,
+        state: ToolRecordingState,
+        turn: TurnRef,
+    ) {
+        if let Some(data) = self.tool_data.note_recording(tool_ref, state) {
+            let loop_id = data.tool_ref.loop_id;
+            let _ = self.events.try_send(AgentEvent::ToolExecution {
+                turn,
+                data,
+                meta: EventMeta {
+                    session_id: self.session_id,
+                    loop_id: Some(loop_id),
+                    dropped_before: 0,
+                },
+            });
+        }
     }
 
     fn emit_tool_process(

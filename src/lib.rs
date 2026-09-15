@@ -59,8 +59,8 @@ pub use sessions::{
 pub use tool_data::{
     CommandResult, CommandStatus, ToolDataAvailability, ToolDataStream, ToolExecutionData,
     ToolExecutionState, ToolInputSummary, ToolInvocationData, ToolOutputPage, ToolOutputRequest,
-    ToolPhase, ToolProcessChunk, ToolProcessData, ToolReadRequest, ToolReadResult, ToolRef,
-    ToolSubject,
+    ToolPhase, ToolProcessChunk, ToolProcessData, ToolReadRequest, ToolReadResult,
+    ToolRecordingState, ToolRef, ToolSubject,
 };
 pub use workspace::listing::{
     WorkspaceFileEntry, WorkspaceFilesRequest, WorkspaceFilesResult, WorkspaceListCursor,

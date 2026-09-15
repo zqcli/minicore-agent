@@ -203,7 +203,9 @@ review and remote verification, together with `workspace.files` and
 `workspace.search` and `workspace.status`. P4 and P5a are verified: Bash now
 has owned process-group/job cleanup, live stdout/stderr events, structured exit
 facts, and bounded in-memory base64 output pages with raw byte offsets.
-P5b durable output retention, P6 change review and P7 integration remain pending. The
+P5b1 bounded auxiliary persistence is also verified; `recording` reports its
+write result independently of the real tool outcome. Public/RPC cold reads
+(P5b2), P6 change review and P7 integration remain pending. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

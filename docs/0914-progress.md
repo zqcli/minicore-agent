@@ -15,7 +15,8 @@ replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
 P3b2 passed parent review and remote verification. P4 is also verified: bounded
 file reads (P4a), listing and literal search (P4b), and isolated Git status
 queries (P4c). P5a owned Bash streams and in-memory output queries are verified.
-P5b durable output retention, P6 change review and P7 integration remain pending.
+P5b1 auxiliary persistence is verified. P5b2 public/RPC cold reads, P6 change
+review and P7 integration remain pending.
 
 ## Execution
 
@@ -43,7 +44,7 @@ stored in source.
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
-| P5 | Owned Bash streaming, cancellation, result retention | P5a verified: 651 stable/MSRV passed, 2 Live ignored; P5b durable retention pending |
+| P5 | Owned Bash streaming, cancellation, result retention | P5a/P5b1 verified: 673 stable/MSRV passed, 2 Live ignored; P5b2 public/RPC cold reads pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
 
@@ -683,8 +684,48 @@ Additional regressions cover a cancelled join followed by a second join,
 concurrent joins, allocation-capacity accounting, stale-offset tail recovery,
 and two real Agent turns reusing a call id across different Loop IDs. The
 second turn is closed while its Bash is still active, and close returns after
-reaping. P5b persistence/restart recovery remains unimplemented; no installation,
-version bump, Runtime modification or push occurred.
+reaping. P5b1 durable tool record and auxiliary stream persistence is also
+verified; public and RPC cold reads remain P5b2.
+
+## P5b1 Durable Tool Record And Auxiliary Stream Persistence
+
+Parent acceptance (2026-09-15): stable and Rust 1.85 each passed **673 tests**,
+with **2 Live tests ignored**. Strict Clippy, fmt, rustdoc and all-target
+Windows GNU/macOS compile checks passed. Windows retains only the pre-existing
+`write_reload_config` test warning. Logs: `logs/p5b1-*.log` on the verification
+host. No local build, native Windows/macOS test, installation or push is claimed.
+
+- Metadata and retained blobs live under `sessions/<session>/tools/<full-SHA256>/`.
+  The digest covers the complete serialized ToolRef; the metadata also validates
+  that identity. Input/result and raw stdout/stderr are separate bounded files,
+  never copied into the core History JSONL.
+- Files and directory publication use exclusive temporary creation, sync and
+  same-filesystem rename. Existing records are compared using the same bounded,
+  validated metadata read; corrupt or conflicting data cannot count as an
+  idempotent success. Unknown directories are never deleted as cache garbage.
+- Per-tool payload is bounded at 3 MiB, per-Session at 16 MiB/1024 records, and
+  per-Store at 256 MiB/8192 records. A 65,536-entry scan ceiling and shared
+  10-second budget bound admission/cleanup. Incomplete scans and cleanup failure
+  reject new writes; rejected budgets create no auxiliary directories. Empty
+  auxiliary parents are removed after their owned contents are reclaimed.
+- The Store writer lock is acquired before cloning one bounded tool snapshot.
+  Quotas coordinate one Store and its clones, not independent processes sharing
+  a data directory. Started writes/sync/cleanup remain owned even when OS IO
+  outlasts the budget; timeouts never detach a half-published write.
+- Main History persistence is settled first. Auxiliary failure changes only
+  `recording` (`memory_only`, `saved`, `failed`) and its best-effort event; real
+  Tool/Turn outcomes and readable memory are preserved, without replaying work.
+  `saved` records the write result, not indefinite retention.
+- Internal cold reads validate format, identity, sizes, ranges, hashes and UTF-8
+  before projection. Missing/corrupt blobs are unavailable with their observed
+  ranges intact; they are not genuine empty streams. The same ToolData projection
+  handles memory and stored bytes. Public async/RPC cold reads remain P5b2.
+
+Regressions cover real Bash save success/failure, held-save close joins, binary
+round trips, retention-pressure snapshots, concurrent Session quotas, static
+symlink and unsafe-temp rejection, inner scan ceilings, oversized/corrupt
+metadata, conflicting idempotency, and the reproduced zero-budget directory
+leak. Source-only helper claims were not used as acceptance evidence.
 
 ## P0 Verification
 

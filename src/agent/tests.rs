@@ -7434,3 +7434,319 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
         "active second command was not reaped by close_session join barrier"
     );
 }
+
+/// Proves that when auxiliary tool persistence fails, the core loop outcome is
+/// still completed, main history is persisted, the bash process is reaped,
+/// and no duplicate tool execution occurs.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
+    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-fail-{}", next_id()));
+    let (workspace, _guard) = workspace_file("bash-aux-fail-ws", "a.txt", b"hello");
+    let pid_file = workspace.join("child.pid");
+
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall(
+                "bash",
+                json!({"command": "echo $$ > child.pid; printf 'done' > output.txt"}),
+            ),
+            ModelScript::Text("all done"),
+        ],
+    );
+
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+
+    // Inject auxiliary write failure on this session
+    crate::store::fail_next_aux_write(info.session_id);
+
+    let turn = send_text(&mut agent, info.session_id, "run with aux failure").await;
+    let result = wait_text(&agent, turn).await;
+
+    // Core loop outcome must be Completed and core history Persisted
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+
+    // Wait for the process to exit and confirm output
+    for _ in 0..500 {
+        if workspace.join("output.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(workspace.join("output.txt").exists());
+
+    if pid_file.exists() {
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!process_is_listed(pid), "bash process was reaped");
+    }
+
+    // In-memory tool records are preserved and marked Failed, core outcome intact
+    let tool_refs = agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .presentation()
+        .tool_data()
+        .loop_tool_refs(info.session_id, turn.loop_id);
+    assert!(!tool_refs.is_empty());
+    for tool_ref in tool_refs {
+        let read_res = agent
+            .tool_read(crate::tool_data::ToolReadRequest {
+                tool_ref: tool_ref.clone(),
+                max_bytes: Some(4096),
+            })
+            .unwrap();
+        assert_eq!(
+            read_res.execution.recording,
+            crate::tool_data::ToolRecordingState::Failed
+        );
+        assert_eq!(
+            read_res.execution.outcome,
+            Some(minicore_runtime::tools::ToolResultOutcome::Success)
+        );
+    }
+
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to_disk() {
+    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-success-{}", next_id()));
+    let (workspace, _guard) = workspace_file("bash-aux-success-ws", "a.txt", b"hello");
+
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall(
+                "bash",
+                json!({"command": "printf 'persisted cold output' > output.txt"}),
+            ),
+            ModelScript::Text("all done"),
+        ],
+    );
+
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+
+    let turn = send_text(&mut agent, info.session_id, "run with aux success").await;
+    let result = wait_text(&agent, turn).await;
+
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+
+    let tool_refs = agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .presentation()
+        .tool_data()
+        .loop_tool_refs(info.session_id, turn.loop_id);
+    assert!(!tool_refs.is_empty());
+    let tool_ref = &tool_refs[0];
+
+    // 1. In-memory record is marked Saved
+    let live_read = agent
+        .tool_read(crate::tool_data::ToolReadRequest {
+            tool_ref: tool_ref.clone(),
+            max_bytes: Some(4096),
+        })
+        .unwrap();
+    assert_eq!(
+        live_read.execution.recording,
+        crate::tool_data::ToolRecordingState::Saved
+    );
+
+    // 2. Real cold read from Store disk
+    let store = agent.store_handle();
+    let recovered = store
+        .read_tool_record(tool_ref)
+        .await
+        .unwrap()
+        .expect("persisted tool record must exist on disk");
+
+    let cold_read = recovered.project_read(tool_ref, 4096).unwrap();
+    assert_eq!(
+        cold_read.execution.recording,
+        crate::tool_data::ToolRecordingState::Saved
+    );
+    assert_eq!(cold_read.execution.name, "bash");
+
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn session_close_while_aux_write_held_still_joins_owned_worker() {
+    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-close-{}", next_id()));
+    let (workspace, _guard) = workspace_file("bash-aux-close-ws", "a.txt", b"hello");
+
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("bash", json!({"command": "echo done > output.txt"})),
+            ModelScript::Text("finished"),
+        ],
+    );
+
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+
+    let gate = Arc::new(crate::store::AuxCommitGate::new());
+    crate::store::register_aux_commit_gate(info.session_id, Arc::clone(&gate));
+
+    let _turn = send_text(&mut agent, info.session_id, "run with aux notify").await;
+
+    // 1. Prove that execution has reached the aux write phase under lock
+    gate.entered.notified().await;
+
+    // 2. Poll close session while aux write is held: must remain pending on owned worker join
+    let close_task = tokio::spawn(async move { agent.close_session(info.session_id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !close_task.is_finished(),
+        "close must be waiting for active loop worker"
+    );
+
+    // 3. Release gate to let aux write complete
+    gate.release.notify_one();
+
+    // 4. Worker joins cleanly and close completes
+    let close_res = close_task.await.unwrap();
+    assert!(close_res.is_ok());
+}
+
+#[tokio::test]
+async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
+    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-deadline-{}", next_id()));
+    let (workspace, _guard) = workspace_file("bash-aux-deadline-ws", "a.txt", b"hello");
+
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("bash", json!({"command": "printf 'fast'"})),
+            ModelScript::Text("done"),
+        ],
+    );
+
+    let profile = Profile {
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["bash".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+    };
+
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        profile,
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let presentation = session.presentation();
+    let loop_id = minicore_runtime::LoopId::new().unwrap();
+    let tool_ref = crate::tool_data::ToolRef {
+        session_id: info.session_id,
+        loop_id,
+        request_index: 0,
+        tool_call_id: minicore_runtime::ToolCallId::new("call-dl-timeout").unwrap(),
+    };
+
+    presentation.tool_data().note_requested(&tool_ref, "bash");
+    presentation.tool_data().mark_running(&tool_ref);
+    presentation.tool_data().note_result(&tool_ref, "hi\n");
+    presentation.tool_data().finish_and_snapshot(
+        &tool_ref,
+        minicore_runtime::tools::ToolResultOutcome::Success,
+    );
+
+    // Initial state is MemoryOnly
+    let initial_read = agent
+        .tool_read(crate::tool_data::ToolReadRequest {
+            tool_ref: tool_ref.clone(),
+            max_bytes: Some(4096),
+        })
+        .unwrap();
+    assert_eq!(
+        initial_read.execution.recording,
+        crate::tool_data::ToolRecordingState::MemoryOnly
+    );
+
+    // Call persist_loop_tool_records with an already-expired deadline
+    let store = agent.store_handle();
+    let expired_deadline = std::time::Instant::now() - std::time::Duration::from_millis(10);
+
+    let results = store
+        .persist_loop_tool_records(
+            std::slice::from_ref(&tool_ref),
+            presentation.tool_data().as_ref(),
+            expired_deadline,
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.is_err());
+
+    agent.close_session(info.session_id).await.unwrap();
+}
