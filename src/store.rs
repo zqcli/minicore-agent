@@ -1231,7 +1231,6 @@ impl Store {
             .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn read_tool_record_with_deadline(
         &self,
         tool_ref: &ToolRef,

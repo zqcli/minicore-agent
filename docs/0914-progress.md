@@ -15,14 +15,14 @@ replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
 P3b2 passed parent review and remote verification. P4 is also verified: bounded
 file reads (P4a), listing and literal search (P4b), and isolated Git status
 queries (P4c). P5a owned Bash streams and in-memory output queries are verified.
-P5b1 auxiliary persistence is verified. P5b2 public/RPC cold reads, P6 change
-review and P7 integration remain pending.
+P5b1 auxiliary persistence and P5b2 public/RPC cold reads are verified.
+P6 change review and P7 integration remain pending.
 
 ## Execution
 
-The requested implementation order is `cus-resp/deepseek-v4.1-flash:max`,
-then `cus-resp/gemini-3.8-flash:high` if unavailable, then
-`cus-resp/gpt-5.6-luna:max`. The earlier model-role compatibility mismatch is
+The latest user instruction selects `cus-resp/gpt-5.6-luna:max` for subsequent
+implementation helpers, superseding the earlier DeepSeek/Gemini/GPT fallback
+order. The earlier model-role compatibility mismatch is
 fixed. P5a resumed with DeepSeek, then used Gemini after a context-overflow
 recovery failure; parent-owned review and remote verification remained required. The P3a implementation preferred
 `cus-resp/deepseek-v4.1-flash:high`, with three consecutive helper failures
@@ -44,7 +44,7 @@ stored in source.
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
-| P5 | Owned Bash streaming, cancellation, result retention | P5a/P5b1 verified: 673 stable/MSRV passed, 2 Live ignored; P5b2 public/RPC cold reads pending |
+| P5 | Owned Bash streaming, cancellation, result retention | Verified; P5b2 stable/MSRV 688 passed, 2 Live ignored; strict and cross-platform compile gates passed |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
 
@@ -726,6 +726,58 @@ round trips, retention-pressure snapshots, concurrent Session quotas, static
 symlink and unsafe-temp rejection, inner scan ceilings, oversized/corrupt
 metadata, conflicting idempotency, and the reproduced zero-budget directory
 leak. Source-only helper claims were not used as acceptance evidence.
+
+## P5b2 Tool Cold Read Closure And RPC Query Pool Integration
+
+Parent review and remote acceptance completed on 2026-09-15. Stable and Rust
+1.85 each passed **688 tests**, with **2 Live Provider tests ignored**. Strict
+Clippy, formatting, rustdoc, Windows GNU and macOS all-target compile checks
+passed. Windows retains only the existing `write_reload_config` test-helper
+warning; native Windows/macOS execution and Live Provider testing were not run.
+Logs: `logs/p5b2-{tests,msrv,clippy,fmt,doc,windows,macos}.log` under the remote
+build root.
+
+Parent review additionally reproduced and corrected the historical `memory_only`
+fast-path mistake and needless disk reads for known empty EOF. Merge checks are
+symmetric for known zero/nonzero ranges and validate immutable command facts;
+historical phase/timestamps are recovered without replacing available memory.
+The real Bash restart test reconstructs multi-page UTF-8, NUL, invalid UTF-8 and
+ANSI bytes exactly under a 1024-byte encoded-result budget.
+
+- `Agent::tool_read` and `Agent::tool_output` are converted to `async fn` in Rust.
+  While wire-compatible over JSON-RPC, this is an API source change for Rust
+  consumers requiring `.await`.
+- Unified timeout budget: `resolve_tool_record` wraps readonly cold reads in a
+  single top-level `tokio::select!` with biased cancellation and sleep until the
+  10s deadline, ensuring immediate abort on cancellation (e.g. shutdown) without
+  waiting 10s. Facade and RPC layers share this single budget without nested timeout resets.
+- Zero disk IO for complete in-memory records: `ToolRecord::needs_stored` identifies
+  complete records (and commands still draining/running), serving them purely from
+  memory without touching disk or cold-path test gates.
+- Strict observation invariants in `ToolRecord::merge_stored`:
+  - Rejects conflicts in tool name, terminal execution state, outcome, or known observed ranges/totals.
+  - Preserves known empty EOF streams against non-empty replacements, while learning valid empty EOF metadata for unknown streams.
+  - Updates total byte counts alongside expired input/result restoration.
+  - Aligns command result ranges with merged process windows and reflects stored `ToolRecordingState`.
+  - Merges into isolated query snapshots only, never mutating cached session records.
+- Pure cold reads are strictly read-only: no directories created, no session
+  workspace/model validation, and trailing partial lines in `history.jsonl` leave
+  all files byte-identical without repairs.
+- RPC deferred query pool integration:
+  - `"tool.read"` and `"tool.output"` migrate to `queries.spawn` bounded by 4 query slots and the shared 32-waiter admission ceiling (`-32019`).
+  - Parameter validation precedes admission.
+  - Control requests (`ping`, `cancel`, `wait`) stay unblocked.
+  - Cancelling or dropping a query has no side effects and never terminates running Bash commands.
+- Regressions added:
+  - Unit tests for `merge_stored` conflict rejection, empty EOF preservation, and partial reconcile hydration.
+  - Real Bash dual-stream execution with full process exit, Session close, and cold-read verification on a fresh Agent instance without Session loading.
+  - Read-only resilience under missing workspace, malformed session configuration, and trailing partial line corruption on `history.jsonl`.
+  - Missing auxiliary records / unknown tool references mapping cleanly to `ToolNotFound`.
+  - Warm record immediate return without hitting disk or held cold gates.
+  - Stream eviction under 9x1MiB pressure with successful disk restoration.
+  - Both sources unavailable preserving observed stream offsets.
+  - Reader timeout/drop isolation from running Bash child processes.
+  - RPC 4-query ceiling enforcement, `-32019` rejection, ping保活, and shutdown cancellation within <2s.
 
 ## P0 Verification
 

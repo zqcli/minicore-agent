@@ -46,7 +46,12 @@ P5b1 auxiliary persistence is verified: stable/MSRV each 673 passed, 2 ignored;
 strict and cross-platform compile gates passed. Atomic metadata/blob directories
 have per-tool, Session and Store budgets; failed auxiliary writes preserve core
 outcomes and report recording=failed. Internal cold reads share the ToolData
-projection. P5b2 public/RPC cold reads, P6 and P7 remain pending.
+projection. P5b2 public/RPC cold reads are also verified: stable/MSRV each
+688 passed, 2 Live ignored; strict and cross-platform compile gates passed.
+Async Rust queries and the existing deferred RPC pool share bounded, cancellable
+cold reads and preserve valid memory observations. P6 and P7 remain pending.
+Subsequent implementation helpers use cus-resp/gpt-5.6-luna:max, per the latest
+user instruction; parent-only remote verification and commits remain unchanged.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,

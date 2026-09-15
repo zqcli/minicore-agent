@@ -17,6 +17,10 @@ use crate::history::sanitize_history;
 use crate::ids::SessionId;
 use crate::sessions::{Session, TurnPersistence, TurnRef};
 use crate::store::{HistoryScanLimits, Store, StoredLoopRecord, StoredTurnSummary};
+use crate::tool_data::{
+    ToolData, ToolOutputPage, ToolOutputRequest, ToolReadRequest, ToolReadResult, ToolRecord,
+    ToolRef,
+};
 
 pub(crate) const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_READ_MAX_BYTES: usize = 1024 * 1024;
@@ -366,6 +370,184 @@ fn pending_turn_page(turn: TurnRef, max_bytes: usize) -> Result<TurnResultPage, 
         return Err(AgentError::InvalidArguments);
     }
     Ok(page)
+}
+
+#[cfg(test)]
+pub(crate) struct ToolReadGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ToolReadGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) async fn wait_started(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+type ToolReadGateEntry = (ToolRef, Arc<ToolReadGate>);
+#[cfg(test)]
+static TOOL_READ_GATES: std::sync::OnceLock<std::sync::Mutex<Vec<ToolReadGateEntry>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn gate_next_tool_read(tool_ref: ToolRef, gate: Arc<ToolReadGate>) {
+    let mutex = TOOL_READ_GATES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    mutex.lock().unwrap().push((tool_ref, gate));
+}
+
+#[cfg(test)]
+async fn check_tool_read_gate(tool_ref: &ToolRef) {
+    let gate = {
+        let Some(mutex) = TOOL_READ_GATES.get() else {
+            return;
+        };
+        let mut entries = mutex.lock().unwrap();
+        let Some(pos) = entries.iter().position(|(r, _)| r == tool_ref) else {
+            return;
+        };
+        entries.remove(pos).1
+    };
+    gate.entered.notify_one();
+    gate.release.notified().await;
+}
+
+async fn resolve_tool_record(
+    store: &Store,
+    loaded_tool_data: Option<&ToolData>,
+    tool_ref: &ToolRef,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<ToolRecord, AgentError> {
+    if cancellation.is_cancelled() || Instant::now() >= deadline {
+        return Err(AgentError::QueryLimit);
+    }
+
+    let mem_record = loaded_tool_data.and_then(|td| td.get_record(tool_ref));
+    if let Some(mem) = mem_record {
+        if !mem.needs_stored() {
+            return Ok(mem);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(AgentError::QueryLimit),
+            res = cold_read_and_merge(store, mem, tool_ref, deadline) => res,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(AgentError::QueryLimit),
+            res = cold_read_only(store, tool_ref, deadline) => res,
+        }
+    }
+}
+
+async fn cold_read_and_merge(
+    store: &Store,
+    mut mem: ToolRecord,
+    tool_ref: &ToolRef,
+    deadline: Instant,
+) -> Result<ToolRecord, AgentError> {
+    #[cfg(test)]
+    check_tool_read_gate(tool_ref).await;
+
+    let disk_result = store
+        .read_tool_record_with_deadline(tool_ref, deadline)
+        .await;
+
+    match disk_result {
+        Ok(Some(disk_record)) => {
+            mem.merge_stored(disk_record);
+            Ok(mem)
+        }
+        Ok(None) => Ok(mem),
+        Err(store_err) => {
+            if matches!(store_err, crate::error::StoreError::QueryLimit) {
+                Err(AgentError::QueryLimit)
+            } else {
+                Ok(mem)
+            }
+        }
+    }
+}
+
+async fn cold_read_only(
+    store: &Store,
+    tool_ref: &ToolRef,
+    deadline: Instant,
+) -> Result<ToolRecord, AgentError> {
+    #[cfg(test)]
+    check_tool_read_gate(tool_ref).await;
+
+    let disk_result = store
+        .read_tool_record_with_deadline(tool_ref, deadline)
+        .await;
+
+    match disk_result {
+        Ok(Some(disk_record)) => Ok(disk_record),
+        Ok(None) => Err(AgentError::ToolNotFound),
+        Err(store_err) => {
+            if matches!(store_err, crate::error::StoreError::QueryLimit) {
+                Err(AgentError::QueryLimit)
+            } else {
+                Err(AgentError::ToolNotFound)
+            }
+        }
+    }
+}
+
+pub(crate) async fn tool_read(
+    store: Store,
+    loaded_tool_data: Option<Arc<ToolData>>,
+    request: ToolReadRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolReadResult, AgentError> {
+    request.validate()?;
+    let max_bytes = request.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
+    let deadline = Instant::now() + READ_DEADLINE;
+    let record = resolve_tool_record(
+        &store,
+        loaded_tool_data.as_deref(),
+        &request.tool_ref,
+        deadline,
+        &cancellation,
+    )
+    .await?;
+    record.project_read(&request.tool_ref, max_bytes)
+}
+
+pub(crate) async fn tool_output(
+    store: Store,
+    loaded_tool_data: Option<Arc<ToolData>>,
+    request: ToolOutputRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolOutputPage, AgentError> {
+    request.validate()?;
+    let max_bytes = request.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
+    let deadline = Instant::now() + READ_DEADLINE;
+    let record = resolve_tool_record(
+        &store,
+        loaded_tool_data.as_deref(),
+        &request.tool_ref,
+        deadline,
+        &cancellation,
+    )
+    .await?;
+    record.project_output(&request, max_bytes)
 }
 
 async fn live_turn_page(
