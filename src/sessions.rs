@@ -2482,6 +2482,13 @@ impl Session {
             }
         }
         self.join_status_workers().await;
+        // A closed Session must reap its own CPU comparisons, not merely cancel
+        // the query token. The Store owns those workers, so closing joins them
+        // by session before the Session reports closure.
+        self.shared
+            .store
+            .shutdown_session_diff_workers(session_id)
+            .await;
         // Owned commands are joined after every owner was told to stop, and
         // before the Session reports closure: a command is only finished when
         // its owner really reaped it.

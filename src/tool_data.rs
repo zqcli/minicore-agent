@@ -2104,6 +2104,18 @@ impl ToolData {
             .collect()
     }
 
+    /// Returns the full in-memory `FileChange` for one tool call, with its
+    /// bounded before/after snapshots, when one was recorded. Callers match on
+    /// `file_change_records` metadata first, so only the hit is cloned here.
+    pub(crate) fn file_change(&self, tool_ref: &ToolRef) -> Option<crate::changes::FileChange> {
+        let inner = self.lock();
+        inner
+            .records
+            .get(tool_ref)
+            .and_then(|record| record.file_change.as_ref())
+            .cloned()
+    }
+
     /// Exports one completed tool call's facts and retained buffers for durable persistence.
     /// Memory copying is bounded to this single record (<= 3 MiB total).
     pub(crate) fn snapshot_for_persistence(

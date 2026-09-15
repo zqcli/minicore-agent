@@ -52,7 +52,9 @@ Async Rust queries and the existing deferred RPC pool share bounded, cancellable
 cold reads and preserve valid memory observations. P6a native mutation records,
 bounded before/after auxiliary snapshots and three-scope changes.list are now
 verified: stable/MSRV each 714 passed, 2 Live ignored; strict Clippy/fmt/rustdoc
-and Windows/macOS all-target compile checks passed. Version-bound changes.diff
+and Windows/macOS all-target compile checks passed. P6b1 tool change diffs
+(`changes.diff`) are now implemented in the current uncommitted source handoff
+and await their own parent remote verification; the workspace-Git-scoped diff
 and P7 remain pending. After an earlier `cus-resp/deepseek-v4.1-flash:high` handoff
 failed with an upstream HTTP 404 (retained as history), the draft was preserved
 and reviewed. The user then paused and reloaded the model configuration, and

@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -127,6 +127,7 @@ protocol version, and ordered capability names:
     "workspace.search",
     "workspace.status",
     "changes.list",
+    "changes.diff",
     "deferred.waiter_limit"
   ]
 }
@@ -1518,8 +1519,59 @@ Workspace records report Git `modified`, `renamed`, `unmerged`, and
 `untracked` entries, subject to the same bounded status observation. A rename
 carries `original_path` when Git provided a safe workspace-relative old name.
 They use unknown content revisions because P6a does not yet provide
-version-bound diffs. Binary files and the `changes.diff` operation remain
-outside this slice.
+version-bound diffs.
+
+### `changes.diff`
+
+`changes.diff` returns one bounded, read-only comparison for a retained
+`tool:` change reference. The workspace-Git scope is not implemented yet: a
+`workspace:` reference is answered with `availability: "unavailable"` rather
+than a fabricated comparison.
+
+```json
+{
+  "session_id": "ses_...",
+  "change_ref": "tool:<sha256>",
+  "context_lines": 3,
+  "cursor": null,
+  "max_bytes": 65536
+}
+```
+
+The reference is resolved with an in-memory change when the Session is loaded,
+and otherwise through the same bounded metadata scan as `changes.list`; only
+the matched record's snapshots are read. A warm change with retained bytes
+answers without disk I/O, and a warm record missing bytes is only completed
+from disk when the disk metadata is identical, so a different revision is never
+substituted. An unknown reference is `tool_not_found`.
+
+The comparison is `comparison: "tool_before_after"` over the actual captured
+before and after buffers, never Git `HEAD`. A missing before is a genuine
+addition (`base_version: {"kind":"missing"}`). `unknown`, expired, or corrupt
+snapshots report `availability: "unavailable"`; NUL or invalid UTF-8 reports
+`binary: true` with no hunks. Each result carries `base_version`,
+`target_version`, `commit_state`, `coverage`, `binary`, `stale`,
+`availability`, structured `hunks`, `complete`, `truncated`, and an optional
+`next_cursor`.
+
+Each hunk has `old_start`/`old_count`/`new_start`/`new_count` and `lines`.
+Every line reports `kind` (`context`/`added`/`removed`), optional `old_index`
+and `new_index`, `line_byte_offset` inside `line_byte_len`, `text`, and
+`line_complete`. Concatenating fragments in offset order reconstructs the exact
+original bytes, including CRLF, a bare CR, and a missing final newline. The
+response is charged by encoded JSON bytes within `4096..=262144` (default
+64 KiB) and reserves room for a continuation cursor.
+
+The cursor binds the session, change reference, the actual diff-op fingerprint,
+context, and hunk/line/offset; `base_version` and `target_version` are carried
+by the result. A different diff returns `stale: true` instead of continuing a
+new comparison under an old cursor. A start tuple that is not a real position
+inside the plan (a hunk/line index past its range, a byte offset past the line,
+or a non-UTF-8-boundary offset) is rejected as invalid arguments. The CPU
+comparison has a bounded deadline and runs in an owned
+Store worker set (max four); dropping the caller cancels it and Agent shutdown
+cancels and joins every handler. Each ToolRef remains an independent segment:
+this slice performs no same-file aggregation.
 
 ## Interactions
 

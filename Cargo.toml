@@ -36,6 +36,8 @@ reqwest = { version = "=0.12.12", default-features = false, features = ["json", 
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "=0.10.9"
+# Structured line diffs for `changes.diff`. Pinned like the other public deps.
+similar = { version = "=2.7.0", default-features = false, features = ["text"] }
 thiserror = "2.0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

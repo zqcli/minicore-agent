@@ -19,7 +19,9 @@ P5b1 auxiliary persistence and P5b2 public/RPC cold reads are verified.
 P6a native file-change recording, bounded auxiliary snapshots and three-scope
 `changes.list` passed parent review and remote verification: stable/MSRV each
 714 passed, 2 Live ignored; strict and cross-platform compile gates passed.
-Version-bound diffs and P7 integration remain pending.
+P6b1 tool change diffs are implemented in the current uncommitted source
+handoff and await parent-owned compilation/test verification; the
+workspace-Git-scoped diff and P7 integration remain pending.
 
 ## Execution
 
@@ -51,7 +53,7 @@ remains in the historical audit. No credentials are stored in source.
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
 | P5 | Owned Bash streaming, cancellation, result retention | Verified; P5b2 stable/MSRV 688 passed, 2 Live ignored; strict and cross-platform compile gates passed |
-| P6 | Workspace and tool change scopes, versioned diffs | P6a verified: stable/MSRV 714 passed, 2 ignored; all gates passed; version-bound diff remains pending |
+| P6 | Workspace and tool change scopes, versioned diffs | P6a verified: stable/MSRV 714 passed, 2 ignored; all gates passed. P6b1 verified: 740 stable/MSRV passed, 2 ignored; workspace diff pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
 
 Each stage is a vertical implementation/API/RPC/test slice, reviewed before
@@ -884,8 +886,62 @@ cumulative budget.
   History. No Bash, editor, external process, or other Agent change is
   attributed to a native ToolRef.
 - `changes.diff`, revision-bound diff semantics, binary/untracked diff
-  details, and same-file aggregation are deliberately deferred to later P6
-  slices and are not a capability or RPC route in this handoff.
+  details, and same-file aggregation were deliberately deferred out of the
+  P6a handoff and are not part of that accepted slice.
+
+## P6b1 Tool Change Diff
+
+Parent acceptance: stable and Rust 1.85 each passed **740 tests**, with 2 Live
+Provider tests ignored. Strict Clippy, fmt, rustdoc and Windows GNU/macOS
+all-target compile checks passed. Logs: `logs/p6b1-{tests,msrv,clippy,fmt,doc,windows,macos}.log`.
+Native Windows/macOS execution and Live Provider tests were not run; the existing
+Windows `write_reload_config` test-helper warning remains.
+
+After interrupted helper runs, the user requested direct parent implementation.
+The parent fixed move errors, corrected invalid test fixtures and context settings,
+and replaced fixed cursor slack with actual encoded-header/cursor accounting.
+Searches must remain scoped to named relevant files/directories, never filesystem
+roots or the entire home directory. Workspace diff and P7 remain pending.
+
+- `changes.diff(session_id, change_ref, context_lines?, cursor?, max_bytes?)`
+  resolves a `tool:` reference through warm ToolData first and the same bounded
+  `changes.list` metadata scan otherwise. Only the matched record's
+  `before.bin`/`after.bin` are read through a narrow Store lookup that never
+  clones unrelated input/result/stream blobs. A warm complete change answers
+  without disk I/O; a warm record missing bytes is only upgraded from disk when
+  the disk metadata is byte-identical, so a different revision is never
+  substituted. An unknown reference is `ToolNotFound`, not an empty diff.
+- The comparison is the real captured before/after buffers, never Git `HEAD`.
+  A `Missing` before is a genuine addition; `Unknown`, expired, or corrupt
+  snapshots report `availability: unavailable` instead of an empty file. NUL or
+  invalid UTF-8 marks the result `binary` with no hunks and no replacement
+  characters. Results carry `origin`, `base_version`, `target_version`,
+  `comparison: tool_before_after`, `commit_state`, `coverage`, `binary`,
+  `stale`, `availability`, structured hunks, `complete`, and `truncated`.
+- Lines are paged as raw UTF-8 fragments with `line_byte_offset` inside a
+  `line_byte_len` logical line, so offsets reconstruct the exact bytes across
+  pages including CRLF, a bare CR, and a missing final newline. Line splitting
+  matches `similar`'s tokenizer: `\r\n`, a bare `\n`, and a bare `\r` all end a
+  line, so plan indices and raw bytes stay aligned. The combined line count is
+  checked before the comparison allocates every line, and a single very large
+  hunk still observes cancellation and the CPU deadline. The page is charged by
+  encoded JSON bytes (default 64 KiB, `2048..=262144`, reserving actual room for a
+  continuation cursor). The cursor binds session, change reference, the actual
+  diff-op fingerprint, context, and hunk/line/offset, so a changed diff is
+  `stale` instead of a different comparison continued under an old cursor. A
+  start tuple outside the plan, a byte offset past its line, or an offset that
+  is not a UTF-8 boundary is `invalid_arguments`, never a silent skip or a fake
+  completion. The diff-op fingerprint is hashed field by field, so it does not
+  build a second full plan copy or its JSON bytes.
+- The CPU comparison uses `similar` 2.7.0 (`text`, no default features) with
+  Myers and a bounded deadline. It runs in a blocking handler owned by a small
+  Store worker set (max four) rather than a generic manager, so it covers
+  unloaded Sessions. Dropping the query awaiter cancels the comparison. Store
+  worker handles are retained with their cancellation tokens; Agent shutdown
+  cancels and joins every handler, and an abrupt drop still cancels the tokens.
+  The RPC reuses the existing four-query and shared 32-waiter ceilings.
+- Each ToolRef stays an independent segment; this slice adds no same-file
+  aggregation, no content snapshot store, no new owner, and no History write.
 
 ## P0 Verification
 

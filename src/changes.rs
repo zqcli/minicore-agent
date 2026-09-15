@@ -244,13 +244,23 @@ pub(crate) struct FileChange {
 }
 
 impl FileChange {
-    pub(crate) fn details_available(&self) -> bool {
+    /// True when the before side is captured and its retained bytes still match
+    /// the recorded revision. Used to decide whether a disk read may fill a
+    /// missing or corrupt side without ever overwriting a valid warm one.
+    pub(crate) fn before_available(&self) -> bool {
         self.before_captured
-            && self.after_captured
             && !self.before_corrupt
-            && !self.after_corrupt
             && revision_matches_snapshot(&self.before, self.before_bytes.as_deref(), true)
+    }
+
+    pub(crate) fn after_available(&self) -> bool {
+        self.after_captured
+            && !self.after_corrupt
             && revision_matches_snapshot(&self.after, self.after_bytes.as_deref(), false)
+    }
+
+    pub(crate) fn details_available(&self) -> bool {
+        self.before_available() && self.after_available()
     }
 
     pub(crate) fn needs_stored(&self) -> bool {
@@ -369,11 +379,11 @@ pub(crate) fn metadata_revision(bytes: u64, modified_unix_ms: Option<u64>) -> Ch
     }
 }
 
-fn tool_change_ref(tool_ref: &ToolRef, change: &FileChange) -> String {
+pub(crate) fn tool_change_ref(tool_ref: &ToolRef, change: &FileChange) -> String {
     stored_tool_change_ref(tool_ref, &change.stored())
 }
 
-fn stored_tool_change_ref(tool_ref: &ToolRef, change: &StoredFileChange) -> String {
+pub(crate) fn stored_tool_change_ref(tool_ref: &ToolRef, change: &StoredFileChange) -> String {
     let bytes = serde_json::to_vec(&(tool_ref, change))
         .expect("serializing a bounded change reference cannot fail");
     format!("tool:{}", crate::store::hash_bytes(&bytes))

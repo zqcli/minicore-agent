@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -517,8 +517,85 @@ pub(crate) fn delivery_state(delivery: minicore_runtime::model::DeliveryState) -
 pub(crate) struct Store {
     root: PathBuf,
     aux_lock: Arc<tokio::sync::Mutex<()>>,
+    diff_workers: Arc<Mutex<DiffWorkers>>,
     #[cfg(test)]
     aux_limits: Option<AuxLimits>,
+}
+
+/// `changes.diff` workers run at most this many CPU comparisons at a time.
+pub(crate) const MAX_DIFF_WORKERS: usize = 4;
+
+/// Owned blocking handlers for `changes.diff`. Each handle is retained with its
+/// cancellation token and session identity so the Store can always cancel and
+/// join it, for a loaded Session or an unloaded one.
+#[derive(Default)]
+struct DiffWorkers {
+    closing: bool,
+    workers: Vec<Arc<OwnedDiffWorker>>,
+}
+
+impl Drop for DiffWorkers {
+    fn drop(&mut self) {
+        // Ordinary Agent drop is non-blocking, but every owned comparison is
+        // still cancelled so its blocking handler stops promptly instead of
+        // running to its own deadline.
+        for worker in &self.workers {
+            worker.cancel.cancel();
+        }
+    }
+}
+
+/// One owned `changes.diff` comparison. The join handle lives behind a tokio
+/// mutex and is taken only after it really finished, so a shutdown future that
+/// is dropped mid-join never detaches it and a second or concurrent join either
+/// waits on the same handle or observes its completion.
+struct OwnedDiffWorker {
+    session_id: SessionId,
+    cancel: CancellationToken,
+    join: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl OwnedDiffWorker {
+    fn is_finished(&self) -> bool {
+        match self.join.try_lock() {
+            Ok(slot) => slot.as_ref().is_none_or(|handle| handle.is_finished()),
+            Err(_) => false,
+        }
+    }
+
+    async fn join(&self) {
+        let mut slot = self.join.lock().await;
+        let Some(handle) = slot.as_mut() else {
+            return;
+        };
+        let _ = std::pin::Pin::new(handle).await;
+        slot.take();
+    }
+}
+
+/// One owned `changes.diff` CPU comparison. Awaiting it observes the blocking
+/// result only; dropping it cancels that comparison without losing the handle.
+pub(crate) struct DiffQuery {
+    receiver:
+        tokio::sync::oneshot::Receiver<Result<crate::diff::DiffOutcome, crate::error::AgentError>>,
+    child_cancel: CancellationToken,
+}
+
+impl DiffQuery {
+    pub(crate) async fn wait(
+        mut self,
+    ) -> Result<crate::diff::DiffOutcome, crate::error::AgentError> {
+        match (&mut self.receiver).await {
+            Ok(result) => result,
+            Err(_) => Err(crate::error::AgentError::Internal),
+        }
+    }
+}
+
+impl Drop for DiffQuery {
+    fn drop(&mut self) {
+        self.child_cancel.cancel();
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -684,6 +761,7 @@ impl Store {
         Ok(Self {
             root,
             aux_lock: Arc::new(tokio::sync::Mutex::new(())),
+            diff_workers: Arc::new(Mutex::new(DiffWorkers::default())),
             #[cfg(test)]
             aux_limits: None,
         })
@@ -1690,6 +1768,179 @@ impl Store {
             Ok(res) => res,
             Err(_) => Err(StoreError::Unavailable),
         }
+    }
+
+    /// Reads only one retained record's bounded before/after snapshots. It
+    /// deliberately skips the larger input/result/stream blobs, so a cold
+    /// `changes.diff` never clones an unrelated tool output.
+    pub(crate) async fn read_file_change_snapshots(
+        &self,
+        session_id: SessionId,
+        tool_ref: &ToolRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::changes::FileChange>, StoreError> {
+        if tool_ref.session_id != session_id {
+            return Err(StoreError::InvalidArguments);
+        }
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(StoreError::QueryLimit);
+        }
+        let session_dir = self.session_directory(session_id);
+        let session_meta = match fs::symlink_metadata(&session_dir).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        if session_meta.file_type().is_symlink() || !session_meta.is_dir() {
+            return Err(StoreError::Corrupt);
+        }
+        let target_dir = session_dir
+            .join(AUX_TOOLS_DIR)
+            .join(tool_ref_hash(tool_ref));
+        let record_path = target_dir.join(TOOL_RECORD_FILE);
+        let file = match safe_open_read(&record_path).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        let mut bytes = Vec::new();
+        let mut reader = file.take((MAX_TOOL_METADATA_BYTES + 1) as u64);
+        let read = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
+            result = tokio::time::timeout_at(deadline.into(), reader.read_to_end(&mut bytes)) => {
+                result.map_err(|_| StoreError::QueryLimit)?
+            }
+        };
+        if read.is_err() || bytes.len() > MAX_TOOL_METADATA_BYTES {
+            return Ok(None);
+        }
+        let stored: StoredToolRecord = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return Ok(None),
+        };
+        if stored.tool_ref != *tool_ref || validate_stored_tool_record(&stored, tool_ref).is_err() {
+            return Ok(None);
+        }
+        let Some(change) = stored.file_change else {
+            return Ok(None);
+        };
+        let (before, before_corrupt) =
+            read_change_blob(&target_dir.join(TOOL_BEFORE_FILE), &change.before).await;
+        check_aux_scan(cancellation, deadline)?;
+        let (after, after_corrupt) =
+            read_change_blob(&target_dir.join(TOOL_AFTER_FILE), &change.after).await;
+        check_aux_scan(cancellation, deadline)?;
+        Ok(Some(crate::changes::FileChange::from_stored(
+            change,
+            before,
+            before_corrupt,
+            after,
+            after_corrupt,
+        )))
+    }
+
+    /// Starts one owned `changes.diff` CPU comparison for `session_id`.
+    /// Registration and the capacity check happen under the same lock as the
+    /// closing flag, so a Store that starts closing either observes this worker
+    /// or refuses it.
+    pub(crate) fn spawn_diff_query(
+        &self,
+        session_id: SessionId,
+        before: Arc<[u8]>,
+        after: Arc<[u8]>,
+        context_lines: usize,
+        deadline: Instant,
+    ) -> Result<DiffQuery, StoreError> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let child_cancel = CancellationToken::new();
+        let worker_cancel = child_cancel.clone();
+        let mut workers = self.diff_workers.lock().unwrap();
+        workers.workers.retain(|worker| !worker.is_finished());
+        if workers.closing || workers.workers.len() >= MAX_DIFF_WORKERS {
+            return Err(StoreError::QueryLimit);
+        }
+        let handle = tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::diff::plan_diff(
+                    before.as_ref(),
+                    after.as_ref(),
+                    context_lines,
+                    &worker_cancel,
+                    deadline,
+                )
+            })
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => Err(crate::error::AgentError::Internal),
+            };
+            let _ = sender.send(result);
+        });
+        workers.workers.push(Arc::new(OwnedDiffWorker {
+            session_id,
+            cancel: child_cancel.clone(),
+            join: tokio::sync::Mutex::new(Some(handle)),
+        }));
+        Ok(DiffQuery {
+            receiver,
+            child_cancel,
+        })
+    }
+
+    /// Cancels every owned diff comparison and waits for its blocking handler
+    /// to really finish. Handles stay registered until they are joined, so a
+    /// second or concurrent call observes the same workers instead of an empty
+    /// set. Called by the Agent shutdown barrier, so unloaded-Session diffs are
+    /// covered too.
+    pub(crate) async fn shutdown_diff_workers(&self) {
+        let workers = {
+            let mut workers = self.diff_workers.lock().unwrap();
+            workers.closing = true;
+            workers.workers.clone()
+        };
+        for worker in &workers {
+            worker.cancel.cancel();
+        }
+        for worker in &workers {
+            worker.join().await;
+        }
+        let mut workers = self.diff_workers.lock().unwrap();
+        workers.workers.retain(|worker| !worker.is_finished());
+    }
+
+    /// Cancels and joins only the diff comparisons started for one closed
+    /// Session, so closing a Session actually reaps its CPU workers rather than
+    /// leaving them to run to the shared deadline.
+    pub(crate) async fn shutdown_session_diff_workers(&self, session_id: SessionId) {
+        let workers = {
+            let workers = self.diff_workers.lock().unwrap();
+            workers
+                .workers
+                .iter()
+                .filter(|worker| worker.session_id == session_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for worker in &workers {
+            worker.cancel.cancel();
+        }
+        for worker in &workers {
+            worker.join().await;
+        }
+        let mut workers = self.diff_workers.lock().unwrap();
+        workers
+            .workers
+            .retain(|worker| !(worker.session_id == session_id && worker.is_finished()));
+    }
+
+    /// Test-only evidence that diff worker handles are still registered (not
+    /// taken and dropped), used to prove a dropped or re-entered shutdown does
+    /// not detach an owned comparison.
+    #[cfg(test)]
+    pub(crate) fn registered_diff_workers(&self) -> usize {
+        self.diff_workers.lock().unwrap().workers.len()
     }
 
     async fn read_tool_record_inner(
@@ -3987,6 +4238,7 @@ mod tests {
     use crate::changes::{
         ChangeCommitState, ChangeCoverage, ChangeKind, FileChange, content_revision,
     };
+    use crate::error::AgentError;
     use crate::tool_data::{ToolData, ToolDataAvailability, ToolDataStream, ToolOutputRequest};
 
     use super::*;
@@ -6061,6 +6313,748 @@ mod tests {
                 .unwrap()
         );
         assert!(blob_budget.exhausted, "the lookahead crosses the budget");
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
+        let (base, store, session_id) = fixture("diff-warm-cold").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-warm").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(b"user dirty\n"),
+                after: content_revision(b"agent clean\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(b"user dirty\n".to_vec()),
+                after_bytes: Some(b"agent clean\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("diff record finishes");
+        store
+            .commit_tool_record(
+                &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let change_ref = crate::changes::stored_tool_change_ref(
+            &tool_ref,
+            &data.file_change(&tool_ref).unwrap().stored(),
+        );
+        let request = crate::diff::ChangesDiffRequest {
+            session_id,
+            change_ref: change_ref.clone(),
+            context_lines: None,
+            cursor: None,
+            max_bytes: None,
+        };
+
+        // Warm path: the in-memory snapshots answer without any disk read.
+        let warm = crate::diff::changes_diff(
+            store.clone(),
+            Some(Arc::new(data)),
+            request.clone(),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(warm.availability, crate::diff::DiffAvailability::Available);
+        assert!(!warm.binary);
+        assert_eq!(warm.base_version, content_revision(b"user dirty\n"));
+        assert_eq!(warm.target_version, content_revision(b"agent clean\n"));
+        assert!(
+            warm.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.kind == crate::diff::DiffLineKind::Removed)
+        );
+
+        // Cold path: an unloaded Session still resolves through the bounded
+        // metadata scan and reads only this record's snapshots.
+        let cold = crate::diff::changes_diff(
+            store.clone(),
+            None,
+            request.clone(),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cold.availability, crate::diff::DiffAvailability::Available);
+        assert_eq!(cold.change_ref, change_ref);
+
+        // A cursor carrying a different diff fingerprint is stale, not a new diff.
+        let stale = crate::diff::changes_diff(
+            store.clone(),
+            None,
+            crate::diff::ChangesDiffRequest {
+                cursor: Some(crate::diff::DiffCursor {
+                    session_id,
+                    change_ref: change_ref.clone(),
+                    tool_ref: Some(tool_ref.clone()),
+                    ops_fingerprint: "a".repeat(64),
+                    context_lines: 3,
+                    hunk_index: 0,
+                    line_index: 0,
+                    line_byte_offset: 0,
+                }),
+                ..request.clone()
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(stale.stale);
+        assert!(stale.hunks.is_empty());
+
+        // An unknown reference is not a fabricated empty diff.
+        let miss = crate::diff::changes_diff(
+            store.clone(),
+            None,
+            crate::diff::ChangesDiffRequest {
+                change_ref: format!("tool:{}", "b".repeat(64)),
+                ..request.clone()
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert!(matches!(miss, Err(AgentError::ToolNotFound)));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_missing_before_is_an_addition_and_empty_content_is_not_binary() {
+        let (base, store, session_id) = fixture("diff-missing-before").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-added").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "created.txt".to_owned(),
+                kind: ChangeKind::Added,
+                before: crate::changes::ChangeRevision::Missing,
+                after: content_revision(b"new\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: None,
+                after_bytes: Some(b"new\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("diff record finishes");
+        store
+            .commit_tool_record(
+                &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let change_ref = crate::changes::stored_tool_change_ref(
+            &tool_ref,
+            &data.file_change(&tool_ref).unwrap().stored(),
+        );
+        let result = crate::diff::changes_diff(
+            store.clone(),
+            None,
+            crate::diff::ChangesDiffRequest {
+                session_id,
+                change_ref,
+                context_lines: None,
+                cursor: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.base_version, crate::changes::ChangeRevision::Missing);
+        assert!(!result.binary);
+        assert_eq!(
+            result.availability,
+            crate::diff::DiffAvailability::Available
+        );
+        assert!(
+            result
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.kind == crate::diff::DiffLineKind::Added)
+        );
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_corrupt_or_missing_snapshots_report_unavailable_not_empty() {
+        let (base, store, session_id) = fixture("diff-corrupt").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-corrupt").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(b"before\n"),
+                after: content_revision(b"after\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(b"before\n".to_vec()),
+                after_bytes: Some(b"after\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("diff record finishes");
+        store
+            .commit_tool_record(
+                &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let change_ref = crate::changes::stored_tool_change_ref(
+            &tool_ref,
+            &data.file_change(&tool_ref).unwrap().stored(),
+        );
+        let target = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(tool_ref_hash(&tool_ref))
+            .join(TOOL_AFTER_FILE);
+        fs::write(&target, b"tampered bytes").await.unwrap();
+        let result = crate::diff::changes_diff(
+            store.clone(),
+            None,
+            crate::diff::ChangesDiffRequest {
+                session_id,
+                change_ref,
+                context_lines: None,
+                cursor: None,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.availability,
+            crate::diff::DiffAvailability::Unavailable
+        );
+        assert!(result.hunks.is_empty());
+        assert!(!result.binary);
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_warm_half_merges_with_its_disk_counterpart_only() {
+        let (base, store, session_id) = fixture("diff-half-merge").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-half").unwrap(),
+        };
+        let before = b"user dirty\n".to_vec();
+        let after = b"agent clean\n".to_vec();
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(&before),
+                after: content_revision(&after),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(before.clone()),
+                after_bytes: Some(after.clone()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("diff record finishes");
+        let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        let change_ref = crate::changes::stored_tool_change_ref(
+            &tool_ref,
+            &data.file_change(&tool_ref).unwrap().stored(),
+        );
+
+        // Warm record lost its before bytes but keeps a valid after half; the
+        // matching disk record supplies the before side. The result compares
+        // the real before, unaugmented by disk, and the request never fabricates
+        // an unrelated half.
+        let warm = ToolData::new();
+        warm.note_requested(&tool_ref, "write");
+        warm.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(&before),
+                after: content_revision(&after),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: None,
+                after_bytes: Some(after.clone()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        let warm = Arc::new(warm);
+        let merged = crate::diff::resolve_tool_change(
+            &store,
+            Some(&warm),
+            session_id,
+            &change_ref,
+            None,
+            Instant::now() + Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the warm record resolves");
+        assert_eq!(merged.1.before_bytes.as_deref(), Some(before.as_slice()));
+        assert_eq!(merged.1.after_bytes.as_deref(), Some(after.as_slice()));
+        assert!(merged.1.details_available());
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_metadata_conflict_keeps_the_valid_warm_side() {
+        let (base, store, session_id) = fixture("diff-meta-conflict").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-conflict").unwrap(),
+        };
+        let disk_before = b"disk before\n".to_vec();
+        let disk_after = b"disk after\n".to_vec();
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(&disk_before),
+                after: content_revision(&disk_after),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(disk_before.clone()),
+                after_bytes: Some(disk_after.clone()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("diff record finishes");
+        store
+            .commit_tool_record(
+                &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+
+        // The warm record carries a different revision than disk. Disk must not
+        // be merged in: the valid warm sides stay, and the absent side stays
+        // unavailable rather than taking a disk half from another revision.
+        let warm_before = b"warm before\n".to_vec();
+        let warm = ToolData::new();
+        warm.note_requested(&tool_ref, "write");
+        warm.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(&warm_before),
+                after: content_revision(&disk_after),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(warm_before.clone()),
+                after_bytes: None,
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        let warm_ref = crate::changes::stored_tool_change_ref(
+            &tool_ref,
+            &warm.file_change(&tool_ref).unwrap().stored(),
+        );
+        let warm = Arc::new(warm);
+        let resolved = crate::diff::resolve_tool_change(
+            &store,
+            Some(&warm),
+            session_id,
+            &warm_ref,
+            None,
+            Instant::now() + Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the warm record resolves");
+        assert_eq!(
+            resolved.1.before_bytes.as_deref(),
+            Some(warm_before.as_slice())
+        );
+        assert!(resolved.1.after_bytes.is_none());
+        assert!(!resolved.1.details_available());
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_cursor_hint_must_match_the_resolved_reference() {
+        let (base, store, session_id) = fixture("diff-hint").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-hint").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(b"before\n"),
+                after: content_revision(b"after\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(b"before\n".to_vec()),
+                after_bytes: Some(b"after\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("diff record finishes");
+        store
+            .commit_tool_record(
+                &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let change_ref = crate::changes::stored_tool_change_ref(
+            &tool_ref,
+            &data.file_change(&tool_ref).unwrap().stored(),
+        );
+
+        // A hint pointing at the right session but the wrong change reference
+        // must not select a different change. The metadata scan is still
+        // consulted, so the real record is found and verified.
+        let wrong = ToolRef {
+            session_id,
+            loop_id: tool_ref.loop_id,
+            request_index: 0,
+            tool_call_id: ToolCallId::new("diff-hint-other").unwrap(),
+        };
+        let resolved = crate::diff::resolve_tool_change(
+            &store,
+            None,
+            session_id,
+            &change_ref,
+            Some(&wrong),
+            Instant::now() + Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the real change is found despite the wrong hint");
+        assert_eq!(resolved.0, tool_ref);
+        assert_eq!(resolved.1.path, "value.txt");
+
+        // A forged hint for a different session is rejected without a lookup.
+        let other_session = SessionId::new().unwrap();
+        assert!(matches!(
+            crate::diff::resolve_tool_change(
+                &store,
+                None,
+                session_id,
+                &change_ref,
+                Some(&ToolRef {
+                    session_id: other_session,
+                    ..wrong.clone()
+                }),
+                Instant::now() + Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
+            .await,
+            Err(AgentError::InvalidArguments)
+        ));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_worker_capacity_is_bounded_and_shutdown_joins() {
+        let (base, store, session_id) = fixture("diff-workers").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        // Hold every worker slot with a distinct, gated comparison so capacity
+        // cannot drain before the overflow attempt.
+        let mut held = Vec::new();
+        let mut gates = Vec::new();
+        for index in 0..MAX_DIFF_WORKERS {
+            let before: Arc<[u8]> = Arc::from(format!("line {index}\n").into_bytes());
+            let after: Arc<[u8]> = Arc::from(format!("LINE {index}\n").into_bytes());
+            let gate = Arc::new(crate::diff::DiffGate::new());
+            crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+            held.push(
+                store
+                    .spawn_diff_query(
+                        session_id,
+                        Arc::clone(&before),
+                        Arc::clone(&after),
+                        3,
+                        Instant::now() + Duration::from_secs(10),
+                    )
+                    .unwrap(),
+            );
+            gates.push(gate);
+        }
+        for gate in &gates {
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+                .await
+                .expect("diff worker did not start");
+        }
+        assert!(matches!(
+            store.spawn_diff_query(
+                session_id,
+                Arc::from(b"one\ntwo\n".to_vec()),
+                Arc::from(b"one\nTWO\n".to_vec()),
+                3,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            Err(StoreError::QueryLimit)
+        ));
+        for gate in &gates {
+            gate.release();
+        }
+        for query in held {
+            let _ = query.wait().await;
+        }
+        store.shutdown_diff_workers().await;
+
+        // After shutdown the worker set refuses new comparisons rather than
+        // launching an unowned one.
+        assert!(matches!(
+            store.spawn_diff_query(
+                session_id,
+                Arc::from(b"one\ntwo\n".to_vec()),
+                Arc::from(b"one\nTWO\n".to_vec()),
+                3,
+                Instant::now() + Duration::from_secs(10),
+            ),
+            Err(StoreError::QueryLimit)
+        ));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_shutdown_drop_and_concurrent_join_really_stop_the_worker() {
+        let (base, store, session_id) = fixture("diff-shutdown-reentrant").await;
+        let before: Arc<[u8]> = Arc::from(b"one\n".to_vec());
+        let after: Arc<[u8]> = Arc::from(b"ONE\n".to_vec());
+        let gate = Arc::new(crate::diff::DiffGate::new());
+        crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+        let query = store
+            .spawn_diff_query(
+                session_id,
+                Arc::clone(&before),
+                Arc::clone(&after),
+                3,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .expect("diff worker did not start");
+        // Dropping the query owner only cancels the comparison; the Store still
+        // owns the handle. The gate is never released, so completion depends on
+        // the cancellation really reaching the blocking handler.
+        drop(query);
+        tokio::time::timeout(Duration::from_secs(10), store.shutdown_diff_workers())
+            .await
+            .expect("shutdown did not join the cancelled worker");
+        assert_eq!(store.registered_diff_workers(), 0);
+        let _ = fs::remove_dir_all(base).await;
+
+        // A shutdown future dropped before it joins must not detach the handle.
+        // The same owner is still registered and a later (or concurrent)
+        // shutdown joins the same worker instead of returning early.
+        let (base, store, session_id) = fixture("diff-shutdown-dropped").await;
+        let before: Arc<[u8]> = Arc::from(b"two\n".to_vec());
+        let after: Arc<[u8]> = Arc::from(b"TWO\n".to_vec());
+        let gate = Arc::new(crate::diff::DiffGate::new());
+        crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+        let _query = store
+            .spawn_diff_query(
+                session_id,
+                Arc::clone(&before),
+                Arc::clone(&after),
+                3,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .expect("diff worker did not start");
+        // Dropping the future before it is ever polled must not detach the
+        // handle: the same owner is still registered, so a later (or
+        // concurrent) shutdown joins the same worker instead of returning early.
+        let dropped = store.shutdown_diff_workers();
+        drop(dropped);
+        assert_eq!(store.registered_diff_workers(), 1);
+        let (first, second) =
+            tokio::join!(store.shutdown_diff_workers(), store.shutdown_diff_workers());
+        let _ = (first, second);
+        assert_eq!(store.registered_diff_workers(), 0);
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_session_shutdown_joins_only_that_session() {
+        let (base, store, first) = fixture("diff-session-join-a").await;
+        let second = SessionId::new().unwrap();
+        let before_a: Arc<[u8]> = Arc::from(b"alpha\n".to_vec());
+        let after_a: Arc<[u8]> = Arc::from(b"ALPHA\n".to_vec());
+        let before_b: Arc<[u8]> = Arc::from(b"beta\n".to_vec());
+        let after_b: Arc<[u8]> = Arc::from(b"BETA\n".to_vec());
+        let gate_a = Arc::new(crate::diff::DiffGate::new());
+        crate::diff::gate_next_diff(&before_a, &after_a, Arc::clone(&gate_a));
+        let gate_b = Arc::new(crate::diff::DiffGate::new());
+        crate::diff::gate_next_diff(&before_b, &after_b, Arc::clone(&gate_b));
+        let query_a = store
+            .spawn_diff_query(
+                first,
+                Arc::clone(&before_a),
+                Arc::clone(&after_a),
+                3,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        let query_b = store
+            .spawn_diff_query(
+                second,
+                Arc::clone(&before_b),
+                Arc::clone(&after_b),
+                3,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate_a.wait_started())
+            .await
+            .expect("first diff worker did not start");
+        tokio::time::timeout(Duration::from_secs(10), gate_b.wait_started())
+            .await
+            .expect("second diff worker did not start");
+        // The first Session's close cancels and joins only its own CPU worker;
+        // the unrelated Session's comparison stays registered and running.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.shutdown_session_diff_workers(first),
+        )
+        .await
+        .expect("session shutdown did not join its worker");
+        assert_eq!(store.registered_diff_workers(), 1);
+        drop(query_a);
+        drop(query_b);
+        store.shutdown_diff_workers().await;
+        assert_eq!(store.registered_diff_workers(), 0);
 
         let _ = fs::remove_dir_all(base).await;
     }

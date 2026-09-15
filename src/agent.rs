@@ -24,6 +24,7 @@ use crate::compaction::{
     AutoContext, CompactionResult, CompactionState, load_state, valid_operation_id,
 };
 use crate::config::AgentConfig;
+use crate::diff::{ChangesDiffRequest, DiffResult, changes_diff, diff_deadline};
 use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
 use crate::models::{ModelConfig, ModelConfigError, ModelInfo, Models};
@@ -58,6 +59,7 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "workspace.search",
     "workspace.status",
     "changes.list",
+    "changes.diff",
     "deferred.waiter_limit",
 ];
 
@@ -699,6 +701,47 @@ impl Agent {
         }
     }
 
+    /// Returns one bounded review diff for a retained native Tool change. A
+    /// loaded Session lets an in-memory change answer without disk I/O; an
+    /// unloaded Session, a removed Workspace, or a missing model never blocks
+    /// the cold path. The CPU comparison is owned by the Store worker set.
+    pub async fn changes_diff(
+        &self,
+        request: ChangesDiffRequest,
+    ) -> Result<DiffResult, AgentError> {
+        self.changes_diff_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn changes_diff_with_cancellation(
+        &self,
+        request: ChangesDiffRequest,
+        cancellation: CancellationToken,
+    ) -> Result<DiffResult, AgentError> {
+        request.validate()?;
+        let deadline = diff_deadline();
+        let (tool_data, session_cancellation) = self
+            .sessions
+            .get(request.session_id)
+            .map(|session| (Some(session.tool_data()), session.query_cancellation()))
+            .unwrap_or_else(|| (None, CancellationToken::new()));
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+            _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(AgentError::QueryLimit)
+            }
+            result = changes_diff(
+                self.store.clone(),
+                tool_data,
+                request,
+                cancellation.clone(),
+                deadline,
+            ) => result,
+        }
+    }
+
     /// Read-only structured facts for one tool call. Loaded in-memory facts
     /// take precedence; unloaded sessions or evicted records fall back to durable
     /// auxiliary storage.
@@ -1287,6 +1330,7 @@ impl Agent {
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
         let result = self.sessions.shutdown_all().await;
+        self.store.shutdown_diff_workers().await;
         self.subagents.drain_all().await;
         drop(self.event_sink);
         drop(self.events_rx.take());
