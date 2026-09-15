@@ -720,6 +720,24 @@ impl Agent {
     ) -> Result<DiffResult, AgentError> {
         request.validate()?;
         let deadline = diff_deadline();
+        if request.change_ref.starts_with("workspace:") {
+            let session = self
+                .loaded_session(request.session_id)
+                .ok_or(AgentError::SessionNotLoaded)?;
+            let session_cancel = session.query_cancellation();
+            let query =
+                session.spawn_workspace_diff(request.clone(), cancellation.clone(), deadline)?;
+            return tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+                _ = session_cancel.cancelled() => Err(AgentError::QueryLimit),
+                _ = tokio::time::sleep_until(deadline.into()) => Err(AgentError::QueryLimit),
+                result = async {
+                    let sources = query.wait().await?;
+                    crate::diff::workspace_diff(self.store.clone(), request, sources, session_cancel.clone(), deadline).await
+                } => result,
+            };
+        }
         let (tool_data, session_cancellation) = self
             .sessions
             .get(request.session_id)
@@ -736,7 +754,7 @@ impl Agent {
                 self.store.clone(),
                 tool_data,
                 request,
-                cancellation.clone(),
+                session_cancellation.clone(),
                 deadline,
             ) => result,
         }
@@ -1329,6 +1347,7 @@ impl Agent {
     /// shutdown cancellation reason.
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
+        self.store.cancel_diff_workers();
         let result = self.sessions.shutdown_all().await;
         self.store.shutdown_diff_workers().await;
         self.subagents.drain_all().await;

@@ -391,12 +391,46 @@ pub(crate) fn stored_tool_change_ref(tool_ref: &ToolRef, change: &StoredFileChan
 
 fn workspace_change_ref(
     session_id: crate::ids::SessionId,
-    observation: &str,
+    head_oid: &str,
     entry: &WorkspaceStatusEntry,
 ) -> String {
-    let bytes = serde_json::to_vec(&(session_id, observation, entry))
+    let bytes = serde_json::to_vec(&(session_id, head_oid, entry))
         .expect("serializing a bounded workspace reference cannot fail");
-    format!("workspace:{}", crate::store::hash_bytes(&bytes))
+    use base64::Engine;
+    format!(
+        "workspace:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
+pub(crate) fn parse_workspace_ref(
+    value: &str,
+    session_id: crate::SessionId,
+) -> Result<(String, WorkspaceStatusEntry), AgentError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            value
+                .strip_prefix("workspace:")
+                .ok_or(AgentError::InvalidArguments)?,
+        )
+        .map_err(|_| AgentError::InvalidArguments)?;
+    let (session, head, entry): (crate::SessionId, String, WorkspaceStatusEntry) =
+        serde_json::from_slice(&bytes).map_err(|_| AgentError::InvalidArguments)?;
+    if session != session_id
+        || (!head.is_empty()
+            && !([40, 64].contains(&head.len())
+                && head.bytes().all(|byte| byte.is_ascii_hexdigit())))
+    {
+        return Err(AgentError::InvalidArguments);
+    }
+    for path in std::iter::once(&entry.path).chain(entry.original_path.iter()) {
+        if path.len() > 4096 {
+            return Err(AgentError::InvalidArguments);
+        }
+        crate::workspace::validate_relative_path(path).map_err(|_| AgentError::InvalidArguments)?;
+    }
+    Ok((head, entry))
 }
 
 fn workspace_observation(status: &WorkspaceStatusResult) -> String {
@@ -453,7 +487,11 @@ pub(crate) fn workspace_records(
         .entries
         .iter()
         .map(|entry| ChangeRecord {
-            change_ref: workspace_change_ref(session_id, &observation, entry),
+            change_ref: workspace_change_ref(
+                session_id,
+                status.head_oid.as_deref().unwrap_or(""),
+                entry,
+            ),
             path: entry.path.clone(),
             kind: workspace_kind(entry),
             origin: ChangeOrigin::WorkspaceUnknown,

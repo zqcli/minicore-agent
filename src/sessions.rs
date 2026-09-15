@@ -424,13 +424,13 @@ impl StatusWorkers {
 /// One owned `workspace.status` query. Awaiting it observes the worker's
 /// result only; dropping it stops that query's child through the child token,
 /// never through the Session token, so other queries keep running.
-pub(crate) struct StatusQuery {
-    receiver: tokio::sync::oneshot::Receiver<Result<crate::WorkspaceStatusResult, AgentError>>,
+pub(crate) struct StatusQuery<T = crate::WorkspaceStatusResult> {
+    receiver: tokio::sync::oneshot::Receiver<Result<T, AgentError>>,
     child_cancel: CancellationToken,
 }
 
-impl StatusQuery {
-    pub(crate) async fn wait(mut self) -> Result<crate::WorkspaceStatusResult, AgentError> {
+impl<T> StatusQuery<T> {
+    pub(crate) async fn wait(mut self) -> Result<T, AgentError> {
         match (&mut self.receiver).await {
             Ok(result) => result,
             // The worker ended without publishing a result, so nothing was
@@ -440,7 +440,7 @@ impl StatusQuery {
     }
 }
 
-impl Drop for StatusQuery {
+impl<T> Drop for StatusQuery<T> {
     fn drop(&mut self) {
         self.child_cancel.cancel();
     }
@@ -1064,8 +1064,46 @@ impl Session {
         })
     }
 
-    /// Refuses new status workers and waits until every owned worker has
-    /// stopped and reaped its child.
+    /// Registers bounded Git source reads in the existing Session-owned worker set.
+    pub(crate) fn spawn_workspace_diff(
+        &self,
+        request: crate::ChangesDiffRequest,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<StatusQuery<crate::diff::DiffSources>, AgentError> {
+        request.validate()?;
+        let workspace = self.workspace();
+        let session_cancel = self.shared.close.clone();
+        let child_cancel = CancellationToken::new();
+        let worker_cancel = child_cancel.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut workers = self.shared.status_workers.lock().unwrap();
+        workers.reap_finished();
+        if workers.closing
+            || session_cancel.is_cancelled()
+            || workers.workers.len() >= MAX_STATUS_QUERY_WORKERS
+        {
+            return Err(AgentError::QueryLimit);
+        }
+        workers.workers.push(tokio::spawn(async move {
+            let result = crate::workspace::status::diff_sources(
+                &workspace,
+                &request,
+                &session_cancel,
+                &cancellation,
+                &worker_cancel,
+                deadline,
+            )
+            .await;
+            let _ = sender.send(result);
+        }));
+        Ok(StatusQuery {
+            receiver,
+            child_cancel,
+        })
+    }
+
+    /// Refuses new status workers and waits until each has reaped its child.
     async fn join_status_workers(&self) {
         let workers = {
             let mut workers = self.shared.status_workers.lock().unwrap();

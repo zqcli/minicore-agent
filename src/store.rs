@@ -1844,7 +1844,9 @@ impl Store {
     /// Starts one owned `changes.diff` CPU comparison for `session_id`.
     /// Registration and the capacity check happen under the same lock as the
     /// closing flag, so a Store that starts closing either observes this worker
-    /// or refuses it.
+    /// or refuses it. Test-only: production callers pass an admission token
+    /// through `spawn_cancellable_diff_query` so a closing Session is observed.
+    #[cfg(test)]
     pub(crate) fn spawn_diff_query(
         &self,
         session_id: SessionId,
@@ -1853,12 +1855,37 @@ impl Store {
         context_lines: usize,
         deadline: Instant,
     ) -> Result<DiffQuery, StoreError> {
+        self.spawn_cancellable_diff_query(
+            session_id,
+            before,
+            after,
+            context_lines,
+            deadline,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// Starts one owned `changes.diff` CPU comparison for `session_id`, deriving
+    /// the comparison's stop token from `admission` so a closing Session or
+    /// Agent cancels it. Registration and the capacity check happen under the
+    /// same lock as the closing flag, so a Store that starts closing either
+    /// observes this worker or refuses it.
+    pub(crate) fn spawn_cancellable_diff_query(
+        &self,
+        session_id: SessionId,
+        before: Arc<[u8]>,
+        after: Arc<[u8]>,
+        context_lines: usize,
+        deadline: Instant,
+        admission: &CancellationToken,
+    ) -> Result<DiffQuery, StoreError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let child_cancel = CancellationToken::new();
+        let child_cancel = admission.child_token();
         let worker_cancel = child_cancel.clone();
         let mut workers = self.diff_workers.lock().unwrap();
         workers.workers.retain(|worker| !worker.is_finished());
-        if workers.closing || workers.workers.len() >= MAX_DIFF_WORKERS {
+        if workers.closing || admission.is_cancelled() || workers.workers.len() >= MAX_DIFF_WORKERS
+        {
             return Err(StoreError::QueryLimit);
         }
         let handle = tokio::spawn(async move {
@@ -1908,6 +1935,14 @@ impl Store {
         }
         let mut workers = self.diff_workers.lock().unwrap();
         workers.workers.retain(|worker| !worker.is_finished());
+    }
+
+    pub(crate) fn cancel_diff_workers(&self) {
+        let mut workers = self.diff_workers.lock().unwrap();
+        workers.closing = true;
+        for worker in &workers.workers {
+            worker.cancel.cancel();
+        }
     }
 
     /// Cancels and joins only the diff comparisons started for one closed
@@ -6365,6 +6400,7 @@ mod tests {
         let request = crate::diff::ChangesDiffRequest {
             session_id,
             change_ref: change_ref.clone(),
+            comparison: None,
             context_lines: None,
             cursor: None,
             max_bytes: None,
@@ -6499,6 +6535,7 @@ mod tests {
                 session_id,
                 change_ref,
                 context_lines: None,
+                comparison: None,
                 cursor: None,
                 max_bytes: None,
             },
@@ -6582,6 +6619,7 @@ mod tests {
                 session_id,
                 change_ref,
                 context_lines: None,
+                comparison: None,
                 cursor: None,
                 max_bytes: None,
             },
@@ -6939,6 +6977,55 @@ mod tests {
             ),
             Err(StoreError::QueryLimit)
         ));
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn diff_cancelled_admission_refuses_to_spawn_a_worker() {
+        let (base, store, session_id) = fixture("diff-admission-cancelled").await;
+        let admission = CancellationToken::new();
+        admission.cancel();
+        // A closing Session's token is observed under the registry lock, so no
+        // worker is registered for a comparison the Session already dropped.
+        assert!(matches!(
+            store.spawn_cancellable_diff_query(
+                session_id,
+                Arc::from(b"one\ntwo\n".to_vec()),
+                Arc::from(b"one\nTWO\n".to_vec()),
+                3,
+                Instant::now() + Duration::from_secs(10),
+                &admission,
+            ),
+            Err(StoreError::QueryLimit)
+        ));
+        assert_eq!(store.registered_diff_workers(), 0);
+
+        // The same admission token cancels a worker that is already running.
+        let live = CancellationToken::new();
+        let before: Arc<[u8]> = Arc::from(b"alpha\n".to_vec());
+        let after: Arc<[u8]> = Arc::from(b"ALPHA\n".to_vec());
+        let gate = Arc::new(crate::diff::DiffGate::new());
+        crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+        let query = store
+            .spawn_cancellable_diff_query(
+                session_id,
+                Arc::clone(&before),
+                Arc::clone(&after),
+                3,
+                Instant::now() + Duration::from_secs(30),
+                &live,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+            .await
+            .expect("diff worker did not start");
+        live.cancel();
+        // The gate is never released, so this only returns once the derived
+        // child token really reached the blocking comparison.
+        assert!(matches!(query.wait().await, Err(AgentError::QueryLimit)));
+        store.shutdown_diff_workers().await;
+        assert_eq!(store.registered_diff_workers(), 0);
 
         let _ = fs::remove_dir_all(base).await;
     }
