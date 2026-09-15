@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use minicore_runtime::tools::{
     Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput,
@@ -8,15 +9,18 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::Workspace;
+use crate::tool_data::{ToolData, ToolRef};
 
 use super::{
-    MAX_WRITE_BYTES, emit_phase, escape_control_characters, map_workspace_error, precheck_control,
+    FileBefore, MAX_WRITE_BYTES, emit_phase, escape_control_characters, expected_file_state,
+    file_before_from_capture, map_workspace_error, precheck_control, record_file_change,
     run_controlled, wait_for_test_io,
 };
 
 const TOOL_NAME: &str = "write";
+const WRITE_CAPTURE_MAX: Duration = Duration::from_millis(250);
 
-pub(super) struct WriteTool {
+pub(crate) struct WriteTool {
     workspace: Arc<Workspace>,
     spec: ToolSpec,
 }
@@ -29,7 +33,7 @@ struct WriteInput {
 }
 
 impl WriteTool {
-    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("write is a valid tool name"),
             "Atomically write UTF-8 content to a workspace-relative file, creating parent directories.",
@@ -61,6 +65,18 @@ impl Tool for WriteTool {
     }
 
     fn execute(&self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'_> {
+        self.execute_bound(invocation, context, None, None)
+    }
+}
+
+impl WriteTool {
+    pub(crate) fn execute_bound(
+        &self,
+        invocation: ToolInvocation,
+        context: ToolContext,
+        tool_ref: Option<ToolRef>,
+        tool_data: Option<Arc<ToolData>>,
+    ) -> ToolFuture<'_> {
         Box::pin(async move {
             precheck_control(&context)?;
             if invocation.tool_name() != self.spec.name() {
@@ -81,14 +97,47 @@ impl Tool for WriteTool {
             run_controlled(&context, async {
                 wait_for_test_io(TOOL_NAME, &input.path).await;
                 emit_phase(&context, "writing");
-                self.workspace
-                    .write_atomic(&input.path, input.content.as_bytes())
-                    .await
-                    .map_err(map_workspace_error)
+                let before = if tool_ref.is_some() && tool_data.is_some() {
+                    capture_before_best_effort(&self.workspace, &input.path, context.deadline).await
+                } else {
+                    FileBefore::Unknown
+                };
+                let expected = expected_file_state(&before);
+                let observation = self
+                    .workspace
+                    .write_atomic_observed(&input.path, input.content.as_bytes(), expected)
+                    .await;
+                record_file_change(
+                    tool_data.as_deref(),
+                    tool_ref.as_ref(),
+                    &input.path,
+                    before,
+                    input.content.as_bytes(),
+                    &observation,
+                );
+                observation.outcome.map_err(map_workspace_error)
             })
             .await?;
             Ok(ToolExecutionOutcome::Completed(output))
         })
+    }
+}
+
+async fn capture_before_best_effort(
+    workspace: &Workspace,
+    path: &str,
+    deadline: Instant,
+) -> FileBefore {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let quarter_nanos = remaining.as_nanos() / 4;
+    let budget_nanos = quarter_nanos.min(WRITE_CAPTURE_MAX.as_nanos());
+    if budget_nanos == 0 {
+        return FileBefore::Unknown;
+    }
+    let budget = Duration::from_nanos(budget_nanos as u64);
+    match tokio::time::timeout(budget, workspace.capture_file(path, MAX_WRITE_BYTES)).await {
+        Ok(capture) => file_before_from_capture(capture),
+        Err(_) => FileBefore::Unknown,
     }
 }
 
@@ -98,14 +147,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use minicore_runtime::ToolCallId;
     use minicore_runtime::tools::{
         Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolInvocation, ToolProgressSink,
     };
+    use minicore_runtime::{LoopId, ToolCallId};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::tool_data::{ToolData, ToolRef};
     use crate::tools::{ToolIoGate, block_next_io};
     use crate::workspace::{
         BeforeRenameGate, block_before_rename, fail_next_before_rename, fail_next_directory_sync,
@@ -152,6 +202,15 @@ mod tests {
         {
             ToolExecutionOutcome::Completed(output) => Ok(output.content().as_str().to_owned()),
             ToolExecutionOutcome::RequestInput(_) => panic!("write must not request input"),
+        }
+    }
+
+    fn bound_ref() -> ToolRef {
+        ToolRef {
+            session_id: "ses_00000000000000000000000000000001".parse().unwrap(),
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("write-call").unwrap(),
         }
     }
 
@@ -216,6 +275,176 @@ mod tests {
                 Err(ToolError::InvalidInvocation)
             );
         }
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn bound_write_records_exact_user_dirty_before_and_after() {
+        let (base, _, tool) = fixture("bound-record").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value.txt"), b"user dirty\n")
+            .await
+            .unwrap();
+        let data = Arc::new(ToolData::new());
+        let tool_ref = bound_ref();
+        data.note_requested(&tool_ref, TOOL_NAME);
+
+        let result = tool
+            .execute_bound(
+                invocation(json!({"path": "value.txt", "content": "agent\n"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                Some(tool_ref.clone()),
+                Some(Arc::clone(&data)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, ToolExecutionOutcome::Completed(_)));
+
+        let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool_ref, Some(tool_ref.clone()));
+        assert!(records[0].details_available);
+        assert_eq!(records[0].commit_state, crate::ChangeCommitState::Applied);
+        data.finish_and_snapshot(
+            &tool_ref,
+            minicore_runtime::tools::ToolResultOutcome::Success,
+        )
+        .expect("bound write record finishes");
+        let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+        assert_eq!(snapshot.file_change_before, Some(b"user dirty\n".to_vec()));
+        assert_eq!(snapshot.file_change_after, Some(b"agent\n".to_vec()));
+
+        let created = bound_ref();
+        data.note_requested(&created, TOOL_NAME);
+        tool.execute_bound(
+            invocation(json!({"path": "created.txt", "content": "new\n"})),
+            context(
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            ),
+            Some(created.clone()),
+            Some(Arc::clone(&data)),
+        )
+        .await
+        .unwrap();
+        let created_records = data.file_change_records(created.session_id, Some(created.loop_id));
+        assert_eq!(created_records.len(), 1);
+        assert_eq!(created_records[0].kind, crate::ChangeKind::Added);
+        assert_eq!(created_records[0].before, crate::ChangeRevision::Missing);
+        assert!(created_records[0].details_available);
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_write_capture_is_partial_but_write_still_commits() {
+        let (base, _, tool) = fixture("oversized-capture").await;
+        let root = base.join("root");
+        tokio::fs::write(
+            root.join("value.txt"),
+            vec![b'x'; MAX_WRITE_BYTES.saturating_add(1)],
+        )
+        .await
+        .unwrap();
+        let data = Arc::new(ToolData::new());
+        let tool_ref = bound_ref();
+        data.note_requested(&tool_ref, TOOL_NAME);
+        tool.execute_bound(
+            invocation(json!({"path": "value.txt", "content": "new"})),
+            context(
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+            ),
+            Some(tool_ref.clone()),
+            Some(Arc::clone(&data)),
+        )
+        .await
+        .unwrap();
+        let record = data
+            .file_change_records(tool_ref.session_id, Some(tool_ref.loop_id))
+            .pop()
+            .unwrap();
+        assert!(matches!(
+            record.before,
+            crate::ChangeRevision::Metadata { .. }
+        ));
+        assert_eq!(record.commit_state, crate::ChangeCommitState::Applied);
+        assert_eq!(record.coverage, crate::ChangeCoverage::Partial);
+        assert!(!record.details_available);
+        assert_eq!(
+            tokio::fs::read(root.join("value.txt")).await.unwrap(),
+            b"new"
+        );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn bound_write_preserves_not_committed_and_post_rename_unknown_states() {
+        let (base, workspace, tool) = fixture("bound-outcomes").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value.txt"), b"old\n")
+            .await
+            .unwrap();
+        let data = Arc::new(ToolData::new());
+        let target = workspace.resolve_for_write("value.txt").await.unwrap();
+
+        let first = bound_ref();
+        data.note_requested(&first, TOOL_NAME);
+        fail_next_before_rename(target.clone());
+        assert_eq!(
+            tool.execute_bound(
+                invocation(json!({"path": "value.txt", "content": "not committed"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                Some(first.clone()),
+                Some(Arc::clone(&data)),
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        let first_record = data
+            .file_change_records(first.session_id, Some(first.loop_id))
+            .pop()
+            .unwrap();
+        assert_eq!(
+            first_record.commit_state,
+            crate::ChangeCommitState::NotCommitted
+        );
+        assert_eq!(first_record.after, crate::ChangeRevision::Unknown);
+
+        let second = bound_ref();
+        data.note_requested(&second, TOOL_NAME);
+        fail_next_directory_sync(target.parent().unwrap().to_path_buf());
+        assert_eq!(
+            tool.execute_bound(
+                invocation(json!({"path": "value.txt", "content": "unknown"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                Some(second.clone()),
+                Some(Arc::clone(&data)),
+            )
+            .await,
+            Err(ToolError::Failed)
+        );
+        let second_record = data
+            .file_change_records(second.session_id, Some(second.loop_id))
+            .pop()
+            .unwrap();
+        assert_eq!(
+            second_record.commit_state,
+            crate::ChangeCommitState::Unknown
+        );
+        assert_eq!(
+            second_record.after,
+            crate::changes::content_revision(b"unknown")
+        );
+        assert_eq!(tokio::fs::read(target).await.unwrap(), b"unknown");
         cleanup(&base).await;
     }
 
@@ -527,5 +756,55 @@ mod tests {
         assert_eq!(result, Err(ToolError::Failed));
         assert_eq!(target_contents, b"complete-new");
         assert!(!temp_found);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_write_deadline_keeps_the_mutation_and_records_it() {
+        let (base, workspace, tool) = fixture("bound-commit-deadline").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value"), b"old").await.unwrap();
+        let target = workspace.resolve_for_write("value").await.unwrap();
+        fail_next_directory_sync(target.parent().unwrap().to_path_buf());
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+        let data = Arc::new(ToolData::new());
+        let tool_ref = bound_ref();
+        data.note_requested(&tool_ref, TOOL_NAME);
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        let task_data = Arc::clone(&data);
+        let task_ref = tool_ref.clone();
+        let task = tokio::spawn(async move {
+            tool.execute_bound(
+                invocation(json!({"path": "value", "content": "complete-new"})),
+                context(CancellationToken::new(), deadline),
+                Some(task_ref),
+                Some(task_data),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
+            .await
+            .expect("worker reached pre-rename gate before deadline");
+        tokio::time::sleep_until(
+            tokio::time::Instant::from_std(deadline) + Duration::from_millis(25),
+        )
+        .await;
+        gate.release();
+        let result = task.await.unwrap();
+        let target_contents = tokio::fs::read(&target).await.unwrap();
+        cleanup(&base).await;
+
+        // The timeout must not pretend nothing happened: the file really
+        // changed and the bound record still describes that real mutation.
+        assert_eq!(result, Err(ToolError::Failed));
+        assert_eq!(target_contents, b"complete-new");
+        let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit_state, crate::ChangeCommitState::Unknown);
+        assert_eq!(
+            records[0].after,
+            crate::changes::content_revision(b"complete-new")
+        );
     }
 }

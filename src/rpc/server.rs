@@ -12,6 +12,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AnswerInteraction, CompactSession, SendMessage};
+use crate::changes::{
+    ChangesListRequest, change_deadline, list_tool_changes, list_workspace_changes,
+};
 use crate::error::AgentError;
 use crate::event::{AgentEventStream, HistoryPageView, SessionStateView, TurnResultView};
 use crate::read::{ReadSession, TurnResultRequest};
@@ -606,6 +609,127 @@ impl RpcServer {
                     };
                     let _ = outbound.send(RpcOutbound::Response(response)).await;
                 });
+                Dispatch::Deferred
+            }
+            "changes.list" => {
+                let request: ChangesListRequest = match params_or_error(&id, params) {
+                    Ok(request) => request,
+                    Err(response) => return Dispatch::Response(response),
+                };
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let deadline = change_deadline();
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                match &request.scope {
+                    crate::changes::ChangeScope::Workspace => {
+                        let Some(session) = self.agent().loaded_session(request.session_id) else {
+                            return Dispatch::Response(agent_error(
+                                id,
+                                &AgentError::SessionNotLoaded,
+                            ));
+                        };
+                        let status_request = crate::WorkspaceStatusRequest {
+                            session_id: request.session_id,
+                            max_bytes: Some(request.max_bytes()),
+                        };
+                        let session_cancellation = session.query_cancellation();
+                        let query = match session.spawn_status_query_with_deadline(
+                            session.workspace(),
+                            status_request,
+                            cancellation.clone(),
+                            deadline,
+                        ) {
+                            Ok(query) => query,
+                            Err(error) => return Dispatch::Response(query_error(id, &error)),
+                        };
+                        drop(session);
+                        self.queries.spawn(async move {
+                            let response = tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => {
+                                    agent_error(id.clone(), &AgentError::QueryLimit)
+                                }
+                                _ = session_cancellation.cancelled() => {
+                                    agent_error(id.clone(), &AgentError::QueryLimit)
+                                }
+                                _ = tokio::time::sleep_until(
+                                    tokio::time::Instant::from_std(deadline)
+                                ) => {
+                                    agent_error(id.clone(), &AgentError::QueryLimit)
+                                }
+                                result = query.wait() => match result {
+                                    Ok(status) => {
+                                        tokio::select! {
+                                            biased;
+                                            _ = cancellation.cancelled() => {
+                                                agent_error(id.clone(), &AgentError::QueryLimit)
+                                            }
+                                            _ = session_cancellation.cancelled() => {
+                                                agent_error(id.clone(), &AgentError::QueryLimit)
+                                            }
+                                            _ = tokio::time::sleep_until(
+                                                tokio::time::Instant::from_std(deadline)
+                                            ) => {
+                                                agent_error(id.clone(), &AgentError::QueryLimit)
+                                            }
+                                            result = list_workspace_changes(
+                                                request,
+                                                status,
+                                                cancellation.clone(),
+                                                deadline,
+                                            ) => match result {
+                                                Ok(result) => success(&id, result),
+                                                Err(error) => query_error(id, &error),
+                                            },
+                                        }
+                                    }
+                                    Err(error) => query_error(id, &error),
+                                }
+                            };
+                            let _ = outbound.send(RpcOutbound::Response(response)).await;
+                        });
+                    }
+                    crate::changes::ChangeScope::Session
+                    | crate::changes::ChangeScope::Turn { .. } => {
+                        let store = self.agent().store_handle();
+                        let loaded = self.agent().loaded_session(request.session_id);
+                        let session_cancellation = loaded
+                            .as_ref()
+                            .map(|session| session.query_cancellation())
+                            .unwrap_or_default();
+                        let tool_data = loaded.map(|session| session.tool_data());
+                        self.queries.spawn(async move {
+                            let response = tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => {
+                                    agent_error(id.clone(), &AgentError::QueryLimit)
+                                }
+                                _ = session_cancellation.cancelled() => {
+                                    agent_error(id.clone(), &AgentError::QueryLimit)
+                                }
+                                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                                    agent_error(id.clone(), &AgentError::QueryLimit)
+                                }
+                                result = list_tool_changes(
+                                    store,
+                                    tool_data,
+                                    request,
+                                    cancellation.clone(),
+                                    deadline,
+                                ) => match result {
+                                    Ok(result) => success(&id, result),
+                                    Err(error) => query_error(id, &error),
+                                }
+                            };
+                            let _ = outbound.send(RpcOutbound::Response(response)).await;
+                        });
+                    }
+                }
                 Dispatch::Deferred
             }
             "session.presentation" => {
@@ -1205,6 +1329,7 @@ fn canonical_method(method: &str) -> &'static str {
         "workspace.files" => "workspace.files",
         "workspace.search" => "workspace.search",
         "workspace.status" => "workspace.status",
+        "changes.list" => "changes.list",
         "tool.read" => "tool.read",
         "tool.output" => "tool.output",
         "turn.send" => "turn.send",

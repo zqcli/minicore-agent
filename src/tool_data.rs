@@ -10,9 +10,9 @@
 //! fixed record/byte budget; queries report the availability and retention
 //! they actually observed instead of claiming a complete object.
 //!
-//! This module intentionally covers only the model-facing per-tool result
-//! output. Bash stdout/stderr streaming, process ownership, and durable
-//! auxiliary files arrive with their own real consumer in P5.
+//! This module owns the model-facing per-tool facts plus bounded native file
+//! change metadata. Bash stdout/stderr streaming, process ownership, and
+//! durable auxiliary files retain their own real consumers from P5.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -26,6 +26,7 @@ use minicore_runtime::history::HistoryItem;
 use minicore_runtime::tools::{ToolInvocation, ToolResultOutcome};
 use minicore_runtime::{LoopId, ToolCallId};
 
+use crate::changes::{CHANGE_METADATA_BYTES, ChangeRecord, FileChange};
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::store::{
@@ -709,6 +710,8 @@ pub(crate) struct ToolRecord {
     stderr: StreamWindow,
     /// The structured process record; absent until a command was owned.
     command: Option<CommandResult>,
+    /// One native file mutation, if the bound tool reached its mutation seam.
+    file_change: Option<FileChange>,
     input_corrupt: bool,
     result_corrupt: bool,
     recording: ToolRecordingState,
@@ -739,6 +742,10 @@ impl ToolRecord {
                 || self.stderr.expired
                 || !self.input_seen
                 || !self.result_seen
+                || self
+                    .file_change
+                    .as_ref()
+                    .is_some_and(FileChange::needs_stored)
                 || self.has_corrupt_streams())
     }
 
@@ -789,6 +796,14 @@ impl ToolRecord {
                     disk.output_complete,
                 )
             })
+        {
+            return false;
+        }
+        if self
+            .file_change
+            .as_ref()
+            .zip(stored.file_change.as_ref())
+            .is_some_and(|(memory, disk)| memory.stored() != disk.stored())
         {
             return false;
         }
@@ -901,7 +916,24 @@ impl ToolRecord {
             self.command = Some(self.live_command(cmd));
         }
 
-        // 6. Recording state
+        // 6. File change snapshots. Metadata from memory wins; disk can only
+        // fill an evicted or corrupt blob for the same immutable change.
+        if self.file_change.is_none() {
+            self.file_change = stored.file_change;
+        } else if let (Some(memory), Some(mut disk)) =
+            (self.file_change.as_mut(), stored.file_change)
+        {
+            if memory.before_bytes.is_none() && !memory.before_corrupt {
+                memory.before_bytes = disk.before_bytes.take();
+                memory.before_corrupt = disk.before_corrupt;
+            }
+            if memory.after_bytes.is_none() && !memory.after_corrupt {
+                memory.after_bytes = disk.after_bytes.take();
+                memory.after_corrupt = disk.after_corrupt;
+            }
+        }
+
+        // 7. Recording state
         if self.recording == ToolRecordingState::MemoryOnly
             && stored.recording != ToolRecordingState::MemoryOnly
         {
@@ -934,6 +966,7 @@ impl ToolRecord {
             stdout: StreamWindow::default(),
             stderr: StreamWindow::default(),
             command: None,
+            file_change: None,
             input_corrupt: false,
             result_corrupt: false,
             recording: ToolRecordingState::MemoryOnly,
@@ -964,6 +997,22 @@ impl ToolRecord {
         } else {
             0
         };
+        let file_change = self.file_change.as_ref().map_or(0, |change| {
+            CHANGE_METADATA_BYTES
+                .saturating_add(change.path.len())
+                .saturating_add(
+                    change
+                        .before_bytes
+                        .as_ref()
+                        .map_or(0, |bytes| bytes.capacity())
+                        .saturating_add(
+                            change
+                                .after_bytes
+                                .as_ref()
+                                .map_or(0, |bytes| bytes.capacity()),
+                        ),
+                )
+        });
         self.name
             .len()
             .saturating_add(subject_len(&self.subject))
@@ -971,6 +1020,7 @@ impl ToolRecord {
             .saturating_add(self.result.len())
             .saturating_add(self.stdout.retained())
             .saturating_add(self.stderr.retained())
+            .saturating_add(file_change)
             .saturating_add(command)
     }
 
@@ -1279,6 +1329,8 @@ impl ToolRecord {
         (result_bytes, result_corrupt): (Option<Vec<u8>>, bool),
         (stdout_bytes, stdout_corrupt): (Option<Vec<u8>>, bool),
         (stderr_bytes, stderr_corrupt): (Option<Vec<u8>>, bool),
+        (file_change_before, file_change_before_corrupt): (Option<Vec<u8>>, bool),
+        (file_change_after, file_change_after_corrupt): (Option<Vec<u8>>, bool),
     ) -> Self {
         let mut input_corrupt = input_corrupt;
         let input = match input_bytes {
@@ -1322,6 +1374,15 @@ impl ToolRecord {
             expired: stored.stderr.expired,
             corrupt: stderr_corrupt,
         };
+        let file_change = stored.file_change.map(|change| {
+            FileChange::from_stored(
+                change,
+                file_change_before,
+                file_change_before_corrupt,
+                file_change_after,
+                file_change_after_corrupt,
+            )
+        });
         Self {
             name: stored.name,
             subject: stored.subject,
@@ -1346,6 +1407,7 @@ impl ToolRecord {
             stdout,
             stderr,
             command: stored.command,
+            file_change,
             recording: ToolRecordingState::Saved,
         }
     }
@@ -1361,6 +1423,8 @@ pub(crate) struct ToolPersistenceSnapshot {
     pub(crate) result_bytes: Option<Vec<u8>>,
     pub(crate) stdout_bytes: Option<Vec<u8>>,
     pub(crate) stderr_bytes: Option<Vec<u8>>,
+    pub(crate) file_change_before: Option<Vec<u8>>,
+    pub(crate) file_change_after: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for ToolPersistenceSnapshot {
@@ -1384,6 +1448,14 @@ impl fmt::Debug for ToolPersistenceSnapshot {
             .field(
                 "stderr_bytes_len",
                 &self.stderr_bytes.as_ref().map(|b| b.len()),
+            )
+            .field(
+                "file_change_before_len",
+                &self.file_change_before.as_ref().map(|b| b.len()),
+            )
+            .field(
+                "file_change_after_len",
+                &self.file_change_after.as_ref().map(|b| b.len()),
             )
             .finish()
     }
@@ -1501,6 +1573,45 @@ impl ToolDataInner {
             self.total_bytes = self.total_bytes.saturating_sub(freed);
             if let Some(record) = self.records.get_mut(&victim) {
                 record.evict_result();
+            }
+            return true;
+        }
+        let victim = self.order.iter().find_map(|tool_ref| {
+            let record = self.records.get(tool_ref)?;
+            let change = record.file_change.as_ref()?;
+            let retained = change
+                .before_bytes
+                .as_ref()
+                .map_or(0, |bytes| bytes.capacity())
+                .saturating_add(
+                    change
+                        .after_bytes
+                        .as_ref()
+                        .map_or(0, |bytes| bytes.capacity()),
+                );
+            (retained > 0).then(|| tool_ref.clone())
+        });
+        if let Some(victim) = victim {
+            let freed = self.records.get(&victim).map_or(0, |record| {
+                record.file_change.as_ref().map_or(0, |change| {
+                    change
+                        .before_bytes
+                        .as_ref()
+                        .map_or(0, |bytes| bytes.capacity())
+                        .saturating_add(
+                            change
+                                .after_bytes
+                                .as_ref()
+                                .map_or(0, |bytes| bytes.capacity()),
+                        )
+                })
+            });
+            self.total_bytes = self.total_bytes.saturating_sub(freed);
+            if let Some(record) = self.records.get_mut(&victim) {
+                if let Some(change) = record.file_change.as_mut() {
+                    change.before_bytes = None;
+                    change.after_bytes = None;
+                }
             }
             return true;
         }
@@ -1824,6 +1935,18 @@ impl ToolData {
         }
     }
 
+    /// Commits one native file-tool fact at the real mutation boundary. A
+    /// duplicate identity is never overwritten with a guessed later value.
+    pub(crate) fn note_file_change(&self, tool_ref: &ToolRef, change: FileChange) {
+        let mut inner = self.lock();
+        inner.resize(tool_ref, |record| {
+            if record.file_change.is_none() {
+                record.file_change = Some(change);
+            }
+        });
+        inner.enforce_limits();
+    }
+
     /// The retained range of one process stream, as
     /// `(base_offset, observed_end)`, so the process record and `tool.output`
     /// describe the same bytes.
@@ -1954,6 +2077,33 @@ impl ToolData {
             .collect()
     }
 
+    /// Returns only bounded file-change metadata and retained blob ownership;
+    /// callers never receive the larger invocation/result snapshots here.
+    pub(crate) fn file_change_records(
+        &self,
+        session_id: SessionId,
+        loop_id: Option<LoopId>,
+    ) -> Vec<ChangeRecord> {
+        let inner = self.lock();
+        inner
+            .order
+            .iter()
+            .filter(|tool_ref| {
+                tool_ref.session_id == session_id
+                    && loop_id
+                        .as_ref()
+                        .is_none_or(|loop_id| &tool_ref.loop_id == loop_id)
+            })
+            .filter_map(|tool_ref| {
+                inner
+                    .records
+                    .get(tool_ref)
+                    .and_then(|record| record.file_change.as_ref())
+                    .map(|change| change.record(tool_ref))
+            })
+            .collect()
+    }
+
     /// Exports one completed tool call's facts and retained buffers for durable persistence.
     /// Memory copying is bounded to this single record (<= 3 MiB total).
     pub(crate) fn snapshot_for_persistence(
@@ -2041,6 +2191,15 @@ impl ToolData {
         };
 
         let command = record.command.clone().map(|cmd| record.live_command(cmd));
+        let file_change = record.file_change.as_ref().map(FileChange::stored);
+        let file_change_before = record
+            .file_change
+            .as_ref()
+            .and_then(|change| change.before_bytes.clone());
+        let file_change_after = record
+            .file_change
+            .as_ref()
+            .and_then(|change| change.after_bytes.clone());
 
         let stored_record = StoredToolRecord {
             version: TOOL_RECORD_FORMAT_VERSION,
@@ -2058,6 +2217,7 @@ impl ToolData {
             stdout: stdout_summary,
             stderr: stderr_summary,
             command,
+            file_change,
         };
 
         Some(ToolPersistenceSnapshot {
@@ -2067,6 +2227,8 @@ impl ToolData {
             result_bytes,
             stdout_bytes,
             stderr_bytes,
+            file_change_before,
+            file_change_after,
         })
     }
 }
@@ -2344,6 +2506,8 @@ mod tests {
 
     use base64::Engine as _;
     use serde_json::json;
+
+    use crate::changes::FileChange;
 
     use super::*;
 
@@ -3584,5 +3748,47 @@ mod tests {
         let cmd = mem.command.expect("command restored from disk");
         assert_eq!(cmd.status, CommandStatus::Exited);
         assert_eq!(cmd.stdout_observed_end, 11);
+    }
+
+    #[test]
+    fn large_file_snapshots_are_evicted_by_real_capacity() {
+        let data = ToolData::new();
+        let before = vec![b'b'; crate::changes::MAX_CHANGE_SNAPSHOT_BYTES];
+        let after = vec![b'a'; crate::changes::MAX_CHANGE_SNAPSHOT_BYTES];
+        let session_id = session(1);
+        let mut refs = Vec::new();
+        for index in 0..8 {
+            let tool_ref = make_tool_ref(
+                session_id,
+                loop_id(index as u8 + 1),
+                index,
+                &format!("write-{index}"),
+            );
+            data.note_requested(&tool_ref, "write");
+            data.note_file_change(
+                &tool_ref,
+                FileChange {
+                    path: format!("file-{index}.txt"),
+                    kind: crate::changes::ChangeKind::Modified,
+                    before: crate::changes::content_revision(&before),
+                    after: crate::changes::content_revision(&after),
+                    commit_state: crate::changes::ChangeCommitState::Applied,
+                    coverage: crate::changes::ChangeCoverage::Complete,
+                    before_captured: true,
+                    after_captured: true,
+                    before_bytes: Some(before.clone()),
+                    after_bytes: Some(after.clone()),
+                    before_corrupt: false,
+                    after_corrupt: false,
+                },
+            );
+            refs.push(tool_ref);
+        }
+        let first = data.get_record(&refs[0]).unwrap();
+        let first_change = first.file_change.as_ref().unwrap();
+        assert!(first_change.before_bytes.is_none());
+        assert!(first_change.after_bytes.is_none());
+        assert_eq!(data.file_change_records(session_id, None).len(), 8);
+        assert!(data.get_record(&refs[7]).unwrap().file_change.is_some());
     }
 }

@@ -1020,6 +1020,17 @@ impl Session {
         request: crate::WorkspaceStatusRequest,
         shutdown_cancellation: CancellationToken,
     ) -> Result<StatusQuery, AgentError> {
+        let deadline = crate::workspace::status::status_deadline_at(workspace.root());
+        self.spawn_status_query_with_deadline(workspace, request, shutdown_cancellation, deadline)
+    }
+
+    pub(crate) fn spawn_status_query_with_deadline(
+        &self,
+        workspace: Arc<Workspace>,
+        request: crate::WorkspaceStatusRequest,
+        shutdown_cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<StatusQuery, AgentError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let child_cancel = CancellationToken::new();
         let session_cancellation = self.shared.close.clone();
@@ -1035,12 +1046,13 @@ impl Session {
             return Err(AgentError::QueryLimit);
         }
         let handle = tokio::spawn(async move {
-            let result = crate::workspace::status::status(
+            let result = crate::workspace::status::status_with_deadline(
                 &workspace,
                 &request,
                 &session_cancellation,
                 &shutdown_cancellation,
                 &worker_child_cancel,
+                deadline,
             )
             .await;
             let _ = sender.send(result);

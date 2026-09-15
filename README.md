@@ -44,8 +44,8 @@ P4's `workspace.read` slice is also verified (528 stable/MSRV tests passed,
 (576 stable/MSRV tests passed, 2 Live ignored; strict and cross-platform compile
 gates passed). `workspace.status` completes P4 with 613 stable/MSRV tests
 passed and 2 Live ignored; the same strict and cross-platform compile gates
-passed. Bash streaming/control, change review and final integration remain
-pending. These changes are not a new installed
+passed. Bash streaming/control, P6a parent verification, version-bound diff
+review, and final integration remain pending. These changes are not a new installed
 Agent release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
@@ -164,6 +164,7 @@ session.update         session.rename        session.history
 session.presentation
 session.read           workspace.read
 workspace.files        workspace.search        workspace.status
+changes.list
 turn.send              turn.cancel            turn.wait
 turn.steer             interaction.answer
 ```
@@ -207,8 +208,9 @@ P5b1 bounded auxiliary persistence is also verified; `recording` reports its
 write result independently of the real tool outcome. P5b2 tool cold read closure
 and RPC query pool integration has passed parent review and remote verification;
 `Agent::tool_read` and `Agent::tool_output` are `async fn` in Rust with deferred
-RPC execution and cold read fallback. P6 change review and P7 integration
-remain pending. The
+RPC execution and cold read fallback. P6a native file-change records, bounded
+before/after snapshots and three-scope `changes.list` have passed parent review
+and remote verification; `changes.diff` and P7 integration remain pending. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

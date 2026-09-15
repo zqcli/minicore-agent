@@ -15,16 +15,27 @@ use std::time::Instant;
 use minicore_runtime::tools::{ToolError, ToolSet, ToolSetBuilder};
 use thiserror::Error;
 
+use crate::changes::{
+    ChangeCommitState, ChangeCoverage, ChangeKind, ChangeRevision, FileChange, content_revision,
+    metadata_revision,
+};
 use crate::presentation::{Presentation, PresentationTool};
 use crate::subagents::{SubagentFactory, SubagentTool};
+use crate::tool_data::{ToolData, ToolRef};
+use crate::workspace::{
+    AtomicWriteObservation, ExpectedFileState, FileCapture, FileStamp, FileState,
+};
 use crate::{Workspace, WorkspaceError};
 
 use apply_patch::ApplyPatchTool;
+pub(crate) use apply_patch::ApplyPatchTool as NativeApplyPatchTool;
 use bash::BashTool;
 pub(crate) use bash::{BashTool as OwnedBashTool, CommandEnvironment};
 use edit::EditTool;
+pub(crate) use edit::EditTool as NativeEditTool;
 use read::ReadTool;
 use write::WriteTool;
+pub(crate) use write::WriteTool as NativeWriteTool;
 
 pub(crate) const MAX_READ_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_WRITE_BYTES: usize = 512 * 1024;
@@ -113,10 +124,15 @@ fn build_tools_with(
         };
         match name.as_str() {
             "apply_patch" => {
-                register(
-                    &mut builder,
-                    Arc::new(ApplyPatchTool::new(Arc::clone(&workspace))),
-                );
+                let tool = Arc::new(ApplyPatchTool::new(Arc::clone(&workspace)));
+                if let Some(presentation) = presentation {
+                    builder.register_arc(PresentationTool::new_apply_patch(
+                        tool,
+                        Arc::clone(presentation),
+                    ));
+                } else {
+                    builder.register_arc(tool);
+                }
             }
             "bash" => {
                 let tool = Arc::new(BashTool::with_binding(
@@ -126,8 +142,8 @@ fn build_tools_with(
                 ));
                 match presentation {
                     Some(presentation) => {
-                        // Only Bash receives the captured identity, so only it
-                        // needs the special wrapper variant.
+                        // Bash and native file tools receive captured identity
+                        // through explicit wrapper variants.
                         builder.register_arc(PresentationTool::new_bash(
                             Arc::clone(&tool),
                             Arc::clone(presentation),
@@ -139,10 +155,13 @@ fn build_tools_with(
                 }
             }
             "edit" => {
-                register(
-                    &mut builder,
-                    Arc::new(EditTool::new(Arc::clone(&workspace))),
-                );
+                let tool = Arc::new(EditTool::new(Arc::clone(&workspace)));
+                if let Some(presentation) = presentation {
+                    builder
+                        .register_arc(PresentationTool::new_edit(tool, Arc::clone(presentation)));
+                } else {
+                    builder.register_arc(tool);
+                }
             }
             "read" => {
                 register(
@@ -151,10 +170,13 @@ fn build_tools_with(
                 );
             }
             "write" => {
-                register(
-                    &mut builder,
-                    Arc::new(WriteTool::new(Arc::clone(&workspace))),
-                );
+                let tool = Arc::new(WriteTool::new(Arc::clone(&workspace)));
+                if let Some(presentation) = presentation {
+                    builder
+                        .register_arc(PresentationTool::new_write(tool, Arc::clone(presentation)));
+                } else {
+                    builder.register_arc(tool);
+                }
             }
             "subagent" => {
                 let Some(subagent) = subagent else {
@@ -234,6 +256,130 @@ pub(super) fn map_workspace_error(error: WorkspaceError) -> ToolError {
         | WorkspaceError::UnknownOutcome
         | WorkspaceError::Binary => ToolError::Failed,
     }
+}
+
+pub(crate) enum FileBefore {
+    Missing,
+    Content {
+        bytes: Vec<u8>,
+        stamp: FileStamp,
+        stable: bool,
+    },
+    Metadata(FileStamp),
+    Unknown,
+}
+
+pub(crate) fn file_before_from_capture(capture: FileCapture) -> FileBefore {
+    match capture {
+        FileCapture::Missing => FileBefore::Missing,
+        FileCapture::Complete(snapshot) => FileBefore::Content {
+            bytes: snapshot.bytes,
+            stamp: snapshot.stamp,
+            stable: snapshot.stable,
+        },
+        FileCapture::TooLarge(stamp) => FileBefore::Metadata(stamp),
+        FileCapture::Error(_) => FileBefore::Unknown,
+    }
+}
+
+pub(crate) fn expected_file_state(before: &FileBefore) -> Option<ExpectedFileState> {
+    match before {
+        FileBefore::Missing => Some(ExpectedFileState::Missing),
+        FileBefore::Content { stamp, .. } | FileBefore::Metadata(stamp) => {
+            Some(ExpectedFileState::Present(*stamp))
+        }
+        FileBefore::Unknown => None,
+    }
+}
+
+pub(crate) fn record_file_change(
+    tool_data: Option<&ToolData>,
+    tool_ref: Option<&ToolRef>,
+    path: &str,
+    before: FileBefore,
+    after_bytes: &[u8],
+    observation: &AtomicWriteObservation,
+) {
+    let (Some(tool_data), Some(tool_ref)) = (tool_data, tool_ref) else {
+        return;
+    };
+    let (before, before_captured, before_bytes, stable, before_unknown) = match before {
+        FileBefore::Missing => (ChangeRevision::Missing, true, None, true, false),
+        FileBefore::Content {
+            bytes,
+            stamp: _,
+            stable,
+        } => (content_revision(&bytes), true, Some(bytes), stable, false),
+        FileBefore::Metadata(stamp) => (
+            metadata_revision(stamp.len(), stamp.modified_unix_ms()),
+            false,
+            None,
+            true,
+            false,
+        ),
+        FileBefore::Unknown => (ChangeRevision::Unknown, false, None, false, true),
+    };
+    let renamed = observation.renamed;
+    let after = if renamed {
+        content_revision(after_bytes)
+    } else {
+        ChangeRevision::Unknown
+    };
+    let after_missing = matches!(observation.after, FileState::Missing);
+    let unknown_facts = before_unknown
+        || observation.expected_unknown
+        || matches!(observation.before, FileState::Unknown)
+        || (renamed && matches!(observation.after, FileState::Unknown));
+    let conflict = !unknown_facts
+        && ((!stable && !before_unknown)
+            || observation.expected_matches == Some(false)
+            || (renamed && after_missing));
+    let commit_state = match &observation.outcome {
+        Err(WorkspaceError::UnknownOutcome) => ChangeCommitState::Unknown,
+        Err(_) if !renamed && observation.expected_matches == Some(false) => {
+            ChangeCommitState::Conflict
+        }
+        Err(_) if !renamed => ChangeCommitState::NotCommitted,
+        Err(_) => ChangeCommitState::Unknown,
+        Ok(()) if unknown_facts => ChangeCommitState::Unknown,
+        Ok(()) if conflict => ChangeCommitState::Conflict,
+        Ok(()) => ChangeCommitState::Applied,
+    };
+    let coverage = if !renamed {
+        ChangeCoverage::Unavailable
+    } else if unknown_facts
+        || !before_captured
+        || !stable
+        || conflict
+        || commit_state != ChangeCommitState::Applied
+    {
+        if matches!(&before, ChangeRevision::Unknown) {
+            ChangeCoverage::Unavailable
+        } else {
+            ChangeCoverage::Partial
+        }
+    } else {
+        ChangeCoverage::Complete
+    };
+    let change = FileChange {
+        path: path.to_owned(),
+        kind: match &before {
+            ChangeRevision::Missing => ChangeKind::Added,
+            ChangeRevision::Unknown => ChangeKind::Unknown,
+            _ => ChangeKind::Modified,
+        },
+        before,
+        after,
+        commit_state,
+        coverage,
+        before_captured,
+        after_captured: renamed,
+        before_bytes,
+        after_bytes: renamed.then(|| after_bytes.to_vec()),
+        before_corrupt: false,
+        after_corrupt: false,
+    };
+    tool_data.note_file_change(tool_ref, change);
 }
 
 #[cfg(test)]
@@ -374,6 +520,41 @@ mod tests {
             );
         }
         let _ = tokio::fs::remove_dir_all(base).await;
+    }
+
+    #[test]
+    fn unknown_before_facts_are_not_reported_as_a_modified_file() {
+        let data = ToolData::new();
+        let tool_ref = ToolRef {
+            session_id: "ses_00000000000000000000000000000001".parse().unwrap(),
+            loop_id: "lup_00000000000000000000000000000001".parse().unwrap(),
+            request_index: 0,
+            tool_call_id: "unknown-before".parse().unwrap(),
+        };
+        data.note_requested(&tool_ref, "write");
+        record_file_change(
+            Some(&data),
+            Some(&tool_ref),
+            "value.txt",
+            FileBefore::Unknown,
+            b"after",
+            &AtomicWriteObservation {
+                outcome: Ok(()),
+                before: FileState::Unknown,
+                after: FileState::Unknown,
+                renamed: true,
+                expected_matches: None,
+                expected_unknown: false,
+            },
+        );
+        let record = data
+            .file_change_records(tool_ref.session_id, Some(tool_ref.loop_id))
+            .pop()
+            .unwrap();
+        assert_eq!(record.kind, ChangeKind::Unknown);
+        assert_eq!(record.commit_state, ChangeCommitState::Unknown);
+        assert_eq!(record.coverage, ChangeCoverage::Unavailable);
+        assert!(!record.details_available);
     }
 
     #[test]

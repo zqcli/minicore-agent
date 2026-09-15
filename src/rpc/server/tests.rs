@@ -28,6 +28,7 @@ use minicore_runtime::model::{
 };
 
 use crate::agent::Agent;
+use crate::changes::{ChangeListGate, gate_next_change_list};
 use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
@@ -640,6 +641,7 @@ async fn capability_discovery_returns_ordered_lists() {
             "workspace.files",
             "workspace.search",
             "workspace.status",
+            "changes.list",
             "deferred.waiter_limit"
         ])
     );
@@ -6086,6 +6088,328 @@ async fn workspace_status_answers_for_the_session_workspace() {
     assert_eq!(bad["error"]["code"], json!(-32602));
 
     harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn changes_list_separates_workspace_session_and_turn_scopes() {
+    let (agent, base, workspace) = test_agent(
+        "changes-list-scopes",
+        [ModelScript::ToolCalls(vec![ToolCallScript {
+            name: "write",
+            arguments: json!({"path": "value.txt", "content": "agent\n"}),
+        }])],
+        &["write"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    std::fs::write(workspace.join("value.txt"), b"user\n").unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session, "text": "update file"})),
+        )
+        .await;
+    let sent = harness.response(json!("send")).await;
+    let turn = sent["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+
+    harness
+        .send(
+            json!("session"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    let session_changes = harness.response(json!("session")).await;
+    let session_records = session_changes["result"]["records"].as_array().unwrap();
+    assert_eq!(session_records.len(), 1);
+    assert_eq!(session_records[0]["origin"], json!("tool"));
+    assert_eq!(session_records[0]["path"], json!("value.txt"));
+    assert_eq!(session_records[0]["before"]["kind"], json!("content"));
+    assert_eq!(session_records[0]["after"]["kind"], json!("content"));
+    assert_eq!(session_records[0]["commit_state"], json!("applied"));
+    assert_eq!(session_records[0]["coverage"], json!("complete"));
+    assert_eq!(session_records[0]["details_available"], json!(true));
+    assert_eq!(session_records[0]["tool_ref"]["session_id"], json!(session));
+
+    harness
+        .send(
+            json!("turn"),
+            "changes.list",
+            Some(json!({
+                "session_id": session,
+                "scope": {"turn": {"loop_id": turn["loop_id"]}}
+            })),
+        )
+        .await;
+    let turn_changes = harness.response(json!("turn")).await;
+    assert_eq!(
+        turn_changes["result"]["records"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        turn_changes["result"]["scope"],
+        json!({"turn": {"loop_id": turn["loop_id"]}})
+    );
+
+    harness
+        .send(
+            json!("workspace"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "workspace"})),
+        )
+        .await;
+    let workspace_changes = harness.response(json!("workspace")).await;
+    assert_eq!(
+        workspace_changes["result"]["records"],
+        json!([]),
+        "the fixture is deliberately outside Git; no tool record may leak into workspace scope"
+    );
+    assert_eq!(workspace_changes["result"]["scope"], json!("workspace"));
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    std::fs::remove_dir_all(&workspace).unwrap();
+    harness
+        .send(
+            json!("cold"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    let cold = harness.response(json!("cold")).await;
+    assert_eq!(cold["result"]["consistency"], json!("cold"));
+    assert_eq!(
+        cold["result"]["records"],
+        session_changes["result"]["records"]
+    );
+    assert!(!workspace.exists());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
+    let (agent, base, workspace) =
+        test_agent("changes-list-capacity", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
+
+    let mut gates = Vec::new();
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let gate = Arc::new(ChangeListGate::new());
+        gate_next_change_list(session_val, Arc::clone(&gate));
+        gates.push(gate);
+        harness
+            .send(
+                json!(format!("cl-{index}")),
+                "changes.list",
+                Some(json!({"session_id": session, "scope": "session"})),
+            )
+            .await;
+    }
+    for gate in &gates {
+        tokio::time::timeout(TIMEOUT, gate.wait_started())
+            .await
+            .expect("changes.list query did not start");
+    }
+
+    // The query pool is now full, so a real (valid) changes.list request is
+    // rejected by capacity rather than by request validation.
+    harness
+        .send(
+            json!("cl-overflow"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    let overflow = harness.response(json!("cl-overflow")).await;
+    assert_eq!(overflow["error"]["code"], json!(-32019));
+    assert_eq!(
+        overflow["error"]["data"]["kind"],
+        json!("resource_exhausted")
+    );
+
+    // Control methods are not deferred and stay responsive while the pool holds
+    // every slot.
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    // Closing the owning Session cancels the started queries and joins them.
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let response = harness.response(json!(format!("cl-{index}"))).await;
+        assert_eq!(response["error"]["code"], json!(-32020));
+    }
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+/// The shared 32-slot deferred ceiling is filled by a real pending model turn
+/// (`turn.wait` waiters) plus held `changes.list` query slots. With fewer than
+/// four query slots held, the 33rd request is refused as `resource_exhausted`;
+/// releasing the turn frees the slots again.
+#[tokio::test]
+async fn changes_list_queries_share_the_total_waiter_ceiling() {
+    let probe = ConcurrencyProbe::new();
+    let (agent, base, workspace) = test_agent(
+        "changes-list-shared-ceiling",
+        [ModelScript::Gate(Arc::clone(&probe))],
+        &[],
+        ApprovalMode::Auto,
+    )
+    .await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session, "text": "gated turn"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    tokio::time::timeout(TIMEOUT, async {
+        while probe.started.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gated model request did not start");
+
+    // One held changes.list query + one parked turn.wait per remaining slot.
+    let held_gate = Arc::new(ChangeListGate::new());
+    gate_next_change_list(session_val, Arc::clone(&held_gate));
+    harness
+        .send(
+            json!("cl-held"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    tokio::time::timeout(TIMEOUT, held_gate.wait_started())
+        .await
+        .expect("held changes.list did not start");
+
+    let waiters = MAX_DEFERRED_WAITERS - 1;
+    for index in 0..waiters {
+        harness
+            .send(
+                json!(format!("wait-{index}")),
+                "turn.wait",
+                Some(turn_params(&turn)),
+            )
+            .await;
+    }
+
+    // The shared ceiling is full; the next request is refused even though fewer
+    // than MAX_DEFERRED_QUERIES query slots are held.
+    harness
+        .send(json!("over"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let over = harness.response(json!("over")).await;
+    assert_eq!(over["error"]["code"], json!(-32019));
+    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
+
+    // Control methods stay responsive while both ceilings are pressed.
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    // Releasing the gated turn drains the parked waiters and frees the slots.
+    probe.release.cancel();
+    for index in 0..waiters {
+        let waited = harness.response(json!(format!("wait-{index}"))).await;
+        assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
+    }
+
+    // Closing the Session cancels the still-held changes.list query.
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    let held = harness.response(json!("cl-held")).await;
+    assert_eq!(held["error"]["code"], json!(-32020));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
+    let (agent, base, workspace) =
+        test_agent("changes-list-shutdown", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
+
+    let gate = Arc::new(ChangeListGate::new());
+    gate_next_change_list(session_val, Arc::clone(&gate));
+    harness
+        .send(
+            json!("cl-pending"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .expect("changes.list query did not start");
+
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    let start = std::time::Instant::now();
+    harness.shutdown().await;
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+
     remove_base(&base).await;
 }
 
