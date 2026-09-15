@@ -200,8 +200,10 @@ also passed parent review and remote verification; see
 TUI `/compact` is outside this backend scope; subsequent work proceeds to P4
 Workspace, whose first read-only `workspace.read` slice has also passed parent
 review and remote verification, together with `workspace.files` and
-`workspace.search` and `workspace.status`. P4 is verified; P5 Bash
-streaming/control and P6 change review remain separate work. The
+`workspace.search` and `workspace.status`. P4 and P5a are verified: Bash now
+has owned process-group/job cleanup, live stdout/stderr events, structured exit
+facts, and bounded in-memory base64 output pages with raw byte offsets.
+P5b durable output retention, P6 change review and P7 integration remain pending. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

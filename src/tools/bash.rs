@@ -1,11 +1,5 @@
 use std::ffi::OsString;
-use std::io;
-use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-#[cfg(windows)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(all(test, unix))]
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use minicore_runtime::tools::{
@@ -15,12 +9,20 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::MAX_TEXT_BYTES;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
+use crate::tool_data::{CommandStatus, ToolRef};
 use crate::{Workspace, WorkspaceError};
 
+use super::command::{Capture, CommandBinding, CommandOutcome, CommandOwners, CommandRequest};
 use super::{DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT, precheck_control};
+
+/// Bounded model-facing prefix of one stream, kept separately from the
+/// streaming window in `tool_data`.
+struct StreamCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
 
 const TOOL_NAME: &str = "bash";
 const STREAM_CAPTURE_LIMIT: usize = MAX_COMMAND_OUTPUT / 2;
@@ -30,17 +32,6 @@ const FORMATTED_OUTPUT_LIMIT: usize = if MAX_COMMAND_OUTPUT < MAX_TEXT_BYTES {
 } else {
     MAX_TEXT_BYTES
 };
-
-#[cfg(windows)]
-static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
-
-type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
-
-struct SpawnedCommand {
-    child: Child,
-    stdout: OutputReader,
-    stderr: OutputReader,
-}
 
 #[derive(Clone)]
 pub(crate) struct CommandEnvironment {
@@ -69,7 +60,7 @@ impl CommandEnvironment {
         &self.removed
     }
 
-    fn apply(&self, command: &mut Command) {
+    pub(crate) fn apply(&self, command: &mut Command) {
         for name in self.removed.iter() {
             command.env_remove(name);
         }
@@ -77,9 +68,16 @@ impl CommandEnvironment {
     }
 }
 
-pub(super) struct BashTool {
+pub(crate) struct BashTool {
     workspace: Arc<Workspace>,
     environment: CommandEnvironment,
+    /// Owner boundary for every command this tool starts. A tool built without
+    /// a presentation still owns its commands instead of relying on the
+    /// Runtime dropping a future.
+    owners: Arc<CommandOwners>,
+    /// Narrow presentation binding: complete identity of the current call and
+    /// the sink its streams go to. `None` for a standalone tool.
+    binding: Option<CommandBinding>,
     spec: ToolSpec,
 }
 
@@ -94,7 +92,19 @@ struct BashInput {
 }
 
 impl BashTool {
+    #[cfg(test)]
     pub(super) fn new(workspace: Arc<Workspace>, environment: CommandEnvironment) -> Self {
+        Self::with_binding(workspace, environment, None)
+    }
+
+    pub(crate) fn with_binding(
+        workspace: Arc<Workspace>,
+        environment: CommandEnvironment,
+        binding: Option<CommandBinding>,
+    ) -> Self {
+        let owners = binding
+            .as_ref()
+            .map_or_else(CommandOwners::new, |binding| Arc::clone(binding.owners()));
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("bash is a valid tool name"),
             "Run one bounded shell command in a workspace directory.",
@@ -127,8 +137,22 @@ impl BashTool {
         Self {
             workspace,
             environment,
+            owners,
+            binding,
             spec,
         }
+    }
+
+    /// Waits for every command this tool owns. A standalone tool has no
+    /// Session-level join, so its tests use this.
+    #[cfg(all(test, unix))]
+    pub(super) async fn join_owned_commands(&self) {
+        self.owners.join_all().await;
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn active_owned_commands(&self) -> usize {
+        self.owners.active()
     }
 }
 
@@ -138,6 +162,23 @@ impl Tool for BashTool {
     }
 
     fn execute(&self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'_> {
+        // A standalone Bash tool has no captured identity; it still owns its
+        // commands and can be joined explicitly.
+        self.execute_bound(invocation, context, None)
+    }
+}
+
+impl BashTool {
+    /// Executes one Bash call whose complete `ToolRef` was captured at the real
+    /// `Tool::execute` boundary of its wrapper. The identity is passed in
+    /// explicitly and is never recovered from a live table, so a new loop that
+    /// reuses a call id can never inherit a stale one.
+    pub(crate) fn execute_bound(
+        &self,
+        invocation: ToolInvocation,
+        context: ToolContext,
+        tool_ref: Option<ToolRef>,
+    ) -> ToolFuture<'_> {
         Box::pin(async move {
             precheck_control(&context)?;
             if invocation.tool_name() != self.spec.name() {
@@ -156,19 +197,75 @@ impl Tool for BashTool {
                 .ok_or(ToolError::InvalidInvocation)?;
             let deadline = context.deadline.min(input_deadline);
             let cwd = resolve_cwd(&self.workspace, &input.cwd, &context, deadline).await?;
-            let output = run_command(
-                &input.command,
-                &cwd,
-                &invocation,
-                &context,
+            let capture = command_capture(&invocation).await?;
+            let request = CommandRequest {
+                tool_ref,
+                command: input.command,
+                cwd,
                 deadline,
-                &self.environment,
-            )
-            .await?;
-            let output = ToolOutput::new(output).map_err(|_| ToolError::Internal)?;
-            Ok(ToolExecutionOutcome::Completed(output))
+                cancellation: context.cancellation.clone(),
+                environment: self.environment.clone(),
+                prefix_limit: STREAM_CAPTURE_LIMIT,
+                streams: self.binding.as_ref().map(|binding| binding.sink()),
+                capture,
+            };
+            // The owner keeps the child even if this future is dropped; the
+            // Runtime result is taken from the owner's terminal facts only.
+            let mut worker = self
+                .owners
+                .start(request)
+                .map_err(|_| ToolError::Internal)?;
+            super::emit_phase(&context, "running");
+            let outcome = worker.completion().await;
+            outcome_to_result(&outcome)
         })
     }
+}
+
+#[cfg(unix)]
+async fn command_capture(_invocation: &ToolInvocation) -> Result<Capture, ToolError> {
+    Ok(Capture::Inherited)
+}
+
+/// Windows keeps its named-pipe capture: the owner reads a pipe it created
+/// rather than the child's inherited handle.
+#[cfg(windows)]
+async fn command_capture(invocation: &ToolInvocation) -> Result<Capture, ToolError> {
+    super::command::NamedPipeCapture::new(invocation.tool_call_id())
+        .await
+        .map(Capture::NamedPipes)
+        .map_err(|_| ToolError::Failed)
+}
+
+/// Maps the owner's terminal facts to the Runtime result. A non-zero exit is a
+/// completed outcome, never an error, and a requested stop is only reported
+/// after the owner really joined the process. The process record is the single
+/// source of truth here: a command that really exited is reported as completed
+/// even when a cancellation happened to arrive while the pipes were closing.
+fn outcome_to_result(outcome: &CommandOutcome) -> Result<ToolExecutionOutcome, ToolError> {
+    match outcome.result.status {
+        CommandStatus::SpawnFailed => return Err(ToolError::Failed),
+        CommandStatus::Failed => return Err(ToolError::Internal),
+        CommandStatus::Cancelled => return Err(ToolError::Cancelled),
+        CommandStatus::TimedOut => return Err(ToolError::TimedOut),
+        CommandStatus::Running | CommandStatus::Cancelling => return Err(ToolError::Internal),
+        CommandStatus::Exited => {}
+    }
+    // A completed result whose output was cut short (a stopped descendant, a
+    // bounded drain, or an evicted window) is still marked truncated for the
+    // model: otherwise the tool text would look like a clean, complete output.
+    let incomplete = !outcome.result.output_complete;
+    let stdout = StreamCapture {
+        bytes: outcome.stdout.clone(),
+        truncated: outcome.stdout_truncated || incomplete,
+    };
+    let stderr = StreamCapture {
+        bytes: outcome.stderr.clone(),
+        truncated: outcome.stderr_truncated || incomplete,
+    };
+    let output = format_output(outcome.result.exit_code, &stdout, &stderr);
+    let output = ToolOutput::new(output).map_err(|_| ToolError::Internal)?;
+    Ok(ToolExecutionOutcome::Completed(output))
 }
 
 async fn resolve_cwd(
@@ -189,299 +286,8 @@ async fn resolve_cwd(
     }
 }
 
-async fn run_command(
-    command: &str,
-    cwd: &std::path::Path,
-    invocation: &ToolInvocation,
-    context: &ToolContext,
-    deadline: Instant,
-    environment: &CommandEnvironment,
-) -> Result<String, ToolError> {
-    if context.cancellation.is_cancelled() {
-        return Err(ToolError::Cancelled);
-    }
-    if Instant::now() >= deadline {
-        return Err(ToolError::TimedOut);
-    }
-
-    let spawned = spawn_with_output_capture(command, cwd, invocation, environment).await?;
-    super::emit_phase(context, "running");
-    let mut child = spawned.child;
-    let stdout = spawned.stdout;
-    let stderr = spawned.stderr;
-    let collectors = async { tokio::try_join!(capture_stream(stdout), capture_stream(stderr)) };
-    tokio::pin!(collectors);
-    let mut status = None;
-    let mut captures = None;
-
-    loop {
-        if status.is_some() && captures.is_some() {
-            break;
-        }
-        let event = tokio::select! {
-            biased;
-            _ = context.cancellation.cancelled() => ProcessEvent::Cancelled,
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                ProcessEvent::TimedOut
-            }
-            result = child.wait(), if status.is_none() => ProcessEvent::Exited(result),
-            result = &mut collectors, if captures.is_none() => ProcessEvent::Output(result),
-        };
-        match event {
-            ProcessEvent::Cancelled => {
-                terminate_and_reap(&mut child).await?;
-                return Err(ToolError::Cancelled);
-            }
-            ProcessEvent::TimedOut => {
-                terminate_and_reap(&mut child).await?;
-                return Err(ToolError::TimedOut);
-            }
-            ProcessEvent::Exited(Ok(exit_status)) => status = Some(exit_status),
-            ProcessEvent::Output(Ok(output)) => captures = Some(output),
-            ProcessEvent::Exited(Err(_)) | ProcessEvent::Output(Err(_)) => {
-                terminate_and_reap(&mut child).await?;
-                return Err(ToolError::Internal);
-            }
-        }
-    }
-
-    let (stdout, stderr) = captures.expect("output capture is complete");
-    Ok(format_output(
-        status.expect("process status is complete"),
-        &stdout,
-        &stderr,
-    ))
-}
-
-#[cfg(unix)]
-async fn spawn_with_output_capture(
-    command: &str,
-    cwd: &std::path::Path,
-    _invocation: &ToolInvocation,
-    environment: &CommandEnvironment,
-) -> Result<SpawnedCommand, ToolError> {
-    let mut process = shell_command(command);
-    environment.apply(&mut process);
-    process
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = process.spawn().map_err(|_| ToolError::Failed)?;
-    drop(process);
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(&mut child).await?;
-            return Err(ToolError::Internal);
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate_and_reap(&mut child).await?;
-            return Err(ToolError::Internal);
-        }
-    };
-    Ok(SpawnedCommand {
-        child,
-        stdout: Box::new(stdout),
-        stderr: Box::new(stderr),
-    })
-}
-
-#[cfg(windows)]
-async fn spawn_with_output_capture(
-    command: &str,
-    cwd: &std::path::Path,
-    invocation: &ToolInvocation,
-    environment: &CommandEnvironment,
-) -> Result<SpawnedCommand, ToolError> {
-    let (stdout_server, stdout_client) =
-        create_capture_pipe(invocation, "stdout").map_err(|_| ToolError::Failed)?;
-    let (stderr_server, stderr_client) =
-        create_capture_pipe(invocation, "stderr").map_err(|_| ToolError::Failed)?;
-    tokio::try_join!(stdout_server.connect(), stderr_server.connect())
-        .map_err(|_| ToolError::Failed)?;
-
-    let mut process = shell_command(command);
-    environment.apply(&mut process);
-    process
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_client))
-        .stderr(Stdio::from(stderr_client))
-        .kill_on_drop(true);
-    let child = process.spawn().map_err(|_| ToolError::Failed)?;
-    drop(process);
-    Ok(SpawnedCommand {
-        child,
-        stdout: Box::new(stdout_server),
-        stderr: Box::new(stderr_server),
-    })
-}
-
-#[cfg(windows)]
-fn create_capture_pipe(
-    invocation: &ToolInvocation,
-    stream: &str,
-) -> io::Result<(
-    tokio::net::windows::named_pipe::NamedPipeServer,
-    std::fs::File,
-)> {
-    use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-
-    let pipe_id = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
-    let tool_call_id = safe_pipe_component(invocation.tool_call_id().as_str());
-    let pipe_name = format!(
-        r"\\.\pipe\minicore-agent-{}-{}-{pipe_id}-{stream}",
-        std::process::id(),
-        tool_call_id,
-    );
-    let server = ServerOptions::new()
-        .pipe_mode(PipeMode::Byte)
-        .access_outbound(false)
-        .first_pipe_instance(true)
-        .create(&pipe_name)?;
-    let client = std::fs::OpenOptions::new().write(true).open(&pipe_name)?;
-    Ok((server, client))
-}
-
-#[cfg(windows)]
-fn safe_pipe_component(value: &str) -> String {
-    value
-        .bytes()
-        .take(48)
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-                char::from(byte)
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-#[cfg(unix)]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("/bin/sh");
-    process.arg("-lc").arg(command);
-    process
-}
-
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new("powershell.exe");
-    process
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(command);
-    process
-}
-
-enum ProcessEvent {
-    Cancelled,
-    TimedOut,
-    Exited(io::Result<ExitStatus>),
-    Output(io::Result<(StreamCapture, StreamCapture)>),
-}
-
-struct StreamCapture {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-async fn capture_stream<R>(mut reader: R) -> io::Result<StreamCapture>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut bytes = Vec::with_capacity(STREAM_CAPTURE_LIMIT.min(8 * 1024));
-    let mut truncated = false;
-    let mut buffer = [0u8; 8 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        let remaining = STREAM_CAPTURE_LIMIT.saturating_sub(bytes.len());
-        let retained = remaining.min(read);
-        bytes.extend_from_slice(&buffer[..retained]);
-        truncated |= retained < read;
-    }
-    Ok(StreamCapture { bytes, truncated })
-}
-
-async fn terminate_and_reap(child: &mut Child) -> Result<(), ToolError> {
-    if child.try_wait().map_err(|_| ToolError::Internal)?.is_some() {
-        return Ok(());
-    }
-    start_kill(child).map_err(|_| ToolError::Internal)?;
-    wait_after_kill(child)
-        .await
-        .map_err(|_| ToolError::Internal)?;
-    Ok(())
-}
-
-fn start_kill(child: &mut Child) -> io::Result<()> {
-    #[cfg(all(test, unix))]
-    if take_termination_failure(child, TerminationFailure::StartKill) {
-        return Err(io::Error::other("injected start_kill failure"));
-    }
-    child.start_kill()
-}
-
-async fn wait_after_kill(child: &mut Child) -> io::Result<ExitStatus> {
-    #[cfg(all(test, unix))]
-    if take_termination_failure(child, TerminationFailure::Wait) {
-        return Err(io::Error::other("injected wait failure"));
-    }
-    child.wait().await
-}
-
-#[cfg(all(test, unix))]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum TerminationFailure {
-    StartKill,
-    Wait,
-}
-
-#[cfg(all(test, unix))]
-static TERMINATION_FAILURES: OnceLock<Mutex<Vec<(u32, TerminationFailure)>>> = OnceLock::new();
-
-#[cfg(all(test, unix))]
-fn inject_termination_failure(pid: u32, failure: TerminationFailure) {
-    TERMINATION_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((pid, failure));
-}
-
-#[cfg(all(test, unix))]
-fn take_termination_failure(child: &Child, failure: TerminationFailure) -> bool {
-    let Some(pid) = child.id() else {
-        return false;
-    };
-    let mut failures = TERMINATION_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    let Some(position) = failures
-        .iter()
-        .position(|candidate| *candidate == (pid, failure))
-    else {
-        return false;
-    };
-    failures.remove(position);
-    true
-}
-
-fn format_output(status: ExitStatus, stdout: &StreamCapture, stderr: &StreamCapture) -> String {
-    let exit_code = status
-        .code()
-        .map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
+fn format_output(exit_code: Option<i32>, stdout: &StreamCapture, stderr: &StreamCapture) -> String {
+    let exit_code = exit_code.map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
     let prefix = format!("exit_code: {exit_code}\nstdout:\n");
     let stderr_label = "stderr:\n";
     let fixed = prefix
@@ -583,6 +389,8 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use minicore_runtime::ToolCallId;
@@ -590,14 +398,89 @@ mod tests {
         Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolInvocation, ToolProgressSink,
     };
     use serde_json::{Value, json};
+    use tokio::process::Command;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::tools::command::TerminationFailure;
 
     const TEST_MODEL_KEY: &str = "MINICORE_TEST_MODEL_KEY";
     const TEST_MODEL_SECRET: &str = "MINICORE-TEST-MODEL-SECRET";
     const TEST_PUBLIC_KEY: &str = "MINICORE_TEST_PUBLIC";
     const TEST_PUBLIC_VALUE: &str = "minicore-test-public-value";
+
+    /// Records the identity and bytes an owned command published, so a test can
+    /// assert which `ToolRef` a bound tool used without a Session.
+    #[cfg(unix)]
+    struct IdentitySink {
+        data: Arc<crate::tool_data::ToolData>,
+        owned: Mutex<Vec<crate::tool_data::ToolRef>>,
+    }
+
+    #[cfg(unix)]
+    impl IdentitySink {
+        fn new(data: Arc<crate::tool_data::ToolData>) -> Arc<Self> {
+            Arc::new(Self {
+                data,
+                owned: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn first_owned(&self) -> Option<crate::tool_data::ToolRef> {
+            self.owned.lock().unwrap().first().cloned()
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::tools::command::CommandStreamSink for IdentitySink {
+        fn push_chunk(
+            &self,
+            tool_ref: &crate::tool_data::ToolRef,
+            stream: crate::tool_data::ToolDataStream,
+            chunk: &[u8],
+        ) -> Option<crate::tool_data::ToolStreamNotice> {
+            self.owned.lock().unwrap().push(tool_ref.clone());
+            self.data.note_stream_chunk(tool_ref, stream, chunk)
+        }
+
+        fn note_command(
+            &self,
+            tool_ref: &crate::tool_data::ToolRef,
+            result: &crate::tool_data::CommandResult,
+        ) {
+            self.owned.lock().unwrap().push(tool_ref.clone());
+            let _ = self.data.note_command(tool_ref, result.clone());
+        }
+
+        fn mark_cancelling(&self, tool_ref: &crate::tool_data::ToolRef) {
+            self.data.mark_cancelling(tool_ref);
+        }
+
+        fn stream_range(
+            &self,
+            tool_ref: &crate::tool_data::ToolRef,
+            stream: crate::tool_data::ToolDataStream,
+        ) -> Option<(u64, u64)> {
+            self.data.stream_range(tool_ref, stream)
+        }
+
+        fn note_stream_end(
+            &self,
+            tool_ref: &crate::tool_data::ToolRef,
+            stream: crate::tool_data::ToolDataStream,
+        ) {
+            self.data.note_stream_end(tool_ref, stream);
+        }
+
+        fn note_stream_cut(
+            &self,
+            tool_ref: &crate::tool_data::ToolRef,
+            stream: crate::tool_data::ToolDataStream,
+        ) {
+            self.data.note_stream_cut(tool_ref, stream);
+        }
+    }
 
     fn empty_command_environment() -> CommandEnvironment {
         CommandEnvironment::new(std::iter::empty::<OsString>())
@@ -959,26 +842,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn aborting_the_execute_future_triggers_kill_on_drop() {
+    async fn a_dropped_execute_future_still_joins_its_owned_command() {
         let (base, _, tool) = fixture("abort-kill").await;
+        let tool = Arc::new(tool);
         let pid_file = base.join("root/child.pid");
+        let runner = Arc::clone(&tool);
         let task = tokio::spawn(async move {
-            tool.execute(
-                invocation(json!({
-                    "command": "echo $$ > child.pid; exec sleep 30",
-                    "timeout_seconds": 30
-                })),
-                context(
-                    CancellationToken::new(),
-                    Instant::now() + Duration::from_secs(30),
-                ),
-            )
-            .await
+            runner
+                .execute(
+                    invocation(json!({
+                        "command": "echo $$ > child.pid; exec sleep 30",
+                        "timeout_seconds": 30
+                    })),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(30),
+                    ),
+                )
+                .await
         });
         let pid = read_pid(&pid_file).await;
+        assert!(process_exists(pid));
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        wait_for_process_exit(pid).await;
+        // The dropped future only requested cancellation; the owner still has
+        // to stop and reap the process, and this join is the barrier.
+        tool.join_owned_commands().await;
+        assert_eq!(tool.active_owned_commands(), 0);
+        assert!(!process_exists(pid), "owned command outlived its join");
         cleanup(&base).await;
     }
 
@@ -1025,12 +916,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn exited_child_with_inherited_pipes_obeys_input_and_context_deadlines() {
-        assert_grandchild_held_pipe_timeout(
-            "held-pipe-input",
+        // The command itself finishes immediately; only a descendant keeps the
+        // pipe open. Stopping the drain at its bounded grace is a normal end
+        // with incomplete output, not a fabricated timeout: the command's own
+        // deadline was never reached.
+        assert_grandchild_held_pipe_drain_is_bounded(
+            "held-pipe-drain",
             1,
             Instant::now() + Duration::from_secs(5),
         )
         .await;
+        // The context deadline really is reached while the drain is bounded, so
+        // this one is a timeout.
         assert_grandchild_held_pipe_timeout(
             "held-pipe-context",
             30,
@@ -1069,7 +966,9 @@ mod tests {
             Err(ToolError::TimedOut)
         );
         assert!(started.elapsed() < Duration::from_secs(15));
-        assert!(process_exists(pid));
+        // The job object is the controlled scope: its grandchild is stopped
+        // with the leader instead of holding the capture open.
+        wait_for_process_exit(pid).await;
         assert_windows_follow_up(&follow_up).await;
         guard.terminate().await;
         cleanup(&base).await;
@@ -1103,7 +1002,7 @@ mod tests {
                 .unwrap(),
             Err(ToolError::Cancelled)
         );
-        assert!(process_exists(pid));
+        wait_for_process_exit(pid).await;
         assert_windows_follow_up(&follow_up).await;
         guard.terminate().await;
         cleanup(&base).await;
@@ -1154,15 +1053,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn start_kill_failure_is_internal_without_waiting_for_natural_exit() {
-        assert_termination_failure_is_internal("start-kill-failure", TerminationFailure::StartKill)
+    async fn an_injected_stop_failure_still_stops_without_claiming_success() {
+        assert_termination_failure_is_honest("start-kill-failure", TerminationFailure::StartKill)
             .await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn wait_failure_is_internal_and_child_drop_finishes_cleanup() {
-        assert_termination_failure_is_internal("wait-failure", TerminationFailure::Wait).await;
+    async fn an_injected_reap_failure_still_stops_without_claiming_success() {
+        assert_termination_failure_is_honest("wait-failure", TerminationFailure::Wait).await;
     }
 
     #[cfg(unix)]
@@ -1174,6 +1073,83 @@ mod tests {
             .unwrap();
         assert!(output.starts_with("exit_code: unavailable\nstdout:\n"));
         assert!(output.contains("\nstderr:\n"));
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unicode_and_binary_bytes_are_reported_exactly() {
+        let (base, _, tool) = fixture("raw-bytes").await;
+        // A multi-byte character split across two writes plus invalid UTF-8
+        // must not change the byte length the model sees as the recorded exit
+        // is still a completed command.
+        let output = execute(
+            &tool,
+            json!({"command": r"printf '\303'; printf '\251'; printf '\377'"}),
+        )
+        .await
+        .unwrap();
+        assert!(output.starts_with("exit_code: 0\nstdout:\n"));
+        assert!(output.contains('\u{fffd}'));
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_nonzero_exit_is_a_completed_result_not_an_error() {
+        let (base, _, tool) = fixture("nonzero-completed").await;
+        let result = tool
+            .execute(
+                invocation(json!({"command": "exit 3"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+            )
+            .await;
+        assert!(matches!(result, Ok(ToolExecutionOutcome::Completed(_))));
+        cleanup(&base).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_grandchild_held_pipe_drain_is_bounded(
+        label: &str,
+        timeout_seconds: u64,
+        context_deadline: Instant,
+    ) {
+        let (base, _, tool) = fixture(label).await;
+        let pid_file = base.join("root/grandchild.pid");
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            tool.execute(
+                invocation(json!({
+                    "command": "sleep 30 & echo $! > grandchild.pid; exit 0",
+                    "timeout_seconds": timeout_seconds
+                })),
+                context(CancellationToken::new(), context_deadline),
+            )
+            .await
+        });
+        let pid = read_pid(&pid_file).await;
+        let mut guard = UnixProcessGuard::new(pid);
+        let result = tokio::time::timeout(Duration::from_secs(3), task).await;
+        let elapsed = started.elapsed();
+        match result.unwrap().unwrap() {
+            Ok(ToolExecutionOutcome::Completed(output)) => {
+                // The leader really exited; only its descendant's output is
+                // missing, so the result is completed and explicitly truncated.
+                assert!(output.content().as_str().starts_with("exit_code: 0\n"));
+                assert!(output.content().as_str().contains(TRUNCATED));
+            }
+            Ok(ToolExecutionOutcome::RequestInput(_)) => {
+                panic!("bash must not request input")
+            }
+            Err(error) => panic!("a bounded drain stop must stay a completed result: {error}"),
+        }
+        assert!(elapsed < Duration::from_secs(2));
+        // The bounded drain still stops the whole controlled group.
+        wait_for_process_exit(pid).await;
+        guard.terminate().await;
         cleanup(&base).await;
     }
 
@@ -1206,13 +1182,15 @@ mod tests {
             "collector waited for inherited pipe EOF"
         );
         assert!(elapsed < Duration::from_secs(2));
-        assert!(process_exists(pid));
+        // A leader that exited while a descendant held its pipe is followed by
+        // a bounded grace, then the whole controlled group is stopped.
+        wait_for_process_exit(pid).await;
         guard.terminate().await;
         cleanup(&base).await;
     }
 
     #[cfg(unix)]
-    async fn assert_termination_failure_is_internal(label: &str, failure: TerminationFailure) {
+    async fn assert_termination_failure_is_honest(label: &str, failure: TerminationFailure) {
         let (base, _, tool) = fixture(label).await;
         let pid_file = base.join("root/child.pid");
         let cancellation = CancellationToken::new();
@@ -1229,10 +1207,10 @@ mod tests {
         });
         let pid = read_pid(&pid_file).await;
         let mut guard = UnixProcessGuard::new(pid);
-        inject_termination_failure(pid, failure);
+        crate::tools::command::inject_termination_failure(pid, failure);
         let started = Instant::now();
         cancellation.cancel();
-        let result = tokio::time::timeout(Duration::from_millis(500), &mut task).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
         let observed = match result {
             Ok(Ok(Err(error))) => Some(error),
             _ => None,
@@ -1241,11 +1219,14 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+        // Whatever the injected failure, the controlled group is still stopped
+        // and the tool reports the cancellation it was asked for, never a
+        // fabricated termination.
         wait_for_process_exit(pid).await;
         guard.disarm();
         cleanup(&base).await;
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(observed, Some(ToolError::Internal));
+        assert_eq!(observed, Some(ToolError::Cancelled));
     }
 
     #[cfg(unix)]
@@ -1385,6 +1366,87 @@ mod tests {
              'Start-Sleep -Seconds 30'); Set-Content -NoNewline -Path \
              grandchild.pid -Value $child.Id{parent_tail}"
         )
+    }
+
+    /// The identity a Bash call runs under is the one passed at the real
+    /// execute boundary, so a standalone tool (no captured identity) still owns
+    /// its command and a bound tool records under the exact `ToolRef` it was
+    /// given -- never under a name, a path, or "the newest call".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_bound_records_under_the_captured_identity() {
+        let (base, workspace, _) = fixture("bound-identity").await;
+        let owners = crate::tools::command::CommandOwners::new();
+        let data = Arc::new(crate::tool_data::ToolData::new());
+        let sink = IdentitySink::new(Arc::clone(&data));
+        let streams: Arc<dyn crate::tools::command::CommandStreamSink> =
+            Arc::clone(&sink) as Arc<dyn crate::tools::command::CommandStreamSink>;
+        let binding = crate::tools::command::CommandBinding::new(Arc::clone(&owners), streams);
+        let bound = BashTool::with_binding(workspace, empty_command_environment(), Some(binding));
+        let tool_ref = crate::tool_data::ToolRef {
+            session_id: crate::ids::SessionId::new().unwrap(),
+            loop_id: minicore_runtime::LoopId::new().unwrap(),
+            request_index: 2,
+            tool_call_id: ToolCallId::new("bound-call").unwrap(),
+        };
+        data.note_requested(&tool_ref, "bash");
+        let result = bound
+            .execute_bound(
+                invocation(json!({"command": "printf bound"})),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                Some(tool_ref.clone()),
+            )
+            .await;
+        assert!(matches!(result, Ok(ToolExecutionOutcome::Completed(_))));
+        // The stream bytes were stored under the captured identity.
+        assert_eq!(
+            data.stream_range(&tool_ref, crate::tool_data::ToolDataStream::Stdout),
+            Some((0, 5))
+        );
+        let owned = sink.first_owned();
+        assert_eq!(owned.as_ref(), Some(&tool_ref));
+        owners.join_all().await;
+        cleanup(&base).await;
+    }
+
+    /// A standalone tool with no captured identity still owns and joins its
+    /// command instead of falling outside every barrier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_standalone_call_still_owns_and_joins_its_command() {
+        let (base, _, tool) = fixture("standalone-owner").await;
+        let pid_file = base.join("root/child.pid");
+        let tool = Arc::new(tool);
+        let runner = Arc::clone(&tool);
+        let task = tokio::spawn(async move {
+            runner
+                .execute_bound(
+                    invocation(json!({
+                        "command": "echo $$ > child.pid; exec sleep 30",
+                        "timeout_seconds": 30
+                    })),
+                    context(
+                        CancellationToken::new(),
+                        Instant::now() + Duration::from_secs(30),
+                    ),
+                    None,
+                )
+                .await
+        });
+        let pid = read_pid(&pid_file).await;
+        assert!(process_exists(pid));
+        task.abort();
+        let _ = task.await;
+        tool.join_owned_commands().await;
+        assert_eq!(tool.active_owned_commands(), 0);
+        assert!(
+            !process_exists(pid),
+            "a standalone command outlived its join"
+        );
+        cleanup(&base).await;
     }
 
     #[cfg(windows)]

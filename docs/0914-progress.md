@@ -14,14 +14,16 @@ policy, startup admission preparation, request-time compaction, exact provider
 replay budgeting, and one-shot bounded ContextOverflow recovery. P3a, P3b1 and
 P3b2 passed parent review and remote verification. P4 is also verified: bounded
 file reads (P4a), listing and literal search (P4b), and isolated Git status
-queries (P4c). P5 Bash streams/control, P6 change review and P7 integration
-remain pending.
+queries (P4c). P5a owned Bash streams and in-memory output queries are verified.
+P5b durable output retention, P6 change review and P7 integration remain pending.
 
 ## Execution
 
-The current model preference is the user's latest
-`cus-resp/deepseek-v4.1-flash:max`; the earlier model-role compatibility
-mismatch is fixed. The P3a implementation preferred
+The requested implementation order is `cus-resp/deepseek-v4.1-flash:max`,
+then `cus-resp/gemini-3.8-flash:high` if unavailable, then
+`cus-resp/gpt-5.6-luna:max`. The earlier model-role compatibility mismatch is
+fixed. P5a resumed with DeepSeek, then used Gemini after a context-overflow
+recovery failure; parent-owned review and remote verification remained required. The P3a implementation preferred
 `cus-resp/deepseek-v4.1-flash:high`, with three consecutive helper failures
 permitting `cus-resp/gpt-5.6-luna:max`; P3a used that fallback after three
 DeepSeek context-compaction failures. Only one helper implements at a time; the
@@ -41,7 +43,7 @@ stored in source.
 | P2 | Structured tool identity, invocation and query records | Verified; memory-only retention, streams/persistence follow in P5 |
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
-| P5 | Owned Bash streaming, cancellation, result retention | Pending |
+| P5 | Owned Bash streaming, cancellation, result retention | P5a verified: 651 stable/MSRV passed, 2 Live ignored; P5b durable retention pending |
 | P6 | Workspace and tool change scopes, versioned diffs | Pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
 
@@ -506,6 +508,183 @@ submodule internals (their work tree changes, their untracked files, and any
 monitor or hook configured inside them) are not covered while commit-level
 gitlink changes are; a query returns one live observation with no cursor, so a
 caller that needs a stable view must re-query.
+
+## P5a Bash Command Ownership And Streaming
+
+Parent acceptance (2026-09-15): stable and Rust 1.85 each passed **651 tests**
+with **2 Live tests ignored**. Strict Clippy, fmt, rustdoc and all-target
+Windows GNU/macOS cross-compilation passed. No local build or native
+Windows/macOS test execution is claimed. Logs are under
+`/root/minicore-agent-0914/logs/p5a-*.log`.
+
+Historical checkpoint (2026-09-14): three DeepSeek dispatches failed with
+upstream HTTP 524, including a fresh-context attempt. The draft then remained
+unaccepted at P4c commit `beafc15`; no substitution was made in that turn.
+The model-specific `supportsDeveloperRole=false` fix was already in effect.
+After the user authorized fallback, work resumed with DeepSeek and then Gemini.
+Early remote compilation failures and the following review findings were
+corrected before this acceptance. Helpers remained source-only; the parent
+resolved dependencies remotely (21 added packages, no existing package upgrades)
+and retrieved the generated lock file.
+
+- Compile-blocking errors: `drain_stream` tracks a real EOF in a local `ended`
+  flag; `command_binding` clones the `Presentation` and coerces it to
+  `Arc<dyn CommandStreamSink>`; `CommandEnvironment::apply` is `pub(crate)`; and
+  the `ToolDataStream` match handles `Stdout`/`Stderr` by delegating to
+  `output_process` after the `is_process` fast path.
+- **The whole controlled scope is stopped, not just a pipe-holding descendant.**
+  A leader can exit while a background member holds no pipe at all (for example
+  `sleep 60 >/dev/null &`), and the group must still be gone before the owner
+  finishes. Unix probes the group after the leader exits; Windows conservatively
+  stops the job. Both retain the one full, never-dropped wrapped wait. A regression
+  test starts exactly that background member and asserts the pid is gone before
+  the loop join returns.
+- **Windows named-pipe capture keeps the server.** `configure` consumed the
+  whole `(server, client)` pair, dropping the server and leaving
+  `take_readers` empty. The ends are now stored separately: `configure` takes
+  only the client, and the server is handed to the owner; a Windows source test
+  asserts the readers survive `configure`.
+- **A queued owner does not run after it was cancelled or its deadline passed.**
+  `execute` re-checks the request cancellation token, the owner's stop token,
+  and the deadline before any capture or spawn, records a never-started terminal
+  record, and runs no script. Tests prove no file side effect is created.
+- **Stop failures never skip real cleanup.** `start_kill` is no longer silently
+  discarded: a failed wrapper stop falls back to killing the leader directly, the
+  group/job is still signalled, and the one full `wrapper.wait()` always runs.
+  The injected test failure now performs the real wait first and only then
+  reports the error, so the process is reaped while `termination_confirmed`
+  stays honest.
+- **The final drain after a stop is bounded but not cancel-abandoned.** The
+  owner's token is normally already cancelled at that point, so the bounded
+  final drain no longer observes it; it keeps its time bound, so an escaped
+  pipe cannot hang the owner.
+- **Identity is passed explicitly, never looked up.** The scan-based
+  `ToolRefLookup` and the duplicate `ToolRef` in the live table were deleted.
+  `PresentationTool` is now a small `Plain`/`Bash` enum; `PresentationTool::new_bash`
+  gives the Bash tool the exact `ToolRef` captured at the real execute boundary
+  through `BashTool::execute_bound`, and `CommandBinding` carries only the owner
+  registry and the sink. A cancelled first loop that leaves a live entry can no
+  longer make a later loop inherit a stale identity, and standalone calls still
+  register for the explicit join.
+- **Live process facts match queries.** `CommandResult` ranges and the retention
+  `truncated` flag are overlaid from the current windows in
+  `execution_data`, so `tool.read` is not stuck at `(0, 0)` while
+  `tool.output` already returns bytes, and a complete EOF with a dropped tail
+  window still reports truncation. `note_command` returns the post-budget
+  snapshot, and a chunk event publishes that same live record instead of a stale
+  clone.
+- **The owner registry is bounded and join is reentrant.** `MAX_COMMAND_OWNERS`
+  (1024, matching the tool-record bound) refuses excess owners. Each handle
+  remains in its registered slot until its await completes; dropping a join
+  future or calling two joins concurrently cannot lose the cleanup barrier.
+- **Capacity and gap recovery are tested.** Stream allocation is counted by
+  actual `Vec::capacity`, capped before append at 1 MiB per stream and included
+  in the Session's 8 MiB budget. An old-offset gap page points `next_offset`
+  to the retained start with `eof=false`, so subsequent pages recover the tail.
+- New integration tests exercise a real Agent Session, FakeModel turns, a
+  cancelled running command, `tool.read`/`tool.output` agreement with the live
+  `tool_process` events, and the `close_session` join (Unix).
+
+Retained fixes from the first convergence pass, still in effect:
+
+- The join barriers cancel each owner's own stop token before awaiting its
+  handle, so a command whose tool future was dropped by the Runtime is still
+  stopped and reaped by the turn/close join.
+- `termination_confirmed` is never inferred from a spawn failure, a requested
+  stop, or elapsed time. A failed stop can fall back to real cleanup; only the
+  OS observation after the actual wait provides confirmation.
+- The Runtime cancels the child token for both a user cancel and a deadline, so
+  the command deadline instant decides which one happened; a reached deadline is
+  `timed_out`, never a fabricated `cancelled`.
+- A drain cut short is reported `eof` + `partial`/truncated, never a clean empty
+  end, and a completed command whose output was cut is marked truncated in the
+  model-facing text.
+- `tool.read` publishes a `running` command record before the first byte, and a
+  stream that produced zero bytes and really ended reports `available` (not
+  `unavailable`, which stays reserved for bytes never observed).
+- `CommandResult`, `CommandStatus`, `ToolProcessChunk` and `ToolProcessData` are
+  re-exported so `AgentEvent::ToolProcess` has no private-in-public types under
+  strict Clippy.
+
+Scope: the Bash execution entry (`BashTool -> Policy -> ToolResult`) and the
+in-memory `tool.output` windows. P5b (durable process records) and P6 (change
+review) are not started, and the Subagent architecture is unchanged.
+
+- **One owner per command**: a command is started by a Session-owned worker
+  registered under the complete `ToolRef` of the call (`(session_id, loop_id,
+  request_index, tool_call_id)`), delivered to the Tool through a narrow
+  binding captured at the real `Tool::execute` boundary. No process is
+  identified by pid, command text, or "latest call". The Runtime may drop the
+  tool future at any time; the worker keeps the child, stops it, and reaps it,
+  and only the owner's join reports completion. A standalone Bash tool without
+  a captured identity still owns its commands and can be joined explicitly.
+- **Join barriers**: Turn completion joins the command owners of that loop
+  before the report is reconciled and persisted, Session `close`/shutdown joins
+  every owner after the other owner cancellations, and a child-loop stage joins
+  its own child owners when the child Agent loop ends. `kill_on_drop` remains
+  only a last-resort backstop and is never the evidence that cleanup finished.
+- **Controlled scope**: commands run in their own Unix process group or Windows
+  job object (`process-wrap`). Cancellation, the earliest of the input timeout,
+  the tool context, and the turn deadline, and a stopped scope are handled by
+  one owner that stops the leader, then the whole group/job, then waits for the
+  OS to report exit. Termination is reported as confirmed only after the group
+  really disappeared (`killpg` observation, job wait); a requested stop, an
+  injected stop/reap failure, or elapsed time is never reported as termination.
+- **Streaming**: both pipes are drained in parallel in raw byte chunks (8-32
+  KiB, no newline requirement). Every accepted chunk is written to the bounded
+  tail window first and published afterwards as a best-effort typed
+  `tool_process` event carrying base64 payload plus raw offsets. The two streams
+  are independent, offsets are raw bytes for both, and no file is re-read to
+  serve a page.
+- **Bounded and honest pages**: each stream keeps a 1 MiB tail window counted
+  into the Session's 8 MiB / 1024-record budget, evicted after inputs and
+  results and oldest first. Eviction moves `base_offset` forward, never
+  renumbers offsets, and reports `truncated`; a running stream is never reported
+  as an end of output, and `eof` becomes true only after the owner observed the
+  real end and the retained bytes were delivered. `offset`/`next_offset` always
+  refer to raw bytes and `encoding` is `base64` for both process streams.
+- **Process facts**: `tool.read` reports a `command` record with `status`
+  (`running`, `cancelling`, `exited`, `cancelled`, `timed_out`, `spawn_failed`,
+  `failed`), nullable `exit_code`, optional `signal`, `termination_confirmed`,
+  the retained ranges, and `output_complete`/`output_truncated`. A requested
+  cancel is recorded as `cancelling` before the terminal record, the Runtime
+  outcome is separate from the process record, and a non-zero exit stays a
+  completed tool result.
+- **Pipes held by a descendant**: a leader that exits while a descendant still
+  holds a pipe is drained under a short grace bounded by the remaining
+  deadline; the drain cut is then reported as incomplete (`truncated`), the
+  controlled scope is stopped, and the command stays `exited` because the
+  leader really exited inside its budget. Only when the command's own deadline
+  cut the drain does the record become `timed_out`. Pipe drain has a bound;
+  actual OS cleanup can outlast it and is not detached to fake a deadline.
+
+Parent-run focused regressions cover owner registry
+identity and duplicate refusal, `join_loop` leaving another loop's command
+running while stopping and reaping its own, a dropped tool future followed by a
+join that reaps both the leader and a group member, a bounded drain cut reported
+as truncated `eof` pages, a deadline recorded as `timed_out`, a spawn failure
+that claims no confirmed termination, a zero-byte stream that ended being
+`available`, stream-window bytes counted into the real Session budget, a cut
+stream reported `partial`/`eof`, offset paging that never overlaps or duplicates
+bytes, the complete identity captured at `Tool::execute` (including the
+no-request-key case), and a nonzero exit staying a completed result.
+
+Source changes: `src/tools/command.rs` (new owner worker, registry, capture
+seam, process facts), `src/tools/bash.rs` (execution entry now starts an owned
+command and maps its terminal facts), `src/tool_data.rs` (stream windows,
+process record, base64 pages), `src/presentation.rs` (owner registry, narrow
+binding, stream sink and best-effort events), `src/event.rs` (`tool_process`),
+`src/sessions.rs` (turn/close join barriers), `src/subagents.rs` (child stage
+join), `src/tools/mod.rs` (binding injection), `src/lib.rs` (new public types),
+`Cargo.toml` (`process-wrap`, `base64`, Unix `nix`). No Cargo.lock was edited by
+hand.
+
+Additional regressions cover a cancelled join followed by a second join,
+concurrent joins, allocation-capacity accounting, stale-offset tail recovery,
+and two real Agent turns reusing a call id across different Loop IDs. The
+second turn is closed while its Bash is still active, and close returns after
+reaping. P5b persistence/restart recovery remains unimplemented; no installation,
+version bump, Runtime modification or push occurred.
 
 ## P0 Verification
 

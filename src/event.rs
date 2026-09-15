@@ -17,7 +17,7 @@ use crate::ids::SessionId;
 use crate::sessions::{
     CompactionProgress, SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef,
 };
-use crate::tool_data::{ToolExecutionData, ToolInvocationData};
+use crate::tool_data::{ToolExecutionData, ToolInvocationData, ToolProcessData};
 
 /// Identity and drop accounting attached to every agent event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -94,6 +94,14 @@ pub enum AgentEvent {
         data: ToolExecutionData,
         meta: EventMeta,
     },
+    /// Best-effort live process facts for one owned command, emitted after the
+    /// authoritative window or record was written. Missing one loses a
+    /// notification only; stored facts and the Runtime outcome are unaffected.
+    ToolProcess {
+        turn: TurnRef,
+        data: ToolProcessData,
+        meta: EventMeta,
+    },
     /// Bounded display for one tool call, emitted when that call finishes
     /// (may arrive before or after `ToolStarted`). Read-only, never drives
     /// execution.
@@ -168,6 +176,7 @@ impl AgentEvent {
             | Self::ToolStarted { meta, .. }
             | Self::ToolInvocation { meta, .. }
             | Self::ToolExecution { meta, .. }
+            | Self::ToolProcess { meta, .. }
             | Self::ToolPresentation { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
@@ -190,6 +199,7 @@ impl AgentEvent {
             | Self::ToolStarted { meta, .. }
             | Self::ToolInvocation { meta, .. }
             | Self::ToolExecution { meta, .. }
+            | Self::ToolProcess { meta, .. }
             | Self::ToolPresentation { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
@@ -771,6 +781,15 @@ impl Serialize for AgentEvent {
                     meta: *meta,
                 },
             ),
+            Self::ToolProcess { turn, data, meta } => serialize_event(
+                serializer,
+                "tool_process",
+                ToolProcessDataWire {
+                    turn,
+                    data,
+                    meta: *meta,
+                },
+            ),
             Self::ToolPresentation {
                 turn,
                 request_index,
@@ -971,6 +990,13 @@ struct ToolInvocationDataWire<'a> {
 struct ToolExecutionDataWire<'a> {
     turn: &'a TurnRef,
     data: &'a ToolExecutionData,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
+struct ToolProcessDataWire<'a> {
+    turn: &'a TurnRef,
+    data: &'a ToolProcessData,
     meta: EventMeta,
 }
 

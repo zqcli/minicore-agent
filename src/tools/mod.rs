@@ -1,5 +1,6 @@
 mod apply_patch;
 mod bash;
+pub(crate) mod command;
 mod edit;
 mod read;
 mod write;
@@ -20,7 +21,7 @@ use crate::{Workspace, WorkspaceError};
 
 use apply_patch::ApplyPatchTool;
 use bash::BashTool;
-pub(crate) use bash::CommandEnvironment;
+pub(crate) use bash::{BashTool as OwnedBashTool, CommandEnvironment};
 use edit::EditTool;
 use read::ReadTool;
 use write::WriteTool;
@@ -118,13 +119,24 @@ fn build_tools_with(
                 );
             }
             "bash" => {
-                register(
-                    &mut builder,
-                    Arc::new(BashTool::new(
-                        Arc::clone(&workspace),
-                        command_environment.clone(),
-                    )),
-                );
+                let tool = Arc::new(BashTool::with_binding(
+                    Arc::clone(&workspace),
+                    command_environment.clone(),
+                    presentation.map(|presentation| presentation.command_binding()),
+                ));
+                match presentation {
+                    Some(presentation) => {
+                        // Only Bash receives the captured identity, so only it
+                        // needs the special wrapper variant.
+                        builder.register_arc(PresentationTool::new_bash(
+                            Arc::clone(&tool),
+                            Arc::clone(presentation),
+                        ));
+                    }
+                    None => {
+                        builder.register_arc(tool);
+                    }
+                }
             }
             "edit" => {
                 register(

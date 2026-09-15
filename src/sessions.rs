@@ -2470,6 +2470,10 @@ impl Session {
             }
         }
         self.join_status_workers().await;
+        // Owned commands are joined after every owner was told to stop, and
+        // before the Session reports closure: a command is only finished when
+        // its owner really reaped it.
+        self.presentation().command_owners().join_all().await;
         self.shared.subagents.drain_session(session_id).await;
         first_error.map_or(Ok(()), Err)
     }
@@ -3189,6 +3193,14 @@ async fn run_active_loop(
         .shared
         .subagents
         .drain_session(turn.session_id)
+        .await;
+    // Owned commands of this loop are joined before the report is reconciled
+    // and persisted: a dropped tool future must not leave a process behind, and
+    // the process record must be final before the terminal state is written.
+    session
+        .presentation()
+        .command_owners()
+        .join_loop(turn.loop_id)
         .await;
     let report = match result {
         Ok(report) => {

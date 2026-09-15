@@ -912,22 +912,55 @@ for unknown tools. Raw arguments remain readable through
 }
 ```
 
-`stream` is `input` (canonical JSON of the requested invocation arguments) or
-`output` (the recorded tool result text). `encoding` is `utf8_json` for `input`
-and `utf8` for `output`. `offset`, `next_offset`, and `observed_end` are UTF-8
-byte offsets; `base_offset` is always the retained window start. Continue with
-`next_offset` until `eof`. `truncated` marks a page cut short or a stream larger
-than the retained cap.
+`stream` is `input` (canonical JSON of the requested invocation arguments),
+`output` (the recorded tool result text), `stdout`, or `stderr`. `encoding` is
+`utf8_json` for `input`, `utf8` for `output`, and `base64` for the two process
+streams, whose bytes are not required to be valid UTF-8. For `input` and
+`output`, `offset`, `next_offset`, and `observed_end` are UTF-8 byte offsets;
+for `stdout` and `stderr` they are raw byte offsets and never base64 positions,
+so decoding a page and continuing from `next_offset` reads the same bytes
+exactly once. `base_offset` identifies the first returned byte; an empty gap
+notice identifies the retained window start. Continue with `next_offset` until
+`eof`. Normal page-budget pagination is not truncation: `truncated` marks
+discarded bytes or an observation cut short. A stale-offset gap notice points
+`next_offset` to the retained start with `eof: false`, allowing the next page to
+read the retained tail even when the process has already exited.
+
+Process streams are written by the owned Bash command as it runs, before any
+best-effort event about the same bytes. A page never claims an end of output
+that the owner has not observed: `eof` on `stdout`/`stderr` requires an ended
+observation (real EOF or an explicitly incomplete cut) and delivery of the
+remaining retained bytes. Each stream keeps a bounded tail window (1 MiB),
+whose allocation capacity is counted into the Session's 8 MiB /
+1024-record tool budget, so the oldest bytes are dropped first and reported as
+`truncated` with a `base_offset` that moves forward; evicting a window frees
+capacity and never renumbers offsets. The two streams are independent: no total
+order between them is implied.
+
+`tool.read` for the same call reports a `command` record while a Bash call is
+`running`: `status` (`running`, `cancelling`, `exited`, `cancelled`,
+`timed_out`, `spawn_failed`, `failed`), a nullable `exit_code`, an optional
+`signal`, `termination_confirmed`, the retained ranges of both streams, and
+`output_complete`/`output_truncated`. `termination_confirmed` is true only when
+the owned process group (Unix) or job object (Windows) was really observed to be
+gone; a requested stop, a failed spawn, a failed reap, or elapsed time is never
+reported as termination. The Runtime outcome is separate: a non-zero exit is a
+completed tool result, not an RPC error, and a cancelled or timed-out command
+never reports a fabricated exit code. A requested `cancel` is recorded as
+`cancelling` first; the terminal status follows only after the owner joined the
+process.
 
 `availability` is per stream: `pending` while the call is still running and
 that stream has no observed bytes (with `observed_end: 0` and `eof: false`),
-`unavailable` once the call is terminal but no bytes were observed this
-process, then `available`, `partial`, or `expired`. `eof` is true only when the
-stream can no longer yield bytes: the retained prefix was fully delivered, or
-the bytes were evicted/truncated. A non-zero `offset` on an unobserved stream,
-or an `offset` past `observed_end`, is rejected with `invalid_params`;
-`next_offset` never moves backwards. An evicted stream returns an empty `data`
-with `availability: expired` rather than claiming no output.
+`unavailable` when no observation is available for a terminal call, then
+`available`, `partial`, or `expired`. A genuinely empty stream that reached EOF
+is `available`. An evicted but running process stream is not EOF merely because
+its retained bytes were freed. A stream whose observation was cut short by a
+stop or a stopped scope is `partial` and reports `eof` with `truncated: true`,
+never as a clean empty end. A non-zero `offset` on an unobserved stream, or an
+`offset` past `observed_end`, is rejected with `invalid_params`; `next_offset`
+never moves backwards. An evicted stream returns an empty `data` with
+`availability: expired` rather than claiming no output.
 
 Returned bytes are the recorded original text. They are never rewritten
 through `escape_default`, and offsets always refer to the raw bytes. Clients
@@ -1447,6 +1480,14 @@ Loop-scoped events:
 - `tool_execution` (`turn`, `data`, `meta`); terminal structured execution
   facts from the Runtime `tool_finished` boundary, from the same record as
   `tool.read`.
+- `tool_process` (`turn`, `data`, `meta`); live facts for one owned command.
+  `data` is the complete `tool_ref`, an optional base64 `chunk`
+  (`stream`, `encoding` `base64`, `base_offset`, `next_offset`, `observed_end`,
+  `dropped`, `expired`), and/or the current structured `command` record. The
+  chunk bytes were already written to the authoritative window before this
+  event, so a missed event loses a notification only; use `tool.output` to
+  reconcile. It is best effort and carries no total order between the two
+  streams.
 - `tool_progress` (`turn`, `request_index`, `tool_call_id`, `progress`, `meta`)
 - `tool_presentation` (`turn`, `request_index`, `tool_call_id`, `tool_name`,
   `display`, `meta`); it is best effort and may arrive before or after

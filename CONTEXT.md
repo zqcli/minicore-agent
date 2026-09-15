@@ -34,8 +34,15 @@ ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed.
 P4c `workspace.status` is verified: 613 stable/MSRV tests passed, 2 Live ignored;
 strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed. It provides
 machine-readable, workspace-scoped Git status with isolated configuration and
-Session-owned child reaping. P4 is complete; P5 Bash streams/control, P6 change
-review and P7 integration remain pending.
+Session-owned child reaping. P4 is complete. P5a passed parent review and remote
+verification: stable/MSRV each 651 passed, 2 Live ignored; strict Clippy/fmt/doc
+and Windows/macOS compile checks passed. Every Bash command has a Session-owned worker
+registered under its complete `ToolRef` that keeps, stops, and reaps the child,
+both pipes stream into bounded 1 MiB tail windows served as base64 pages with
+raw offsets. Capacity is accounted under the 8 MiB Session budget; stale-offset
+pages can recover retained tails. Turn/close joins retain handles across dropped
+or concurrent join futures before publishing the ordinary Turn result. P5b durable process records, P6 change review and P7 integration
+remain pending.
 
 The R1 source checkpoint at `5397a65` adds direct no-tools manual summary
 generation, bounded source/merge/output handling, atomic sidecar persistence,
