@@ -44,8 +44,10 @@ P4's `workspace.read` slice is also verified (528 stable/MSRV tests passed,
 (576 stable/MSRV tests passed, 2 Live ignored; strict and cross-platform compile
 gates passed). `workspace.status` completes P4 with 613 stable/MSRV tests
 passed and 2 Live ignored; the same strict and cross-platform compile gates
-passed. Bash streaming/control, P6a parent verification, version-bound diff
-review, and final integration remain pending. These changes are not a new installed
+passed. Bash streaming/control, P6a native-change records, P6b1 version-bound
+tool diffs, P6b2 workspace diffs, and the P7 shared-client contract are all
+verified: stable/MSRV each 749 passed, 2 Live ignored, with strict and
+cross-platform gates. These changes are not a new installed
 Agent release. It also includes a native, stateless `subagent` Tool for explicitly
 delegated child loops.
 
@@ -210,7 +212,15 @@ and RPC query pool integration has passed parent review and remote verification;
 `Agent::tool_read` and `Agent::tool_output` are `async fn` in Rust with deferred
 RPC execution and cold read fallback. P6a native file-change records, bounded
 before/after snapshots and three-scope `changes.list` have passed parent review
-and remote verification; `changes.diff` and P7 integration remain pending. The
+and remote verification. P6b1 `changes.diff` is verified: stable/MSRV each
+passed 740 tests, 2 Live ignored, with strict and cross-platform gates. P6b2
+workspace-Git-scoped diff and the P7 shared-client contract are verified
+together: stable/MSRV each 749 passed, 2 Live ignored, with strict
+Clippy/fmt/rustdoc and Windows GNU/macOS all-target compile checks. P6b1 is
+`c6cb248`, P6a is `fd08b2b`, and P6b2 is `023e34a`. The final
+[acceptance map](docs/verification/0914-final.md) links the 30 blueprint checks
+to regression evidence.
+Version stays 0.3.3 and the Runtime pin is unchanged. The
 [execution audit](docs/verification/compaction-manual-audit.md) remains
 historical evidence, not an acceptance gate. The
 [foundation verification](docs/verification/compaction.md) remains separate;

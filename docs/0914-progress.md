@@ -19,9 +19,15 @@ P5b1 auxiliary persistence and P5b2 public/RPC cold reads are verified.
 P6a native file-change recording, bounded auxiliary snapshots and three-scope
 `changes.list` passed parent review and remote verification: stable/MSRV each
 714 passed, 2 Live ignored; strict and cross-platform compile gates passed.
-P6b1 tool change diffs are implemented in the current uncommitted source
-handoff and await parent-owned compilation/test verification; the
-workspace-Git-scoped diff and P7 integration remain pending.
+P6b1 tool change diffs are verified: stable/MSRV each 740 passed, 2 Live
+ignored, with strict and cross-platform gates. P6b2 workspace-Git-scoped diffs
+and the P7 shared-client contract are verified together: stable/MSRV each 749
+passed, 2 Live ignored, with strict Clippy/fmt/rustdoc and Windows GNU/macOS
+all-target compile checks. P6b1 is commit `c6cb248` and P6a is `fd08b2b`; the
+P6b2 is committed as `023e34a`; P7 client tests and the acceptance map are
+committed together with this final progress record. Version stays 0.3.3, the Runtime pin
+is unchanged, the cross-platform checks are compile-only, and Live Providers
+were not run; nothing was installed or pushed.
 
 ## Execution
 
@@ -53,8 +59,8 @@ remains in the historical audit. No credentials are stored in source.
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
 | P5 | Owned Bash streaming, cancellation, result retention | Verified; P5b2 stable/MSRV 688 passed, 2 Live ignored; strict and cross-platform compile gates passed |
-| P6 | Workspace and tool change scopes, versioned diffs | P6a verified: stable/MSRV 714 passed, 2 ignored; all gates passed. P6b1 verified: 740 stable/MSRV passed, 2 ignored; workspace diff pending |
-| P7 | Client contract integration and final verification/documentation | Pending |
+| P6 | Workspace and tool change scopes, versioned diffs | P6a verified: 714 passed; P6b1 verified: 740 passed; P6b2 verified together with P7: 749 stable/MSRV passed, 2 ignored |
+| P7 | Client contract integration and final verification/documentation | Verified: P6b2/P7 stable/MSRV 749 passed, 2 ignored; strict and cross-platform gates passed |
 
 Each stage is a vertical implementation/API/RPC/test slice, reviewed before
 commit. Shared protocols are developed serially. DTOs are introduced alongside
@@ -402,7 +408,7 @@ installation, version bump or push occurred. Runtime source and pin are unchange
 
 `workspace.status` is the only Git interface in the P4c slice. P6a adds the
 read-only `changes.list` facade over this observation and retained native file
-records; `changes.diff` and later phases are not implemented.
+records; `changes.diff` is out of scope for this slice.
 
 - **Fixed, shell-free Git observation**: one query runs at most three
   commands, `rev-parse --show-toplevel`, at most one
@@ -901,7 +907,8 @@ After interrupted helper runs, the user requested direct parent implementation.
 The parent fixed move errors, corrected invalid test fixtures and context settings,
 and replaced fixed cursor slack with actual encoded-header/cursor accounting.
 Searches must remain scoped to named relevant files/directories, never filesystem
-roots or the entire home directory. Workspace diff and P7 remain pending.
+roots or the entire home directory. At that point the workspace diff and P7
+were still pending; both are implemented in the later source handoff.
 
 - `changes.diff(session_id, change_ref, context_lines?, cursor?, max_bytes?)`
   resolves a `tool:` reference through warm ToolData first and the same bounded
@@ -942,6 +949,72 @@ roots or the entire home directory. Workspace diff and P7 remain pending.
   The RPC reuses the existing four-query and shared 32-waiter ceilings.
 - Each ToolRef stays an independent segment; this slice adds no same-file
   aggregation, no content snapshot store, no new owner, and no History write.
+
+## P6b2 Workspace Change Diff
+
+Parent acceptance: P6b2 and P7 were verified together with stable and Rust 1.85
+each passing **749 tests** and 2 Live Provider tests ignored. Strict Clippy, fmt,
+rustdoc and Windows GNU/macOS all-target compile checks passed. Logs:
+`/root/minicore-agent-0914/logs/p7-{tests,msrv,clippy,fmt,doc,windows,macos}.log`.
+The cross-platform checks are compile-only, not native execution; the existing
+Windows `write_reload_config` test-helper warning remains, Live Provider tests
+were not run, and nothing was installed, pushed, or version-bumped.
+
+- A `workspace:` reference is an opaque base64url token minted by
+  `changes.list` and decoded only by `changes.diff`; clients never parse or
+  construct it. This is a development-protocol change from the earlier hashed
+  form: old `workspace:` references must be re-listed, and long-term liveness of
+  a saved reference is not promised because it pins a list-time `HEAD` OID and
+  status entry. It binds the Session, the list-time `HEAD` OID, and the
+  observed status entry. Every decoded path is length-bounded and validated as
+  workspace-relative.
+- Sources come from real Git objects each query, never a cached list snapshot:
+  fixed, shell-free, read-only `rev-parse --show-toplevel`, `ls-files --stage
+  -z` (index OID), `ls-tree -z <head>` (`HEAD` OID) and `cat-file blob <oid>`
+  (bytes), plus one bounded `capture_file` for the worktree side. Paths are
+  literal pathspecs. Diff drivers, clean filters, textconv, external diff, lazy
+  fetch and replacement objects are disabled; the environment adds
+  `GIT_NO_LAZY_FETCH=1` and `GIT_NO_REPLACE_OBJECTS=1`.
+- `comparison` defaults to `index_to_worktree` when the entry has an unstaged
+  change or is untracked, otherwise `head_to_index`; an explicit value must be
+  `head_to_index`, `index_to_worktree`, or `head_to_worktree`. Each side is
+  bounded to 512 KiB.
+- `versions_refreshed: true` records that `base_version`/`target_version` are
+  the versions actually compared this query. Index and worktree are fresh
+  observations, not a compare-and-swap; `HEAD` is the list-time OID from the
+  reference, so a concurrent commit is not silently folded in.
+- `origin` is always `workspace_unknown`; attribution is never claimed.
+  Untracked regular files are compared against a missing base as additions; removed worktree
+  files are genuine deletions. Unmerged, gitlink, directory, symlink, oversized,
+  or unreadable sides report `availability: unavailable`.
+- A nested workspace resolves the reference path against the repository top
+  level and rejects anything outside the canonical workspace root.
+- CPU comparison pages with an `ops_fingerprint` binding the actual versions and
+  comparison, so changed content with unchanged Git `XY` codes is `stale`.
+  Workspace diff reuses the Session `StatusWorkers` through the generic
+  `StatusQuery<T>` rather than adding a worker owner, sharing the four-query and
+  32-waiter ceilings.
+- Tests: `src/workspace/status/diff_tests.rs` (staged/unstaged/untracked,
+  explicit comparisons, refresh-stale, nested literal path with a configured
+  filter marker, unborn/deletion, conflict, real Git child cancel/reap,
+  symlink).
+
+## P7 Shared Client Contract
+
+Verified together with P6b2 (749 stable/MSRV passed, 2 Live ignored; strict and
+cross-platform gates passed). `tests/shared_data_clients.rs` drives one running
+Agent over a single stdio RPC connection plus a mock OpenAI provider. It defines
+two consumers on that one connection — `HunkClient`, which retains pages and
+extracts the changed sides, and `LineClient`, which reconstructs logical lines
+from fragments without retaining pages — and asserts both reconstruct the same
+before/after under different page budgets. This is not two independent clients
+and not a real GUI/TUI; the blueprint excludes multi-client synchronization.
+The test also covers native `write`/Bash execution, full ToolRef invocation plus
+dual-stream binary tool output, no native attribution for Bash-external changes,
+and `changes.list`/`changes.diff`, `workspace.read`/`files`/`search`, `session.context`,
+`turn.result`, multi-page `session.read`, and a restart that deletes the
+workspace while cold history and tool diff remain readable. It uses only public
+RPC and never reads the internal Store.
 
 ## P0 Verification
 

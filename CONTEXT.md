@@ -53,9 +53,13 @@ cold reads and preserve valid memory observations. P6a native mutation records,
 bounded before/after auxiliary snapshots and three-scope changes.list are now
 verified: stable/MSRV each 714 passed, 2 Live ignored; strict Clippy/fmt/rustdoc
 and Windows/macOS all-target compile checks passed. P6b1 tool change diffs
-(`changes.diff`) are now implemented in the current uncommitted source handoff
-and await their own parent remote verification; the workspace-Git-scoped diff
-and P7 remain pending. After an earlier `cus-resp/deepseek-v4.1-flash:high` handoff
+(`changes.diff`) are now verified the same way: stable/MSRV each 740 passed,
+2 Live ignored, with strict and cross-platform gates. P6b2 workspace-Git-scoped
+diff and the P7 shared-client contract are verified together: stable/MSRV each
+749 passed, 2 Live ignored, with strict Clippy/fmt/rustdoc and Windows GNU/macOS
+all-target compile checks; P6b1 is `c6cb248`, P6a is `fd08b2b`, and 0.3.3 with
+the unchanged Runtime pin still applies. The P7 cross-platform checks are
+compile-only, not native execution. After an earlier `cus-resp/deepseek-v4.1-flash:high` handoff
 failed with an upstream HTTP 404 (retained as history), the draft was preserved
 and reviewed. The user then paused and reloaded the model configuration, and
 continued the same P6a remediation with `cus-resp/deepseek-v4.1-flash:high`
