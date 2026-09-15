@@ -32,6 +32,7 @@ use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
+use crate::read::{ToolReadGate, gate_next_tool_read};
 use crate::sessions::{WorkerGate, pause_next_compaction_after_result};
 use crate::store::{
     SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
@@ -6168,6 +6169,204 @@ async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     let after = harness.response(json!("after")).await;
     assert_eq!(after["result"]["stopped_by"], json!("end"));
 
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn tool_read_deferred_query_capacity_ceiling_and_ping_availability() {
+    let (agent, base, workspace) =
+        test_agent("tool-read-capacity", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_val = create_and_open(&mut harness, &workspace).await;
+    let session_id: SessionId = session_val.as_str().unwrap().parse().unwrap();
+
+    let mut gates = Vec::new();
+    let mut refs = Vec::new();
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let tool_ref = crate::tool_data::ToolRef {
+            session_id,
+            loop_id: minicore_runtime::LoopId::new().unwrap(),
+            request_index: index as u32,
+            tool_call_id: minicore_runtime::ToolCallId::new(format!("gate-call-{index}")).unwrap(),
+        };
+        let gate = Arc::new(ToolReadGate::new());
+        gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+        gates.push(gate);
+        refs.push(tool_ref.clone());
+
+        harness
+            .send(
+                json!(format!("tr-{index}")),
+                "tool.read",
+                Some(json!({
+                    "session_id": session_id,
+                    "loop_id": tool_ref.loop_id,
+                    "request_index": tool_ref.request_index,
+                    "tool_call_id": tool_ref.tool_call_id,
+                })),
+            )
+            .await;
+    }
+
+    for gate in &gates {
+        tokio::time::timeout(TIMEOUT, gate.wait_started())
+            .await
+            .expect("tool read query did not start");
+    }
+
+    // 5th query must be rejected with resource_exhausted (-32019)
+    let overflow_ref = crate::tool_data::ToolRef {
+        session_id,
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 99,
+        tool_call_id: minicore_runtime::ToolCallId::new("overflow-call").unwrap(),
+    };
+    harness
+        .send(
+            json!("tr-overflow"),
+            "tool.read",
+            Some(json!({
+                "session_id": session_id,
+                "loop_id": overflow_ref.loop_id,
+                "request_index": overflow_ref.request_index,
+                "tool_call_id": overflow_ref.tool_call_id,
+            })),
+        )
+        .await;
+    let overflow = harness.response(json!("tr-overflow")).await;
+    assert_eq!(overflow["error"]["code"], json!(-32019));
+
+    // Agent control methods (like ping) are not deferred and remain fully responsive
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    // Release gates, all queries finish
+    for gate in &gates {
+        gate.release();
+    }
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let resp = harness.response(json!(format!("tr-{index}"))).await;
+        // The mock tool call does not exist, so it returns tool not found error (-32021)
+        assert_eq!(resp["error"]["code"], json!(-32021));
+    }
+
+    // Capacity is freed after releasing queries
+    harness
+        .send(
+            json!("tr-after"),
+            "tool.read",
+            Some(json!({
+                "session_id": session_id,
+                "loop_id": overflow_ref.loop_id,
+                "request_index": overflow_ref.request_index,
+                "tool_call_id": overflow_ref.tool_call_id,
+            })),
+        )
+        .await;
+    let after = harness.response(json!("tr-after")).await;
+    // Query went through (not rejected with -32019)
+    assert_ne!(after["error"]["code"], json!(-32019));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn tool_read_deferred_query_shutdown_cancels_within_deadline() {
+    let (agent, base, workspace) =
+        test_agent("tool-read-shutdown", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_val = create_and_open(&mut harness, &workspace).await;
+    let session_id: SessionId = session_val.as_str().unwrap().parse().unwrap();
+
+    let tool_ref = crate::tool_data::ToolRef {
+        session_id,
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 0,
+        tool_call_id: minicore_runtime::ToolCallId::new("gate-shutdown-call").unwrap(),
+    };
+    let gate = Arc::new(ToolReadGate::new());
+    gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+
+    harness
+        .send(
+            json!("tr-pending"),
+            "tool.read",
+            Some(json!({
+                "session_id": session_id,
+                "loop_id": tool_ref.loop_id,
+                "request_index": tool_ref.request_index,
+                "tool_call_id": tool_ref.tool_call_id,
+            })),
+        )
+        .await;
+
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .expect("tool read did not start");
+
+    // Ping works during pending query
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    // Calling shutdown must cancel the query immediately and complete in < 2 seconds,
+    // not waiting for the 10-second deadline.
+    let start = std::time::Instant::now();
+    harness.shutdown().await;
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn tool_output_deferred_query_shutdown_cancellation_cleans_up() {
+    let (agent, base, workspace) =
+        test_agent("tool-output-shutdown", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session_val = create_and_open(&mut harness, &workspace).await;
+    let session_id: SessionId = session_val.as_str().unwrap().parse().unwrap();
+
+    let tool_ref = crate::tool_data::ToolRef {
+        session_id,
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 0,
+        tool_call_id: minicore_runtime::ToolCallId::new("gate-output-call").unwrap(),
+    };
+    let gate = Arc::new(ToolReadGate::new());
+    gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+
+    harness
+        .send(
+            json!("to-pending"),
+            "tool.output",
+            Some(json!({
+                "session_id": session_id,
+                "loop_id": tool_ref.loop_id,
+                "request_index": tool_ref.request_index,
+                "tool_call_id": tool_ref.tool_call_id,
+                "stream": "stdout",
+                "offset": 0,
+            })),
+        )
+        .await;
+
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .expect("tool output did not start");
+
+    // Ping works during pending query
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    // Release gate so shutdown can cleanly drain
+    gate.release();
     harness.shutdown().await;
     remove_base(&base).await;
 }

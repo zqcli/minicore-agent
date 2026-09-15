@@ -18,6 +18,7 @@ use crate::read::{ReadSession, TurnResultRequest};
 use crate::sessions::{
     TurnRef, await_compaction_completion, await_loop_preparation, await_turn_completion,
 };
+use crate::tool_data::{ToolOutputRequest, ToolReadRequest};
 use crate::workspace::listing::WorkspaceFilesRequest;
 use crate::workspace::query::{WORKSPACE_READ_DEADLINE, WorkspaceReadRequest};
 use crate::workspace::search::WorkspaceSearchRequest;
@@ -620,16 +621,55 @@ impl RpcServer {
                     Ok(params) => params,
                     Err(response) => return Dispatch::Response(response),
                 };
-                let result = self.agent().tool_read(params.into());
-                Dispatch::Response(agent_result(&id, result))
+                let request: ToolReadRequest = params.into();
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let store = self.agent().store_handle();
+                let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    let response =
+                        match crate::read::tool_read(store, tool_data, request, cancellation).await
+                        {
+                            Ok(result) => success(&id, result),
+                            Err(error) => query_error(id, &error),
+                        };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
             }
             "tool.output" => {
                 let params: ToolOutputParams = match params_or_error(&id, params) {
                     Ok(params) => params,
                     Err(response) => return Dispatch::Response(response),
                 };
-                let result = self.agent().tool_output(params.into());
-                Dispatch::Response(agent_result(&id, result))
+                let request: ToolOutputRequest = params.into();
+                if let Err(error) = request.validate() {
+                    return Dispatch::Response(query_error(id, &error));
+                }
+                if !self.query_capacity_available() {
+                    return Dispatch::Response(resource_exhausted(id));
+                }
+                let store = self.agent().store_handle();
+                let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
+                let cancellation = self.query_cancellation.clone();
+                let outbound = self.outbound_tx.clone();
+                self.queries.spawn(async move {
+                    let response =
+                        match crate::read::tool_output(store, tool_data, request, cancellation)
+                            .await
+                        {
+                            Ok(result) => success(&id, result),
+                            Err(error) => query_error(id, &error),
+                        };
+                    let _ = outbound.send(RpcOutbound::Response(response)).await;
+                });
+                Dispatch::Deferred
             }
             "turn.send" => {
                 let params: TurnSendParams = match params_or_error(&id, params) {

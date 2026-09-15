@@ -334,7 +334,7 @@ impl fmt::Debug for CommandResult {
 /// offset of the first retained byte, so eviction moves `base_offset` forward
 /// instead of renumbering bytes; `observed_end` counts every byte the owner
 /// really read, whether or not it is still retained.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct StreamWindow {
     bytes: Vec<u8>,
     start_offset: u64,
@@ -683,6 +683,7 @@ impl fmt::Debug for ToolOutputPage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ToolRecord {
     name: String,
     subject: ToolSubject,
@@ -716,6 +717,198 @@ pub(crate) struct ToolRecord {
 impl ToolRecord {
     pub(crate) fn has_corrupt_streams(&self) -> bool {
         self.input_corrupt || self.result_corrupt || self.stdout.corrupt || self.stderr.corrupt
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        if !self.state.is_terminal() {
+            return false;
+        }
+        if let Some(cmd) = &self.command {
+            if !cmd.status.is_terminal() {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn needs_stored(&self) -> bool {
+        self.is_terminal()
+            && (self.input_expired
+                || self.result_expired
+                || self.stdout.expired
+                || self.stderr.expired
+                || !self.input_seen
+                || !self.result_seen
+                || self.has_corrupt_streams())
+    }
+
+    pub(crate) fn merge_stored(&mut self, stored: ToolRecord) -> bool {
+        // 1. Conflict checks: refuse merge on any identity or observed range conflict.
+        if self.name != stored.name {
+            return false;
+        }
+        if self.state.is_terminal() && stored.state.is_terminal() && self.state != stored.state {
+            return false;
+        }
+        if self.outcome.is_some() && stored.outcome.is_some() && self.outcome != stored.outcome {
+            return false;
+        }
+        if self.input_seen && stored.input_seen && self.input_total != stored.input_total {
+            return false;
+        }
+        if self.result_seen && stored.result_seen && self.result_total != stored.result_total {
+            return false;
+        }
+        let known = |stream: &StreamWindow| {
+            stream.seen || stream.complete || stream.expired || stream.observed_end > 0
+        };
+        for (memory, disk) in [
+            (&self.stdout, &stored.stdout),
+            (&self.stderr, &stored.stderr),
+        ] {
+            if known(memory) && known(disk) && memory.observed_end != disk.observed_end {
+                return false;
+            }
+        }
+        if self
+            .command
+            .as_ref()
+            .zip(stored.command.as_ref())
+            .is_some_and(|(memory, disk)| {
+                (
+                    memory.status,
+                    memory.exit_code,
+                    memory.signal,
+                    memory.termination_confirmed,
+                    memory.output_complete,
+                ) != (
+                    disk.status,
+                    disk.exit_code,
+                    disk.signal,
+                    disk.termination_confirmed,
+                    disk.output_complete,
+                )
+            })
+        {
+            return false;
+        }
+
+        if !self.input_seen && self.started_at.is_none() {
+            self.phase = self.phase.or(stored.phase);
+            self.started_at = stored.started_at;
+            if stored.finished_at.is_some() {
+                self.finished_at = stored.finished_at;
+            }
+        }
+
+        // 2. Input
+        if !self.input_seen {
+            if stored.input_seen {
+                self.input = stored.input;
+                self.input_total = stored.input_total;
+                self.input_seen = true;
+                self.input_truncated = stored.input_truncated;
+                self.input_expired = stored.input_expired;
+                self.input_corrupt = stored.input_corrupt;
+                self.subject = stored.subject;
+                self.subject_truncated = stored.subject_truncated;
+            }
+        } else if self.input_expired || self.input_corrupt {
+            if stored.input_seen && !stored.input_expired && !stored.input_corrupt {
+                self.input = stored.input;
+                self.input_total = stored.input_total;
+                self.input_truncated = stored.input_truncated;
+                self.input_expired = false;
+                self.input_corrupt = false;
+            } else if stored.input_corrupt {
+                self.input_corrupt = true;
+                self.input_total = stored.input_total;
+            }
+        }
+
+        // 3. Result
+        if !self.result_seen {
+            if stored.result_seen {
+                self.result = stored.result;
+                self.result_total = stored.result_total;
+                self.result_seen = true;
+                self.result_truncated = stored.result_truncated;
+                self.result_expired = stored.result_expired;
+                self.result_corrupt = stored.result_corrupt;
+            }
+        } else if self.result_expired || self.result_corrupt {
+            if stored.result_seen && !stored.result_expired && !stored.result_corrupt {
+                self.result = stored.result;
+                self.result_total = stored.result_total;
+                self.result_truncated = stored.result_truncated;
+                self.result_expired = false;
+                self.result_corrupt = false;
+            } else if stored.result_corrupt {
+                self.result_corrupt = true;
+                self.result_total = stored.result_total;
+            }
+        }
+
+        // 4. Process streams (stdout / stderr)
+        let stdout_unknown =
+            !self.stdout.seen && !self.stdout.complete && self.stdout.observed_end == 0;
+        if stdout_unknown {
+            self.stdout = stored.stdout;
+        } else if self.stdout.expired || self.stdout.corrupt {
+            if (stored.stdout.seen || stored.stdout.complete)
+                && !stored.stdout.expired
+                && !stored.stdout.corrupt
+            {
+                self.stdout = stored.stdout;
+            } else if stored.stdout.corrupt {
+                self.stdout.corrupt = true;
+                if stored.stdout.observed_end > 0 {
+                    self.stdout.observed_end = stored.stdout.observed_end;
+                    self.stdout.start_offset = stored.stdout.start_offset;
+                }
+            }
+        } else if !self.stdout.complete && stored.stdout.complete {
+            self.stdout.complete = true;
+        }
+
+        let stderr_unknown =
+            !self.stderr.seen && !self.stderr.complete && self.stderr.observed_end == 0;
+        if stderr_unknown {
+            self.stderr = stored.stderr;
+        } else if self.stderr.expired || self.stderr.corrupt {
+            if (stored.stderr.seen || stored.stderr.complete)
+                && !stored.stderr.expired
+                && !stored.stderr.corrupt
+            {
+                self.stderr = stored.stderr;
+            } else if stored.stderr.corrupt {
+                self.stderr.corrupt = true;
+                if stored.stderr.observed_end > 0 {
+                    self.stderr.observed_end = stored.stderr.observed_end;
+                    self.stderr.start_offset = stored.stderr.start_offset;
+                }
+            }
+        } else if !self.stderr.complete && stored.stderr.complete {
+            self.stderr.complete = true;
+        }
+
+        // 5. Command record
+        if self.command.is_none() {
+            if let Some(cmd) = stored.command {
+                self.command = Some(self.live_command(cmd));
+            }
+        } else if let Some(cmd) = self.command.take() {
+            self.command = Some(self.live_command(cmd));
+        }
+
+        // 6. Recording state
+        if self.recording == ToolRecordingState::MemoryOnly
+            && stored.recording != ToolRecordingState::MemoryOnly
+        {
+            self.recording = stored.recording;
+        }
+
+        true
     }
 
     fn new(name: String) -> Self {
@@ -1404,6 +1597,12 @@ impl ToolData {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Returns an isolated copy of one tool call's record from memory if present.
+    pub(crate) fn get_record(&self, tool_ref: &ToolRef) -> Option<ToolRecord> {
+        let inner = self.lock();
+        inner.records.get(tool_ref).cloned()
+    }
+
     /// Records that the Runtime accepted a tool call, before any policy
     /// decision. Arguments are not available at this boundary.
     pub(crate) fn note_requested(&self, tool_ref: &ToolRef, name: &str) {
@@ -1718,6 +1917,7 @@ impl ToolData {
         inner.enforce_limits();
     }
 
+    #[cfg(test)]
     pub(crate) fn read(
         &self,
         request: &ToolReadRequest,
@@ -1730,6 +1930,7 @@ impl ToolData {
         record.project_read(&request.tool_ref, max_bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn output(
         &self,
         request: &ToolOutputRequest,
@@ -2107,6 +2308,40 @@ fn encoded_len<T: Serialize>(value: &T) -> Result<usize, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn historical_memory_only_record_needs_stored_details() {
+        let mut record = super::ToolRecord::new("bash".to_owned());
+        record.state = super::ToolExecutionState::Succeeded;
+        record.outcome = Some(super::ToolResultOutcome::Success);
+        record.result_seen = true;
+        assert!(record.needs_stored());
+    }
+
+    #[test]
+    fn complete_empty_streams_do_not_need_stored_details() {
+        let mut record = super::ToolRecord::new("bash".to_owned());
+        record.state = super::ToolExecutionState::Succeeded;
+        record.outcome = Some(super::ToolResultOutcome::Success);
+        record.input_seen = true;
+        record.result_seen = true;
+        record.recording = super::ToolRecordingState::Saved;
+        record.stdout.complete = true;
+        record.stderr.complete = true;
+        record.command = Some(super::CommandResult {
+            status: super::CommandStatus::Exited,
+            exit_code: Some(0),
+            signal: None,
+            termination_confirmed: true,
+            stdout_base_offset: 0,
+            stdout_observed_end: 0,
+            stderr_base_offset: 0,
+            stderr_observed_end: 0,
+            output_complete: true,
+            output_truncated: false,
+        });
+        assert!(!record.needs_stored());
+    }
+
     use base64::Engine as _;
     use serde_json::json;
 
@@ -3230,5 +3465,124 @@ mod tests {
             assert!(!debug.contains("private.invalid"));
             assert!(!debug.contains("Authorization"));
         }
+    }
+
+    #[test]
+    fn merge_stored_rejects_incompatible_identity_totals_and_state() {
+        let mut mem = ToolRecord::new("bash".to_owned());
+        mem.state = ToolExecutionState::Succeeded;
+        mem.input_seen = true;
+        mem.input_total = 100;
+        mem.stdout.seen = true;
+        mem.stdout.observed_end = 500;
+
+        // Incompatible tool name
+        let stored_diff_name = ToolRecord::new("read".to_owned());
+        assert!(!mem.merge_stored(stored_diff_name));
+
+        // Incompatible state
+        let mut stored_diff_state = ToolRecord::new("bash".to_owned());
+        stored_diff_state.state = ToolExecutionState::Failed;
+        assert!(!mem.merge_stored(stored_diff_state));
+
+        // Incompatible input total
+        let mut stored_diff_total = ToolRecord::new("bash".to_owned());
+        stored_diff_total.state = ToolExecutionState::Succeeded;
+        stored_diff_total.input_seen = true;
+        stored_diff_total.input_total = 999;
+        assert!(!mem.merge_stored(stored_diff_total));
+
+        // Incompatible stdout observed end
+        let mut stored_diff_end = ToolRecord::new("bash".to_owned());
+        stored_diff_end.state = ToolExecutionState::Succeeded;
+        stored_diff_end.input_seen = true;
+        stored_diff_end.input_total = 100;
+        stored_diff_end.stdout.seen = true;
+        stored_diff_end.stdout.observed_end = 999;
+        assert!(!mem.merge_stored(stored_diff_end));
+
+        // Memory remains completely unmutated
+        assert_eq!(mem.input_total, 100);
+        assert_eq!(mem.stdout.observed_end, 500);
+    }
+
+    #[test]
+    fn merge_stored_preserves_known_empty_eof_and_fills_unknown() {
+        // Known empty EOF in memory cannot be replaced by non-empty stream
+        let mut mem = ToolRecord::new("bash".to_owned());
+        mem.state = ToolExecutionState::Succeeded;
+        mem.stdout.complete = true;
+        mem.stdout.observed_end = 0;
+
+        let mut stored = ToolRecord::new("bash".to_owned());
+        stored.state = ToolExecutionState::Succeeded;
+        stored.stdout.observed_end = 120;
+        assert!(!mem.merge_stored(stored));
+        assert_eq!(mem.stdout.observed_end, 0);
+        assert!(mem.stdout.complete);
+
+        // Unknown in memory learns complete EOF even if seen is false
+        let mut mem_unknown = ToolRecord::new("bash".to_owned());
+        mem_unknown.state = ToolExecutionState::Succeeded;
+        let mut stored_empty_eof = ToolRecord::new("bash".to_owned());
+        stored_empty_eof.state = ToolExecutionState::Succeeded;
+        stored_empty_eof.stdout.complete = true;
+        stored_empty_eof.stdout.observed_end = 0;
+        assert!(mem_unknown.merge_stored(stored_empty_eof));
+        assert!(mem_unknown.stdout.complete);
+        assert_eq!(mem_unknown.stdout.observed_end, 0);
+    }
+
+    #[test]
+    fn merge_stored_reconciled_result_learns_input_and_command_from_disk() {
+        let mut mem = ToolRecord::new("bash".to_owned());
+        mem.state = ToolExecutionState::Succeeded;
+        mem.result = "cmd output\n".to_owned();
+        mem.result_seen = true;
+        mem.result_total = 11;
+        mem.finished_at = Some("2026-09-15T00:00:00Z".to_owned());
+        // input and command are missing in memory
+        assert!(!mem.input_seen);
+        assert!(mem.command.is_none());
+
+        let mut stored = ToolRecord::new("bash".to_owned());
+        stored.state = ToolExecutionState::Succeeded;
+        stored.phase = Some(ToolPhase::Running);
+        stored.started_at = Some("2026-09-14T00:00:00Z".to_owned());
+        stored.finished_at = Some("2026-09-14T00:00:01Z".to_owned());
+        stored.result = "cmd output\n".to_owned();
+        stored.result_seen = true;
+        stored.result_total = 11;
+        stored.input = "echo hello".to_owned();
+        stored.input_seen = true;
+        stored.input_total = 10;
+        stored.stdout.seen = true;
+        stored.stdout.bytes = b"cmd output\n".to_vec();
+        stored.stdout.start_offset = 0;
+        stored.stdout.observed_end = 11;
+        stored.stdout.complete = true;
+        stored.command = Some(CommandResult {
+            status: CommandStatus::Exited,
+            exit_code: Some(0),
+            signal: None,
+            termination_confirmed: true,
+            stdout_base_offset: 0,
+            stdout_observed_end: 11,
+            stderr_base_offset: 0,
+            stderr_observed_end: 0,
+            output_complete: true,
+            output_truncated: false,
+        });
+
+        assert!(mem.merge_stored(stored));
+        assert!(mem.input_seen);
+        assert_eq!(mem.input, "echo hello");
+        assert_eq!(mem.input_total, 10);
+        assert_eq!(mem.phase, Some(ToolPhase::Running));
+        assert_eq!(mem.started_at.as_deref(), Some("2026-09-14T00:00:00Z"));
+        assert_eq!(mem.finished_at.as_deref(), Some("2026-09-14T00:00:01Z"));
+        let cmd = mem.command.expect("command restored from disk");
+        assert_eq!(cmd.status, CommandStatus::Exited);
+        assert_eq!(cmd.stdout_observed_end, 11);
     }
 }

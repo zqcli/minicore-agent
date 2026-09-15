@@ -826,10 +826,22 @@ name or "most recent call":
 All four values come from real Runtime boundaries: the session id, the
 `ModelCallContext` request at `Model::start`, and the Runtime tool-call id. A
 query whose identity was never recorded returns `-32021` (`tool_not_found`,
-non-retryable) rather than a nearby match. Records are held in memory for a
-loaded Session only, under a fixed per-session record and byte budget; a call
-whose bytes were evicted is reported through `availability` instead of being
-dropped silently.
+non-retryable) rather than a nearby match.
+
+In the RPC server, `tool.read` and `tool.output` are deferred queries executed
+in the query pool under a 10-second deadline. They are bounded by the 4-query
+concurrency ceiling and count against the shared 32-entry deferred admission
+capacity; requests exceeding capacity are rejected with `-32019`
+(`resource_exhausted`, retryable). Loaded Sessions serve complete records
+directly from memory with zero disk IO. Unloaded Sessions or records whose stream
+bytes were evicted under memory budget fall back to durable auxiliary storage on
+disk (cold read). If auxiliary records are absent or unreadable, the query
+cleanly returns `-32021` (`tool_not_found`).
+
+In the Rust library API, `Agent::tool_read` and `Agent::tool_output` are
+`async fn` methods returning futures that must be `.await`ed. While the JSON-RPC
+wire format remains backward-compatible, this is a source-level breaking change
+for Rust consumers migrating from synchronous signatures.
 
 ### `tool.read`
 
