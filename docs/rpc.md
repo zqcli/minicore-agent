@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -72,7 +72,7 @@ All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
 requests are dispatched sequentially. `turn.wait`, `session.compact`,
 `session.read`, `workspace.read`, `workspace.files`, `workspace.search`,
-`workspace.status`, and
+`workspace.status`, `changes.list`, and
 `turn.result` are exceptions: the server registers one bounded owned task and
 immediately continues reading requests. A deferred query/waiter does not own
 the underlying Session operation. The two workspace scan queries each own one
@@ -126,6 +126,7 @@ protocol version, and ordered capability names:
     "workspace.files",
     "workspace.search",
     "workspace.status",
+    "changes.list",
     "deferred.waiter_limit"
   ]
 }
@@ -1430,6 +1431,95 @@ makes the result incomplete. Results are live observations with no author
 attribution: changes made before, by other tools, or by other processes look
 the same, and no Turn, history entry, or model call is involved. There is no
 watcher and no cache: every result comes from the query that produced it.
+
+### `changes.list`
+
+The P6a change-review query lists bounded file-change records. It is read-only
+and does not call a model, write History, create a Session, or run a garbage
+collector. `changes.diff` is not implemented or advertised by this protocol
+version.
+
+```json
+{
+  "session_id": "ses_...",
+  "scope": "workspace",
+  "cursor": null,
+  "limit": 100,
+  "max_bytes": 65536
+}
+```
+
+`scope` is either `workspace`, `session`, or
+`{"turn":{"loop_id":"lup_..."}}`. The workspace scope is a live Git
+observation and has `origin: "workspace_unknown"`; it never attributes a
+pre-existing, Bash, editor, or other-Agent change to a ToolRef. Session and
+turn scopes use only retained native `write`, `edit`, and `apply_patch`
+records with their complete ToolRef identity. A turn scope is filtered by the
+exact Loop ID, not by presentation text or a request key.
+
+```json
+{
+  "scope": "session",
+  "records": [{
+    "change_ref": "tool:<sha256>",
+    "path": "src/main.rs",
+    "kind": "modified",
+    "origin": "tool",
+    "tool_ref": {
+      "session_id": "ses_...",
+      "loop_id": "lup_...",
+      "request_index": 0,
+      "tool_call_id": "call_..."
+    },
+    "before": {"kind": "content", "bytes": 12, "sha256": "..."},
+    "after": {"kind": "content", "bytes": 15, "sha256": "..."},
+    "commit_state": "applied",
+    "details_available": true,
+    "coverage": "complete"
+  }],
+  "next_cursor": null,
+  "total": 1,
+  "complete": true,
+  "stale": false,
+  "consistency": "cold",
+  "warnings": []
+}
+```
+
+The response is charged by encoded JSON bytes and accepts `1024..=262144`
+bytes, defaulting to 64 KiB. `limit` is optional, defaults to 100, and accepts
+`1..=1000`; the byte budget may return fewer records. `cursor` contains the
+record offset and the scope binding. A continuation cursor
+is returned only when the page ended at a record boundary and the observation
+or durable record set remains the same. Workspace cursors bind the Git
+observation fingerprint; a changed observation returns `stale` rather than
+silently reading a new version. Session and turn cursors bind the retained
+record fingerprint and are likewise stale when the record set changes.
+The page end is planned once against the worst-case header and
+`details_unavailable`/`records_skipped` warnings with the longer
+`complete: false` encoding, then reused as an upper bound after blob
+verification. A page can therefore only shrink, never include a record whose
+`before.bin`/`after.bin` were already verified and then dropped, so continuation
+cursors stay continuous with no gaps or duplicates.
+
+Native records capture facts at the actual mutation boundary. `edit` and
+`apply_patch` reuse the source read used for matching and the computed result;
+`write` best-effort captures an existing regular file. Captures are bounded to
+512 KiB per before/after snapshot. Missing files are represented as
+`{"kind":"missing"}`; failed or post-rename-uncertain commits use
+`commit_state: "unknown"`, not a false no-op. A successful mutation can still
+have `coverage: "partial"` when a capture is unavailable. Auxiliary
+`before.bin` and `after.bin` files are persisted under the existing bounded
+ToolData/Store budgets; a missing or corrupt blob keeps the revision metadata
+but returns `details_available: false`. Memory eviction and auxiliary
+persistence failure do not change the native tool result.
+
+Workspace records report Git `modified`, `renamed`, `unmerged`, and
+`untracked` entries, subject to the same bounded status observation. A rename
+carries `original_path` when Git provided a safe workspace-relative old name.
+They use unknown content revisions because P6a does not yet provide
+version-bound diffs. Binary files and the `changes.diff` operation remain
+outside this slice.
 
 ## Interactions
 

@@ -20,6 +20,7 @@ use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::{ModelError, ModelErrorKind, RetryHint, Usage};
 use minicore_runtime::tools::ToolResultOutcome;
 
+use crate::changes::{ChangeRevision, StoredFileChange};
 use crate::error::StoreError;
 use crate::history::sanitize_history;
 use crate::ids::SessionId;
@@ -55,12 +56,16 @@ pub(crate) const TOOL_INPUT_FILE: &str = "input.bin";
 pub(crate) const TOOL_RESULT_FILE: &str = "result.bin";
 pub(crate) const TOOL_STDOUT_FILE: &str = "stdout.bin";
 pub(crate) const TOOL_STDERR_FILE: &str = "stderr.bin";
-pub(crate) const ALLOWED_AUX_FILES: [&str; 5] = [
+pub(crate) const TOOL_BEFORE_FILE: &str = "before.bin";
+pub(crate) const TOOL_AFTER_FILE: &str = "after.bin";
+pub(crate) const ALLOWED_AUX_FILES: [&str; 7] = [
     TOOL_RECORD_FILE,
     TOOL_INPUT_FILE,
     TOOL_RESULT_FILE,
     TOOL_STDOUT_FILE,
     TOOL_STDERR_FILE,
+    TOOL_BEFORE_FILE,
+    TOOL_AFTER_FILE,
 ];
 pub(crate) const TOOL_RECORD_FORMAT_VERSION: u32 = 1;
 pub(crate) const MAX_TOOL_METADATA_BYTES: usize = 64 * 1024;
@@ -71,6 +76,8 @@ pub(crate) const DEFAULT_SESSION_AUX_RECORDS: usize = 1024;
 pub(crate) const DEFAULT_GLOBAL_AUX_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_GLOBAL_AUX_RECORDS: usize = 8192;
 pub(crate) const MAX_AUX_SCAN_ENTRIES: usize = 65536;
+pub(crate) const CHANGE_SCAN_METADATA_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const CHANGE_SCAN_BLOB_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const AUX_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 
 static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -83,6 +90,8 @@ static RECORD_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 static SUMMARY_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 #[cfg(test)]
 static AUX_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+#[cfg(test)]
+static READ_CHANGE_BLOBS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static FAIL_REMOVE_TEMP_SESSIONS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 #[cfg(test)]
@@ -153,6 +162,24 @@ type SummaryCommitGateEntry = (SessionId, Arc<SummaryCommitGate>);
 static SUMMARY_COMMIT_GATES: OnceLock<Mutex<Vec<SummaryCommitGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 static SUMMARY_UNKNOWN_WRITES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn take_read_change_blobs_under(prefix: &Path) -> Vec<PathBuf> {
+    let mut entries = READ_CHANGE_BLOBS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    let mut taken = Vec::new();
+    entries.retain(|path| {
+        if path.starts_with(prefix) {
+            taken.push(path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    taken
+}
 
 #[cfg(test)]
 pub(crate) fn fail_next_aux_write(session_id: SessionId) {
@@ -512,11 +539,58 @@ pub(crate) struct StoredToolRecord {
     pub(crate) stdout: StoredStreamWindow,
     pub(crate) stderr: StoredStreamWindow,
     pub(crate) command: Option<CommandResult>,
+    #[serde(default)]
+    pub(crate) file_change: Option<StoredFileChange>,
 }
 
 struct ReadToolRecord {
     metadata: StoredToolRecord,
     record: ToolRecord,
+}
+
+pub(crate) struct ToolChangeScan {
+    pub(crate) records: Vec<(ToolRef, StoredFileChange)>,
+    pub(crate) complete: bool,
+    pub(crate) skipped: bool,
+    #[cfg(test)]
+    pub(crate) entries: usize,
+    #[cfg(test)]
+    pub(crate) metadata_bytes: usize,
+    pub(crate) observation: String,
+}
+
+impl ToolChangeScan {
+    /// The fail-closed fallback used when the durable scan is unavailable but
+    /// warm in-memory records still exist. It carries no records and no budget
+    /// accounting across the `cfg(test)` field boundary.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            records: Vec::new(),
+            complete: false,
+            skipped: true,
+            #[cfg(test)]
+            entries: 0,
+            #[cfg(test)]
+            metadata_bytes: 0,
+            observation: hash_bytes(b"change-scan-store-unavailable"),
+        }
+    }
+}
+
+pub(crate) struct ChangeBlobBudget {
+    pub(crate) used_bytes: usize,
+    pub(crate) exhausted: bool,
+}
+
+#[derive(Default)]
+struct ChangeScanBudget {
+    entries: usize,
+    metadata_bytes: usize,
+}
+
+enum ChangeMetadataRead {
+    Record(Option<Box<StoredToolRecord>>),
+    BudgetExhausted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -977,6 +1051,14 @@ impl Store {
         let result_len = snapshot.result_bytes.as_ref().map_or(0, |b| b.len());
         let stdout_len = snapshot.stdout_bytes.as_ref().map_or(0, |b| b.len());
         let stderr_len = snapshot.stderr_bytes.as_ref().map_or(0, |b| b.len());
+        let before_len = snapshot
+            .file_change_before
+            .as_ref()
+            .map_or(0, |bytes| bytes.len());
+        let after_len = snapshot
+            .file_change_after
+            .as_ref()
+            .map_or(0, |bytes| bytes.len());
 
         if input_len != snapshot.record.input.file_bytes
             || result_len != snapshot.record.result.file_bytes
@@ -1005,6 +1087,20 @@ impl Store {
             if snapshot.record.stderr.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
                 return Err(StoreError::Corrupt);
             }
+        }
+        validate_file_change_snapshot(
+            snapshot.record.file_change.as_ref(),
+            snapshot.file_change_before.as_deref(),
+            snapshot.file_change_after.as_deref(),
+        )?;
+        let raw_bytes = input_len
+            .saturating_add(result_len)
+            .saturating_add(stdout_len)
+            .saturating_add(stderr_len)
+            .saturating_add(before_len)
+            .saturating_add(after_len);
+        if raw_bytes > 3 * 1024 * 1024 {
+            return Err(StoreError::RecordTooLarge);
         }
 
         let session_dir = self
@@ -1061,8 +1157,13 @@ impl Store {
             return Err(StoreError::RecordTooLarge);
         }
 
-        let item_bytes =
-            (record_bytes.len() + input_len + result_len + stdout_len + stderr_len) as u64;
+        let item_bytes = (record_bytes.len()
+            + input_len
+            + result_len
+            + stdout_len
+            + stderr_len
+            + before_len
+            + after_len) as u64;
         let reserve = item_bytes.saturating_mul(2);
 
         let limits = self.aux_limits();
@@ -1115,6 +1216,18 @@ impl Store {
                     return Err(StoreError::Unavailable);
                 }
                 write_sync_file(&temp_dir.join(TOOL_STDERR_FILE), bytes).await?;
+            }
+            if let Some(bytes) = &snapshot.file_change_before {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Unavailable);
+                }
+                write_sync_file(&temp_dir.join(TOOL_BEFORE_FILE), bytes).await?;
+            }
+            if let Some(bytes) = &snapshot.file_change_after {
+                if Instant::now() >= deadline {
+                    return Err(StoreError::Unavailable);
+                }
+                write_sync_file(&temp_dir.join(TOOL_AFTER_FILE), bytes).await?;
             }
             if Instant::now() >= deadline {
                 return Err(StoreError::Unavailable);
@@ -1241,6 +1354,332 @@ impl Store {
             .map(|loaded| loaded.map(|loaded| loaded.record))
     }
 
+    /// Lists only persisted file-change metadata for one Session or loop.
+    /// Blob contents are deliberately not touched here; callers verify only
+    /// the records that survive their encoded page budget.
+    pub(crate) async fn list_tool_changes(
+        &self,
+        session_id: SessionId,
+        loop_id: Option<LoopId>,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<ToolChangeScan, StoreError> {
+        check_aux_scan(cancellation, deadline)?;
+        let session_dir = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
+            result = tokio::time::timeout_at(
+                deadline.into(),
+                self.require_session_directory(session_id),
+            ) => result.map_err(|_| StoreError::QueryLimit)??,
+        };
+        check_aux_scan(cancellation, deadline)?;
+        let tools_dir = session_dir.join(AUX_TOOLS_DIR);
+        let mut budget = ChangeScanBudget::default();
+        let mut complete = true;
+        let mut skipped = false;
+        let mut records = Vec::new();
+        match path_state(&tools_dir).await {
+            Ok(PathState::Missing) => {}
+            Ok(PathState::Directory) => {
+                let mut entries = match fs::read_dir(&tools_dir).await {
+                    Ok(entries) => entries,
+                    Err(_) => {
+                        return Ok(make_tool_change_scan(records, false, true, &budget));
+                    }
+                };
+                let limits = self.aux_limits();
+                loop {
+                    check_aux_scan(cancellation, deadline)?;
+                    // Reserve the entry ceiling before the next directory I/O, so
+                    // the hard limit is never exceeded by one speculative read.
+                    if !budget.entry_available(limits.max_scan_entries) {
+                        complete = false;
+                        skipped = true;
+                        break;
+                    }
+                    let entry = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
+                        result = tokio::time::timeout_at(
+                            deadline.into(),
+                            entries.next_entry(),
+                        ) => match result {
+                            Ok(Ok(Some(entry))) => entry,
+                            Ok(Ok(None)) => break,
+                            Ok(Err(_)) => {
+                                complete = false;
+                                skipped = true;
+                                break;
+                            }
+                            Err(_) => return Err(StoreError::QueryLimit),
+                        },
+                    };
+                    budget.consume_entry();
+                    check_aux_scan(cancellation, deadline)?;
+                    let path = entry.path();
+                    let metadata = match fs::symlink_metadata(&path).await {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            complete = false;
+                            skipped = true;
+                            continue;
+                        }
+                    };
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        complete = false;
+                        skipped = true;
+                        continue;
+                    };
+                    if is_valid_temp_name(&name) {
+                        continue;
+                    }
+                    if !valid_sha256(&name)
+                        || metadata.file_type().is_symlink()
+                        || !metadata.is_dir()
+                    {
+                        complete = false;
+                        skipped = true;
+                        continue;
+                    }
+                    match self
+                        .read_change_metadata_at(
+                            &path,
+                            session_id,
+                            &name,
+                            cancellation,
+                            deadline,
+                            &mut budget,
+                        )
+                        .await?
+                    {
+                        ChangeMetadataRead::BudgetExhausted => {
+                            complete = false;
+                            skipped = true;
+                            break;
+                        }
+                        ChangeMetadataRead::Record(None) => {
+                            complete = false;
+                            skipped = true;
+                        }
+                        ChangeMetadataRead::Record(Some(stored)) => {
+                            let Some(change) = stored.file_change else {
+                                continue;
+                            };
+                            if loop_id
+                                .as_ref()
+                                .is_some_and(|wanted| &stored.tool_ref.loop_id != wanted)
+                            {
+                                continue;
+                            }
+                            records.push((stored.tool_ref, change));
+                            if records.len() > limits.session_records {
+                                records.pop();
+                                complete = false;
+                                skipped = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(_) | Err(_) => {
+                complete = false;
+                skipped = true;
+            }
+        }
+        Ok(make_tool_change_scan(records, complete, skipped, &budget))
+    }
+
+    async fn read_change_metadata_at(
+        &self,
+        path: &Path,
+        session_id: SessionId,
+        expected_hash: &str,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        budget: &mut ChangeScanBudget,
+    ) -> Result<ChangeMetadataRead, StoreError> {
+        let mut entries = match fs::read_dir(path).await {
+            Ok(entries) => entries,
+            Err(_) => return Ok(ChangeMetadataRead::Record(None)),
+        };
+        let mut record_path = None;
+        let mut malformed = false;
+        let max_entries = self.aux_limits().max_scan_entries;
+        loop {
+            check_aux_scan(cancellation, deadline)?;
+            // Same entry ceiling reservation as the outer scan, before I/O.
+            if !budget.entry_available(max_entries) {
+                return Ok(ChangeMetadataRead::BudgetExhausted);
+            }
+            let entry = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
+                result = tokio::time::timeout_at(
+                    deadline.into(),
+                    entries.next_entry(),
+                ) => match result {
+                    Ok(Ok(Some(entry))) => entry,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(_)) => return Ok(ChangeMetadataRead::Record(None)),
+                    Err(_) => return Err(StoreError::QueryLimit),
+                },
+            };
+            budget.consume_entry();
+            let metadata = match fs::symlink_metadata(entry.path()).await {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    malformed = true;
+                    continue;
+                }
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                malformed = true;
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || !ALLOWED_AUX_FILES.contains(&name.as_str())
+            {
+                malformed = true;
+                continue;
+            }
+            if name == TOOL_RECORD_FILE {
+                record_path = Some(entry.path());
+            }
+        }
+        if malformed {
+            return Ok(ChangeMetadataRead::Record(None));
+        }
+        let Some(record_path) = record_path else {
+            return Ok(ChangeMetadataRead::Record(None));
+        };
+        let file = match safe_open_read(&record_path).await {
+            Ok(file) => file,
+            Err(_) => return Ok(ChangeMetadataRead::Record(None)),
+        };
+        // Read at most the remaining allowance, capped by the oversized-file
+        // probe. If the read fills a cap smaller than that probe the file did
+        // not reach EOF, so a truncated read is never accepted as a complete
+        // record and the whole read stays inside the cumulative budget.
+        let probe = MAX_TOOL_METADATA_BYTES.saturating_add(1);
+        let remaining = CHANGE_SCAN_METADATA_BYTES.saturating_sub(budget.metadata_bytes);
+        if remaining == 0 {
+            return Ok(ChangeMetadataRead::BudgetExhausted);
+        }
+        let cap = remaining.min(probe);
+        let mut bytes = Vec::new();
+        let mut reader = file.take(cap as u64);
+        let read = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
+            result = tokio::time::timeout_at(
+                deadline.into(),
+                reader.read_to_end(&mut bytes),
+            ) => result.map_err(|_| StoreError::QueryLimit)?,
+        };
+        if read.is_err() {
+            return Ok(ChangeMetadataRead::Record(None));
+        }
+        check_aux_scan(cancellation, deadline)?;
+        // Charge every byte actually read, including an oversized file, so the
+        // cumulative budget bounds total metadata I/O rather than only the
+        // records that parse successfully.
+        if !budget.consume_metadata(bytes.len(), CHANGE_SCAN_METADATA_BYTES) {
+            return Ok(ChangeMetadataRead::BudgetExhausted);
+        }
+        if bytes.len() > MAX_TOOL_METADATA_BYTES {
+            return Ok(ChangeMetadataRead::Record(None));
+        }
+        if bytes.len() == cap && cap < probe {
+            return Ok(ChangeMetadataRead::BudgetExhausted);
+        }
+        let stored: StoredToolRecord = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(_) => return Ok(ChangeMetadataRead::Record(None)),
+        };
+        if stored.tool_ref.session_id != session_id
+            || tool_ref_hash(&stored.tool_ref) != expected_hash
+            || validate_stored_tool_record(&stored, &stored.tool_ref).is_err()
+        {
+            return Ok(ChangeMetadataRead::Record(None));
+        }
+        Ok(ChangeMetadataRead::Record(Some(Box::new(stored))))
+    }
+
+    pub(crate) async fn change_blobs_available(
+        &self,
+        session_id: SessionId,
+        tool_ref: &ToolRef,
+        change: &StoredFileChange,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        budget: &mut ChangeBlobBudget,
+    ) -> Result<bool, StoreError> {
+        check_aux_scan(cancellation, deadline)?;
+        if !change.before_captured
+            || !change.after_captured
+            || (!matches!(
+                &change.before,
+                ChangeRevision::Missing | ChangeRevision::Content { .. }
+            ))
+            || !matches!(&change.after, ChangeRevision::Content { .. })
+        {
+            return Ok(false);
+        }
+        // Charge the worst-case read cost (expected bytes plus the one-byte
+        // lookahead), not just the expected length, so the cumulative budget
+        // bounds what is actually read from disk. A `Missing` before-image is
+        // not opened and costs 0; a real empty `Content` still costs 1.
+        let required = change_blob_read_cost(&change.before)
+            .saturating_add(change_blob_read_cost(&change.after));
+        if budget.used_bytes.saturating_add(required) > CHANGE_SCAN_BLOB_BYTES {
+            budget.exhausted = true;
+            return Ok(false);
+        }
+        budget.used_bytes = budget.used_bytes.saturating_add(required);
+        let target_dir = self
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(tool_ref_hash(tool_ref));
+        let before = Self::change_blob_present(
+            &target_dir.join(TOOL_BEFORE_FILE),
+            &change.before,
+            cancellation,
+            deadline,
+        )
+        .await?;
+        let after = Self::change_blob_present(
+            &target_dir.join(TOOL_AFTER_FILE),
+            &change.after,
+            cancellation,
+            deadline,
+        )
+        .await?;
+        Ok(before && after)
+    }
+
+    async fn change_blob_present(
+        path: &Path,
+        revision: &ChangeRevision,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        if !matches!(revision, ChangeRevision::Content { .. }) {
+            return Ok(true);
+        }
+        let (value, corrupt) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
+            result = tokio::time::timeout_at(deadline.into(), read_change_blob(path, revision)) => {
+                result.map_err(|_| StoreError::QueryLimit)?
+            }
+        };
+        check_aux_scan(cancellation, deadline)?;
+        Ok(value.is_some() && !corrupt)
+    }
+
     async fn read_tool_record_details(
         &self,
         tool_ref: &ToolRef,
@@ -1364,12 +1803,27 @@ impl Store {
         )
         .await;
 
+        let (file_change_before, file_change_before_corrupt) = match &stored.file_change {
+            Some(change) => {
+                read_change_blob(&target_dir.join(TOOL_BEFORE_FILE), &change.before).await
+            }
+            None => (None, false),
+        };
+        let (file_change_after, file_change_after_corrupt) = match &stored.file_change {
+            Some(change) => {
+                read_change_blob(&target_dir.join(TOOL_AFTER_FILE), &change.after).await
+            }
+            None => (None, false),
+        };
+
         let record = ToolRecord::from_stored(
             stored.clone(),
             (input_bytes, input_corrupt),
             (result_bytes, result_corrupt),
             (stdout_bytes, stdout_corrupt),
             (stderr_bytes, stderr_corrupt),
+            (file_change_before, file_change_before_corrupt),
+            (file_change_after, file_change_after_corrupt),
         );
 
         Ok(Some(ReadToolRecord {
@@ -2245,6 +2699,71 @@ fn check_history_scan(limits: &HistoryScanLimits) -> Result<(), StoreError> {
     }
 }
 
+fn check_aux_scan(cancellation: &CancellationToken, deadline: Instant) -> Result<(), StoreError> {
+    if cancellation.is_cancelled() || Instant::now() >= deadline {
+        Err(StoreError::QueryLimit)
+    } else {
+        Ok(())
+    }
+}
+
+impl ChangeScanBudget {
+    /// True when one more directory entry fits under the scan ceiling. Callers
+    /// check this before the next `next_entry()` I/O, then record the consumed
+    /// entry only after they really received one.
+    fn entry_available(&self, max_entries: usize) -> bool {
+        self.entries < max_entries
+    }
+
+    fn consume_entry(&mut self) {
+        self.entries = self.entries.saturating_add(1);
+    }
+
+    fn consume_metadata(&mut self, bytes: usize, max_bytes: usize) -> bool {
+        self.metadata_bytes = self.metadata_bytes.saturating_add(bytes);
+        self.metadata_bytes <= max_bytes
+    }
+}
+
+/// The worst-case bytes one blob verification reads, including the one-byte
+/// lookahead that detects an oversized or truncated file. A `Content` blob is
+/// always read with `.take(bytes + 1)`, so even a genuinely empty one costs 1;
+/// a `Missing` before-image is not opened at all and costs 0.
+fn change_blob_read_cost(revision: &ChangeRevision) -> usize {
+    match revision {
+        ChangeRevision::Content { bytes, .. } => bytes.saturating_add(1),
+        ChangeRevision::Missing | ChangeRevision::Metadata { .. } | ChangeRevision::Unknown => 0,
+    }
+}
+
+fn make_tool_change_scan(
+    mut records: Vec<(ToolRef, StoredFileChange)>,
+    complete: bool,
+    skipped: bool,
+    budget: &ChangeScanBudget,
+) -> ToolChangeScan {
+    records.sort_by_cached_key(|entry| tool_ref_hash(&entry.0));
+    let fingerprint = serde_json::to_vec(&(
+        &records,
+        complete,
+        skipped,
+        budget.entries,
+        budget.metadata_bytes,
+    ))
+    .map(|bytes| hash_bytes(&bytes))
+    .unwrap_or_else(|_| hash_bytes(b"change-scan-serialization-failed"));
+    ToolChangeScan {
+        records,
+        complete,
+        skipped,
+        #[cfg(test)]
+        entries: budget.entries,
+        #[cfg(test)]
+        metadata_bytes: budget.metadata_bytes,
+        observation: fingerprint,
+    }
+}
+
 fn finish_empty_history_page(
     captured_end: u64,
     expected_revision: Option<&str>,
@@ -2799,12 +3318,25 @@ fn validate_stored_tool_record(
         return Err(StoreError::RecordTooLarge);
     }
 
+    let change_bytes = stored.file_change.as_ref().map_or(0, |change| {
+        let before = match &change.before {
+            crate::changes::ChangeRevision::Content { bytes, .. } => *bytes,
+            _ => 0,
+        };
+        let after = match &change.after {
+            crate::changes::ChangeRevision::Content { bytes, .. } => *bytes,
+            _ => 0,
+        };
+        before.saturating_add(after)
+    });
+
     let total_file_bytes = stored
         .input
         .file_bytes
         .saturating_add(stored.result.file_bytes)
         .saturating_add(stored.stdout.file_bytes)
-        .saturating_add(stored.stderr.file_bytes);
+        .saturating_add(stored.stderr.file_bytes)
+        .saturating_add(change_bytes);
     if total_file_bytes > 3 * 1024 * 1024 {
         return Err(StoreError::RecordTooLarge);
     }
@@ -2846,6 +3378,108 @@ fn validate_stored_tool_record(
         }
     }
 
+    if let Some(change) = &stored.file_change {
+        validate_stored_file_change(change)?;
+    }
+
+    Ok(())
+}
+
+fn validate_stored_file_change(change: &StoredFileChange) -> Result<(), StoreError> {
+    crate::workspace::validate_relative_path(&change.path).map_err(|_| StoreError::Corrupt)?;
+    match &change.before {
+        ChangeRevision::Missing => {
+            if !change.before_captured {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        ChangeRevision::Content { sha256, bytes } => {
+            if !change.before_captured
+                || *bytes > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES
+                || !valid_sha256(sha256)
+            {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        ChangeRevision::Metadata { .. } | ChangeRevision::Unknown => {
+            if change.before_captured {
+                return Err(StoreError::Corrupt);
+            }
+        }
+    }
+    match &change.after {
+        ChangeRevision::Content { sha256, bytes } => {
+            if !change.after_captured
+                || *bytes > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES
+                || !valid_sha256(sha256)
+            {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        ChangeRevision::Missing | ChangeRevision::Metadata { .. } | ChangeRevision::Unknown => {
+            if change.after_captured {
+                return Err(StoreError::Corrupt);
+            }
+        }
+    }
+    match change.commit_state {
+        crate::changes::ChangeCommitState::Applied
+        | crate::changes::ChangeCommitState::Conflict => {
+            if !matches!(&change.after, ChangeRevision::Content { .. }) {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        crate::changes::ChangeCommitState::NotCommitted
+        | crate::changes::ChangeCommitState::Unknown => {}
+    }
+    Ok(())
+}
+
+fn validate_file_change_snapshot(
+    stored: Option<&StoredFileChange>,
+    before_bytes: Option<&[u8]>,
+    after_bytes: Option<&[u8]>,
+) -> Result<(), StoreError> {
+    let Some(stored) = stored else {
+        return if before_bytes.is_none() && after_bytes.is_none() {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt)
+        };
+    };
+    validate_stored_file_change(stored)?;
+    if let Some(bytes) = before_bytes {
+        let ChangeRevision::Content {
+            sha256,
+            bytes: size,
+        } = &stored.before
+        else {
+            return Err(StoreError::Corrupt);
+        };
+        if !stored.before_captured
+            || bytes.len() != *size
+            || bytes.len() > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES
+            || hash_bytes(bytes) != *sha256
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
+    if let Some(bytes) = after_bytes {
+        let ChangeRevision::Content {
+            sha256,
+            bytes: size,
+        } = &stored.after
+        else {
+            return Err(StoreError::Corrupt);
+        };
+        if !stored.after_captured
+            || bytes.len() != *size
+            || bytes.len() > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES
+            || hash_bytes(bytes) != *sha256
+        {
+            return Err(StoreError::Corrupt);
+        }
+    }
     Ok(())
 }
 
@@ -2884,6 +3518,37 @@ async fn read_blob(
         return (None, true);
     }
     (Some(bytes), false)
+}
+
+async fn read_change_blob(path: &Path, revision: &ChangeRevision) -> (Option<Vec<u8>>, bool) {
+    let ChangeRevision::Content { sha256, bytes } = revision else {
+        return (None, false);
+    };
+    if *bytes > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES || !valid_sha256(sha256) {
+        return (None, true);
+    }
+    #[cfg(test)]
+    READ_CHANGE_BLOBS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(path.to_path_buf());
+    let Ok(file) = safe_open_read(path).await else {
+        return (None, true);
+    };
+    let mut value = Vec::with_capacity(*bytes);
+    if file
+        .take((*bytes).saturating_add(1) as u64)
+        .read_to_end(&mut value)
+        .await
+        .is_err()
+    {
+        return (None, true);
+    }
+    if value.len() != *bytes || hash_bytes(&value) != *sha256 {
+        return (None, true);
+    }
+    (Some(value), false)
 }
 
 async fn verify_and_scan_temp_dir(
@@ -3011,6 +3676,7 @@ async fn scan_and_verify_tool_dir(
     {
         return Err(StoreError::Corrupt);
     }
+    validate_stored_tool_record(&stored, &stored.tool_ref)?;
 
     Ok((
         dir_bytes,
@@ -3314,10 +3980,14 @@ mod tests {
     use minicore_runtime::model::{
         AssistantPart, ModelFinishReason, ModelRef, ReasoningPreference, ToolCall, Usage,
     };
+    use minicore_runtime::tools::ToolResultOutcome;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
-    use crate::tool_data::{ToolDataAvailability, ToolDataStream, ToolOutputRequest};
+    use crate::changes::{
+        ChangeCommitState, ChangeCoverage, ChangeKind, FileChange, content_revision,
+    };
+    use crate::tool_data::{ToolData, ToolDataAvailability, ToolDataStream, ToolOutputRequest};
 
     use super::*;
 
@@ -4718,11 +5388,14 @@ mod tests {
                     output_complete: true,
                     output_truncated: false,
                 }),
+                file_change: None,
             },
             input_bytes: Some(input_bytes),
             result_bytes: Some(result_bytes),
             stdout_bytes: Some(stdout_bytes.clone()),
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         store
@@ -4775,6 +5448,656 @@ mod tests {
         assert_eq!(stderr_page.observed_end, 0);
         assert!(stderr_page.data.is_empty());
 
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn file_change_auxiliary_round_trip_and_missing_blob_degrade_details() {
+        let (base, store, session_id) = fixture("file-change-round-trip").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("write-file-change").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "write");
+        data.note_file_change(
+            &tool_ref,
+            FileChange {
+                path: "value.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(b"user\n"),
+                after: content_revision(b"agent\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(b"user\n".to_vec()),
+                after_bytes: Some(b"agent\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+            .expect("file change record finishes");
+        let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let scan = store
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan.records.len(), 1);
+        let mut blob_budget = ChangeBlobBudget {
+            used_bytes: 0,
+            exhausted: false,
+        };
+        assert!(
+            store
+                .change_blobs_available(
+                    session_id,
+                    &scan.records[0].0,
+                    &scan.records[0].1,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(10),
+                    &mut blob_budget,
+                )
+                .await
+                .unwrap()
+        );
+
+        let target = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(tool_ref_hash(&tool_ref))
+            .join(TOOL_AFTER_FILE);
+        fs::remove_file(&target).await.unwrap();
+        let scan = store
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan.records.len(), 1);
+        let mut blob_budget = ChangeBlobBudget {
+            used_bytes: 0,
+            exhausted: false,
+        };
+        assert!(
+            !store
+                .change_blobs_available(
+                    session_id,
+                    &scan.records[0].0,
+                    &scan.records[0].1,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(10),
+                    &mut blob_budget,
+                )
+                .await
+                .unwrap()
+        );
+        fs::write(&target, b"bogus!").await.unwrap();
+        let scan = store
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan.records.len(), 1);
+        let mut blob_budget = ChangeBlobBudget {
+            used_bytes: 0,
+            exhausted: false,
+        };
+        assert!(
+            !store
+                .change_blobs_available(
+                    session_id,
+                    &scan.records[0].0,
+                    &scan.records[0].1,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(10),
+                    &mut blob_budget,
+                )
+                .await
+                .unwrap()
+        );
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs() {
+        let (base, store, session_id) = fixture("change-cold-pages").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        // 12 persisted native records; only the page's records are ever verified.
+        let mut refs = Vec::new();
+        for index in 0..12u32 {
+            let tool_ref = ToolRef {
+                session_id,
+                loop_id: LoopId::new().unwrap(),
+                request_index: index,
+                tool_call_id: ToolCallId::new(format!("cold-{index}")).unwrap(),
+            };
+            let before = format!("before-{index}\n").into_bytes();
+            let after = format!("after-{index}\n").into_bytes();
+            let data = ToolData::new();
+            data.note_requested(&tool_ref, "write");
+            data.note_file_change(
+                &tool_ref,
+                FileChange {
+                    path: format!("file-{index}.txt"),
+                    kind: ChangeKind::Modified,
+                    before: content_revision(&before),
+                    after: content_revision(&after),
+                    commit_state: ChangeCommitState::Applied,
+                    coverage: ChangeCoverage::Complete,
+                    before_captured: true,
+                    after_captured: true,
+                    before_bytes: Some(before),
+                    after_bytes: Some(after),
+                    before_corrupt: false,
+                    after_corrupt: false,
+                },
+            );
+            data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+                .expect("cold change record finishes");
+            store
+                .commit_tool_record(
+                    &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+                .unwrap();
+            refs.push(tool_ref);
+        }
+
+        // A missing after.bin degrades only that one record's details.
+        let broken_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(tool_ref_hash(&refs[3]));
+        fs::remove_file(broken_dir.join(TOOL_AFTER_FILE))
+            .await
+            .unwrap();
+
+        let scan = store
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan.records.len(), 12);
+        assert!(scan.complete);
+        assert!(!scan.skipped);
+        assert!(scan.metadata_bytes > 0);
+        assert!(scan.entries >= 12);
+        // Metadata-only scan: no blob is read or hashed while listing.
+        let mut budget = ChangeBlobBudget {
+            used_bytes: 0,
+            exhausted: false,
+        };
+        for (tool_ref, change) in &scan.records {
+            if tool_ref == &refs[3] {
+                assert!(
+                    !store
+                        .change_blobs_available(
+                            session_id,
+                            tool_ref,
+                            change,
+                            &CancellationToken::new(),
+                            Instant::now() + Duration::from_secs(10),
+                            &mut budget,
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+
+        // Continuation cursors keep scope identity and reject a different scope.
+        let request = crate::changes::ChangesListRequest {
+            session_id,
+            scope: crate::changes::ChangeScope::Session,
+            cursor: None,
+            limit: 3,
+            max_bytes: Some(64 * 1024),
+        };
+        // Only the records that survive a page may have their blobs read and
+        // verified. Walk every page to exhaustion: each page must attempt at
+        // least one read (even a missing after.bin is still attempted), and no
+        // attempt may target a record outside that page. The log is scoped to
+        // this fixture root so parallel tests cannot pollute or drain it.
+        let page_dirs = |page: &crate::changes::ChangesListResult| {
+            page.records
+                .iter()
+                .filter_map(|record| record.tool_ref.as_ref())
+                .map(tool_ref_hash)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let dir_of = |path: &Path| {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .to_owned()
+        };
+        let _ = take_read_change_blobs_under(&base);
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pages = 0;
+        let mut broken_seen = false;
+        loop {
+            let page = crate::changes::list_tool_changes(
+                store.clone(),
+                None,
+                crate::changes::ChangesListRequest {
+                    cursor: cursor.clone(),
+                    ..request.clone()
+                },
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert!(!page.records.is_empty());
+            let expected_dirs = page_dirs(&page);
+            let attempts = take_read_change_blobs_under(&base);
+            assert!(
+                !attempts.is_empty(),
+                "page {pages} did not attempt any blob verification"
+            );
+            for path in attempts {
+                let dir = dir_of(&path);
+                assert!(
+                    expected_dirs.contains(&dir),
+                    "cold listing read a blob outside its page: {dir}"
+                );
+            }
+            for record in &page.records {
+                assert!(
+                    seen.insert(record.change_ref.clone()),
+                    "a record was returned on two pages"
+                );
+                if record.tool_ref.as_ref() == Some(&refs[3]) {
+                    broken_seen = true;
+                    assert!(!record.details_available);
+                } else {
+                    assert!(record.details_available);
+                }
+            }
+            pages += 1;
+            match page.next_cursor {
+                Some(next) => {
+                    assert_eq!(next.session_id, session_id);
+                    assert_eq!(next.scope, crate::changes::ChangeScope::Session);
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pages, 4, "12 records page as 3+3+3+3");
+        assert_eq!(seen.len(), 12, "every record was returned exactly once");
+        assert!(broken_seen, "the degraded record was still listed");
+
+        // A workspace-scoped cursor cannot continue a session page.
+        let mismatched = crate::changes::ChangesListRequest {
+            scope: crate::changes::ChangeScope::Workspace,
+            cursor: cursor.clone(),
+            ..request.clone()
+        };
+        assert!(mismatched.validate().is_err());
+
+        // Turn scope is filtered by the exact Loop ID and stays separate from
+        // the session scope: each record has its own loop here.
+        let turn_page = crate::changes::list_tool_changes(
+            store.clone(),
+            None,
+            crate::changes::ChangesListRequest {
+                scope: crate::changes::ChangeScope::Turn {
+                    loop_id: refs[0].loop_id,
+                },
+                cursor: None,
+                limit: 100,
+                max_bytes: Some(64 * 1024),
+                ..request.clone()
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn_page.records.len(), 1);
+        assert_eq!(
+            turn_page.records[0].tool_ref.as_ref().unwrap().loop_id,
+            refs[0].loop_id
+        );
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_change_metadata_is_skipped_without_corrupting_the_store() {
+        let (base, store, session_id) = fixture("change-metadata-corrupt").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let good_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("good").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&good_ref, "write");
+        data.note_file_change(
+            &good_ref,
+            FileChange {
+                path: "good.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(b"before\n"),
+                after: content_revision(b"after\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(b"before\n".to_vec()),
+                after_bytes: Some(b"after\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        data.finish_and_snapshot(&good_ref, ToolResultOutcome::Success)
+            .expect("change record finishes");
+        store
+            .commit_tool_record(
+                &data.snapshot_for_persistence(&good_ref).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+
+        // A directory with a malformed record.json must be skipped as an
+        // incomplete scan, not treated as Store corruption. Warm records still
+        // list the valid one.
+        let bad_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join("f".repeat(64));
+        fs::create_dir_all(&bad_dir).await.unwrap();
+        fs::write(bad_dir.join(TOOL_RECORD_FILE), b"{ not json")
+            .await
+            .unwrap();
+        let valid_ref = ToolRef {
+            session_id,
+            loop_id: good_ref.loop_id,
+            request_index: good_ref.request_index,
+            tool_call_id: good_ref.tool_call_id.clone(),
+        };
+        let warm = ToolData::new();
+        warm.note_requested(&valid_ref, "write");
+        warm.note_file_change(
+            &valid_ref,
+            FileChange {
+                path: "good.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                before: content_revision(b"before\n"),
+                after: content_revision(b"after\n"),
+                commit_state: ChangeCommitState::Applied,
+                coverage: ChangeCoverage::Complete,
+                before_captured: true,
+                after_captured: true,
+                before_bytes: Some(b"before\n".to_vec()),
+                after_bytes: Some(b"after\n".to_vec()),
+                before_corrupt: false,
+                after_corrupt: false,
+            },
+        );
+        let result = crate::changes::list_tool_changes(
+            store.clone(),
+            Some(std::sync::Arc::new(warm)),
+            crate::changes::ChangesListRequest {
+                session_id,
+                scope: crate::changes::ChangeScope::Session,
+                cursor: None,
+                limit: 10,
+                max_bytes: Some(64 * 1024),
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result
+                .warnings
+                .contains(&crate::changes::ChangeListWarning::RecordsSkipped)
+        );
+        assert!(!result.complete);
+        assert!(
+            result
+                .records
+                .iter()
+                .any(|record| record.path == "good.txt")
+        );
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn change_scan_entry_and_metadata_budgets_reserve_before_io() {
+        let (base, store, session_id) = fixture("change-scan-budget").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let mut refs = Vec::new();
+        for index in 0..3u32 {
+            let tool_ref = ToolRef {
+                session_id,
+                loop_id: LoopId::new().unwrap(),
+                request_index: index,
+                tool_call_id: ToolCallId::new(format!("budget-{index}")).unwrap(),
+            };
+            let data = ToolData::new();
+            data.note_requested(&tool_ref, "write");
+            data.note_file_change(
+                &tool_ref,
+                FileChange {
+                    path: format!("budget-{index}.txt"),
+                    kind: ChangeKind::Modified,
+                    before: content_revision(b"before\n"),
+                    after: content_revision(b"after\n"),
+                    commit_state: ChangeCommitState::Applied,
+                    coverage: ChangeCoverage::Complete,
+                    before_captured: true,
+                    after_captured: true,
+                    before_bytes: Some(b"before\n".to_vec()),
+                    after_bytes: Some(b"after\n".to_vec()),
+                    before_corrupt: false,
+                    after_corrupt: false,
+                },
+            );
+            data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+                .expect("budget change record finishes");
+            store
+                .commit_tool_record(
+                    &data.snapshot_for_persistence(&tool_ref).unwrap(),
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+                .unwrap();
+            refs.push(tool_ref);
+        }
+
+        // A scan budget that admits at most one entry must stop before reading a
+        // second directory entry, and must report the scan as incomplete rather
+        // than silently claiming a complete one-record list.
+        let limited = store.clone().with_aux_limits(AuxLimits {
+            max_scan_entries: 1,
+            ..DEFAULT_AUX_LIMITS
+        });
+        let scan = limited
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(!scan.complete);
+        assert!(scan.skipped);
+        assert!(
+            scan.entries <= 1,
+            "the entry ceiling is never exceeded (got {})",
+            scan.entries
+        );
+
+        // Metadata reads stay strictly inside the cumulative allowance: an empty
+        // remainder refuses before any read, and the direct unit assertions on
+        // accounting stay independent of filesystem size.
+        let budget = ChangeScanBudget {
+            entries: 0,
+            metadata_bytes: CHANGE_SCAN_METADATA_BYTES,
+        };
+        assert_eq!(
+            CHANGE_SCAN_METADATA_BYTES.saturating_sub(budget.metadata_bytes),
+            0
+        );
+        assert!(!budget.entry_available(0));
+        assert!(budget.entry_available(1));
+
+        // A record.json larger than the bounded metadata read is refused, never
+        // parsed as a complete record: the scan reports it as skipped.
+        let oversized_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join("a".repeat(64));
+        fs::create_dir_all(&oversized_dir).await.unwrap();
+        fs::write(
+            oversized_dir.join(TOOL_RECORD_FILE),
+            vec![b'x'; MAX_TOOL_METADATA_BYTES + 1],
+        )
+        .await
+        .unwrap();
+        let oversized_scan = store
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(!oversized_scan.complete);
+        assert!(oversized_scan.skipped);
+        assert_eq!(
+            oversized_scan.records.len(),
+            3,
+            "only the real records list"
+        );
+
+        // Blob verification charges the +1 lookahead, not just the expected
+        // bytes, and a missing before-image costs nothing.
+        assert_eq!(
+            change_blob_read_cost(&content_revision(b"")),
+            1,
+            "an empty content blob still costs its one-byte lookahead"
+        );
+        assert_eq!(change_blob_read_cost(&ChangeRevision::Missing), 0);
+        let mut blob_budget = ChangeBlobBudget {
+            used_bytes: CHANGE_SCAN_BLOB_BYTES - 1,
+            exhausted: false,
+        };
+        let change = StoredFileChange {
+            path: "x".to_owned(),
+            kind: ChangeKind::Modified,
+            before: ChangeRevision::Missing,
+            after: content_revision(b"after\n"),
+            commit_state: ChangeCommitState::Applied,
+            coverage: ChangeCoverage::Complete,
+            before_captured: true,
+            after_captured: true,
+        };
+        assert!(
+            !store
+                .change_blobs_available(
+                    session_id,
+                    &refs[0],
+                    &change,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(10),
+                    &mut blob_budget,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(blob_budget.exhausted, "the lookahead crosses the budget");
+
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn valid_temp_directory_does_not_mark_tool_change_scan_incomplete() {
+        let (base, store, session_id) = fixture("temp-scan-complete").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("call-temp-1").unwrap(),
+        };
+        let valid_hash = tool_ref_hash(&tool_ref);
+        let temp_dir = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(format!(".{valid_hash}.tmp-1234-1"));
+        fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let scan = store
+            .list_tool_changes(
+                session_id,
+                None,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(scan.complete);
+        assert!(!scan.skipped);
+        assert!(scan.records.is_empty());
         let _ = fs::remove_dir_all(base).await;
     }
 
@@ -4843,11 +6166,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: None,
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         store
@@ -4949,11 +6275,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: None,
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         // First commit succeeds
@@ -5049,11 +6378,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: Some(stdout_bytes),
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         store
@@ -5207,11 +6539,14 @@ mod tests {
                         file_sha256: None,
                     },
                     command: None,
+                    file_change: None,
                 },
                 input_bytes: None,
                 result_bytes: None,
                 stdout_bytes: None,
                 stderr_bytes: None,
+                file_change_before: None,
+                file_change_after: None,
             }
         };
 
@@ -5365,11 +6700,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: Some(stdout_bytes),
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         // First commit with normal limits
@@ -5482,11 +6820,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: None,
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         // Budget enforcement scanning encounters the symlink session entry and must fail closed
@@ -5574,11 +6915,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: None,
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         let res = store
@@ -5668,11 +7012,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: None,
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         // Budget enforcement fails closed because of unknown directory
@@ -5767,11 +7114,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: None,
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         // Commit succeeds and cleans up the orphaned legitimate temp directory
@@ -5858,6 +7208,7 @@ mod tests {
                 file_sha256: None,
             },
             command: None,
+            file_change: None,
         };
 
         fs::write(
@@ -5945,6 +7296,7 @@ mod tests {
                 file_sha256: None,
             },
             command: None,
+            file_change: None,
         };
         fs::write(
             target_dir.join(TOOL_RECORD_FILE),
@@ -6061,11 +7413,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: Some(stdout_bytes),
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         store
@@ -6173,11 +7528,14 @@ mod tests {
                     file_sha256: None,
                 },
                 command: None,
+                file_change: None,
             },
             input_bytes: None,
             result_bytes: None,
             stdout_bytes: Some(stdout_bytes),
             stderr_bytes: None,
+            file_change_before: None,
+            file_change_after: None,
         };
 
         store
@@ -6282,11 +7640,14 @@ mod tests {
                         file_sha256: None,
                     },
                     command: None,
+                    file_change: None,
                 },
                 input_bytes: None,
                 result_bytes: None,
                 stdout_bytes: None,
                 stderr_bytes: None,
+                file_change_before: None,
+                file_change_after: None,
             }
         };
 

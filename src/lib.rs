@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod changes;
 mod compaction;
 mod config;
 mod error;
@@ -35,6 +36,11 @@ pub use agent::{
     SessionState, SessionStatus, SessionUpdateResult, SteerMessage, TurnPersistence, TurnRef,
     TurnResult, TurnResultAvailability, TurnResultPage, TurnResultRequest, UpdateSession,
     agent_version,
+};
+pub use changes::{
+    ChangeCommitState, ChangeCoverage, ChangeCursor, ChangeKind, ChangeListConsistency,
+    ChangeListWarning, ChangeOrigin, ChangeRecord, ChangeRevision, ChangeScope, ChangesListRequest,
+    ChangesListResult,
 };
 pub use compaction::{
     AutomaticCompactionObservation, AutomaticCompactionView, CompactionResult, CompactionStatus,

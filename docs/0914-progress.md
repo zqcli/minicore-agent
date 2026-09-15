@@ -16,24 +16,30 @@ P3b2 passed parent review and remote verification. P4 is also verified: bounded
 file reads (P4a), listing and literal search (P4b), and isolated Git status
 queries (P4c). P5a owned Bash streams and in-memory output queries are verified.
 P5b1 auxiliary persistence and P5b2 public/RPC cold reads are verified.
-P6 change review and P7 integration remain pending.
+P6a native file-change recording, bounded auxiliary snapshots and three-scope
+`changes.list` passed parent review and remote verification: stable/MSRV each
+714 passed, 2 Live ignored; strict and cross-platform compile gates passed.
+Version-bound diffs and P7 integration remain pending.
 
 ## Execution
 
-The latest user instruction selects `cus-resp/gpt-5.6-luna:max` for subsequent
-implementation helpers, superseding the earlier DeepSeek/Gemini/GPT fallback
-order. The earlier model-role compatibility mismatch is
-fixed. P5a resumed with DeepSeek, then used Gemini after a context-overflow
-recovery failure; parent-owned review and remote verification remained required. The P3a implementation preferred
-`cus-resp/deepseek-v4.1-flash:high`, with three consecutive helper failures
-permitting `cus-resp/gpt-5.6-luna:max`; P3a used that fallback after three
-DeepSeek context-compaction failures. Only one helper implements at a time; the
-parent owns review, remote verification and commits. This handoff permits
-source, focused tests, documentation and formatting only. No local
-build/test/check or remote operation is part of the handoff. Transfers of
-private configuration and real Session data are excluded; the prior
-execution-boundary incident remains in the historical audit. No credentials are
-stored in source.
+The latest user instruction paused and reloaded the model configuration, then
+continued the same P6a draft review and remediation with
+`cus-resp/deepseek-v4.1-flash:high` (reasoning `high`); the reload is confirmed
+successful and is the current model. An upstream HTTP 404 had blocked the earlier
+`cus-resp/deepseek-v4.1-flash:high` handoff, and `cus-resp/gemini-3.8-flash:high`
+then carried the draft forward; both remain history. The P6a draft originally
+produced by GPT max was corrected under parent review and accepted after the
+reloaded DeepSeek high session completed the P6a remediation. The earlier model-role compatibility mismatch is fixed. P5a
+resumed with DeepSeek, then used Gemini after a context-overflow recovery
+failure; parent-owned review and remote verification remained required.
+The P3a implementation preferred `cus-resp/deepseek-v4.1-flash:high`, with three consecutive helper
+failures permitting `cus-resp/gpt-5.6-luna:max`; P3a used that fallback after three DeepSeek
+context-compaction failures. Only one helper implements at a time; the parent owns review,
+remote verification and commits. This handoff permits source, focused tests, documentation and
+formatting only. No local build/test/check or remote operation is part of the handoff. Transfers of
+private configuration and real Session data are excluded; the prior execution-boundary incident
+remains in the historical audit. No credentials are stored in source.
 
 ## Stages
 
@@ -45,7 +51,7 @@ stored in source.
 | P3 | Manual acceptance, startup/request compaction, one overflow recovery | Verified; P3b2 stable/MSRV 511 passed, 2 Live ignored; cross-platform compile checks passed |
 | P4 | Bounded Workspace files/read/search/status | Verified; 613 stable/MSRV passed, 2 Live ignored; strict and cross-platform compile gates passed |
 | P5 | Owned Bash streaming, cancellation, result retention | Verified; P5b2 stable/MSRV 688 passed, 2 Live ignored; strict and cross-platform compile gates passed |
-| P6 | Workspace and tool change scopes, versioned diffs | Pending |
+| P6 | Workspace and tool change scopes, versioned diffs | P6a verified: stable/MSRV 714 passed, 2 ignored; all gates passed; version-bound diff remains pending |
 | P7 | Client contract integration and final verification/documentation | Pending |
 
 Each stage is a vertical implementation/API/RPC/test slice, reviewed before
@@ -392,8 +398,9 @@ installation, version bump or push occurred. Runtime source and pin are unchange
 
 ## P4c Workspace Status
 
-`workspace.status` is the only interface in this slice: `changes.list`,
-`changes.diff`, and later phases are not implemented.
+`workspace.status` is the only Git interface in the P4c slice. P6a adds the
+read-only `changes.list` facade over this observation and retained native file
+records; `changes.diff` and later phases are not implemented.
 
 - **Fixed, shell-free Git observation**: one query runs at most three
   commands, `rev-parse --show-toplevel`, at most one
@@ -778,6 +785,107 @@ ANSI bytes exactly under a 1024-byte encoded-result budget.
   - Both sources unavailable preserving observed stream offsets.
   - Reader timeout/drop isolation from running Bash child processes.
   - RPC 4-query ceiling enforcement, `-32019` rejection, ping保活, and shutdown cancellation within <2s.
+
+## P6a Change Listing And Native File Records
+
+Parent acceptance completed on 2026-09-15 for the first P6 vertical slice,
+based on P5b2 `f15f88c`. Stable and Rust 1.85 each passed **714 tests**, with
+**2 Live Provider tests ignored**. Strict Clippy, formatting, rustdoc, Windows
+GNU and macOS all-target compile checks passed. Windows retains the existing
+`write_reload_config` test-helper warning. Native Windows/macOS execution and
+Live Provider tests were not run. Logs are under the remote build root:
+`logs/p6a-{tests,msrv,clippy,fmt,doc,windows,macos}.log`.
+
+The original GPT-produced draft compiled only after two compile fixes
+(`src/store.rs:1525` borrowed a temporary `file.take(...)` across
+`tokio::select!`, and the test at `src/store.rs:5461` reused `target` after
+passing it by value to `remove_file`) and retained a failing
+`tools::apply_patch::tests::bound_patch_records_the_same_source_and_computed_result`
+case whose test patch was a bare `@@\n-old\n+new`, which the tool deliberately
+rejects. These were draft failures, resolved before P6a acceptance.
+
+The `cus-resp/deepseek-v4.1-flash:high` handoff call that first attempted this
+remediation failed with upstream HTTP 404
+(`404 Not found. Check the docs for available routes.`) before producing a model
+response or modifying source; that 404 is retained as history. The user then
+selected `cus-resp/gemini-3.8-flash:high`, and after a pause and model reload
+continued the same P6a remediation with `cus-resp/deepseek-v4.1-flash:high`
+(reasoning `high`). The reload is confirmed successful and is the current model.
+No local build, test, check, clippy or rustdoc was run; formatting only.
+
+The reloaded session then corrected the invalid test patch to a legal complete
+unified diff (`--- a/value.txt` / `+++ b/value.txt` / `@@ -1 +1 @@`) without
+loosening the tool grammar, and unified the two duplicated page constructors
+into one `plan_page_end`. That plan reserves the worst-case header and
+`DetailsUnavailable`/`RecordsSkipped` warnings and forces `complete: false` (the
+longer encoding) while measuring, so the post-verification page can only shrink
+and a record whose blobs were already hashed can no longer fall outside the byte
+budget. The page end is planned once before blob verification and reused as an
+upper bound for the final `page_records`, keeping cursors continuous with no
+gaps or duplicates.
+
+New regressions cover: a real cold pagination path that walks all 12 persisted
+records across every page, asserting each page attempts at least one blob read
+and that no attempt targets a record outside that page (proved with a
+test-only blob-read log scoped to the fixture root so parallel tests cannot
+pollute it), a missing `after.bin` degrading only that record's details, cursor
+scope/session mismatch rejection across pages, a malformed `record.json` being
+skipped as an incomplete scan rather than Store corruption with warm records
+still listing the valid one, a bound `write` that times out after a real rename
+keeps the changed file and records `unknown` instead of pretending no mutation,
+the pagination byte reservation, and deferred `changes.list` capacity/cancel
+RPC cases that share the existing four-slot query pool and 32-waiter ceiling.
+The public RPC scope regression also closes the Session and deletes its Workspace,
+then obtains the same saved native change records through the cold query path.
+
+Parent strict-Clippy diagnostics then drove focused cleanup: the test-only
+`ToolChangeScan` counters are `cfg(test)` with a `ToolChangeScan::unavailable()`
+constructor, the test-only `workspace::status::status` wrapper is `cfg(test)`,
+`ChangeMetadataRead` boxes its large record, `LoopId` is copied instead of
+cloned, a cached-key sort avoids repeated hashing, and the test gate static uses
+a narrow alias. The same review found that the metadata and blob scans charged
+their limits only *after* the read: the entry ceiling is now reserved before
+the next directory I/O, metadata is read with `.take(remaining.min(probe))` so
+the cumulative byte allowance bounds total I/O and a truncated read is reported
+as an exhausted budget rather than a complete record, and blob verification
+charges the real `expected + 1` lookahead (a genuinely empty `Content` costs 1,
+a `Missing` before-image costs 0). Only the new P6 query budgets changed; the
+P5 write/GC retention logic is untouched. Boundary regressions cover the entry
+ceiling, an oversized `record.json`, and the blob lookahead crossing the
+cumulative budget.
+
+- `changes.list` has explicit `workspace`, `session`, and `turn(loop_id)`
+  scopes. Workspace results are live Git observations with
+  `WorkspaceUnknown` origin and no ToolRef. Session and turn results merge
+  warm ToolData with bounded cold Store metadata, preserving the complete
+  `(session_id, loop_id, request_index, tool_call_id)` identity.
+- The list cursor binds session, scope, and an observation fingerprint. Pages
+  are charged by encoded JSON bytes, and stale observations fail closed rather
+  than returning a new version under an old cursor; incomplete metadata scans
+  still expose cursors for retained records. Cold listing scans bounded
+  metadata first and verifies before/after blobs only for the selected page,
+  with separate cumulative metadata/blob budgets. The single pagination plan
+  reserves the worst-case warnings and the longer `complete: false` encoding,
+  so blob verification cannot push an already-selected record past the budget;
+  deferred RPC queries reuse the existing four-slot query pool and 32-waiter
+  ceiling, and workspace status work remains Session-owned under the same
+  absolute ten-second deadline as pagination.
+- Native `write`, `edit`, and `apply_patch` record only at the real mutation
+  boundary. `edit` and `apply_patch` reuse their source/result pair; `write`
+  best-effort captures an existing regular file. Each before/after snapshot is
+  bounded to 512 KiB and is independently retained or persisted as
+  `before.bin`/`after.bin` under existing ToolData/Store quotas.
+- Pre-commit failure is `not_committed`; an observed target mismatch is
+  `conflict`; rename followed by directory-sync failure is `unknown`. Unknown
+  capture/probe facts become `unknown` or partial rather than a false
+  `conflict`; oversized write-only capture remains best effort and the native
+  write continues. Memory/auxiliary eviction or missing/corrupt blobs make
+  details unavailable without changing the native tool outcome or blocking
+  History. No Bash, editor, external process, or other Agent change is
+  attributed to a native ToolRef.
+- `changes.diff`, revision-bound diff semantics, binary/untracked diff
+  details, and same-file aggregation are deliberately deferred to later P6
+  slices and are not a capability or RPC route in this handoff.
 
 ## P0 Verification
 

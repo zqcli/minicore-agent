@@ -36,6 +36,7 @@ use crate::tool_data::{
     ToolRecordingState, ToolRef, ToolStreamNotice,
 };
 use crate::tools::command::{CommandBinding, CommandOwners, CommandStreamSink};
+use crate::tools::{NativeApplyPatchTool, NativeEditTool, NativeWriteTool};
 
 /// Display text limits. Aligned with the existing per-argument/output caps so
 /// the expanded view can never promise rows that the Agent cannot show.
@@ -884,9 +885,10 @@ impl PromptProvider for SteerReceiptPrompt {
 
 /// Fixes the current request identity at `Tool::execute` start, computes the
 /// bounded ToolDisplay, then delegates execution unchanged (cancellation,
-/// deadline, errors, and the result are never altered). A real Bash tool
-/// receives the exact `ToolRef` captured here, so a command never resolves its
-/// identity from a table that a dropped future can leave stale.
+/// deadline, errors, and the result are never altered). Real Bash and native
+/// file tools receive the exact `ToolRef` captured here, so commands and
+/// mutation records never resolve identity from a table that a dropped future
+/// can leave stale.
 pub(crate) enum PresentationTool {
     Plain {
         inner: Arc<dyn Tool>,
@@ -894,6 +896,18 @@ pub(crate) enum PresentationTool {
     },
     Bash {
         inner: Arc<crate::tools::OwnedBashTool>,
+        presentation: Arc<Presentation>,
+    },
+    Write {
+        inner: Arc<NativeWriteTool>,
+        presentation: Arc<Presentation>,
+    },
+    Edit {
+        inner: Arc<NativeEditTool>,
+        presentation: Arc<Presentation>,
+    },
+    ApplyPatch {
+        inner: Arc<NativeApplyPatchTool>,
         presentation: Arc<Presentation>,
     },
 }
@@ -918,16 +932,53 @@ impl PresentationTool {
         })
     }
 
+    pub(crate) fn new_write(
+        inner: Arc<NativeWriteTool>,
+        presentation: Arc<Presentation>,
+    ) -> Arc<Self> {
+        Arc::new(Self::Write {
+            inner,
+            presentation,
+        })
+    }
+
+    pub(crate) fn new_edit(
+        inner: Arc<NativeEditTool>,
+        presentation: Arc<Presentation>,
+    ) -> Arc<Self> {
+        Arc::new(Self::Edit {
+            inner,
+            presentation,
+        })
+    }
+
+    pub(crate) fn new_apply_patch(
+        inner: Arc<NativeApplyPatchTool>,
+        presentation: Arc<Presentation>,
+    ) -> Arc<Self> {
+        Arc::new(Self::ApplyPatch {
+            inner,
+            presentation,
+        })
+    }
+
     fn inner(&self) -> &dyn Tool {
         match self {
             Self::Plain { inner, .. } => inner.as_ref(),
             Self::Bash { inner, .. } => inner.as_ref(),
+            Self::Write { inner, .. } => inner.as_ref(),
+            Self::Edit { inner, .. } => inner.as_ref(),
+            Self::ApplyPatch { inner, .. } => inner.as_ref(),
         }
     }
 
     fn presentation(&self) -> &Arc<Presentation> {
         match self {
-            Self::Plain { presentation, .. } | Self::Bash { presentation, .. } => presentation,
+            Self::Plain { presentation, .. }
+            | Self::Bash { presentation, .. }
+            | Self::Write { presentation, .. }
+            | Self::Edit { presentation, .. }
+            | Self::ApplyPatch { presentation, .. } => presentation,
         }
     }
 }
@@ -986,6 +1037,57 @@ impl Tool for PresentationTool {
                 Box::pin(async move {
                     let result = inner
                         .execute_bound(invocation, context, tool_ref.clone())
+                        .await;
+                    finish_presentation_tool(
+                        &presentation,
+                        request_key,
+                        &tool_call_id,
+                        tool_ref.as_ref(),
+                        &result,
+                    );
+                    result
+                })
+            }
+            Self::Write { inner, .. } => {
+                let inner = Arc::clone(inner);
+                let tool_data = presentation.tool_data();
+                Box::pin(async move {
+                    let result = inner
+                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
+                        .await;
+                    finish_presentation_tool(
+                        &presentation,
+                        request_key,
+                        &tool_call_id,
+                        tool_ref.as_ref(),
+                        &result,
+                    );
+                    result
+                })
+            }
+            Self::Edit { inner, .. } => {
+                let inner = Arc::clone(inner);
+                let tool_data = presentation.tool_data();
+                Box::pin(async move {
+                    let result = inner
+                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
+                        .await;
+                    finish_presentation_tool(
+                        &presentation,
+                        request_key,
+                        &tool_call_id,
+                        tool_ref.as_ref(),
+                        &result,
+                    );
+                    result
+                })
+            }
+            Self::ApplyPatch { inner, .. } => {
+                let inner = Arc::clone(inner);
+                let tool_data = presentation.tool_data();
+                Box::pin(async move {
+                    let result = inner
+                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
                         .await;
                     finish_presentation_tool(
                         &presentation,

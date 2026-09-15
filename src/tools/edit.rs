@@ -7,16 +7,17 @@ use minicore_runtime::tools::{
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::tool_data::{ToolData, ToolRef};
 use crate::{Workspace, WorkspaceError};
 
 use super::{
-    MAX_PATCH_BYTES, emit_phase, escape_control_characters, map_workspace_error, precheck_control,
-    run_controlled, wait_for_test_io,
+    FileBefore, MAX_PATCH_BYTES, emit_phase, escape_control_characters, expected_file_state,
+    map_workspace_error, precheck_control, record_file_change, run_controlled, wait_for_test_io,
 };
 
 const TOOL_NAME: &str = "edit";
 
-pub(super) struct EditTool {
+pub(crate) struct EditTool {
     workspace: Arc<Workspace>,
     spec: ToolSpec,
 }
@@ -32,7 +33,7 @@ struct EditInput {
 }
 
 impl EditTool {
-    pub(super) fn new(workspace: Arc<Workspace>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("edit is a valid tool name"),
             "Replace exact literal UTF-8 text in one existing workspace file.",
@@ -74,6 +75,18 @@ impl Tool for EditTool {
     }
 
     fn execute(&self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'_> {
+        self.execute_bound(invocation, context, None, None)
+    }
+}
+
+impl EditTool {
+    pub(crate) fn execute_bound(
+        &self,
+        invocation: ToolInvocation,
+        context: ToolContext,
+        tool_ref: Option<ToolRef>,
+        tool_data: Option<Arc<ToolData>>,
+    ) -> ToolFuture<'_> {
         Box::pin(async move {
             precheck_control(&context)?;
             if invocation.tool_name() != self.spec.name() {
@@ -97,11 +110,27 @@ impl Tool for EditTool {
             run_controlled(&context, async {
                 wait_for_test_io(TOOL_NAME, &input.path).await;
                 emit_phase(&context, "reading");
-                let source = self
-                    .workspace
-                    .read_text(&input.path, MAX_PATCH_BYTES)
-                    .await
-                    .map_err(map_source_error)?;
+                let (source, before) = if tool_ref.is_some() && tool_data.is_some() {
+                    let (source, stamp, stable) = self
+                        .workspace
+                        .read_text_snapshot(&input.path, MAX_PATCH_BYTES)
+                        .await
+                        .map_err(map_source_error)?;
+                    let before = FileBefore::Content {
+                        bytes: source.as_bytes().to_vec(),
+                        stamp,
+                        stable,
+                    };
+                    (source, before)
+                } else {
+                    (
+                        self.workspace
+                            .read_text(&input.path, MAX_PATCH_BYTES)
+                            .await
+                            .map_err(map_source_error)?,
+                        FileBefore::Unknown,
+                    )
+                };
                 emit_phase(&context, "matching");
                 let (result, replacements) = edit_text(&source, &input)?;
                 let output = ToolOutput::new(format!(
@@ -109,10 +138,20 @@ impl Tool for EditTool {
                 ))
                 .map_err(|_| ToolError::Internal)?;
                 emit_phase(&context, "committing");
-                self.workspace
-                    .write_atomic(&input.path, result.as_bytes())
-                    .await
-                    .map_err(map_workspace_error)?;
+                let expected = expected_file_state(&before);
+                let observation = self
+                    .workspace
+                    .write_atomic_observed(&input.path, result.as_bytes(), expected)
+                    .await;
+                record_file_change(
+                    tool_data.as_deref(),
+                    tool_ref.as_ref(),
+                    &input.path,
+                    before,
+                    result.as_bytes(),
+                    &observation,
+                );
+                observation.outcome.map_err(map_workspace_error)?;
                 Ok(ToolExecutionOutcome::Completed(output))
             })
             .await
@@ -174,16 +213,19 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use minicore_runtime::ToolCallId;
     use minicore_runtime::tools::{
         Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolInvocation, ToolProgressSink,
     };
+    use minicore_runtime::{LoopId, ToolCallId};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::tool_data::{ToolData, ToolRef};
     use crate::tools::{ToolIoGate, block_next_io};
-    use crate::workspace::{fail_next_before_rename, fail_next_directory_sync};
+    use crate::workspace::{
+        BeforeRenameGate, block_before_rename, fail_next_before_rename, fail_next_directory_sync,
+    };
 
     async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, EditTool) {
         let base = std::env::temp_dir().join(format!(
@@ -226,6 +268,15 @@ mod tests {
         {
             ToolExecutionOutcome::Completed(output) => Ok(output.content().as_str().to_owned()),
             ToolExecutionOutcome::RequestInput(_) => panic!("edit must not request input"),
+        }
+    }
+
+    fn bound_ref() -> ToolRef {
+        ToolRef {
+            session_id: "ses_00000000000000000000000000000001".parse().unwrap(),
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("edit-call").unwrap(),
         }
     }
 
@@ -277,6 +328,95 @@ mod tests {
                 .unwrap(),
             "before 世界 after"
         );
+        cleanup(&base).await;
+    }
+
+    #[tokio::test]
+    async fn bound_edit_records_the_same_source_and_computed_result() {
+        let (base, _, tool) = fixture("bound-record").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value.txt"), b"user dirty\n")
+            .await
+            .unwrap();
+        let data = Arc::new(ToolData::new());
+        let tool_ref = bound_ref();
+        data.note_requested(&tool_ref, TOOL_NAME);
+        let result = tool
+            .execute_bound(
+                invocation(json!({
+                    "path": "value.txt",
+                    "old_text": "dirty",
+                    "new_text": "clean"
+                })),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                Some(tool_ref.clone()),
+                Some(Arc::clone(&data)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, ToolExecutionOutcome::Completed(_)));
+        let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit_state, crate::ChangeCommitState::Applied);
+        data.finish_and_snapshot(
+            &tool_ref,
+            minicore_runtime::tools::ToolResultOutcome::Success,
+        )
+        .expect("bound edit record finishes");
+        let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+        assert_eq!(snapshot.file_change_before, Some(b"user dirty\n".to_vec()));
+        assert_eq!(snapshot.file_change_after, Some(b"user clean\n".to_vec()));
+        cleanup(&base).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_edit_records_a_conflict_when_the_target_changes_before_commit() {
+        let (base, workspace, tool) = fixture("bound-conflict").await;
+        let root = base.join("root");
+        tokio::fs::write(root.join("value.txt"), b"user dirty\n")
+            .await
+            .unwrap();
+        let target = workspace.resolve_for_write("value.txt").await.unwrap();
+        let gate = Arc::new(BeforeRenameGate::new(target.clone()));
+        block_before_rename(Arc::clone(&gate));
+        let data = Arc::new(ToolData::new());
+        let tool_ref = bound_ref();
+        data.note_requested(&tool_ref, TOOL_NAME);
+        let task_ref = tool_ref.clone();
+        let task_data = Arc::clone(&data);
+        let task = tokio::spawn(async move {
+            tool.execute_bound(
+                invocation(json!({
+                    "path": "value.txt",
+                    "old_text": "dirty",
+                    "new_text": "clean"
+                })),
+                context(
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                ),
+                Some(task_ref),
+                Some(task_data),
+            )
+            .await
+        });
+        gate.wait_started().await;
+        tokio::fs::write(&target, b"external change\n")
+            .await
+            .unwrap();
+        gate.release();
+        assert!(matches!(
+            task.await.unwrap(),
+            Ok(ToolExecutionOutcome::Completed(_))
+        ));
+        let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit_state, crate::ChangeCommitState::Conflict);
+        assert_eq!(records[0].coverage, crate::ChangeCoverage::Partial);
+        assert_eq!(tokio::fs::read(target).await.unwrap(), b"user clean\n");
         cleanup(&base).await;
     }
 

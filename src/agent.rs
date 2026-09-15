@@ -16,6 +16,10 @@ use minicore_runtime::prompt::PromptProvider;
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
+use crate::changes::{
+    ChangeScope, ChangesListRequest, ChangesListResult, change_deadline, list_tool_changes,
+    list_workspace_changes,
+};
 use crate::compaction::{
     AutoContext, CompactionResult, CompactionState, load_state, valid_operation_id,
 };
@@ -53,6 +57,7 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "workspace.files",
     "workspace.search",
     "workspace.status",
+    "changes.list",
     "deferred.waiter_limit",
 ];
 
@@ -610,6 +615,88 @@ impl Agent {
         // away first.
         let query = session.spawn_status_query(workspace, request, CancellationToken::new())?;
         query.wait().await
+    }
+
+    pub async fn changes_list(
+        &self,
+        request: ChangesListRequest,
+    ) -> Result<ChangesListResult, AgentError> {
+        self.changes_list_with_cancellation(request, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn changes_list_with_cancellation(
+        &self,
+        request: ChangesListRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ChangesListResult, AgentError> {
+        request.validate()?;
+        let deadline = change_deadline();
+        match &request.scope {
+            ChangeScope::Workspace => {
+                let session = self
+                    .loaded_session(request.session_id)
+                    .ok_or(AgentError::SessionNotLoaded)?;
+                let status_request = crate::WorkspaceStatusRequest {
+                    session_id: request.session_id,
+                    max_bytes: Some(request.max_bytes()),
+                };
+                let session_cancellation = session.query_cancellation();
+                let query = session.spawn_status_query_with_deadline(
+                    session.workspace(),
+                    status_request,
+                    cancellation.clone(),
+                    deadline,
+                )?;
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+                    _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        Err(AgentError::QueryLimit)
+                    }
+                    result = query.wait() => {
+                        let status = result?;
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+                            _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                                Err(AgentError::QueryLimit)
+                            }
+                            result = list_workspace_changes(
+                                request,
+                                status,
+                                cancellation.clone(),
+                                deadline,
+                            ) => result,
+                        }
+                    }
+                }
+            }
+            ChangeScope::Session | ChangeScope::Turn { .. } => {
+                let (tool_data, session_cancellation) = self
+                    .sessions
+                    .get(request.session_id)
+                    .map(|session| (Some(session.tool_data()), session.query_cancellation()))
+                    .unwrap_or_else(|| (None, CancellationToken::new()));
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+                    _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        Err(AgentError::QueryLimit)
+                    }
+                    result = list_tool_changes(
+                        self.store.clone(),
+                        tool_data,
+                        request,
+                        cancellation.clone(),
+                        deadline,
+                    ) => result,
+                }
+            }
+        }
     }
 
     /// Read-only structured facts for one tool call. Loaded in-memory facts

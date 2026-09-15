@@ -353,6 +353,7 @@ impl Observation {
 }
 
 /// Observes the Workspace's Git status through fixed, shell-free git arguments.
+#[cfg(test)]
 pub(crate) async fn status(
     workspace: &Workspace,
     request: &WorkspaceStatusRequest,
@@ -360,10 +361,27 @@ pub(crate) async fn status(
     shutdown_cancellation: &CancellationToken,
     child_cancellation: &CancellationToken,
 ) -> Result<WorkspaceStatusResult, AgentError> {
+    let deadline = status_deadline_at(workspace.root());
+    status_with_deadline(
+        workspace,
+        request,
+        session_cancellation,
+        shutdown_cancellation,
+        child_cancellation,
+        deadline,
+    )
+    .await
+}
+
+pub(crate) async fn status_with_deadline(
+    workspace: &Workspace,
+    request: &WorkspaceStatusRequest,
+    session_cancellation: &CancellationToken,
+    shutdown_cancellation: &CancellationToken,
+    child_cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<WorkspaceStatusResult, AgentError> {
     let root = workspace.root().to_path_buf();
-    let deadline = Instant::now()
-        .checked_add(status_deadline(&root))
-        .unwrap_or_else(Instant::now);
     let caps = status_caps(&root);
     let program = status_program(&root);
     let env = status_env(&root);
@@ -1346,6 +1364,12 @@ fn status_caps(root: &Path) -> StatusCaps {
     }
     let _ = root;
     StatusCaps::standard()
+}
+
+pub(crate) fn status_deadline_at(root: &Path) -> Instant {
+    Instant::now()
+        .checked_add(status_deadline(root))
+        .unwrap_or_else(Instant::now)
 }
 
 fn status_deadline(root: &Path) -> Duration {
