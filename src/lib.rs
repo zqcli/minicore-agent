@@ -4,6 +4,7 @@ mod agent;
 mod changes;
 mod compaction;
 mod config;
+mod diff;
 mod error;
 mod event;
 mod history;
@@ -48,6 +49,10 @@ pub use compaction::{
 };
 pub use config::{
     AgentConfig, ApprovalMode, CompactionConfig, ConfigError, LoopOverrides, Profile,
+};
+pub use diff::{
+    ChangesDiffRequest, DiffAvailability, DiffComparison, DiffCursor, DiffHunk, DiffLine,
+    DiffLineKind, DiffResult,
 };
 pub use error::{AgentError, RuntimeErrorView};
 pub use event::{

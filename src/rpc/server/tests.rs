@@ -642,6 +642,7 @@ async fn capability_discovery_returns_ordered_lists() {
             "workspace.search",
             "workspace.status",
             "changes.list",
+            "changes.diff",
             "deferred.waiter_limit"
         ])
     );
@@ -6204,6 +6205,322 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
         session_changes["result"]["records"]
     );
     assert!(!workspace.exists());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+/// End-to-end public-RPC flow: a real native write records a change, the
+/// change is listed, and `changes.diff` returns the actual user-dirty before
+/// rather than the Git HEAD content. It works both warm and after the Session
+/// is closed (cold), and pages a long line by UTF-8 fragments.
+#[tokio::test]
+async fn changes_diff_public_rpc_compares_native_before_and_after() {
+    let (agent, base, workspace) = test_agent(
+        "changes-diff-flow",
+        [
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "write",
+                arguments: json!({"path": "value.txt", "content": "agent\n"}),
+            }]),
+            ModelScript::ToolCalls(vec![ToolCallScript {
+                name: "write",
+                arguments: json!({"path": "long.txt", "content": "short"}),
+            }]),
+        ],
+        &["write"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    std::fs::write(workspace.join("value.txt"), b"user dirty\n").unwrap();
+    std::fs::write(workspace.join("long.txt"), "x".repeat(40)).unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session, "text": "update files"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+
+    harness
+        .send(
+            json!("list"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    let listed = harness.response(json!("list")).await;
+    let records = listed["result"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    let target = records
+        .iter()
+        .find(|record| record["path"] == json!("value.txt"))
+        .unwrap();
+    let change_ref = target["change_ref"].as_str().unwrap().to_owned();
+
+    // Warm diff: before is the actual user-dirty buffer, not HEAD.
+    harness
+        .send(
+            json!("diff"),
+            "changes.diff",
+            Some(json!({"session_id": session, "change_ref": change_ref})),
+        )
+        .await;
+    let diff = harness.response(json!("diff")).await;
+    assert_eq!(diff["result"]["base_version"]["kind"], json!("content"));
+    assert_eq!(diff["result"]["target_version"]["kind"], json!("content"));
+    assert_eq!(diff["result"]["comparison"], json!("tool_before_after"));
+    assert_eq!(diff["result"]["availability"], json!("available"));
+    let removed: String = diff["result"]["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|hunk| hunk["lines"].as_array().unwrap())
+        .filter(|line| line["kind"] == json!("removed"))
+        .map(|line| line["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(removed, "user dirty\n");
+
+    // A returned cursor continues the same comparison; a bumped revision is stale.
+    let cursor = diff["result"]["next_cursor"].clone();
+    if !cursor.is_null() {
+        harness
+            .send(
+                json!("cont"),
+                "changes.diff",
+                Some(json!({
+                    "session_id": session,
+                    "change_ref": change_ref,
+                    "cursor": cursor,
+                })),
+            )
+            .await;
+        let continued = harness.response(json!("cont")).await;
+        assert_eq!(continued["result"]["stale"], json!(false));
+    }
+
+    // Cold diff after close: the Store still resolves the record.
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    harness
+        .send(
+            json!("cold"),
+            "changes.diff",
+            Some(json!({"session_id": session, "change_ref": change_ref})),
+        )
+        .await;
+    let cold = harness.response(json!("cold")).await;
+    assert_eq!(cold["result"]["availability"], json!("available"));
+    assert_eq!(cold["result"]["change_ref"], json!(change_ref));
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+/// A long CRLF line with a missing final newline is paged by raw UTF-8
+/// fragments whose offsets reconstruct the exact original bytes.
+#[tokio::test]
+async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
+    let long = format!("{}{}", "a".repeat(2_500), "é🙂世界".repeat(300));
+    let (agent, base, workspace) = test_agent(
+        "changes-diff-paging",
+        [ModelScript::ToolCalls(vec![ToolCallScript {
+            name: "write",
+            arguments: json!({"path": "long.txt", "content": "changed"}),
+        }])],
+        &["write"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    std::fs::write(workspace.join("long.txt"), &long).unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session, "text": "update file"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+    harness
+        .send(
+            json!("list"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    let listed = harness.response(json!("list")).await;
+    let change_ref = listed["result"]["records"][0]["change_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut cursor = Value::Null;
+    let mut removed = String::new();
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 50, "paging did not terminate");
+        let params = if cursor.is_null() {
+            json!({"session_id": session, "change_ref": change_ref, "max_bytes": 4096})
+        } else {
+            json!({
+                "session_id": session,
+                "change_ref": change_ref,
+                "max_bytes": 4096,
+                "cursor": cursor,
+            })
+        };
+        harness
+            .send(json!("diff"), "changes.diff", Some(params))
+            .await;
+        let diff = harness.response(json!("diff")).await;
+        for hunk in diff["result"]["hunks"].as_array().unwrap() {
+            for line in hunk["lines"].as_array().unwrap() {
+                if line["kind"] == json!("removed") {
+                    assert_eq!(
+                        line["line_byte_offset"].as_u64().unwrap(),
+                        removed.len() as u64
+                    );
+                    removed.push_str(line["text"].as_str().unwrap());
+                }
+            }
+        }
+        if diff["result"]["complete"] == json!(true) {
+            break;
+        }
+        cursor = diff["result"]["next_cursor"].clone();
+        assert!(!cursor.is_null(), "an incomplete page must carry a cursor");
+    }
+    assert_eq!(removed, long);
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+/// Four `changes.diff` queries hold every query slot; a fifth is refused with
+/// `resource_exhausted` while ping stays available, and closing the owning
+/// Session cancels the held comparisons.
+#[tokio::test]
+async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
+    let (agent, base, workspace) = test_agent(
+        "changes-diff-capacity",
+        [ModelScript::ToolCalls(vec![ToolCallScript {
+            name: "write",
+            arguments: json!({"path": "value.txt", "content": "agent\n"}),
+        }])],
+        &["write"],
+        ApprovalMode::Auto,
+    )
+    .await;
+    std::fs::write(workspace.join("value.txt"), b"user\n").unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    harness
+        .send(
+            json!("send"),
+            "turn.send",
+            Some(json!({"session_id": session, "text": "update file"})),
+        )
+        .await;
+    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(
+        harness.response(json!("wait")).await["result"]["outcome"]["type"],
+        json!("completed")
+    );
+    harness
+        .send(
+            json!("list"),
+            "changes.list",
+            Some(json!({"session_id": session, "scope": "session"})),
+        )
+        .await;
+    let listed = harness.response(json!("list")).await;
+    let change_ref = listed["result"]["records"][0]["change_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut gates = Vec::new();
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let gate = Arc::new(crate::diff::DiffGate::new());
+        crate::diff::gate_next_diff(b"user\n", b"agent\n", Arc::clone(&gate));
+        gates.push(gate);
+        harness
+            .send(
+                json!(format!("diff-{index}")),
+                "changes.diff",
+                Some(json!({"session_id": session, "change_ref": change_ref})),
+            )
+            .await;
+    }
+    for gate in &gates {
+        tokio::time::timeout(TIMEOUT, gate.wait_started())
+            .await
+            .expect("changes.diff query did not start");
+    }
+
+    harness
+        .send(
+            json!("diff-over"),
+            "changes.diff",
+            Some(json!({"session_id": session, "change_ref": change_ref})),
+        )
+        .await;
+    let over = harness.response(json!("diff-over")).await;
+    assert_eq!(over["error"]["code"], json!(-32019));
+
+    harness
+        .send(json!("ping"), "agent.ping", Some(json!({})))
+        .await;
+    assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
+
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let response = harness.response(json!(format!("diff-{index}"))).await;
+        assert_eq!(response["error"]["code"], json!(-32020));
+    }
 
     harness.shutdown().await;
     remove_base(&base).await;
