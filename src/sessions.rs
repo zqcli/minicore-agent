@@ -65,6 +65,12 @@ static PAUSE_AFTER_ADMISSION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = Onc
 type RuntimeStartGateEntry = (SessionId, Arc<RuntimeStartGate>);
 #[cfg(test)]
 static PAUSE_AFTER_RUNTIME_START: OnceLock<Mutex<Vec<RuntimeStartGateEntry>>> = OnceLock::new();
+/// Records the `LoopOptions` a started Runtime loop actually captured. The
+/// Runtime owns those options privately, so this test-only observation is the
+/// only way to prove that a model update does not hot-modify a running loop.
+/// The entries are keyed by `LoopId` and never read outside tests.
+#[cfg(test)]
+static INSTALLED_LOOP_OPTIONS: OnceLock<Mutex<Vec<(LoopId, LoopOptions)>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct WorkerGate {
@@ -173,6 +179,18 @@ pub(crate) fn pause_next_runtime_start_before_bind(
         .lock()
         .unwrap()
         .push((session_id, gate));
+}
+
+#[cfg(test)]
+pub(crate) fn installed_loop_options_for_test(loop_id: LoopId) -> Option<LoopOptions> {
+    INSTALLED_LOOP_OPTIONS.get().and_then(|options| {
+        options
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(candidate, _)| *candidate == loop_id)
+            .map(|(_, options)| options.clone())
+    })
 }
 
 #[cfg(test)]
@@ -1293,6 +1311,8 @@ impl Session {
             // AgentLoop::start only validates and spawns the Runtime task; it
             // does not await model work. Keeping this short lock held closes
             // the cancellation/close race between validation and ownership.
+            #[cfg(test)]
+            let captured_options = execution.options.clone();
             let mut agent_loop = AgentLoop::start(execution.request, execution.options)
                 .map_err(map_loop_start_error)?;
             #[cfg(test)]
@@ -1311,6 +1331,12 @@ impl Session {
                 session_id: inner.record.session_id,
                 loop_id: handle.id(),
             };
+            #[cfg(test)]
+            INSTALLED_LOOP_OPTIONS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap()
+                .push((turn.loop_id, captured_options));
             let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
             let (completion_tx, completion_rx) = watch::channel(None);
             if let Some(admission) = admission {

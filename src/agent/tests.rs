@@ -4326,6 +4326,14 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
         .await
         .unwrap();
     assert!(updated.active_revision.is_some());
+    // The running loop keeps the options it captured at `AgentLoop::start`,
+    // even though the future options now carry the candidate model's timeout.
+    assert_eq!(
+        crate::sessions::installed_loop_options_for_test(turn.loop_id)
+            .expect("the running loop must record its install-time options")
+            .prompt_timeout,
+        std::time::Duration::from_secs(31)
+    );
     assert_eq!(
         session_options(&agent, info.session_id).prompt_timeout,
         std::time::Duration::from_secs(47)
@@ -4383,6 +4391,12 @@ async fn f2_03_close_and_reopen_rederives_installed_future_options() {
     );
 
     let turn = send_text(&mut agent, info.session_id, "after reopen").await;
+    // The reopened loop must derive exactly the options the pre-close update
+    // installed, so a future Turn and a reopen cannot drift apart.
+    let started = crate::sessions::installed_loop_options_for_test(turn.loop_id)
+        .expect("the reopened loop records its install-time options");
+    assert_eq!(started.prompt_timeout, installed.prompt_timeout);
+    assert_eq!(started.max_tool_rounds, installed.max_tool_rounds);
     wait_text(&agent, turn).await;
     assert_eq!(model_b.requests().lock().unwrap().len(), 1);
 }
@@ -4497,21 +4511,31 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
     let (workspace, _guard) = workspace_file("f2-05-ws", "a.txt", b"hello");
     let model_a = FakeModel::new("main", [ModelScript::Text("from a")]);
     let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
-    let mut agent = open_agent_with_configs(
+    let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
         ]),
         BTreeMap::from([
-            ("main".to_owned(), model_config("MINICORE_AGENT_TEST_KEY")),
-            ("other".to_owned(), model_config("MINICORE_AGENT_TEST_KEY")),
+            (
+                "main".to_owned(),
+                model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
+            ),
+            (
+                "other".to_owned(),
+                model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
+            ),
         ]),
         read_profile(),
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let before_options = session_options(&agent, info.session_id);
+    assert_eq!(
+        before_options.prompt_timeout,
+        std::time::Duration::from_secs(31)
+    );
     let gate = Arc::new(WorkerGate::new());
     pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
     let turn = send_text(&mut agent, info.session_id, "finish").await;
@@ -4546,7 +4570,8 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
     );
     assert_eq!(
         session_options(&agent, info.session_id).prompt_timeout,
-        before_options.prompt_timeout
+        std::time::Duration::from_secs(47),
+        "a sealed update must persist the candidate model's options for the next loop"
     );
     assert_eq!(
         agent.sessions.get(info.session_id).unwrap().record().model,
