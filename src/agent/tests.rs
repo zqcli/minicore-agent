@@ -4585,6 +4585,99 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
     assert_eq!(model_b.requests().lock().unwrap().len(), 1);
 }
 
+/// F2 sealed update with automatic compaction enabled: the candidate model's
+/// context budget must be installed for the next loop even though the sealed
+/// update returns no active revision. The two models use different windows so
+/// the derived trigger/target budget is observably different.
+#[tokio::test]
+async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
+    let (data_dir, _guard) = fixture_dir(&format!("f2-06-{}", next_id()));
+    let (workspace, _guard) = workspace_file("f2-06-ws", "a.txt", b"hello");
+    let model_a = FakeModel::with_window("main", 16_000, [ModelScript::Text("from a")]);
+    let model_b = FakeModel::with_window("other", 8_000, [ModelScript::Text("from b")]);
+    let mut agent = open_agent_auto_with_configs(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("other".to_owned(), Arc::clone(&model_b)),
+        ]),
+        BTreeMap::from([
+            (
+                "main".to_owned(),
+                model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
+            ),
+            (
+                "other".to_owned(),
+                model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
+            ),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let before = agent.session_context(info.session_id).unwrap().budget;
+    assert_eq!(before.input_budget_tokens, Some(16_000));
+    assert_eq!(before.trigger_tokens, Some(12_800));
+
+    // Seal the Runtime loop before the worker joins, then update.
+    let gate = Arc::new(WorkerGate::new());
+    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let turn = send_text(&mut agent, info.session_id, "finish").await;
+    gate.wait_started().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if agent
+                .runtime_loop_finished_for_test(info.session_id)
+                .unwrap()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime must seal before the worker is joined");
+
+    let updated = agent
+        .update_session(UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        updated.active_revision.is_none(),
+        "a sealed loop cannot accept a live revision"
+    );
+    let after = agent.session_context(info.session_id).unwrap().budget;
+    assert_eq!(
+        after.input_budget_tokens,
+        Some(8_000),
+        "the sealed update must install the candidate model's window"
+    );
+    assert_eq!(after.trigger_tokens, Some(6_400));
+    assert_eq!(after.target_tokens, Some(4_000));
+    assert_eq!(
+        session_options(&agent, info.session_id).prompt_timeout,
+        std::time::Duration::from_secs(47)
+    );
+
+    gate.release();
+    wait_text(&agent, turn).await;
+    let next = send_text(&mut agent, info.session_id, "next").await;
+    wait_text(&agent, next).await;
+    assert_eq!(model_b.requests().lock().unwrap().len(), 1);
+    assert_eq!(
+        agent
+            .session_context(info.session_id)
+            .unwrap()
+            .budget
+            .input_budget_tokens,
+        Some(8_000)
+    );
+}
+
 #[tokio::test]
 async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() {
     let (data_dir, _guard) = fixture_dir(&format!("i2-01-{}", next_id()));
@@ -8400,6 +8493,920 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     agent.close_session(info.session_id).await.unwrap();
 }
 
+/// S1 public read path: a legacy six-tool record, its historical `subagent`
+/// exchange, and its retained auxiliary record must all be readable through
+/// the public Agent queries, while `open` must refuse without repairing the
+/// deliberately partial history tail.
+#[tokio::test]
+async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
+    use crate::read::TurnResultAvailability;
+
+    let (data_dir, _data_guard) = fixture_dir(&format!("s1-public-read-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("s1-public-read-ws", "a.txt", b"hello");
+    let session_id = SessionId::new().unwrap();
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    let now = "2026-01-02T03:04:05.000Z".to_owned();
+    let mut record = SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title: Some("legacy six".to_owned()),
+        profile: "test".to_owned(),
+        workspace: workspace.clone(),
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["read".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    // The Store refuses to *create* the removed tool, so a legacy record is
+    // produced the way the old version would have persisted it: create a valid
+    // five-tool record, then append the historical sixth name.
+    store.create_session(&record).await.unwrap();
+    record.tools.push("subagent".to_owned());
+    store.write_record(&record).await.unwrap();
+
+    let loop_id = LoopId::new().unwrap();
+    let call_id = ToolCallId::new("legacy-subagent-call").unwrap();
+    let call = ToolCall::new(
+        call_id.clone(),
+        "subagent".parse().unwrap(),
+        json!({"task": "historical child"}),
+        0,
+    )
+    .unwrap();
+    let legacy_loop = StoredLoopRecord {
+        loop_id,
+        outcome: StoredLoopOutcome::Completed,
+        items: vec![
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text("delegate this").unwrap(),
+            }),
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id,
+                request_index: 0,
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::ToolCall(call)],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: Usage::new(1, 2, 0),
+            }),
+            HistoryItem::ToolResult(ToolResultHistory {
+                loop_id,
+                request_index: 0,
+                call_id: call_id.clone(),
+                tool_name: "subagent".parse().unwrap(),
+                outcome: ToolResultOutcome::Success,
+                output: minicore_runtime::tools::ToolOutput::new("historical child result")
+                    .unwrap(),
+            }),
+        ],
+        usage: Usage::new(1, 2, 0),
+        requests: 1,
+        tool_rounds: 1,
+        final_config_revision: ConfigRevision::INITIAL,
+        completed_at: now.clone(),
+        user_times: None,
+    };
+    store.append_loop(session_id, &legacy_loop).await.unwrap();
+
+    // A retained auxiliary record for the historical subagent call.
+    let legacy_ref = crate::tool_data::ToolRef {
+        session_id,
+        loop_id,
+        request_index: 0,
+        tool_call_id: call_id.clone(),
+    };
+    let tool_data = ToolData::new();
+    tool_data.note_requested(&legacy_ref, "subagent");
+    tool_data.note_result(&legacy_ref, "historical auxiliary result");
+    tool_data.finish_and_snapshot(&legacy_ref, ToolResultOutcome::Success);
+    let snapshot = tool_data.snapshot_for_persistence(&legacy_ref).unwrap();
+    store
+        .commit_tool_record(
+            &snapshot,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+    // A partial trailing history line that must never be repaired by a read or
+    // by the open precheck.
+    let history_path = data_dir
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("history.jsonl");
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history_path)
+            .unwrap();
+        file.write_all(b"{\"partial_legacy_tail\": true").unwrap();
+    }
+    let history_before = std::fs::read(&history_path).unwrap();
+
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+
+    // list/read succeed without loading the removed executor.
+    let listed = agent.list_sessions().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, session_id);
+    let read = agent
+        .read_session(ReadSession {
+            session_id,
+            cursor: None,
+            limit: 100,
+            max_bytes: None,
+            captured_end: None,
+            history_revision: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(read.session.session_id, session_id);
+    assert_eq!(read.total, 3, "the three stored legacy items are visible");
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+
+    // turn.result reads the stored legacy exchange, including the subagent name.
+    let turn_page = agent
+        .turn_result(crate::TurnResultRequest {
+            turn: TurnRef {
+                session_id,
+                loop_id,
+            },
+            cursor: None,
+            limit: 100,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(turn_page.availability, TurnResultAvailability::Stored);
+    assert!(
+        turn_page
+            .items
+            .iter()
+            .any(|chunk| chunk.data.contains("subagent")
+                || chunk.data.contains("historical child result"))
+    );
+
+    // tool.read/tool.output serve the legal auxiliary record through the
+    // generic path.
+    let read_tool = agent
+        .tool_read(crate::tool_data::ToolReadRequest {
+            tool_ref: legacy_ref.clone(),
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(read_tool.execution.name, "subagent");
+    let output = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: legacy_ref.clone(),
+            stream: crate::tool_data::ToolDataStream::Output,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .await
+        .unwrap();
+    assert_eq!(output.data, "historical auxiliary result");
+
+    // The open precheck refuses before execution and does not repair the tail.
+    assert!(matches!(
+        agent.open_session(session_id).await,
+        Err(AgentError::InvalidSessionSettings)
+    ));
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+    assert!(agent.loaded_session(session_id).is_none());
+    assert!(model.requests().lock().unwrap().is_empty());
+}
+
+/// S1 five-tool subset: a record whose saved tool list is the current five but
+/// whose history contains an old `subagent` exchange must still open and run.
+#[tokio::test]
+async fn s1_five_tool_subset_record_with_old_history_still_executes() {
+    let (data_dir, _data_guard) = fixture_dir(&format!("s1-five-subset-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("s1-five-subset-ws", "a.txt", b"hello");
+    let session_id = SessionId::new().unwrap();
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    let now = "2026-01-02T03:04:05.000Z".to_owned();
+    let record = SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title: Some("five subset".to_owned()),
+        profile: "test".to_owned(),
+        workspace: workspace.clone(),
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["read".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    store.create_session(&record).await.unwrap();
+
+    let loop_id = LoopId::new().unwrap();
+    let call_id = ToolCallId::new("old-subagent-call").unwrap();
+    let legacy_loop = StoredLoopRecord {
+        loop_id,
+        outcome: StoredLoopOutcome::Completed,
+        items: vec![
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text("old delegate").unwrap(),
+            }),
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id,
+                request_index: 0,
+                model: "main".parse::<ModelRef>().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::ToolCall(
+                    ToolCall::new(
+                        call_id.clone(),
+                        "subagent".parse().unwrap(),
+                        json!({"task": "old"}),
+                        0,
+                    )
+                    .unwrap(),
+                )],
+                finish_reason: ModelFinishReason::ToolCalls,
+                usage: Usage::new(1, 2, 0),
+            }),
+            HistoryItem::ToolResult(ToolResultHistory {
+                loop_id,
+                request_index: 0,
+                call_id,
+                tool_name: "subagent".parse().unwrap(),
+                outcome: ToolResultOutcome::Success,
+                output: minicore_runtime::tools::ToolOutput::new("old child result").unwrap(),
+            }),
+        ],
+        usage: Usage::new(1, 2, 0),
+        requests: 1,
+        tool_rounds: 1,
+        final_config_revision: ConfigRevision::INITIAL,
+        completed_at: now,
+        user_times: None,
+    };
+    store.append_loop(session_id, &legacy_loop).await.unwrap();
+
+    let model = FakeModel::new("main", [ModelScript::Text("after old history")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let opened = agent.open_session(session_id).await.unwrap();
+    assert!(opened.loaded);
+    let turn = send_text(&mut agent, session_id, "continue").await;
+    wait_text(&agent, turn).await;
+    assert_eq!(model.requests().lock().unwrap().len(), 1);
+    agent.close_session(session_id).await.unwrap();
+}
+
+/// S1 hallucinated tool: a model request for the removed `subagent` tool in a
+/// five-tool Session must become the Runtime's unknown-tool failure, never a
+/// dispatched child loop or a new process.
+#[tokio::test]
+async fn s1_hallucinated_subagent_is_an_unavailable_tool_not_a_dispatch() {
+    let (data_dir, _guard) = fixture_dir(&format!("s1-hallucinated-{}", next_id()));
+    let (workspace, _guard) = workspace_file("s1-hallucinated-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall("subagent", json!({"task": "go delegate"})),
+            ModelScript::Text("after hallucination"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "try to delegate").await;
+    let result = wait_text(&agent, turn).await;
+    // Runtime's existing unknown-tool handling rejects the response at
+    // assembly time: a tool call absent from the request schema is a malformed
+    // model response, so the loop fails without ever dispatching a tool.
+    assert!(
+        matches!(
+            result.report.outcome,
+            minicore_runtime::LoopOutcome::Failed(_)
+        ),
+        "unexpected outcome: {:?}",
+        result.report.outcome
+    );
+    // Exactly one main-loop request ran; the second scripted request was never
+    // reached, and no child model call happened.
+    assert_eq!(model.requests().lock().unwrap().len(), 1);
+
+    let stored = read_store_history(&data_dir, info.session_id).await;
+    assert!(
+        !stored.iter().any(|item| matches!(
+            item,
+            HistoryItem::ToolResult(result) if result.tool_name.as_str() == "subagent"
+        )),
+        "a hallucinated tool must not produce a tool result"
+    );
+    // No ToolRef was recorded: the call never reached a real Tool::execute.
+    let refs = history_tool_refs(&agent, info.session_id);
+    assert!(refs.is_empty());
+}
+
+/// I1 stub: create, open, and both a no-tool and a tool-bearing Turn must not
+/// invoke Git at all. The status stub records every invocation, so a single
+/// implicit query would leave a marker behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
+    use crate::workspace::status::set_status_program;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (data_dir, _data_guard) = fixture_dir(&format!("i1-stub-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("i1-stub-ws", "file.txt", b"contents\n");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let marker = data_dir.join("git-invocations");
+    let script = data_dir.join("count-git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'called\\n' >> '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::Text("no tool"),
+            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            ModelScript::Text("tool complete"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+
+    let info = create_session(&mut agent, &workspace).await;
+    assert!(
+        !marker.exists(),
+        "session.create started an implicit Git query"
+    );
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert!(
+        !marker.exists(),
+        "session.open started an implicit Git query"
+    );
+
+    let no_tool = send_text(&mut agent, info.session_id, "no tool").await;
+    wait_text(&agent, no_tool).await;
+    assert!(
+        !marker.exists(),
+        "a no-tool Turn started an implicit Git query"
+    );
+
+    let with_tool = send_text(&mut agent, info.session_id, "read file").await;
+    wait_text(&agent, with_tool).await;
+    assert!(
+        !marker.exists(),
+        "a tool-bearing Turn started an implicit Git query"
+    );
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+/// I2 release: a real Bash command's owners must be joinable and reclaimed
+/// after the Turn, and a Weak handle to the observation resources must fail
+/// after close/shutdown. The command is always cleaned up even if the
+/// assertions fail.
+#[cfg(unix)]
+#[tokio::test]
+async fn i2_real_command_releases_owners_and_observation_resources() {
+    use crate::tool_data::CommandStatus;
+    use std::sync::Weak;
+
+    let (data_dir, _guard) = fixture_dir(&format!("i2-release-{}", next_id()));
+    let (workspace, _guard) = workspace_file("i2-release-ws", "a.txt", b"hello");
+    let pid_file = workspace.join("child.pid");
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::ToolCall(
+            "bash",
+            json!({"command": "printf 'started\\n'; echo $$ > child.pid; exec sleep 30"}),
+        )],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        bash_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
+    let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
+    let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.tool_observer());
+    drop(session);
+
+    let turn = send_text(&mut agent, info.session_id, "run bash").await;
+    for _ in 0..500 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(pid_file.exists(), "the command really started");
+    let child_pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the command published its pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+
+    // Cancel, then wait: the Turn barrier joins the owned command.
+    assert!(agent.cancel(turn).unwrap());
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+    );
+    let tool_ref = agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .tool_data()
+        .loop_tool_refs(info.session_id, turn.loop_id)
+        .into_iter()
+        .next()
+        .expect("the Bash call recorded a ToolRef");
+    let terminal = read_tool(&agent, tool_ref).await;
+    let command = terminal.execution.command.expect("a terminal command");
+    assert_eq!(command.status, CommandStatus::Cancelled);
+    assert!(command.termination_confirmed);
+
+    // Failure-safe cleanup: always stop the child even if an assertion above
+    // changed the control flow.
+    let cleanup = || {
+        if process_is_listed(child_pid) {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(child_pid.to_string())
+                .status();
+        }
+    };
+    cleanup();
+    assert!(
+        !process_is_listed(child_pid),
+        "the cancelled command was not reaped by its owner"
+    );
+    assert_eq!(
+        agent
+            .loaded_session(info.session_id)
+            .unwrap()
+            .command_owners()
+            .active(),
+        0
+    );
+
+    agent.close_session(info.session_id).await.unwrap();
+    drop(agent);
+    cleanup();
+    assert!(weak_data.upgrade().is_none(), "ToolData was not released");
+    assert!(
+        weak_owners.upgrade().is_none(),
+        "CommandOwners was not released"
+    );
+    assert!(
+        weak_observer.upgrade().is_none(),
+        "ToolObserver was not released"
+    );
+}
+
+/// E2E-A: normal multi-turn Session with a hot model switch. The first request
+/// publishes its invocation before the tool runs; Bash output and a native
+/// write change are read back; a same-loop update changes the model for the
+/// next request and the future options for the next Turn; close/open keeps
+/// configuration and history consistent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
+    use crate::changes::{ChangeScope, ChangesListRequest};
+    use crate::diff::ChangesDiffRequest;
+    use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState};
+    use base64::Engine;
+
+    let (data_dir, _guard) = fixture_dir(&format!("e2e-a-{}", next_id()));
+    let (workspace, _guard) = workspace_file("e2e-a-ws", "value.txt", b"user\n");
+    let first_pid = workspace.join("first.pid");
+    let release = workspace.join("release.txt");
+    let model_a = FakeModel::new(
+        "main",
+        [ModelScript::ToolCall(
+            "bash",
+            json!({"command": "printf 'out\\n'; printf 'err\\n' >&2; echo $$ > first.pid; while [ ! -f release.txt ]; do sleep 0.05; done"}),
+        )],
+    );
+    let model_b = FakeModel::new(
+        "other",
+        [
+            ModelScript::ToolCall("write", json!({"path": "value.txt", "content": "agent\n"})),
+            ModelScript::Text("other finished"),
+        ],
+    );
+    let profile = Profile {
+        tools: vec!["bash".to_owned(), "write".to_owned()],
+        ..read_profile()
+    };
+    let mut agent = open_agent_auto_with_configs(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_a)),
+            ("other".to_owned(), Arc::clone(&model_b)),
+        ]),
+        BTreeMap::from([
+            (
+                "main".to_owned(),
+                model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
+            ),
+            (
+                "other".to_owned(),
+                model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
+            ),
+        ]),
+        profile,
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    assert_eq!(
+        session_options(&agent, info.session_id).prompt_timeout,
+        std::time::Duration::from_secs(31)
+    );
+
+    // Turn 1: observe the first request's invocation while Bash still runs.
+    let turn = send_text(&mut agent, info.session_id, "run bash").await;
+    let invocation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.expect("event stream must remain open");
+            if let AgentEvent::ToolInvocation {
+                turn: event_turn,
+                data,
+                ..
+            } = event
+            {
+                if event_turn == turn {
+                    return data;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the first invocation must be published before the tool finishes");
+    assert_eq!(invocation.name, "bash");
+    assert_eq!(invocation.tool_ref.request_index, 0);
+    for _ in 0..500 {
+        if first_pid.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(first_pid.exists(), "the Bash command really started");
+    let live = read_tool(&agent, invocation.tool_ref.clone()).await;
+    assert_eq!(live.execution.state, ToolExecutionState::Running);
+    assert_eq!(
+        live.execution
+            .command
+            .as_ref()
+            .map(|command| command.status),
+        Some(CommandStatus::Running)
+    );
+    let stdout = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: invocation.tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .await
+        .unwrap();
+    let stderr = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: invocation.tool_ref.clone(),
+            stream: ToolDataStream::Stderr,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&stdout.data)
+            .unwrap(),
+        b"out\n"
+    );
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&stderr.data)
+            .unwrap(),
+        b"err\n"
+    );
+
+    // Same-loop model update while the first request's command is active.
+    let updated = agent
+        .update_session(UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    let active_revision = updated
+        .active_revision
+        .expect("the loop accepts the update");
+    assert_eq!(
+        crate::sessions::installed_loop_options_for_test(turn.loop_id)
+            .expect("the running loop recorded install options")
+            .prompt_timeout,
+        std::time::Duration::from_secs(31),
+        "a running loop must not be hot-modified"
+    );
+    assert_eq!(
+        session_options(&agent, info.session_id).prompt_timeout,
+        std::time::Duration::from_secs(47),
+        "future options must track the candidate model"
+    );
+    // Let the blocked Bash command finish so the Turn completes normally.
+    std::fs::write(&release, b"go").unwrap();
+
+    let first_result = wait_text(&agent, turn).await;
+    // request 0: model_a Bash; request 1: model_b write; request 2: model_b
+    // final text after the same-loop switch.
+    assert_eq!(first_result.report.requests, 3);
+    assert_eq!(first_result.report.tool_rounds, 2);
+    assert_eq!(first_result.report.final_config_revision, active_revision);
+    assert_eq!(
+        first_result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+    assert!(
+        !process_is_listed(
+            std::fs::read_to_string(&first_pid)
+                .expect("the command published its pid")
+                .trim()
+                .parse()
+                .expect("a pid")
+        ),
+        "the completed Turn must have joined its reported command"
+    );
+
+    // turn.result is readable and changes.diff covers the native write in the
+    // same loop.
+    let page = agent
+        .turn_result(crate::TurnResultRequest {
+            turn,
+            cursor: None,
+            limit: 100,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        page.availability,
+        crate::read::TurnResultAvailability::Live | crate::read::TurnResultAvailability::Stored
+    ));
+    let changes = agent
+        .changes_list(ChangesListRequest {
+            session_id: info.session_id,
+            scope: ChangeScope::Turn {
+                loop_id: turn.loop_id,
+            },
+            cursor: None,
+            limit: 10,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(changes.records.len(), 1, "one native write in the turn");
+    let diff = agent
+        .changes_diff(ChangesDiffRequest {
+            session_id: info.session_id,
+            change_ref: changes.records[0].change_ref.clone(),
+            comparison: None,
+            context_lines: None,
+            cursor: None,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert!(!diff.hunks.is_empty());
+
+    // Turn 2: the next Turn uses the candidate options and the new model.
+    let second = send_text(&mut agent, info.session_id, "next turn").await;
+    let next_options = crate::sessions::installed_loop_options_for_test(second.loop_id)
+        .expect("the next loop recorded install options");
+    assert_eq!(
+        next_options.prompt_timeout,
+        std::time::Duration::from_secs(47)
+    );
+    wait_text(&agent, second).await;
+    // model_b already served both its scripted turn-1 requests; the third call
+    // is the next Turn and confirms the switched model stayed selected.
+    assert_eq!(model_b.requests().lock().unwrap().len(), 3);
+    assert_eq!(model_a.requests().lock().unwrap().len(), 1);
+
+    // Close/open keeps the record and history consistent with the update.
+    let history_before = read_store_history(&data_dir, info.session_id).await;
+    agent.close_session(info.session_id).await.unwrap();
+    let reopened = agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(reopened.model, "other");
+    assert_eq!(
+        session_options(&agent, info.session_id).prompt_timeout,
+        std::time::Duration::from_secs(47)
+    );
+    assert_eq!(
+        read_store_history(&data_dir, info.session_id).await.len(),
+        history_before.len()
+    );
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+/// E2E-B: a dropped event stream, a failed JSONL append, and a rejected send.
+/// The authoritative `turn.wait`, `turn.result`, and `tool.read/output` remain
+/// readable; a rejected new send keeps the previous result; close reclaims the
+/// owned command.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
+    use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState, ToolRecordingState};
+    use base64::Engine;
+
+    let (data_dir, _guard) = fixture_dir(&format!("e2e-b-{}", next_id()));
+    let (workspace, _guard) = workspace_file("e2e-b-ws", "value.txt", b"user\n");
+    let pid_file = workspace.join("child.pid");
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::ToolCall(
+                "bash",
+                json!({"command": "printf 'kept\\n'; echo $$ > child.pid; exec sleep 30"}),
+            ),
+            ModelScript::ToolCall("write", json!({"path": "value.txt", "content": "agent\n"})),
+            ModelScript::Text("finished"),
+        ],
+    );
+    let profile = Profile {
+        tools: vec!["bash".to_owned(), "write".to_owned()],
+        ..read_profile()
+    };
+    // Capacity-1 event queue drops nearly every best-effort event; the query
+    // path must not depend on it.
+    let mut agent = open_agent_with(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        profile,
+        AgentOptions {
+            agent_event_capacity: 1,
+            loop_event_capacity: Some(1),
+        },
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    fail_next_append(info.session_id);
+
+    let turn = send_text(&mut agent, info.session_id, "run tools").await;
+    for _ in 0..500 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let child_pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the command published its pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Failed,
+        "the injected append failure must surface as failed persistence"
+    );
+    assert!(
+        !process_is_listed(child_pid),
+        "the completed Turn must have reaped its owned command"
+    );
+
+    // Session is Blocked; a new send is rejected without discarding the result.
+    let rejected = agent
+        .send(crate::agent::SendMessage {
+            session_id: info.session_id,
+            text: "after".to_owned(),
+        })
+        .await;
+    assert!(matches!(rejected, Err(AgentError::SessionBlocked)));
+    let again = agent.wait_turn(turn).await.unwrap();
+    assert_eq!(again.persistence, crate::sessions::TurnPersistence::Failed);
+
+    // turn.result remains readable from the live failed report.
+    let page = agent
+        .turn_result(crate::TurnResultRequest {
+            turn,
+            cursor: None,
+            limit: 100,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.availability, crate::read::TurnResultAvailability::Live);
+    assert_eq!(
+        page.persistence,
+        Some(crate::sessions::TurnPersistence::Failed)
+    );
+
+    // tool.read and tool.output still serve the retained Bash and write facts.
+    let refs = agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .tool_data()
+        .loop_tool_refs(info.session_id, turn.loop_id);
+    assert_eq!(
+        refs.len(),
+        2,
+        "the Bash and write calls both recorded facts"
+    );
+    let bash_ref = refs
+        .iter()
+        .find(|reference| {
+            agent
+                .loaded_session(info.session_id)
+                .unwrap()
+                .tool_data()
+                .snapshot(reference)
+                .is_some_and(|data| data.name == "bash")
+        })
+        .expect("the Bash ToolRef is present")
+        .clone();
+    let bash = read_tool(&agent, bash_ref.clone()).await;
+    assert_eq!(bash.execution.state, ToolExecutionState::Succeeded);
+    assert_eq!(bash.execution.recording, ToolRecordingState::Saved);
+    assert_eq!(
+        bash.execution
+            .command
+            .as_ref()
+            .map(|command| command.status),
+        Some(CommandStatus::Exited)
+    );
+    let output = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: bash_ref,
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&output.data)
+            .unwrap(),
+        b"kept\n"
+    );
+
+    // Closing the blocked Session still joins the owned command workers.
+    agent.close_session(info.session_id).await.unwrap();
+    assert!(matches!(
+        agent.session_state(info.session_id),
+        Err(AgentError::SessionNotLoaded)
+    ));
+    agent.shutdown().await.unwrap();
+}
+
 /// Two turns across model change: the first Bash command is cancelled, the
 /// second model reuses the same tool call id ("bash-call-0") under a new loop,
 /// the second Bash command actually runs without mixing up stdout/stderr/queries,
@@ -9554,4 +10561,150 @@ async fn reader_drop_or_timeout_does_not_cancel_running_bash() {
 
     // Clean up
     let _ = wait_text(&agent, turn).await;
+}
+
+// ---------------------------------------------------------------------------
+// P7: closeout integration acceptance
+// ---------------------------------------------------------------------------
+
+/// F1 native-file identity: a first request forced to reach `Model::start`
+/// before `bind_started_loop` must still associate its `write` ToolRef and
+/// change records. This is the native-tool counterpart of the Bash F1
+/// regression, and it reads the facts back through `changes.list` /
+/// `changes.diff` rather than only through final History.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f1_native_write_changes_keep_the_first_request_identity() {
+    use crate::changes::{ChangeScope, ChangesListRequest};
+    use crate::diff::{ChangesDiffRequest, DiffComparison};
+
+    let (data_dir, _guard) = fixture_dir(&format!("f1-native-write-{}", next_id()));
+    let (workspace, _guard) = workspace_file("f1-native-write-ws", "value.txt", b"user\n");
+    let model_gate = BlockGate::new();
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::ToolCallAfterGate(
+            model_gate.clone(),
+            "write",
+            json!({"path": "value.txt", "content": "agent\n"}),
+        )],
+    );
+    let model_started = model.start_entered();
+    let profile = Profile {
+        tools: vec!["write".to_owned()],
+        ..read_profile()
+    };
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        profile,
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let gate = Arc::new(RuntimeStartGate::new());
+    pause_next_runtime_start_before_bind(info.session_id, Arc::clone(&gate));
+
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
+    let send_agent = Arc::clone(&agent);
+    let mut send_task = tokio::spawn(async move {
+        let mut agent = send_agent.lock().await;
+        send_text(&mut agent, info.session_id, "write the file").await
+    });
+
+    let startup = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        gate.wait_started().await;
+        model_started.notified().await;
+        model_gate.entered.notified().await;
+    })
+    .await;
+    let startup_boundary_observed = startup.is_ok() && !send_task.is_finished();
+    gate.release();
+    model_gate.release.notify_one();
+
+    let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut send_task).await;
+    let turn = match send_result {
+        Ok(Ok(turn)) => turn,
+        Ok(Err(error)) => {
+            let mut agent = agent.lock().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                agent.close_session(info.session_id),
+            )
+            .await;
+            panic!("send task failed: {error}");
+        }
+        Err(_) => {
+            send_task.abort();
+            let _ = send_task.await;
+            let mut agent = agent.lock().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                agent.close_session(info.session_id),
+            )
+            .await;
+            panic!("install_loop did not leave the startup gate in time");
+        }
+    };
+    assert!(
+        startup_boundary_observed,
+        "startup observation did not prove the bind boundary"
+    );
+
+    let mut agent = agent.lock().await;
+    wait_text(&agent, turn).await;
+    let listed = agent
+        .changes_list(ChangesListRequest {
+            session_id: info.session_id,
+            scope: ChangeScope::Turn {
+                loop_id: turn.loop_id,
+            },
+            cursor: None,
+            limit: 10,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.records.len(), 1, "the native write must be recorded");
+    let record = &listed.records[0];
+    let tool_ref = record
+        .tool_ref
+        .clone()
+        .expect("a native change keeps its ToolRef");
+    assert_eq!(tool_ref.session_id, info.session_id);
+    assert_eq!(tool_ref.loop_id, turn.loop_id);
+    assert_eq!(
+        tool_ref.request_index, 0,
+        "the first request owns the write"
+    );
+    assert_eq!(tool_ref.tool_call_id.as_str(), "write-call-0");
+
+    let diff = agent
+        .changes_diff(ChangesDiffRequest {
+            session_id: info.session_id,
+            change_ref: record.change_ref.clone(),
+            comparison: Some(DiffComparison::ToolBeforeAfter),
+            context_lines: None,
+            cursor: None,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    let removed = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .filter(|line| line.kind == crate::diff::DiffLineKind::Removed)
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    let added = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .filter(|line| line.kind == crate::diff::DiffLineKind::Added)
+        .map(|line| line.text.as_str())
+        .collect::<String>();
+    assert_eq!(removed, "user\n");
+    assert_eq!(added, "agent\n");
+
+    agent.close_session(info.session_id).await.unwrap();
 }
