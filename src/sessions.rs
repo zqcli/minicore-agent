@@ -1065,6 +1065,12 @@ impl Session {
         inner.record.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn options_for_test(&self) -> LoopOptions {
+        let inner = self.shared.inner.lock().unwrap();
+        inner.options.clone()
+    }
+
     pub(crate) fn workspace(&self) -> Arc<Workspace> {
         let inner = self.shared.inner.lock().unwrap();
         Arc::clone(&inner.workspace)
@@ -2459,6 +2465,7 @@ impl Session {
         record: crate::store::SessionRecord,
         config: ExecutionConfig,
         auto: Option<AutoContext>,
+        options: LoopOptions,
     ) -> Result<Option<ConfigRevision>, AgentError> {
         let _io = self.shared.io.lock().await;
         let active_summary = {
@@ -2494,6 +2501,7 @@ impl Session {
             let update_config = config.clone();
             inner.config = config;
             inner.auto = auto.clone();
+            inner.options = options;
             self.shared.compaction.note_settings_installed();
             (
                 inner.active.as_ref().map(|active| active.handle.clone()),
