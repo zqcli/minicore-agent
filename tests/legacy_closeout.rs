@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 //! E2E-C: a legacy six-tool SessionRecord with a historical `subagent`
 //! exchange and a legal auxiliary record. The removed executor is gone, so the
 //! Session is listable/readable, `turn.result` and `tool.output` still answer,
@@ -28,7 +26,26 @@ const LOOP_ID: &str = "lup_960347f4f796126a9cc17809e53094a4";
 const TOOL_CALL_ID: &str = "legacy-subagent-call";
 const AUX_HASH: &str = "6366c852f562f07dd57c0f45d901c2588adc12d8b2da12d96b4970ad1c5d8d34";
 
-const SESSION_JSON_TEMPLATE: &str = r#"{"format_version":1,"session_id":"__SESSION__","title":"legacy six","profile":"test","workspace":"__WORKSPACE__","model":"main","reasoning":"auto","system_prompt":"test system prompt","tools":["read","subagent"],"max_tool_rounds":8,"approval":"auto","created_at":"2026-01-02T03:04:05.000Z","updated_at":"2026-01-02T03:04:05.000Z"}"#;
+/// The real six-tool legacy record, expressed as JSON so the workspace and
+/// session id can be substituted without replacing text in a raw string.
+fn session_json(workspace: &str) -> Vec<u8> {
+    let record = json!({
+        "format_version": 1,
+        "session_id": SESSION_ID,
+        "title": "legacy six",
+        "profile": "test",
+        "workspace": workspace,
+        "model": "main",
+        "reasoning": "auto",
+        "system_prompt": "test system prompt",
+        "tools": ["read", "write", "edit", "apply_patch", "bash", "subagent"],
+        "max_tool_rounds": 8,
+        "approval": "auto",
+        "created_at": "2026-01-02T03:04:05.000Z",
+        "updated_at": "2026-01-02T03:04:05.000Z"
+    });
+    serde_json::to_vec(&record).unwrap()
+}
 
 const HISTORY_JSONL: &str = r#"{"loop_id":"lup_960347f4f796126a9cc17809e53094a4","outcome":{"type":"completed"},"items":[{"type":"user","data":{"loop_id":"lup_960347f4f796126a9cc17809e53094a4","kind":"prompt","input":{"text":"delegate this"}}},{"type":"assistant","data":{"loop_id":"lup_960347f4f796126a9cc17809e53094a4","request_index":0,"model":"main","reasoning":"auto","content":[{"type":"tool_call","data":{"tool_call_id":"legacy-subagent-call","name":"subagent","arguments":{"task":"historical child"},"call_index":0}}],"finish_reason":"tool_calls","usage":{"input_tokens":1,"output_tokens":2,"reasoning_tokens":0}}},{"type":"tool_result","data":{"loop_id":"lup_960347f4f796126a9cc17809e53094a4","request_index":0,"call_id":"legacy-subagent-call","tool_name":"subagent","outcome":"success","output":{"content":"historical child result"}}}],"usage":{"input_tokens":1,"output_tokens":2,"reasoning_tokens":0},"requests":1,"tool_rounds":1,"final_config_revision":0,"completed_at":"2026-01-02T03:04:05.000Z"}"#;
 
@@ -64,7 +81,7 @@ event_capacity = 256
 model = "test"
 reasoning = "auto"
 system_prompt = "E2E-C fixture."
-tools = ["read"]
+tools = ["read", "write", "edit", "apply_patch", "bash"]
 max_tool_rounds = 4
 approval = "auto"
 [models.test]
@@ -86,6 +103,21 @@ request_timeout_seconds = 5
     config
 }
 
+/// Collects every tool name a captured provider request offered.
+fn request_tool_names(request: &openai_mock::CapturedRequest) -> Vec<String> {
+    request
+        .json_body()
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_six_tool_session_is_readable_but_never_executed() {
     let fixture =
@@ -101,9 +133,7 @@ async fn legacy_six_tool_session_is_readable_but_never_executed() {
     std::fs::create_dir_all(&session_dir).unwrap();
     std::fs::write(
         session_dir.join("session.json"),
-        SESSION_JSON_TEMPLATE
-            .replace("__SESSION__", SESSION_ID)
-            .replace("__WORKSPACE__", canonical.to_str().unwrap()),
+        session_json(canonical.to_str().unwrap()),
     )
     .unwrap();
     std::fs::write(
@@ -207,7 +237,8 @@ async fn legacy_six_tool_session_is_readable_but_never_executed() {
         before_aux_result
     );
 
-    // A fresh five-tool Session still runs normally.
+    // A fresh five-tool Session runs normally, and its provider request offers
+    // exactly the five executable tools with no removed name.
     let created = call(
         &mut process,
         "session.create",
@@ -215,6 +246,13 @@ async fn legacy_six_tool_session_is_readable_but_never_executed() {
     )
     .await;
     let fresh = created["session"]["session_id"].clone();
+    let fresh_read = call(
+        &mut process,
+        "session.read",
+        json!({"session_id":fresh,"limit":1}),
+    )
+    .await;
+    assert_eq!(fresh_read["total"], json!(0));
     call(&mut process, "session.open", json!({"session_id":fresh})).await;
     let (_, wait) = process
         .send_turn_and_register_wait("fresh", &fresh, "run")
@@ -223,7 +261,31 @@ async fn legacy_six_tool_session_is_readable_but_never_executed() {
     assert_eq!(waited["result"]["persistence"], json!("persisted"));
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
 
+    let requests = server.finish().await;
+    assert!(
+        !requests.is_empty(),
+        "the fresh Session must call the model"
+    );
+    for request in &requests {
+        let mut tools = request_tool_names(request);
+        tools.sort();
+        assert_eq!(
+            tools,
+            vec![
+                "apply_patch".to_owned(),
+                "bash".to_owned(),
+                "edit".to_owned(),
+                "read".to_owned(),
+                "write".to_owned(),
+            ],
+            "a fresh five-tool Session offers exactly its configured tools"
+        );
+        assert!(
+            !tools.iter().any(|name| name == "subagent"),
+            "the provider request must not offer the removed subagent tool"
+        );
+    }
+
     let (_, stderr) = process.shutdown().await;
     assert!(!stderr.contains(KEY));
-    server.finish().await;
 }
