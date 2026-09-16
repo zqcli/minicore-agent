@@ -7,9 +7,10 @@ historical material and marked superseded where they describe behavior this
 closeout removed.
 
 This file records what the implementing agent actually ran and what it did not;
-it is not itself a gate. The parent-agent review separately inspected the source
-and independently ran only the P5 gates (see "Parent Review Sources" below); the
-implementing agent ran the P0–P7 gates listed here on the isolated remote copy.
+it is not itself a gate. The parent agent inspected the source and, for the
+final round, ran the full host gate set itself on a freshly cleared target; see
+"Parent Review Sources" and "Final Gates". The implementing agent ran the
+P0–P7 gates listed here on the isolated remote copy.
 
 ## Source, Runtime And Commits
 
@@ -18,9 +19,10 @@ implementing agent ran the P0–P7 gates listed here on the isolated remote copy
   (`feat/0914-shared-data`).
 - P7 start: `6e6732e9c7c800157923b842c6964abaec30a4a9` (P6b, completed by the
   prior subagent before the final parent review).
-- Final HEAD: the parent-review fix commits on top of `c1e6c9c`
-  (`test(docs): close shared data cleanup acceptance`). The first round is
-  `54d5fae`; the follow-up fix is a separate new commit.
+- Final source HEAD: `42d4ab8793cb3c7833caa4c1af590edcd0192cd3` (`42d4ab8`),
+  the parent-review fix commits on top of `c1e6c9c` (`test(docs): close shared
+  data cleanup acceptance`). Round 1 is `54d5fae`; round 2 is `42d4ab8`; this
+  docs-only record is a separate new commit on top of `42d4ab8`.
 - Runtime: unchanged at `0.4.1`, Git revision
   `6cd2bdbc634437dea925495c61c7eb0be10ba171` (`Cargo.toml` and `Cargo.lock`).
 - No new dependency. `Cargo.lock` was not edited by hand.
@@ -54,6 +56,8 @@ Full P1–P6b SHAs:
 | `78a3e6a` | F1/F2/I1/I2/S1/E2E-A/E2E-B gap tests in `src/agent/tests.rs` |
 | `08dabcd` | Process-level E2E-C (`tests/legacy_closeout.rs`) |
 | `c1e6c9c` | P7 closeout acceptance document |
+| `54d5fae` | Parent review round 1: run closeout E2E evidence after the risky step |
+| `42d4ab8` | Parent review round 2: drop the test-only process scan from the i2 release check |
 
 A plain `cargo check --target x86_64-apple-darwin` cannot build the `ring` C
 sources on this Linux host without an Apple toolchain; the macOS row below uses
@@ -62,31 +66,47 @@ run.
 
 ## Parent Review Sources
 
-The parent agent reviewed this branch after `c1e6c9c`. Its review log and the
-source diff are the acceptance basis for the parent-review fix commits; the
-parent agent independently ran only the P5 gates, not P0–P7. This record does
-not claim the parent ran the P1–P7 suites. Two parent-review rounds were
-addressed: `54d5fae` and the follow-up commit that drops the test-only process
-scan.
+The parent agent reviewed this branch after `c1e6c9c`, then after each fix
+commit, and is the acceptance basis for the parent-review fixes. For the final
+round it ran the complete host gate set itself on a freshly cleared target (see
+"Final Gates"). Two parent-review rounds were addressed: `54d5fae` and
+`42d4ab8` (which drops the test-only process scan); this docs-only record
+follows them.
 
 ## Final Gates (remote, isolated copy only)
 
 All commands ran on `root@192.168.20.199` in the isolated copy
 `/root/minicore-agent-0914/src`; logs are under `/root/minicore-agent-0914/logs`.
-Local `cargo` was never run. The table lists the final parent-review run
-(`p7fix2-*` logs) on the committed tree; the first parent-review round produced
-the earlier `p7fix-*` logs.
+Local `cargo` was never run. The implementing agent produced the `p7fix-*` logs
+(round 1) and `p7fix2-*` logs (round 2). Round 2's `p7fix2-tests.log` showed a
+`join_loop` "never used" warning even though the source calls it, which the
+parent agent took as a sign of incremental-cache reuse after the negative
+control restored `sessions.rs`. The parent agent then cleared the target
+(`rm -rf target`) and re-ran the full acceptance itself; those `p7-parent-*`
+logs are the authoritative final gates. That clean run shows no `join_loop`
+warning and rebuilt from scratch (check 27.67s, tests 48.19s, clippy 24.35s,
+MSRV 57.42s), consistent with a genuine rebuild. This record does not claim to
+have proven what caused the earlier warning, only that the clean rerun does not
+reproduce it.
 
 | Gate | Command | Result |
 |---|---|---|
-| Format | `cargo fmt --all -- --check` | pass (`p7fix2-fmt.log`) |
-| Check | `cargo check --locked --all-targets` | pass (`p7fix2-check.log`) |
-| Clippy | `cargo clippy --locked --all-targets -- -D warnings` | pass (`p7fix2-clippy.log`) |
-| Rustdoc | `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` | pass (`p7fix2-doc.log`) |
-| Tests (stable) | `cargo test --locked --all-targets` | pass (`p7fix2-tests.log`) |
-| Tests (MSRV) | `cargo +1.85.0 test --locked --all-targets` | pass (`p7fix2-msrv.log`) |
-| Windows cross | `cargo check --locked --all-targets --target x86_64-pc-windows-gnu` | pass (`p7fix2-windows.log`) |
-| macOS cross | `cargo check --locked --all-targets --target x86_64-apple-darwin` with `CC_x86_64_apple_darwin` / `CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER` pointing at the remote `darwin-cc` zig wrapper and `/root/.local/bin` on `PATH` | pass (`p7fix2-macos.log`) |
+| Format | `cargo fmt --all -- --check` | pass (`p7-parent-fmt.log`) |
+| Check | `cargo check --locked --all-targets` | pass (`p7-parent-check.log`) |
+| Clippy | `cargo clippy --locked --all-targets -- -D warnings` | pass (`p7-parent-clippy.log`) |
+| Rustdoc | `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` | pass (`p7-parent-doc.log`) |
+| Tests (stable) | `cargo test --locked --all-targets` | pass (`p7-parent-tests.log`) |
+| Tests (MSRV) | `cargo +1.85.0 test --locked --all-targets` | pass (`p7-parent-msrv.log`) |
+| Windows cross | `cargo check --locked --all-targets --target x86_64-pc-windows-gnu` | pass, child-run (`p7fix2-windows.log`) |
+| macOS cross | `cargo check --locked --all-targets --target x86_64-apple-darwin` with `CC_x86_64_apple_darwin` / `CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER` pointing at the remote `darwin-cc` zig wrapper and `/root/.local/bin` on `PATH` | pass, child-run (`p7fix2-macos.log`) |
+
+The two cross-target rows are the implementing agent's run; the parent only
+re-ran the host gates. The Windows cross `check` reports compile warnings: the
+new F1 Runtime-start test hook's `cfg(test)`-only gate reads as unused on that
+target and belongs to this branch, while `write_reload_config` in
+`tests/openai_rpc_process.rs` is an unrelated pre-existing dead-code warning. It
+is `cargo check` (compile-only), not a native Windows run, and the warnings are
+not errors.
 
 The targeted I2 regression passed on its own (`p7fix2-i2.log`). An earlier first
 MSRV run (`p7fix-msrv.log`) failed on the pre-existing, unrelated
@@ -294,7 +314,7 @@ and gates); "test files" is `src/**/tests.rs` and `tests/**`.
 | P6a `e246693` (move) | 0 / 0 | +4 / −7554 | +7523 / −0 | 0 / 0 |
 | P6b `6e6732e` (move) | +4309 / −4260 | +44 / −43 | 0 / 0 | 0 / 0 |
 | P7 pre-review (`5e547c7`,`78a3e6a`,`08dabcd`) | 0 / 0 | +26 / −0 | +1517 / −110 | 0 / 0 |
-| Parent-review fixes (`c1e6c9c`..final, test/docs only) | 0 / 0 | 0 / 0 | +509 / −356 | +169 / −67 |
+| Parent-review fixes (`c1e6c9c`..`42d4ab8`, test/docs only) | 0 / 0 | 0 / 0 | +509 / −356 | +169 / −67 |
 
 Interpretation limits:
 
@@ -312,6 +332,8 @@ Interpretation limits:
 - This is raw churn plus a line-level `cfg(test)` heuristic; the intended
   semantic change is the F1/F2 fixes, the I1 removal, and the I2 ownership move,
   all described above.
+- These counts were not recomputed for this docs-only record; the branch tip
+  adds prose to this file only.
 
 Aggregate over `58b011f..HEAD` (before the parent-review fix): 34 files,
 +18,664 / −18,213, dominated by the P6a/P6b moves.
