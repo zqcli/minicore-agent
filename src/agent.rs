@@ -1094,11 +1094,13 @@ impl Agent {
             &candidate,
             workspace,
             session.presentation(),
-            options,
+            options.clone(),
             session.compaction_state(),
             session.policy(),
         )?;
-        let active_revision = session.update(candidate.clone(), config, auto).await?;
+        let active_revision = session
+            .update(candidate.clone(), config, auto, options)
+            .await?;
         session
             .presentation()
             .set_model_label(candidate.model.clone());
