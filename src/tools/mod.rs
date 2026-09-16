@@ -20,7 +20,6 @@ use crate::changes::{
     metadata_revision,
 };
 use crate::presentation::{Presentation, PresentationTool};
-use crate::subagents::{SubagentFactory, SubagentTool};
 use crate::tool_data::{ToolData, ToolRef};
 use crate::workspace::{
     AtomicWriteObservation, ExpectedFileState, FileCapture, FileStamp, FileState,
@@ -47,8 +46,7 @@ pub(crate) const DEFAULT_READ_OFFSET: usize = 1;
 pub(crate) const DEFAULT_READ_LIMIT: usize = 400;
 pub(crate) const MAX_READ_LINES: usize = 2_000;
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 1_000;
-pub(crate) const KNOWN_TOOL_NAMES: &[&str] =
-    &["read", "write", "edit", "apply_patch", "bash", "subagent"];
+pub(crate) const KNOWN_TOOL_NAMES: &[&str] = &["read", "write", "edit", "apply_patch", "bash"];
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum BuildToolsError {
@@ -64,41 +62,16 @@ pub(crate) fn build_tools(
     workspace: Arc<Workspace>,
     command_environment: CommandEnvironment,
 ) -> Result<ToolSet, BuildToolsError> {
-    build_tools_with(names, workspace, command_environment, None, None)
+    build_tools_with(names, workspace, command_environment, None)
 }
 
-pub(crate) fn build_tools_for_child_with_presentation(
+pub(crate) fn build_tools_with_presentation(
     names: &[String],
     workspace: Arc<Workspace>,
     command_environment: CommandEnvironment,
     presentation: &Arc<Presentation>,
 ) -> Result<ToolSet, BuildToolsError> {
-    build_tools_with(
-        names,
-        workspace,
-        command_environment,
-        Some(presentation),
-        None,
-    )
-}
-
-/// Builds the parent Session tool set, optionally enabling the native
-/// stateless child-loop Tool. The option is deliberately explicit: a profile
-/// that does not name `subagent` never receives it implicitly.
-pub(crate) fn build_tools_with_presentation_and_subagent(
-    names: &[String],
-    workspace: Arc<Workspace>,
-    command_environment: CommandEnvironment,
-    presentation: &Arc<Presentation>,
-    subagent: Option<&SubagentFactory>,
-) -> Result<ToolSet, BuildToolsError> {
-    build_tools_with(
-        names,
-        workspace,
-        command_environment,
-        Some(presentation),
-        subagent,
-    )
+    build_tools_with(names, workspace, command_environment, Some(presentation))
 }
 
 fn build_tools_with(
@@ -106,7 +79,6 @@ fn build_tools_with(
     workspace: Arc<Workspace>,
     command_environment: CommandEnvironment,
     presentation: Option<&Arc<Presentation>>,
-    subagent: Option<&SubagentFactory>,
 ) -> Result<ToolSet, BuildToolsError> {
     let mut builder = ToolSet::builder();
     let mut seen = BTreeSet::new();
@@ -177,12 +149,6 @@ fn build_tools_with(
                 } else {
                     builder.register_arc(tool);
                 }
-            }
-            "subagent" => {
-                let Some(subagent) = subagent else {
-                    return Err(BuildToolsError::InvalidConfiguration);
-                };
-                register(&mut builder, Arc::new(SubagentTool::new(subagent.clone())));
             }
             _ => return Err(BuildToolsError::InvalidConfiguration),
         }
@@ -460,7 +426,6 @@ mod tests {
         let bash = "bash".parse().unwrap();
         let edit = "edit".parse().unwrap();
         let read = "read".parse().unwrap();
-        let subagent = "subagent".parse().unwrap();
         let write = "write".parse().unwrap();
         let command_environment = CommandEnvironment::new(std::iter::empty::<OsString>());
 
@@ -469,12 +434,11 @@ mod tests {
         assert!(!empty.contains(&bash));
         assert!(!empty.contains(&edit));
         assert!(!empty.contains(&read));
-        assert!(!empty.contains(&subagent));
         assert!(!empty.contains(&write));
 
         assert_eq!(
             KNOWN_TOOL_NAMES,
-            &["read", "write", "edit", "apply_patch", "bash", "subagent"]
+            &["read", "write", "edit", "apply_patch", "bash"]
         );
 
         for mask in 0..(1usize << KNOWN_TOOL_NAMES.len()) {
@@ -484,13 +448,6 @@ mod tests {
                 .filter(|(index, _)| mask & (1usize << index) != 0)
                 .map(|(_, name)| (*name).to_owned())
                 .collect::<Vec<_>>();
-            if names.iter().any(|name| name == "subagent") {
-                assert_eq!(
-                    build_tools(&names, Arc::clone(&workspace), command_environment.clone()).err(),
-                    Some(BuildToolsError::InvalidConfiguration)
-                );
-                continue;
-            }
             let tools =
                 build_tools(&names, Arc::clone(&workspace), command_environment.clone()).unwrap();
             for (index, name) in KNOWN_TOOL_NAMES.iter().enumerate() {
@@ -512,6 +469,17 @@ mod tests {
             assert_eq!(
                 build_tools(
                     &[(*name).to_owned(), (*name).to_owned()],
+                    Arc::clone(&workspace),
+                    command_environment.clone(),
+                )
+                .err(),
+                Some(BuildToolsError::InvalidConfiguration)
+            );
+        }
+        for name in ["subagent", "unknown"] {
+            assert_eq!(
+                build_tools(
+                    &[name.to_owned()],
                     Arc::clone(&workspace),
                     command_environment.clone(),
                 )

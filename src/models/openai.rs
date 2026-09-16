@@ -621,7 +621,6 @@ impl<'a> ResponsesRequest<'a> {
                 name: tool.name().as_str().to_owned(),
                 description: tool.description().as_str().to_owned(),
                 parameters: tool.input_schema().clone(),
-                strict: (tool.name().as_str() == crate::subagents::TOOL_NAME).then_some(true),
             })
             .collect();
         let reasoning = match request.reasoning() {
@@ -765,10 +764,6 @@ struct FunctionTool {
     name: String,
     description: String,
     parameters: Value,
-    /// The native `subagent` schema uses OpenAI strict mode; legacy tools
-    /// retain their existing optional-field schemas and omit this flag.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    strict: Option<bool>,
 }
 
 #[derive(Serialize)]

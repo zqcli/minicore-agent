@@ -63,7 +63,7 @@ impl ToolPolicy for Policy {
 fn classify(name: &str) -> Option<ToolClass> {
     match name {
         "read" => Some(ToolClass::ReadOnly),
-        "write" | "edit" | "apply_patch" | "bash" | "subagent" => Some(ToolClass::Mutating),
+        "write" | "edit" | "apply_patch" | "bash" => Some(ToolClass::Mutating),
         _ => None,
     }
 }
@@ -90,8 +90,8 @@ mod tests {
     use crate::ids::SessionId;
     use crate::sessions::TurnRef;
 
-    const KNOWN_TOOLS: &[&str] = &["read", "write", "edit", "apply_patch", "bash", "subagent"];
-    const MUTATING_TOOLS: &[&str] = &["write", "edit", "apply_patch", "bash", "subagent"];
+    const KNOWN_TOOLS: &[&str] = &["read", "write", "edit", "apply_patch", "bash"];
+    const MUTATING_TOOLS: &[&str] = &["write", "edit", "apply_patch", "bash"];
     const SECRET: &str = "TOP-SECRET-ARGUMENT";
 
     fn ids() -> (SessionId, LoopId) {

@@ -33,7 +33,6 @@ use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::prompt::ProjectPromptProvider;
 use crate::sessions::{Sessions, TurnCompletion, await_compaction_completion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
-use crate::subagents::{SubagentFactory, SubagentService};
 use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
@@ -194,7 +193,6 @@ struct ResolvedSessionSettings {
 struct ExecutionConfigFactory<'a> {
     models: &'a Models,
     command_environment: &'a CommandEnvironment,
-    subagents: Arc<SubagentService>,
     compaction: Arc<CompactionState>,
     policy: crate::compaction::CompactionPolicy,
 }
@@ -237,29 +235,11 @@ impl ExecutionConfigFactory<'_> {
             model
         };
         let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
-        let subagent = record
-            .tools
-            .iter()
-            .any(|name| name == crate::subagents::TOOL_NAME)
-            .then(|| SubagentFactory {
-                service: Arc::clone(&self.subagents),
-                session_id: record.session_id,
-                parent_workspace: Arc::clone(&workspace),
-                models: Arc::new(self.models.clone()),
-                command_environment: self.command_environment.clone(),
-                system_prompt: record.system_prompt.clone(),
-                parent_tools: record.tools.clone(),
-                approval: record.approval,
-                options: options.clone(),
-                default_model: record.model.clone(),
-                default_reasoning: record.reasoning,
-            });
-        let tools = crate::tools::build_tools_with_presentation_and_subagent(
+        let tools = crate::tools::build_tools_with_presentation(
             &record.tools,
             Arc::clone(&workspace),
             self.command_environment.clone(),
             &presentation,
-            subagent.as_ref(),
         )
         .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
@@ -291,9 +271,9 @@ impl ExecutionConfigFactory<'_> {
 /// Top-level coordinator for the local Store and loaded Sessions.
 ///
 /// `Agent::shutdown` is the cleanup barrier for embedded Rust callers: it
-/// cancels active loops, waits for Agent-owned loop and child-worker tasks,
-/// and awaits persistence wrap-up. Dropping an `Agent` with live turns does
-/// not synchronously wait for Agent-owned loop tasks.
+/// cancels active loops, waits for Agent-owned loop and worker tasks, and
+/// awaits persistence wrap-up. Dropping an `Agent` with live turns does not
+/// synchronously wait for Agent-owned loop tasks.
 pub struct Agent {
     config: AgentConfig,
     config_path: Option<PathBuf>,
@@ -301,7 +281,6 @@ pub struct Agent {
     profiles: Profiles,
     models: Models,
     command_environment: CommandEnvironment,
-    subagents: Arc<SubagentService>,
     sessions: Sessions,
     event_sink: AgentEventSink,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -342,7 +321,6 @@ impl Agent {
         config_path: Option<PathBuf>,
     ) -> Result<Self, AgentError> {
         let command_environment = command_environment(&config);
-        let subagents = Arc::new(SubagentService::new());
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone())
             .await
@@ -356,7 +334,6 @@ impl Agent {
             profiles,
             models,
             command_environment,
-            subagents,
             sessions: Sessions::new(),
             event_sink,
             events_rx: Some(events_rx),
@@ -429,7 +406,6 @@ impl Agent {
             let factory = ExecutionConfigFactory {
                 models: &models,
                 command_environment: &command_environment,
-                subagents: Arc::clone(&self.subagents),
                 compaction: session.compaction_state(),
                 policy: candidate.compaction.policy(),
             };
@@ -886,7 +862,6 @@ impl Agent {
             config,
             auto,
             options,
-            Arc::clone(&self.subagents),
             compaction,
             self.config.compaction.policy(),
             self.store.clone(),
@@ -918,11 +893,22 @@ impl Agent {
             tracing::debug!(session_id = %session_id, "session already loaded");
             return Ok(session.info(true));
         }
+        let record = self
+            .store
+            .load_record(session_id)
+            .await
+            .map_err(crate::sessions::map_store_error)?;
+        if contains_removed_tool(&record.tools) {
+            return Err(AgentError::InvalidSessionSettings);
+        }
         let stored = self
             .store
             .load_session(session_id)
             .await
             .map_err(crate::sessions::map_store_error)?;
+        if contains_removed_tool(&stored.record.tools) {
+            return Err(AgentError::InvalidSessionSettings);
+        }
         let workspace = Arc::new(
             Workspace::open(stored.record.workspace.clone())
                 .await
@@ -964,7 +950,6 @@ impl Agent {
             config,
             auto,
             options,
-            Arc::clone(&self.subagents),
             compaction,
             self.config.compaction.policy(),
             self.store.clone(),
@@ -1334,7 +1319,7 @@ impl Agent {
     /// Orderly shutdown barrier for embedded Rust callers.
     ///
     /// Cancels active loops and manual compaction across all loaded Sessions, waits
-    /// for Agent-owned loop/compaction and child-worker tasks plus persistence
+    /// for Agent-owned loop/compaction and worker tasks plus persistence
     /// completion, and drops event channels.
     /// Dropping an `Agent` with live turns does not synchronously wait for
     /// Agent-owned loop tasks.
@@ -1347,7 +1332,6 @@ impl Agent {
         self.store.cancel_diff_workers();
         let result = self.sessions.shutdown_all().await;
         self.store.shutdown_diff_workers().await;
-        self.subagents.drain_all().await;
         drop(self.event_sink);
         drop(self.events_rx.take());
         tracing::info!(success = result.is_ok(), "agent shutdown end");
@@ -1403,7 +1387,6 @@ impl Agent {
         let factory = ExecutionConfigFactory {
             models: &self.models,
             command_environment: &self.command_environment,
-            subagents: Arc::clone(&self.subagents),
             compaction,
             policy,
         };
@@ -1448,6 +1431,12 @@ fn build_record(
         created_at: now.clone(),
         updated_at: now,
     })
+}
+
+const REMOVED_TOOL_NAME: &str = "subagent";
+
+fn contains_removed_tool(tools: &[String]) -> bool {
+    tools.iter().any(|name| name == REMOVED_TOOL_NAME)
 }
 
 fn map_build_tools_error(error: BuildToolsError) -> AgentError {

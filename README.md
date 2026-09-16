@@ -17,11 +17,11 @@ These follow-up fixes preserve the pinned Runtime revision and RPC surface.
 The subsequent [Session rename and prompt-file features](docs/verification/session-config.md)
 are separately committed and natively verified with the paired TUI; package
 versions and the Runtime pin are unchanged. Current
-[Tool, configuration reload and native stateless delegation acceptance](docs/verification/followups.md)
+[Tool and configuration reload acceptance](docs/verification/followups.md)
 uses unchanged Agent `f1697f7` / corrected TUI `a604e55` after the
 [public reload correction](docs/verification/reload-refresh.md), verified and
-installed separately without another version bump or push. Persistent subagent
-orchestration is not included.
+installed separately without another version bump or push. Delegated child-loop
+execution is not part of the Agent.
 
 ## Run
 
@@ -47,9 +47,7 @@ passed and 2 Live ignored; the same strict and cross-platform compile gates
 passed. Bash streaming/control, P6a native-change records, P6b1 version-bound
 tool diffs, P6b2 workspace diffs, and the P7 shared-client contract are all
 verified: stable/MSRV each 749 passed, 2 Live ignored, with strict and
-cross-platform gates. These changes are not a new installed
-Agent release. It also includes a native, stateless `subagent` Tool for explicitly
-delegated child loops.
+cross-platform gates. These changes are not a new installed Agent release.
 
 Profile `system_prompt` keeps its existing inline string form and also accepts
 `{ file = "..." }`. Relative prompt paths are resolved against the parent of
@@ -288,36 +286,20 @@ truncated at a UTF-8 boundary and marked `[truncated]`.
 
 The crate-private `Policy` implements MiniCore's `ToolPolicy` and is bound
 whenever a profile enables at least one Tool. Classification is an exact
-six-name match: `read` is read-only, while `write`, `edit`, `apply_patch`,
-`bash`, and `subagent` are mutating. `Auto` allows every known Tool; `Ask`
+five-name match: `read` is read-only, while `write`, `edit`, `apply_patch`,
+`bash` is mutating. `Auto` allows every known Tool; `Ask`
 requests a `Medium`-risk approval per mutating call with the prompt
 ``Allow tool `<name>` for this call?``; `ReadOnly` denies every mutating Tool.
 Approval prompts and denial reasons never include Tool arguments, paths,
 content, commands, or raw JSON.
 
-The Tool module implements the exact `read`, `write`, `edit`, `apply_patch`,
-`bash`, and `subagent` tools. Each production Session receives a new ToolSet
-sharing only that Session's Workspace. All six use strict object schemas and
-reject unknown input fields. `subagent` is registered only when the profile
-explicitly names it, runs stateless child `AgentLoop`s without Store records,
-supports one task, bounded parallel `tasks`, and sequential `chain` handoff via
-`{previous}`. Each stage propagates the text from its final assistant response;
-a later textless response does not reuse an earlier round. It excludes itself
-from child tools. Child work is limited to
-the parent Workspace or descendants, uses a fresh model/config snapshot, and
-joins before a normally completed subagent Tool returns. If external Tool or
-turn cancellation/timeout drops that Tool future, its scope only cancels
-children synchronously; the Agent-owned registry retains their handles until
-the Session loop completion, `session.close`, or `Agent::shutdown` drains them.
-The parent Tool may therefore return before that deferred join completes. The
-inherited approval policy remains active; child approval/input requests fail as
-a static stage result because stateless child calls have no separate interaction
-channel. The child runner uses Runtime's authoritative `LoopHandle::watch_state()`
-and `WaitingForInput` state rather than the best-effort `InteractionRequested` event,
-which may be dropped under pressure. Native interaction coverage uses an offline
-fake model/provider seam; it is evidence for this Agent/Runtime integration, not for
-real-provider behavior. `read` supports one-based line offsets, line and byte limits,
-and safe directory listings.
+The Tool module implements exactly `read`, `write`, `edit`, `apply_patch`, and
+`bash`. Each production Session receives a new ToolSet
+sharing only that Session's Workspace. All five use strict object schemas and
+reject unknown input fields. Historical Store v1 records may still contain the
+removed `subagent` name for compatibility, but such records are not executable
+and cannot be opened. `read` supports one-based line offsets, line and byte
+limits, and safe directory listings.
 `bash` is not a sandbox and retains the host authority of the Agent process;
 use external container or OS isolation for untrusted models or commands. Run
 only one Agent process for a given `data_dir`; the Store has no cross-process
@@ -344,7 +326,7 @@ active work, joins Session-owned workers, and persists cleanly before returning.
 
 `Agent::shutdown` is the cleanup barrier for embedded Rust callers. It cancels
 active loops, manual compaction, and startup admission, waits for Agent-owned
-workers and any native child workers, and awaits persistence wrap-up.
+workers, and awaits persistence wrap-up.
 Dropping an Agent with live turns does not synchronously wait for Agent-owned
 loop tasks. MiniCore Agent v0.3 uses the Runtime user-cancellation path when
 closing or shutting down an active Session; it does not currently preserve a

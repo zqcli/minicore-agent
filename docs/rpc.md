@@ -99,7 +99,7 @@ Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
 history query results, not the event stream.
 
-`agent.shutdown` waits for the Agent, its active child workers, pre-existing
+`agent.shutdown` waits for the Agent, its active workers, pre-existing
 waiter/query tasks, and event pump, then queues its response last. EOF, Ctrl-C,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
 MiniCore Agent v0.3 uses the Runtime user-cancellation path when closing or
@@ -176,7 +176,7 @@ Params are omitted or `{}`. Profiles are sorted by `id`.
       "id": "coding",
       "model": "coding",
       "reasoning": "high",
-      "tools": ["read", "write", "edit", "apply_patch", "bash", "subagent"],
+      "tools": ["read", "write", "edit", "apply_patch", "bash"],
       "approval": "auto"
     }
   ]
@@ -575,78 +575,12 @@ reread the Session before deciding whether to retry.
 
 ## Tools
 
-Profiles opt into Tools explicitly through the `tools` array. The native
-`subagent` Tool is available only when a profile names it; it is never added
-automatically. Its OpenAI function schema is strict (`additionalProperties`
-is `false` and optional values are represented as nullable required fields).
-
-The Tool accepts exactly one of these modes:
-
-```json
-{
-  "model": null,
-  "reasoning": null,
-  "task": "Review the parser and report the highest-risk issue",
-  "tasks": null,
-  "chain": null,
-  "cwd": null
-}
-```
-
-The `task` form runs one stateless child loop. Each task may select a
-configured model and reasoning value; `model: "id:reasoning"` is accepted as a
-convenient suffix form when `reasoning` is not also supplied. `tasks` runs up
-to eight independent child loops with at most four workers at once:
-
-```json
-{
-  "model": null,
-  "reasoning": null,
-  "task": null,
-  "tasks": [
-    {"model": null, "reasoning": null, "task": "Inspect the parser", "cwd": null},
-    {"model": null, "reasoning": null, "task": "Inspect the tests", "cwd": null}
-  ],
-  "chain": null,
-  "cwd": null
-}
-```
-
-`chain` runs up to eight stages sequentially. Each stage may contain the
-bounded `{previous}` placeholder, which is replaced with the preceding stage's
-final output. Final output is the text projection of the last assistant
-response; a later response without text does not reuse an earlier round. A
-stage result reports its status, selected model and reasoning,
-child loop ID, bounded output, usage, request count, tool-round count, and a
-static failure reason when applicable. Child output is capped at 50 KiB and
-aggregate Tool details are capped at 512 KiB. Generic progress events report
-stage starts, output activity, child Tool activity, and completed counts without
-forwarding raw child output. The top-level status is `completed` only when
-every returned stage completed, `partial` when at least one stage completed and
-another returned a non-completed status, and `failed` when no stage completed.
-Unknown aggregate usage fields remain `null`/unknown, empty usage is `null`, and
-reported fields are summed with checked arithmetic. Request and Tool-round
-aggregates are `null` when any included (non-skipped) stage omits that
-observation; skipped chain stages are not included in the aggregate. Per-stage
-observations remain in each stage object.
-
-Child loops have empty, independent history and presentation state, with no
-Store or Session record. They inherit the parent system prompt and the selected
-workspace's `AGENTS.md`, receive the parent's ordinary Tools except `subagent`,
-and inherit the parent's approval mode. A child `cwd` must be the parent workspace or a
-descendant. Child loops cannot delegate recursively. The inherited approval
-mode is enforced by the child policy; a child approval/input request cannot be
-answered through this stateless Tool and is returned as a failed stage. The child
-runner uses Runtime's authoritative `LoopHandle::watch_state()` and
-`WaitingForInput` state rather than the best-effort `InteractionRequested` event,
-which may be dropped under pressure. Native interaction coverage uses an offline
-fake model/provider seam; it is evidence for this Agent/Runtime integration, not
-for real-provider behavior. A normally completed subagent Tool joins its child workers before returning. If
-external Tool or turn cancellation/timeout drops the Tool future, its scope
-only cancels children synchronously; the Agent-owned registry retains their
-handles until Session loop completion, `session.close`, or Agent shutdown drains
-them. The parent Tool may return before that deferred join completes. Session
-and Agent shutdown still cancel and join outstanding child workers.
+Profiles opt into the five executable Tools explicitly through the `tools` array:
+`read`, `write`, `edit`, `apply_patch`, and `bash`. Unknown and duplicate names
+are rejected. Historical Store v1 records may contain the removed `subagent`
+name for read-only compatibility; those records can be listed, read, and
+renamed, but opening them returns `session settings are incompatible` before
+execution begins.
 
 ## History
 

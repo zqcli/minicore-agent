@@ -39,14 +39,6 @@ pub(crate) struct ProjectPromptProvider {
 }
 
 impl ProjectPromptProvider {
-    pub(crate) fn new(
-        workspace: Arc<Workspace>,
-        system_prompt: String,
-        compaction: Arc<CompactionState>,
-    ) -> Result<Self, AgentPromptError> {
-        Self::with_auto(workspace, system_prompt, compaction, None)
-    }
-
     pub(crate) fn with_auto(
         workspace: Arc<Workspace>,
         system_prompt: String,
@@ -93,7 +85,7 @@ impl ProjectPromptProvider {
         compaction: Arc<CompactionState>,
         read_gate: Arc<PromptReadGate>,
     ) -> Result<Self, AgentPromptError> {
-        let mut provider = Self::new(workspace, system_prompt, compaction)?;
+        let mut provider = Self::with_auto(workspace, system_prompt, compaction, None)?;
         provider.read_gate = Some(read_gate);
         Ok(provider)
     }
@@ -530,9 +522,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let provider =
-            ProjectPromptProvider::new(workspace, "system".to_owned(), CompactionState::new())
-                .unwrap();
+        let provider = ProjectPromptProvider::with_auto(
+            workspace,
+            "system".to_owned(),
+            CompactionState::new(),
+            None,
+        )
+        .unwrap();
         let model = ModelDescriptor::new(
             "test".parse::<ModelRef>().unwrap(),
             16_384,
@@ -564,9 +560,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let provider =
-            ProjectPromptProvider::new(workspace, "system".to_owned(), CompactionState::new())
-                .unwrap();
+        let provider = ProjectPromptProvider::with_auto(
+            workspace,
+            "system".to_owned(),
+            CompactionState::new(),
+            None,
+        )
+        .unwrap();
         let model = ModelDescriptor::new(
             "test".parse::<ModelRef>().unwrap(),
             16_384,

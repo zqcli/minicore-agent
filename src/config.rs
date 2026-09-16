@@ -612,6 +612,20 @@ request_timeout_seconds = 30
     }
 
     #[test]
+    fn removed_subagent_tool_is_rejected_from_profile_configuration() {
+        let mut config = valid_config();
+        config.profiles.get_mut("test").unwrap().tools = vec!["subagent".to_owned()];
+        assert_eq!(config.validate(), Err(ConfigError::InvalidProfile));
+
+        let text =
+            config_with_prompt_spec(r#""system""#).replace("tools = []", "tools = [\"subagent\"]");
+        assert!(matches!(
+            AgentConfig::from_toml(&text),
+            Err(ConfigError::InvalidProfile)
+        ));
+    }
+
+    #[test]
     fn compaction_policy_bounds_are_enforced() {
         for (target, trigger, valid) in [
             (50u8, 80u8, true),
