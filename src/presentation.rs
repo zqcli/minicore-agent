@@ -18,7 +18,6 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::Serialize;
 
@@ -31,11 +30,12 @@ use minicore_runtime::{LoopId, ToolCallId};
 use crate::event::{AgentEvent, AgentEventSink, EventMeta};
 use crate::ids::SessionId;
 use crate::sessions::TurnRef;
-use crate::tool_data::{
-    CommandResult, ToolData, ToolDataStream, ToolInvocationData, ToolProcessChunk, ToolProcessData,
-    ToolRecordingState, ToolRef, ToolStreamNotice,
-};
-use crate::tools::command::{CommandBinding, CommandOwners, CommandStreamSink};
+#[cfg(test)]
+use crate::tool_data::ToolData;
+use crate::tool_data::ToolRef;
+#[cfg(test)]
+use crate::tools::command::CommandOwners;
+use crate::tools::observe::{RequestKey, ToolObserver};
 use crate::tools::{NativeApplyPatchTool, NativeEditTool, NativeWriteTool};
 
 /// Display text limits. Aligned with the existing per-argument/output caps so
@@ -43,15 +43,6 @@ use crate::tools::{NativeApplyPatchTool, NativeEditTool, NativeWriteTool};
 pub(crate) const MAX_DETAIL_BYTES: usize = 512;
 pub(crate) const MAX_EXPANDED_INPUT_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_RESULT_DISPLAY_BYTES: usize = 512 * 1024;
-
-/// Fixed identity of one model request, captured from the real
-/// `ModelCallContext` at `Model::start`. One session runs at most one loop;
-/// tools in a batch belong to the request that produced them.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RequestKey {
-    pub(crate) loop_id: LoopId,
-    pub(crate) request_index: u32,
-}
 
 /// Whitelisted, single-line detail plus bounded expandable input for one tool
 /// card. This is the only Tool-detail formatter; live events and history
@@ -256,7 +247,6 @@ type RequestUsageCache = HashMap<RequestKey, minicore_runtime::model::Usage>;
 
 #[derive(Default)]
 struct PresentationInner {
-    request_key: Option<RequestKey>,
     /// Current-loop-only caches; cleared when a new loop starts.
     live_tools: HashMap<(Option<RequestKey>, ToolCallId), LiveTool>,
     tool_results: HashMap<(RequestKey, ToolCallId), ToolResultInfo>,
@@ -318,10 +308,6 @@ impl PresentationInner {
 pub(crate) struct Presentation {
     session_id: SessionId,
     events: AgentEventSink,
-    tool_data: Arc<ToolData>,
-    /// Owned Bash commands of this Session (or child loop). Every command of a
-    /// real loop is registered here and joined by that loop's owner.
-    command_owners: Arc<CommandOwners>,
     inner: Mutex<PresentationInner>,
 }
 
@@ -330,147 +316,27 @@ impl Presentation {
         Arc::new(Self {
             session_id,
             events,
-            tool_data: Arc::new(ToolData::new()),
-            command_owners: CommandOwners::new(),
             inner: Mutex::new(PresentationInner::default()),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn session_id(&self) -> SessionId {
         self.session_id
-    }
-
-    /// The registry every owned command started from this presentation joins.
-    pub(crate) fn command_owners(&self) -> &Arc<CommandOwners> {
-        &self.command_owners
-    }
-
-    /// The narrow handle a tool needs to run an owned command: the registry it
-    /// joins and the sink its bytes go to. Identity is never resolved from this
-    /// handle; the concrete tool passes the `ToolRef` it captured at the real
-    /// `Tool::execute` boundary.
-    pub(crate) fn command_binding(self: &Arc<Self>) -> CommandBinding {
-        let sink: Arc<dyn CommandStreamSink> = Arc::clone(self) as Arc<dyn CommandStreamSink>;
-        CommandBinding::new(Arc::clone(&self.command_owners), sink)
-    }
-
-    /// Per-Session structured tool facts. Separate from the legacy UI display
-    /// caches above: the new contract never depends on presentation fields.
-    pub(crate) fn tool_data(&self) -> Arc<ToolData> {
-        Arc::clone(&self.tool_data)
-    }
-
-    /// Publishes the validated invocation to the structured store at the real
-    /// execution boundary and emits the best-effort `tool_invocation` event on
-    /// first publish. Runtime calls `Tool::execute` only after the policy
-    /// decision and approval, so this is where `Running` becomes true; the
-    /// policy wrapper may already have published the same data while the call
-    /// awaited approval.
-    pub(crate) fn publish_tool_invocation(&self, tool_ref: &ToolRef, invocation: &ToolInvocation) {
-        let data = self.tool_data.note_invocation(tool_ref, invocation);
-        self.tool_data.mark_running(tool_ref);
-        if let Some(data) = data {
-            self.emit_tool_invocation(data);
-        }
-    }
-
-    /// Best-effort live state for one recorded call, emitted only after the
-    /// stored record was updated. `ToolExecution` remains the terminal event.
-    pub(crate) fn emit_tool_execution(&self, tool_ref: &ToolRef) {
-        let Some(data) = self.tool_data.snapshot(tool_ref) else {
-            return;
-        };
-        let loop_id = data.tool_ref.loop_id;
-        let _ = self.events.try_send(AgentEvent::ToolExecution {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
-            data,
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
-        });
-    }
-
-    /// Records durable recording state and emits the authoritative ToolExecution event.
-    pub(crate) fn note_tool_recording(
-        &self,
-        tool_ref: &ToolRef,
-        state: ToolRecordingState,
-        turn: TurnRef,
-    ) {
-        if let Some(data) = self.tool_data.note_recording(tool_ref, state) {
-            let loop_id = data.tool_ref.loop_id;
-            let _ = self.events.try_send(AgentEvent::ToolExecution {
-                turn,
-                data,
-                meta: EventMeta {
-                    session_id: self.session_id,
-                    loop_id: Some(loop_id),
-                    dropped_before: 0,
-                },
-            });
-        }
-    }
-
-    fn emit_tool_process(
-        &self,
-        tool_ref: &ToolRef,
-        chunk: Option<ToolProcessChunk>,
-        command: Option<CommandResult>,
-    ) {
-        let loop_id = tool_ref.loop_id;
-        let data = ToolProcessData {
-            tool_ref: tool_ref.clone(),
-            chunk,
-            command,
-        };
-        let _ = self.events.try_send(AgentEvent::ToolProcess {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
-            data,
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
-        });
-    }
-
-    pub(crate) fn emit_tool_invocation(&self, data: ToolInvocationData) {
-        let loop_id = data.tool_ref.loop_id;
-        let _ = self.events.try_send(AgentEvent::ToolInvocation {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
-            data,
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
-        });
     }
 
     pub(crate) fn set_branch(&self, branch: Option<String>) {
         self.lock().branch = branch;
     }
 
-    /// Records a model request identity at the real `Model::start` boundary.
+    /// Records the real model-start boundary for display-only steering
+    /// receipts. The execution request key lives in `ToolObserver`; this cache
+    /// only commits a prepared steering count and emits its read-only event.
     /// The user-facing label is set from the session profile, never from the
-    /// provider descriptor. At this same real boundary any steering count the
-    /// last successful prepare observed is committed and, when newly observed,
-    /// surfaced as a read-only `steer_progress` event.
+    /// provider descriptor.
     pub(crate) fn note_request_start(&self, key: RequestKey) {
         let event = {
             let mut inner = self.lock();
-            inner.request_key = Some(key);
             if let Some((prepared_key, count)) = inner.prepared_steers.take() {
                 if prepared_key == key {
                     inner.commit_steer_applied(self.session_id, key, count)
@@ -545,7 +411,6 @@ impl Presentation {
     /// `AgentLoop::start`, so this must not run after that call.
     pub(crate) fn reset_before_loop_start(&self) {
         let mut inner = self.lock();
-        inner.request_key = None;
         inner.live_tools.clear();
         inner.tool_results.clear();
         inner.request_usage.clear();
@@ -713,10 +578,6 @@ impl Presentation {
         }
     }
 
-    pub(crate) fn request_key(&self) -> Option<RequestKey> {
-        self.lock().request_key
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, PresentationInner> {
         self.inner
             .lock()
@@ -724,84 +585,29 @@ impl Presentation {
     }
 }
 
-/// Owned commands write through the presentation: the authoritative window or
-/// record is stored first, and only then is a best-effort event published.
-impl CommandStreamSink for Presentation {
-    fn push_chunk(
-        &self,
-        tool_ref: &ToolRef,
-        stream: ToolDataStream,
-        chunk: &[u8],
-    ) -> Option<ToolStreamNotice> {
-        let notice = self.tool_data.note_stream_chunk(tool_ref, stream, chunk)?;
-        // Publish the current stored command record together with the chunk, so
-        // a consumer learns the running process ranges from the same source as
-        // `tool.read` instead of from a record captured before the bytes.
-        let command = self
-            .tool_data
-            .snapshot(tool_ref)
-            .and_then(|execution| execution.command);
-        self.emit_tool_process(
-            tool_ref,
-            Some(ToolProcessChunk {
-                stream: notice.stream,
-                encoding: notice.stream.encoding(),
-                data: base64::engine::general_purpose::STANDARD.encode(chunk),
-                base_offset: notice.base_offset,
-                next_offset: notice.next_offset,
-                observed_end: notice.observed_end,
-                dropped: notice.dropped,
-                expired: notice.expired,
-            }),
-            command,
-        );
-        Some(notice)
-    }
-
-    fn note_command(&self, tool_ref: &ToolRef, result: &CommandResult) {
-        // The event carries the record the store actually holds after the
-        // Session budget ran, with ranges overlaid from the current windows,
-        // so a live consumer and a later `tool.read` cannot disagree.
-        let Some(snapshot) = self.tool_data.note_command(tool_ref, result.clone()) else {
-            return;
-        };
-        self.emit_tool_process(tool_ref, None, snapshot.command);
-    }
-
-    fn mark_cancelling(&self, tool_ref: &ToolRef) {
-        self.tool_data.mark_cancelling(tool_ref);
-        self.emit_tool_execution(tool_ref);
-    }
-
-    fn stream_range(&self, tool_ref: &ToolRef, stream: ToolDataStream) -> Option<(u64, u64)> {
-        self.tool_data.stream_range(tool_ref, stream)
-    }
-
-    fn note_stream_end(&self, tool_ref: &ToolRef, stream: ToolDataStream) {
-        self.tool_data.note_stream_end(tool_ref, stream);
-    }
-
-    fn note_stream_cut(&self, tool_ref: &ToolRef, stream: ToolDataStream) {
-        self.tool_data.note_stream_cut(tool_ref, stream);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Model / Tool wrappers (thin; identity + best-effort display only)
 // ---------------------------------------------------------------------------
 
-/// Records `(loop_id, request_index)` from the real `ModelCallContext` at the
-/// real `Model::start` boundary, then delegates unchanged.
+/// Records the real request key in `ToolObserver` at the model boundary and
+/// mirrors that boundary into the display-only steering cache, then delegates
+/// unchanged.
 pub(crate) struct PresentationModel {
     inner: Arc<dyn Model>,
     presentation: Arc<Presentation>,
+    observer: Arc<ToolObserver>,
 }
 
 impl PresentationModel {
-    pub(crate) fn new(inner: Arc<dyn Model>, presentation: Arc<Presentation>) -> Arc<Self> {
+    pub(crate) fn new_with_observer(
+        inner: Arc<dyn Model>,
+        presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             presentation,
+            observer,
         })
     }
 }
@@ -821,6 +627,7 @@ impl Model for PresentationModel {
             request_index: context.request_index,
         };
         // Synchronous; no lock is held across an await.
+        self.observer.note_request_start(key);
         self.presentation.note_request_start(key);
         let inner = self.inner.start(request, context);
         let presentation = Arc::clone(&self.presentation);
@@ -890,82 +697,100 @@ impl PromptProvider for SteerReceiptPrompt {
     }
 }
 
-/// Fixes the current request identity at `Tool::execute` start, computes the
-/// bounded ToolDisplay, then delegates execution unchanged (cancellation,
-/// deadline, errors, and the result are never altered). Real Bash and native
-/// file tools receive the exact `ToolRef` captured here, so commands and
-/// mutation records never resolve identity from a table that a dropped future
-/// can leave stale.
+/// Captures the current request identity in `ToolObserver` at `Tool::execute`
+/// start, computes the bounded ToolDisplay, then delegates execution unchanged
+/// (cancellation, deadline, errors, and the result are never altered). Real
+/// Bash and native file tools receive the exact `ToolRef` captured here, so
+/// commands and mutation records never resolve identity from a table that a
+/// dropped future can leave stale.
 pub(crate) enum PresentationTool {
     Plain {
         inner: Arc<dyn Tool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     },
     Bash {
         inner: Arc<crate::tools::OwnedBashTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     },
     Write {
         inner: Arc<NativeWriteTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     },
     Edit {
         inner: Arc<NativeEditTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     },
     ApplyPatch {
         inner: Arc<NativeApplyPatchTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     },
 }
 
 impl PresentationTool {
-    pub(crate) fn new(inner: Arc<dyn Tool>, presentation: Arc<Presentation>) -> Arc<Self> {
+    pub(crate) fn new_with_observer(
+        inner: Arc<dyn Tool>,
+        presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
+    ) -> Arc<Self> {
         Arc::new(Self::Plain {
             inner,
             presentation,
+            observer,
         })
     }
 
     /// Explicit construction for the owned-command tool: only this variant
     /// receives the captured `ToolRef` at the real execute boundary.
-    pub(crate) fn new_bash(
+    pub(crate) fn new_bash_with_observer(
         inner: Arc<crate::tools::OwnedBashTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
         Arc::new(Self::Bash {
             inner,
             presentation,
+            observer,
         })
     }
 
-    pub(crate) fn new_write(
+    pub(crate) fn new_write_with_observer(
         inner: Arc<NativeWriteTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
         Arc::new(Self::Write {
             inner,
             presentation,
+            observer,
         })
     }
 
-    pub(crate) fn new_edit(
+    pub(crate) fn new_edit_with_observer(
         inner: Arc<NativeEditTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
         Arc::new(Self::Edit {
             inner,
             presentation,
+            observer,
         })
     }
 
-    pub(crate) fn new_apply_patch(
+    pub(crate) fn new_apply_patch_with_observer(
         inner: Arc<NativeApplyPatchTool>,
         presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
         Arc::new(Self::ApplyPatch {
             inner,
             presentation,
+            observer,
         })
     }
 
@@ -988,6 +813,16 @@ impl PresentationTool {
             | Self::ApplyPatch { presentation, .. } => presentation,
         }
     }
+
+    fn observer(&self) -> &Arc<ToolObserver> {
+        match self {
+            Self::Plain { observer, .. }
+            | Self::Bash { observer, .. }
+            | Self::Write { observer, .. }
+            | Self::Edit { observer, .. }
+            | Self::ApplyPatch { observer, .. } => observer,
+        }
+    }
 }
 
 impl Tool for PresentationTool {
@@ -1001,7 +836,8 @@ impl Tool for PresentationTool {
         context: ToolContext,
     ) -> minicore_runtime::tools::ToolFuture<'a> {
         let presentation = Arc::clone(self.presentation());
-        let key = presentation.request_key();
+        let observer = Arc::clone(self.observer());
+        let key = observer.request_key();
         let display = build_tool_display(
             invocation.tool_name().as_str(),
             Some(invocation.arguments()),
@@ -1011,7 +847,7 @@ impl Tool for PresentationTool {
         // Runtime's tool-call id. This is the single place the identity is
         // captured; it is passed downward, never recovered from a live table.
         let tool_ref = key.map(|key| ToolRef {
-            session_id: presentation.session_id(),
+            session_id: observer.session_id(),
             loop_id: key.loop_id,
             request_index: key.request_index,
             tool_call_id: invocation.tool_call_id().clone(),
@@ -1019,7 +855,7 @@ impl Tool for PresentationTool {
         presentation.begin_tool(key, &invocation, display);
         if let Some(tool_ref) = &tool_ref {
             // Published before the work starts, never after it returns.
-            presentation.publish_tool_invocation(tool_ref, &invocation);
+            observer.publish_tool_invocation(tool_ref, &invocation);
         }
 
         let request_key = key;
@@ -1031,6 +867,7 @@ impl Tool for PresentationTool {
                     let result = inner.execute(invocation, context).await;
                     finish_presentation_tool(
                         &presentation,
+                        &observer,
                         request_key,
                         &tool_call_id,
                         tool_ref.as_ref(),
@@ -1047,6 +884,7 @@ impl Tool for PresentationTool {
                         .await;
                     finish_presentation_tool(
                         &presentation,
+                        &observer,
                         request_key,
                         &tool_call_id,
                         tool_ref.as_ref(),
@@ -1057,13 +895,14 @@ impl Tool for PresentationTool {
             }
             Self::Write { inner, .. } => {
                 let inner = Arc::clone(inner);
-                let tool_data = presentation.tool_data();
+                let tool_data = observer.tool_data();
                 Box::pin(async move {
                     let result = inner
                         .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
                         .await;
                     finish_presentation_tool(
                         &presentation,
+                        &observer,
                         request_key,
                         &tool_call_id,
                         tool_ref.as_ref(),
@@ -1074,13 +913,14 @@ impl Tool for PresentationTool {
             }
             Self::Edit { inner, .. } => {
                 let inner = Arc::clone(inner);
-                let tool_data = presentation.tool_data();
+                let tool_data = observer.tool_data();
                 Box::pin(async move {
                     let result = inner
                         .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
                         .await;
                     finish_presentation_tool(
                         &presentation,
+                        &observer,
                         request_key,
                         &tool_call_id,
                         tool_ref.as_ref(),
@@ -1091,13 +931,14 @@ impl Tool for PresentationTool {
             }
             Self::ApplyPatch { inner, .. } => {
                 let inner = Arc::clone(inner);
-                let tool_data = presentation.tool_data();
+                let tool_data = observer.tool_data();
                 Box::pin(async move {
                     let result = inner
                         .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
                         .await;
                     finish_presentation_tool(
                         &presentation,
+                        &observer,
                         request_key,
                         &tool_call_id,
                         tool_ref.as_ref(),
@@ -1115,13 +956,14 @@ impl Tool for PresentationTool {
 /// while the authoritative terminal state still comes from the Runtime.
 fn finish_presentation_tool(
     presentation: &Presentation,
+    observer: &ToolObserver,
     request_key: Option<RequestKey>,
     tool_call_id: &ToolCallId,
     tool_ref: Option<&ToolRef>,
     result: &Result<ToolExecutionOutcome, minicore_runtime::tools::ToolError>,
 ) {
     if let (Some(tool_ref), Ok(ToolExecutionOutcome::Completed(output))) = (tool_ref, result) {
-        presentation
+        observer
             .tool_data()
             .note_result(tool_ref, output.content().as_str());
     }
@@ -1138,25 +980,22 @@ fn finish_presentation_tool(
     presentation.finish_tool(request_key, tool_call_id, result_text);
 }
 
-/// Fixes the current request identity at the policy boundary and publishes
-/// the validated invocation before any approval decision. This is what makes
-/// invocation data obtainable while a tool is still waiting for approval;
-/// `Running` is not set here, because the tool has not been invoked yet.
-/// Delegation, fallback decisions, and error paths are unchanged.
+/// Reads the request identity from `ToolObserver` at the policy boundary and
+/// publishes the validated invocation before any approval decision. This is
+/// what makes invocation data obtainable while a tool is still waiting for
+/// approval; `Running` is not set here, because the tool has not been invoked
+/// yet. Delegation, fallback decisions, and error paths are unchanged.
 pub(crate) struct PresentationPolicy {
     inner: Arc<dyn minicore_runtime::tools::ToolPolicy>,
-    presentation: Arc<Presentation>,
+    observer: Arc<ToolObserver>,
 }
 
 impl PresentationPolicy {
-    pub(crate) fn new(
+    pub(crate) fn new_with_observer(
         inner: Arc<dyn minicore_runtime::tools::ToolPolicy>,
-        presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            presentation,
-        })
+        Arc::new(Self { inner, observer })
     }
 }
 
@@ -1165,22 +1004,22 @@ impl minicore_runtime::tools::ToolPolicy for PresentationPolicy {
         &'a self,
         request: minicore_runtime::tools::ToolPolicyRequest,
     ) -> minicore_runtime::tools::ToolPolicyFuture<'a> {
-        let tool_ref = self.presentation.request_key().map(|key| ToolRef {
-            session_id: self.presentation.session_id(),
+        let tool_ref = self.observer.request_key().map(|key| ToolRef {
+            session_id: self.observer.session_id(),
             loop_id: key.loop_id,
             request_index: key.request_index,
             tool_call_id: request.invocation.tool_call_id().clone(),
         });
         if let Some(tool_ref) = &tool_ref {
             if let Some(data) = self
-                .presentation
+                .observer
                 .tool_data()
                 .note_invocation(tool_ref, &request.invocation)
             {
-                self.presentation.emit_tool_invocation(data);
+                self.observer.emit_tool_invocation(data);
             }
         }
-        let presentation = Arc::clone(&self.presentation);
+        let observer = Arc::clone(&self.observer);
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let decision = inner.decide(request).await;
@@ -1189,7 +1028,7 @@ impl minicore_runtime::tools::ToolPolicy for PresentationPolicy {
                     decision,
                     minicore_runtime::tools::ToolDecision::RequireApproval { .. }
                 ) {
-                    presentation.tool_data().mark_awaiting_policy(tool_ref);
+                    observer.tool_data().mark_awaiting_policy(tool_ref);
                 }
             }
             decision
@@ -1872,6 +1711,11 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::channel(8);
         let presentation =
             Presentation::new(SessionId::new().unwrap(), AgentEventSink::new(sender));
+        let observer = ToolObserver::new(
+            presentation.session_id(),
+            Arc::new(ToolData::new()),
+            AgentEventSink::new(tokio::sync::mpsc::channel(8).0),
+        );
         let call_id = ToolCallId::new("call-a").unwrap();
         let invocation = ToolInvocation {
             tool_call_id: call_id.clone(),
@@ -1900,7 +1744,7 @@ mod tests {
             request_index: 0,
             tool_call_id: call_id.clone(),
         };
-        presentation.tool_data().note_requested(&first_ref, "bash");
+        observer.tool_data().note_requested(&first_ref, "bash");
 
         // Second loop on the same Session reuses the call id.
         let second_key = RequestKey {
@@ -1922,7 +1766,7 @@ mod tests {
         assert_ne!(first_ref.loop_id, second_ref.loop_id);
         assert_eq!(second_ref.loop_id, second_key.loop_id);
         // The new loop's binding only owns the new loop's registry.
-        let binding = presentation.command_binding();
+        let binding = observer.command_binding(CommandOwners::new());
         assert_eq!(binding.owners().active(), 0);
     }
 

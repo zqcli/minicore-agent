@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::stream;
 use serde_json::json;
@@ -36,6 +36,9 @@ use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
     fail_next_append, fail_next_record_write,
 };
+use crate::tool_data::ToolData;
+use crate::tools::command::CommandOwners;
+use crate::tools::observe::ToolObserver;
 
 use super::{
     Agent, CompactSession, CreateSession, RenameSession, SessionUpdateResult, TurnRef,
@@ -4558,6 +4561,96 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
 }
 
 #[tokio::test]
+async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() {
+    let (data_dir, _guard) = fixture_dir(&format!("i2-01-{}", next_id()));
+    let (workspace_a, _workspace_a_guard) = workspace_file("i2-01-a", "a.txt", b"a");
+    let (workspace_b, _workspace_b_guard) = workspace_file("i2-01-b", "b.txt", b"b");
+    let model_main = FakeModel::new("main", []);
+    let model_other = FakeModel::new("other", []);
+    let mut agent = open_agent_auto_with_configs(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), Arc::clone(&model_main)),
+            ("other".to_owned(), Arc::clone(&model_other)),
+        ]),
+        BTreeMap::from([
+            ("main".to_owned(), model_config("MINICORE_AGENT_TEST_KEY")),
+            ("other".to_owned(), model_config("MINICORE_AGENT_TEST_KEY")),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let first = create_session(&mut agent, &workspace_a).await;
+    let second = create_session(&mut agent, &workspace_b).await;
+    let first_session = agent.loaded_session(first.session_id).unwrap();
+    let second_session = agent.loaded_session(second.session_id).unwrap();
+    let first_data = first_session.tool_data();
+    let first_owners = first_session.command_owners();
+    let first_observer = first_session.tool_observer();
+    assert!(Arc::ptr_eq(&first_data, &first_observer.tool_data()));
+    assert_eq!(first_observer.session_id(), first.session_id);
+    assert!(!Arc::ptr_eq(&first_data, &second_session.tool_data()));
+    assert!(!Arc::ptr_eq(
+        &first_owners,
+        &second_session.command_owners()
+    ));
+
+    agent
+        .update_session(UpdateSession {
+            session_id: first.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&first_data, &first_session.tool_data()));
+    assert!(Arc::ptr_eq(&first_owners, &first_session.command_owners()));
+    assert!(Arc::ptr_eq(&first_observer, &first_session.tool_observer()));
+
+    let candidate = agent.config().clone();
+    let models = Models::from_values(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_main) as Arc<dyn Model>),
+        (
+            "other".to_owned(),
+            Arc::clone(&model_other) as Arc<dyn Model>,
+        ),
+    ]));
+    assert_eq!(
+        agent
+            .reload_settings_with_models(candidate, models)
+            .unwrap(),
+        crate::agent::ReloadResult { ok: true }
+    );
+    assert!(Arc::ptr_eq(&first_data, &first_session.tool_data()));
+    assert!(Arc::ptr_eq(&first_owners, &first_session.command_owners()));
+    assert!(Arc::ptr_eq(&first_observer, &first_session.tool_observer()));
+}
+
+#[tokio::test]
+async fn i2_05_session_observation_resources_are_released_without_cycles() {
+    let (data_dir, _guard) = fixture_dir(&format!("i2-05-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("i2-05-ws", "a.txt", b"a");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
+    let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
+    let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.tool_observer());
+    drop(session);
+
+    agent.close_session(info.session_id).await.unwrap();
+    drop(agent);
+    assert!(weak_data.upgrade().is_none());
+    assert!(weak_owners.upgrade().is_none());
+    assert!(weak_observer.upgrade().is_none());
+}
+
+#[tokio::test]
 async fn embedded_open_without_a_file_source_cannot_reload() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-no-source-{}", next_id()));
     let (workspace, _guard) = workspace_file("reload-no-source-ws", "a.txt", b"hello");
@@ -4786,8 +4879,7 @@ async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
             .append(true)
             .open(&history_path)
             .unwrap();
-        file.write_all(b"{\"partial_legacy_tail\": true")
-            .unwrap();
+        file.write_all(b"{\"partial_legacy_tail\": true").unwrap();
     }
     let summary_path = session_dir.join("summary.json");
     std::fs::write(&summary_path, b"historical summary").unwrap();
@@ -6536,7 +6628,7 @@ async fn tool_read_exposes_approval_time_data_without_running() {
 }
 
 #[tokio::test]
-async fn tool_execution_event_matches_the_tool_read_query() {
+async fn i2_02_tool_execution_event_matches_the_tool_read_query() {
     let (data_dir, _guard) = fixture_dir(&format!("tool-data-events-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-data-events-ws", "a.txt", b"alpha\nbeta");
     let model = FakeModel::new(
@@ -6586,7 +6678,7 @@ async fn tool_execution_event_matches_the_tool_read_query() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn first_request_observation_survives_runtime_start_binding() {
+async fn i2_06_first_request_observation_survives_runtime_start_binding() {
     use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState};
     use base64::Engine;
 
@@ -6792,7 +6884,6 @@ async fn first_request_observation_survives_runtime_start_binding() {
         if agent
             .loaded_session(info.session_id)
             .ok_or_else(|| "Session was unloaded while Bash was running".to_owned())?
-            .presentation()
             .command_owners()
             .active()
             == 0
@@ -6858,7 +6949,6 @@ async fn first_request_observation_survives_runtime_start_binding() {
         if agent
             .loaded_session(info.session_id)
             .ok_or_else(|| "Session was unloaded before owner join check".to_owned())?
-            .presentation()
             .command_owners()
             .active()
             != 0
@@ -6923,7 +7013,7 @@ async fn tool_result_raw_text_is_readable_by_offset_without_escaping() {
 }
 
 #[tokio::test]
-async fn tool_read_answers_without_consuming_live_events() {
+async fn i2_03_tool_read_answers_without_consuming_live_events() {
     // A capacity-1 Agent event queue drops nearly every best-effort event, yet
     // the authoritative join report still reconciles terminal tool state.
     let (data_dir, _guard) = fixture_dir(&format!("tool-data-lost-{}", next_id()));
@@ -8158,7 +8248,7 @@ fn process_is_listed(pid: i32) -> bool {
 /// `close_session` returns only after the owned command was reaped.
 #[cfg(unix)]
 #[tokio::test]
-async fn bash_owned_command_matches_events_queries_and_the_close_join() {
+async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     use crate::tool_data::{CommandStatus, ToolDataStream};
 
     let (data_dir, _guard) = fixture_dir(&format!("bash-owned-turn-{}", next_id()));
@@ -8587,7 +8677,6 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
     let tool_refs = agent
         .loaded_session(info.session_id)
         .unwrap()
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     assert!(!tool_refs.is_empty());
@@ -8660,7 +8749,6 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
     let tool_refs = agent
         .loaded_session(info.session_id)
         .unwrap()
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     assert!(!tool_refs.is_empty());
@@ -8782,7 +8870,6 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
     let info = create_session(&mut agent, &workspace).await;
 
     let session = agent.loaded_session(info.session_id).unwrap();
-    let presentation = session.presentation();
     let loop_id = minicore_runtime::LoopId::new().unwrap();
     let tool_ref = crate::tool_data::ToolRef {
         session_id: info.session_id,
@@ -8791,10 +8878,10 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
         tool_call_id: minicore_runtime::ToolCallId::new("call-dl-timeout").unwrap(),
     };
 
-    presentation.tool_data().note_requested(&tool_ref, "bash");
-    presentation.tool_data().mark_running(&tool_ref);
-    presentation.tool_data().note_result(&tool_ref, "hi\n");
-    presentation.tool_data().finish_and_snapshot(
+    session.tool_data().note_requested(&tool_ref, "bash");
+    session.tool_data().mark_running(&tool_ref);
+    session.tool_data().note_result(&tool_ref, "hi\n");
+    session.tool_data().finish_and_snapshot(
         &tool_ref,
         minicore_runtime::tools::ToolResultOutcome::Success,
     );
@@ -8819,7 +8906,7 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
     let results = store
         .persist_loop_tool_records(
             std::slice::from_ref(&tool_ref),
-            presentation.tool_data().as_ref(),
+            session.tool_data().as_ref(),
             expired_deadline,
         )
         .await;
@@ -8865,7 +8952,6 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     let tool_refs = agent
         .loaded_session(info.session_id)
         .unwrap()
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     assert_eq!(tool_refs.len(), 1);
@@ -8988,7 +9074,6 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     let tool_refs = agent
         .loaded_session(info.session_id)
         .unwrap()
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     let tool_ref = tool_refs[0].clone();
@@ -9153,7 +9238,6 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     let tool_refs = agent
         .loaded_session(info.session_id)
         .unwrap()
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     let tool_ref = tool_refs[0].clone();
@@ -9234,7 +9318,6 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
 
     let session = agent.loaded_session(info.session_id).unwrap();
     let tool_refs = session
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     let tool_ref = tool_refs[0].clone();
@@ -9258,11 +9341,8 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
             request_index: i,
             tool_call_id: minicore_runtime::ToolCallId::new(format!("filler-{i}")).unwrap(),
         };
-        session
-            .presentation()
-            .tool_data()
-            .note_requested(&filler, "bash");
-        session.presentation().tool_data().note_stream_chunk(
+        session.tool_data().note_requested(&filler, "bash");
+        session.tool_data().note_stream_chunk(
             &filler,
             ToolDataStream::Stdout,
             &vec![b'x'; 1024 * 1024],
@@ -9271,7 +9351,6 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
 
     // Direct memory check on session shows availability is Expired
     let mem_output = session
-        .presentation()
         .tool_data()
         .output(
             &crate::tool_data::ToolOutputRequest {
@@ -9331,7 +9410,6 @@ async fn both_sources_unavailable_preserves_known_offsets() {
 
     let session = agent.loaded_session(info.session_id).unwrap();
     let tool_refs = session
-        .presentation()
         .tool_data()
         .loop_tool_refs(info.session_id, turn.loop_id);
     let tool_ref = tool_refs[0].clone();
@@ -9345,11 +9423,8 @@ async fn both_sources_unavailable_preserves_known_offsets() {
             request_index: i,
             tool_call_id: minicore_runtime::ToolCallId::new(format!("filler-{i}")).unwrap(),
         };
-        session
-            .presentation()
-            .tool_data()
-            .note_requested(&filler, "bash");
-        session.presentation().tool_data().note_stream_chunk(
+        session.tool_data().note_requested(&filler, "bash");
+        session.tool_data().note_stream_chunk(
             &filler,
             ToolDataStream::Stdout,
             &vec![b'x'; 1024 * 1024],

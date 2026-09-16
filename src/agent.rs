@@ -33,6 +33,9 @@ use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::prompt::ProjectPromptProvider;
 use crate::sessions::{Sessions, TurnCompletion, await_compaction_completion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
+use crate::tool_data::ToolData;
+use crate::tools::command::CommandOwners;
+use crate::tools::observe::ToolObserver;
 use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
@@ -203,6 +206,8 @@ impl ExecutionConfigFactory<'_> {
         record: &SessionRecord,
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
+        observer: Arc<ToolObserver>,
+        command_owners: Arc<CommandOwners>,
         options: LoopOptions,
     ) -> Result<(ExecutionConfig, Option<AutoContext>), AgentError> {
         let model = self
@@ -234,20 +239,26 @@ impl ExecutionConfigFactory<'_> {
         } else {
             model
         };
-        let model = crate::presentation::PresentationModel::new(model, Arc::clone(&presentation));
+        let model = crate::presentation::PresentationModel::new_with_observer(
+            model,
+            Arc::clone(&presentation),
+            Arc::clone(&observer),
+        );
         let tools = crate::tools::build_tools_with_presentation(
             &record.tools,
             Arc::clone(&workspace),
             self.command_environment.clone(),
             &presentation,
+            &observer,
+            &command_owners,
         )
         .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
             None
         } else {
-            Some(crate::presentation::PresentationPolicy::new(
+            Some(crate::presentation::PresentationPolicy::new_with_observer(
                 Arc::new(Policy::new(record.approval)),
-                Arc::clone(&presentation),
+                Arc::clone(&observer),
             ))
         };
         let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
@@ -409,8 +420,14 @@ impl Agent {
                 compaction: session.compaction_state(),
                 policy: candidate.compaction.policy(),
             };
-            let (config, auto) =
-                factory.build(&record, workspace, presentation, options.clone())?;
+            let (config, auto) = factory.build(
+                &record,
+                workspace,
+                presentation,
+                session.tool_observer(),
+                session.command_owners(),
+                options.clone(),
+            )?;
             session_candidates.push((
                 session.clone(),
                 config,
@@ -836,6 +853,10 @@ impl Agent {
         )?;
         // Every predictable configuration error must fail before the store write.
         let presentation = self.build_presentation(session_id, record.model.clone());
+        let tool_data = Arc::new(ToolData::new());
+        let command_owners = CommandOwners::new();
+        let tool_observer =
+            ToolObserver::new(session_id, Arc::clone(&tool_data), self.event_sink.clone());
         let options = self
             .config
             .loop_options_for_model(record.max_tool_rounds, &record.model)
@@ -845,6 +866,8 @@ impl Agent {
             &record,
             Arc::clone(&workspace),
             Arc::clone(&presentation),
+            Arc::clone(&tool_observer),
+            Arc::clone(&command_owners),
             options.clone(),
             Arc::clone(&compaction),
             self.config.compaction.policy(),
@@ -866,6 +889,9 @@ impl Agent {
             self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
+            tool_data,
+            command_owners,
+            tool_observer,
         );
         let _ = self.sessions.insert(session_id, session);
         let info = self
@@ -928,6 +954,10 @@ impl Agent {
             return Err(AgentError::Workspace);
         }
         let presentation = self.build_presentation(session_id, stored.record.model.clone());
+        let tool_data = Arc::new(ToolData::new());
+        let command_owners = CommandOwners::new();
+        let tool_observer =
+            ToolObserver::new(session_id, Arc::clone(&tool_data), self.event_sink.clone());
         let options = self
             .config
             .loop_options_for_model(stored.record.max_tool_rounds, &stored.record.model)
@@ -937,6 +967,8 @@ impl Agent {
             &stored.record,
             Arc::clone(&workspace),
             Arc::clone(&presentation),
+            Arc::clone(&tool_observer),
+            Arc::clone(&command_owners),
             options.clone(),
             Arc::clone(&compaction),
             self.config.compaction.policy(),
@@ -954,6 +986,9 @@ impl Agent {
             self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
+            tool_data,
+            command_owners,
+            tool_observer,
         );
         let _ = self.sessions.insert(session_id, session);
         let info = self
@@ -1074,6 +1109,8 @@ impl Agent {
             &candidate,
             workspace,
             session.presentation(),
+            session.tool_observer(),
+            session.command_owners(),
             options.clone(),
             session.compaction_state(),
             session.policy(),
@@ -1373,13 +1410,17 @@ impl Agent {
     /// Assembles a complete runtime `ExecutionConfig` from the session record:
     /// model, tools, policy, and the project prompt provider. The same
     /// settings are reused across every turn and replaced atomically on
-    /// update. Model and tools are wrapped with the per-session presentation
-    /// (identity capture + bounded display; never execution semantics).
+    /// update. Model and tools use the Session-owned observer for execution
+    /// facts, while the per-session presentation remains bounded display
+    /// state only.
+    #[allow(clippy::too_many_arguments)]
     fn execution_config(
         &self,
         record: &SessionRecord,
         workspace: Arc<Workspace>,
         presentation: Arc<crate::presentation::Presentation>,
+        observer: Arc<ToolObserver>,
+        command_owners: Arc<CommandOwners>,
         options: minicore_runtime::LoopOptions,
         compaction: Arc<CompactionState>,
         policy: crate::compaction::CompactionPolicy,
@@ -1390,11 +1431,19 @@ impl Agent {
             compaction,
             policy,
         };
-        factory.build(record, workspace, presentation, options)
+        factory.build(
+            record,
+            workspace,
+            presentation,
+            observer,
+            command_owners,
+            options,
+        )
     }
 
-    /// Per-session presentation wired into this session's model/tool wrappers
-    /// and the `session.presentation` read. The branch starts unknown and is
+    /// Per-session display state wired into this session's model/tool wrappers
+    /// and the `session.presentation` read. Execution observation is owned by
+    /// the Session separately. The branch starts unknown and is
     /// projected only when an explicit `workspace.status` query completes.
     fn build_presentation(
         &self,

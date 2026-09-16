@@ -322,9 +322,9 @@ impl Drop for CommandWorker {
     }
 }
 
-/// Owned command workers for one owner boundary: a Session presentation, a
-/// child-loop presentation, or a standalone tool. At most one worker exists per
-/// complete `ToolRef`, and never more than one for the same call.
+/// Owned command workers for one owner boundary: a Session or standalone
+/// owner. At most one worker exists per complete `ToolRef`, and never more than
+/// one for the same call.
 pub(crate) struct CommandOwners {
     inner: Mutex<OwnersInner>,
 }
