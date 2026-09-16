@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(test)]
+use std::sync::{Condvar, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,10 @@ static PAUSE_BEFORE_JOIN: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new(
 static PAUSE_AFTER_COMPACTION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 static PAUSE_AFTER_ADMISSION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
+#[cfg(test)]
+type RuntimeStartGateEntry = (SessionId, Arc<RuntimeStartGate>);
+#[cfg(test)]
+static PAUSE_AFTER_RUNTIME_START: OnceLock<Mutex<Vec<RuntimeStartGateEntry>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) struct WorkerGate {
@@ -78,6 +82,45 @@ impl WorkerGate {
 
     pub(crate) fn release(&self) {
         self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct RuntimeStartGate {
+    started: tokio::sync::Notify,
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+#[cfg(test)]
+impl RuntimeStartGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: tokio::sync::Notify::new(),
+            released: Mutex::new(false),
+            release: Condvar::new(),
+        }
+    }
+
+    pub(crate) async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_one();
+    }
+
+    pub(crate) fn enter_and_wait(&self) {
+        self.started.notify_one();
+        self.wait_release();
+    }
+
+    fn wait_release(&self) {
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release.wait(released).unwrap();
+        }
     }
 }
 
@@ -113,6 +156,30 @@ pub(crate) fn pause_next_worker_before_join(session_id: SessionId, gate: Arc<Wor
         .lock()
         .unwrap()
         .push((session_id, gate));
+}
+
+#[cfg(test)]
+pub(crate) fn pause_next_runtime_start_before_bind(
+    session_id: SessionId,
+    gate: Arc<RuntimeStartGate>,
+) {
+    PAUSE_AFTER_RUNTIME_START
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, gate));
+}
+
+#[cfg(test)]
+fn take_pause_after_runtime_start(session_id: SessionId) -> Option<Arc<RuntimeStartGate>> {
+    let mut gates = PAUSE_AFTER_RUNTIME_START
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    gates
+        .iter()
+        .position(|(candidate, _)| *candidate == session_id)
+        .map(|position| gates.remove(position).1)
 }
 
 #[cfg(test)]
@@ -1789,11 +1856,25 @@ impl Session {
         let turn = {
             let mut inner = self.shared.inner.lock().unwrap();
             Self::validate_install_state(&inner, admission)?;
+            // Initialize current-loop observation before spawning the Runtime
+            // task: the runner may reach Model::start synchronously.
+            inner.presentation.reset_before_loop_start();
             // AgentLoop::start only validates and spawns the Runtime task; it
             // does not await model work. Keeping this short lock held closes
             // the cancellation/close race between validation and ownership.
             let mut agent_loop = AgentLoop::start(execution.request, execution.options)
                 .map_err(map_loop_start_error)?;
+            #[cfg(test)]
+            let runtime_start_gate = take_pause_after_runtime_start(inner.record.session_id);
+            #[cfg(test)]
+            if let Some(gate) = runtime_start_gate {
+                // The Runtime may need the Session lock to reach Model::start.
+                // Release it only while the deterministic test gate waits;
+                // production startup keeps the original ownership boundary.
+                drop(inner);
+                tokio::task::block_in_place(|| gate.enter_and_wait());
+                inner = self.shared.inner.lock().unwrap();
+            }
             let handle = agent_loop.handle();
             let turn = TurnRef {
                 session_id: inner.record.session_id,
@@ -1823,7 +1904,7 @@ impl Session {
             });
             inner
                 .presentation
-                .note_loop_started(turn.loop_id, accepted_at.clone());
+                .bind_started_loop(turn.loop_id, accepted_at.clone());
             inner.presentation.record_prompt_time(accepted_at.clone());
             let task = Arc::new(SessionTask::new(tokio::spawn(run_active_loop(
                 self.clone(),
