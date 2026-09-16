@@ -540,10 +540,11 @@ impl Presentation {
         }
     }
 
-    pub(crate) fn note_loop_started(&self, loop_id: LoopId, started_at: Option<String>) {
+    /// Clears observation state owned by the previous loop before the Runtime
+    /// task is spawned. The next loop may begin synchronously from
+    /// `AgentLoop::start`, so this must not run after that call.
+    pub(crate) fn reset_before_loop_start(&self) {
         let mut inner = self.lock();
-        // Only the current loop is kept; drop every previous loop's caches and
-        // stale request identity before the first model call of this loop.
         inner.request_key = None;
         inner.live_tools.clear();
         inner.tool_results.clear();
@@ -552,7 +553,13 @@ impl Presentation {
         inner.accepted_steers = 0;
         inner.prepared_steers = None;
         inner.applied_steer = None;
-        inner.last_loop = Some(LastLoop {
+    }
+
+    /// Binds metadata for the loop that was successfully started. This is
+    /// deliberately metadata-only: the first real model request may already
+    /// have installed its observation identity.
+    pub(crate) fn bind_started_loop(&self, loop_id: LoopId, started_at: Option<String>) {
+        self.lock().last_loop = Some(LastLoop {
             loop_id,
             started_at,
             finished_at: None,
@@ -1838,7 +1845,8 @@ mod tests {
         );
 
         // Loop reset clears accepted count and progress.
-        presentation.note_loop_started(LoopId::new().unwrap(), None);
+        presentation.reset_before_loop_start();
+        presentation.bind_started_loop(LoopId::new().unwrap(), None);
         assert_eq!(presentation.note_steer_accepted(Some("t2".into())), Some(1));
         assert_eq!(presentation.snapshot().steer_progress, None);
     }
@@ -1899,7 +1907,8 @@ mod tests {
             loop_id: LoopId::new().unwrap(),
             request_index: 0,
         };
-        presentation.note_loop_started(second_key.loop_id, None);
+        presentation.reset_before_loop_start();
+        presentation.bind_started_loop(second_key.loop_id, None);
         presentation.note_request_start(second_key);
         presentation.begin_tool(Some(second_key), &invocation, display);
         let second_ref = ToolRef {

@@ -27,8 +27,9 @@ use crate::ids::SessionId;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
 use crate::sessions::{
-    LoopSubmission, WorkerGate, panic_next_worker, pause_next_admission_after_result,
-    pause_next_compaction_after_result, pause_next_worker_before_join,
+    LoopSubmission, RuntimeStartGate, WorkerGate, panic_next_worker,
+    pause_next_admission_after_result, pause_next_compaction_after_result,
+    pause_next_runtime_start_before_bind, pause_next_worker_before_join,
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
@@ -130,6 +131,7 @@ struct FakeModel {
     scripts: Arc<Mutex<VecDeque<ModelScript>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
     contexts: Arc<Mutex<Vec<ModelCallContext>>>,
+    start_entered: Arc<Notify>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -167,6 +169,7 @@ impl FakeModel {
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
             requests: Arc::new(Mutex::new(Vec::new())),
             contexts: Arc::new(Mutex::new(Vec::new())),
+            start_entered: Arc::new(Notify::new()),
             calls: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -178,6 +181,10 @@ impl FakeModel {
     fn contexts(&self) -> Arc<Mutex<Vec<ModelCallContext>>> {
         Arc::clone(&self.contexts)
     }
+
+    fn start_entered(&self) -> Arc<Notify> {
+        Arc::clone(&self.start_entered)
+    }
 }
 
 impl Model for FakeModel {
@@ -186,6 +193,7 @@ impl Model for FakeModel {
     }
 
     fn start(&self, request: ModelRequest, context: ModelCallContext) -> ModelStartFuture<'_> {
+        self.start_entered.notify_one();
         let model_ref = self.model_ref.clone();
         self.requests.lock().unwrap().push(request);
         self.contexts.lock().unwrap().push(context);
@@ -5832,6 +5840,305 @@ async fn tool_execution_event_matches_the_tool_read_query() {
         invocation_event.subject,
         queried.invocation.expect("queried invocation").subject
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_request_observation_survives_runtime_start_binding() {
+    use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState};
+    use base64::Engine;
+
+    let (data_dir, _guard) = fixture_dir(&format!("startup-observation-{}", next_id()));
+    let (workspace, _guard) = workspace_file("startup-observation-ws", "a.txt", b"hello");
+    let model_gate = BlockGate::new();
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::ToolCallAfterGate(
+            model_gate.clone(),
+            "bash",
+            json!({"command": "printf 'started\\n'; exec tail -f /dev/null"}),
+        )],
+    );
+    let model_started = model.start_entered();
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        bash_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+    let info = create_session(&mut agent, &workspace).await;
+    let gate = Arc::new(RuntimeStartGate::new());
+    pause_next_runtime_start_before_bind(info.session_id, Arc::clone(&gate));
+
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
+    let send_agent = Arc::clone(&agent);
+    let mut send_task = tokio::spawn(async move {
+        let mut agent = send_agent.lock().await;
+        send_text(&mut agent, info.session_id, "run bash").await
+    });
+
+    // Keep every startup wait bounded. Always release both test gates before
+    // joining the sender so a failed observation cannot strand its Session.
+    let startup = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        gate.wait_started().await;
+        model_started.notified().await;
+        model_gate.entered.notified().await;
+    })
+    .await;
+
+    // The sender must still be waiting for install_loop to bind the started
+    // loop. This is the observation that the startup gate is between
+    // AgentLoop::start and bind_started_loop, not merely before startup.
+    let startup_boundary_observed = startup.is_ok() && !send_task.is_finished();
+    gate.release();
+    model_gate.release.notify_one();
+
+    let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut send_task).await;
+    let turn = match send_result {
+        Ok(Ok(turn)) => turn,
+        Ok(Err(error)) => {
+            let mut agent = agent.lock().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                agent.close_session(info.session_id),
+            )
+            .await;
+            panic!("send task failed: {error}");
+        }
+        Err(_) => {
+            send_task.abort();
+            let _ = send_task.await;
+            let mut agent = agent.lock().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                agent.close_session(info.session_id),
+            )
+            .await;
+            panic!("install_loop did not leave the startup gate in time");
+        }
+    };
+
+    if !startup_boundary_observed {
+        let mut agent = agent.lock().await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.close_session(info.session_id),
+        )
+        .await;
+        panic!("startup observation did not prove the bind boundary");
+    }
+
+    let mut agent = agent.lock().await;
+    let body_result: Result<(), String> = async {
+        let mut invocation = None;
+        let mut process_ref = None;
+        let mut output_chunk = None;
+        let mut tool_started = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .ok_or_else(|| "event stream closed before Bash started".to_owned())?;
+                match event {
+                    AgentEvent::ToolInvocation {
+                        turn: event_turn,
+                        data,
+                        ..
+                    } if event_turn == turn => {
+                        invocation = Some(data);
+                    }
+                    AgentEvent::ToolStarted {
+                        turn: event_turn, ..
+                    } if event_turn == turn => {
+                        tool_started = true;
+                    }
+                    AgentEvent::ToolProcess {
+                        turn: event_turn,
+                        data,
+                        ..
+                    } if event_turn == turn => {
+                        if let Some(chunk) = data.chunk {
+                            if chunk.stream == ToolDataStream::Stdout {
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .decode(&chunk.data)
+                                    .map_err(|error| format!("decode Bash output: {error}"))?;
+                                process_ref = Some(data.tool_ref);
+                                output_chunk = Some(bytes);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if invocation.is_some()
+                    && tool_started
+                    && process_ref.is_some()
+                    && output_chunk.is_some()
+                {
+                    return Ok::<(), String>(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| "Bash startup events timed out".to_owned())??;
+
+        let invocation = invocation.ok_or_else(|| "missing ToolInvocation event".to_owned())?;
+        let tool_ref = invocation.tool_ref.clone();
+        if invocation.name != "bash" {
+            return Err(format!("expected Bash invocation, got {}", invocation.name));
+        }
+        if tool_ref.session_id != info.session_id
+            || tool_ref.loop_id != turn.loop_id
+            || tool_ref.request_index != 0
+            || tool_ref.tool_call_id.as_str() != "bash-call-0"
+        {
+            return Err(format!("unexpected first Bash ToolRef: {tool_ref:?}"));
+        }
+        if process_ref != Some(tool_ref.clone()) {
+            return Err("tool_process used a different ToolRef".to_owned());
+        }
+
+        let queried = agent
+            .tool_read(crate::tool_data::ToolReadRequest {
+                tool_ref: tool_ref.clone(),
+                max_bytes: None,
+            })
+            .await
+            .map_err(|error| format!("tool.read failed: {error}"))?;
+        if queried.execution.tool_ref != tool_ref
+            || queried
+                .invocation
+                .as_ref()
+                .is_none_or(|data| data.tool_ref != tool_ref)
+            || queried.execution.state != ToolExecutionState::Running
+        {
+            return Err("tool.read did not preserve the complete running ToolRef".to_owned());
+        }
+        let command = queried
+            .execution
+            .command
+            .ok_or_else(|| "tool.read did not contain a Bash command".to_owned())?;
+        if command.status != CommandStatus::Running {
+            return Err(format!(
+                "Bash command was not running: {:?}",
+                command.status
+            ));
+        }
+
+        let running_output = agent
+            .tool_output(crate::tool_data::ToolOutputRequest {
+                tool_ref: tool_ref.clone(),
+                stream: ToolDataStream::Stdout,
+                offset: 0,
+                max_bytes: Some(4096),
+            })
+            .await
+            .map_err(|error| format!("tool/output failed: {error}"))?;
+        if running_output.tool_ref != tool_ref || running_output.stream != ToolDataStream::Stdout {
+            return Err("tool/output did not preserve the complete ToolRef".to_owned());
+        }
+        let running_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&running_output.data)
+            .map_err(|error| format!("decode tool/output: {error}"))?;
+        if running_bytes != b"started\n" || running_output.eof {
+            return Err(format!(
+                "tool/output did not expose the live Bash output: {:?}, eof={}",
+                running_bytes, running_output.eof
+            ));
+        }
+        if agent
+            .loaded_session(info.session_id)
+            .ok_or_else(|| "Session was unloaded while Bash was running".to_owned())?
+            .presentation()
+            .command_owners()
+            .active()
+            == 0
+        {
+            return Err("Bash command owner was not active before cancellation".to_owned());
+        }
+
+        if !agent
+            .cancel(turn)
+            .map_err(|error| format!("cancel failed: {error}"))?
+        {
+            return Err("cancel did not find the active Bash turn".to_owned());
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), agent.wait_turn(turn))
+            .await
+            .map_err(|_| "turn.wait timed out after Bash cancellation".to_owned())?
+            .map_err(|error| format!("turn.wait failed: {error}"))?;
+        if result.report.outcome
+            != minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        {
+            return Err(format!(
+                "unexpected cancelled turn outcome: {:?}",
+                result.report.outcome
+            ));
+        }
+
+        let terminal = agent
+            .tool_read(crate::tool_data::ToolReadRequest {
+                tool_ref: tool_ref.clone(),
+                max_bytes: None,
+            })
+            .await
+            .map_err(|error| format!("terminal tool.read failed: {error}"))?;
+        if terminal.execution.tool_ref != tool_ref
+            || terminal.execution.state != ToolExecutionState::Cancelled
+        {
+            return Err("terminal tool.read changed the Bash ToolRef or state".to_owned());
+        }
+        let terminal_command = terminal
+            .execution
+            .command
+            .ok_or_else(|| "terminal tool.read lost the Bash command".to_owned())?;
+        if terminal_command.status != CommandStatus::Cancelled
+            || !terminal_command.termination_confirmed
+        {
+            return Err("cancelled Bash command was not confirmed terminated".to_owned());
+        }
+
+        let terminal_output = agent
+            .tool_output(crate::tool_data::ToolOutputRequest {
+                tool_ref: tool_ref.clone(),
+                stream: ToolDataStream::Stdout,
+                offset: 0,
+                max_bytes: Some(4096),
+            })
+            .await
+            .map_err(|error| format!("terminal tool/output failed: {error}"))?;
+        if terminal_output.tool_ref != tool_ref
+            || (terminal_output.eof && terminal_output.data.is_empty())
+        {
+            return Err("terminal tool/output lost the observed Bash output".to_owned());
+        }
+        if agent
+            .loaded_session(info.session_id)
+            .ok_or_else(|| "Session was unloaded before owner join check".to_owned())?
+            .presentation()
+            .command_owners()
+            .active()
+            != 0
+        {
+            return Err("turn.wait returned before the Bash command owner joined".to_owned());
+        }
+        Ok(())
+    }
+    .await;
+
+    let close_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.close_session(info.session_id),
+    )
+    .await;
+    if let Err(error) = body_result {
+        let _ = close_result;
+        panic!("{error}");
+    }
+    close_result
+        .expect("Session cleanup timed out")
+        .expect("Session cleanup failed");
 }
 
 #[tokio::test]
