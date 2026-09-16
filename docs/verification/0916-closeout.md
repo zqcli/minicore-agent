@@ -18,16 +18,15 @@ implementing agent ran the P0–P7 gates listed here on the isolated remote copy
   (`feat/0914-shared-data`).
 - P7 start: `6e6732e9c7c800157923b842c6964abaec30a4a9` (P6b, completed by the
   prior subagent before the final parent review).
-- Final HEAD: the commit titled
-  `test(docs): close shared data cleanup acceptance` (this record's predecessor),
-  followed by the parent-review fix commit described under "Parent Review
-  Fixes".
+- Final HEAD: the parent-review fix commits on top of `c1e6c9c`
+  (`test(docs): close shared data cleanup acceptance`). The first round is
+  `54d5fae`; the follow-up fix is a separate new commit.
 - Runtime: unchanged at `0.4.1`, Git revision
   `6cd2bdbc634437dea925495c61c7eb0be10ba171` (`Cargo.toml` and `Cargo.lock`).
 - No new dependency. `Cargo.lock` was not edited by hand.
 
 The P1–P6b work packages were already committed from the reviewed base
-`58b011f` to `6e6732e`, then the P7 additions were committed on top. The fix
+`58b011f` to `6e6732e`, then the P7 additions were committed on top. Each fix
 commit for the parent review is a new, independent commit (no amend, no rebase).
 
 Full P1–P6b SHAs:
@@ -64,32 +63,37 @@ run.
 ## Parent Review Sources
 
 The parent agent reviewed this branch after `c1e6c9c`. Its review log and the
-source diff are the acceptance basis for the parent-review fix commit; the
+source diff are the acceptance basis for the parent-review fix commits; the
 parent agent independently ran only the P5 gates, not P0–P7. This record does
-not claim the parent ran the P1–P7 suites.
+not claim the parent ran the P1–P7 suites. Two parent-review rounds were
+addressed: `54d5fae` and the follow-up commit that drops the test-only process
+scan.
 
 ## Final Gates (remote, isolated copy only)
 
 All commands ran on `root@192.168.20.199` in the isolated copy
 `/root/minicore-agent-0914/src`; logs are under `/root/minicore-agent-0914/logs`.
-Local `cargo` was never run. The `p7fix-*` logs are the parent-review fix run.
+Local `cargo` was never run. The table lists the final parent-review run
+(`p7fix2-*` logs) on the committed tree; the first parent-review round produced
+the earlier `p7fix-*` logs.
 
 | Gate | Command | Result |
 |---|---|---|
-| Format | `cargo fmt --all -- --check` | pass (`p7fix-fmt.log`) |
-| Check | `cargo check --locked --all-targets` | pass (`p7fix-check.log`) |
-| Clippy | `cargo clippy --locked --all-targets -- -D warnings` | pass (`p7fix-clippy.log`) |
-| Rustdoc | `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` | pass (`p7fix-doc.log`) |
-| Tests (stable) | `cargo test --locked --all-targets` | pass (`p7fix-tests.log`) |
-| Tests (MSRV) | `cargo +1.85.0 test --locked --all-targets` | pass on rerun (`p7fix-msrv-rerun.log`); see note |
-| Windows cross | `cargo check --locked --all-targets --target x86_64-pc-windows-gnu` | pass (`p7fix-windows.log`) |
-| macOS cross | `cargo check --locked --all-targets --target x86_64-apple-darwin` with `CC_x86_64_apple_darwin` / `CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER` pointing at the remote `darwin-cc` zig wrapper and `/root/.local/bin` on `PATH` | pass (`p7fix-macos.log`) |
+| Format | `cargo fmt --all -- --check` | pass (`p7fix2-fmt.log`) |
+| Check | `cargo check --locked --all-targets` | pass (`p7fix2-check.log`) |
+| Clippy | `cargo clippy --locked --all-targets -- -D warnings` | pass (`p7fix2-clippy.log`) |
+| Rustdoc | `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps` | pass (`p7fix2-doc.log`) |
+| Tests (stable) | `cargo test --locked --all-targets` | pass (`p7fix2-tests.log`) |
+| Tests (MSRV) | `cargo +1.85.0 test --locked --all-targets` | pass (`p7fix2-msrv.log`) |
+| Windows cross | `cargo check --locked --all-targets --target x86_64-pc-windows-gnu` | pass (`p7fix2-windows.log`) |
+| macOS cross | `cargo check --locked --all-targets --target x86_64-apple-darwin` with `CC_x86_64_apple_darwin` / `CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER` pointing at the remote `darwin-cc` zig wrapper and `/root/.local/bin` on `PATH` | pass (`p7fix2-macos.log`) |
 
-The first MSRV run (`p7fix-msrv.log`) failed on the pre-existing, unrelated
+The targeted I2 regression passed on its own (`p7fix2-i2.log`). An earlier first
+MSRV run (`p7fix-msrv.log`) failed on the pre-existing, unrelated
 `workspace::status::diff_tests::workspace_pagination_refreshes_versions_and_rejects_changed_content`
 pagination test (`diff_tests.rs` is untouched by this branch). It passes on
 rerun on both stable and 1.85.0, so it is recorded as a flaky test, not an MSRV
-regression; the full MSRV suite passes on rerun.
+regression; the full MSRV suite passes.
 
 ### Test counts
 
@@ -224,17 +228,28 @@ Implemented in `b4ae849`. Ownership/reference direction:
   `presentation().command_owners()`.
 
 P7 adds `i2_real_command_releases_owners_and_observation_resources`. The Turn is
-cancelled and awaited; the genuine reclamation evidence (a `Cancelled` command
-with `termination_confirmed`, an empty `ps` listing for the child, and
-`command_owners().active() == 0`) is captured *before* any fallback cleanup. The
-post-startup body runs under `catch_unwind` so no panic can skip the
-unconditional `close_session`, which joins the owners and then releases the
-`Weak<ToolData>`/`Weak<CommandOwners>`/`Weak<ToolObserver>` handles. Fallback
-cleanup only kills process groups whose command line still carries this test's
-unique marker, so a reused pid is never signalled. Negative control (remote
-copy only): removing `join_loop` from `run_active_loop` makes the test fail on
-`Cancelling != Cancelled` and the fallback still reaps the child; the good
-source was restored without leaving a marker process.
+cancelled and awaited; the reclamation evidence (a `Cancelled` command with
+`termination_confirmed`, an empty `ps` listing for the child, and
+`command_owners().active() == 0`) is captured *before* the unconditional
+`close_session`, so the close cannot turn a failed assertion into a pass. The
+post-startup body runs under `catch_unwind`; the close runs on both the success
+and panic paths and is the only cleanup mechanism: it joins the Session's
+command owners (via `join_all`) and then releases the
+`Weak<ToolData>`/`Weak<CommandOwners>`/`Weak<ToolObserver>` handles. The "no pid"
+early-exit path likewise closes the Session to let its owners join and revert
+the command before it panics. The test introduces no `kill`, signal, or
+process-table scan; it relies solely on the production join boundary, so a
+failed assertion can never be hidden by an out-of-band reap.
+
+On the negative-control boundary: removing `join_loop` from `run_active_loop`
+was tried on the remote copy, but that removal does **not** reliably fail this
+test. When the Runtime drops the cancelled tool future, the running-command
+guard cancels the underlying worker, so the command usually finishes and is
+reaped on its own before `turn.wait` returns; `join_loop` is the deterministic
+barrier for the dropped-future case, not the only thing that stops the command.
+The single failure observed while developing this was a lost race, not a
+reproducible detection, so it is not cited as proof. The restored `sessions.rs`
+SHA-256 matches the local one (`e7d313ec…`).
 
 ## E2E Workflows (Spec §12)
 
@@ -260,13 +275,14 @@ source was restored without leaving a marker process.
 
 ## Change Statistics (production vs tests vs moves)
 
-Line counts from the reviewed base through P7, separated so a large move is not
-presented as complexity change. Counts come from `git show --numstat`; they are
-line churn, not semantic complexity, and a move appears as near-equal
-additions/deletions. "logic" excludes lines inside `#[cfg(test)]` items and
-test files; "test support" is `#[cfg(test)]` code that stays in production
-files (injection hooks and gates); "test files" is `src/**/tests.rs` and
-`tests/**`.
+Line counts from the reviewed base through P7. These are a **heuristic split,
+not a precise semantic classification**: a script attributes each changed line
+by whether it sits inside a top-level `#[cfg(test)]` item or a test file.
+Counts themselves come from `git show --numstat` and are exact line churn, not
+semantic complexity; a move appears as near-equal additions/deletions.
+"logic" excludes lines inside `#[cfg(test)]` items and test files; "test
+support" is `#[cfg(test)]` code that stays in production files (injection hooks
+and gates); "test files" is `src/**/tests.rs` and `tests/**`.
 
 | Stage | Logic +/− | Test support +/− | Test files +/− | Docs +/− |
 |---|---|---|---|---|
@@ -275,22 +291,27 @@ files (injection hooks and gates); "test files" is `src/**/tests.rs` and
 | P3 `f3d955a` | +50 / −113 | 0 / −93 | +285 / −0 | +6 / −3 |
 | P4 `a6c4a3c` | +42 / −1483 | +162 / −946 | +168 / −516 | +28 / −110 |
 | P5 `b4ae849` | +662 / −304 | +9 / −2 | +108 / −33 | 0 / 0 |
-| P6a `e246693` (move) | 0 / −2 | +4 / −7552 | +7523 / −0 | 0 / 0 |
+| P6a `e246693` (move) | 0 / 0 | +4 / −7554 | +7523 / −0 | 0 / 0 |
 | P6b `6e6732e` (move) | +4309 / −4260 | +44 / −43 | 0 / 0 | 0 / 0 |
-| P7 pre-review (`5e547c7`,`78a3e6a`,`08dabcd`) | +13 / −0 | +13 / −0 | +1517 / −110 | 0 / 0 |
-| Parent-review fix (test/docs only) | 0 / 0 | 0 / 0 | +546 / −357 | +147 / −66 |
+| P7 pre-review (`5e547c7`,`78a3e6a`,`08dabcd`) | 0 / 0 | +26 / −0 | +1517 / −110 | 0 / 0 |
+| Parent-review fixes (`c1e6c9c`..final, test/docs only) | 0 / 0 | 0 / 0 | +509 / −356 | +169 / −67 |
 
 Interpretation limits:
 
 - P6a/P6b are moves; their additions and deletions approximately cancel and
   must not be read as net growth. P6b's "logic" figures are the same functions
   moving between files, not new behavior.
+- P6a's only in-file additions are the four `#[cfg(test)] mod tests;`
+  declarations after the inline suites moved out; the two removed top-level
+  test-only `use` lines are counted as test support, not production logic.
 - P4's logic deletions are the removed stateless-subagent module; the test-file
   deletions are its acceptance tests, not coverage of retained behavior.
-- P7's production delta is `#[cfg(test)]` support only (the F2 install-time
-  observation hook); it adds no non-test production logic.
-- These are raw churn numbers; the intended semantic change is the F1/F2 fixes,
-  the I1 removal, and the I2 ownership move, all described above.
+- P7 adds no non-test production logic: its whole production diff is
+  `#[cfg(test)]` support (the F2 install-time observation hook plus its doc
+  comment), so it is classified entirely as test support.
+- This is raw churn plus a line-level `cfg(test)` heuristic; the intended
+  semantic change is the F1/F2 fixes, the I1 removal, and the I2 ownership move,
+  all described above.
 
 Aggregate over `58b011f..HEAD` (before the parent-review fix): 34 files,
 +18,664 / −18,213, dominated by the P6a/P6b moves.
