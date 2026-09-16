@@ -158,10 +158,12 @@ Agent-level `event_capacity` require restart.
 
 `Agent::open` creates an embedded Agent without a reload source and therefore
 returns `reload_unavailable`; the binary uses `Agent::open_file` so its startup
-configuration can be reloaded. A failed reload leaves the current catalog,
-loaded Sessions, and configuration unchanged. The reload operation does not
-reload the Agent binary or previously stored Session system-prompt snapshots;
-workspace `AGENTS.md` remains request-level behavior.
+configuration can be reloaded. A profile that names the removed `subagent`
+Tool fails the reload with `invalid_profile`; the current catalog, loaded
+Sessions, and configuration stay unchanged. A failed reload leaves the current
+catalog, loaded Sessions, and configuration unchanged. The reload operation
+does not reload the Agent binary or previously stored Session system-prompt
+snapshots; workspace `AGENTS.md` remains request-level behavior.
 
 ## Discovery
 
@@ -469,10 +471,15 @@ The result is returned directly (not under another `session` member):
 }
 ```
 
-`git_branch` is obtained by the Agent with fixed arguments equivalent to
-`git -C <workspace> symbolic-ref --short HEAD`; it is `null` for a non-Git,
-detached, or unavailable workspace. The lookup runs at session create/open,
-after Tool batches, and at loop completion, never once per UI frame.
+`git_branch` is the branch from the most recent completed explicit
+`workspace.status` observation, projected into this read-only view. It starts
+as `null` for a freshly created or opened Session and is never obtained by an
+implicit Git query: Presentation reads never start Git work, and no lookup runs
+at session create/open, after Tool batches, or at loop completion. Clients that
+need fresh workspace state call `workspace.status`; `git_branch` is only a
+compatibility cache of one observed result. It is `null` for a non-Git,
+detached, unborn, or unavailable workspace, and an incomplete or failed status
+observation clears it rather than faking a branch.
 `model_label` is the configured Session model/profile ID, not a provider model
 identifier. Context, cost, and subscription fields are `null`/`unknown` when
 MiniCore has no reliable provider source; cumulative Usage is not treated as
@@ -577,10 +584,19 @@ reread the Session before deciding whether to retry.
 
 Profiles opt into the five executable Tools explicitly through the `tools` array:
 `read`, `write`, `edit`, `apply_patch`, and `bash`. Unknown and duplicate names
-are rejected. Historical Store v1 records may contain the removed `subagent`
-name for read-only compatibility; those records can be listed, read, and
-renamed, but opening them returns `session settings are incompatible` before
-execution begins.
+are rejected, and a profile that names the removed `subagent` Tool fails to load
+or reload instead of silently dropping it. Historical Store v1 records may
+contain the removed `subagent` name for read-only compatibility: such records
+can be listed, read, and given a new title, and their history, summary, and
+retained auxiliary records remain readable through the generic history and
+`tool.read`/`tool.output` paths. `session.open` still returns the existing
+`invalid_session_settings` error before any model request or Store repair,
+because the saved tool list cannot be executed. There is no automatic
+migration: the user must close the Session, keep a backup of its data, and then
+explicitly change the Session's tool configuration. The Agent never rewrites
+an old Profile, `session.json`, or `history.jsonl` on its own. Full delegated
+Agent execution (a future `SubagentTool` that drives a complete
+`minicore-agent` Session) is separate future work, not implemented here.
 
 ## History
 
@@ -1701,7 +1717,9 @@ the current time. The metadata is FIFO by User occurrence, so repeated text is
 not used as a map key.
 
 The client never reads Store or Workspace for `session.presentation`: the
-Agent performs its own fixed-argument branch lookup and returns honest
-`null`/`unknown` context, cost, and subscription values when no reliable source
-exists. A client must not run `git`, execute a Tool, or use presentation data
-as an execution request.
+Agent returns the branch from the most recent completed explicit
+`workspace.status` observation and honest `null`/`unknown` context, cost, and
+subscription values when no reliable source exists. Presentation reads never
+start Git work; fresh branch state comes only from `workspace.status`. A client
+must not run `git`, execute a Tool, or use presentation data as an execution
+request.
