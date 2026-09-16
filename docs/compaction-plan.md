@@ -295,4 +295,5 @@ or installation was made.
 
 See [staged compaction verification](verification/compaction.md). TUI
 `/compact`, automatic compaction, P3b2 overflow recovery, and persistent
-subagents remain separate work. P4 remains the bounded Workspace slice.
+delegated child execution remains outside this Agent's scope. P4 remains the
+bounded Workspace slice.

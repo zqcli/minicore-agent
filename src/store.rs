@@ -33,6 +33,7 @@ use crate::tool_data::{
 use crate::tools::KNOWN_TOOL_NAMES;
 
 pub(crate) const SESSION_FORMAT_VERSION: u32 = 1;
+const LEGACY_STORED_TOOL_NAME: &str = "subagent";
 
 const SESSIONS_DIR: &str = "sessions";
 pub(crate) const SESSION_RECORD_FILE: &str = "session.json";
@@ -256,9 +257,10 @@ pub(crate) struct SessionRecord {
 impl SessionRecord {
     pub(crate) fn validate(&self) -> Result<(), StoreError> {
         let mut seen_tools = BTreeSet::new();
-        let valid_tools = self.tools.len() <= KNOWN_TOOL_NAMES.len()
+        let valid_tools = self.tools.len() <= KNOWN_TOOL_NAMES.len() + 1
             && self.tools.iter().all(|name| {
-                KNOWN_TOOL_NAMES.contains(&name.as_str()) && seen_tools.insert(name.as_str())
+                (KNOWN_TOOL_NAMES.contains(&name.as_str()) || name == LEGACY_STORED_TOOL_NAME)
+                    && seen_tools.insert(name.as_str())
             });
 
         if self.format_version != SESSION_FORMAT_VERSION
@@ -808,6 +810,13 @@ impl Store {
 
     pub(crate) async fn create_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
         record.validate()?;
+        if record
+            .tools
+            .iter()
+            .any(|name| name == LEGACY_STORED_TOOL_NAME)
+        {
+            return Err(StoreError::InvalidRecord);
+        }
         self.require_sessions_root().await?;
         let directory = self.session_directory(record.session_id);
         match path_state(&directory)
@@ -3489,6 +3498,9 @@ fn validate_stored_tool_record(
     if stored.tool_ref != *tool_ref {
         return Err(StoreError::Corrupt);
     }
+    if !KNOWN_TOOL_NAMES.contains(&stored.name.as_str()) && stored.name != LEGACY_STORED_TOOL_NAME {
+        return Err(StoreError::Corrupt);
+    }
     if !stored.state.is_terminal() {
         return Err(StoreError::Corrupt);
     }
@@ -4262,7 +4274,7 @@ mod tests {
     use base64::Engine as _;
     use minicore_runtime::ToolCallId;
     use minicore_runtime::execution::ConfigRevision;
-    use minicore_runtime::history::{AssistantHistory, UserHistory};
+    use minicore_runtime::history::{AssistantHistory, ToolResultHistory, UserHistory};
     use minicore_runtime::model::{
         AssistantPart, ModelFinishReason, ModelRef, ReasoningPreference, ToolCall, Usage,
     };
@@ -5368,6 +5380,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_subagent_history_items_remain_generic_and_readable() {
+        let (base, store, session_id) = fixture("legacy-history").await;
+        let mut session = record(&store, session_id);
+        session.tools = vec!["read".to_owned(), "subagent".to_owned()];
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+        store.write_record(&session).await.unwrap();
+
+        let loop_id = LoopId::new().unwrap();
+        let call_id = ToolCallId::new("historical-call").unwrap();
+        let call = ToolCall::new(
+            call_id.clone(),
+            "subagent".parse().unwrap(),
+            json!({"task": "historical task"}),
+            0,
+        )
+        .unwrap();
+        let history_record = StoredLoopRecord {
+            loop_id,
+            outcome: StoredLoopOutcome::Completed,
+            items: vec![
+                HistoryItem::Assistant(AssistantHistory {
+                    loop_id,
+                    request_index: 0,
+                    model: "main".parse::<ModelRef>().unwrap(),
+                    reasoning: ReasoningPreference::Auto,
+                    content: vec![AssistantPart::ToolCall(call)],
+                    finish_reason: ModelFinishReason::ToolCalls,
+                    usage: Usage::new(1, 2, 0),
+                }),
+                HistoryItem::ToolResult(ToolResultHistory {
+                    loop_id,
+                    request_index: 0,
+                    call_id,
+                    tool_name: "subagent".parse().unwrap(),
+                    outcome: ToolResultOutcome::Success,
+                    output: minicore_runtime::tools::ToolOutput::new("historical child result")
+                        .unwrap(),
+                }),
+            ],
+            usage: Usage::new(1, 2, 0),
+            requests: 1,
+            tool_rounds: 1,
+            final_config_revision: ConfigRevision::INITIAL,
+            completed_at: utc_timestamp().unwrap(),
+            user_times: None,
+        };
+        store
+            .append_loop(session_id, &history_record)
+            .await
+            .unwrap();
+
+        let loaded = store.load_session(session_id).await.unwrap();
+        assert_eq!(loaded.record.tools, session.tools);
+        assert_eq!(loaded.history.len(), 2);
+        let serialized = serde_json::to_string(loaded.history.as_ref()).unwrap();
+        assert!(serialized.contains("subagent"));
+        assert!(serialized.contains("historical child result"));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
     async fn session_record_validation_accepts_valid_multiline_prompt_and_known_tools() {
         let (base, store, session_id) = fixture("valid-record").await;
         let mut record = record(&store, session_id);
@@ -5429,8 +5505,63 @@ mod tests {
             .collect();
         assert!(record.validate().is_ok());
 
+        record.tools.push("subagent".to_owned());
+        assert!(record.validate().is_ok());
+        assert!(matches!(
+            store.create_session(&record).await,
+            Err(StoreError::InvalidRecord)
+        ));
+
         record.tools.push("read".to_owned());
         assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+        record.tools = vec!["subagent".to_owned(), "subagent".to_owned()];
+        assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
+        let _ = fs::remove_dir_all(base).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_auxiliary_tool_records_remain_readable() {
+        let (base, store, session_id) = fixture("legacy-auxiliary-tool").await;
+        store
+            .create_session(&record(&store, session_id))
+            .await
+            .unwrap();
+
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new("legacy-subagent").unwrap(),
+        };
+        let data = ToolData::new();
+        data.note_requested(&tool_ref, "subagent");
+        data.note_result(&tool_ref, "historical result");
+        data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success);
+        let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let recovered = store
+            .read_tool_record(&tool_ref)
+            .await
+            .unwrap()
+            .expect("historical auxiliary record must remain readable");
+        let read = recovered.project_read(&tool_ref, 4096).unwrap();
+        assert_eq!(read.execution.name, "subagent");
+        let output = recovered
+            .project_output(
+                &ToolOutputRequest {
+                    tool_ref,
+                    stream: ToolDataStream::Output,
+                    offset: 0,
+                    max_bytes: Some(4096),
+                },
+                4096,
+            )
+            .unwrap();
+        assert_eq!(output.data, "historical result");
         let _ = fs::remove_dir_all(base).await;
     }
 

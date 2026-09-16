@@ -18,7 +18,6 @@ mod read;
 mod rpc;
 mod sessions;
 pub(crate) mod store;
-mod subagents;
 mod tool_data;
 mod tools;
 mod workspace;

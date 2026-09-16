@@ -26,6 +26,7 @@ use crate::history::GetHistory;
 use crate::ids::SessionId;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
+use crate::read::ReadSession;
 use crate::sessions::{
     LoopSubmission, RuntimeStartGate, WorkerGate, panic_next_worker,
     pause_next_admission_after_result, pause_next_compaction_after_result,
@@ -4737,6 +4738,173 @@ async fn reload_command_environment_accumulates_all_prior_credential_names() {
             "MINICORE_RELOAD_UNIT_KEY_C",
         ]
     );
+}
+
+#[tokio::test]
+async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
+    let (data_dir, _data_guard) = fixture_dir(&format!("legacy-open-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("legacy-open-ws", "a.txt", b"hello");
+    let session_id = SessionId::new().unwrap();
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    let record = SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title: Some("legacy".to_owned()),
+        profile: "test".to_owned(),
+        workspace,
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["read".to_owned()],
+        max_tool_rounds: 8,
+        approval: ApprovalMode::Auto,
+        created_at: "2026-01-02T03:04:05.000Z".to_owned(),
+        updated_at: "2026-01-02T03:04:05.000Z".to_owned(),
+    };
+    store.create_session(&record).await.unwrap();
+    let mut legacy = record.clone();
+    legacy.tools.push("subagent".to_owned());
+    store.write_record(&legacy).await.unwrap();
+    store
+        .append_loop(
+            session_id,
+            &synthetic_loop_record(
+                LoopId::new().unwrap(),
+                "legacy user",
+                "legacy assistant",
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let session_dir = data_dir.join("sessions").join(session_id.to_string());
+    let history_path = session_dir.join("history.jsonl");
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history_path)
+            .unwrap();
+        file.write_all(b"{\"partial_legacy_tail\": true")
+            .unwrap();
+    }
+    let summary_path = session_dir.join("summary.json");
+    std::fs::write(&summary_path, b"historical summary").unwrap();
+    let aux_dir = session_dir
+        .join(crate::store::AUX_TOOLS_DIR)
+        .join("legacy-aux");
+    std::fs::create_dir_all(&aux_dir).unwrap();
+    std::fs::write(
+        aux_dir.join(crate::store::TOOL_RECORD_FILE),
+        b"historical auxiliary record",
+    )
+    .unwrap();
+    std::fs::write(
+        aux_dir.join(crate::store::TOOL_INPUT_FILE),
+        b"historical auxiliary input",
+    )
+    .unwrap();
+
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let listed = agent.list_sessions().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].loaded);
+
+    let renamed = agent
+        .rename_session(crate::agent::RenameSession {
+            session_id,
+            title: "renamed legacy".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed.title.as_deref(), Some("renamed legacy"));
+    let persisted = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(session_id)
+        .await
+        .unwrap();
+    assert_eq!(persisted.tools, legacy.tools);
+    let record_before_open = std::fs::read(session_dir.join("session.json")).unwrap();
+    let history_before_open = std::fs::read(&history_path).unwrap();
+    let summary_before_open = std::fs::read(&summary_path).unwrap();
+    let mut aux_before_open = BTreeMap::new();
+    for entry in std::fs::read_dir(&aux_dir).unwrap() {
+        let entry = entry.unwrap();
+        aux_before_open.insert(entry.file_name(), std::fs::read(entry.path()).unwrap());
+    }
+
+    let read = agent
+        .read_session(ReadSession {
+            session_id,
+            cursor: None,
+            limit: 100,
+            max_bytes: None,
+            captured_end: None,
+            history_revision: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(read.session.session_id, session_id);
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before_open);
+    assert_eq!(std::fs::read(&summary_path).unwrap(), summary_before_open);
+    assert!(matches!(
+        agent.open_session(session_id).await,
+        Err(AgentError::InvalidSessionSettings)
+    ));
+    assert_eq!(
+        std::fs::read(session_dir.join("session.json")).unwrap(),
+        record_before_open
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), history_before_open);
+    assert_eq!(std::fs::read(&summary_path).unwrap(), summary_before_open);
+    for (name, expected_bytes) in aux_before_open {
+        assert_eq!(
+            std::fs::read(aux_dir.join(name)).unwrap(),
+            expected_bytes,
+            "auxiliary bytes must remain unchanged"
+        );
+    }
+    assert!(agent.loaded_session(session_id).is_none());
+    assert!(model.requests().lock().unwrap().is_empty());
+    assert!(!agent.list_sessions().await.unwrap()[0].loaded);
+}
+
+#[tokio::test]
+async fn reload_rejects_removed_subagent_profile_without_publishing_or_starting_work() {
+    let (data_dir, _guard) = fixture_dir(&format!("reload-subagent-{}", next_id()));
+    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let original = agent.list_profiles();
+    let mut candidate = agent.config().clone();
+    candidate.profiles.get_mut("test").unwrap().tools = vec!["subagent".to_owned()];
+
+    assert!(matches!(
+        agent.reload_settings_with_models(
+            candidate,
+            Models::from_values(BTreeMap::from([(
+                "main".to_owned(),
+                Arc::clone(&model) as Arc<dyn Model>,
+            )])),
+        ),
+        Err(AgentError::Config(
+            crate::config::ConfigError::InvalidProfile
+        ))
+    ));
+    assert_eq!(agent.list_profiles(), original);
+    assert!(model.requests().lock().unwrap().is_empty());
 }
 
 #[tokio::test]

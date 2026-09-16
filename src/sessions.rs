@@ -43,7 +43,6 @@ use crate::store::{
     Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError,
     SummaryCommit, utc_timestamp,
 };
-use crate::subagents::SubagentService;
 use crate::workspace::{Workspace, WorkspaceError};
 
 #[cfg(test)]
@@ -526,7 +525,6 @@ struct SessionShared {
     status_workers: Mutex<StatusWorkers>,
     store: Store,
     events: AgentEventSink,
-    subagents: Arc<SubagentService>,
     compaction: Arc<CompactionState>,
 }
 
@@ -1014,7 +1012,6 @@ impl Session {
         config: ExecutionConfig,
         auto: Option<AutoContext>,
         options: LoopOptions,
-        subagents: Arc<SubagentService>,
         compaction: Arc<CompactionState>,
         policy: CompactionPolicy,
         store: Store,
@@ -1049,7 +1046,6 @@ impl Session {
                 status_workers: Mutex::new(StatusWorkers::new()),
                 store,
                 events,
-                subagents,
                 compaction,
             }),
         }
@@ -2646,7 +2642,6 @@ impl Session {
         // before the Session reports closure: a command is only finished when
         // its owner really reaped it.
         self.presentation().command_owners().join_all().await;
-        self.shared.subagents.drain_session(session_id).await;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -3348,11 +3343,6 @@ async fn run_active_loop(
     while let Ok(envelope) = events.try_recv() {
         forward_loop_event(turn.session_id, envelope, &session);
     }
-    session
-        .shared
-        .subagents
-        .drain_session(turn.session_id)
-        .await;
     // Owned commands of this loop are joined before the report is reconciled
     // and persisted: a dropped tool future must not leave a process behind, and
     // the process record must be final before the terminal state is written.
