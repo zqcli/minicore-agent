@@ -8398,36 +8398,6 @@ fn process_is_listed(pid: i32) -> bool {
     !String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
 
-/// Failure-path fallback: kills the process group of any process whose command
-/// line still carries this test's unique marker. The marker proves the process
-/// is this test's child, so a reused pid is never signalled, and the "kill the
-/// group" form also reaps an orphaned child the shell left behind.
-#[cfg(unix)]
-fn kill_marked(marker: &str) {
-    let output = std::process::Command::new("ps")
-        .arg("-eo")
-        .arg("pid=,pgid=,args=")
-        .output()
-        .expect("ps runs");
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if !line.contains(marker) {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
-            continue;
-        };
-        let group = fields
-            .next()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(pid);
-        let _ = std::process::Command::new("kill")
-            .arg("-9")
-            .arg(format!("-{group}"))
-            .status();
-    }
-}
-
 /// End-to-end Bash ownership through a real Agent Session: a running command is
 /// cancelled with its loop, the stored process record matches the live
 /// `tool_process` event and the `tool.read`/`tool.output` queries, and
@@ -8984,9 +8954,9 @@ async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
 
 /// I2 release: a real Bash command's owners must be joinable and reclaimed
 /// after the Turn, and a Weak handle to the observation resources must fail
-/// after close/shutdown. Genuine reclamation evidence is captured before any
-/// fallback cleanup, and every post-startup failure path still closes the
-/// Session and joins its owners.
+/// after close/shutdown. The reclamation evidence is captured before the
+/// unconditional `close_session`, so a failed assertion cannot be turned into a
+/// pass by the close itself; no other process cleanup is introduced.
 #[cfg(unix)]
 #[tokio::test]
 async fn i2_real_command_releases_owners_and_observation_resources() {
@@ -8995,18 +8965,15 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     use std::panic::{AssertUnwindSafe, resume_unwind};
     use std::sync::Weak;
 
-    let marker = format!("i2-release-{}", next_id());
-    let (data_dir, _guard) = fixture_dir(&marker);
-    let (workspace, _guard) = workspace_file(&marker, "a.txt", b"hello");
+    let label = format!("i2-release-{}", next_id());
+    let (data_dir, _guard) = fixture_dir(&label);
+    let (workspace, _guard) = workspace_file(&label, "a.txt", b"hello");
     let pid_file = workspace.join("child.pid");
-    // The shell stays alive (no `exec`) so its command line keeps the unique
-    // marker; fallback cleanup can then prove a listed pid is still this test's
-    // child rather than a reused pid.
     let model = FakeModel::new(
         "main",
         [ModelScript::ToolCall(
             "bash",
-            json!({"command": format!("printf 'started\\n'; echo $$ > child.pid; marker={marker}; sleep 30")}),
+            json!({"command": "printf 'started\\n'; echo $$ > child.pid; exec sleep 30"}),
         )],
     );
     let mut agent = open_agent(
@@ -9033,7 +9000,10 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
         .ok()
         .and_then(|text| text.trim().parse::<i32>().ok())
     else {
-        kill_marked(&marker);
+        // A command may still be running without ever publishing a pid. Close
+        // the Session first so its owners join and revert the command, then
+        // fail: no other process cleanup is attempted.
+        let _ = agent.close_session(info.session_id).await;
         panic!("the command never published a pid");
     };
 
@@ -9074,16 +9044,10 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     .catch_unwind()
     .await;
 
-    // Fallback cleanup only while the evidence does not show reclamation: a
-    // still-listed process carrying our marker is this test's unreaped child.
-    if !matches!(&body, Ok((_, _, _, true, _))) {
-        kill_marked(&marker);
-    }
-
     // Unconditional close joins the Session's owners on every path.
     let close = agent.close_session(info.session_id).await;
 
-    // Assert the evidence saved before cleanup ran.
+    // Assert the evidence saved before the close ran.
     let (cancelled, status, termination_confirmed, reaped, active) = match body {
         Ok(evidence) => evidence,
         Err(payload) => resume_unwind(payload),
