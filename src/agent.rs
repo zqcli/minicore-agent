@@ -615,8 +615,11 @@ impl Agent {
         // The Session owns the worker that runs the query, so closing the
         // Session stops and reaps this query's child even if this caller goes
         // away first.
-        let query = session.spawn_status_query(workspace, request, CancellationToken::new())?;
-        query.wait().await
+        let cancellation = CancellationToken::new();
+        let query = session.spawn_status_query(workspace, request, cancellation.clone())?;
+        let result = query.wait().await?;
+        session.complete_status_query(&result, &cancellation);
+        Ok(result)
     }
 
     pub async fn changes_list(
@@ -856,9 +859,7 @@ impl Agent {
             canonical_workspace,
         )?;
         // Every predictable configuration error must fail before the store write.
-        let presentation = self
-            .build_presentation(session_id, Arc::clone(&workspace), record.model.clone())
-            .await;
+        let presentation = self.build_presentation(session_id, record.model.clone());
         let options = self
             .config
             .loop_options_for_model(record.max_tool_rounds, &record.model)
@@ -940,13 +941,7 @@ impl Agent {
             );
             return Err(AgentError::Workspace);
         }
-        let presentation = self
-            .build_presentation(
-                session_id,
-                Arc::clone(&workspace),
-                stored.record.model.clone(),
-            )
-            .await;
+        let presentation = self.build_presentation(session_id, stored.record.model.clone());
         let options = self
             .config
             .loop_options_for_model(stored.record.max_tool_rounds, &stored.record.model)
@@ -1416,19 +1411,16 @@ impl Agent {
     }
 
     /// Per-session presentation wired into this session's model/tool wrappers
-    /// and the `session.presentation` read. Refreshes the git branch at
-    /// create/open; later refreshes happen at tool-batch boundaries in the
-    /// per-loop worker.
-    async fn build_presentation(
+    /// and the `session.presentation` read. The branch starts unknown and is
+    /// projected only when an explicit `workspace.status` query completes.
+    fn build_presentation(
         &self,
         session_id: crate::ids::SessionId,
-        workspace: Arc<Workspace>,
         model_label: String,
     ) -> Arc<crate::presentation::Presentation> {
         let presentation =
             crate::presentation::Presentation::new(session_id, self.event_sink.clone());
         presentation.set_model_label(model_label);
-        presentation.set_branch(workspace.git_branch().await);
         presentation
     }
 }

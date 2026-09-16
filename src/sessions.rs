@@ -1082,6 +1082,32 @@ impl Session {
         self.shared.close.clone()
     }
 
+    /// Completes an explicit `workspace.status` observation. Branch is a
+    /// projection of the complete status result, never a separate Git query;
+    /// an unavailable or incomplete observation clears the cache. The Session
+    /// lock makes close and projection linearizable, while the caller token
+    /// prevents a cancelled request from publishing a late result.
+    pub(crate) fn complete_status_query(
+        &self,
+        result: &crate::WorkspaceStatusResult,
+        cancellation: &CancellationToken,
+    ) {
+        let inner = self.shared.inner.lock().unwrap();
+        if inner.closing || self.shared.close.is_cancelled() || cancellation.is_cancelled() {
+            return;
+        }
+        let branch = result
+            .complete
+            .then(|| {
+                result
+                    .repo_available
+                    .then(|| result.branch.clone())
+                    .flatten()
+            })
+            .flatten();
+        inner.presentation.set_branch(branch);
+    }
+
     /// Starts one owned `workspace.status` query. Registration and the capacity
     /// check happen under the worker lock, so a Session that starts closing
     /// either observes this worker or refuses it here. The worker captures only
@@ -3303,22 +3329,13 @@ async fn run_active_loop(
     let join = agent_loop.join();
     tokio::pin!(join);
     let mut events_open = true;
-    let mut tool_batch_dirty = false;
     let result = loop {
         tokio::select! {
             biased;
             result = &mut join => break result,
             envelope = events.recv(), if events_open => {
                 match envelope {
-                    Some(envelope) => {
-                        forward_loop_event_and_refresh(
-                            turn.session_id,
-                            envelope,
-                            &session,
-                            &mut tool_batch_dirty,
-                        )
-                        .await;
-                    }
+                    Some(envelope) => forward_loop_event(turn.session_id, envelope, &session),
                     None => events_open = false,
                 }
             }
@@ -3329,11 +3346,7 @@ async fn run_active_loop(
     // unnecessary completion dependency. This also accounts for a queued
     // `Finished` envelope without mapping it to Agent `TurnFinished`.
     while let Ok(envelope) = events.try_recv() {
-        forward_loop_event_and_refresh(turn.session_id, envelope, &session, &mut tool_batch_dirty)
-            .await;
-    }
-    if tool_batch_dirty {
-        refresh_branch(&session).await;
+        forward_loop_event(turn.session_id, envelope, &session);
     }
     session
         .shared
@@ -3375,8 +3388,7 @@ async fn run_active_loop(
         }
     };
     // The runtime loop is complete regardless of whether the later JSONL
-    // append succeeds. Keep live footer state honest on both outcomes.
-    refresh_branch(&session).await;
+    // append succeeds.
     session.presentation().note_loop_finished();
     // The joined report is authoritative: reconcile terminal tool state even
     // when the wrapper future was dropped by an outer Runtime deadline/cancel
@@ -3623,36 +3635,6 @@ fn tool_execution_event(
             dropped_before: 0,
         },
     })
-}
-
-async fn forward_loop_event_and_refresh(
-    session_id: SessionId,
-    envelope: minicore_runtime::LoopEventEnvelope,
-    session: &Session,
-    tool_batch_dirty: &mut bool,
-) {
-    let refresh_before_next_request = *tool_batch_dirty
-        && matches!(
-            &envelope.event,
-            minicore_runtime::LoopEvent::RequestStarted { .. }
-        );
-    let tool_finished = matches!(
-        &envelope.event,
-        minicore_runtime::LoopEvent::ToolFinished { .. }
-    );
-    forward_loop_event(session_id, envelope, session);
-    if tool_finished {
-        *tool_batch_dirty = true;
-    }
-    if refresh_before_next_request {
-        refresh_branch(session).await;
-        *tool_batch_dirty = false;
-    }
-}
-
-async fn refresh_branch(session: &Session) {
-    let branch = session.workspace().git_branch().await;
-    session.presentation().set_branch(branch);
 }
 
 fn extract_loop_id(event: &minicore_runtime::LoopEvent) -> Option<LoopId> {

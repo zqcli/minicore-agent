@@ -1659,6 +1659,192 @@ async fn create_and_open_do_not_start_agent_loop() {
 }
 
 #[tokio::test]
+async fn i1_create_open_and_turns_leave_branch_unknown_until_explicit_status() {
+    let (data_dir, _data_guard) = fixture_dir(&format!("i1-turns-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("i1-turns-ws", "file.txt", b"contents\n");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .expect("git must be available for the branch-cache regression");
+    assert!(init.success());
+    let head = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&workspace)
+        .args(["symbolic-ref", "HEAD", "refs/heads/i1-test"])
+        .status()
+        .unwrap();
+    assert!(head.success());
+
+    let model = FakeModel::new(
+        "main",
+        [
+            ModelScript::Text("no tool"),
+            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            ModelScript::Text("tool complete"),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+
+    let info = create_session(&mut agent, &workspace).await;
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        None
+    );
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        None
+    );
+
+    let no_tool = send_text(&mut agent, info.session_id, "no tool").await;
+    wait_text(&agent, no_tool).await;
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        None
+    );
+
+    let with_tool = send_text(&mut agent, info.session_id, "read file").await;
+    wait_text(&agent, with_tool).await;
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
+    use crate::workspace::status::set_status_program;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    let (data_dir, _data_guard) = fixture_dir(&format!("i1-status-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("i1-status-ws", "file.txt", b"contents\n");
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .expect("git must be available for the status projection regression");
+    assert!(init.success());
+    let head = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&workspace)
+        .args(["symbolic-ref", "HEAD", "refs/heads/i1-status"])
+        .status()
+        .unwrap();
+    assert!(head.success());
+
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        None
+    );
+
+    let status = agent
+        .workspace_status(crate::WorkspaceStatusRequest {
+            session_id: info.session_id,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert!(status.complete);
+    assert!(status.repo_available);
+    assert_eq!(status.branch.as_deref(), Some("i1-status"));
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        Some("i1-status".to_owned())
+    );
+
+    let marker = data_dir.join("status-fails");
+    let script = data_dir.join("status-wrapper");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then exit 1; fi\nexec git \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    std::fs::write(&marker, b"fail\n").unwrap();
+
+    let failed = agent
+        .workspace_status(crate::WorkspaceStatusRequest {
+            session_id: info.session_id,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert!(!failed.complete);
+    assert!(!failed.repo_available);
+    assert_eq!(failed.branch, None);
+    assert_eq!(
+        agent
+            .session_presentation(info.session_id)
+            .unwrap()
+            .git_branch,
+        None
+    );
+
+    let session = agent.loaded_session(info.session_id).unwrap();
+    session.complete_status_query(&status, &CancellationToken::new());
+    assert_eq!(
+        session.presentation_view().git_branch,
+        Some("i1-status".to_owned())
+    );
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    session.complete_status_query(&failed, &cancelled);
+    assert_eq!(
+        session.presentation_view().git_branch,
+        Some("i1-status".to_owned())
+    );
+
+    agent.close_session(info.session_id).await.unwrap();
+    session.complete_status_query(&failed, &CancellationToken::new());
+    assert_eq!(
+        session.presentation_view().git_branch,
+        Some("i1-status".to_owned())
+    );
+}
+
+#[tokio::test]
 async fn rename_loaded_session_trims_clears_and_rejects_invalid_titles() {
     let (data_dir, _guard) = fixture_dir(&format!("rename-loaded-{}", next_id()));
     let (workspace, _guard) = workspace_file("rename-loaded-ws", "a.txt", b"hello");

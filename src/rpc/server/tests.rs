@@ -6036,6 +6036,105 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     remove_base(&base).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_status_projects_the_shared_presentation_branch_and_clears_failures() {
+    use crate::workspace::status::set_status_program;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (agent, base, workspace) =
+        test_agent("workspace-status-projection", [], &[], ApprovalMode::Auto).await;
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .expect("git must be available for the status projection regression");
+    assert!(init.success());
+    let head = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&workspace)
+        .args(["symbolic-ref", "HEAD", "refs/heads/rpc-status"])
+        .status()
+        .unwrap();
+    assert!(head.success());
+
+    let mut harness = RpcHarness::spawn(agent);
+    let session_id = create_and_open(&mut harness, &workspace).await;
+
+    harness
+        .send(
+            json!("before"),
+            "session.presentation",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert!(harness.response(json!("before")).await["result"]["git_branch"].is_null());
+
+    harness
+        .send(
+            json!("status"),
+            "workspace.status",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let status = harness.response(json!("status")).await;
+    assert_eq!(status["result"]["complete"], json!(true));
+    assert_eq!(status["result"]["repo_available"], json!(true));
+    assert_eq!(status["result"]["branch"], json!("rpc-status"));
+
+    harness
+        .send(
+            json!("after"),
+            "session.presentation",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("after")).await["result"]["git_branch"],
+        json!("rpc-status")
+    );
+
+    let marker = base.join("status-fails");
+    let script = base.join("status-wrapper");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then exit 1; fi\nexec git \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    std::fs::write(&marker, b"fail\n").unwrap();
+
+    harness
+        .send(
+            json!("failed-status"),
+            "workspace.status",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    let failed = harness.response(json!("failed-status")).await;
+    assert_eq!(failed["result"]["complete"], json!(false));
+    assert_eq!(failed["result"]["repo_available"], json!(false));
+    assert_eq!(failed["result"]["branch"], json!(null));
+
+    harness
+        .send(
+            json!("cleared"),
+            "session.presentation",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert!(harness.response(json!("cleared")).await["result"]["git_branch"].is_null());
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
 #[tokio::test]
 async fn workspace_status_answers_for_the_session_workspace() {
     let (agent, base, workspace) =
