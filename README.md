@@ -246,10 +246,13 @@ fails is retained as a known partial total rather than dropped. It is never a
 zero-filled copy of the main turn usage.
 
 `session.presentation` is a read-only footer/tool-card projection. It returns
-the configured Session model label, a fixed-argument Git branch lookup, the
+the configured Session model label, the branch from the most recent completed
+explicit `workspace.status` observation (or `null` when unknown), the
 last-loop activity timestamps, and explicit unknown/null context, cost, and
-subscription fields. Tool presentation is bounded and whitelist-based; live
-and history views use the same formatter. Successful `turn.send` and
+subscription fields. Presentation reads never start Git work; clients that
+need fresh workspace state should call `workspace.status`. Tool presentation
+is bounded and whitelist-based; live and history views use the same formatter.
+Successful `turn.send` and
 `turn.steer` responses may include Agent acceptance timestamps without
 changing their existing `turn`/`ok` fields.
 

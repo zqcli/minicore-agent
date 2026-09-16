@@ -595,17 +595,22 @@ impl RpcServer {
                 // The owned worker is registered on the Session, so closing the
                 // Session joins it even when this dispatcher is dropped.
                 let cancellation = self.query_cancellation.clone();
-                let query = match session.spawn_status_query(workspace, request, cancellation) {
-                    Ok(query) => query,
-                    Err(error) => return Dispatch::Response(query_error(id, &error)),
-                };
+                let query =
+                    match session.spawn_status_query(workspace, request, cancellation.clone()) {
+                        Ok(query) => query,
+                        Err(error) => return Dispatch::Response(query_error(id, &error)),
+                    };
+                let session_for_completion = session.clone();
                 drop(session);
                 let outbound = self.outbound_tx.clone();
                 self.queries.spawn(async move {
                     // The awaiter only observes the owned worker's result; the
                     // worker owns its git child and enforces its own deadline.
                     let response = match query.wait().await {
-                        Ok(result) => success(&id, result),
+                        Ok(result) => {
+                            session_for_completion.complete_status_query(&result, &cancellation);
+                            success(&id, result)
+                        }
                         Err(error) => query_error(id, &error),
                     };
                     let _ = outbound.send(RpcOutbound::Response(response)).await;
