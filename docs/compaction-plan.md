@@ -295,5 +295,8 @@ or installation was made.
 
 See [staged compaction verification](verification/compaction.md). TUI
 `/compact`, automatic compaction, P3b2 overflow recovery, and persistent
-delegated child execution remains outside this Agent's scope. P4 remains the
-bounded Workspace slice.
+subagents remain separate work. P4 remains the bounded Workspace slice.
+
+> Superseded for the deleted legacy stateless subagent: the 0916 closeout
+> removed that execution path and keeps only read-only history compatibility.
+> See [the 0916 closeout acceptance](verification/0916-closeout.md).

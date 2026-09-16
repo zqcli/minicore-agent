@@ -296,9 +296,20 @@ content, commands, or raw JSON.
 The Tool module implements exactly `read`, `write`, `edit`, `apply_patch`, and
 `bash`. Each production Session receives a new ToolSet
 sharing only that Session's Workspace. All five use strict object schemas and
-reject unknown input fields. Historical Store v1 records may still contain the
-removed `subagent` name for compatibility, but such records are not executable
-and cannot be opened. `read` supports one-based line offsets, line and byte
+reject unknown input fields. A Profile that names the removed `subagent` Tool
+fails config load or reload instead of silently dropping it. Historical Store
+v1 records may still contain the `subagent` name: they can be listed, read, and
+retitled, and their history, summary, and retained auxiliary records stay
+readable through the generic history and `tool.read`/`tool.output` paths, but
+`session.open` refuses them with `invalid_session_settings` before any model
+call or Store repair, because their saved tool list cannot be executed. There
+is no automatic migration: close the Session, keep a backup of its data, then
+explicitly adjust the tool configuration. A model that hallucinates `subagent`
+receives the Runtime's ordinary unknown-tool handling and never dispatches a
+child loop or process. Full delegated Agent execution — a future `SubagentTool`
+that drives a complete `minicore-agent` Session over its normal API — is
+separate future work, not part of this Agent. `read` supports one-based line
+offsets, line and byte
 limits, and safe directory listings.
 `bash` is not a sandbox and retains the host authority of the Agent process;
 use external container or OS isolation for untrusted models or commands. Run

@@ -6,7 +6,10 @@ Agent starting HEAD: `8b8bbcb33dd692f023e89a0eefcbbb6f2c7a87c0`.
 Runtime remains pinned to 0.4.1, `6cd2bdbc634437dea925495c61c7eb0be10ba171`.
 
 Historical audit reports remain historical evidence and previous unaccepted
-results are not acceptance gates. The current source handoff includes the P3a foundation, the P3b1 automatic
+results are not acceptance gates. The legacy stateless subagent described by the
+subagent sections below was removed by the
+[0916 closeout acceptance](verification/0916-closeout.md); those sections are
+kept as historical evidence and no longer describe executable behavior. The current source handoff includes the P3a foundation, the P3b1 automatic
 compaction slice, and the P3b2 provider replay budget and overflow recovery slice:
 startup projection from a validated summary, same-loop model-update binding,
 `session.context`, independent manual utility usage, the Agent-global automatic
@@ -624,8 +627,7 @@ Retained fixes from the first convergence pass, still in effect:
 
 Scope: the Bash execution entry (`BashTool -> Policy -> ToolResult`) and the
 in-memory `tool.output` windows. P5b (durable process records) and P6 (change
-review) are not started; delegated child-loop execution remains outside this
-historical progress slice.
+review) are not started, and the Subagent architecture is unchanged.
 
 - **One owner per command**: a command is started by a Session-owned worker
   registered under the complete `ToolRef` of the call (`(session_id, loop_id,
@@ -691,8 +693,8 @@ seam, process facts), `src/tools/bash.rs` (execution entry now starts an owned
 command and maps its terminal facts), `src/tool_data.rs` (stream windows,
 process record, base64 pages), `src/presentation.rs` (owner registry, narrow
 binding, stream sink and best-effort events), `src/event.rs` (`tool_process`),
-`src/sessions.rs` (turn/close join barriers), `src/tools/mod.rs` (binding
-injection), `src/lib.rs` (new public types),
+`src/sessions.rs` (turn/close join barriers), `src/subagents.rs` (child stage
+join), `src/tools/mod.rs` (binding injection), `src/lib.rs` (new public types),
 `Cargo.toml` (`process-wrap`, `base64`, Unix `nix`). No Cargo.lock was edited by
 hand.
 

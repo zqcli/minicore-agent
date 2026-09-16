@@ -1,5 +1,12 @@
 # Tool, Reload And Stateless Subagent Acceptance
 
+> Historical evidence only. This document records the acceptance of the legacy
+> native stateless subagent at commit `f1697f7`. That execution path was removed
+> by the [0916 closeout acceptance](0916-closeout.md); its raw evidence and
+> checksums are preserved unaltered and are not a claim about current
+> executable behavior. Current Tools are the five in
+> [the closeout record](0916-closeout.md).
+
 The Agent acceptance below is unchanged. Its original TUI `30ea7ca` pairing is
 historical; current paired TUI `a604e55` adds the separately verified
 [public reload correction](reload-refresh.md). Existing manifests, raw evidence
@@ -59,6 +66,11 @@ UUID checks. No user process was restarted and installation did not change user
 configuration or Store data. Already-running processes may still use old images.
 
 ## Contracts And Limits
+
+> Historical wording below describes the removed version at `f1697f7`; the
+> present-tense instructions for enabling `subagent` no longer apply. See
+> [the 0916 closeout record](0916-closeout.md) for the current five-tool
+> behavior.
 
 `Agent::open_file` retains the absolute lexical startup path for reload;
 `Agent::open` remains source-less. Reload prebuilds the candidate before swapping,
