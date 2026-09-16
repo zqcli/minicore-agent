@@ -43,6 +43,9 @@ use crate::store::{
     Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError,
     SummaryCommit, utc_timestamp,
 };
+use crate::tool_data::ToolData;
+use crate::tools::command::CommandOwners;
+use crate::tools::observe::ToolObserver;
 use crate::workspace::{Workspace, WorkspaceError};
 
 #[cfg(test)]
@@ -526,6 +529,9 @@ struct SessionShared {
     store: Store,
     events: AgentEventSink,
     compaction: Arc<CompactionState>,
+    tool_data: Arc<ToolData>,
+    command_owners: Arc<CommandOwners>,
+    tool_observer: Arc<ToolObserver>,
 }
 
 impl Drop for SessionShared {
@@ -1016,6 +1022,9 @@ impl Session {
         policy: CompactionPolicy,
         store: Store,
         events: AgentEventSink,
+        tool_data: Arc<ToolData>,
+        command_owners: Arc<CommandOwners>,
+        tool_observer: Arc<ToolObserver>,
     ) -> Self {
         compaction.note_settings_installed();
         let inner = SessionInner {
@@ -1047,6 +1056,9 @@ impl Session {
                 store,
                 events,
                 compaction,
+                tool_data,
+                command_owners,
+                tool_observer,
             }),
         }
     }
@@ -1887,6 +1899,7 @@ impl Session {
             // Initialize current-loop observation before spawning the Runtime
             // task: the runner may reach Model::start synchronously.
             inner.presentation.reset_before_loop_start();
+            self.shared.tool_observer.reset_before_loop_start();
             // AgentLoop::start only validates and spawns the Runtime task; it
             // does not await model work. Keeping this short lock held closes
             // the cancellation/close race between validation and ownership.
@@ -2453,7 +2466,15 @@ impl Session {
     }
 
     pub(crate) fn tool_data(&self) -> Arc<crate::tool_data::ToolData> {
-        self.presentation().tool_data()
+        Arc::clone(&self.shared.tool_data)
+    }
+
+    pub(crate) fn command_owners(&self) -> Arc<CommandOwners> {
+        Arc::clone(&self.shared.command_owners)
+    }
+
+    pub(crate) fn tool_observer(&self) -> Arc<ToolObserver> {
+        Arc::clone(&self.shared.tool_observer)
     }
 
     pub(crate) fn presentation_view(&self) -> crate::presentation::PresentationView {
@@ -2641,7 +2662,7 @@ impl Session {
         // Owned commands are joined after every owner was told to stop, and
         // before the Session reports closure: a command is only finished when
         // its owner really reaped it.
-        self.presentation().command_owners().join_all().await;
+        self.shared.command_owners.join_all().await;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -3346,11 +3367,7 @@ async fn run_active_loop(
     // Owned commands of this loop are joined before the report is reconciled
     // and persisted: a dropped tool future must not leave a process behind, and
     // the process record must be final before the terminal state is written.
-    session
-        .presentation()
-        .command_owners()
-        .join_loop(turn.loop_id)
-        .await;
+    session.shared.command_owners.join_loop(turn.loop_id).await;
     let report = match result {
         Ok(report) => {
             if let minicore_runtime::LoopOutcome::Failed(failure) = &report.outcome {
@@ -3384,8 +3401,8 @@ async fn run_active_loop(
     // when the wrapper future was dropped by an outer Runtime deadline/cancel
     // or its best-effort events were lost.
     session
-        .presentation()
-        .tool_data()
+        .shared
+        .tool_data
         .reconcile(turn.session_id, &sanitized);
     let user_item_count = sanitized
         .iter()
@@ -3488,10 +3505,7 @@ async fn run_active_loop(
 }
 
 async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loop_id: LoopId) {
-    let tool_refs = session
-        .presentation()
-        .tool_data()
-        .loop_tool_refs(session_id, loop_id);
+    let tool_refs = session.shared.tool_data.loop_tool_refs(session_id, loop_id);
     if tool_refs.is_empty() {
         return;
     }
@@ -3499,11 +3513,7 @@ async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loo
     let results = session
         .shared
         .store
-        .persist_loop_tool_records(
-            &tool_refs,
-            session.presentation().tool_data().as_ref(),
-            deadline,
-        )
+        .persist_loop_tool_records(&tool_refs, session.shared.tool_data.as_ref(), deadline)
         .await;
 
     for (tool_ref, outcome) in results {
@@ -3513,7 +3523,7 @@ async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loo
         };
         match outcome {
             Ok(()) => {
-                session.presentation().note_tool_recording(
+                session.shared.tool_observer.note_tool_recording(
                     &tool_ref,
                     crate::tool_data::ToolRecordingState::Saved,
                     turn,
@@ -3526,7 +3536,7 @@ async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loo
                     error_kind = error.kind(),
                     "auxiliary tool record persistence failed"
                 );
-                session.presentation().note_tool_recording(
+                session.shared.tool_observer.note_tool_recording(
                     &tool_ref,
                     crate::tool_data::ToolRecordingState::Failed,
                     turn,
@@ -3610,8 +3620,8 @@ fn tool_execution_event(
     // Record the authoritative terminal state before reading it back, so the
     // event never reports a stale non-terminal state.
     let data = session
-        .presentation()
-        .tool_data()
+        .shared
+        .tool_data
         .finish_and_snapshot(&tool_ref, *outcome)?;
     Some(AgentEvent::ToolExecution {
         turn: TurnRef {
@@ -3697,7 +3707,7 @@ fn map_loop_event(
             ..
         } => {
             // Runtime accepted the call; arguments are not available yet.
-            session.presentation().tool_data().note_requested(
+            session.shared.tool_data.note_requested(
                 &crate::tool_data::ToolRef {
                     session_id,
                     loop_id,
@@ -3723,7 +3733,7 @@ fn map_loop_event(
             // A real `ToolContext.progress` phase is the only thing recorded
             // here; raw stream bytes never travel through progress messages.
             if let Some(message) = progress.message.as_ref() {
-                session.presentation().tool_data().note_phase(
+                session.shared.tool_data.note_phase(
                     &crate::tool_data::ToolRef {
                         session_id,
                         loop_id,
@@ -3753,7 +3763,7 @@ fn map_loop_event(
             // channels have independent delivery/drop semantics. Terminal
             // structured facts are recorded once by `tool_execution_event`.
             let presentation_result = session.presentation().tool_result(
-                crate::presentation::RequestKey {
+                crate::tools::observe::RequestKey {
                     loop_id,
                     request_index,
                 },
