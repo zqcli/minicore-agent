@@ -397,21 +397,19 @@ impl RpcServer {
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.session_id);
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response = match tokio::time::timeout(
+                // The outer read timeout stays here, in the future the helper
+                // only encodes; `QueryLimit` maps the same way as before.
+                self.defer_query(id, async move {
+                    match tokio::time::timeout(
                         crate::read::READ_DEADLINE,
                         crate::read::read_session(store, loaded, request, cancellation),
                     )
                     .await
                     {
-                        Ok(Ok(result)) => success(&id, result),
-                        Ok(Err(error)) => query_error(id, &error),
-                        Err(_) => agent_error(id, &AgentError::QueryLimit),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                        Ok(result) => result,
+                        Err(_) => Err(AgentError::QueryLimit),
+                    }
+                })
             }
             "workspace.read" => {
                 let request: WorkspaceReadRequest = params_or_error(&id, params)?;
@@ -430,9 +428,10 @@ impl RpcServer {
                 let workspace = session.workspace();
                 drop(session);
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response = match tokio::time::timeout(
+                // The outer read timeout stays here, in the future the helper
+                // only encodes.
+                self.defer_query(id, async move {
+                    match tokio::time::timeout(
                         WORKSPACE_READ_DEADLINE,
                         crate::workspace::query::read(
                             workspace,
@@ -443,13 +442,10 @@ impl RpcServer {
                     )
                     .await
                     {
-                        Ok(Ok(result)) => success(&id, result),
-                        Ok(Err(error)) => query_error(id, &error),
-                        Err(_) => agent_error(id, &AgentError::QueryLimit),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                        Ok(result) => result,
+                        Err(_) => Err(AgentError::QueryLimit),
+                    }
+                })
             }
             "workspace.files" => {
                 let request: WorkspaceFilesRequest = params_or_error(&id, params)?;
@@ -466,25 +462,18 @@ impl RpcServer {
                 let workspace = session.workspace();
                 drop(session);
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    // The scan owns one retained blocking worker and enforces
-                    // its own deadline, so an outer timeout here would drop
-                    // the worker join instead of cancelling it.
-                    let response = match crate::workspace::listing::files(
+                // The scan owns one retained blocking worker and enforces its
+                // own deadline, so an outer timeout here would drop the worker
+                // join instead of cancelling it.
+                self.defer_query(
+                    id,
+                    crate::workspace::listing::files(
                         workspace,
                         request,
                         session_cancellation,
                         cancellation,
-                    )
-                    .await
-                    {
-                        Ok(result) => success(&id, result),
-                        Err(error) => query_error(id, &error),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                    ),
+                )
             }
             "workspace.search" => {
                 let request: WorkspaceSearchRequest = params_or_error(&id, params)?;
@@ -501,23 +490,16 @@ impl RpcServer {
                 let workspace = session.workspace();
                 drop(session);
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    // Same retained-worker contract as `workspace.files`.
-                    let response = match crate::workspace::search::search(
+                // Same retained-worker contract as `workspace.files`.
+                self.defer_query(
+                    id,
+                    crate::workspace::search::search(
                         workspace,
                         request,
                         session_cancellation,
                         cancellation,
-                    )
-                    .await
-                    {
-                        Ok(result) => success(&id, result),
-                        Err(error) => query_error(id, &error),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                    ),
+                )
             }
             "workspace.status" => {
                 let request: WorkspaceStatusRequest = params_or_error(&id, params)?;
@@ -543,17 +525,9 @@ impl RpcServer {
                     Ok(query) => query,
                     Err(error) => return Err(query_error(id, &error)),
                 };
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    // The awaiter only observes the owned worker's result; the
-                    // worker owns its git child and enforces its own deadline.
-                    let response = match query.await {
-                        Ok(result) => success(&id, result),
-                        Err(error) => query_error(id, &error),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                // The awaiter only observes the owned worker's result; the
+                // worker owns its git child and enforces its own deadline.
+                self.defer_query(id, query)
             }
             "changes.list" => {
                 let request: ChangesListRequest = params_or_error(&id, params)?;
@@ -580,15 +554,7 @@ impl RpcServer {
                     Ok(query) => query,
                     Err(error) => return Err(query_error(id, &error)),
                 };
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response = match query.await {
-                        Ok(result) => success(&id, result),
-                        Err(error) => query_error(id, &error),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                self.defer_query(id, query)
             }
             "changes.diff" => {
                 let request: ChangesDiffRequest = params_or_error(&id, params)?;
@@ -615,15 +581,7 @@ impl RpcServer {
                     Ok(query) => query,
                     Err(error) => return Err(query_error(id, &error)),
                 };
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response = match query.await {
-                        Ok(result) => success(&id, result),
-                        Err(error) => query_error(id, &error),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                self.defer_query(id, query)
             }
             "session.presentation" => {
                 let params: SessionParams = params_or_error(&id, params)?;
@@ -642,17 +600,10 @@ impl RpcServer {
                 let store = self.agent().store_handle();
                 let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response =
-                        match crate::read::tool_read(store, tool_data, request, cancellation).await
-                        {
-                            Ok(result) => success(&id, result),
-                            Err(error) => query_error(id, &error),
-                        };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                self.defer_query(
+                    id,
+                    crate::read::tool_read(store, tool_data, request, cancellation),
+                )
             }
             "tool.output" => {
                 let params: ToolOutputParams = params_or_error(&id, params)?;
@@ -666,18 +617,10 @@ impl RpcServer {
                 let store = self.agent().store_handle();
                 let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response =
-                        match crate::read::tool_output(store, tool_data, request, cancellation)
-                            .await
-                        {
-                            Ok(result) => success(&id, result),
-                            Err(error) => query_error(id, &error),
-                        };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                self.defer_query(
+                    id,
+                    crate::read::tool_output(store, tool_data, request, cancellation),
+                )
             }
             "turn.send" => {
                 let params: TurnSendParams = params_or_error(&id, params)?;
@@ -796,21 +739,18 @@ impl RpcServer {
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.turn.session_id);
                 let cancellation = self.query_cancellation.clone();
-                let outbound = self.outbound_tx.clone();
-                self.queries.spawn(async move {
-                    let response = match tokio::time::timeout(
+                // Same outer read timeout as `session.read`, kept in the future.
+                self.defer_query(id, async move {
+                    match tokio::time::timeout(
                         crate::read::READ_DEADLINE,
                         crate::read::turn_result(store, loaded, request, cancellation),
                     )
                     .await
                     {
-                        Ok(Ok(result)) => success(&id, result),
-                        Ok(Err(error)) => query_error(id, &error),
-                        Err(_) => agent_error(id, &AgentError::QueryLimit),
-                    };
-                    let _ = outbound.send(RpcOutbound::Response(response)).await;
-                });
-                Dispatch::Deferred
+                        Ok(result) => result,
+                        Err(_) => Err(AgentError::QueryLimit),
+                    }
+                })
             }
             "interaction.answer" => {
                 let params: InteractionAnswerParams = params_or_error(&id, params)?;
@@ -841,6 +781,29 @@ impl RpcServer {
                 false,
             )),
         })
+    }
+
+    /// Registers one already-prepared query on the existing queries JoinSet and
+    /// encodes its success or `query_error` on the outbound channel.
+    ///
+    /// The caller keeps admission: capacity was checked and any Session-owned
+    /// worker was registered synchronously before this call. The helper adds no
+    /// timeout, validation, cancellation, or retry; the caller's future retains
+    /// its existing business error mapping.
+    fn defer_query<T, F>(&mut self, id: RpcId, future: F) -> Dispatch
+    where
+        T: Serialize + Send + 'static,
+        F: Future<Output = Result<T, AgentError>> + Send + 'static,
+    {
+        let outbound = self.outbound_tx.clone();
+        self.queries.spawn(async move {
+            let response = match future.await {
+                Ok(result) => success(&id, result),
+                Err(error) => query_error(id, &error),
+            };
+            let _ = outbound.send(RpcOutbound::Response(response)).await;
+        });
+        Dispatch::Deferred
     }
 
     async fn send(&self, response: RpcResponse) -> Result<(), ()> {
