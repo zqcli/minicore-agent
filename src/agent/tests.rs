@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -1660,6 +1661,126 @@ async fn create_and_open_do_not_start_agent_loop() {
     let reopened = agent.open_session(info.session_id).await.unwrap();
     let state = agent.session_state(reopened.session_id).unwrap();
     assert_eq!(state.status, crate::sessions::SessionStatus::Idle);
+}
+
+#[tokio::test]
+async fn create_and_loaded_open_emit_session_opened_once() {
+    let (data_dir, _guard) = fixture_dir(&format!("session-opened-{}", next_id()));
+    let (workspace, _guard) = workspace_file("session-opened-ws", "a.txt", b"hello");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        read_profile(),
+    )
+    .await;
+    let mut events = agent.take_events().unwrap();
+
+    let info = create_session(&mut agent, &workspace).await;
+    match events
+        .recv()
+        .await
+        .expect("create must publish SessionOpened")
+    {
+        AgentEvent::SessionOpened { session, meta } => {
+            assert_eq!(session, info);
+            assert_eq!(meta.session_id, info.session_id);
+            assert_eq!(meta.loop_id, None);
+        }
+        event => panic!("unexpected create event: {event:?}"),
+    }
+
+    let created_session = agent.loaded_session(info.session_id).unwrap();
+    let created_data = created_session.tool_data();
+    let created_presentation = created_session.presentation();
+    let loaded = agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(loaded, info);
+    let loaded_session = agent.loaded_session(info.session_id).unwrap();
+    assert!(Arc::ptr_eq(&created_data, &loaded_session.tool_data()));
+    assert!(Arc::ptr_eq(
+        &created_presentation,
+        &loaded_session.presentation()
+    ));
+    assert!(futures_util::poll!(pin!(events.recv())).is_pending());
+
+    agent.close_session(info.session_id).await.unwrap();
+    match events
+        .recv()
+        .await
+        .expect("close must publish SessionClosed")
+    {
+        AgentEvent::SessionClosed {
+            session_id: closed_id,
+            meta,
+        } => {
+            assert_eq!(closed_id, info.session_id);
+            assert_eq!(meta.session_id, info.session_id);
+            assert_eq!(meta.loop_id, None);
+        }
+        event => panic!("unexpected close event: {event:?}"),
+    }
+
+    let reopened = agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(reopened, info);
+    let reopened_session = agent.loaded_session(info.session_id).unwrap();
+    assert!(!Arc::ptr_eq(
+        &created_session.tool_data(),
+        &reopened_session.tool_data()
+    ));
+    assert!(!Arc::ptr_eq(
+        &created_session.presentation(),
+        &reopened_session.presentation()
+    ));
+    match events
+        .recv()
+        .await
+        .expect("reopen must publish SessionOpened")
+    {
+        AgentEvent::SessionOpened { session, meta } => {
+            assert_eq!(session, info);
+            assert_eq!(meta.session_id, info.session_id);
+            assert_eq!(meta.loop_id, None);
+        }
+        event => panic!("unexpected reopen event: {event:?}"),
+    }
+    assert!(futures_util::poll!(pin!(events.recv())).is_pending());
+}
+
+#[tokio::test]
+async fn create_capability_precheck_leaves_no_session_directory() {
+    let (data_dir, _guard) = fixture_dir(&format!("create-capability-precheck-{}", next_id()));
+    let (workspace, _workspace_guard) =
+        workspace_file("create-capability-precheck-ws", "a.txt", b"hello");
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        read_profile(),
+    )
+    .await;
+    let mut invalid_profile = read_profile();
+    invalid_profile.tools = vec!["read".to_owned(), "read".to_owned()];
+    agent.profiles = crate::profiles::Profiles::from_values(BTreeMap::from([(
+        "test".to_owned(),
+        invalid_profile,
+    )]));
+
+    let result = agent
+        .create_session(CreateSession {
+            workspace,
+            profile: String::new(),
+            model: None,
+            reasoning: None,
+            title: Some("must not persist".to_owned()),
+        })
+        .await;
+    assert!(matches!(result, Err(AgentError::InvalidSessionSettings)));
+    assert!(agent.list_sessions().await.unwrap().is_empty());
+    assert!(
+        std::fs::read_dir(data_dir.join("sessions"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "capability precheck must run before creating a session directory"
+    );
 }
 
 #[tokio::test]
