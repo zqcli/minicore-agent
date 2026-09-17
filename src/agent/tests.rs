@@ -8456,6 +8456,111 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     assert!(matches!(prepared.await, Err(AgentError::QueryLimit)));
 }
 
+/// P2b: `prepare_changes_diff` registers the Session-owned source worker
+/// synchronously for a `workspace:` ref and returns a wait-only future. If that
+/// future is never polled and the Session closes immediately, the close must
+/// still cancel and join the worker it registered.
+#[cfg(unix)]
+#[tokio::test]
+async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close() {
+    use crate::workspace::status::{StatusReapGate, set_status_program, set_status_reap_gate};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (data_dir, _data_guard) = fixture_dir(&format!("diff-prepare-{}", next_id()));
+    let (workspace, _workspace_guard) =
+        workspace_file("diff-prepare-ws", "note.txt", b"raw\ncontent\n");
+    // A real repository is needed: `diff_sources` first resolves the work tree
+    // through Git before it can report a missing side.
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&workspace)
+        .status()
+        .expect("git must be available for the diff ownership regression");
+    assert!(init.success());
+
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session_id = info.session_id;
+
+    // A real `workspace:` ref for the untracked file, taken from the live
+    // status projection.
+    let status = agent
+        .workspace_status(crate::WorkspaceStatusRequest {
+            session_id,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert!(status.repo_available);
+    let (records, _, _) = crate::changes::workspace_records(session_id, &status);
+    let change_ref = records
+        .iter()
+        .find(|record| record.path == "note.txt")
+        .expect("the untracked file is listed")
+        .change_ref
+        .clone();
+
+    // A git stub that records its pid and then holds its pipes open.
+    let pid_path = data_dir.join("diff-prepare-pids");
+    let script = data_dir.join("slow-diff-git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nsleep 30\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+
+    let session = agent.loaded_session(session_id).unwrap();
+    let prepared = crate::queries::prepare_changes_diff(
+        agent.store_handle(),
+        Some(session.clone()),
+        crate::ChangesDiffRequest {
+            session_id,
+            change_ref,
+            comparison: None,
+            context_lines: None,
+            cursor: None,
+            max_bytes: None,
+        },
+        tokio_util::sync::CancellationToken::new(),
+        crate::diff::diff_deadline(),
+    )
+    .unwrap();
+    let pid = wait_for_started_child(&pid_path, 0).await;
+    assert!(
+        process_is_listed(pid),
+        "the registered child is not running"
+    );
+    assert_eq!(session.active_status_workers(), 1);
+
+    let gate = StatusReapGate::new();
+    set_status_reap_gate(
+        std::fs::canonicalize(&workspace).unwrap(),
+        Arc::clone(&gate),
+    );
+
+    let close = agent.close_session(session_id);
+    let mut close = std::pin::pin!(close);
+    assert!(futures_util::poll!(&mut close).is_pending());
+    gate.entered().await;
+    gate.release();
+    close.await.unwrap();
+    assert_eq!(session.active_status_workers(), 0);
+    drop(prepared);
+}
+
 /// Waits until a fake git child has appended its process id, and returns it.
 #[cfg(unix)]
 async fn wait_for_started_child(pid_path: &Path, index: usize) -> i32 {

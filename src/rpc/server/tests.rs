@@ -581,6 +581,41 @@ fn session_id(response: &Value) -> Value {
         .clone()
 }
 
+/// The complete `resource_exhausted` error object, so a regression that only
+/// preserved the code/kind is caught.
+#[cfg(unix)]
+fn resource_exhausted_error(id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32019,
+            "message": "too many deferred requests",
+            "data": {"kind": "resource_exhausted", "retryable": true},
+        },
+    })
+}
+
+/// A syntactically valid `workspace:` change reference for one path, built the
+/// same way the live projection does. Used to pass `validate` without a real
+/// Git fixture when the point is the capacity check, not the diff content.
+#[cfg(unix)]
+fn untracked_workspace_ref(session_id: SessionId, path: &str) -> String {
+    use base64::Engine;
+    let entry = crate::workspace::status::WorkspaceStatusEntry {
+        path: path.to_owned(),
+        kind: crate::workspace::status::WorkspaceStatusEntryKind::Untracked,
+        index_status: None,
+        worktree_status: None,
+        original_path: None,
+    };
+    let bytes = serde_json::to_vec(&(session_id, String::new(), entry)).unwrap();
+    format!(
+        "workspace:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 fn turn_params(turn: &Value) -> Value {
     json!({
         "session_id": turn["session_id"],
@@ -6253,6 +6288,142 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
     );
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("cl-{index}"))).await;
+        assert_eq!(response["error"]["code"], json!(-32020));
+    }
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+/// Capacity is checked before any Session-owned worker is registered. With
+/// every query slot held, a request that already resolved to a loaded Session
+/// must still be refused as the complete `resource_exhausted` object and must
+/// not start a Git child; an unloaded Session plus a `workspace` scope/ref is
+/// refused the same way instead of `session_not_loaded`.
+#[cfg(unix)]
+#[tokio::test]
+async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
+    use crate::workspace::status::set_status_program;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (agent, base, workspace) =
+        test_agent("changes-capacity-precedence", [], &[], ApprovalMode::Auto).await;
+    let root = std::fs::canonicalize(&workspace).unwrap();
+    let started = base.join("capacity-git-started");
+    let script = base.join("counting-git");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\n: > '{}'\nexec git \"$@\"\n", started.display()),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(root, script);
+
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
+    let unloaded = SessionId::new().unwrap();
+
+    // Hold every query slot with gated (already admitted) tool-change queries.
+    let mut gates = Vec::new();
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let gate = Arc::new(ChangeListGate::new());
+        gate_next_change_list(session_val, Arc::clone(&gate));
+        gates.push(gate);
+        harness
+            .send(
+                json!(format!("cap-{index}")),
+                "changes.list",
+                Some(json!({"session_id": session, "scope": "session"})),
+            )
+            .await;
+    }
+    for gate in &gates {
+        tokio::time::timeout(TIMEOUT, gate.wait_started())
+            .await
+            .expect("changes.list query did not start");
+    }
+
+    // Loaded Session, workspace-bearing entries: the slot is refused before a
+    // worker registers, and the whole error object is unchanged.
+    for (id, method, params) in [
+        (
+            json!("status-loaded"),
+            "workspace.status",
+            json!({"session_id": session}),
+        ),
+        (
+            json!("list-loaded"),
+            "changes.list",
+            json!({"session_id": session, "scope": "workspace"}),
+        ),
+        (
+            json!("diff-loaded"),
+            "changes.diff",
+            json!({
+                "session_id": session,
+                "change_ref": untracked_workspace_ref(session_val, "note.txt"),
+            }),
+        ),
+    ] {
+        harness.send(id.clone(), method, Some(params)).await;
+        assert_eq!(
+            harness.response(id.clone()).await,
+            resource_exhausted_error(id),
+            "{method} must be refused by capacity with the full object"
+        );
+    }
+
+    // Workspace scope/ref with an unloaded Session: capacity wins over the
+    // missing Session, and no status/source worker (Git child) may start.
+    harness
+        .send(
+            json!("list-workspace"),
+            "changes.list",
+            Some(json!({"session_id": unloaded, "scope": "workspace"})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("list-workspace")).await,
+        resource_exhausted_error(json!("list-workspace"))
+    );
+    harness
+        .send(
+            json!("diff-workspace"),
+            "changes.diff",
+            Some(json!({
+                "session_id": unloaded,
+                "change_ref": untracked_workspace_ref(unloaded, "note.txt"),
+            })),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("diff-workspace")).await,
+        resource_exhausted_error(json!("diff-workspace"))
+    );
+
+    assert!(
+        !started.exists(),
+        "a refused changes/status request started a Git child"
+    );
+
+    // Closing the owning Session drains the held queries so the harness can
+    // shut down cleanly.
+    harness
+        .send(
+            json!("close"),
+            "session.close",
+            Some(json!({"session_id": session})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("close")).await["result"],
+        json!({"ok": true})
+    );
+    for index in 0..MAX_DEFERRED_QUERIES {
+        let response = harness.response(json!(format!("cap-{index}"))).await;
         assert_eq!(response["error"]["code"], json!(-32020));
     }
 
