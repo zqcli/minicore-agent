@@ -693,6 +693,67 @@ async fn agent_reload_requires_empty_params_and_a_file_source() {
     remove_base(&base).await;
 }
 
+/// P1 regression: the private `Result` boundary must return the exact same
+/// error object a caller saw before, with the request id preserved and no
+/// `result` field. It drives a plain method, a query entry's param decode, and
+/// the unknown-method fallback through `dispatch_inner`.
+#[tokio::test]
+async fn dispatch_inner_propagates_the_full_error_object() {
+    let (agent, base, _workspace) = test_agent("dispatch-error", [], &[], ApprovalMode::Auto).await;
+    let mut harness = RpcHarness::spawn(agent);
+
+    let cases = [
+        (
+            json!("ping-bad"),
+            "agent.ping",
+            Some(json!({"extra": true})),
+        ),
+        (json!("shutdown-bad"), "agent.shutdown", Some(json!([]))),
+        (
+            json!("status-bad"),
+            "workspace.status",
+            Some(json!({"session_id": 7})),
+        ),
+    ];
+    for (id, method, params) in cases {
+        harness.send(id.clone(), method, params).await;
+        let response = harness.response(id.clone()).await;
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "invalid params",
+                    "data": {"kind": "invalid_params", "retryable": false},
+                },
+            }),
+            "{method} invalid params changed shape"
+        );
+    }
+
+    harness
+        .send(json!("no-such-method"), "no.such.method", None)
+        .await;
+    let unknown = harness.response(json!("no-such-method")).await;
+    assert_eq!(
+        unknown,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "no-such-method",
+            "error": {
+                "code": -32601,
+                "message": "method not found",
+                "data": {"kind": "method_not_found", "retryable": false},
+            },
+        })
+    );
+
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
 #[tokio::test]
 async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
     let (agent, base, workspace) =

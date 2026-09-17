@@ -227,37 +227,32 @@ impl RpcServer {
     }
 
     async fn dispatch(&mut self, request: RpcRequest) -> Dispatch {
+        match self.dispatch_inner(request).await {
+            Ok(dispatch) => dispatch,
+            Err(response) => Dispatch::Response(response),
+        }
+    }
+
+    async fn dispatch_inner(&mut self, request: RpcRequest) -> Result<Dispatch, RpcResponse> {
         let RpcRequest { id, method, params } = request;
         tracing::debug!(method = canonical_method(&method), "rpc dispatch");
-        match method.as_str() {
+        Ok(match method.as_str() {
             "agent.ping" => {
-                let _: EmptyParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let _: EmptyParams = params_or_error(&id, params)?;
                 let result = self.agent().ping();
                 Dispatch::Response(success(&id, result))
             }
             "agent.reload" => {
-                let _: EmptyParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let _: EmptyParams = params_or_error(&id, params)?;
                 let result = self.agent_mut().reload().await;
                 Dispatch::Response(agent_result(&id, result))
             }
             "agent.shutdown" => {
-                let _: EmptyParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let _: EmptyParams = params_or_error(&id, params)?;
                 Dispatch::Shutdown(id)
             }
             "profile.list" => {
-                let _: EmptyParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let _: EmptyParams = params_or_error(&id, params)?;
                 Dispatch::Response(success(
                     &id,
                     ProfilesResult {
@@ -266,10 +261,7 @@ impl RpcServer {
                 ))
             }
             "model.list" => {
-                let _: EmptyParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let _: EmptyParams = params_or_error(&id, params)?;
                 Dispatch::Response(success(
                     &id,
                     ModelsResult {
@@ -278,10 +270,7 @@ impl RpcServer {
                 ))
             }
             "session.list" => {
-                let _: EmptyParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let _: EmptyParams = params_or_error(&id, params)?;
                 let result = self
                     .agent()
                     .list_sessions()
@@ -290,10 +279,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.create" => {
-                let params: SessionCreateParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionCreateParams = params_or_error(&id, params)?;
                 let result = self
                     .agent_mut()
                     .create_session(params.into())
@@ -302,10 +288,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.open" => {
-                let params: SessionParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionParams = params_or_error(&id, params)?;
                 let result = self
                     .agent_mut()
                     .open_session(params.session_id)
@@ -314,10 +297,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.close" => {
-                let params: SessionParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionParams = params_or_error(&id, params)?;
                 let result = self
                     .agent_mut()
                     .close_session(params.session_id)
@@ -326,10 +306,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.delete" => {
-                let params: SessionParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionParams = params_or_error(&id, params)?;
                 let result = self
                     .agent_mut()
                     .delete_session(params.session_id)
@@ -338,10 +315,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.state" => {
-                let params: SessionParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionParams = params_or_error(&id, params)?;
                 let result = self
                     .agent()
                     .session_state(params.session_id)
@@ -349,23 +323,17 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.context" => {
-                let params: SessionParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionParams = params_or_error(&id, params)?;
                 let result = self.agent().session_context(params.session_id);
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.compact" => {
-                let params: SessionCompactParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionCompactParams = params_or_error(&id, params)?;
                 // Reserve waiter capacity before starting the Session-owned
                 // operation, so a full waiter set never launches a compaction
                 // that cannot be awaited.
                 if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 match self.agent_mut().compact_session(params.into()).await {
                     Ok(receiver) => {
@@ -383,10 +351,7 @@ impl RpcServer {
                 }
             }
             "session.compact.cancel" => {
-                let params: SessionCompactParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionCompactParams = params_or_error(&id, params)?;
                 let result = self
                     .agent()
                     .cancel_compaction(params.into())
@@ -394,12 +359,9 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.update" => {
-                let params: SessionUpdateParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionUpdateParams = params_or_error(&id, params)?;
                 if !params.has_field() {
-                    return Dispatch::Response(invalid_params(Some(id)));
+                    return Err(invalid_params(Some(id)));
                 }
                 let result = self
                     .agent_mut()
@@ -409,10 +371,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.rename" => {
-                let params: SessionRenameParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionRenameParams = params_or_error(&id, params)?;
                 let result = self
                     .agent_mut()
                     .rename_session(params.into())
@@ -421,10 +380,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.history" => {
-                let params: SessionHistoryParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionHistoryParams = params_or_error(&id, params)?;
                 let result = self
                     .agent()
                     .history(params.into())
@@ -432,16 +388,13 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.read" => {
-                let params: SessionReadParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionReadParams = params_or_error(&id, params)?;
                 let request: ReadSession = params.into();
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.session_id);
@@ -463,20 +416,17 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "workspace.read" => {
-                let request: WorkspaceReadRequest = match params_or_error(&id, params) {
-                    Ok(request) => request,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let request: WorkspaceReadRequest = params_or_error(&id, params)?;
                 // Lexical path/range validation happens before a query slot is
                 // reserved; the offset itself is checked against the file.
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 let Some(session) = self.agent().loaded_session(request.session_id) else {
-                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                    return Err(agent_error(id, &AgentError::SessionNotLoaded));
                 };
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let session_cancellation = session.query_cancellation();
                 let workspace = session.workspace();
@@ -504,18 +454,15 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "workspace.files" => {
-                let request: WorkspaceFilesRequest = match params_or_error(&id, params) {
-                    Ok(request) => request,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let request: WorkspaceFilesRequest = params_or_error(&id, params)?;
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 let Some(session) = self.agent().loaded_session(request.session_id) else {
-                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                    return Err(agent_error(id, &AgentError::SessionNotLoaded));
                 };
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let session_cancellation = session.query_cancellation();
                 let workspace = session.workspace();
@@ -542,18 +489,15 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "workspace.search" => {
-                let request: WorkspaceSearchRequest = match params_or_error(&id, params) {
-                    Ok(request) => request,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let request: WorkspaceSearchRequest = params_or_error(&id, params)?;
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 let Some(session) = self.agent().loaded_session(request.session_id) else {
-                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                    return Err(agent_error(id, &AgentError::SessionNotLoaded));
                 };
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let session_cancellation = session.query_cancellation();
                 let workspace = session.workspace();
@@ -578,18 +522,15 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "workspace.status" => {
-                let request: WorkspaceStatusRequest = match params_or_error(&id, params) {
-                    Ok(request) => request,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let request: WorkspaceStatusRequest = params_or_error(&id, params)?;
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 let Some(session) = self.agent().loaded_session(request.session_id) else {
-                    return Dispatch::Response(agent_error(id, &AgentError::SessionNotLoaded));
+                    return Err(agent_error(id, &AgentError::SessionNotLoaded));
                 };
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let workspace = session.workspace();
                 // The owned worker is registered on the Session, so closing the
@@ -598,7 +539,7 @@ impl RpcServer {
                 let query =
                     match session.spawn_status_query(workspace, request, cancellation.clone()) {
                         Ok(query) => query,
-                        Err(error) => return Dispatch::Response(query_error(id, &error)),
+                        Err(error) => return Err(query_error(id, &error)),
                     };
                 let session_for_completion = session.clone();
                 drop(session);
@@ -618,15 +559,12 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "changes.list" => {
-                let request: ChangesListRequest = match params_or_error(&id, params) {
-                    Ok(request) => request,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let request: ChangesListRequest = params_or_error(&id, params)?;
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let deadline = change_deadline();
                 let cancellation = self.query_cancellation.clone();
@@ -634,10 +572,7 @@ impl RpcServer {
                 match &request.scope {
                     crate::changes::ChangeScope::Workspace => {
                         let Some(session) = self.agent().loaded_session(request.session_id) else {
-                            return Dispatch::Response(agent_error(
-                                id,
-                                &AgentError::SessionNotLoaded,
-                            ));
+                            return Err(agent_error(id, &AgentError::SessionNotLoaded));
                         };
                         let status_request = crate::WorkspaceStatusRequest {
                             session_id: request.session_id,
@@ -651,7 +586,7 @@ impl RpcServer {
                             deadline,
                         ) {
                             Ok(query) => query,
-                            Err(error) => return Dispatch::Response(query_error(id, &error)),
+                            Err(error) => return Err(query_error(id, &error)),
                         };
                         drop(session);
                         self.queries.spawn(async move {
@@ -739,21 +674,18 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "changes.diff" => {
-                let request: ChangesDiffRequest = match params_or_error(&id, params) {
-                    Ok(request) => request,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let request: ChangesDiffRequest = params_or_error(&id, params)?;
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.session_id);
                 if request.change_ref.starts_with("workspace:") {
                     let Some(session) = loaded else {
-                        return Dispatch::Response(query_error(id, &AgentError::SessionNotLoaded));
+                        return Err(query_error(id, &AgentError::SessionNotLoaded));
                     };
                     let deadline = diff_deadline();
                     let cancellation = self.query_cancellation.clone();
@@ -764,7 +696,7 @@ impl RpcServer {
                         deadline,
                     ) {
                         Ok(query) => query,
-                        Err(error) => return Dispatch::Response(query_error(id, &error)),
+                        Err(error) => return Err(query_error(id, &error)),
                     };
                     let outbound = self.outbound_tx.clone();
                     self.queries.spawn(async move {
@@ -784,7 +716,7 @@ impl RpcServer {
                         };
                         let _ = outbound.send(RpcOutbound::Response(response)).await;
                     });
-                    return Dispatch::Deferred;
+                    return Ok(Dispatch::Deferred);
                 }
                 let session_cancellation = loaded
                     .as_ref()
@@ -824,24 +756,18 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "session.presentation" => {
-                let params: SessionParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: SessionParams = params_or_error(&id, params)?;
                 let result = self.agent().session_presentation(params.session_id);
                 Dispatch::Response(agent_result(&id, result))
             }
             "tool.read" => {
-                let params: ToolReadParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: ToolReadParams = params_or_error(&id, params)?;
                 let request: ToolReadRequest = params.into();
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let store = self.agent().store_handle();
                 let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
@@ -859,16 +785,13 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "tool.output" => {
-                let params: ToolOutputParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: ToolOutputParams = params_or_error(&id, params)?;
                 let request: ToolOutputRequest = params.into();
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let store = self.agent().store_handle();
                 let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
@@ -887,23 +810,20 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "turn.send" => {
-                let params: TurnSendParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: TurnSendParams = params_or_error(&id, params)?;
                 let automatic = match self.agent().automatic_compaction_enabled(params.session_id) {
                     Ok(automatic) => automatic,
-                    Err(error) => return Dispatch::Response(agent_error(id, &error)),
+                    Err(error) => return Err(agent_error(id, &error)),
                 };
                 if minicore_runtime::execution::UserInput::text(&params.text).is_err() {
-                    return Dispatch::Response(invalid_params(Some(id)));
+                    return Err(invalid_params(Some(id)));
                 }
                 // Automatic admission may need a deferred response. Reserve
                 // waiter capacity before publishing the Session reservation;
                 // otherwise a full waiter set could leave a real loop with no
                 // response path.
                 if automatic && self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let submission = self
                     .agent_mut()
@@ -931,7 +851,7 @@ impl RpcServer {
                                 session_id: params.session_id,
                                 operation_id,
                             });
-                            return Dispatch::Response(resource_exhausted(id));
+                            return Err(resource_exhausted(id));
                         }
                         let outbound = self.outbound_tx.clone();
                         self.waiters.spawn(async move {
@@ -953,10 +873,7 @@ impl RpcServer {
                 }
             }
             "turn.steer" => {
-                let params: TurnSteerParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: TurnSteerParams = params_or_error(&id, params)?;
                 let result =
                     self.agent()
                         .steer_accepted(params.into())
@@ -968,10 +885,7 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.cancel" => {
-                let params: TurnParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: TurnParams = params_or_error(&id, params)?;
                 let result = self
                     .agent()
                     .cancel(params.into())
@@ -979,14 +893,11 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "turn.wait" => {
-                let params: TurnParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: TurnParams = params_or_error(&id, params)?;
                 match self.agent().wait_turn_receiver(params.into()) {
                     Ok(receiver) => {
                         if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
-                            return Dispatch::Response(resource_exhausted(id));
+                            return Err(resource_exhausted(id));
                         }
                         let outbound = self.outbound_tx.clone();
                         self.waiters.spawn(async move {
@@ -1004,16 +915,13 @@ impl RpcServer {
                 }
             }
             "turn.result" => {
-                let params: TurnResultParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: TurnResultParams = params_or_error(&id, params)?;
                 let request: TurnResultRequest = params.into();
                 if let Err(error) = request.validate() {
-                    return Dispatch::Response(query_error(id, &error));
+                    return Err(query_error(id, &error));
                 }
                 if !self.query_capacity_available() {
-                    return Dispatch::Response(resource_exhausted(id));
+                    return Err(resource_exhausted(id));
                 }
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.turn.session_id);
@@ -1035,13 +943,10 @@ impl RpcServer {
                 Dispatch::Deferred
             }
             "interaction.answer" => {
-                let params: InteractionAnswerParams = match params_or_error(&id, params) {
-                    Ok(params) => params,
-                    Err(response) => return Dispatch::Response(response),
-                };
+                let params: InteractionAnswerParams = params_or_error(&id, params)?;
                 let answer = match params.answer.into_runtime() {
                     Ok(answer) => answer,
-                    Err(_) => return Dispatch::Response(invalid_params(Some(id))),
+                    Err(_) => return Err(invalid_params(Some(id))),
                 };
                 let turn = TurnRef {
                     session_id: params.session_id,
@@ -1065,7 +970,7 @@ impl RpcServer {
                 "method_not_found",
                 false,
             )),
-        }
+        })
     }
 
     async fn send(&self, response: RpcResponse) -> Result<(), ()> {
