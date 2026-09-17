@@ -561,16 +561,13 @@ async fn live_turn_page(
 ) -> Result<TurnResultPage, AgentError> {
     let sanitized =
         sanitized_live_history(result.report.appended.as_ref(), cancellation, deadline).await?;
-    validate_cursor(cursor, sanitized.len())?;
-    let end = cursor.item.saturating_add(limit).min(sanitized.len());
-    let timestamps = vec![None; end.saturating_sub(cursor.item)];
-    let encoded = encoded_items(cursor.item, &sanitized[cursor.item..end], &timestamps)?;
     let outcome = LoopOutcomeView::from_report(&result.report);
     let persistence = result.persistence;
     let usage = result.report.usage;
     let requests = result.report.requests;
     let tool_rounds = result.report.tool_rounds;
     let final_config_revision = result.report.final_config_revision;
+    let total = sanitized.len();
     let base = TurnResultPage {
         turn,
         availability: TurnResultAvailability::Live,
@@ -583,31 +580,18 @@ async fn live_turn_page(
         completed_at: None,
         items: Vec::new(),
         next_cursor: None,
-        total: sanitized.len(),
-    };
-    let total = sanitized.len();
-    let (items, next_cursor) = pack_items(
-        encoded,
-        cursor,
         total,
+    };
+    assemble_turn_page(
+        base,
+        &sanitized,
+        cursor,
+        limit,
         max_bytes,
         cancellation,
         deadline,
-        |items, next_cursor| {
-            serde_json::to_vec(&TurnResultPage {
-                items: items.to_vec(),
-                next_cursor,
-                ..base.clone()
-            })
-            .map_err(|_| AgentError::RpcSerialization)
-        },
     )
-    .await?;
-    Ok(TurnResultPage {
-        items,
-        next_cursor,
-        ..base
-    })
+    .await
 }
 
 async fn stored_turn_page(
@@ -620,11 +604,7 @@ async fn stored_turn_page(
     deadline: Instant,
 ) -> Result<TurnResultPage, AgentError> {
     let sanitized = sanitized_record_items(&record, cancellation, deadline).await?;
-    validate_cursor(cursor, sanitized.len())?;
     let total = sanitized.len();
-    let end = cursor.item.saturating_add(limit).min(total);
-    let timestamps = vec![None; end.saturating_sub(cursor.item)];
-    let encoded = encoded_items(cursor.item, &sanitized[cursor.item..end], &timestamps)?;
     let base = TurnResultPage {
         turn,
         availability: TurnResultAvailability::Stored,
@@ -639,6 +619,38 @@ async fn stored_turn_page(
         next_cursor: None,
         total,
     };
+    assemble_turn_page(
+        base,
+        &sanitized,
+        cursor,
+        limit,
+        max_bytes,
+        cancellation,
+        deadline,
+    )
+    .await
+}
+
+/// Shared page assembly for Live and Stored turns: cursor validation, slicing,
+/// the timestamp array, JSON encoding, and the byte-budget pack.
+///
+/// The caller cleans its own source and builds the metadata-only base page; the
+/// source differences (availability, persistence, `completed_at`, outcome,
+/// usage, revision) stay in that base. Pending never reaches this helper.
+async fn assemble_turn_page(
+    base: TurnResultPage,
+    sanitized: &[HistoryItem],
+    cursor: ReadCursor,
+    limit: usize,
+    max_bytes: usize,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<TurnResultPage, AgentError> {
+    validate_cursor(cursor, sanitized.len())?;
+    let end = cursor.item.saturating_add(limit).min(sanitized.len());
+    let timestamps = vec![None; end.saturating_sub(cursor.item)];
+    let encoded = encoded_items(cursor.item, &sanitized[cursor.item..end], &timestamps)?;
+    let total = sanitized.len();
     let (items, next_cursor) = pack_items(
         encoded,
         cursor,
@@ -1068,6 +1080,8 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
+    use crate::store::StoredLoopOutcome;
+    use minicore_runtime::execution::ConfigRevision;
 
     #[derive(Clone, Serialize)]
     struct TestPage {
@@ -1187,5 +1201,179 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, AgentError::InvalidArguments));
+    }
+
+    fn user_item(loop_id: LoopId, text: &str) -> HistoryItem {
+        HistoryItem::User(minicore_runtime::history::UserHistory {
+            loop_id,
+            kind: minicore_runtime::history::UserMessageKind::Prompt,
+            input: minicore_runtime::execution::UserInput::text(text).unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
+        const MAX_BYTES: usize = 512;
+        const COMPLETED_AT: &str = "2026-01-02T03:04:05.000Z";
+
+        let loop_id = LoopId::new().unwrap();
+        let turn = TurnRef {
+            session_id: SessionId::new().unwrap(),
+            loop_id,
+        };
+        let multi_items: Vec<HistoryItem> = (0..6)
+            .map(|index| user_item(loop_id, &format!("turn item {index} é🙂\n\t\\\"")))
+            .collect();
+        let long_text = "é🙂\n\t\\\"".repeat(256);
+        let cases = [
+            ("multi-item", multi_items),
+            ("long-item", vec![user_item(loop_id, &long_text)]),
+            ("empty-items", Vec::new()),
+        ];
+        let cancellation = CancellationToken::new();
+
+        for (label, items) in cases {
+            let sanitized = sanitize_history(&items).unwrap();
+            let expected: Vec<String> = sanitized
+                .iter()
+                .map(|item| {
+                    serde_json::to_string(&ReadItemEnvelope {
+                        item,
+                        timestamp: None,
+                    })
+                    .unwrap()
+                })
+                .collect();
+            let live = Arc::new(crate::sessions::TurnResult {
+                turn,
+                report: Arc::new(minicore_runtime::LoopReport {
+                    loop_id,
+                    outcome: minicore_runtime::LoopOutcome::Completed,
+                    appended: items.clone().into(),
+                    usage: Usage::default(),
+                    requests: 1,
+                    tool_rounds: 0,
+                    final_config_revision: ConfigRevision::INITIAL,
+                }),
+                persistence: crate::sessions::TurnPersistence::Failed,
+            });
+            let stored = StoredLoopRecord {
+                loop_id,
+                outcome: StoredLoopOutcome::Completed,
+                items,
+                usage: Usage::default(),
+                requests: 1,
+                tool_rounds: 0,
+                final_config_revision: ConfigRevision::INITIAL,
+                completed_at: COMPLETED_AT.to_owned(),
+                user_times: None,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+
+            for live_side in [true, false] {
+                let side = if live_side { "live" } else { "stored" };
+                let (availability, persistence, completed_at) = if live_side {
+                    (
+                        TurnResultAvailability::Live,
+                        Some(crate::sessions::TurnPersistence::Failed),
+                        None,
+                    )
+                } else {
+                    (
+                        TurnResultAvailability::Stored,
+                        Some(crate::sessions::TurnPersistence::Persisted),
+                        Some(COMPLETED_AT),
+                    )
+                };
+                let mut cursor = ReadCursor::start();
+                let mut reconstructed = vec![String::new(); expected.len()];
+                let mut page_count = 0;
+                loop {
+                    let page = if live_side {
+                        live_turn_page(
+                            turn,
+                            Arc::clone(&live),
+                            cursor,
+                            100,
+                            MAX_BYTES,
+                            &cancellation,
+                            deadline,
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        stored_turn_page(
+                            turn,
+                            stored.clone(),
+                            cursor,
+                            100,
+                            MAX_BYTES,
+                            &cancellation,
+                            deadline,
+                        )
+                        .await
+                        .unwrap()
+                    };
+                    assert!(
+                        encoded_len(&page).unwrap() <= MAX_BYTES,
+                        "{label} {side} page over budget"
+                    );
+                    assert_eq!(
+                        (
+                            page.turn,
+                            page.availability,
+                            page.outcome.clone(),
+                            page.persistence,
+                            page.usage,
+                            page.requests,
+                            page.tool_rounds,
+                            page.final_config_revision,
+                            page.completed_at.as_deref(),
+                            page.total,
+                        ),
+                        (
+                            turn,
+                            availability,
+                            Some(LoopOutcomeView::Completed),
+                            persistence,
+                            Some(Usage::default()),
+                            Some(1),
+                            Some(0),
+                            Some(ConfigRevision::INITIAL),
+                            completed_at,
+                            expected.len(),
+                        ),
+                        "{label} {side} metadata"
+                    );
+                    for chunk in &page.items {
+                        let expected_item = &expected[chunk.index];
+                        assert_eq!(chunk.encoding, JSON_ENCODING);
+                        assert_eq!(chunk.total_bytes, expected_item.len());
+                        assert_eq!(chunk.offset, reconstructed[chunk.index].len());
+                        let end = chunk.offset.saturating_add(chunk.data.len());
+                        assert!(
+                            end <= expected_item.len()
+                                && expected_item.is_char_boundary(chunk.offset)
+                                && expected_item.is_char_boundary(end)
+                        );
+                        assert_eq!(chunk.data.as_str(), &expected_item[chunk.offset..end]);
+                        reconstructed[chunk.index].push_str(&chunk.data);
+                        assert_eq!(chunk.complete, end == expected_item.len());
+                    }
+                    let next_cursor = page.next_cursor;
+                    page_count += 1;
+                    match next_cursor {
+                        Some(next) => cursor = next,
+                        None => break,
+                    }
+                }
+                assert_eq!(reconstructed, expected, "{label} {side} item data");
+                if expected.is_empty() {
+                    assert_eq!(page_count, 1, "{label} {side} empty page");
+                } else {
+                    assert!(page_count > 1, "{label} {side} must span pages");
+                }
+            }
+        }
     }
 }
