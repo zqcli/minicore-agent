@@ -1,6 +1,6 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.3 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.5.0 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
 ## Transport And Framing
@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.3.3","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.5.0","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -70,19 +70,25 @@ be recovered.
 
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
-requests are dispatched sequentially. `turn.wait`, `session.compact`,
-`session.read`, `workspace.read`, `workspace.files`, `workspace.search`,
-`workspace.status`, `changes.list`, and
-`turn.result` are exceptions: the server registers one bounded owned task and
-immediately continues reading requests. A deferred query/waiter does not own
-the underlying Session operation. The two workspace scan queries each own one
-retained blocking worker and join it before their response; a drop guard also
-cancels that worker immediately when the query task itself is dropped, so a
-detached scan stops walking instead of running on. A `workspace.status` query
-is different again: its owned worker is registered on the loaded Session, which
-runs at most four of them and joins every one of them on close, so a dropped
-waiting task cancels only that query's git child and never detaches a child from
-the Session that owns it.
+requests are dispatched sequentially. The server registers a bounded owned
+waiter/query task and immediately continues reading requests for `turn.wait`,
+`session.compact`, `session.read`, `workspace.read`, `workspace.files`,
+`workspace.search`, `workspace.status`, `changes.list`, `changes.diff`,
+`tool.read`, `tool.output`, and `turn.result`. For an automatic-enabled
+Session, `turn.send` first enters a Session-owned startup admission worker.
+That worker either installs a fitting loop directly or prepares a summary before
+installing it; the RPC result remains deferred until admission publishes a real
+Turn or a failure. A read-query waiter observes a result but is not the worker
+owner. Workspace scan queries own one retained blocking worker and normally join
+it before returning; their Drop guard signals cooperative stop when the query
+future is dropped, but dropping an awaiter is not itself a join barrier. Session
+or RPC cancellation is joined by the query before it returns. For an automatic
+turn, dropping the `PreparationWaiter` requests cooperative cancellation of the
+Session-owned admission; it is still the Session's owner that completes and
+joins that operation. `workspace.status` registers its worker on the loaded
+Session, which runs at most four and joins every one during close. For query
+paths with an outer cancellation select, caller cancellation can end the wait
+with `-32020`, but does not transfer or remove worker ownership.
 
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
@@ -90,10 +96,12 @@ The following orderings are not guaranteed:
 - a `turn.send` response before the corresponding `turn_started` event;
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
-- a deferred `turn.wait` response before responses to later requests;
-- a deferred `session.compact`, `session.read`, `workspace.read`,
-  `workspace.files`, `workspace.search`, or `turn.result` response before
-  responses to later requests.
+- a deferred response for `turn.wait`, `session.compact`, `session.read`,
+  `workspace.read`, `workspace.files`, `workspace.search`, `workspace.status`,
+  `changes.list`, `changes.diff`, `tool.read`, `tool.output`, or `turn.result`
+  before responses to later requests;
+- an automatic-enabled Session's `turn.send` response is deferred until startup
+  admission publishes a real Turn or a failure.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -102,9 +110,27 @@ history query results, not the event stream.
 `agent.shutdown` waits for the Agent, its active workers, pre-existing
 waiter/query tasks, and event pump, then queues its response last. EOF, Ctrl-C,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
-MiniCore Agent v0.3 uses the Runtime user-cancellation path when closing or
+MiniCore Agent v0.5.0 uses the Runtime user-cancellation path when closing or
 shutting down an active Session;
 it does not currently preserve a distinct shutdown cancellation reason.
+
+## Method Index
+
+The current source dispatches exactly 33 methods. This is a navigation index;
+the sections below define the wire contract.
+
+```text
+agent.ping, agent.reload, agent.shutdown
+profile.list, model.list
+session.list, session.create, session.open, session.close, session.delete
+session.state, session.context, session.compact, session.compact.cancel
+session.update, session.rename, session.history, session.read, session.presentation
+workspace.read, workspace.files, workspace.search, workspace.status
+changes.list, changes.diff
+tool.read, tool.output
+turn.send, turn.steer, turn.cancel, turn.wait, turn.result
+interaction.answer
+```
 
 ## Agent Methods
 
@@ -113,7 +139,7 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.3.3",
+  "version": "0.5.0",
   "protocol_version": 1,
   "capabilities": [
     "session.read",
@@ -151,9 +177,10 @@ rebuilds the model/profile catalog and command environment before validating
 every loaded Session's future execution snapshot. Session records, selected
 models, reasoning, tools, system-prompt snapshots, history, and Store files
 are not rewritten. Existing Sessions keep those persisted snapshots; newly
-created Sessions use the reloaded profile/default catalog. Active loops keep
-their current request configuration and are not updated, cancelled, or
-reopened; the new configuration applies to future turns. `data_dir` and the
+created Sessions use the reloaded profile/default catalog. An active Loop keeps
+the complete execution configuration and LoopOptions captured when it started;
+reload does not update any request in that Loop. The rebuilt future snapshot
+applies when a new Loop is created. `data_dir` and the
 Agent-level `event_capacity` require restart.
 
 `Agent::open` creates an embedded Agent without a reload source and therefore
@@ -282,7 +309,7 @@ The result has a `session` member containing the created SessionInfo.
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
 - `session.close` cancels any active loop or manual compaction, joins all
-  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.3 uses
+  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.5.0 uses
   the Runtime user-cancellation path when closing or shutting down an active
   Session; it does not currently preserve a distinct shutdown cancellation
   reason.
@@ -316,11 +343,10 @@ The result has a `session` member containing the created SessionInfo.
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
 
-The manual compaction methods, startup summary projection, automatic compaction
-and P3b2 one-shot provider overflow recovery have passed parent-owned remote
-verification on this development branch. They are not available in the
-previously installed Agent binary; no new installation or release is claimed.
-See `archive/0914-progress.md` for acceptance evidence and limits.
+The manual compaction methods, startup summary projection, automatic compaction,
+and one-shot provider overflow recovery are implemented in the current source.
+This document describes their wire behavior; recorded acceptance evidence and
+installation status are grouped in the [verification index](verification/README.md).
 
 The deferred compact result has this shape:
 
@@ -414,11 +440,12 @@ by `session.state`; it also names a startup admission preparation. `coverage` is
 non-zero only for a currently validated summary snapshot; `retained_item_count`
 is calculated against the complete loaded history. `estimated_history_items`,
 `estimated_history_bytes`, and `estimated_history_tokens` describe only the
-history suffix passed to Runtime as `LoopRequest.history` (or full history when
-no valid summary is loaded). They exclude the summary, system/AGENTS text, tool
-schemas, current User/Steer input, framing, and provider tokenization. The byte
-scan is bounded; bytes and tokens are `null` when the query cannot finish within
-that bound, and `within_runtime_limits` is then also `null` unless the item
+current projected history-suffix snapshot: the suffix a next preparation would
+pass as `LoopRequest.history` (or full history when no valid summary is loaded).
+They exclude the summary, system/AGENTS text, tool schemas, current User/Steer
+input, framing, and provider tokenization. The byte scan is bounded; bytes and
+tokens are `null` when the query cannot finish within that bound, and
+`within_runtime_limits` is then also `null` unless the item
 count already proves an over-limit history. `estimated_request_context_tokens`
 is the latest bounded full-request estimate observed by automatic preparation
 (the current estimate while preparing, otherwise the last completed estimate);
@@ -437,8 +464,7 @@ an in-flight recovery has been attempted; the field is omitted when the loaded
 Session has no such observation.
 The recovery source is retained only up to 512 KiB; a larger source does not
 receive a recovery ticket. Token counts are estimates, and recovery never
-re-runs tools or duplicates the current User/Steer messages. P3b2 has passed
-parent-owned remote verification; see `archive/0914-progress.md`. `last_result` is the latest manual
+re-runs tools or duplicates the current User/Steer messages. `last_result` is the latest manual
 compaction result retained by this loaded Session process; it is not a durable
 history record.
 
@@ -546,9 +572,10 @@ the continuation mechanism when one item itself is larger than the page.
 
 `model` and `reasoning` are optional but at least one must be present; otherwise
 the request is rejected with `-32602`. The change is validated and the persistent
-`session.json` updated before the response. Any active loop keeps running with
-its current snapshot; the update is forwarded to the loop and takes effect at
-the next request boundary.
+`session.json` updated before the response. Any active Loop keeps its captured
+LoopOptions, while the new execution configuration is forwarded to the Loop and
+takes effect at the next request boundary. A new Loop uses the updated future
+LoopOptions as well.
 
 ```json
 {
@@ -594,9 +621,9 @@ retained auxiliary records remain readable through the generic history and
 because the saved tool list cannot be executed. There is no automatic
 migration: the user must close the Session, keep a backup of its data, and then
 explicitly change the Session's tool configuration. The Agent never rewrites
-an old Profile, `session.json`, or `history.jsonl` on its own. Full delegated
-Agent execution (a future `SubagentTool` that drives a complete
-`minicore-agent` Session) is separate future work, not implemented here.
+an old Profile, `session.json`, or `history.jsonl` on its own. The current Agent
+has no executable delegated child-session Tool; `subagent` remains unsupported
+in current Profiles.
 
 ## History
 
@@ -670,17 +697,20 @@ The timestamp is when the Agent accepted the Prompt (for a deferred automatic
 submission, when its prepared loop is installed), not when the loop or provider
 request completes. It may be omitted if the clock was unavailable.
 
-When automatic compaction is enabled, `turn.send` is deferred while the
-Session computes a bounded startup estimate after checking the irreducible
-minimum and Runtime structural limits. If the projected history exceeds
-the Runtime limits or the request exceeds the trigger, the Session first folds
-a settled prefix into a bounded `summary.json`; a fitting request creates its
-loop directly from the same preparation worker. The deferred response carries
-the same result shape once the loop exists; `session.context` reports the
-preparing operation while it runs, and `session.compact.cancel` terminates a
-preparation that has not started its loop. If the waiter pool is full, the
-just-started preparation is cancelled and the request fails with `-32019`
-(`resource_exhausted`) rather than running an unawaitable operation. A request
+For an automatic-enabled Session, `turn.send` enters `Session::submit`, which
+returns `LoopSubmission::Preparing` while its Session-owned startup admission
+worker computes the bounded startup estimate and checks the irreducible minimum
+and Runtime structural limits. That worker either installs the loop directly or
+folds a settled prefix into a bounded `summary.json` before installing it; the
+RPC response remains deferred until a real Turn or a failure is published.
+`session.context` reports the preparing operation while it runs, and
+`session.compact.cancel` terminates a preparation that has not started its loop.
+The server checks deferred capacity before invoking `submit_accepted`, before
+`Session::submit` can start admission; when the pool is full, it returns
+`-32019` (`resource_exhausted`) and does not start an admission worker. If that check passes but the defensive check after
+`LoopSubmission::Preparing` finds the pool full, the server cancels that
+preparation and returns the same error instead of leaving an unawaitable
+operation. A request
 whose irreducible system/current-input/tool-schema minimum still exceeds the
 hard model window fails with `-32022` (`context_uncompressible`); semantic summary
 failures return an internal error and do not start a loop, while their stable
@@ -921,8 +951,8 @@ main Turn persistence, and retained memory remains readable. `saved` is not a
 promise of indefinite retention: the Store applies per-tool (3 MiB), per-Session
 (16 MiB/1024 records), and Store-wide (256 MiB/8192 records) auxiliary budgets.
 These budgets coordinate one Store and its clones; independent writers sharing
-a data directory are not supported. Public queries currently use loaded memory;
-stored-data query access follows in P5b2.
+a data directory are not supported. Public queries prefer loaded memory and use
+durable auxiliary storage for unloaded Sessions or evicted bytes.
 
 `availability` is per stream: `pending` while the call is still running and
 that stream has no observed bytes (with `observed_end: 0` and `eof: false`),
@@ -953,8 +983,7 @@ page through a file while a turn is in flight. A closed or unknown Session is
 rejected with `-32002` (`session_not_loaded`); closing the owning Session
 cancels its in-flight reads with `-32020` (`query_limit`). The query never
 derives a root from a path. It holds one of the 4 concurrent read-query slots
-described above. P4a has passed parent review and remote verification; see
-`archive/0914-progress.md` for the gates and platform limits.
+described above.
 
 ```json
 {
@@ -1063,8 +1092,7 @@ owned queries before the shutdown response.
 
 `workspace.files` lists one bounded page of Workspace entries. It shares the
 loaded-Session ownership, the ignore-aware traversal, the four read-query
-slots, and the cancellation rules of `workspace.read`. The P4b files/search
-slice has passed parent-owned remote verification; see `archive/0914-progress.md`.
+slots, and the cancellation rules of `workspace.read`.
 
 ```json
 {
@@ -1275,8 +1303,8 @@ continuation.
 
 ### `workspace.status`
 
-The P4c slice has passed parent-owned remote verification; see
-`archive/0914-progress.md` for the gates and platform limits.
+`workspace.status` is a bounded, read-only Git observation owned by the loaded
+Session.
 
 ```json
 {"session_id": "ses_...", "max_bytes": 65536}
@@ -1352,27 +1380,30 @@ answers for a bare repository or a git directory without a work tree);
 workspace git cannot read for an unexplained reason (dubious ownership, a
 corrupt configuration, a permission problem, a signal death) is reported as
 `repo_available: false` with `complete: false` and the `status_failed` warning,
-never as a definite missing repository. Session close, RPC shutdown, and
-cancellation fail the query with `-32020` after the owned git process is
-stopped and reaped. The 10 s deadline keeps whatever the query already captured,
-reports `deadline`, and marks the result incomplete. Stopping a child is not a
-latency guess: the owner waits until the operating system reports the exit, so a
-system that never reports it can delay a query or a Session close past the
-deadline, exactly like a blocking filesystem read, and an unconfirmed kill or
-wait is reported as a failed observation. `complete` is true only
+never as a definite missing repository. The 10 s deadline keeps whatever the
+query already captured, reports `deadline`, and marks the result incomplete.
+Stopping a child is not a latency guess: the owner waits until the operating
+system reports the exit, so a system that never reports it can delay a query or
+a Session close past the deadline, exactly like a blocking filesystem read, and
+an unconfirmed kill or wait is reported as a failed observation. `complete` is true only
 when nothing was cut short or skipped, and `warnings` names each limitation
 with a code (`git_unavailable`, `status_failed`, `output_truncated`,
 `deadline`, `skipped_paths`, `nested_repository`) and never a path. The budget
 reserves room for the widest form of the summary, so a result never exceeds
 `max_bytes` even when a warning is added while entries are appended.
 
-The loaded Session owns each status worker: the worker keeps the git child
-until it is stopped and reaped, the query caller only observes the worker's
-result, and dropping that caller cancels that one child without touching the
-Session. Closing the Session stops its workers and joins them, so no child is
-left behind, and a Session runs at most four status workers at once (a fifth
-query is refused with `-32020`). Both the
-public Agent method and the RPC method go through this same Session-owned path.
+The loaded Session owns each status worker. The explicit status future waits
+on `StatusQuery::wait()` without an outer select; the status worker handles
+cancellation, stops and reaps Git when needed, then sends the result. Dropping
+`StatusQuery` unconditionally calls `child_cancel.cancel()`; that requests child
+stop but is not the ownership or cleanup barrier. Session close cancels the
+Session token and joins every registered status worker; Agent shutdown closes
+Sessions and joins them. The worker and Git child use one absolute query
+deadline, but a slow operating-system reap can make owner cleanup outlast that
+result deadline. A Session runs at most four status workers at once (a fifth
+query is refused with `-32020`). Unlike this explicit status path, the outer
+worker-backed `changes.*` selects can finish a wait with `-32020` while their
+registered Session/Store owner retains a worker for later joining.
 When the workspace is a subdirectory of a larger repository, git is given the
 workspace as a literal pathspec, every reported path is checked against the
 canonical workspace root, and paths outside it are neither counted nor
@@ -1385,7 +1416,7 @@ watcher and no cache: every result comes from the query that produced it.
 
 ### `changes.list`
 
-The P6a change-review query lists bounded file-change records. It is read-only
+The change-review query lists bounded file-change records. It is read-only
 and does not call a model, write History, create a Session, or run a garbage
 collector. `changes.diff` resolves the references this method returns.
 
@@ -1553,10 +1584,15 @@ by the result. A different diff returns `stale: true` instead of continuing a
 new comparison under an old cursor. A start tuple that is not a real position
 inside the plan (a hunk/line index past its range, a byte offset past the line,
 or a non-UTF-8-boundary offset) is rejected as invalid arguments. The CPU
-comparison has a bounded deadline and runs in an owned
-Store worker set (max four); dropping the caller cancels it and Agent shutdown
-cancels and joins every handler. Each ToolRef remains an independent segment:
-this slice performs no same-file aggregation.
+comparison runs under one absolute deadline in an owned Store worker set
+(max four). `DiffQuery` is a wait-only observation handle; its Drop
+unconditionally calls `child_cancel.cancel()`, which requests child stop but is
+not the Store ownership or cleanup barrier. Store ownership retains the join
+handle; Session close joins that Session's workers, while Agent shutdown joins
+all Store workers, including comparisons for unloaded Sessions. The absolute
+deadline bounds the query result and cooperative CPU work; if a blocking
+handler has not returned, the owner join can outlast the result deadline. Each
+ToolRef remains an independent segment; same-file aggregation is not performed.
 
 ## Interactions
 
