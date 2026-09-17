@@ -699,45 +699,40 @@ impl PromptProvider for SteerReceiptPrompt {
 /// Bash and native file tools receive the exact `ToolRef` captured here, so
 /// commands and mutation records never resolve identity from a table that a
 /// dropped future can leave stale.
-pub(crate) enum PresentationTool {
-    Plain {
-        inner: Arc<dyn Tool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    },
-    Bash {
-        inner: Arc<crate::tools::OwnedBashTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    },
-    Write {
-        inner: Arc<NativeWriteTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    },
-    Edit {
-        inner: Arc<NativeEditTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    },
-    ApplyPatch {
-        inner: Arc<NativeApplyPatchTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    },
+pub(crate) struct PresentationTool {
+    inner: ToolImpl,
+    presentation: Arc<Presentation>,
+    observer: Arc<ToolObserver>,
+}
+
+#[derive(Clone)]
+enum ToolImpl {
+    Plain(Arc<dyn Tool>),
+    Bash(Arc<crate::tools::OwnedBashTool>),
+    Write(Arc<NativeWriteTool>),
+    Edit(Arc<NativeEditTool>),
+    ApplyPatch(Arc<NativeApplyPatchTool>),
 }
 
 impl PresentationTool {
+    fn new(
+        inner: ToolImpl,
+        presentation: Arc<Presentation>,
+        observer: Arc<ToolObserver>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            presentation,
+            observer,
+        })
+    }
+
     pub(crate) fn new_with_observer(
         inner: Arc<dyn Tool>,
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
-        Arc::new(Self::Plain {
-            inner,
-            presentation,
-            observer,
-        })
+        Self::new(ToolImpl::Plain(inner), presentation, observer)
     }
 
     /// Explicit construction for the owned-command tool: only this variant
@@ -747,11 +742,7 @@ impl PresentationTool {
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
-        Arc::new(Self::Bash {
-            inner,
-            presentation,
-            observer,
-        })
+        Self::new(ToolImpl::Bash(inner), presentation, observer)
     }
 
     pub(crate) fn new_write_with_observer(
@@ -759,11 +750,7 @@ impl PresentationTool {
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
-        Arc::new(Self::Write {
-            inner,
-            presentation,
-            observer,
-        })
+        Self::new(ToolImpl::Write(inner), presentation, observer)
     }
 
     pub(crate) fn new_edit_with_observer(
@@ -771,11 +758,7 @@ impl PresentationTool {
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
-        Arc::new(Self::Edit {
-            inner,
-            presentation,
-            observer,
-        })
+        Self::new(ToolImpl::Edit(inner), presentation, observer)
     }
 
     pub(crate) fn new_apply_patch_with_observer(
@@ -783,47 +766,23 @@ impl PresentationTool {
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
-        Arc::new(Self::ApplyPatch {
-            inner,
-            presentation,
-            observer,
-        })
+        Self::new(ToolImpl::ApplyPatch(inner), presentation, observer)
     }
 
-    fn inner(&self) -> &dyn Tool {
-        match self {
-            Self::Plain { inner, .. } => inner.as_ref(),
-            Self::Bash { inner, .. } => inner.as_ref(),
-            Self::Write { inner, .. } => inner.as_ref(),
-            Self::Edit { inner, .. } => inner.as_ref(),
-            Self::ApplyPatch { inner, .. } => inner.as_ref(),
-        }
-    }
-
-    fn presentation(&self) -> &Arc<Presentation> {
-        match self {
-            Self::Plain { presentation, .. }
-            | Self::Bash { presentation, .. }
-            | Self::Write { presentation, .. }
-            | Self::Edit { presentation, .. }
-            | Self::ApplyPatch { presentation, .. } => presentation,
-        }
-    }
-
-    fn observer(&self) -> &Arc<ToolObserver> {
-        match self {
-            Self::Plain { observer, .. }
-            | Self::Bash { observer, .. }
-            | Self::Write { observer, .. }
-            | Self::Edit { observer, .. }
-            | Self::ApplyPatch { observer, .. } => observer,
+    fn tool(&self) -> &dyn Tool {
+        match &self.inner {
+            ToolImpl::Plain(inner) => inner.as_ref(),
+            ToolImpl::Bash(inner) => inner.as_ref(),
+            ToolImpl::Write(inner) => inner.as_ref(),
+            ToolImpl::Edit(inner) => inner.as_ref(),
+            ToolImpl::ApplyPatch(inner) => inner.as_ref(),
         }
     }
 }
 
 impl Tool for PresentationTool {
     fn spec(&self) -> &ToolSpec {
-        self.inner().spec()
+        self.tool().spec()
     }
 
     fn execute<'a>(
@@ -831,8 +790,8 @@ impl Tool for PresentationTool {
         invocation: ToolInvocation,
         context: ToolContext,
     ) -> minicore_runtime::tools::ToolFuture<'a> {
-        let presentation = Arc::clone(self.presentation());
-        let observer = Arc::clone(self.observer());
+        let presentation = Arc::clone(&self.presentation);
+        let observer = Arc::clone(&self.observer);
         let key = observer.request_key();
         let display = build_tool_display(
             invocation.tool_name().as_str(),
@@ -856,94 +815,42 @@ impl Tool for PresentationTool {
 
         let request_key = key;
         let tool_call_id = invocation.tool_call_id().clone();
-        match self {
-            Self::Plain { inner, .. } => {
-                let inner = Arc::clone(inner);
-                Box::pin(async move {
-                    let result = inner.execute(invocation, context).await;
-                    finish_presentation_tool(
-                        &presentation,
-                        &observer,
-                        request_key,
-                        &tool_call_id,
-                        tool_ref.as_ref(),
-                        &result,
-                    );
-                    result
-                })
-            }
-            Self::Bash { inner, .. } => {
-                let inner = Arc::clone(inner);
-                Box::pin(async move {
-                    let result = inner
+        let inner = self.inner.clone();
+        let tool_data = observer.tool_data();
+        Box::pin(async move {
+            let result = match inner {
+                ToolImpl::Plain(inner) => inner.execute(invocation, context).await,
+                ToolImpl::Bash(inner) => {
+                    inner
                         .execute_bound(invocation, context, tool_ref.clone())
-                        .await;
-                    finish_presentation_tool(
-                        &presentation,
-                        &observer,
-                        request_key,
-                        &tool_call_id,
-                        tool_ref.as_ref(),
-                        &result,
-                    );
-                    result
-                })
-            }
-            Self::Write { inner, .. } => {
-                let inner = Arc::clone(inner);
-                let tool_data = observer.tool_data();
-                Box::pin(async move {
-                    let result = inner
+                        .await
+                }
+                ToolImpl::Write(inner) => {
+                    inner
                         .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await;
-                    finish_presentation_tool(
-                        &presentation,
-                        &observer,
-                        request_key,
-                        &tool_call_id,
-                        tool_ref.as_ref(),
-                        &result,
-                    );
-                    result
-                })
-            }
-            Self::Edit { inner, .. } => {
-                let inner = Arc::clone(inner);
-                let tool_data = observer.tool_data();
-                Box::pin(async move {
-                    let result = inner
+                        .await
+                }
+                ToolImpl::Edit(inner) => {
+                    inner
                         .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await;
-                    finish_presentation_tool(
-                        &presentation,
-                        &observer,
-                        request_key,
-                        &tool_call_id,
-                        tool_ref.as_ref(),
-                        &result,
-                    );
-                    result
-                })
-            }
-            Self::ApplyPatch { inner, .. } => {
-                let inner = Arc::clone(inner);
-                let tool_data = observer.tool_data();
-                Box::pin(async move {
-                    let result = inner
+                        .await
+                }
+                ToolImpl::ApplyPatch(inner) => {
+                    inner
                         .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await;
-                    finish_presentation_tool(
-                        &presentation,
-                        &observer,
-                        request_key,
-                        &tool_call_id,
-                        tool_ref.as_ref(),
-                        &result,
-                    );
-                    result
-                })
-            }
-        }
+                        .await
+                }
+            };
+            finish_presentation_tool(
+                &presentation,
+                &observer,
+                request_key,
+                &tool_call_id,
+                tool_ref.as_ref(),
+                &result,
+            );
+            result
+        })
     }
 }
 

@@ -1,6 +1,12 @@
 use super::*;
-use crate::tool_data::ToolData;
+use crate::tool_data::{ToolData, ToolExecutionState};
 use crate::tools::command::CommandOwners;
+use crate::tools::{
+    CommandEnvironment, NativeApplyPatchTool, NativeEditTool, NativeWriteTool, OwnedBashTool,
+};
+use minicore_runtime::tools::{Tool, ToolContext, ToolError, ToolInvocation, ToolProgressSink};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn tool_error_presentation_is_static_for_every_variant() {
@@ -456,4 +462,167 @@ fn finishing_a_call_removes_its_live_entry() {
     );
     presentation.finish_tool(Some(key), &call_id, None);
     assert!(presentation.lock().live_tools.is_empty());
+}
+
+#[tokio::test]
+async fn presentation_tool_variants_share_binding_and_finish() {
+    let session_id = SessionId::new().unwrap();
+    let base = std::env::temp_dir().join(format!("minicore-agent-presentation-tool-{session_id}"));
+    let root = base.join("root");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let workspace = Arc::new(crate::Workspace::open(root).await.unwrap());
+
+    let (presentation_sender, mut presentation_events) = tokio::sync::mpsc::channel(16);
+    let presentation = Presentation::new(
+        session_id,
+        crate::event::AgentEventSink::new(presentation_sender),
+    );
+    let (observer_sender, mut observer_events) = tokio::sync::mpsc::channel(16);
+    let observer = ToolObserver::new(
+        session_id,
+        Arc::new(ToolData::new()),
+        crate::event::AgentEventSink::new(observer_sender),
+    );
+    let owners = CommandOwners::new();
+    let plain = crate::tools::build_tools(
+        &["read".to_owned()],
+        Arc::clone(&workspace),
+        CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),
+    )
+    .unwrap()
+    .get(&"read".parse().unwrap())
+    .unwrap();
+    let bash = Arc::new(OwnedBashTool::with_binding(
+        Arc::clone(&workspace),
+        CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),
+        Some(observer.command_binding(Arc::clone(&owners))),
+    ));
+    let write = Arc::new(NativeWriteTool::new(Arc::clone(&workspace)));
+    let edit = Arc::new(NativeEditTool::new(Arc::clone(&workspace)));
+    let apply_patch = Arc::new(NativeApplyPatchTool::new(Arc::clone(&workspace)));
+    let tools = [
+        (
+            "read",
+            PresentationTool::new_with_observer(
+                plain,
+                Arc::clone(&presentation),
+                Arc::clone(&observer),
+            ),
+        ),
+        (
+            "bash",
+            PresentationTool::new_bash_with_observer(
+                bash,
+                Arc::clone(&presentation),
+                Arc::clone(&observer),
+            ),
+        ),
+        (
+            "write",
+            PresentationTool::new_write_with_observer(
+                write,
+                Arc::clone(&presentation),
+                Arc::clone(&observer),
+            ),
+        ),
+        (
+            "edit",
+            PresentationTool::new_edit_with_observer(
+                edit,
+                Arc::clone(&presentation),
+                Arc::clone(&observer),
+            ),
+        ),
+        (
+            "apply_patch",
+            PresentationTool::new_apply_patch_with_observer(
+                apply_patch,
+                Arc::clone(&presentation),
+                Arc::clone(&observer),
+            ),
+        ),
+    ];
+    assert!(matches!(&tools[0].1.inner, ToolImpl::Plain(_)));
+    assert!(matches!(&tools[1].1.inner, ToolImpl::Bash(_)));
+    assert!(matches!(&tools[2].1.inner, ToolImpl::Write(_)));
+    assert!(matches!(&tools[3].1.inner, ToolImpl::Edit(_)));
+    assert!(matches!(&tools[4].1.inner, ToolImpl::ApplyPatch(_)));
+
+    for (index, (name, tool)) in tools.into_iter().enumerate() {
+        assert_eq!(tool.spec().name().as_str(), name);
+        assert!(Arc::ptr_eq(&tool.presentation, &presentation));
+        assert!(Arc::ptr_eq(&tool.observer, &observer));
+        let key = RequestKey {
+            loop_id: LoopId::new().unwrap(),
+            request_index: index as u32,
+        };
+        observer.note_request_start(key);
+        let tool_call_id = ToolCallId::new(format!("presentation-{name}")).unwrap();
+        let old_ref = ToolRef {
+            session_id,
+            loop_id: key.loop_id,
+            request_index: key.request_index,
+            tool_call_id: tool_call_id.clone(),
+        };
+        let invocation = ToolInvocation {
+            tool_call_id,
+            tool_name: name.parse().unwrap(),
+            arguments: serde_json::json!({}),
+        };
+        let future = tool.execute(
+            invocation,
+            ToolContext {
+                cancellation: CancellationToken::new(),
+                deadline: Instant::now() + Duration::from_secs(5),
+                progress: ToolProgressSink::default(),
+            },
+        );
+
+        let execution = observer
+            .tool_data()
+            .snapshot(&old_ref)
+            .expect("execute must publish the old ToolRef before polling");
+        assert_eq!(execution.tool_ref, old_ref);
+        assert_eq!(execution.state, ToolExecutionState::Running);
+        match observer_events.try_recv().expect("invocation event") {
+            AgentEvent::ToolInvocation { data, meta, .. } => {
+                assert_eq!(data.tool_ref, old_ref);
+                assert_eq!(meta.session_id, session_id);
+                assert_eq!(meta.loop_id, Some(key.loop_id));
+            }
+            event => panic!("unexpected observer event: {event:?}"),
+        }
+
+        let new_key = RequestKey {
+            loop_id: LoopId::new().unwrap(),
+            request_index: 100 + index as u32,
+        };
+        observer.note_request_start(new_key);
+        assert_eq!(future.await, Err(ToolError::InvalidInvocation));
+
+        match presentation_events.try_recv().expect("finish event") {
+            AgentEvent::ToolPresentation {
+                turn,
+                request_index,
+                tool_call_id,
+                tool_name,
+                meta,
+                ..
+            } => {
+                assert_eq!(tool_name, name);
+                assert_eq!(turn.loop_id, old_ref.loop_id);
+                assert_eq!(request_index, old_ref.request_index);
+                assert_eq!(tool_call_id, old_ref.tool_call_id);
+                assert_eq!(meta.session_id, session_id);
+                assert_eq!(meta.loop_id, Some(old_ref.loop_id));
+                assert_ne!(turn.loop_id, new_key.loop_id);
+            }
+            event => panic!("unexpected presentation event: {event:?}"),
+        }
+        assert!(presentation.lock().live_tools.is_empty());
+    }
+
+    assert!(observer_events.try_recv().is_err());
+    assert!(presentation_events.try_recv().is_err());
+    let _ = tokio::fs::remove_dir_all(base).await;
 }
