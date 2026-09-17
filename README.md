@@ -11,7 +11,7 @@ that exact Git revision; the local sibling checkout is used only for API review
 and is not modified here.
 
 Current release: **0.3.3**, paired with MiniCore TUI **0.2.8**. See
-[release notes](docs/release-0.3.3.md) and the subsequent
+[release notes](docs/releases/0.3.3.md) and the subsequent
 [presentation-path source fixes](docs/verification/presentation-risk-fixes.md).
 These follow-up fixes preserve the pinned Runtime revision and RPC surface.
 The subsequent [Session rename and prompt-file features](docs/verification/session-config.md)
@@ -187,7 +187,7 @@ clients must reread before retrying.
 
 The R1 manual-compaction draft is committed as source checkpoint `5397a65`,
 following ordinary worker lifecycle checkpoint `1771898`. The current P3a slice
-has parent-owned remote acceptance (see [progress](docs/0914-progress.md)), but
+has parent-owned remote acceptance (see [progress](docs/archive/0914-progress.md)), but
 no new installation. It projects a validated summary and
 its complete history suffix into the next Runtime `LoopRequest`; it also exposes
 `session.context` and reports manual utility usage separately from ordinary turn
@@ -197,7 +197,7 @@ startup preparation, per-request budget estimation and ephemeral tool-exchange
 summaries, bounded automatic observations, and `context_uncompressible`
 reporting. P3b2 provider replay budgeting and one-shot overflow recovery have
 also passed parent review and remote verification; see
-[development progress](docs/0914-progress.md) for evidence and limits.
+[development progress](docs/archive/0914-progress.md) for evidence and limits.
 TUI `/compact` is outside this backend scope; subsequent work proceeds to P4
 Workspace, whose first read-only `workspace.read` slice has also passed parent
 review and remote verification, together with `workspace.files` and

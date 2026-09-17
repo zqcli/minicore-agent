@@ -8,7 +8,7 @@ remain the original release evidence; current feature acceptance is in
 Paired with TUI 0.2.8. Compilation was remote-only in
 `/root/minicore-release-028-033.Fm9vbA`; no user configuration, store or real
 provider was used. No additional Agent Rust behavior was changed during the
-version update; the known limitations in [release notes](../../release-0.3.3.md)
+version update; the known limitations in [release notes](../../releases/0.3.3.md)
 remain open.
 
 - Stable and Rust 1.85: **280 passed / 2 ignored each**.

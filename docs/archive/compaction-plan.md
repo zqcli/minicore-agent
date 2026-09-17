@@ -9,7 +9,7 @@ tests ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed
 P3b2 provider replay budgeting and one-shot overflow recovery are also
 parent-reviewed and remotely verified: 511 stable/MSRV tests passed, 2 Live
 ignored; strict Clippy/fmt/rustdoc and Windows/macOS compile checks passed**. See the
-[manual execution audit](verification/compaction-manual-audit.md) for historical
+[manual execution audit](../verification/compaction-manual-audit.md) for historical
 incident context. Foundation acceptance baseline: Agent `eec636a`, TUI `6ecd736`,
 Runtime 0.4.1 revision
 `6cd2bdbc634437dea925495c61c7eb0be10ba171`. Runtime source, its pin, existing
@@ -293,10 +293,10 @@ child-run test while preserving the unrelated Runtime build; remote private
 copies remain pending the user's cleanup authorization. No new native artifact
 or installation was made.
 
-See [staged compaction verification](verification/compaction.md). TUI
+See [staged compaction verification](../verification/compaction.md). TUI
 `/compact`, automatic compaction, P3b2 overflow recovery, and persistent
 subagents remain separate work. P4 remains the bounded Workspace slice.
 
 > Superseded for the deleted legacy stateless subagent: the 0916 closeout
 > removed that execution path and keeps only read-only history compatibility.
-> See [the 0916 closeout acceptance](verification/0916-closeout.md).
+> See [the 0916 closeout acceptance](../verification/0916-closeout.md).

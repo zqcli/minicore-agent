@@ -72,7 +72,7 @@ Session-owned cancellation/join lifecycle, and deferred `session.compact` RPC.
 The ordinary worker lifecycle was split into `1771898`. Both source checkpoints
 were originally unaccepted checkpoints. The current P3a implementation and
 manual-compaction regressions now have parent-owned remote verification; see
-`docs/0914-progress.md`. There is no local compilation or installation.
+`docs/archive/0914-progress.md`. There is no local compilation or installation.
 
 The September 13, 2026 source-only execution violation and private-data-copy
 incident remains historical audit context; do not use its child-run claims as
