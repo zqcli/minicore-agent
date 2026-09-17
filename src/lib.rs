@@ -1,3 +1,28 @@
+//! MiniCore Agent is a local, RPC-first agent core. The binary exposes the
+//! [`run_stdio`] NDJSON service; embedded callers can use [`Agent`] directly.
+//! The public API separates Session execution, bounded observations, local
+//! presentation, and durable Store persistence. Bash retains host authority, so
+//! the Agent is not an OS sandbox.
+//!
+//! # Minimal embedded use
+//!
+//! The example opens the startup configuration, reads the local ping metadata,
+//! takes the single-consumer event stream, and shuts down without starting a
+//! turn or contacting a provider. It is `no_run` because opening a real config
+//! is an environment-dependent operation.
+//!
+//! ```no_run
+//! # use minicore_agent::{Agent, AgentError};
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), AgentError> {
+//! let mut agent = Agent::open_file("agent.toml").await?;
+//! assert_eq!(agent.ping().protocol_version, 1);
+//! let _events = agent.take_events()?;
+//! agent.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+
 #![forbid(unsafe_code)]
 
 mod agent;
