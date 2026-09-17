@@ -16,15 +16,12 @@ use minicore_runtime::prompt::PromptProvider;
 use minicore_runtime::tools::ToolPolicy;
 
 use crate::Workspace;
-use crate::changes::{
-    ChangeScope, ChangesListRequest, ChangesListResult, change_deadline, list_tool_changes,
-    list_workspace_changes,
-};
+use crate::changes::{ChangesListRequest, ChangesListResult, change_deadline};
 use crate::compaction::{
     AutoContext, CompactionResult, CompactionState, load_state, valid_operation_id,
 };
 use crate::config::AgentConfig;
-use crate::diff::{ChangesDiffRequest, DiffResult, changes_diff, diff_deadline};
+use crate::diff::{ChangesDiffRequest, DiffResult, diff_deadline};
 use crate::error::AgentError;
 use crate::event::{AgentEvent, AgentEventSink, AgentEventStream, EventMeta};
 use crate::models::{ModelConfig, ModelConfigError, ModelInfo, Models};
@@ -626,71 +623,15 @@ impl Agent {
     ) -> Result<ChangesListResult, AgentError> {
         request.validate()?;
         let deadline = change_deadline();
-        match &request.scope {
-            ChangeScope::Workspace => {
-                let session = self
-                    .loaded_session(request.session_id)
-                    .ok_or(AgentError::SessionNotLoaded)?;
-                let status_request = crate::WorkspaceStatusRequest {
-                    session_id: request.session_id,
-                    max_bytes: Some(request.max_bytes()),
-                };
-                let session_cancellation = session.query_cancellation();
-                let query = session.spawn_status_query_with_deadline(
-                    session.workspace(),
-                    status_request,
-                    cancellation.clone(),
-                    deadline,
-                )?;
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                    _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        Err(AgentError::QueryLimit)
-                    }
-                    result = query.wait() => {
-                        let status = result?;
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                            _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
-                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                                Err(AgentError::QueryLimit)
-                            }
-                            result = list_workspace_changes(
-                                request,
-                                status,
-                                cancellation.clone(),
-                                deadline,
-                            ) => result,
-                        }
-                    }
-                }
-            }
-            ChangeScope::Session | ChangeScope::Turn { .. } => {
-                let (tool_data, session_cancellation) = self
-                    .sessions
-                    .get(request.session_id)
-                    .map(|session| (Some(session.tool_data()), session.query_cancellation()))
-                    .unwrap_or_else(|| (None, CancellationToken::new()));
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                    _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        Err(AgentError::QueryLimit)
-                    }
-                    result = list_tool_changes(
-                        self.store.clone(),
-                        tool_data,
-                        request,
-                        cancellation.clone(),
-                        deadline,
-                    ) => result,
-                }
-            }
-        }
+        let loaded = self.loaded_session(request.session_id);
+        crate::queries::prepare_changes_list(
+            self.store.clone(),
+            loaded,
+            request,
+            cancellation,
+            deadline,
+        )?
+        .await
     }
 
     /// Returns one bounded review diff for a retained native Tool change. A
@@ -712,44 +653,15 @@ impl Agent {
     ) -> Result<DiffResult, AgentError> {
         request.validate()?;
         let deadline = diff_deadline();
-        if request.change_ref.starts_with("workspace:") {
-            let session = self
-                .loaded_session(request.session_id)
-                .ok_or(AgentError::SessionNotLoaded)?;
-            let session_cancel = session.query_cancellation();
-            let query =
-                session.spawn_workspace_diff(request.clone(), cancellation.clone(), deadline)?;
-            return tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                _ = session_cancel.cancelled() => Err(AgentError::QueryLimit),
-                _ = tokio::time::sleep_until(deadline.into()) => Err(AgentError::QueryLimit),
-                result = async {
-                    let sources = query.wait().await?;
-                    crate::diff::workspace_diff(self.store.clone(), request, sources, session_cancel.clone(), deadline).await
-                } => result,
-            };
-        }
-        let (tool_data, session_cancellation) = self
-            .sessions
-            .get(request.session_id)
-            .map(|session| (Some(session.tool_data()), session.query_cancellation()))
-            .unwrap_or_else(|| (None, CancellationToken::new()));
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-            _ = session_cancellation.cancelled() => Err(AgentError::QueryLimit),
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                Err(AgentError::QueryLimit)
-            }
-            result = changes_diff(
-                self.store.clone(),
-                tool_data,
-                request,
-                session_cancellation.clone(),
-                deadline,
-            ) => result,
-        }
+        let loaded = self.loaded_session(request.session_id);
+        crate::queries::prepare_changes_diff(
+            self.store.clone(),
+            loaded,
+            request,
+            cancellation,
+            deadline,
+        )?
+        .await
     }
 
     /// Read-only structured facts for one tool call. Loaded in-memory facts
