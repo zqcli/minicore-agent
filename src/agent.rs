@@ -276,6 +276,17 @@ impl ExecutionConfigFactory<'_> {
     }
 }
 
+struct SessionSetup {
+    presentation: Arc<crate::presentation::Presentation>,
+    tool_data: Arc<ToolData>,
+    command_owners: Arc<CommandOwners>,
+    observer: Arc<ToolObserver>,
+    config: ExecutionConfig,
+    auto: Option<AutoContext>,
+    options: LoopOptions,
+    compaction: Arc<CompactionState>,
+}
+
 /// Top-level coordinator for the local Store and loaded Sessions.
 ///
 /// `Agent::shutdown` is the cleanup barrier for embedded Rust callers: it
@@ -759,62 +770,25 @@ impl Agent {
             request.title,
             canonical_workspace,
         )?;
-        // Every predictable configuration error must fail before the store write.
-        let presentation = self.build_presentation(session_id, record.model.clone());
-        let tool_data = Arc::new(ToolData::new());
-        let command_owners = CommandOwners::new();
-        let tool_observer =
-            ToolObserver::new(session_id, Arc::clone(&tool_data), self.event_sink.clone());
         let options = self
             .config
             .loop_options_for_model(record.max_tool_rounds, &record.model)
             .map_err(AgentError::Config)?;
         let compaction = CompactionState::new();
-        let (config, auto) = self.execution_config(
-            &record,
-            Arc::clone(&workspace),
-            Arc::clone(&presentation),
-            Arc::clone(&tool_observer),
-            Arc::clone(&command_owners),
-            options.clone(),
-            Arc::clone(&compaction),
-            self.config.compaction.policy(),
-        )?;
+        // Every predictable configuration error must fail before the store write.
+        let setup =
+            self.prepare_session_setup(&record, Arc::clone(&workspace), options, compaction)?;
         self.store
             .create_session(&record)
             .await
             .map_err(crate::sessions::map_store_error)?;
-        let session = crate::sessions::Session::new(
-            record.clone(),
+        let info = self.install_session(
+            record,
             workspace,
             Vec::new().into(),
             std::collections::HashMap::new(),
-            presentation,
-            config,
-            auto,
-            options,
-            compaction,
-            self.config.compaction.policy(),
-            self.store.clone(),
-            self.event_sink.clone(),
-            tool_data,
-            command_owners,
-            tool_observer,
+            setup,
         );
-        let _ = self.sessions.insert(session_id, session);
-        let info = self
-            .sessions
-            .get(session_id)
-            .expect("created session is loaded")
-            .info(true);
-        self.event_sink.try_send(AgentEvent::SessionOpened {
-            session: info.clone(),
-            meta: EventMeta {
-                session_id,
-                loop_id: None,
-                dropped_before: 0,
-            },
-        });
         tracing::info!(session_id = %session_id, "session created");
         Ok(info)
     }
@@ -861,57 +835,24 @@ impl Agent {
             );
             return Err(AgentError::Workspace);
         }
-        let presentation = self.build_presentation(session_id, stored.record.model.clone());
-        let tool_data = Arc::new(ToolData::new());
-        let command_owners = CommandOwners::new();
-        let tool_observer =
-            ToolObserver::new(session_id, Arc::clone(&tool_data), self.event_sink.clone());
         let options = self
             .config
             .loop_options_for_model(stored.record.max_tool_rounds, &stored.record.model)
             .map_err(AgentError::Config)?;
         let compaction = load_state(&self.store, session_id, &stored.history).await;
-        let (config, auto) = self.execution_config(
+        let setup = self.prepare_session_setup(
             &stored.record,
             Arc::clone(&workspace),
-            Arc::clone(&presentation),
-            Arc::clone(&tool_observer),
-            Arc::clone(&command_owners),
-            options.clone(),
-            Arc::clone(&compaction),
-            self.config.compaction.policy(),
+            options,
+            compaction,
         )?;
-        let session = crate::sessions::Session::new(
-            stored.record.clone(),
+        let info = self.install_session(
+            stored.record,
             workspace,
             stored.history,
             stored.user_times,
-            presentation,
-            config,
-            auto,
-            options,
-            compaction,
-            self.config.compaction.policy(),
-            self.store.clone(),
-            self.event_sink.clone(),
-            tool_data,
-            command_owners,
-            tool_observer,
+            setup,
         );
-        let _ = self.sessions.insert(session_id, session);
-        let info = self
-            .sessions
-            .get(session_id)
-            .expect("opened session is loaded")
-            .info(true);
-        self.event_sink.try_send(AgentEvent::SessionOpened {
-            session: info.clone(),
-            meta: EventMeta {
-                session_id,
-                loop_id: None,
-                dropped_before: 0,
-            },
-        });
         tracing::info!(session_id = %session_id, "session opened");
         Ok(info)
     }
@@ -1313,6 +1254,96 @@ impl Agent {
             model,
             reasoning,
         })
+    }
+
+    fn prepare_session_setup(
+        &self,
+        record: &SessionRecord,
+        workspace: Arc<Workspace>,
+        options: LoopOptions,
+        compaction: Arc<CompactionState>,
+    ) -> Result<SessionSetup, AgentError> {
+        let presentation = self.build_presentation(record.session_id, record.model.clone());
+        let tool_data = Arc::new(ToolData::new());
+        let command_owners = CommandOwners::new();
+        let observer = ToolObserver::new(
+            record.session_id,
+            Arc::clone(&tool_data),
+            self.event_sink.clone(),
+        );
+        let (config, auto) = self.execution_config(
+            record,
+            workspace,
+            Arc::clone(&presentation),
+            Arc::clone(&observer),
+            Arc::clone(&command_owners),
+            options.clone(),
+            Arc::clone(&compaction),
+            self.config.compaction.policy(),
+        )?;
+        Ok(SessionSetup {
+            presentation,
+            tool_data,
+            command_owners,
+            observer,
+            config,
+            auto,
+            options,
+            compaction,
+        })
+    }
+
+    fn install_session(
+        &mut self,
+        record: SessionRecord,
+        workspace: Arc<Workspace>,
+        history: Arc<[minicore_runtime::history::HistoryItem]>,
+        user_times: std::collections::HashMap<(minicore_runtime::LoopId, usize), String>,
+        setup: SessionSetup,
+    ) -> SessionInfo {
+        let session_id = record.session_id;
+        let SessionSetup {
+            presentation,
+            tool_data,
+            command_owners,
+            observer,
+            config,
+            auto,
+            options,
+            compaction,
+        } = setup;
+        let session = crate::sessions::Session::new(
+            record,
+            workspace,
+            history,
+            user_times,
+            presentation,
+            config,
+            auto,
+            options,
+            compaction,
+            self.config.compaction.policy(),
+            self.store.clone(),
+            self.event_sink.clone(),
+            tool_data,
+            command_owners,
+            observer,
+        );
+        let _ = self.sessions.insert(session_id, session);
+        let info = self
+            .sessions
+            .get(session_id)
+            .expect("installed session is loaded")
+            .info(true);
+        self.event_sink.try_send(AgentEvent::SessionOpened {
+            session: info.clone(),
+            meta: EventMeta {
+                session_id,
+                loop_id: None,
+                dropped_before: 0,
+            },
+        });
+        info
     }
 
     /// Assembles a complete runtime `ExecutionConfig` from the session record:
