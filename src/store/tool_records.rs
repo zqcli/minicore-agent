@@ -1,6 +1,65 @@
 //! Auxiliary tool record, output blob, quota, and cold-read implementation.
 use super::*;
 
+#[cfg(test)]
+static AUX_BLOB_WRITE_FAILURES: OnceLock<Mutex<Vec<(SessionId, usize)>>> = OnceLock::new();
+#[cfg(test)]
+type AuxTempCreationGateEntry = (SessionId, Arc<AuxCommitGate>);
+#[cfg(test)]
+static AUX_TEMP_CREATION_GATES: OnceLock<Mutex<Vec<AuxTempCreationGateEntry>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn fail_aux_blob_write_after(session_id: SessionId, successful_writes: usize) {
+    AUX_BLOB_WRITE_FAILURES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, successful_writes));
+}
+
+#[cfg(test)]
+fn should_fail_aux_blob_write(session_id: SessionId) -> bool {
+    let Some(mutex) = AUX_BLOB_WRITE_FAILURES.get() else {
+        return false;
+    };
+    let mut failures = mutex.lock().unwrap();
+    let Some(pos) = failures.iter().position(|(item, _)| *item == session_id) else {
+        return false;
+    };
+    if failures[pos].1 == 0 {
+        failures.remove(pos);
+        true
+    } else {
+        failures[pos].1 -= 1;
+        false
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_aux_temp_creation_gate(session_id: SessionId, gate: Arc<AuxCommitGate>) {
+    AUX_TEMP_CREATION_GATES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push((session_id, gate));
+}
+
+#[cfg(test)]
+async fn wait_aux_temp_creation_gate(session_id: SessionId) {
+    let Some(mutex) = AUX_TEMP_CREATION_GATES.get() else {
+        return;
+    };
+    let gate = {
+        let mut entries = mutex.lock().unwrap();
+        let Some(pos) = entries.iter().position(|(item, _)| *item == session_id) else {
+            return;
+        };
+        entries.remove(pos).1
+    };
+    gate.entered.notify_one();
+    gate.release.notified().await;
+}
+
 impl Store {
     #[cfg(test)]
     pub(crate) fn with_aux_limits(mut self, limits: AuxLimits) -> Self {
@@ -58,32 +117,38 @@ impl Store {
             .as_ref()
             .map_or(0, |bytes| bytes.len());
 
-        if input_len != snapshot.record.input.file_bytes
-            || result_len != snapshot.record.result.file_bytes
-            || stdout_len != snapshot.record.stdout.file_bytes
-            || stderr_len != snapshot.record.stderr.file_bytes
-        {
-            return Err(StoreError::Corrupt);
-        }
-
-        if let Some(bytes) = &snapshot.input_bytes {
-            if snapshot.record.input.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
+        let streams = [
+            (
+                snapshot.input_bytes.as_deref(),
+                snapshot.record.input.file_bytes,
+                snapshot.record.input.file_sha256.as_deref(),
+            ),
+            (
+                snapshot.result_bytes.as_deref(),
+                snapshot.record.result.file_bytes,
+                snapshot.record.result.file_sha256.as_deref(),
+            ),
+            (
+                snapshot.stdout_bytes.as_deref(),
+                snapshot.record.stdout.file_bytes,
+                snapshot.record.stdout.file_sha256.as_deref(),
+            ),
+            (
+                snapshot.stderr_bytes.as_deref(),
+                snapshot.record.stderr.file_bytes,
+                snapshot.record.stderr.file_sha256.as_deref(),
+            ),
+        ];
+        for (bytes, expected_len, expected_sha) in streams {
+            let actual_len = bytes.map_or(0, |bytes| bytes.len());
+            if actual_len != expected_len {
                 return Err(StoreError::Corrupt);
             }
-        }
-        if let Some(bytes) = &snapshot.result_bytes {
-            if snapshot.record.result.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
-                return Err(StoreError::Corrupt);
-            }
-        }
-        if let Some(bytes) = &snapshot.stdout_bytes {
-            if snapshot.record.stdout.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
-                return Err(StoreError::Corrupt);
-            }
-        }
-        if let Some(bytes) = &snapshot.stderr_bytes {
-            if snapshot.record.stderr.file_sha256.as_deref() != Some(&hash_bytes(bytes)) {
-                return Err(StoreError::Corrupt);
+            if let Some(bytes) = bytes {
+                let actual_sha = hash_bytes(bytes);
+                if expected_sha != Some(actual_sha.as_str()) {
+                    return Err(StoreError::Corrupt);
+                }
             }
         }
         validate_file_change_snapshot(
@@ -191,41 +256,28 @@ impl Store {
         }
 
         let write_res = async {
-            if let Some(bytes) = &snapshot.input_bytes {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::Unavailable);
+            #[cfg(test)]
+            wait_aux_temp_creation_gate(snapshot.tool_ref.session_id).await;
+
+            let blobs = [
+                (TOOL_INPUT_FILE, snapshot.input_bytes.as_deref()),
+                (TOOL_RESULT_FILE, snapshot.result_bytes.as_deref()),
+                (TOOL_STDOUT_FILE, snapshot.stdout_bytes.as_deref()),
+                (TOOL_STDERR_FILE, snapshot.stderr_bytes.as_deref()),
+                (TOOL_BEFORE_FILE, snapshot.file_change_before.as_deref()),
+                (TOOL_AFTER_FILE, snapshot.file_change_after.as_deref()),
+            ];
+            for (name, bytes) in blobs {
+                if let Some(bytes) = bytes {
+                    if Instant::now() >= deadline {
+                        return Err(StoreError::Unavailable);
+                    }
+                    #[cfg(test)]
+                    if should_fail_aux_blob_write(snapshot.tool_ref.session_id) {
+                        return Err(StoreError::Unavailable);
+                    }
+                    write_sync_file(&temp_dir.join(name), bytes).await?;
                 }
-                write_sync_file(&temp_dir.join(TOOL_INPUT_FILE), bytes).await?;
-            }
-            if let Some(bytes) = &snapshot.result_bytes {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::Unavailable);
-                }
-                write_sync_file(&temp_dir.join(TOOL_RESULT_FILE), bytes).await?;
-            }
-            if let Some(bytes) = &snapshot.stdout_bytes {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::Unavailable);
-                }
-                write_sync_file(&temp_dir.join(TOOL_STDOUT_FILE), bytes).await?;
-            }
-            if let Some(bytes) = &snapshot.stderr_bytes {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::Unavailable);
-                }
-                write_sync_file(&temp_dir.join(TOOL_STDERR_FILE), bytes).await?;
-            }
-            if let Some(bytes) = &snapshot.file_change_before {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::Unavailable);
-                }
-                write_sync_file(&temp_dir.join(TOOL_BEFORE_FILE), bytes).await?;
-            }
-            if let Some(bytes) = &snapshot.file_change_after {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::Unavailable);
-                }
-                write_sync_file(&temp_dir.join(TOOL_AFTER_FILE), bytes).await?;
             }
             if Instant::now() >= deadline {
                 return Err(StoreError::Unavailable);

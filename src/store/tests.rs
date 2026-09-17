@@ -9,11 +9,14 @@ use minicore_runtime::tools::ToolResultOutcome;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::changes::{ChangeCommitState, ChangeCoverage, ChangeKind, FileChange, content_revision};
+use crate::changes::{
+    ChangeCommitState, ChangeCoverage, ChangeKind, ChangeRevision, FileChange, content_revision,
+};
 use crate::error::AgentError;
 use crate::tool_data::{ToolData, ToolDataAvailability, ToolDataStream, ToolOutputRequest};
 
 use super::*;
+use crate::store::tool_records::{fail_aux_blob_write_after, register_aux_temp_creation_gate};
 
 async fn fixture(label: &str) -> (PathBuf, Store, SessionId) {
     let base = std::env::temp_dir().join(format!(
@@ -87,6 +90,110 @@ fn loop_record_with_users(texts: &[&str]) -> StoredLoopRecord {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+    }
+}
+
+fn auxiliary_snapshot(tool_ref: ToolRef, blobs: [Option<Vec<u8>>; 6]) -> ToolPersistenceSnapshot {
+    let [
+        input_bytes,
+        result_bytes,
+        stdout_bytes,
+        stderr_bytes,
+        before_bytes,
+        after_bytes,
+    ] = blobs;
+    let input_len = input_bytes.as_ref().map_or(0, |bytes| bytes.len());
+    let result_len = result_bytes.as_ref().map_or(0, |bytes| bytes.len());
+    let stdout_len = stdout_bytes.as_ref().map_or(0, |bytes| bytes.len());
+    let stderr_len = stderr_bytes.as_ref().map_or(0, |bytes| bytes.len());
+    let file_change = if before_bytes.is_none() && after_bytes.is_none() {
+        None
+    } else {
+        Some(crate::changes::StoredFileChange {
+            path: "value.txt".to_owned(),
+            kind: ChangeKind::Modified,
+            before: before_bytes
+                .as_deref()
+                .map_or(ChangeRevision::Missing, content_revision),
+            after: after_bytes
+                .as_deref()
+                .map_or(ChangeRevision::Missing, content_revision),
+            commit_state: ChangeCommitState::NotCommitted,
+            coverage: ChangeCoverage::Complete,
+            before_captured: true,
+            after_captured: after_bytes.is_some(),
+        })
+    };
+    ToolPersistenceSnapshot {
+        tool_ref: tool_ref.clone(),
+        record: StoredToolRecord {
+            version: TOOL_RECORD_FORMAT_VERSION,
+            tool_ref,
+            name: "write".to_owned(),
+            subject: ToolSubject::Other,
+            subject_truncated: false,
+            state: ToolExecutionState::Succeeded,
+            phase: None,
+            started_at: Some("2026-09-15T00:00:00Z".to_owned()),
+            finished_at: Some("2026-09-15T00:00:01Z".to_owned()),
+            outcome: Some(ToolResultOutcome::Success),
+            input: StoredInputSummary {
+                total_bytes: input_len,
+                seen: input_bytes.is_some(),
+                truncated: false,
+                expired: false,
+                file_bytes: input_len,
+                file_sha256: input_bytes
+                    .as_deref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(hash_bytes),
+            },
+            result: StoredResultSummary {
+                total_bytes: result_len,
+                seen: result_bytes.is_some(),
+                truncated: false,
+                expired: false,
+                file_bytes: result_len,
+                file_sha256: result_bytes
+                    .as_deref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(hash_bytes),
+            },
+            stdout: StoredStreamWindow {
+                start_offset: 0,
+                observed_end: stdout_len as u64,
+                seen: stdout_bytes.is_some(),
+                complete: true,
+                truncated: false,
+                expired: false,
+                file_bytes: stdout_len,
+                file_sha256: stdout_bytes
+                    .as_deref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(hash_bytes),
+            },
+            stderr: StoredStreamWindow {
+                start_offset: 0,
+                observed_end: stderr_len as u64,
+                seen: stderr_bytes.is_some(),
+                complete: true,
+                truncated: false,
+                expired: false,
+                file_bytes: stderr_len,
+                file_sha256: stderr_bytes
+                    .as_deref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(hash_bytes),
+            },
+            command: None,
+            file_change,
+        },
+        input_bytes,
+        result_bytes,
+        stdout_bytes,
+        stderr_bytes,
+        file_change_before: before_bytes,
+        file_change_after: after_bytes,
     }
 }
 
@@ -1585,6 +1692,127 @@ async fn binary_and_utf8_empty_eof_auxiliary_tool_persistence() {
     assert_eq!(stderr_page.observed_end, 0);
     assert!(stderr_page.data.is_empty());
 
+    let _ = fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
+async fn auxiliary_blob_states_preserve_snapshot_files_and_metadata() {
+    let (base, store, session_id) = fixture("aux-blob-states").await;
+    store
+        .create_session(&record(&store, session_id))
+        .await
+        .unwrap();
+
+    let cases: [(&str, [Option<Vec<u8>>; 6]); 3] = [
+        ("missing", [None, None, None, None, None, None]),
+        (
+            "nonempty",
+            [
+                Some(b"input\0bytes".to_vec()),
+                Some(b"result\0bytes".to_vec()),
+                Some(b"stdout\0bytes".to_vec()),
+                Some(b"stderr\0bytes".to_vec()),
+                Some(b"before\0bytes".to_vec()),
+                Some(b"after\0bytes".to_vec()),
+            ],
+        ),
+        (
+            "mixed",
+            [
+                Some(b"input\0bytes".to_vec()),
+                None,
+                Some(b"stdout\0bytes".to_vec()),
+                None,
+                Some(Vec::new()),
+                Some(Vec::new()),
+            ],
+        ),
+    ];
+
+    for (state, blobs) in cases {
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            tool_call_id: ToolCallId::new(format!("blob-{state}")).unwrap(),
+        };
+        let snapshot = auxiliary_snapshot(tool_ref.clone(), blobs);
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let target = store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .join(tool_ref_hash(&tool_ref));
+        assert!(target.is_dir(), "{state} target directory");
+        let expected_files = [
+            (TOOL_INPUT_FILE, snapshot.input_bytes.as_deref()),
+            (TOOL_RESULT_FILE, snapshot.result_bytes.as_deref()),
+            (TOOL_STDOUT_FILE, snapshot.stdout_bytes.as_deref()),
+            (TOOL_STDERR_FILE, snapshot.stderr_bytes.as_deref()),
+            (TOOL_BEFORE_FILE, snapshot.file_change_before.as_deref()),
+            (TOOL_AFTER_FILE, snapshot.file_change_after.as_deref()),
+        ];
+        let mut expected_names = vec![TOOL_RECORD_FILE.to_owned()];
+        for (file, expected) in expected_files {
+            let path = target.join(file);
+            if let Some(bytes) = expected {
+                expected_names.push(file.to_owned());
+                assert_eq!(fs::read(&path).await.unwrap(), bytes, "{state} {file}");
+            } else {
+                assert!(!path.exists(), "{state} {file} absent");
+            }
+        }
+        let mut actual_names = Vec::new();
+        let mut entries = fs::read_dir(&target).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            actual_names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        expected_names.sort();
+        actual_names.sort();
+        assert_eq!(actual_names, expected_names, "{state} filenames");
+        assert_eq!(
+            fs::read(target.join(TOOL_RECORD_FILE)).await.unwrap(),
+            serde_json::to_vec(&snapshot.record).unwrap(),
+            "{state} metadata"
+        );
+    }
+
+    let _ = fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
+async fn empty_process_stream_blobs_remain_corrupt() {
+    let (base, store, session_id) = fixture("aux-empty-stream-corrupt").await;
+    store
+        .create_session(&record(&store, session_id))
+        .await
+        .unwrap();
+    for (index, name) in ["input", "result", "stdout", "stderr"].iter().enumerate() {
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+            request_index: index as u32,
+            tool_call_id: ToolCallId::new(format!("empty-{name}")).unwrap(),
+        };
+        let mut blobs = [None, None, None, None, None, None];
+        blobs[index] = Some(Vec::new());
+        let snapshot = auxiliary_snapshot(tool_ref, blobs);
+        assert!(matches!(
+            store
+                .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+                .await,
+            Err(StoreError::Corrupt)
+        ));
+    }
+    assert!(
+        !store
+            .session_directory(session_id)
+            .join(AUX_TOOLS_DIR)
+            .exists()
+    );
     let _ = fs::remove_dir_all(base).await;
 }
 
@@ -3240,6 +3468,100 @@ async fn atomic_publishing_idempotent_overwrite_and_cleanup_on_failure() {
     // Read still succeeds
     assert!(store.read_tool_record(&tool_ref).await.unwrap().is_some());
 
+    let _ = fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
+async fn auxiliary_mid_write_failure_removes_partial_commit() {
+    let (base, store, session_id) = fixture("aux-mid-write-cleanup").await;
+    store
+        .create_session(&record(&store, session_id))
+        .await
+        .unwrap();
+
+    let tool_ref = ToolRef {
+        session_id,
+        loop_id: LoopId::new().unwrap(),
+        request_index: 0,
+        tool_call_id: ToolCallId::new("mid-write-cleanup").unwrap(),
+    };
+    let snapshot = auxiliary_snapshot(
+        tool_ref.clone(),
+        [
+            Some(b"input".to_vec()),
+            Some(b"result".to_vec()),
+            Some(b"stdout".to_vec()),
+            Some(b"stderr".to_vec()),
+            Some(b"before".to_vec()),
+            Some(b"after".to_vec()),
+        ],
+    );
+    fail_aux_blob_write_after(session_id, 1);
+    assert!(matches!(
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await,
+        Err(StoreError::Unavailable)
+    ));
+    let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
+    assert!(
+        !tools_dir.exists(),
+        "partial temp commit must be cleaned up"
+    );
+    assert!(
+        !tools_dir.join(tool_ref_hash(&tool_ref)).exists(),
+        "partial temp commit must not publish a target"
+    );
+    let _ = fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
+async fn auxiliary_deadline_after_temp_creation_removes_partial_commit() {
+    let (base, store, session_id) = fixture("aux-deadline-cleanup").await;
+    store
+        .create_session(&record(&store, session_id))
+        .await
+        .unwrap();
+
+    let tool_ref = ToolRef {
+        session_id,
+        loop_id: LoopId::new().unwrap(),
+        request_index: 0,
+        tool_call_id: ToolCallId::new("deadline-cleanup").unwrap(),
+    };
+    let snapshot = auxiliary_snapshot(
+        tool_ref.clone(),
+        [
+            Some(b"input".to_vec()),
+            Some(b"result".to_vec()),
+            Some(b"stdout".to_vec()),
+            Some(b"stderr".to_vec()),
+            None,
+            None,
+        ],
+    );
+    let gate = Arc::new(AuxCommitGate::new());
+    register_aux_temp_creation_gate(session_id, Arc::clone(&gate));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let store_for_task = store.clone();
+    let task =
+        tokio::spawn(async move { store_for_task.commit_tool_record(&snapshot, deadline).await });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("auxiliary commit did not create its temp directory");
+    tokio::time::sleep_until(deadline.into()).await;
+    gate.release.notify_one();
+
+    assert!(matches!(task.await.unwrap(), Err(StoreError::Unavailable)));
+    let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
+    assert!(
+        !tools_dir.exists(),
+        "expired temp commit must be cleaned up"
+    );
+    assert!(
+        !tools_dir.join(tool_ref_hash(&tool_ref)).exists(),
+        "expired temp commit must not publish a target"
+    );
     let _ = fs::remove_dir_all(base).await;
 }
 
