@@ -14,6 +14,7 @@ mod policy;
 mod presentation;
 mod profiles;
 mod prompt;
+mod queries;
 mod read;
 mod rpc;
 mod sessions;

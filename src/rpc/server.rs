@@ -532,26 +532,25 @@ impl RpcServer {
                 if !self.query_capacity_available() {
                     return Err(resource_exhausted(id));
                 }
-                let workspace = session.workspace();
-                // The owned worker is registered on the Session, so closing the
-                // Session joins it even when this dispatcher is dropped.
+                // Registration happens synchronously inside `prepare`, so the
+                // Session owns the worker before this dispatcher can be
+                // dropped. The returned future only waits and completes the
+                // cache; `session` moves into it.
                 let cancellation = self.query_cancellation.clone();
-                let query =
-                    match session.spawn_status_query(workspace, request, cancellation.clone()) {
-                        Ok(query) => query,
-                        Err(error) => return Err(query_error(id, &error)),
-                    };
-                let session_for_completion = session.clone();
-                drop(session);
+                let query = match crate::queries::prepare_workspace_status(
+                    session,
+                    request,
+                    cancellation,
+                ) {
+                    Ok(query) => query,
+                    Err(error) => return Err(query_error(id, &error)),
+                };
                 let outbound = self.outbound_tx.clone();
                 self.queries.spawn(async move {
                     // The awaiter only observes the owned worker's result; the
                     // worker owns its git child and enforces its own deadline.
-                    let response = match query.wait().await {
-                        Ok(result) => {
-                            session_for_completion.complete_status_query(&result, &cancellation);
-                            success(&id, result)
-                        }
+                    let response = match query.await {
+                        Ok(result) => success(&id, result),
                         Err(error) => query_error(id, &error),
                     };
                     let _ = outbound.send(RpcOutbound::Response(response)).await;
