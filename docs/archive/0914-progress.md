@@ -1,6 +1,6 @@
 # Shared Data Development Progress
 
-Specification: `minicore-agent-0914-dev-spec.md` (2026-09-13).
+Specification: `specs/minicore-agent-0914-dev-spec.md` (2026-09-13).
 Branch: `feat/0914-shared-data`.
 Agent starting HEAD: `e59e9a70b1f65539ea16ee3dd64c2ee055d8a241`.
 Runtime remains pinned to 0.4.1, `df00602d35008fb4ef1c655e943d8db3d6465331`.
@@ -8,7 +8,7 @@ Runtime remains pinned to 0.4.1, `df00602d35008fb4ef1c655e943d8db3d6465331`.
 Historical audit reports remain historical evidence and previous unaccepted
 results are not acceptance gates. The legacy stateless subagent described by the
 subagent sections below was removed by the
-[0916 closeout acceptance](verification/0916-closeout.md); those sections are
+[0916 closeout acceptance](../verification/0916-closeout.md); those sections are
 kept as historical evidence and no longer describe executable behavior. The current source handoff includes the P3a foundation, the P3b1 automatic
 compaction slice, and the P3b2 provider replay budget and overflow recovery slice:
 startup projection from a validated summary, same-loop model-update binding,

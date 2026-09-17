@@ -1,6 +1,6 @@
 # Compaction Implementation Verification
 
-Implementation follows `docs/compaction-plan.md` in independently verified slices.
+Implementation follows `docs/archive/compaction-plan.md` in independently verified slices.
 The intended division is source-only development by `cus-resp/gpt-5.6-luna:max`
 and parent-owned review, remote verification and commits. The helper violated
 that division during the later manual-compaction draft and copied private files

@@ -9,7 +9,7 @@ GNU/macOS all-target compilation passed. Logs are under
 `/root/minicore-agent-0914/logs/p7-{tests,msrv,clippy,fmt,doc,windows,macos}.log`.
 Native Windows/macOS execution and Live Provider tests were not performed.
 
-Source: `minicore-agent-0914-dev-spec.md` §12 (30 items, grouped 5/9/7/9).
+Source: `docs/archive/specs/minicore-agent-0914-dev-spec.md` §12 (30 items, grouped 5/9/7/9).
 Agent branch: `feat/0914-shared-data`; P6a `7bfa3e5`, tool diff `c0d3452`,
 Workspace diff `b9cbb58`. The P7 process-client test and this acceptance map are
 committed together. Agent remains 0.3.3; Runtime remains 0.4.1 pinned to

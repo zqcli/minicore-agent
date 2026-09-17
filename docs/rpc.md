@@ -320,7 +320,7 @@ The manual compaction methods, startup summary projection, automatic compaction
 and P3b2 one-shot provider overflow recovery have passed parent-owned remote
 verification on this development branch. They are not available in the
 previously installed Agent binary; no new installation or release is claimed.
-See `0914-progress.md` for acceptance evidence and limits.
+See `archive/0914-progress.md` for acceptance evidence and limits.
 
 The deferred compact result has this shape:
 
@@ -438,7 +438,7 @@ Session has no such observation.
 The recovery source is retained only up to 512 KiB; a larger source does not
 receive a recovery ticket. Token counts are estimates, and recovery never
 re-runs tools or duplicates the current User/Steer messages. P3b2 has passed
-parent-owned remote verification; see `0914-progress.md`. `last_result` is the latest manual
+parent-owned remote verification; see `archive/0914-progress.md`. `last_result` is the latest manual
 compaction result retained by this loaded Session process; it is not a durable
 history record.
 
@@ -954,7 +954,7 @@ rejected with `-32002` (`session_not_loaded`); closing the owning Session
 cancels its in-flight reads with `-32020` (`query_limit`). The query never
 derives a root from a path. It holds one of the 4 concurrent read-query slots
 described above. P4a has passed parent review and remote verification; see
-`0914-progress.md` for the gates and platform limits.
+`archive/0914-progress.md` for the gates and platform limits.
 
 ```json
 {
@@ -1064,7 +1064,7 @@ owned queries before the shutdown response.
 `workspace.files` lists one bounded page of Workspace entries. It shares the
 loaded-Session ownership, the ignore-aware traversal, the four read-query
 slots, and the cancellation rules of `workspace.read`. The P4b files/search
-slice has passed parent-owned remote verification; see `0914-progress.md`.
+slice has passed parent-owned remote verification; see `archive/0914-progress.md`.
 
 ```json
 {
@@ -1276,7 +1276,7 @@ continuation.
 ### `workspace.status`
 
 The P4c slice has passed parent-owned remote verification; see
-`0914-progress.md` for the gates and platform limits.
+`archive/0914-progress.md` for the gates and platform limits.
 
 ```json
 {"session_id": "ses_...", "max_bytes": 65536}
