@@ -2562,6 +2562,88 @@ async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
 }
 
 #[tokio::test]
+async fn cold_changes_diff_caller_cancel_keeps_store_owned_worker() {
+    let (base, store, session_id) = fixture("diff-cold-caller-cancel").await;
+    store
+        .create_session(&record(&store, session_id))
+        .await
+        .unwrap();
+
+    let tool_ref = ToolRef {
+        session_id,
+        loop_id: LoopId::new().unwrap(),
+        request_index: 0,
+        tool_call_id: ToolCallId::new("diff-cold-cancel").unwrap(),
+    };
+    let before = b"before\n".to_vec();
+    let after = b"after\n".to_vec();
+    let snapshot = auxiliary_snapshot(
+        tool_ref.clone(),
+        [
+            None,
+            None,
+            None,
+            None,
+            Some(before.clone()),
+            Some(after.clone()),
+        ],
+    );
+    store
+        .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    let change_ref = crate::changes::stored_tool_change_ref(
+        &tool_ref,
+        snapshot.record.file_change.as_ref().unwrap(),
+    );
+    let gate = Arc::new(crate::diff::DiffGate::new());
+    crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+    // `loaded=None` makes the cold branch use its own Session token. The
+    // DiffGate waits on the worker's derived token or its explicit release;
+    // it does not observe this outer caller token.
+    let caller = CancellationToken::new();
+    let query = crate::queries::prepare_changes_diff(
+        store.clone(),
+        None,
+        crate::diff::ChangesDiffRequest {
+            session_id,
+            change_ref,
+            comparison: None,
+            context_lines: None,
+            cursor: None,
+            max_bytes: None,
+        },
+        caller.clone(),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    let task = tokio::spawn(query);
+
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+        .await
+        .expect("cold changes.diff did not admit its CPU worker");
+    assert_eq!(store.registered_diff_workers(), 1);
+
+    caller.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("caller cancellation did not finish the query")
+        .unwrap();
+    assert!(matches!(result, Err(AgentError::QueryLimit)));
+    // Cancelling the outer caller only drops the wait future. The Store still
+    // owns the admitted worker and its join handle; the worker remains at the
+    // gate until the explicit release below.
+    assert_eq!(store.registered_diff_workers(), 1);
+
+    gate.release();
+    assert_eq!(store.registered_diff_workers(), 1);
+    store.shutdown_diff_workers().await;
+    assert_eq!(store.registered_diff_workers(), 0);
+
+    let _ = fs::remove_dir_all(base).await;
+}
+
+#[tokio::test]
 async fn diff_missing_before_is_an_addition_and_empty_content_is_not_binary() {
     let (base, store, session_id) = fixture("diff-missing-before").await;
     store
