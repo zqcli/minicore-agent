@@ -2,9 +2,10 @@
 
 ## 0.5.0 — Unreleased
 
-This is the current 0.5.0 source freeze candidate. It is not a tagged or
-installed release; this file does not claim a release artifact or final
-acceptance result.
+This is the current 0.5.0 local source freeze (unreleased). It has not been
+tagged, pushed, published, or installed. The [0.5.0 freeze verification
+record](docs/verification/0.5.0.md) centralizes its measured static checks and
+remote gate results.
 
 ### Changes Since 0.3.3
 
@@ -52,7 +53,8 @@ does not claim a runtime implementation change in this delta.
 - the current documentation set covers configuration, ownership and
   architecture, context/compaction, security, contribution rules, and the
   complete 33-method RPC surface, including deferred-query ownership and
-  cancellation boundaries;
+  cancellation boundaries; the measured freeze status is centralized in the
+  [0.5.0 verification record](docs/verification/0.5.0.md);
 - historical specifications, context, plans, and 0.3.x release notes are
   indexed separately from current guidance, while verification records and
   native artifacts retain their recorded facts and paths;

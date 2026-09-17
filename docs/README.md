@@ -16,7 +16,7 @@ verification evidence.
 - [Security](security.md): local trust assumptions, Workspace limits, redaction,
   stdout, and Store scope.
 - [RPC contract](rpc.md): the normative NDJSON wire contract and all 33 methods.
-- [Changelog](../CHANGELOG.md): current candidate history without release-gate claims.
+- [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
 These guides describe the current source package **0.5.0**, Rust 2024/MSRV 1.85,
@@ -27,9 +27,10 @@ formats.
 
 ## Evidence And History
 
-- [Verification index](verification/README.md): grouped acceptance records and
-  their limitations; it is not a second current contract and does not claim a
-  final 0.5.0 release gate.
+- [Verification index](verification/README.md): historical evidence plus the
+  centralized 0.5.0 freeze record and its measured status.
+- [0.5.0 freeze record](verification/0.5.0.md): current source, compatibility,
+  static checks, and measured remote gate results.
 - [Archive index](archive/README.md): historical context, plans, and tracked
   specifications marked not current.
 - [0.3.3 release notes](releases/0.3.3.md) and [0.3.2 notes](releases/0.3.2.md):

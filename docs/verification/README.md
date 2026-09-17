@@ -5,6 +5,12 @@ Records retain the facts, source revisions, gate counts, limitations, and
 artifact provenance from the runs they describe. A later package version or
 newer acceptance record does not rewrite those historical facts.
 
+## 0.5.0 Local Freeze
+
+- [`0.5.0.md`](0.5.0.md) is the centralized measured freeze record for source
+  `8a581a8`; it lists scoped checks, static values, and parent-remote gate
+  results. It is the status entry linked from the current guides.
+
 ## 0917 Simplification
 
 - [`0917-simplify.md`](0917-simplify.md) records the P0–P7 nonbreaking

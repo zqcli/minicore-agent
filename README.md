@@ -10,8 +10,9 @@ Tool data, and a stdio JSON-RPC service for a client UI.
 - Runtime: `minicore-runtime 0.4.1`, pinned to Git revision
   `6cd2bdbc634437dea925495c61c7eb0be10ba171`
 - RPC protocol version: **1**
-- Current state: source freeze candidate; this repository does not claim a new
-  tag, installed artifact, or final 0.5.0 acceptance result here.
+- Current state: local source freeze (unreleased); see the [0.5.0 freeze
+  verification record](docs/verification/0.5.0.md) for centralized status.
+  No 0.5.0 tag, push, published artifact, or installed release is identified here.
 
 ## Quickstart
 
@@ -107,7 +108,9 @@ cross-process lock.
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
 
-Verification records preserve the facts and limitations of the runs they
-record; they are not substitutes for this current contract. Historical release
-notes remain under [`docs/releases`](docs/releases/0.3.3.md), and archived plans
-and specifications are indexed by [docs/archive](docs/archive/README.md).
+The [0.5.0 freeze verification record](docs/verification/0.5.0.md) is the
+central current status entry for the measured local freeze. Verification records
+preserve the facts and limitations of the runs they record and are not substitutes
+for this current contract. Historical release notes remain under
+[`docs/releases`](docs/releases/0.3.3.md), and archived plans and specifications
+are indexed by [docs/archive](docs/archive/README.md).
