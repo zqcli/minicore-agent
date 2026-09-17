@@ -8370,6 +8370,92 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
     assert!(matches!(second.wait().await, Err(AgentError::QueryLimit)));
 }
 
+/// P2a: `prepare_workspace_status` registers the Session-owned worker
+/// synchronously and returns a wait-only future. If that future is never
+/// polled and the Session closes immediately, the close must still cancel and
+/// join the worker it registered, and the unpolled future must then observe
+/// the cancellation instead of a fake success.
+#[cfg(unix)]
+#[tokio::test]
+async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
+    use crate::workspace::status::{StatusReapGate, set_status_program, set_status_reap_gate};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (data_dir, _data_guard) = fixture_dir(&format!("status-prepare-{}", next_id()));
+    let (workspace, _workspace_guard) =
+        workspace_file("status-prepare-ws", "note.txt", b"raw\ncontent\n");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let session_id = info.session_id;
+
+    // A child that reports its own process id and then holds its pipes open.
+    let pid_path = data_dir.join("status-prepare-pids");
+    let script = data_dir.join("slow-status-git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nsleep 30\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+
+    let session = agent.loaded_session(session_id).unwrap();
+    // Registration is synchronous: the worker exists before the future is ever
+    // polled, and no poll is needed to make close observe it.
+    let prepared = crate::queries::prepare_workspace_status(
+        session.clone(),
+        crate::WorkspaceStatusRequest {
+            session_id,
+            max_bytes: None,
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    let pid = wait_for_started_child(&pid_path, 0).await;
+    assert!(
+        process_is_listed(pid),
+        "the registered child is not running"
+    );
+    assert_eq!(session.active_status_workers(), 1);
+
+    // The gate parks the worker at its child reap point, so the close is proven
+    // to wait for that worker rather than skipping it.
+    let gate = StatusReapGate::new();
+    set_status_reap_gate(
+        std::fs::canonicalize(&workspace).unwrap(),
+        Arc::clone(&gate),
+    );
+
+    let close = agent.close_session(session_id);
+    let mut close = std::pin::pin!(close);
+    assert!(futures_util::poll!(&mut close).is_pending());
+    gate.entered().await;
+    assert!(
+        process_is_listed(pid),
+        "the child was reaped before its owner was released"
+    );
+    gate.release();
+    close.await.unwrap();
+    assert!(
+        !process_is_listed(pid),
+        "the closing Session returned before its owned child was reaped"
+    );
+    assert_eq!(session.active_status_workers(), 0);
+    // The unpolled future never saw a success; it observes the cancellation.
+    assert!(matches!(prepared.await, Err(AgentError::QueryLimit)));
+}
+
 /// Waits until a fake git child has appended its process id, and returns it.
 #[cfg(unix)]
 async fn wait_for_started_child(pid_path: &Path, index: usize) -> i32 {

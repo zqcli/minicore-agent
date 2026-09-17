@@ -604,15 +604,11 @@ impl Agent {
         let session = self
             .loaded_session(request.session_id)
             .ok_or(AgentError::SessionNotLoaded)?;
-        let workspace = session.workspace();
         // The Session owns the worker that runs the query, so closing the
         // Session stops and reaps this query's child even if this caller goes
-        // away first.
+        // away first. Registration happens synchronously inside `prepare`.
         let cancellation = CancellationToken::new();
-        let query = session.spawn_status_query(workspace, request, cancellation.clone())?;
-        let result = query.wait().await?;
-        session.complete_status_query(&result, &cancellation);
-        Ok(result)
+        crate::queries::prepare_workspace_status(session, request, cancellation)?.await
     }
 
     pub async fn changes_list(
