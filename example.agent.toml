@@ -14,7 +14,7 @@ make focused changes, run relevant checks, and explain the result.
 # system_prompt = { file = "prompts/coding.md" }
 tools = ["read", "write", "edit", "apply_patch", "bash"]
 # The five executable tools above are the complete current tool set; "subagent" is not supported.
-max_tool_rounds = 32
+# No finite tool-round limit. Legacy max_tool_rounds values are accepted but ignored.
 # Auto mode executes enabled tools without user approval. Use only in a trusted local environment.
 approval = "auto"
 

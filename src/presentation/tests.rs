@@ -70,8 +70,8 @@ fn whitelist_details_and_counts() {
         Some("ok\nok"),
     );
     assert_eq!(bash.detail, "$ cargo test");
-    assert!(bash.expanded_input.is_none());
-    assert_eq!(bash.hidden_line_count, Some(5));
+    assert_eq!(bash.expanded_input.as_deref(), Some("cargo test"));
+    assert_eq!(bash.hidden_line_count, Some(3));
 
     let write = build_tool_display(
         "write",
@@ -96,7 +96,10 @@ fn whitelist_details_and_counts() {
         None,
     );
     assert_eq!(edit.detail, "a.rs");
-    assert_eq!(edit.expanded_input.as_deref(), Some("x\ny\nz"));
+    assert_eq!(
+        edit.expanded_input.as_deref(),
+        Some("--- before\n+++ after\n@@\n-x\n-y\n+z\n")
+    );
     assert_eq!(edit.input_line_count, Some(3));
 }
 
@@ -177,7 +180,7 @@ fn result_truncation_marks_display_and_bounds_hidden_rows() {
     assert!(display.truncated);
     assert_eq!(
         display.hidden_line_count,
-        Some(3 + count_lines(&result[..MAX_RESULT_DISPLAY_BYTES]))
+        Some(1 + count_lines(&result[..MAX_RESULT_DISPLAY_BYTES]))
     );
 }
 
@@ -221,8 +224,117 @@ fn editor_old_and_new_and_bash_hint_lines() {
         Some("updated"),
     );
     assert_eq!(edit.input_line_count, Some(4));
-    // input(4) + result(1) = 5 hidden rows.
-    assert_eq!(edit.hidden_line_count, Some(5));
+    // Three diff headers, four changed lines, final blank, and one result row.
+    assert_eq!(edit.hidden_line_count, Some(9));
+}
+
+#[test]
+fn bash_expanded_input_keeps_long_multiline_commands_not_raw_arguments() {
+    let command = format!("printf '{}'\nprintf done\n", "中文 command ".repeat(100));
+    let display = build_tool_display(
+        "bash",
+        Some(&serde_json::json!({
+            "command": command, "cwd": "/private/not-for-display", "env": {"SECRET": "never shown"}
+        })),
+        None,
+    );
+    assert_eq!(display.expanded_input.as_deref(), Some(command.as_str()));
+    assert_eq!(display.input_line_count, Some(3));
+    assert_eq!(display.hidden_line_count, Some(3));
+    assert!(!display.expanded_input.unwrap().contains("never shown"));
+    let huge = build_tool_display(
+        "bash",
+        Some(&serde_json::json!({
+            "command": "中".repeat(MAX_EXPANDED_INPUT_BYTES)
+        })),
+        None,
+    );
+    assert!(huge.truncated);
+    assert!(huge.expanded_input.unwrap().len() <= MAX_EXPANDED_INPUT_BYTES);
+}
+
+#[test]
+fn edit_diff_distinguishes_unchanged_inserted_removed_and_empty_lines() {
+    for (old, new, expected) in [
+        (
+            "same\nold\nend\n",
+            "same\nnew\nend\n",
+            " same\n-old\n+new\n end\n",
+        ),
+        ("same\n\nend", "same\nnew\n\nend", " same\n+new\n \n end\n"),
+        ("same", "same", " same\n"),
+        ("old", "", "-old\n"),
+        ("", "new", "+new\n"),
+        ("a\r\nb", "a\r\nc", " a\\r\n-b\n+c\n"),
+    ] {
+        let display = build_tool_display(
+            "edit",
+            Some(&serde_json::json!({
+                "path": "file", "old_text": old, "new_text": new
+            })),
+            None,
+        );
+        assert_eq!(
+            display.expanded_input.as_deref(),
+            Some(format!("--- before\n+++ after\n@@\n{expected}").as_str())
+        );
+        assert!(!display.truncated);
+        assert_eq!(
+            display.hidden_line_count,
+            Some(count_lines(display.expanded_input.as_deref().unwrap()))
+        );
+    }
+}
+
+#[test]
+fn edit_diff_is_bounded_and_escapes_terminal_controls() {
+    let display = build_tool_display(
+        "edit",
+        Some(&serde_json::json!({
+            "path": "file", "old_text": "\u{1b}[31mold", "new_text": "new"
+        })),
+        None,
+    );
+    assert!(
+        !display
+            .expanded_input
+            .as_deref()
+            .unwrap()
+            .contains('\u{1b}')
+    );
+    let large = "same\n".repeat(MAX_EXPANDED_INPUT_BYTES / 5 + 1);
+    let display = build_tool_display(
+        "edit",
+        Some(&serde_json::json!({
+            "path": "file", "old_text": large, "new_text": large
+        })),
+        None,
+    );
+    assert!(display.truncated);
+    assert!(display.expanded_input.as_deref().unwrap().len() <= MAX_EXPANDED_INPUT_BYTES);
+    assert_eq!(
+        display.hidden_line_count,
+        Some(count_lines(display.expanded_input.as_deref().unwrap()))
+    );
+}
+
+#[test]
+fn patch_rows_count_actual_whitelisted_body_and_unknown_batch_stays_redacted() {
+    let patch = "*** Begin Patch\n*** Update File: a\n@@\n old\n-new\n+changed\n*** End Patch";
+    let display = build_tool_display(
+        "apply_patch",
+        Some(&serde_json::json!({"patch": patch})),
+        None,
+    );
+    assert_eq!(display.expanded_input.as_deref(), Some(patch));
+    assert_eq!(display.hidden_line_count, Some(count_lines(patch)));
+    let unknown = build_tool_display(
+        "apply_batch",
+        Some(&serde_json::json!({"SECRET": "not a supported tool contract"})),
+        None,
+    );
+    assert!(unknown.expanded_input.is_none());
+    assert_eq!(unknown.detail, "tool apply_batch");
 }
 
 #[test]

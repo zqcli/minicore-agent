@@ -2925,6 +2925,82 @@ fn flatten_texts(items: &[HistoryItem]) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
+    let (data_dir, _data_guard) = fixture_dir(&format!("legacy-rounds-{}", next_id()));
+    let (workspace, _workspace_guard) =
+        workspace_file("legacy-rounds-ws", "file.txt", b"file contents");
+    let session_id = SessionId::new().unwrap();
+    let record = SessionRecord {
+        format_version: SESSION_FORMAT_VERSION,
+        session_id,
+        title: None,
+        profile: "test".to_owned(),
+        workspace,
+        model: "main".to_owned(),
+        reasoning: ReasoningPreference::Auto,
+        system_prompt: "test system prompt".to_owned(),
+        tools: vec!["read".to_owned()],
+        max_tool_rounds: 32,
+        approval: ApprovalMode::Auto,
+        created_at: "2026-01-02T03:04:05.000Z".to_owned(),
+        updated_at: "2026-01-02T03:04:05.000Z".to_owned(),
+    };
+    let store = Store::open(data_dir.clone()).await.unwrap();
+    store.create_session(&record).await.unwrap();
+    assert_eq!(
+        store
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .record
+            .max_tool_rounds,
+        32
+    );
+    drop(store);
+
+    let mut scripts =
+        vec![ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})); 40];
+    scripts.push(ModelScript::Text("completed after forty tool rounds"));
+    let model = FakeModel::new("main", scripts);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        Profile {
+            max_tool_rounds: 32,
+            ..read_profile()
+        },
+    )
+    .await;
+    agent.open_session(session_id).await.unwrap();
+    assert_eq!(session_options(&agent, session_id).max_tool_rounds, 0);
+
+    let turn = send_text(&mut agent, session_id, "read forty times then finish").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(result.report.tool_rounds, 40);
+    assert_eq!(result.report.requests, 41);
+    assert_eq!(model.requests().lock().unwrap().len(), 41);
+    let stored = read_store_history(&data_dir, session_id).await;
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|item| matches!(
+                item,
+                HistoryItem::ToolResult(result) if result.outcome == ToolResultOutcome::Success
+            ))
+            .count(),
+        40
+    );
+    assert_eq!(
+        flatten_texts(&stored).last().unwrap(),
+        "completed after forty tool rounds"
+    );
+}
+
+#[tokio::test]
 async fn tool_loop_runs_read_and_persists_one_loop_record() {
     let (data_dir, _guard) = fixture_dir(&format!("tool-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-ws", "file.txt", b"file contents");

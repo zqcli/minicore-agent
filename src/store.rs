@@ -274,7 +274,6 @@ impl SessionRecord {
             || self.workspace.as_os_str().is_empty()
             || self.workspace.as_os_str().len() > MAX_WORKSPACE_BYTES
             || !valid_multiline_text(&self.system_prompt, MAX_SYSTEM_PROMPT_BYTES, false)
-            || !(1..=1_024).contains(&self.max_tool_rounds)
             || !valid_tools
             || !valid_timestamp(&self.created_at)
             || !valid_timestamp(&self.updated_at)
