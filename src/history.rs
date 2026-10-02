@@ -700,7 +700,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .hidden_line_count,
-            Some(4)
+            Some(2)
         );
         assert_eq!(
             second.tool_calls[0]
@@ -708,7 +708,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .hidden_line_count,
-            Some(5)
+            Some(3)
         );
         assert_eq!(
             missing.tool_calls[0]
@@ -716,7 +716,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .hidden_line_count,
-            Some(3)
+            Some(1)
         );
     }
 
@@ -738,7 +738,13 @@ mod tests {
         assert_eq!(assistant.tool_calls[0].call_index, 0);
         assert_eq!(assistant.tool_calls[1].call_index, 1);
         for call in &assistant.tool_calls {
-            assert_eq!(call.display.as_ref().unwrap().hidden_line_count, Some(4));
+            // Count the visible command and result, not pretty-printed argument JSON.
+            let display = call.display.as_ref().unwrap();
+            assert_eq!(display.hidden_line_count, Some(2));
+            assert_eq!(
+                display.expanded_input.as_deref(),
+                display.detail.strip_prefix("$ ")
+            );
         }
         assert_eq!(
             assistant.tool_calls[0].display.as_ref().unwrap().detail,
@@ -828,7 +834,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .hidden_line_count,
-            Some(4)
+            Some(2)
         );
         assert_eq!(
             two.tool_calls[0]
@@ -836,7 +842,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .hidden_line_count,
-            Some(4)
+            Some(2)
         );
     }
 

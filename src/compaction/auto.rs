@@ -48,6 +48,31 @@ pub(crate) struct AutoContextBinding {
 }
 
 impl AutoContext {
+    pub(crate) fn summary_context_hash(
+        &self,
+        system: &BoundedText,
+        tools: &[ToolSpec],
+        reasoning: ReasoningPreference,
+        hard_tokens: u64,
+        target_tokens: u64,
+    ) -> Result<[u8; 32], UtilityError> {
+        // Bind both immutable utility/provider identities and every summary
+        // input. A later settings installation clears this context atomically.
+        let bytes = serde_json::to_vec(&(
+            system.as_str(),
+            tools,
+            reasoning,
+            self.state.request_settings().config_generation,
+            Arc::as_ptr(&self.model) as *const () as usize,
+            Arc::as_ptr(&self.budget) as *const () as usize,
+            hard_tokens,
+            target_tokens,
+            self.max_prompt_messages,
+        ))
+        .map_err(|_| UtilityError::Serialization)?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
     pub(crate) fn binding(&self) -> AutoContextBinding {
         AutoContextBinding {
             model: Arc::clone(&self.model),
@@ -459,9 +484,22 @@ pub(crate) async fn plan(
         request_index,
         budget,
     );
+    let context_hash = auto
+        .summary_context_hash(
+            system,
+            tools,
+            reasoning,
+            budget.hard_tokens,
+            budget.target_tokens,
+        )
+        .map_err(PlanError::Utility)?;
+    let items: Vec<&HistoryItem> = base.iter().chain(appended.iter()).collect();
+    let mut candidates =
+        compressible_ranges(base.len(), &items, loop_id).map_err(PlanError::Utility)?;
+    let valid_keys = candidates.iter().map(|(key, _)| key.clone()).collect();
     let mut folded: BTreeMap<EphemeralGroupKey, BoundedText> = auto
         .state
-        .ephemeral(loop_id)
+        .ephemeral_for_context(loop_id, context_hash, &valid_keys)
         .map(|summary| summary.groups)
         .unwrap_or_default();
     let mut current =
@@ -515,25 +553,13 @@ pub(crate) async fn plan(
         observation.finish("context_uncompressible", Some(tokens));
         return Err(PlanError::Uncompressible);
     }
-    let candidates = {
-        let items: Vec<&HistoryItem> = base.iter().chain(appended.iter()).collect();
-        let mut candidates: Vec<(EphemeralGroupKey, usize)> =
-            compressible_ranges(base.len(), &items, loop_id)
-                .map_err(|error| {
-                    observation.finish("invalid_history", Some(tokens));
-                    PlanError::Utility(error)
-                })?
-                .into_iter()
-                .collect();
-        candidates.sort_by(|left, right| {
-            folded
-                .contains_key(&left.0)
-                .cmp(&folded.contains_key(&right.0))
-                .then(right.1.cmp(&left.1))
-                .then(left.0.start.cmp(&right.0.start))
-        });
-        candidates
-    };
+    candidates.sort_by(|left, right| {
+        folded
+            .contains_key(&left.0)
+            .cmp(&folded.contains_key(&right.0))
+            .then(right.1.cmp(&left.1))
+            .then(left.0.start.cmp(&right.0.start))
+    });
     if candidates.is_empty() {
         if tokens <= budget.hard_tokens {
             observation.finish("fit_over_trigger", Some(tokens));
@@ -622,8 +648,12 @@ pub(crate) async fn plan(
         };
         observation.set_utility_estimate(generation.before_tokens, generation.after_tokens);
         observation.add_usage(generation.utility_usage.clone());
-        auto.state
-            .cache_ephemeral(loop_id, key.clone(), generation.content.clone());
+        auto.state.cache_ephemeral_for_context(
+            loop_id,
+            key.clone(),
+            generation.content.clone(),
+            Some(context_hash),
+        );
         folded.insert(key, generation.content);
         compacted = true;
         current =
@@ -1077,6 +1107,121 @@ mod tests {
         let cached = context.state.ephemeral(loop_id).unwrap();
         assert_eq!(cached.groups.len(), 3);
         assert_eq!(model.utility_calls(), 3);
+
+        // A settled turn releases ownership but must not force unchanged
+        // history through the summary model again on the next user message.
+        context.state.clear_ephemeral(loop_id);
+        assert!(context.state.ephemeral(loop_id).is_none());
+        let next_loop = LoopId::new().unwrap();
+        context.state.begin_ephemeral_loop(next_loop);
+        let next_messages = run_plan(
+            &context,
+            &system,
+            &base,
+            &[],
+            next_loop,
+            budget,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_messages, messages);
+        assert_eq!(model.utility_calls(), 3);
+
+        // A changed source at an identical range must never reuse stale text.
+        base.splice(0..2, tool_group(loop_id, 0, "changed".repeat(2_000)));
+        run_plan(
+            &context,
+            &system,
+            &base,
+            &[],
+            next_loop,
+            budget,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(model.utility_calls() > 3);
+    }
+
+    #[tokio::test]
+    async fn summary_cache_invalidates_on_model_binding_and_settings_changes() {
+        let loop_id = LoopId::new().unwrap();
+        let (mut context, model, system) = context();
+        let base = tool_group(loop_id, 0, "x".repeat(8_000));
+        let budget = InputBudget {
+            hard_tokens: 20_000,
+            trigger_tokens: 2_000,
+            target_tokens: 1_000,
+        };
+        let cancellation = CancellationToken::new();
+        run_plan(
+            &context,
+            &system,
+            &base,
+            &[],
+            loop_id,
+            budget,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(model.utility_calls(), 1);
+
+        context.state.note_settings_installed();
+        run_plan(
+            &context,
+            &system,
+            &base,
+            &[],
+            loop_id,
+            budget,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            model.utility_calls(),
+            2,
+            "new settings cannot reuse old summaries"
+        );
+
+        let replacement = RecordingModel::new();
+        context.model = Arc::clone(&replacement) as Arc<dyn Model>;
+        run_plan(
+            &context,
+            &system,
+            &base,
+            &[],
+            loop_id,
+            budget,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replacement.utility_calls(),
+            1,
+            "new utility binding must regenerate"
+        );
+
+        context.budget = Arc::new(crate::models::DefaultProviderBudget);
+        run_plan(
+            &context,
+            &system,
+            &base,
+            &[],
+            loop_id,
+            budget,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replacement.utility_calls(),
+            2,
+            "new provider binding must regenerate"
+        );
     }
 
     #[tokio::test]

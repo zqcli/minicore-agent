@@ -16,7 +16,6 @@ use crate::tools::KNOWN_TOOL_NAMES;
 
 const MAX_EVENT_CAPACITY: usize = 4_096;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
-const MAX_TOOL_ROUNDS: u16 = 1_024;
 /// System prompt is merged with AGENTS.md into one model system message, so
 /// the profile half is capped well under the absolute `ModelMessage` ceiling.
 pub(crate) const MAX_PROFILE_SYSTEM_PROMPT_BYTES: usize = 128 * 1024;
@@ -159,7 +158,6 @@ impl AgentConfig {
                     .system_prompt
                     .chars()
                     .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
-                || !(1..=MAX_TOOL_ROUNDS).contains(&profile.max_tool_rounds)
                 || profile.tools.iter().any(|name| {
                     !KNOWN_TOOL_NAMES.contains(&name.as_str()) || !tools.insert(name.as_str())
                 })
@@ -193,12 +191,13 @@ impl AgentConfig {
     }
 
     /// Builds the per-loop `LoopOptions` for one session turn: runtime safe
-    /// defaults, the session's tool-round budget, and this config's `[loop]`
-    /// overrides. Runtime `LoopLimits` are not configurable in this phase.
-    pub(crate) fn loop_options(&self, max_tool_rounds: u16) -> Result<LoopOptions, ConfigError> {
+    /// defaults and this config's `[loop]` overrides. Legacy stored/profile
+    /// round budgets remain readable but no longer stop normal agent turns.
+    /// Runtime `LoopLimits` are not configurable in this phase.
+    pub(crate) fn loop_options(&self, _max_tool_rounds: u16) -> Result<LoopOptions, ConfigError> {
         let mut options =
             LoopOptions::default_checked().map_err(|_| ConfigError::InvalidLoopOptions)?;
-        options.max_tool_rounds = max_tool_rounds;
+        options.max_tool_rounds = 0;
         let overrides = &self.loop_options;
         if let Some(value) = overrides.event_capacity {
             options.event_capacity = value;
@@ -700,7 +699,7 @@ request_timeout_seconds = 30
         config.loop_options.model_retry_attempts = Some(3);
         config.loop_options.model_retry_base_delay_millis = Some(250);
         let options = config.loop_options(7).unwrap();
-        assert_eq!(options.max_tool_rounds, 7);
+        assert_eq!(options.max_tool_rounds, 0);
         assert_eq!(options.event_capacity, 16);
         assert_eq!(options.max_pending_steers, 8);
         assert_eq!(options.model_retry_attempts, 3);

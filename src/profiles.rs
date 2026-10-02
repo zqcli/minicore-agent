@@ -22,7 +22,8 @@ pub struct Profile {
     pub system_prompt: String,
     #[serde(default)]
     pub tools: Vec<String>,
-    #[serde(default = "default_tool_rounds")]
+    /// Legacy compatibility field; execution has no tool-round limit.
+    #[serde(default)]
     pub max_tool_rounds: u16,
     #[serde(default)]
     pub approval: ApprovalMode,
@@ -35,10 +36,6 @@ pub struct ProfileInfo {
     pub reasoning: ReasoningPreference,
     pub tools: Vec<String>,
     pub approval: ApprovalMode,
-}
-
-fn default_tool_rounds() -> u16 {
-    32
 }
 
 pub(crate) struct Profiles {

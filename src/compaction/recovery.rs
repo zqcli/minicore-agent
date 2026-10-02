@@ -448,9 +448,25 @@ pub(crate) async fn reconstruct_for_recovery(
         }
     };
 
+    let context_hash = match auto.summary_context_hash(
+        &ticket.system,
+        &ticket.tools,
+        ticket.reasoning,
+        hard_tokens,
+        target_tokens,
+    ) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (
+                Err(RecoveryReconstructionError::Other(error.kind().to_owned())),
+                utility_usage,
+            );
+        }
+    };
+    let valid_keys = ranges.iter().map(|(key, _)| key.clone()).collect();
     let mut folded: BTreeMap<super::EphemeralGroupKey, BoundedText> = auto
         .state
-        .ephemeral(loop_id)
+        .ephemeral_for_context(loop_id, context_hash, &valid_keys)
         .map(|summary| summary.groups)
         .unwrap_or_default();
 
@@ -543,8 +559,12 @@ pub(crate) async fn reconstruct_for_recovery(
         };
 
         merge_utility_usage(&mut utility_usage, generation.utility_usage);
-        auto.state
-            .cache_ephemeral(loop_id, key.clone(), generation.content.clone());
+        auto.state.cache_ephemeral_for_context(
+            loop_id,
+            key.clone(),
+            generation.content.clone(),
+            Some(context_hash),
+        );
         folded.insert(key, generation.content);
 
         if let Some((request, tokens, bytes)) = measure_reconstruction(

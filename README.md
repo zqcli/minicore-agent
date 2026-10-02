@@ -7,14 +7,23 @@ library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
 Tool data, and a stdio JSON-RPC service for a client UI.
 
 - Rust edition: 2024; MSRV: **1.85**
-- Runtime: `minicore-runtime 0.4.1`, pinned to Git revision
-  `6cd2bdbc634437dea925495c61c7eb0be10ba171`
+- Runtime: `minicore-runtime 0.4.1`, using the sibling source checkout
+  `../minicore-runtime` for the current unreleased integration.
 - RPC protocol version: **1**
 - Current state: local source freeze (unreleased); see the [0.5.0 freeze
   verification record](docs/verification/0.5.0.md) for centralized status.
   No 0.5.0 tag, push, published artifact, or installed release is identified here.
 
 ## Quickstart
+
+This unreleased source integration requires an adjacent `minicore-runtime`
+checkout containing the matching unlimited-tool-round fix (`0` means unlimited).
+The default Cargo dependency is an explicit relative path, not a test-only patch;
+a standalone Agent checkout therefore cannot build this source tree by itself.
+Before publishing a standalone release, replace that path with a publicly
+available fixed Runtime revision and regenerate the lockfile. The older revision
+`6cd2bdbc634437dea925495c61c7eb0be10ba171` does not implement this new contract.
+No dependency publishing or push is implied by this local integration.
 
 Edit `example.agent.toml` with a real provider model ID and provide the API key
 through the environment variable named by `api_key_env`. The example enables

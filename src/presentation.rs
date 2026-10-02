@@ -1012,32 +1012,38 @@ fn single_line(value: &str, max: usize) -> (String, bool) {
     bounded(&sanitized, max)
 }
 
-/// Joins the two edit bodies without ever allocating more than the expansion
-/// cap. The separator is display-only and is counted in the resulting rows.
-fn bounded_joined(left: &str, right: &str, max: usize) -> (String, bool) {
-    let (left, left_truncated) = bounded(left, max);
-    if left_truncated {
-        return (left, true);
+/// A display-only line diff with an explicit format marker. Bound both the
+/// diff inputs and emitted text; the deadline prevents expensive alignments
+/// from delaying tool invocation/history projection. No raw argument object
+/// is ever exposed through this whitelist.
+fn bounded_edit_diff(old: &str, new: &str) -> (String, bool) {
+    use similar::{Algorithm, ChangeTag, TextDiff};
+    let (old, old_cut) = bounded(old, MAX_EXPANDED_INPUT_BYTES);
+    let (new, new_cut) = bounded(new, MAX_EXPANDED_INPUT_BYTES);
+    let old = sanitize_multiline(&old);
+    let new = sanitize_multiline(&new);
+    let mut config = TextDiff::configure();
+    config
+        .algorithm(Algorithm::Myers)
+        .deadline(std::time::Instant::now() + std::time::Duration::from_millis(25));
+    let diff = config.diff_lines(&old, &new);
+    let mut text = String::from("--- before\n+++ after\n@@\n");
+    for op in diff.ops() {
+        for change in diff.iter_changes(op) {
+            let prefix = match change.tag() {
+                ChangeTag::Equal => ' ',
+                ChangeTag::Delete => '-',
+                ChangeTag::Insert => '+',
+            };
+            let row = format!("{prefix}{}\n", change.value().trim_end_matches('\n'));
+            let (row, cut) = bounded(&row, MAX_EXPANDED_INPUT_BYTES - text.len());
+            text.push_str(&row);
+            if cut {
+                return (text, true);
+            }
+        }
     }
-    if left.is_empty() {
-        return bounded(right, max);
-    }
-    if right.is_empty() {
-        return (left, false);
-    }
-    if left.len() == max {
-        return (left, !right.is_empty());
-    }
-    let remaining = max - left.len();
-    if remaining == 0 {
-        return (left, !right.is_empty());
-    }
-    let mut joined = left;
-    joined.push('\n');
-    let remaining = max - joined.len();
-    let (right, right_truncated) = bounded(right, remaining);
-    joined.push_str(&right);
-    (joined, right_truncated)
+    (text, old_cut || new_cut)
 }
 
 fn path_arg(args: &serde_json::Value, home: &str) -> Option<String> {
@@ -1147,6 +1153,16 @@ pub(crate) fn build_tool_display(
     truncated |= result_truncated;
 
     let (expanded_input, input_line_count) = match name {
+        "bash" => arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| {
+                let sanitized = sanitize_multiline(command);
+                let (text, cut) = bounded(&sanitized, MAX_EXPANDED_INPUT_BYTES);
+                truncated |= cut;
+                (Some(text), Some(count_lines(command)))
+            })
+            .unwrap_or((None, None)),
         "write" => {
             let content = arguments.get("content").and_then(serde_json::Value::as_str);
             content
@@ -1169,9 +1185,7 @@ pub(crate) fn build_tool_display(
             match (old, new) {
                 (Some(old), Some(new)) => {
                     let line_count = count_lines(old) + count_lines(new);
-                    let old = sanitize_multiline(old);
-                    let new = sanitize_multiline(new);
-                    let (text, cut) = bounded_joined(&old, &new, MAX_EXPANDED_INPUT_BYTES);
+                    let (text, cut) = bounded_edit_diff(old, new);
                     truncated |= cut;
                     (Some(text), Some(line_count))
                 }
@@ -1208,11 +1222,13 @@ pub(crate) fn build_tool_display(
     };
 
     let input_rows = match name {
-        "write" | "edit" if expanded_input.is_some() => expanded_input
-            .as_deref()
-            .filter(|text| !text.is_empty())
-            .map(count_lines)
-            .unwrap_or(0),
+        "bash" | "write" | "edit" | "apply_patch" | "patch" if expanded_input.is_some() => {
+            expanded_input
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(count_lines)
+                .unwrap_or(0)
+        }
         _ => json_line_count(args),
     };
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -178,12 +178,13 @@ pub(crate) struct RequestSettings {
     pub(crate) summary_generation: u64,
 }
 
-/// A request-time summary of the active loop's still-unpersisted tool
-/// exchanges. It is bound to one loop and never reused by another loop or
-/// Session, and it is never written to durable history.
+/// Bounded session-local summaries of complete source groups. Source hashes
+/// and the preparing utility context must match before reuse across turns.
+/// This derived cache is never written to durable history.
 #[derive(Clone, Default)]
 pub(crate) struct EphemeralSummary {
     pub(crate) loop_id: Option<LoopId>,
+    context_hash: Option<[u8; 32]>,
     /// Ephemeral summary keyed by the owning loop's source range and content
     /// hash. The range is stable while the loop is live and the hash prevents
     /// reuse after the source history changes.
@@ -225,6 +226,7 @@ impl EphemeralSummary {
     fn for_loop(loop_id: LoopId) -> Self {
         Self {
             loop_id: Some(loop_id),
+            context_hash: None,
             groups: BTreeMap::new(),
         }
     }
@@ -296,9 +298,10 @@ impl CompactionState {
         })
     }
 
-    /// Returns the request-time summary bound to `loop_id`, if any. A summary
-    /// from another loop is never reused; a model/settings update re-estimates
-    /// the same semantic summaries through the new execution binding.
+    /// Returns summaries bound to the active loop. Settled source-identical
+    /// groups can survive between turns; projection verifies their full source
+    /// hash and every request re-estimates them under its execution binding.
+    #[cfg(test)]
     pub(crate) fn ephemeral(&self, loop_id: LoopId) -> Option<EphemeralSummary> {
         self.ephemeral
             .lock()
@@ -308,24 +311,67 @@ impl CompactionState {
             .cloned()
     }
 
+    pub(crate) fn ephemeral_for_context(
+        &self,
+        loop_id: LoopId,
+        context_hash: [u8; 32],
+        valid_keys: &BTreeSet<EphemeralGroupKey>,
+    ) -> Option<EphemeralSummary> {
+        let mut slot = self.ephemeral.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(EphemeralSummary::for_loop(loop_id));
+        }
+        let summary = slot
+            .as_mut()
+            .filter(|summary| summary.loop_id == Some(loop_id))?;
+        if summary.context_hash != Some(context_hash) {
+            summary.groups.clear();
+            summary.context_hash = Some(context_hash);
+        }
+        // History projection can move or remove source ranges between turns.
+        // Unreachable keys must not permanently occupy the bounded cache.
+        summary.groups.retain(|key, _| valid_keys.contains(key));
+        Some(summary.clone())
+    }
+
     pub(crate) fn begin_ephemeral_loop(&self, loop_id: LoopId) {
         let mut slot = self.ephemeral.lock().unwrap();
-        if slot.as_ref().and_then(|summary| summary.loop_id) != Some(loop_id) {
-            *slot = Some(EphemeralSummary::for_loop(loop_id));
+        match slot.as_mut() {
+            Some(summary) => summary.loop_id = Some(loop_id),
+            None => *slot = Some(EphemeralSummary::for_loop(loop_id)),
         }
     }
 
-    /// Caches one ephemeral summary only when the loop-local bounded cache can
+    /// Caches one ephemeral summary only when the session-local bounded cache can
     /// retain it. The caller still uses a successful summary for the current
     /// request when the cache is full.
+    #[cfg(test)]
     pub(crate) fn cache_ephemeral(
         &self,
         loop_id: LoopId,
         key: EphemeralGroupKey,
         summary: BoundedText,
     ) -> bool {
+        self.cache_ephemeral_for_context(loop_id, key, summary, None)
+    }
+
+    pub(crate) fn cache_ephemeral_for_context(
+        &self,
+        loop_id: LoopId,
+        key: EphemeralGroupKey,
+        summary: BoundedText,
+        context_hash: Option<[u8; 32]>,
+    ) -> bool {
         let mut slot = self.ephemeral.lock().unwrap();
-        if slot.as_ref().and_then(|summary| summary.loop_id) != Some(loop_id) {
+        if let Some(context_hash) = context_hash {
+            // A utility request may finish after settings change or cleanup.
+            // Never install its old result into a newer context's cache.
+            if slot.as_ref().is_none_or(|entry| {
+                entry.loop_id != Some(loop_id) || entry.context_hash != Some(context_hash)
+            }) {
+                return false;
+            }
+        } else if slot.as_ref().and_then(|summary| summary.loop_id) != Some(loop_id) {
             *slot = Some(EphemeralSummary::for_loop(loop_id));
         }
         let Some(ephemeral) = slot.as_mut() else {
@@ -368,7 +414,10 @@ impl CompactionState {
             .as_ref()
             .is_some_and(|summary| summary.loop_id == Some(loop_id))
         {
-            *ephemeral = None;
+            // Release turn ownership, not the source-validated summaries.
+            // Otherwise every subsequent turn repeats the same utility calls
+            // and changes the provider-visible prefix for unchanged history.
+            ephemeral.as_mut().unwrap().loop_id = None;
         }
         let mut high_water = self.recovery_high_water.lock().unwrap();
         if high_water
@@ -387,6 +436,11 @@ impl CompactionState {
     /// settings change bumps the config generation, which invalidates tickets
     /// and cached source bindings prepared under the previous configuration.
     pub(crate) fn note_settings_installed(&self) {
+        let mut ephemeral = self.ephemeral.lock().unwrap();
+        if let Some(summary) = ephemeral.as_mut() {
+            summary.groups.clear();
+            summary.context_hash = None;
+        }
         let mut settings = self.settings.lock().unwrap();
         settings.config_generation = settings.config_generation.wrapping_add(1);
     }
@@ -826,6 +880,84 @@ fn valid_sha256(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyed_cache_prunes_unreachable_sources_and_rejects_late_writers() {
+        use super::*;
+        let state = CompactionState::new();
+        let old_loop = LoopId::new().unwrap();
+        state.begin_ephemeral_loop(old_loop);
+        let old_keys: BTreeSet<_> = (0..MAX_EPHEMERAL_GROUPS)
+            .map(|index| EphemeralGroupKey {
+                start: index * 2,
+                end: index * 2 + 2,
+                source_hash: [index as u8; 32],
+            })
+            .collect();
+        state
+            .ephemeral_for_context(old_loop, [1; 32], &old_keys)
+            .unwrap();
+        for key in &old_keys {
+            assert!(state.cache_ephemeral_for_context(
+                old_loop,
+                key.clone(),
+                BoundedText::new("old").unwrap(),
+                Some([1; 32])
+            ));
+        }
+        state.clear_ephemeral(old_loop);
+        let current = LoopId::new().unwrap();
+        state.begin_ephemeral_loop(current);
+        let key = EphemeralGroupKey {
+            start: 500,
+            end: 502,
+            source_hash: [99; 32],
+        };
+        let valid = BTreeSet::from([key.clone()]);
+        assert!(
+            state
+                .ephemeral_for_context(current, [1; 32], &valid)
+                .unwrap()
+                .groups
+                .is_empty()
+        );
+        assert!(state.cache_ephemeral_for_context(
+            current,
+            key.clone(),
+            BoundedText::new("current").unwrap(),
+            Some([1; 32])
+        ));
+        assert_eq!(
+            state
+                .ephemeral_for_context(current, [1; 32], &valid)
+                .unwrap()
+                .groups
+                .len(),
+            1
+        );
+        assert!(!state.cache_ephemeral_for_context(
+            old_loop,
+            key.clone(),
+            BoundedText::new("late loop").unwrap(),
+            Some([1; 32])
+        ));
+        state
+            .ephemeral_for_context(current, [2; 32], &valid)
+            .unwrap();
+        assert!(!state.cache_ephemeral_for_context(
+            current,
+            key.clone(),
+            BoundedText::new("late context").unwrap(),
+            Some([1; 32])
+        ));
+        state.note_settings_installed();
+        assert!(!state.cache_ephemeral_for_context(
+            current,
+            key,
+            BoundedText::new("late settings").unwrap(),
+            Some([2; 32])
+        ));
+    }
+
     use super::*;
 
     #[test]

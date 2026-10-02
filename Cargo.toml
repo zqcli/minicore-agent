@@ -15,8 +15,8 @@ name = "minicore-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Public API is pinned to this exact upstream runtime revision.
-minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "6cd2bdbc634437dea925495c61c7eb0be10ba171", version = "0.4.1" }
+# Unreleased integration uses the matching sibling Runtime fixes; see README.
+minicore-runtime = { path = "../minicore-runtime", version = "0.4.1" }
 # Owned process groups/jobs for the Bash command worker. `tracing` is left off
 # on purpose: a wrapped command must never be logged with its script text.
 process-wrap = { version = "=8.2.0", default-features = false, features = [
