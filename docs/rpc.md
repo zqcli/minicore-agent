@@ -1,6 +1,6 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.5.0 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.6.0 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
 ## Transport And Framing
@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.5.0","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.0","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -74,18 +74,14 @@ requests are dispatched sequentially. The server registers a bounded owned
 waiter/query task and immediately continues reading requests for `turn.wait`,
 `session.compact`, `session.read`, `workspace.read`, `workspace.files`,
 `workspace.search`, `workspace.status`, `changes.list`, `changes.diff`,
-`tool.read`, `tool.output`, and `turn.result`. For an automatic-enabled
-Session, `turn.send` first enters a Session-owned startup admission worker.
-That worker either installs a fitting loop directly or prepares a summary before
-installing it; the RPC result remains deferred until admission publishes a real
-Turn or a failure. A read-query waiter observes a result but is not the worker
-owner. Workspace scan queries own one retained blocking worker and normally join
+`tool.read`, `tool.output`, and `turn.result`. `turn.send` uses the normal
+Session submit path and returns an installed Turn, without a startup summary
+worker or a deferred preparation waiter. A read-query waiter observes a result
+but is not the worker owner. Workspace scan queries own one retained blocking worker and normally join
 it before returning; their Drop guard signals cooperative stop when the query
 future is dropped, but dropping an awaiter is not itself a join barrier. Session
-or RPC cancellation is joined by the query before it returns. For an automatic
-turn, dropping the `PreparationWaiter` requests cooperative cancellation of the
-Session-owned admission; it is still the Session's owner that completes and
-joins that operation. `workspace.status` registers its worker on the loaded
+or RPC cancellation is joined by the query before it returns.
+`workspace.status` registers its worker on the loaded
 Session, which runs at most four and joins every one during close. For query
 paths with an outer cancellation select, caller cancellation can end the wait
 with `-32020`, but does not transfer or remove worker ownership.
@@ -99,9 +95,13 @@ The following orderings are not guaranteed:
 - a deferred response for `turn.wait`, `session.compact`, `session.read`,
   `workspace.read`, `workspace.files`, `workspace.search`, `workspace.status`,
   `changes.list`, `changes.diff`, `tool.read`, `tool.output`, or `turn.result`
-  before responses to later requests;
-- an automatic-enabled Session's `turn.send` response is deferred until startup
-  admission publishes a real Turn or a failure.
+  before responses to later requests.
+
+A successful persisted turn can reserve an independent post-turn compaction
+before publishing completion. `turn.wait` does not wait for that operation;
+while it exists, new sends return `session_busy`, even during a short budget
+check that ultimately finishes Noop. Clients discover it through state/context,
+retain unsent drafts, and must not automatically resend them.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -110,7 +110,7 @@ history query results, not the event stream.
 `agent.shutdown` waits for the Agent, its active workers, pre-existing
 waiter/query tasks, and event pump, then queues its response last. EOF, Ctrl-C,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
-MiniCore Agent v0.5.0 uses the Runtime user-cancellation path when closing or
+MiniCore Agent v0.6.0 uses the Runtime user-cancellation path when closing or
 shutting down an active Session;
 it does not currently preserve a distinct shutdown cancellation reason.
 
@@ -139,7 +139,7 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
   "protocol_version": 1,
   "capabilities": [
     "session.read",
@@ -308,26 +308,28 @@ The result has a `session` member containing the created SessionInfo.
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
-- `session.close` cancels any active loop or manual compaction, joins all
-  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.5.0 uses
+- `session.close` cancels any active loop and manual/post-turn compaction, joins all
+  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.6.0 uses
   the Runtime user-cancellation path when closing or shutting down an active
   Session; it does not currently preserve a distinct shutdown cancellation
   reason.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`.
 - `session.state` takes a loaded Session ID and returns the current Session
-  state projection. While manual compaction is in progress, the optional
+  state projection. While manual or post-turn compaction is in progress, the optional
   `compaction` member reports only its safe operation ID, phase, and item counts;
   clients use its presence, rather than the ordinary loop `status`, to observe
   compaction busy.
-- `session.context` takes a loaded Session ID and returns the current manual
-  compaction operation, validated-summary coverage, latest manual result, and
-  the estimated Runtime history budget. It is read-only and responds
-  immediately, including while manual compaction is busy.
+- `session.context` takes a loaded Session ID and returns the current manual or
+  post-turn compaction operation, validated-summary coverage, latest operation
+  result, and the estimated Runtime history budget. It is read-only and responds
+  immediately, including while compaction is busy.
 - `session.compact` takes `{"session_id":"ses_...","operation_id":"..."}`
   and returns one deferred result after manual compaction finishes. The
-  operation ID is non-empty printable ASCII and at most 128 bytes, and cannot
-  be reused during one loaded Session lifetime. At most 4096 IDs are retained
-  per loaded Session; the bounded set resets on close/reopen, and a new ID at
+  operation ID is non-empty printable ASCII and at most 128 bytes, must not
+  start with reserved `auto-`, and cannot be reused during one loaded Session
+  lifetime. At most 4096 manual IDs are retained per loaded Session; automatic
+  `auto-{completed_loop_id}` IDs do not consume that quota. The bounded manual
+  set resets on close/reopen, and a new manual ID at
   the cap is rejected as invalid input. Compaction is admitted only for a
   loaded, idle, settled, unblocked Session; a busy or duplicate request is
   rejected. `turn.send` and `session.update` are also
@@ -343,8 +345,9 @@ The result has a `session` member containing the created SessionInfo.
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
 
-The manual compaction methods, startup summary projection, automatic compaction,
-and one-shot provider overflow recovery are implemented in the current source.
+Manual and independent post-turn compaction, loading of validated existing
+summaries, and bounded confirmed provider-overflow recovery are implemented.
+Ordinary submit/prepare/context reads do not start threshold-driven summaries.
 This document describes their wire behavior; recorded acceptance evidence and
 installation status are grouped in the [verification index](verification/README.md).
 
@@ -377,8 +380,9 @@ when no model call was made. A failed result contains a safe `failure_kind`
 but never the generated summary body. `unknown_write` means the atomic
 replacement outcome could not be established: the disk may have changed after
 the write or rename, while the old in-memory projection remains unpublished.
-Clients must reread the Session and snapshot before deciding what to do; they
-must not retry blindly.
+Clients may reread state/context to confirm operation termination before deciding
+what to do; these observations do not reload the disk snapshot. The Session is
+not permanently blocked by UnknownWrite. Clients must not retry blindly.
 
 `utility_usage` is non-null once a utility call attempt has been observed. Its
 `call_count` includes an attempt that failed before returning a complete
@@ -436,7 +440,9 @@ The result is returned directly:
 ```
 
 `current_operation`, when non-null, has the same safe progress shape exposed
-by `session.state`; it also names a startup admission preparation. `coverage` is
+by `session.state` for independent manual or post-turn compaction. Automatic IDs
+are `auto-{completed_loop_id}`; manual creation rejects `auto-`, but cancellation
+accepts the actual automatic ID. `coverage` is
 non-zero only for a currently validated summary snapshot; `retained_item_count`
 is calculated against the complete loaded history. `estimated_history_items`,
 `estimated_history_bytes`, and `estimated_history_tokens` describe only the
@@ -447,11 +453,12 @@ input, framing, and provider tokenization. The byte scan is bounded; bytes and
 tokens are `null` when the query cannot finish within that bound, and
 `within_runtime_limits` is then also `null` unless the item
 count already proves an over-limit history. `estimated_request_context_tokens`
-is the latest bounded full-request estimate observed by automatic preparation
-(the current estimate while preparing, otherwise the last completed estimate);
-it is `null` before any automatic preparation. The `automatic` object retains
-only current/last operation metadata, fitting estimates, and bounded utility
-accounting; it does not expose summary bodies or ordinary model-report usage.
+is the latest serialized request estimate recorded before the wrapped model
+starts, or `null` before an estimate is available. It is not a live context
+measure or provider metering and may retain the original rejected attempt's
+estimate after recovery; the reduced value is in `recovery.after_tokens`. The mandatory
+`automatic` compatibility object retains null `current` and `last`. Independent
+operations are represented by `current_operation`/`last_result`, not that shell.
 When automatic compaction is enabled, `input_budget_tokens`,
 `trigger_tokens`, and `target_tokens` describe the model's already-reduced
 context window and the active policy thresholds; they are `null` when the
@@ -464,9 +471,15 @@ an in-flight recovery has been attempted; the field is omitted when the loaded
 Session has no such observation.
 The recovery source is retained only up to 512 KiB; a larger source does not
 receive a recovery ticket. Token counts are estimates, and recovery never
-re-runs tools or duplicates the current User/Steer messages. `last_result` is the latest manual
-compaction result retained by this loaded Session process; it is not a durable
-history record.
+re-runs tools or duplicates the current User/Steer messages. Successful reductions
+remain effective for subsequent requests in the active turn. Local serialized
+budget rejection is `InvalidRequest`, not confirmed upstream overflow; generic
+HTTP 413, partial output and unknown delivery do not trigger compaction.
+`last_result` is the latest manual or post-turn compaction result retained by
+this loaded Session process, not a durable history record. Failure to promote an
+emergency reduction after source persistence is observed separately as
+`recovery_failed` with `emergency_settlement_*`, preserving the original turn
+result and old in-memory snapshot. See [context boundaries](context.md).
 
 ### `session.presentation`
 
@@ -693,29 +706,28 @@ The successful result preserves the original `turn` member and may add
 {"turn":{"session_id":"ses_...","loop_id":"lup_..."},"accepted_at":"2026-01-02T03:04:05.006Z"}
 ```
 
-The timestamp is when the Agent accepted the Prompt (for a deferred automatic
-submission, when its prepared loop is installed), not when the loop or provider
-request completes. It may be omitted if the clock was unavailable.
+The timestamp is when the Agent accepted the Prompt, not when the loop or
+provider request completes. It may be omitted if the clock was unavailable.
 
-For an automatic-enabled Session, `turn.send` enters `Session::submit`, which
-returns `LoopSubmission::Preparing` while its Session-owned startup admission
-worker computes the bounded startup estimate and checks the irreducible minimum
-and Runtime structural limits. That worker either installs the loop directly or
-folds a settled prefix into a bounded `summary.json` before installing it; the
-RPC response remains deferred until a real Turn or a failure is published.
-`session.context` reports the preparing operation while it runs, and
-`session.compact.cancel` terminates a preparation that has not started its loop.
-The server checks deferred capacity before invoking `submit_accepted`, before
-`Session::submit` can start admission; when the pool is full, it returns
-`-32019` (`resource_exhausted`) and does not start an admission worker. If that check passes but the defensive check after
-`LoopSubmission::Preparing` finds the pool full, the server cancels that
-preparation and returns the same error instead of leaving an unawaitable
-operation. A request
-whose irreducible system/current-input/tool-schema minimum still exceeds the
-hard model window fails with `-32022` (`context_uncompressible`); semantic summary
-failures return an internal error and do not start a loop, while their stable
-failure kind is retained in `session.context.last_prepare_failure`. A disabled
-policy keeps the previous immediate `-32015` (`history_too_large`).
+`Session::submit` follows the normal loop installation path; there is no startup
+admission compaction or `LoopSubmission::Preparing`. Runtime structural history
+limits can still reject submission with `history_too_large`. A successfully
+installed turn may later fail request preparation or local serialized-budget
+preflight; `turn.wait`/`turn.result` report that failure and its persistence,
+rather than pretending that the already accepted submit never started.
+
+Crossing a soft threshold within a turn never starts a utility call. Only a
+confirmed safe pre-output upstream capacity rejection can compact and retry the
+rejected logical model request once. Recovery stays within the active turn,
+shares its cancellation/deadline, and never redispatches completed tools.
+An independent post-turn operation instead requires Completed + Persisted and
+automatic compaction enabled. `session.compact.cancel` cancels that operation,
+not the already completed turn; active recovery is cancelled through the turn.
+
+`tool_rounds` in turn results and history/read summaries is an unsigned `u64`
+JSON integer. Old small integer records remain readable, but clients that decode
+it as `u16` cannot read values above 65,535. The legacy `max_tool_rounds`
+configuration field remains `u16` with zero meaning unlimited.
 
 ### `turn.wait`
 
