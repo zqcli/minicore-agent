@@ -287,6 +287,30 @@ fn edit_diff_distinguishes_unchanged_inserted_removed_and_empty_lines() {
 }
 
 #[test]
+fn edit_diff_compares_source_before_escaping_and_preserves_final_newline_changes() {
+    for (old, new, expected) in [
+        ("a\r\n", "a\\r\n", "-a\\r\n+a\\r\n"),
+        (
+            "\u{1b}[31m\n",
+            "\\u{1b}[31m\n",
+            "-\\u{1b}[31m\n+\\u{1b}[31m\n",
+        ),
+        ("中\u{7}\n", "中\\u{7}\n", "-中\\u{7}\n+中\\u{7}\n"),
+        ("same", "same\n", "-same\n+same\n"),
+        ("same\n", "same", "-same\n+same\n"),
+    ] {
+        let (diff, truncated) = bounded_edit_diff(old, new);
+        assert_eq!(diff, format!("--- before\n+++ after\n@@\n{expected}"));
+        assert!(!truncated);
+        assert!(
+            !diff
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+        );
+    }
+}
+
+#[test]
 fn edit_diff_is_bounded_and_escapes_terminal_controls() {
     let display = build_tool_display(
         "edit",

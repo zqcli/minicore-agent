@@ -1020,8 +1020,6 @@ fn bounded_edit_diff(old: &str, new: &str) -> (String, bool) {
     use similar::{Algorithm, ChangeTag, TextDiff};
     let (old, old_cut) = bounded(old, MAX_EXPANDED_INPUT_BYTES);
     let (new, new_cut) = bounded(new, MAX_EXPANDED_INPUT_BYTES);
-    let old = sanitize_multiline(&old);
-    let new = sanitize_multiline(&new);
     let mut config = TextDiff::configure();
     config
         .algorithm(Algorithm::Myers)
@@ -1035,7 +1033,10 @@ fn bounded_edit_diff(old: &str, new: &str) -> (String, bool) {
                 ChangeTag::Delete => '-',
                 ChangeTag::Insert => '+',
             };
-            let row = format!("{prefix}{}\n", change.value().trim_end_matches('\n'));
+            // Alignment must compare source bytes: escaping first can collapse
+            // distinct edits (for example CRLF and a literal backslash-r).
+            let value = sanitize_multiline(change.value().trim_end_matches('\n'));
+            let row = format!("{prefix}{value}\n");
             let (row, cut) = bounded(&row, MAX_EXPANDED_INPUT_BYTES - text.len());
             text.push_str(&row);
             if cut {
