@@ -626,6 +626,7 @@ async fn call_model(
             | ModelEvent::ToolCallEnd { .. } => {
                 return Err(CallError::with_usage(UtilityError::ToolCall, usage));
             }
+            ModelEvent::ProviderReplay { .. } => {}
             ModelEvent::Usage { usage: value } => {
                 if usage.is_some() {
                     // A duplicate usage event makes the call's total
@@ -875,8 +876,11 @@ pub(super) fn history_message(item: &HistoryItem) -> Result<ModelMessage, Utilit
         HistoryItem::User(user) => {
             ModelMessage::user(user.input.as_text()).map_err(|_| UtilityError::TooLarge)
         }
-        HistoryItem::Assistant(assistant) => ModelMessage::assistant(assistant.content.clone())
-            .map_err(|_| UtilityError::InvalidResponse),
+        HistoryItem::Assistant(assistant) => ModelMessage::assistant_with_provider_replay(
+            assistant.content.clone(),
+            assistant.provider_replay.clone(),
+        )
+        .map_err(|_| UtilityError::InvalidResponse),
         HistoryItem::ToolResult(result) => ModelMessage::tool_with_outcome(
             result.call_id.clone(),
             result.output.clone(),
@@ -1137,6 +1141,9 @@ impl SourceChunkWriter {
     }
 
     fn write_group(&mut self, records: &[HistoryItem]) -> io::Result<()> {
+        let records = crate::history::sanitize_history(records)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "history redaction"))?;
+        let records = records.as_ref();
         let total = records.iter().try_fold(0usize, |total, record| {
             serialized_len_io(record)?
                 .checked_add(1)

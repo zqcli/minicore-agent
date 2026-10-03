@@ -22,7 +22,7 @@ use minicore_runtime::tools::ToolResultOutcome;
 
 use crate::changes::{ChangeRevision, StoredFileChange};
 use crate::error::StoreError;
-use crate::history::sanitize_history;
+use crate::history::normalize_history;
 use crate::ids::SessionId;
 use crate::models::Models;
 use crate::profiles::ApprovalMode;
@@ -469,6 +469,8 @@ pub(crate) struct StoredModelError {
     pub(crate) delivery: String,
     pub(crate) retryable: bool,
     pub(crate) retry_after_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_context_budget: Option<crate::event::LocalContextBudgetFailure>,
 }
 
 impl StoredModelError {
@@ -484,6 +486,7 @@ impl StoredModelError {
             delivery: delivery_state(error.delivery()),
             retryable: error.diagnostic().retryable,
             retry_after_millis,
+            local_context_budget: crate::event::LocalContextBudgetFailure::from_model(error),
         }
     }
 }

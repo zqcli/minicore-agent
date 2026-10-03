@@ -225,7 +225,9 @@ pub(crate) enum TicketClaimError {
 pub(crate) fn validate_clean_tool_exchanges(messages: &[ModelMessage]) -> bool {
     let mut index = 0usize;
     while index < messages.len() {
-        if let ModelMessage::Assistant(parts) = &messages[index] {
+        if let ModelMessage::Assistant(parts) | ModelMessage::AssistantWithReplay { parts, .. } =
+            &messages[index]
+        {
             let tool_calls = parts
                 .iter()
                 .filter_map(AssistantPart::as_tool_call)
@@ -1330,6 +1332,7 @@ mod tests {
         .unwrap();
         let base = vec![
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: 0,
                 model: "main".parse().unwrap(),
@@ -1606,6 +1609,7 @@ mod tests {
         let empty: Vec<HistoryItem> = (0..20_000)
             .map(|_| {
                 HistoryItem::Assistant(AssistantHistory {
+                    provider_replay: None,
                     loop_id,
                     request_index: 0,
                     model: "main".parse().unwrap(),

@@ -85,8 +85,16 @@ pub struct CompactionUtilityUsage {
     pub usage: Option<Usage>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionOrigin {
+    Manual,
+    Automatic,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompactionResult {
+    pub origin: CompactionOrigin,
     pub operation_id: String,
     pub status: CompactionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -867,6 +875,7 @@ mod tests {
         let loop_id = LoopId::new().unwrap();
         let assistant = |content| {
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: 0,
                 model: "main".parse().unwrap(),

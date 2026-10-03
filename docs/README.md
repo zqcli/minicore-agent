@@ -11,6 +11,7 @@ verification evidence.
   prompt files, reload, and Session updates.
 - [Architecture](architecture.md): Agent, Session, Runtime, Tool, Store, and
   query ownership.
+- [Provider replay](provider-replay.md): durable output, identity, redaction, and bounds.
 - [Context](context.md): append-only ordinary turns, post-turn/manual summaries,
   bounded emergency recovery, and
   context estimates/errors.
@@ -20,9 +21,9 @@ verification evidence.
 - [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
-These guides describe the current source package **0.6.0**, Rust 2024/MSRV 1.85,
-Runtime `0.6.0` at revision
-`a6bab348194248dc123e10b36a50d713080f3285`, and RPC protocol version `1`.
+These guides describe the current source package **0.6.1**, Rust 2024/MSRV 1.85,
+Runtime `0.6.1` at revision
+`9082184e929508b30cf19f553a6837d075e2fed3`, and RPC protocol version `1`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 

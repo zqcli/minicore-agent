@@ -414,12 +414,58 @@ pub struct SessionStateView {
     pub compaction: Option<CompactionProgress>,
 }
 
+/// Safe numeric evidence from the Agent's local request preflight only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalContextBudgetFailure {
+    pub estimated_tokens: u64,
+    pub input_budget_tokens: u64,
+}
+
+impl LocalContextBudgetFailure {
+    pub(crate) fn from_model(error: &ModelError) -> Option<Self> {
+        use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode};
+        use minicore_runtime::model::{DeliveryState, ModelErrorKind, RetryHint};
+        let diagnostic = error.diagnostic();
+        if error.kind() != ModelErrorKind::InvalidRequest
+            || error.delivery() != DeliveryState::NotStarted
+            || !matches!(error.retry_hint(), RetryHint::Never)
+            || diagnostic.code != DiagnosticCode::InvalidConfiguration
+            || diagnostic.category != DiagnosticCategory::Model
+            || diagnostic.retryable
+        {
+            return None;
+        }
+        let text = diagnostic.message.as_str();
+        let numbers = text
+            .strip_prefix(
+                "local serialized context estimate exceeds input budget: estimated_tokens=",
+            )?
+            .strip_suffix("; use /compact or a larger model")?;
+        let (estimated, budget) = numbers.split_once(", input_budget_tokens=")?;
+        let estimated_tokens = estimated.parse::<u64>().ok()?;
+        let input_budget_tokens = budget.parse::<u64>().ok()?;
+        if estimated != estimated_tokens.to_string()
+            || budget != input_budget_tokens.to_string()
+            || estimated_tokens <= input_budget_tokens
+        {
+            return None;
+        }
+        Some(Self {
+            estimated_tokens,
+            input_budget_tokens,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ModelErrorView {
     pub kind: String,
     pub delivery: String,
     pub retryable: bool,
     pub retry_after_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_context_budget: Option<LocalContextBudgetFailure>,
 }
 
 impl ModelErrorView {
@@ -435,6 +481,7 @@ impl ModelErrorView {
             delivery: crate::store::delivery_state(error.delivery()),
             retryable: error.diagnostic().retryable,
             retry_after_millis,
+            local_context_budget: LocalContextBudgetFailure::from_model(error),
         }
     }
 
@@ -444,6 +491,7 @@ impl ModelErrorView {
             delivery: error.delivery.clone(),
             retryable: error.retryable,
             retry_after_millis: error.retry_after_millis,
+            local_context_budget: error.local_context_budget,
         }
     }
 }
@@ -1095,5 +1143,108 @@ mod tests {
         let debug = format!("{view:?}");
         assert!(!debug.contains("secret progress path"));
         assert!(debug.contains("message_len"));
+    }
+}
+
+#[cfg(test)]
+mod local_budget_tests {
+    use super::*;
+    use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
+    use minicore_runtime::model::{DeliveryState, ModelErrorKind};
+    use minicore_runtime::value::BoundedText;
+
+    fn error(kind: ModelErrorKind, delivery: DeliveryState, text: &str) -> ModelError {
+        ModelError::permanent(
+            kind,
+            delivery,
+            DiagnosticSummary::new(
+                DiagnosticCode::InvalidConfiguration,
+                DiagnosticCategory::Model,
+                BoundedText::new(text).unwrap(),
+                false,
+            ),
+        )
+    }
+    const VALID: &str = "local serialized context estimate exceeds input budget: estimated_tokens=32001, input_budget_tokens=32000; use /compact or a larger model";
+
+    #[test]
+    fn only_exact_local_numeric_preflight_is_exposed_and_persisted() {
+        let error = error(
+            ModelErrorKind::InvalidRequest,
+            DeliveryState::NotStarted,
+            VALID,
+        );
+        let view = ModelErrorView::from_model(&error);
+        assert_eq!(
+            view.local_context_budget,
+            Some(LocalContextBudgetFailure {
+                estimated_tokens: 32001,
+                input_budget_tokens: 32000
+            })
+        );
+        let stored = crate::store::StoredModelError::from_model(&error);
+        let encoded = serde_json::to_vec(&stored).unwrap();
+        let restored: crate::store::StoredModelError = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(ModelErrorView::from_stored(&restored), view);
+        assert!(
+            !String::from_utf8(encoded)
+                .unwrap()
+                .contains("serialized context estimate")
+        );
+    }
+    #[test]
+    fn provider_diagnostics_and_lookalike_numbers_are_not_exposed() {
+        for text in [
+            "provider private body",
+            "local serialized context estimate exceeds input budget; use /compact or a larger model",
+            &VALID.replace("32001", "032001"),
+            &VALID.replace("32001", "+32001"),
+            &VALID.replace("32001", "32000"),
+            &VALID.replace("32001", "18446744073709551616"),
+            &format!("{VALID} secret"),
+        ] {
+            assert!(
+                LocalContextBudgetFailure::from_model(&error(
+                    ModelErrorKind::InvalidRequest,
+                    DeliveryState::NotStarted,
+                    text
+                ))
+                .is_none()
+            );
+        }
+        for delivery in [DeliveryState::Started, DeliveryState::Unknown] {
+            assert!(
+                LocalContextBudgetFailure::from_model(&error(
+                    ModelErrorKind::InvalidRequest,
+                    delivery,
+                    VALID
+                ))
+                .is_none()
+            );
+        }
+        assert!(
+            LocalContextBudgetFailure::from_model(&error(
+                ModelErrorKind::ContextOverflow,
+                DeliveryState::NotStarted,
+                VALID
+            ))
+            .is_none()
+        );
+    }
+    #[test]
+    fn legacy_and_nullable_stored_errors_keep_optional_field_absent() {
+        for suffix in ["", ",\"local_context_budget\":null"] {
+            let old = format!(
+                "{{\"kind\":\"invalid_request\",\"delivery\":\"not_started\",\"retryable\":false,\"retry_after_millis\":null{suffix}}}"
+            );
+            let stored: crate::store::StoredModelError = serde_json::from_str(&old).unwrap();
+            assert!(stored.local_context_budget.is_none());
+            assert!(
+                serde_json::to_value(ModelErrorView::from_stored(&stored))
+                    .unwrap()
+                    .get("local_context_budget")
+                    .is_none()
+            );
+        }
     }
 }

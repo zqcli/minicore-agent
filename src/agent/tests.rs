@@ -109,6 +109,7 @@ impl BlockGate {
 
 #[derive(Clone)]
 enum ModelScript {
+    ReplayOnly(minicore_runtime::model::ProviderReplay),
     Text(&'static str),
     /// Text answer with a distinct per-request usage so per-request identity
     /// (loop_id, request_index) can be asserted (spec 9.4/12.4).
@@ -313,6 +314,12 @@ impl Model for FakeModel {
                     let stream: ModelStream = Box::pin(stream::iter(event_rows));
                     Ok(stream)
                 }
+                ModelScript::ReplayOnly(replay) => events(vec![
+                    ModelEvent::ProviderReplay { replay },
+                    ModelEvent::Finish {
+                        reason: ModelFinishReason::Stop,
+                    },
+                ]),
                 ModelScript::Text(text) => {
                     // Respect ModelEvent's delta bound while allowing fixtures
                     // to exercise the independently bounded assembled response.
@@ -586,6 +593,7 @@ fn synthetic_loop_record(
             input: minicore_runtime::execution::UserInput::text(user_text).unwrap(),
         }),
         HistoryItem::Assistant(AssistantHistory {
+            provider_replay: None,
             loop_id,
             request_index: 0,
             model: "main".parse::<ModelRef>().unwrap(),
@@ -597,6 +605,7 @@ fn synthetic_loop_record(
     ];
     if include_opaque_reasoning {
         items.push(HistoryItem::Assistant(AssistantHistory {
+            provider_replay: None,
             loop_id,
             request_index: 1,
             model: "main".parse::<ModelRef>().unwrap(),
@@ -646,6 +655,7 @@ fn synthetic_tool_loop_record(loop_id: minicore_runtime::LoopId) -> StoredLoopRe
                 input: minicore_runtime::execution::UserInput::text("suffix user").unwrap(),
             }),
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: 0,
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -941,6 +951,7 @@ async fn valid_summary_allows_history_over_runtime_byte_limit_to_start() {
     let items = (0..item_count)
         .map(|index| {
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: u32::try_from(index).unwrap(),
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -8372,6 +8383,7 @@ async fn openai_overflow_loopback(preflight: bool) -> MockServer {
                 "status": "completed",
                 "output": [{
                     "type": "message",
+                    "id": "msg_fixture",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": "Summary of prior read execution"}]
                 }]
@@ -8399,6 +8411,7 @@ async fn openai_overflow_loopback(preflight: bool) -> MockServer {
                 "status": "completed",
                 "output": [{
                     "type": "message",
+                    "id": "msg_fixture",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": "Recovered: file contains hello"}]
                 }]
@@ -8519,10 +8532,14 @@ async fn run_openai_overflow_loopback(preflight: bool) {
     let history = read_store_history(&data_dir, info.session_id).await;
     let texts = flatten_texts(&history);
     assert!(texts.iter().any(|t| t == "Recovered: file contains hello"));
-    // Provider-owned metadata stays in the request continuation and is never
-    // persisted into durable history.
+    // Durable history retains provider replay; public/prose views strip it.
     assert!(
-        !serde_json::to_string(&history)
+        serde_json::to_string(&history)
+            .unwrap()
+            .contains(REPLAY_MARKER)
+    );
+    assert!(
+        !serde_json::to_string(crate::history::sanitize_history(&history).unwrap().as_ref())
             .unwrap()
             .contains(REPLAY_MARKER)
     );
@@ -8683,7 +8700,7 @@ fn emergency_http_tool_response(call_id: &str, path: &str, opaque: &str) -> Mock
 }
 
 fn emergency_http_text_response(text: &str) -> MockResponse {
-    let item = json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":text}]});
+    let item = json!({"type":"message", "id":"msg_fixture", "role":"assistant", "content":[{"type":"output_text","text":text}]});
     MockResponse::sse(&[
         json!({"type":"response.output_text.delta", "delta":text}),
         json!({"type":"response.output_item.added", "output_index":0, "item":item}),
@@ -8740,12 +8757,16 @@ async fn openai_session_emergency_projection_survives_driver_retry_followups_and
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read a, b, c once").await;
     let result = wait_text(&agent, turn).await;
-    assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    ));
-    assert_eq!(result.report.tool_rounds, 3);
     let captured = server.finish().await;
+    assert!(
+        matches!(
+            result.report.outcome,
+            minicore_runtime::LoopOutcome::Completed
+        ),
+        "{:?}",
+        result.report.outcome
+    );
+    assert_eq!(result.report.tool_rounds, 3);
     assert_eq!(captured.len(), 9);
     let bodies = captured
         .iter()
@@ -8804,7 +8825,12 @@ async fn openai_session_emergency_projection_survives_driver_retry_followups_and
     for name in ["a", "b", "c"] {
         assert!(raw.contains(&format!("RAW-HTTP-{name}")));
     }
-    assert!(!raw.contains(REPLAY_MARKER));
+    assert!(raw.contains(REPLAY_MARKER));
+    assert!(
+        !serde_json::to_string(crate::history::sanitize_history(&stored).unwrap().as_ref())
+            .unwrap()
+            .contains(REPLAY_MARKER)
+    );
     agent.close_session(info.session_id).await.unwrap();
 }
 
@@ -9333,6 +9359,7 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
                 input: minicore_runtime::execution::UserInput::text("delegate this").unwrap(),
             }),
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: 0,
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -9514,6 +9541,7 @@ async fn s1_five_tool_subset_record_with_old_history_still_executes() {
                 input: minicore_runtime::execution::UserInput::text("old delegate").unwrap(),
             }),
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: 0,
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -11546,4 +11574,95 @@ async fn f1_native_write_changes_keep_the_first_request_identity() {
     assert_eq!(added, "agent\n");
 
     agent.close_session(info.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_does_not_merge() {
+    const OPAQUE: &str = "SYNTHETIC-READ-REPLAY-SECRET";
+    for fail in [false, true] {
+        let (data_dir, _guard) = fixture_dir(&format!("replay-read-{fail}-{}", next_id()));
+        let (workspace, _workspace_guard) = workspace_file("replay-read-ws", "a.txt", b"hello");
+        let replay=minicore_runtime::model::ProviderReplay::new("openai-responses-v1", json!({
+            "endpoint":"http://localhost/v1/responses", "model":"provider-model",
+            "output":[{"type":"reasoning","id":"rs_only","summary":[],"encrypted_content":OPAQUE}]
+        })).unwrap();
+        let model = FakeModel::new("main", [ModelScript::ReplayOnly(replay)]);
+        let mut agent = open_agent(
+            &data_dir,
+            BTreeMap::from([("main".to_owned(), model)]),
+            read_profile(),
+        )
+        .await;
+        let info = create_session(&mut agent, &workspace).await;
+        if fail {
+            fail_next_append(info.session_id);
+        }
+        let turn = send_text(&mut agent, info.session_id, "opaque-only response").await;
+        let result = wait_text(&agent, turn).await;
+        assert_eq!(
+            result.report.outcome,
+            minicore_runtime::LoopOutcome::Completed
+        );
+        assert!(result.report.appended.iter().any(|item| matches!(item,HistoryItem::Assistant(a) if a.content.is_empty() && a.provider_replay.is_some())));
+        let expected = if fail { 0 } else { 2 };
+        assert_eq!(
+            agent
+                .history(GetHistory {
+                    session_id: info.session_id,
+                    offset: 0,
+                    limit: 100
+                })
+                .unwrap()
+                .total,
+            expected
+        );
+        if fail {
+            assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
+            assert!(
+                read_store_history(&data_dir, info.session_id)
+                    .await
+                    .is_empty()
+            );
+        } else {
+            assert!(
+                serde_json::to_string(&read_store_history(&data_dir, info.session_id).await)
+                    .unwrap()
+                    .contains(OPAQUE)
+            );
+            for loaded in [true, false] {
+                if !loaded {
+                    agent.close_session(info.session_id).await.unwrap();
+                }
+                let mut cursor = None;
+                let mut captured_end = None;
+                let mut history_revision = None;
+                let mut indexes = std::collections::BTreeSet::new();
+                loop {
+                    let page = agent
+                        .read_session(ReadSession {
+                            session_id: info.session_id,
+                            cursor,
+                            limit: 1,
+                            max_bytes: Some(4096),
+                            captured_end,
+                            history_revision,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!serde_json::to_string(&page).unwrap().contains(OPAQUE));
+                    for item in &page.items {
+                        indexes.insert(item.index);
+                    }
+                    cursor = page.next_cursor;
+                    captured_end = Some(page.captured_end);
+                    history_revision = Some(page.history_revision);
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(indexes, std::collections::BTreeSet::from([0, 1]));
+            }
+        }
+        agent.shutdown().await.unwrap();
+    }
 }

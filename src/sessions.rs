@@ -25,8 +25,8 @@ use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
 use crate::compaction::{
-    AutoContext, AutomaticCompactionView, CompactionInput, CompactionPolicy, CompactionResult,
-    CompactionState, CompactionStatus, CompactionUtilityUsage, generate_summary,
+    AutoContext, AutomaticCompactionView, CompactionInput, CompactionOrigin, CompactionPolicy,
+    CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage, generate_summary,
 };
 use crate::config::map_loop_start_error;
 use crate::error::{AgentError, StoreError};
@@ -34,7 +34,7 @@ use crate::event::{
     AgentEvent, AgentEventSink, CancelReasonView, EventMeta, LoopOutcomeView, ModelErrorView,
     OutputChannel, ToolProgressView, ToolResultView,
 };
-use crate::history::{GetHistory, HistoryPage, page_history, sanitize_history};
+use crate::history::{GetHistory, HistoryPage, normalize_history, page_history};
 use crate::ids::SessionId;
 use crate::presentation::SteerReceiptPrompt;
 use crate::prompt::ProjectPromptProvider;
@@ -629,6 +629,7 @@ impl SessionTask {
 }
 
 struct CompactionOperation {
+    origin: CompactionOrigin,
     operation_id: String,
     cancellation: CancellationToken,
     result: watch::Sender<Option<CompactionResult>>,
@@ -1689,7 +1690,13 @@ fn estimate_history_item_bytes(item: &HistoryItem) -> usize {
             .content
             .iter()
             .map(estimate_assistant_part_bytes)
-            .sum(),
+            .sum::<usize>()
+            .saturating_add(
+                assistant
+                    .provider_replay
+                    .as_ref()
+                    .map_or(0, |replay| replay.byte_len()),
+            ),
         HistoryItem::ToolResult(result) => {
             result.call_id.as_str().len()
                 + result.tool_name.as_str().len()
@@ -1786,7 +1793,7 @@ async fn run_active_loop(
         }
     };
 
-    let sanitized = match sanitize_history(report.appended.as_ref()) {
+    let sanitized = match normalize_history(report.appended.as_ref()) {
         Ok(items) => items,
         Err(_) => {
             completion.publish_internal();
@@ -1910,7 +1917,10 @@ async fn run_active_loop(
     // Own the join slot before reserving. Reservation excludes the next
     // submit and close captures its cancellation owner under the same lock.
     // There is no await between completion publication and handle installation.
-    let (operation, _) = CompactionOperation::new(format!("auto-{}", turn.loop_id));
+    let (operation, _) = CompactionOperation::new(
+        format!("auto-{}", turn.loop_id),
+        CompactionOrigin::Automatic,
+    );
     let mut join_slot = operation.join.lock().await;
     let reservation = if persistence == TurnPersistence::Persisted
         && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)

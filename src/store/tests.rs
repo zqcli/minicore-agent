@@ -652,6 +652,7 @@ async fn extended_reasoning_values_round_trip_in_record_and_history() {
                     loop_id,
                     outcome: StoredLoopOutcome::Completed,
                     items: vec![HistoryItem::Assistant(AssistantHistory {
+                        provider_replay: None,
                         loop_id,
                         request_index: 0,
                         model: "main".parse().unwrap(),
@@ -1085,6 +1086,7 @@ async fn record_too_large_append_is_rejected() {
         .unwrap();
     let loop_id = LoopId::new().unwrap();
     let oversized_item = HistoryItem::Assistant(AssistantHistory {
+        provider_replay: None,
         loop_id,
         request_index: 0,
         model: "main".parse().unwrap(),
@@ -1214,6 +1216,7 @@ async fn loaded_history_is_sanitized_of_opaque_reasoning() {
     )
     .unwrap();
     let assistant = HistoryItem::Assistant(AssistantHistory {
+        provider_replay: None,
         loop_id,
         request_index: 0,
         model: "main".parse::<ModelRef>().unwrap(),
@@ -1291,6 +1294,7 @@ async fn historical_subagent_history_items_remain_generic_and_readable() {
         outcome: StoredLoopOutcome::Completed,
         items: vec![
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index: 0,
                 model: "main".parse::<ModelRef>().unwrap(),
