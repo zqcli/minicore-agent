@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0 — 2026-10-03
+
+- Ordinary turns are append-only across soft thresholds; create/open/submit and
+  context reads no longer launch routine startup or per-request summaries.
+- Completed + Persisted turns can reserve an independent automatic compaction
+  using the existing manual operation engine. Original turn completion does not
+  wait for summary generation; even a short Noop budget check can make submit
+  temporarily busy. Clients retain drafts without automatic resend.
+- Confirmed safe pre-output context-capacity rejection permits one bounded
+  compact-and-retry of that logical model request. Reduced context survives
+  follow-ups and delivery retries, tools are not replayed, and later real growth
+  may have its own recovery opportunity. Local serialized hard estimates,
+  generic HTTP 413, partial output and unknown delivery do not trigger recovery.
+- Existing emergency summaries can become a source-validated durable snapshot
+  after history persistence, without another model call. The existing 64 KiB
+  summary-content bound remains: explicit `emergency_settlement_*` failures preserve original
+  history/results and the old projection; UnknownWrite does not block the
+  Session or masquerade as success. Context reads do not reload disk snapshots.
+- Manual operation creation reserves the `auto-` namespace for post-turn IDs;
+  cancellation still accepts those IDs. The mandatory `automatic` wire object
+  remains as a null current/last compatibility shell; operation and recovery
+  observations remain distinct. RPC protocol version stays 1.
+- Tool-round statistics are `u64` across Runtime, persistence and read/event
+  DTOs; old small integers remain readable. Older clients limited to `u16`
+  cannot read counts above 65,535. Legacy `max_tool_rounds` remains `u16` and
+  zero means unlimited; no new tool-round cap is introduced.
+- Edit presentation diffs bounded raw source before sanitizing emitted rows,
+  preserving deadline/size controls and distinct CRLF versus literal escapes.
+- Standalone builds pin Runtime 0.6.0 at
+  `9e230617d36130e7ec77aba122b45f1347ac53f2`; no sibling checkout is needed.
+  MSRV remains Rust 1.85. This source release does not publish registry packages
+  or install binaries. Historical verification records below remain unchanged.
+
 ## 0.5.0 — Unreleased
 
 This is the current 0.5.0 local source freeze (unreleased). It has not been

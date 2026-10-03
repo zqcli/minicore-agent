@@ -11,7 +11,8 @@ verification evidence.
   prompt files, reload, and Session updates.
 - [Architecture](architecture.md): Agent, Session, Runtime, Tool, Store, and
   query ownership.
-- [Context](context.md): durable history, summaries, ephemeral fitting, and
+- [Context](context.md): append-only ordinary turns, post-turn/manual summaries,
+  bounded emergency recovery, and
   context estimates/errors.
 - [Security](security.md): local trust assumptions, Workspace limits, redaction,
   stdout, and Store scope.
@@ -19,9 +20,9 @@ verification evidence.
 - [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
-These guides describe the current source package **0.5.0**, Rust 2024/MSRV 1.85,
-Runtime `0.4.1` at revision
-`6cd2bdbc634437dea925495c61c7eb0be10ba171`, and RPC protocol version `1`.
+These guides describe the current source package **0.6.0**, Rust 2024/MSRV 1.85,
+Runtime `0.6.0` at revision
+`9e230617d36130e7ec77aba122b45f1347ac53f2`, and RPC protocol version `1`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 
@@ -29,7 +30,7 @@ formats.
 
 - [Verification index](verification/README.md): historical evidence plus the
   centralized 0.5.0 freeze record and its measured status.
-- [0.5.0 freeze record](verification/0.5.0.md): current source, compatibility,
+- [0.5.0 freeze record](verification/0.5.0.md): historical source, compatibility,
   static checks, and measured remote gate results.
 - [Archive index](archive/README.md): historical context, plans, and tracked
   specifications marked not current.

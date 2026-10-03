@@ -2,28 +2,24 @@
 
 [![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
-MiniCore Agent **0.5.0** is an RPC-first local agent core. It provides a Rust
+MiniCore Agent **0.6.0** is an RPC-first local agent core. It provides a Rust
 library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
 Tool data, and a stdio JSON-RPC service for a client UI.
 
 - Rust edition: 2024; MSRV: **1.85**
-- Runtime: `minicore-runtime 0.4.1`, using the sibling source checkout
-  `../minicore-runtime` for the current unreleased integration.
+- Runtime: `minicore-runtime 0.6.0`, pinned to Git revision
+  `9e230617d36130e7ec77aba122b45f1347ac53f2`.
 - RPC protocol version: **1**
-- Current state: local source freeze (unreleased); see the [0.5.0 freeze
-  verification record](docs/verification/0.5.0.md) for centralized status.
-  No 0.5.0 tag, push, published artifact, or installed release is identified here.
+- Versioned source delivery uses the `dev` branch and annotated release tags;
+  this does not imply a package-registry publication or binary installation.
+  Historical verification records retain their original scope and dates.
 
 ## Quickstart
 
-This unreleased source integration requires an adjacent `minicore-runtime`
-checkout containing the matching unlimited-tool-round fix (`0` means unlimited).
-The default Cargo dependency is an explicit relative path, not a test-only patch;
-a standalone Agent checkout therefore cannot build this source tree by itself.
-Before publishing a standalone release, replace that path with a publicly
-available fixed Runtime revision and regenerate the lockfile. The older revision
-`6cd2bdbc634437dea925495c61c7eb0be10ba171` does not implement this new contract.
-No dependency publishing or push is implied by this local integration.
+A standalone checkout fetches the fixed Runtime Git revision from `Cargo.toml`
+and `Cargo.lock`; no adjacent Runtime checkout or path override is required.
+Tool-round execution defaults to unlimited (`0`), while cancellation, deadlines,
+and other resource limits remain active.
 
 Edit `example.agent.toml` with a real provider model ID and provide the API key
 through the environment variable named by `api_key_env`. The example enables
@@ -73,6 +69,27 @@ authority. Existing v0.2 Session data is not migrated.
 Warm in-memory observations are preferred, while bounded cold reads use durable
 Store data when a Session is unloaded or retained bytes were evicted.
 
+## 0.6.0 Context And Compatibility
+
+Ordinary turns append context without threshold-driven summaries. Automatic
+compaction is an independent operation after a Completed + Persisted turn;
+manual `/compact` remains idle-only. A confirmed safe pre-output upstream
+context-capacity rejection can compact and retry that logical model request
+once, without restarting the task or replaying tools. Local hard estimates,
+partial output, unknown delivery and generic HTTP 413 are not that exception.
+
+`turn.wait` does not wait for post-turn compaction. Even a budget check that
+becomes Noop can briefly make submit busy; clients preserve drafts and reconcile
+state/context without auto-resending. Manual operation IDs cannot use `auto-`.
+`tool_rounds` statistics are now `u64`; clients restricted to `u16` cannot read
+counts above 65,535. RPC version and storage formats do not mechanically change.
+
+Emergency reductions are promoted only after their source is persisted. The
+existing 64 KiB summary-content bound can prevent promotion of a large tail;
+`emergency_settlement_*` failures preserve the original turn/history and old
+in-memory projection. UnknownWrite remains non-blocking and does not imply
+success or a disk reload from context queries. See [context and compaction](docs/context.md).
+
 ## RPC Surface
 
 The service implements 33 methods, grouped here for orientation rather than as
@@ -117,8 +134,8 @@ cross-process lock.
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
 
-The [0.5.0 freeze verification record](docs/verification/0.5.0.md) is the
-central current status entry for the measured local freeze. Verification records
+The [0.5.0 freeze verification record](docs/verification/0.5.0.md) documents
+that historical local freeze, not the current release. Verification records
 preserve the facts and limitations of the runs they record and are not substitutes
 for this current contract. Historical release notes remain under
 [`docs/releases`](docs/releases/0.3.3.md), and archived plans and specifications
