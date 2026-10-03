@@ -454,7 +454,7 @@ pub struct TurnResultView {
     pub outcome: LoopOutcomeView,
     pub usage: Usage,
     pub requests: u32,
-    pub tool_rounds: u16,
+    pub tool_rounds: u64,
     pub final_config_revision: ConfigRevision,
     pub persistence: TurnPersistence,
 }

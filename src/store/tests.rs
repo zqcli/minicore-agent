@@ -215,6 +215,67 @@ async fn append_raw_history_json_line(store: &Store, session_id: SessionId, json
 }
 
 #[tokio::test]
+async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
+    let (base, store, session_id) = fixture("wide-tool-rounds").await;
+    store
+        .create_session(&record(&store, session_id))
+        .await
+        .unwrap();
+    let counts = [0_u64, 32, 65_535, 65_536, 70_000];
+    let mut loop_ids = Vec::new();
+    for count in counts {
+        let mut entry = loop_record(session_id, "count fixture");
+        entry.tool_rounds = count;
+        loop_ids.push(entry.loop_id);
+        // Old records have the same JSON integer representation, without
+        // the later optional user_times field. No storage migration is needed.
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["tool_rounds"].as_u64(), Some(count));
+        assert!(value.get("user_times").is_none());
+        append_raw_history_json_line(&store, session_id, &value.to_string()).await;
+    }
+    drop(store);
+    let reopened = Store::open(base.clone()).await.unwrap();
+    assert_eq!(
+        reopened
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .history
+            .len(),
+        counts.len()
+    );
+    let limits = HistoryScanLimits {
+        // History pages reserve one maximum-sized record before retaining
+        // source items, independently of this fixture's small on-disk size.
+        max_bytes: MAX_LOOP_RECORD_BYTES as u64 + 1024 * 1024,
+        max_lines: 100,
+        deadline: Instant::now() + std::time::Duration::from_secs(5),
+        cancellation: CancellationToken::new(),
+    };
+    for (loop_id, count) in loop_ids.into_iter().zip(counts) {
+        let entry = reopened
+            .read_loop_record(session_id, loop_id, &limits)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.tool_rounds, count);
+    }
+    let page = reopened
+        .read_history_page(session_id, 0, 100, None, None, None, None, &limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.turns
+            .iter()
+            .map(|turn| turn.tool_rounds)
+            .collect::<Vec<_>>(),
+        counts
+    );
+    fs::remove_dir_all(base).await.unwrap();
+}
+
+#[tokio::test]
 async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible() {
     let (base, store, session_id) = fixture("user-times").await;
     let session = record(&store, session_id);

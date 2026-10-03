@@ -112,7 +112,7 @@ pub struct ReadTurnSummary {
     pub outcome: LoopOutcomeView,
     pub usage: Usage,
     pub requests: u32,
-    pub tool_rounds: u16,
+    pub tool_rounds: u64,
     pub final_config_revision: minicore_runtime::execution::ConfigRevision,
     pub completed_at: String,
 }
@@ -172,7 +172,7 @@ pub struct TurnResultPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requests: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_rounds: Option<u16>,
+    pub tool_rounds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_config_revision: Option<minicore_runtime::execution::ConfigRevision>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1209,6 +1209,92 @@ mod tests {
             kind: minicore_runtime::history::UserMessageKind::Prompt,
             input: minicore_runtime::execution::UserInput::text(text).unwrap(),
         })
+    }
+
+    #[tokio::test]
+    async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
+        for tool_rounds in [65_535_u64, 65_536, 70_000] {
+            let loop_id = LoopId::new().unwrap();
+            let turn = TurnRef {
+                session_id: SessionId::new().unwrap(),
+                loop_id,
+            };
+            let live = Arc::new(crate::sessions::TurnResult {
+                turn,
+                report: Arc::new(minicore_runtime::LoopReport {
+                    loop_id,
+                    outcome: minicore_runtime::LoopOutcome::Completed,
+                    appended: Arc::from([]),
+                    usage: Usage::default(),
+                    requests: 1,
+                    tool_rounds,
+                    final_config_revision: ConfigRevision::INITIAL,
+                }),
+                persistence: TurnPersistence::Persisted,
+            });
+            let event = crate::event::TurnResultView::from_turn_result(&live);
+            assert_eq!(
+                serde_json::to_value(event).unwrap()["tool_rounds"].as_u64(),
+                Some(tool_rounds)
+            );
+            let stored = StoredLoopRecord {
+                loop_id,
+                outcome: StoredLoopOutcome::Completed,
+                items: Vec::new(),
+                usage: Usage::default(),
+                requests: 1,
+                tool_rounds,
+                final_config_revision: ConfigRevision::INITIAL,
+                completed_at: "2026-10-03T00:00:00Z".to_owned(),
+                user_times: None,
+            };
+            let cancellation = CancellationToken::new();
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            let live_page = live_turn_page(
+                turn,
+                live,
+                ReadCursor::start(),
+                100,
+                4096,
+                &cancellation,
+                deadline,
+            )
+            .await
+            .unwrap();
+            let stored_page = stored_turn_page(
+                turn,
+                stored,
+                ReadCursor::start(),
+                100,
+                4096,
+                &cancellation,
+                deadline,
+            )
+            .await
+            .unwrap();
+            for page in [live_page, stored_page] {
+                assert_eq!(page.tool_rounds, Some(tool_rounds));
+                assert_eq!(
+                    serde_json::to_value(page).unwrap()["tool_rounds"].as_u64(),
+                    Some(tool_rounds)
+                );
+            }
+            let summary = ReadTurnSummary::from_stored(&StoredTurnSummary {
+                item_start: 0,
+                item_end: 0,
+                loop_id,
+                outcome: StoredLoopOutcome::Completed,
+                usage: Usage::default(),
+                requests: 1,
+                tool_rounds,
+                final_config_revision: ConfigRevision::INITIAL,
+                completed_at: "2026-10-03T00:00:00Z".to_owned(),
+            });
+            assert_eq!(
+                serde_json::to_value(summary).unwrap()["tool_rounds"].as_u64(),
+                Some(tool_rounds)
+            );
+        }
     }
 
     #[tokio::test]

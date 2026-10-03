@@ -225,7 +225,20 @@ impl OpenAiResponsesModel {
             serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
         let estimated_tokens = encoded.len().div_ceil(4) as u64;
         if estimated_tokens > self.descriptor.context_window {
-            return Err(local_error(ModelErrorKind::ContextOverflow));
+            // Conservative byte/4 preflight of the exact emitted body,
+            // including opaque replay. This is not a provider capacity rejection
+            // and must never authorize emergency compaction.
+            return Err(ModelError::permanent(
+                ModelErrorKind::InvalidRequest,
+                DeliveryState::NotStarted,
+                DiagnosticSummary::new(
+                    DiagnosticCode::InvalidConfiguration,
+                    DiagnosticCategory::Model,
+                    BoundedText::new("local serialized context estimate exceeds input budget; use /compact or a larger model")
+                        .expect("static preflight diagnostic"),
+                    false,
+                ),
+            ));
         }
         Ok((encoded, matched_request_indexes))
     }
@@ -822,7 +835,7 @@ async fn classify_http_error(
         400 | 422 => local_error(ModelErrorKind::InvalidRequest),
         401 | 403 => local_error(ModelErrorKind::AuthRejected),
         408 => unknown_error(ModelErrorKind::Timeout),
-        413 => local_error(ModelErrorKind::ContextOverflow),
+        413 => local_error(ModelErrorKind::InvalidRequest),
         429 if quota_exceeded => local_error(ModelErrorKind::QuotaExceeded),
         429 => retryable_error(
             ModelErrorKind::RateLimited,

@@ -478,16 +478,6 @@ impl Agent {
         self.sessions.get(session_id).cloned()
     }
 
-    pub(crate) fn automatic_compaction_enabled(
-        &self,
-        session_id: crate::ids::SessionId,
-    ) -> Result<bool, AgentError> {
-        self.sessions
-            .get(session_id)
-            .map(crate::sessions::Session::automatic_compaction_enabled)
-            .ok_or(AgentError::SessionNotLoaded)
-    }
-
     pub(crate) fn store_handle(&self) -> Store {
         self.store.clone()
     }
@@ -1006,10 +996,7 @@ impl Agent {
         Ok(SessionInfo::from_record(&record, false))
     }
 
-    /// Sends a prompt and preserves the original public return type. A startup
-    /// preparation is awaited here so embedded callers still receive a real
-    /// `TurnRef`; RPC uses `submit_accepted` to defer instead of blocking the
-    /// reader.
+    /// Starts an ordinary user turn without pre-turn summarization.
     pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
         let session = self
             .sessions
@@ -1019,17 +1006,10 @@ impl Agent {
         let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
         match session.submit(input).await? {
             crate::sessions::LoopSubmission::Accepted(accepted) => Ok(accepted.turn),
-            crate::sessions::LoopSubmission::Preparing(waiter) => {
-                crate::sessions::await_loop_preparation(waiter)
-                    .await
-                    .map(|accepted| accepted.turn)
-            }
         }
     }
 
-    /// Admits one submission for the RPC server. An automatic session returns
-    /// a preparation the server observes as a deferred waiter; a disabled
-    /// session returns the loop immediately.
+    /// Starts one submission for the RPC server through the normal turn path.
     pub(crate) async fn submit_accepted(
         &mut self,
         request: SendMessage,
@@ -1047,7 +1027,7 @@ impl Agent {
         &mut self,
         request: CompactSession,
     ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
-        if !valid_operation_id(&request.operation_id) {
+        if !valid_operation_id(&request.operation_id) || request.operation_id.starts_with("auto-") {
             return Err(AgentError::InvalidInput);
         }
         let session = self

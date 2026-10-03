@@ -7,9 +7,7 @@ use minicore_runtime::prompt::{
 };
 use minicore_runtime::value::BoundedText;
 
-use crate::compaction::{
-    AutoContext, CompactionState, PlanError, UtilityError, plan as plan_auto, summary_data_message,
-};
+use crate::compaction::{AutoContext, CompactionState, summary_data_message};
 use crate::workspace::{ReadPrefix, Workspace, WorkspaceError};
 
 pub(crate) const AGENTS_PATH: &str = "AGENTS.md";
@@ -23,11 +21,9 @@ const TRUNCATED: &str = "[truncated]";
 /// history to the runtime `DefaultPromptProvider`.
 ///
 /// `AGENTS.md` is re-read for every model request, so edits become visible at
-/// the next request boundary without a file cache or watcher. With automatic
-/// compaction enabled, the same request also performs a bounded context
-/// estimate and folds complete tool exchanges or settled base items into
-/// ephemeral semantic summaries when needed. The disabled path retains Runtime's normal prompt
-/// preparation behavior.
+/// the next request boundary without a file cache or watcher. Ordinary
+/// preparation only appends history. A previously installed emergency
+/// projection is reused, but preparation never generates a summary.
 pub(crate) struct ProjectPromptProvider {
     workspace: Arc<Workspace>,
     system_prompt: BoundedText,
@@ -195,95 +191,75 @@ impl PromptProvider for ProjectPromptProvider {
                 history.appended(),
             )
             .map_err(|_| PromptError::InvalidHistory)?;
-            let budget = auto.policy.budget(model.context_window);
-            match plan_auto(
+            let items = projected_base
+                .iter()
+                .chain(history.appended())
+                .collect::<Vec<_>>();
+            let ranges =
+                crate::compaction::auto::compressible_ranges(projected_base.len(), &items, loop_id)
+                    .map_err(|_| PromptError::InvalidHistory)?;
+            let valid_keys = ranges.into_iter().map(|(key, _)| key).collect();
+            let folded = auto.state.emergency_groups(loop_id, &valid_keys);
+            let messages = crate::compaction::auto::fold_history(
                 &fixed,
-                history_messages,
-                &system,
+                &history_messages,
                 projected_base,
                 history.appended(),
-                tools,
-                reasoning,
-                budget,
-                &auto,
-                deadline.into_std(),
-                &cancellation,
                 loop_id,
-                request_index,
+                &folded,
             )
-            .await
+            .map_err(|_| PromptError::InvalidHistory)?;
             {
-                Ok(messages) => {
-                    auto.state.clear_prepare_failure();
-                    // Bound the retained recovery source before cloning any
-                    // history item; an over-cap source is never copied.
-                    let source_safe = crate::compaction::recovery_source_is_safe(
-                        &system,
-                        summary.as_ref(),
-                        projected_base,
-                        history.appended(),
+                auto.state.clear_prepare_failure();
+                // Bound the retained recovery source before cloning any
+                // history item; an over-cap source is never copied.
+                let source_safe = crate::compaction::recovery_source_is_safe(
+                    &system,
+                    summary.as_ref(),
+                    projected_base,
+                    history.appended(),
+                    tools,
+                );
+                let settings = auto.state.request_settings();
+                let ticket = if source_safe {
+                    crate::compaction::compute_content_hash(
+                        loop_id,
+                        request_index,
+                        &messages,
                         tools,
-                    );
-                    let settings = auto.state.request_settings();
-                    let ticket = if source_safe {
-                        crate::compaction::compute_content_hash(
+                        model,
+                        reasoning,
+                        settings.config_generation,
+                        settings.summary_generation,
+                    )
+                    .ok()
+                    .map(|content_hash| {
+                        crate::compaction::ActiveRecoveryTicket {
                             loop_id,
                             request_index,
-                            &messages,
-                            tools,
-                            model,
+                            content_hash,
+                            ticket_hash: None,
+                            original_body_bytes: 0,
+                            original_tokens: 0,
+                            system: system.clone(),
+                            summary: summary.clone(),
+                            base: projected_base.to_vec(),
+                            appended: history.appended().to_vec(),
+                            tools: tools.to_vec(),
+                            limits: minicore_runtime::model::ModelLimits::default(),
                             reasoning,
-                            settings.config_generation,
-                            settings.summary_generation,
-                        )
-                        .ok()
-                        .map(|content_hash| {
-                            crate::compaction::ActiveRecoveryTicket {
-                                loop_id,
-                                request_index,
-                                content_hash,
-                                ticket_hash: None,
-                                original_body_bytes: 0,
-                                original_tokens: 0,
-                                system: system.clone(),
-                                summary: summary.clone(),
-                                base: projected_base.to_vec(),
-                                appended: history.appended().to_vec(),
-                                tools: tools.to_vec(),
-                                limits: minicore_runtime::model::ModelLimits::default(),
-                                reasoning,
-                                // The utility binding is the one this provider
-                                // is preparing the request with. It is never
-                                // replaced by a later global settings read.
-                                auto_binding: Some(auto.binding()),
-                            }
-                        })
-                    } else {
-                        None
-                    };
-                    auto.state
-                        .register_recovery_ticket(loop_id, request_index, ticket);
-                    Ok(minicore_runtime::prompt::PreparedPrompt { messages })
-                }
-                Err(PlanError::Cancelled) => Err(PromptError::Cancelled),
-                Err(PlanError::Uncompressible) => {
-                    auto.state
-                        .note_prepare_failure(crate::compaction::CONTEXT_UNCOMPRESSIBLE);
-                    Err(PromptError::InvalidHistory)
-                }
-                Err(PlanError::Utility(UtilityError::Cancelled)) => Err(PromptError::Cancelled),
-                Err(PlanError::Utility(UtilityError::Timeout)) => {
-                    auto.state
-                        .note_prepare_failure(UtilityError::Timeout.kind());
-                    Err(PromptError::Cancelled)
-                }
-                // A failed semantic summary means the request cannot be
-                // prepared within budget; report it as uncompressible rather
-                // than sending a truncated or untrusted context.
-                Err(PlanError::Utility(error)) => {
-                    auto.state.note_prepare_failure(error.kind());
-                    Err(PromptError::InvalidHistory)
-                }
+                            // The utility binding is the one this provider
+                            // is preparing the request with. It is never
+                            // replaced by a later global settings read.
+                            auto_binding: Some(auto.binding()),
+                        }
+                    })
+                } else {
+                    None
+                };
+                auto.state
+                    .register_recovery_ticket(loop_id, request_index, ticket);
+                Ok(minicore_runtime::prompt::PreparedPrompt { messages })
             }
         })
     }

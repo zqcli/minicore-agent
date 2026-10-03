@@ -567,7 +567,7 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     let session_before = std::fs::read(session_dir.join("session.json")).unwrap();
     let history_before = std::fs::read(session_dir.join("history.jsonl")).unwrap();
 
-    let (_, first_wait) = process
+    let (first_turn, first_wait) = process
         .send_turn_and_register_wait("old", &first_session, "first turn")
         .await;
     old_server.wait_for_requests(1).await;
@@ -597,6 +597,10 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     old_gate.release();
     let first_result = process.response(&first_wait).await;
     assert_eq!(first_result["result"]["outcome"]["type"], "completed");
+
+    process
+        .wait_post_turn_noop("old-settled", &first_session, &first_turn)
+        .await;
 
     let (_, second_wait) = process
         .send_turn_and_register_wait("new", &first_session, "second turn")

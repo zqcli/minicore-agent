@@ -4930,23 +4930,29 @@ async fn session_context_omits_budget_when_auto_disabled() {
 /// any model call. The system prompt plus the current input alone exceed the
 /// tiny effective budget.
 #[tokio::test]
-async fn turn_send_reports_context_uncompressible_for_oversized_current_input() {
+async fn turn_send_accepts_then_local_preflight_fails_oversized_current_input_without_summary() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-rpc-uncompressible-{}",
         SessionId::new().unwrap()
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let model = FakeModel::with_context_window([ModelScript::Text("answer")], 1_000);
     let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
     config.compaction = CompactionConfig {
         enabled: true,
         trigger_percent: 80,
         target_percent: 50,
     };
-    let agent = Agent::open_with_models(config, test_models(model))
-        .await
-        .unwrap();
+    // Real adapter preflight of the emitted body, not an admission planner.
+    // The oversized request must fail before this loopback endpoint is used.
+    let mut model = configured_model("provider-model", "http://127.0.0.1:1", "PATH");
+    let ModelConfig::OpenAiResponses {
+        physical_context_window,
+        ..
+    } = &mut model;
+    *physical_context_window = 4_000;
+    config.models.insert("fake".to_owned(), model);
+    let agent = Agent::open(config).await.unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let oversized = "x".repeat(20_000);
@@ -4958,13 +4964,34 @@ async fn turn_send_reports_context_uncompressible_for_oversized_current_input() 
         )
         .await;
     let response = harness.response(json!("send")).await;
-    assert_eq!(response["error"]["code"], json!(-32022));
-    assert_eq!(
-        response["error"]["data"]["kind"],
-        json!("context_uncompressible")
+    let turn = response["result"]["turn"].clone();
+    assert!(
+        turn["loop_id"].is_string(),
+        "ordinary submit must accept without admission summary"
     );
-    assert_eq!(response["error"]["data"]["retryable"], json!(false));
-    // The reader still serves control methods and the session is idle.
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let result = harness.response(json!("wait")).await;
+    assert_eq!(result["result"]["outcome"]["type"], json!("failed"));
+    assert_eq!(result["result"]["persistence"], json!("persisted"));
+    let error = &result["result"]["outcome"]["model_error"];
+    assert_eq!(error["kind"], json!("invalid_request"));
+    assert_eq!(error["delivery"], json!("not_started"));
+    assert_eq!(error["retryable"], json!(false));
+    assert!(error["retry_after_millis"].is_null());
+    harness
+        .send(
+            json!("context"),
+            "session.context",
+            Some(json!({"session_id":session_id})),
+        )
+        .await;
+    let context = harness.response(json!("context")).await;
+    assert!(context["result"]["recovery"].is_null());
+    assert!(context["result"]["current_operation"].is_null());
+    assert!(context["result"]["last_result"].is_null());
+    // The reader still serves control methods and the failed persisted turn is idle.
     harness
         .send(
             json!("state"),
@@ -4979,7 +5006,7 @@ async fn turn_send_reports_context_uncompressible_for_oversized_current_input() 
 }
 
 #[tokio::test]
-async fn automatic_startup_accepts_minimum_between_trigger_and_hard_limit() {
+async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-rpc-minimum-window-{}",
         SessionId::new().unwrap()
@@ -4997,14 +5024,18 @@ async fn automatic_startup_accepts_minimum_between_trigger_and_hard_limit() {
     let text = (1..10_000)
         .map(|size| "x".repeat(size))
         .find(|candidate| {
-            crate::compaction::estimate_minimal(
-                &system,
-                &[candidate.as_str()],
-                &[],
-                ReasoningPreference::Auto,
-                &crate::models::DefaultProviderBudget,
-            )
-            .is_ok_and(|tokens| (801..=900).contains(&tokens))
+            crate::compaction::auto::minimal_messages(&system, &[candidate.as_str()])
+                .and_then(|messages| {
+                    crate::compaction::auto::estimate_tokens_with_budget(
+                        &crate::models::DefaultProviderBudget,
+                        messages,
+                        &[],
+                        ReasoningPreference::Auto,
+                        None,
+                        None,
+                    )
+                })
+                .is_ok_and(|tokens| (801..=900).contains(&tokens))
         })
         .expect("test input must land above trigger and below hard limit");
     let agent = Agent::open_with_models(config, test_models(Arc::clone(&model)))
@@ -5028,9 +5059,9 @@ async fn automatic_startup_accepts_minimum_between_trigger_and_hard_limit() {
     let wait = harness.response(json!("wait")).await;
     assert_eq!(wait["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(wait["result"]["persistence"], json!("persisted"));
-    // turn.send promises loop creation, not that the model has started yet.
-    // The call count is meaningful only after the turn has completed.
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    // The only call before completion is the ordinary model request. The
+    // completed near-budget turn may independently start post-turn compaction.
+    assert!(model.calls.load(Ordering::SeqCst) >= 1);
     harness.shutdown().await;
     remove_base(&base).await;
 }

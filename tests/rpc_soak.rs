@@ -255,6 +255,10 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
         "persisted"
     );
 
+    process
+        .wait_post_turn_noop("first-settled", &session_id, &turn1)
+        .await;
+
     // Second turn is cancelled.
     process
         .send(
