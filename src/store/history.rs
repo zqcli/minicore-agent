@@ -99,6 +99,21 @@ impl Store {
                 return Err(StoreError::Corrupt);
             }
         }
+        // Keep legacy raw record bytes unchanged. New replay-bearing records
+        // must pass durable admission before any append is attempted.
+        let normalized_record = if record.items.iter().any(|item| {
+            matches!(item,
+            HistoryItem::Assistant(assistant) if assistant.provider_replay.is_some())
+        }) {
+            let mut normalized = record.clone();
+            normalized.items = normalize_history(&record.items)
+                .map_err(|_| StoreError::Corrupt)?
+                .to_vec();
+            Some(normalized)
+        } else {
+            None
+        };
+        let record = normalized_record.as_ref().unwrap_or(record);
         let mut bytes = if record.user_times_are_valid() {
             serde_json::to_vec(record)
         } else {
@@ -227,7 +242,7 @@ impl Store {
             }
             let record: StoredLoopRecord =
                 serde_json::from_slice(&line).map_err(|_| StoreError::Corrupt)?;
-            let normalized = sanitize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
+            let normalized = normalize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
             let record_start = total_items;
             let record_end = record_start
                 .checked_add(normalized.len())
@@ -518,7 +533,7 @@ impl Store {
                 tracing::warn!(session_id = %session_id, "history tail repaired");
             }
         }
-        let history = sanitize_history(&items).map_err(|_| StoreError::Corrupt)?;
+        let history = normalize_history(&items).map_err(|_| StoreError::Corrupt)?;
         Ok((history, times))
     }
 }
@@ -666,7 +681,7 @@ async fn scan_history_prefix(
             }
             let record: StoredLoopRecord =
                 serde_json::from_slice(&line).map_err(|_| StoreError::Corrupt)?;
-            let normalized = sanitize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
+            let normalized = normalize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
             for item in normalized.iter() {
                 let Some(expected) = expected_history.get(expected_item_index) else {
                     return Ok(None);

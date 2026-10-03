@@ -44,7 +44,10 @@ payloads.
 The RPC and history views are different from logs: user text, Tool results, and
 some bounded raw Tool streams are intentionally queryable data and may contain
 secrets supplied by a user or model. Opaque provider reasoning is removed from
-sanitized history views. Treat `data_dir`, `history.jsonl`, auxiliary Tool files,
+sanitized history views, read/export responses, and summary prose. Validated
+provider replay (including encrypted reasoning) is retained privately in the
+existing JSONL history, bound to provider endpoint and actual model; it is not
+a secret store and is not reinterpreted as tool authority. Treat `data_dir`, `history.jsonl`, auxiliary Tool files,
 and captured workspace content as sensitive local data; never commit or upload
 it as a fixture.
 

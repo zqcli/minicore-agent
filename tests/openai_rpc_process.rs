@@ -975,11 +975,19 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         }),
         completed(),
     ]);
+    let final_reasoning = json!({"type":"reasoning","id":"rs_final","encrypted_content":"FINAL-OPAQUE-REPLAY","summary":[]});
+    let final_message = json!({"type":"message","id":"msg_final","role":"assistant","content":[{"type":"output_text","text":"reasoning process final"}]});
     let second = MockResponse::sse(&[
         json!({"type": "response.output_text.delta", "delta": "reasoning process final"}),
-        completed(),
+        json!({"type":"response.completed","response":{"status":"completed","output":[final_reasoning.clone(),final_message.clone()]}}),
     ]);
-    let server = MockServer::spawn([first, second]).await;
+    let next = || {
+        MockResponse::sse(&[
+            json!({"type":"response.output_text.delta","delta":"follow-up done"}),
+            completed(),
+        ])
+    };
+    let server = MockServer::spawn([first, second, next(), next(), next()]).await;
     let temp_dir = std::env::temp_dir().join(format!(
         "minicore-agent-openai-reasoning-process-{}",
         minicore_agent::SessionId::new().unwrap()
@@ -1022,7 +1030,7 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         .expect("created session ID must be text")
         .to_owned();
     let user_prompt = format!("read the phase4 process fixture {USER_MARKER}");
-    let (_, wait_id) = process
+    let (first_turn, wait_id) = process
         .send_turn_and_register_wait("reasoning", &session_id, &user_prompt)
         .await;
     process.event("tool_started").await;
@@ -1055,6 +1063,16 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     // Reasoning text/summary stays visible, but never opaque fields.
     assert!(history_text.contains("inspect the process fixture"));
     process
+        .wait_post_turn_noop("after-first", &session_id, &first_turn)
+        .await;
+    let (_, next_wait) = process
+        .send_turn_and_register_wait("next-turn", &session_id, "continue the same session")
+        .await;
+    assert_eq!(
+        process.response(&next_wait).await["result"]["outcome"]["type"],
+        "completed"
+    );
+    process
         .send("close", "session.close", json!({"session_id": session_id}))
         .await;
     process.response("close").await;
@@ -1086,8 +1104,14 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         let contents = std::fs::read(session_dir.join(file_name))
             .unwrap_or_else(|error| panic!("failed to read persisted {file_name}: {error}"));
         let contents = String::from_utf8_lossy(&contents);
-        assert!(!contents.contains(ENCRYPTED_MARKER));
-        assert!(!contents.contains(OPAQUE_MARKER));
+        assert_eq!(
+            contents.contains(ENCRYPTED_MARKER),
+            file_name == "history.jsonl"
+        );
+        assert_eq!(
+            contents.contains(OPAQUE_MARKER),
+            file_name == "history.jsonl"
+        );
         assert!(!contents.contains(KEY));
     }
     // The legacy v0.2 file names must not be recreated.
@@ -1095,8 +1119,100 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         assert!(!session_dir.join(legacy).exists());
     }
 
+    // A fresh OS process loads JSONL; no adapter-local memory can survive.
+    let mut reopened = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+    reopened
+        .send("open", "session.open", json!({"session_id":session_id}))
+        .await;
+    assert!(reopened.response("open").await.get("error").is_none());
+    let (_, reopened_wait) = reopened
+        .send_turn_and_register_wait("reopened", &session_id, "continue after process restart")
+        .await;
+    assert_eq!(
+        reopened.response(&reopened_wait).await["result"]["outcome"]["type"],
+        "completed"
+    );
+    reopened
+        .send(
+            "reopened-history",
+            "session.history",
+            json!({"session_id":session_id,"offset":0,"limit":100}),
+        )
+        .await;
+    let public = reopened.response("reopened-history").await.to_string();
+    for marker in [ENCRYPTED_MARKER, OPAQUE_MARKER, "FINAL-OPAQUE-REPLAY"] {
+        assert!(!public.contains(marker));
+    }
+    reopened
+        .send(
+            "isolated-create",
+            "session.create",
+            json!({"workspace":workspace}),
+        )
+        .await;
+    let isolated_id =
+        reopened.response("isolated-create").await["result"]["session"]["session_id"].clone();
+    let (_, isolated_wait) = reopened
+        .send_turn_and_register_wait("isolated", &isolated_id, "new isolated session")
+        .await;
+    assert_eq!(
+        reopened.response(&isolated_wait).await["result"]["outcome"]["type"],
+        "completed"
+    );
+    let (reopened_frames, reopened_stderr) = reopened.shutdown().await;
+    for marker in [ENCRYPTED_MARKER, OPAQUE_MARKER, "FINAL-OPAQUE-REPLAY", KEY] {
+        assert!(
+            !serde_json::to_string(&reopened_frames)
+                .unwrap()
+                .contains(marker)
+        );
+        assert!(!reopened_stderr.contains(marker));
+    }
     let requests = server.finish().await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 5);
+    for marker in [
+        ENCRYPTED_MARKER,
+        OPAQUE_MARKER,
+        "FINAL-OPAQUE-REPLAY",
+        CALL_ID,
+    ] {
+        assert!(!String::from_utf8_lossy(requests[4].body()).contains(marker));
+    }
+    for index in [1, 2, 3] {
+        let body = requests[index].json_body();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(
+            input.iter().filter(|item| **item == reasoning_item).count(),
+            1
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| **item == function_call_item)
+                .count(),
+            1
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .count(),
+            1
+        );
+        if index > 1 {
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| **item == final_reasoning)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                input.iter().filter(|item| **item == final_message).count(),
+                1
+            );
+        }
+    }
     for request in &requests {
         assert_eq!(
             request.header("authorization"),

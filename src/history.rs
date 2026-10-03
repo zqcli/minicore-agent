@@ -35,19 +35,18 @@ fn tool_result_scan_count() -> usize {
     TOOL_RESULT_SCAN_COUNT.with(Cell::get)
 }
 
-/// Cleans a loop's persisted history so provider-opaque continuation data
-/// never reaches the Agent JSONL, the in-memory session history, RPC views,
-/// logs, or the next user turn.
-///
-/// - User, ToolResult, and Summary items pass through unchanged.
-/// - Assistant reasoning parts keep only `text`/`summary`; `encrypted` and
-///   `signature` are dropped. A reasoning part that carried only opaque
-///   fields is removed entirely.
-/// - An Assistant item whose content becomes empty is removed.
-///
-/// ToolCall arguments are preserved: the runtime `DefaultPromptProvider`
-/// reconstructs the next request from Assistant ToolCall + ToolResult pairs.
+/// Public/prose normalization strips opaque provider replay and legacy opaque
+/// reasoning. Durable normalization uses the same canonical cleanup while
+/// retaining validated replay in the existing history pipeline.
 pub(crate) fn sanitize_history(items: &[HistoryItem]) -> Result<Arc<[HistoryItem]>, AgentError> {
+    normalize(items, false)
+}
+
+pub(crate) fn normalize_history(items: &[HistoryItem]) -> Result<Arc<[HistoryItem]>, AgentError> {
+    normalize(items, true)
+}
+
+fn normalize(items: &[HistoryItem], durable: bool) -> Result<Arc<[HistoryItem]>, AgentError> {
     let mut sanitized = Vec::with_capacity(items.len());
     for item in items {
         match item {
@@ -57,7 +56,7 @@ pub(crate) fn sanitize_history(items: &[HistoryItem]) -> Result<Arc<[HistoryItem
             }
             HistoryItem::Summary(summary) => sanitized.push(HistoryItem::Summary(summary.clone())),
             HistoryItem::Assistant(assistant) => {
-                if let Some(assistant) = sanitize_assistant(assistant)? {
+                if let Some(assistant) = sanitize_assistant(assistant, durable)? {
                     sanitized.push(HistoryItem::Assistant(assistant));
                 }
             }
@@ -68,6 +67,7 @@ pub(crate) fn sanitize_history(items: &[HistoryItem]) -> Result<Arc<[HistoryItem
 
 fn sanitize_assistant(
     assistant: &AssistantHistory,
+    durable: bool,
 ) -> Result<Option<AssistantHistory>, AgentError> {
     let mut content = Vec::with_capacity(assistant.content.len());
     for part in &assistant.content {
@@ -87,10 +87,20 @@ fn sanitize_assistant(
             }
         }
     }
-    if content.is_empty() {
+    let provider_replay = if durable {
+        if let Some(replay) = &assistant.provider_replay {
+            crate::models::validate_history_replay(replay, &content)
+                .map_err(|_| AgentError::Internal)?;
+        }
+        assistant.provider_replay.clone()
+    } else {
+        None
+    };
+    if content.is_empty() && provider_replay.is_none() {
         return Ok(None);
     }
     Ok(Some(AssistantHistory {
+        provider_replay,
         loop_id: assistant.loop_id,
         request_index: assistant.request_index,
         model: assistant.model.clone(),
@@ -547,6 +557,7 @@ mod tests {
         .unwrap();
         (
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index,
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -600,6 +611,7 @@ mod tests {
         .collect();
         (
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id,
                 request_index,
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -777,6 +789,7 @@ mod tests {
         let loop_two: LoopId = "lup_00000000000000000000000000000002".parse().unwrap();
         let history = vec![
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id: loop_one,
                 request_index: 0,
                 model: "main".parse::<ModelRef>().unwrap(),
@@ -794,6 +807,7 @@ mod tests {
                 output: ToolOutput::new("first result").unwrap(),
             }),
             HistoryItem::Assistant(AssistantHistory {
+                provider_replay: None,
                 loop_id: loop_two,
                 request_index: 0,
                 model: "main".parse::<ModelRef>().unwrap(),

@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
-MiniCore Agent **0.6.0** is an RPC-first local agent core. It provides a Rust
+MiniCore Agent **0.6.1** is an RPC-first local agent core. It provides a Rust
 library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
 Tool data, and a stdio JSON-RPC service for a client UI.
 
 - Rust edition: 2024; MSRV: **1.85**
-- Runtime: `minicore-runtime 0.6.0`, pinned to Git revision
-  `9e230617d36130e7ec77aba122b45f1347ac53f2`.
+- Runtime: `minicore-runtime 0.6.1`, pinned to Git revision
+  `666d5a15ac08c614ce75dd90337f95f10ec29f80`.
 - RPC protocol version: **1**
 - Versioned source delivery uses the `dev` branch and annotated release tags;
   this does not imply a package-registry publication or binary installation.
@@ -69,7 +69,15 @@ authority. Existing v0.2 Session data is not migrated.
 Warm in-memory observations are preferred, while bounded cold reads use durable
 Store data when a Session is unloaded or retained bytes were evicted.
 
-## 0.6.0 Context And Compatibility
+## Durable Provider Replay
+
+Validated Responses output now follows the existing session history and JSONL
+pipeline across tool rounds, later turns, and process restarts. It is private
+provider metadata, excluded from RPC/read/summary prose and redacted Debug.
+See [the replay contract](docs/provider-replay.md) for identity fallback, bounds,
+usage uncertainty, and compatibility.
+
+## 0.6.1 Context And Compatibility
 
 Ordinary turns append context without threshold-driven summaries. Automatic
 compaction is an independent operation after a Completed + Persisted turn;

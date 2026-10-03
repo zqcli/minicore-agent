@@ -30,7 +30,7 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
   `CommandOwners`, `ToolObserver`, Presentation state, and Session-owned query
   workers. Close cancels and joins those workers before unloading the Session.
 - The Runtime owns the `AgentLoop` semantics and model/tool scheduling. The
-  Agent's Session task observes the loop, persists the sanitized result, merges
+  Agent's Session task observes the loop, persists the durably normalized result (including validated private replay), merges
   settled history, and publishes Agent-level completion.
 - `ToolObserver` captures the real request/Tool identity at Runtime boundaries.
   `ToolData` retains bounded invocation, execution, stream, and change facts.

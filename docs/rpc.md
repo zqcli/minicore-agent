@@ -1,6 +1,6 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.6.0 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.6.1 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
 ## Transport And Framing
@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.0","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.1","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -110,7 +110,7 @@ history query results, not the event stream.
 `agent.shutdown` waits for the Agent, its active workers, pre-existing
 waiter/query tasks, and event pump, then queues its response last. EOF, Ctrl-C,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
-MiniCore Agent v0.6.0 uses the Runtime user-cancellation path when closing or
+MiniCore Agent v0.6.1 uses the Runtime user-cancellation path when closing or
 shutting down an active Session;
 it does not currently preserve a distinct shutdown cancellation reason.
 
@@ -139,7 +139,7 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.6.0",
+  "version": "0.6.1",
   "protocol_version": 1,
   "capabilities": [
     "session.read",
@@ -309,7 +309,7 @@ The result has a `session` member containing the created SessionInfo.
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
 - `session.close` cancels any active loop and manual/post-turn compaction, joins all
-  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.6.0 uses
+  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.6.1 uses
   the Runtime user-cancellation path when closing or shutting down an active
   Session; it does not currently preserve a distinct shutdown cancellation
   reason.
@@ -560,8 +560,10 @@ concatenate chunks with the same `index` in offset order and parse the result
 when `complete` is true. `offset` and `total_bytes` are UTF-8 byte offsets and
 lengths. This permits a single huge User, Assistant, ToolResult, or structured
 Assistant part to continue across pages without truncating or skipping it.
-The envelope retains the Runtime message parts and full text; only opaque
-encrypted/signature-only reasoning is removed by the common history sanitizer.
+The envelope retains canonical Runtime message parts and full text. Opaque
+provider replay and legacy encrypted/signature-only reasoning are removed from
+public read data. Replay-only session items retain their raw item index with an
+empty public canonical projection.
 
 The response also includes bounded `records` summaries with outcome, usage,
 request/tool counts, final config revision, and completion time. It contains
@@ -1777,3 +1779,19 @@ subscription values when no reliable source exists. Presentation reads never
 start Git work; fresh branch state comes only from `workspace.status`. A client
 must not run `git`, execute a Tool, or use presentation data as an execution
 request.
+
+## 0.6.1 Additive Metadata
+
+A safe model-error view may include `local_context_budget` with unsigned
+`estimated_tokens` and `input_budget_tokens`. Missing/null means no verified
+local numeric estimate. Only the exact locally generated InvalidRequest /
+NotStarted preflight diagnostic supplies this field; provider response bodies
+and free-form diagnostics are never exposed. Stored legacy errors remain valid.
+
+Compaction results include `origin`, either `manual` or `automatic`, from the
+operation that produced the result. Clients must not infer origin from IDs.
+
+Responses providers may omit `cache_write_tokens`. In that case both cache-write
+and ordinary input usage remain unknown; cached read, ordinary output, reasoning,
+and provider total remain available when reported and arithmetically valid.
+RPC protocol version remains 1; these are additive fields and optional usage.

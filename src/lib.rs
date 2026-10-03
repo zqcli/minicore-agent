@@ -69,8 +69,8 @@ pub use changes::{
     ChangesListResult,
 };
 pub use compaction::{
-    AutomaticCompactionObservation, AutomaticCompactionView, CompactionResult, CompactionStatus,
-    CompactionUtilityUsage, RecoveryObservation,
+    AutomaticCompactionObservation, AutomaticCompactionView, CompactionOrigin, CompactionResult,
+    CompactionStatus, CompactionUtilityUsage, RecoveryObservation,
 };
 pub use config::{
     AgentConfig, ApprovalMode, CompactionConfig, ConfigError, LoopOverrides, Profile,
@@ -81,7 +81,8 @@ pub use diff::{
 };
 pub use error::{AgentError, RuntimeErrorView};
 pub use event::{
-    AgentEvent, AgentEventStream, EventMeta, OutputChannel, ToolProgressView, ToolResultView,
+    AgentEvent, AgentEventStream, EventMeta, LocalContextBudgetFailure, OutputChannel,
+    ToolProgressView, ToolResultView,
 };
 pub use ids::{SessionId, SessionIdError};
 pub use models::{ModelConfig, ModelInfo};

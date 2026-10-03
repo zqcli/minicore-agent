@@ -342,6 +342,14 @@ pub(crate) fn serialize_openai_request_for_budget(
     openai::serialize_request_for_budget(request, writer).map_err(|_| ())
 }
 
+/// Validate provider-owned metadata at the durable history admission boundary.
+pub(crate) fn validate_history_replay(
+    replay: &minicore_runtime::model::ProviderReplay,
+    parts: &[minicore_runtime::model::AssistantPart],
+) -> Result<(), ()> {
+    openai::validate_history_replay(replay, parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

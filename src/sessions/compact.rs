@@ -10,10 +10,12 @@ pub(super) struct CompactionCompletionGuard {
 impl CompactionOperation {
     pub(super) fn new(
         operation_id: String,
+        origin: CompactionOrigin,
     ) -> (Arc<Self>, watch::Receiver<Option<CompactionResult>>) {
         let (result, receiver) = watch::channel(None);
         let operation = Arc::new(Self {
             operation_id,
+            origin,
             cancellation: CancellationToken::new(),
             result,
             join: tokio::sync::Mutex::new(None),
@@ -66,6 +68,7 @@ impl CompactionOperation {
     ) -> CompactionResult {
         CompactionResult {
             operation_id: self.operation_id.clone(),
+            origin: self.origin,
             status: CompactionStatus::Failed,
             before_tokens: None,
             after_tokens: None,
@@ -80,6 +83,7 @@ impl CompactionOperation {
     fn unknown_write_result(&self) -> CompactionResult {
         CompactionResult {
             operation_id: self.operation_id.clone(),
+            origin: self.origin,
             status: CompactionStatus::UnknownWrite,
             before_tokens: None,
             after_tokens: None,
@@ -332,7 +336,8 @@ impl Session {
     ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
         self.cleanup_finished().await?;
         let _io = self.shared.io.lock().await;
-        let (operation, receiver) = CompactionOperation::new(operation_id.clone());
+        let (operation, receiver) =
+            CompactionOperation::new(operation_id.clone(), CompactionOrigin::Manual);
 
         // Acquire the operation's join slot before publishing the reservation.
         // From the point where the Session becomes busy to the point where the
@@ -668,6 +673,7 @@ pub(super) async fn run_compaction_inner(
     if history_len == 0 || (retained_item_count == 0 && reservation.trigger_tokens.is_none()) {
         return CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
+            origin: reservation.operation.origin,
             status: CompactionStatus::Noop,
             before_tokens: None,
             after_tokens: None,
@@ -783,6 +789,7 @@ pub(super) async fn run_compaction_inner(
         if before < trigger {
             return CompactionResult {
                 operation_id: reservation.operation.operation_id.clone(),
+                origin: reservation.operation.origin,
                 status: CompactionStatus::Noop,
                 before_tokens: Some(before),
                 after_tokens: Some(before),
@@ -861,6 +868,7 @@ pub(super) async fn run_compaction_inner(
     match commit {
         CompactionCommit::Store(SummaryCommit::Committed) => CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
+            origin: reservation.operation.origin,
             status: CompactionStatus::Compacted,
             before_tokens: Some(generated.before_tokens),
             after_tokens: Some(generated.after_tokens),
@@ -892,6 +900,7 @@ pub(super) async fn run_compaction_inner(
         }
         CompactionCommit::Store(SummaryCommit::Unknown) => CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
+            origin: reservation.operation.origin,
             status: CompactionStatus::UnknownWrite,
             before_tokens: Some(generated.before_tokens),
             after_tokens: Some(generated.after_tokens),
@@ -920,6 +929,7 @@ fn failed_compaction_with_usage(
 ) -> CompactionResult {
     CompactionResult {
         operation_id: operation.operation_id.clone(),
+        origin: operation.origin,
         status: CompactionStatus::Failed,
         before_tokens: None,
         after_tokens: None,
@@ -928,5 +938,22 @@ fn failed_compaction_with_usage(
         retained_item_count: history_len,
         utility_usage,
         failure_kind: Some(failure_kind.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    #[test]
+    fn origin_is_owned_by_operation_not_inferred_from_identifier() {
+        for (id, origin) in [
+            ("auto-looking-manual", CompactionOrigin::Manual),
+            ("opaque-id", CompactionOrigin::Automatic),
+        ] {
+            let (operation, _) = CompactionOperation::new(id.into(), origin);
+            assert_eq!(operation.failed_result("cancelled", None).origin, origin);
+            assert_eq!(operation.unknown_write_result().origin, origin);
+            assert_eq!(failed_compaction(&operation, "timeout", 0).origin, origin);
+        }
     }
 }

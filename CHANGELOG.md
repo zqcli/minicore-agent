@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 — 2026-10-03
+
+- Preserve bounded provider-owned Responses replay through the existing history
+  pipeline, including later turns and JSONL process reopen. Remove the old
+  loop-local continuation store. Public read/RPC/summary prose stays redacted.
+- Keep canonical parts authoritative for display and tool execution; bind replay
+  to normalized endpoint and actual provider model. See the replay contract.
+- Add safe numeric local context-budget failures and explicit compaction origin.
+- Treat omitted cache-write usage as unknown rather than zero.
+- Pin Runtime 0.6.1 at `666d5a15ac08c614ce75dd90337f95f10ec29f80`.
+- This is a new reconstruction from the official 0.6.0 base. Historical live
+  provider/cache experiments are not verification of this build.
+
 ## 0.6.0 — 2026-10-03
 
 - Ordinary turns are append-only across soft thresholds; create/open/submit and

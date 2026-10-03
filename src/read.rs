@@ -685,7 +685,14 @@ fn encoded_items<'a>(
     }
     Ok(items.iter().enumerate().map(move |(offset, item)| {
         let timestamp = timestamps[offset].as_deref();
-        let envelope = ReadItemEnvelope { item, timestamp };
+        let mut item = item.clone();
+        if let HistoryItem::Assistant(assistant) = &mut item {
+            assistant.provider_replay = None;
+        }
+        let envelope = ReadItemEnvelope {
+            item: &item,
+            timestamp,
+        };
         let bytes = serde_json::to_vec(&envelope).map_err(|_| AgentError::RpcSerialization)?;
         let data = String::from_utf8(bytes).map_err(|_| AgentError::Internal)?;
         Ok((start.saturating_add(offset), data))
