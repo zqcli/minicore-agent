@@ -4105,9 +4105,16 @@ fn reasoning_request_mapping_and_preflight_overflow_are_conservative() {
         .unwrap_err();
     assert_error(
         &error,
-        ModelErrorKind::ContextOverflow,
+        ModelErrorKind::InvalidRequest,
         DeliveryState::NotStarted,
         false,
+    );
+    assert!(
+        error
+            .diagnostic()
+            .message
+            .as_str()
+            .contains("local serialized context estimate")
     );
 
     for reasoning in [
@@ -5079,7 +5086,7 @@ async fn http_status_connect_timeout_and_non_sse_errors_have_conservative_delive
         ),
         (
             MockResponse::json(413, r#"{"error":{"message":"SECRET"}}"#),
-            ModelErrorKind::ContextOverflow,
+            ModelErrorKind::InvalidRequest,
             DeliveryState::NotStarted,
             false,
         ),

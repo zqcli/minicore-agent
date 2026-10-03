@@ -11,29 +11,26 @@ use minicore_runtime::value::BoundedText;
 use crate::ids::SessionId;
 use crate::store::{HistoryPrefix, MAX_SUMMARY_FILE_BYTES, SessionRecord, Store};
 
-mod auto;
+pub(crate) mod auto;
 mod recovery;
 mod utility;
 
+pub(crate) use auto::AutoContext;
 pub(crate) use auto::compose as auto_compose;
-pub(crate) use auto::{
-    AutoContext, PlanError, estimate_minimal, estimate_startup, estimate_startup_exact, plan,
-    startup_history_is_request_safe,
-};
 pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
     ActiveRecoveryTicket, CompactingModel, compute_content_hash, recovery_source_is_safe,
 };
-pub(crate) use utility::{CompactionInput, UtilityError, generate_summary};
+pub(crate) use utility::{CompactionInput, generate_summary};
 /// Failure kind recorded when request preparation cannot reduce a context
 /// without dropping user constraints or replaying tools.
 pub(crate) const CONTEXT_UNCOMPRESSIBLE: &str = "context_uncompressible";
 const MAX_EPHEMERAL_GROUPS: usize = 64;
 const MAX_EPHEMERAL_BYTES: usize = 512 * 1024;
 
-/// Agent-global automatic compaction policy. `enabled` gates both startup
-/// admission compaction and per-request threshold compaction; explicit manual
-/// compaction stays available regardless.
+/// Agent-global policy for post-turn automatic compaction and bounded
+/// emergency recovery. Ordinary request preparation never summarizes;
+/// explicit manual compaction stays available regardless.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompactionPolicy {
     pub(crate) enabled: bool,
@@ -146,7 +143,6 @@ struct LoadedSummary {
 pub(crate) struct CompactionState {
     snapshot: Mutex<Option<LoadedSummary>>,
     ephemeral: Mutex<Option<EphemeralSummary>>,
-    automatic: Mutex<AutomaticCompactionView>,
     /// Latest bounded full-request estimate. This is a scalar for
     /// `session.context`; it is intentionally not an unbounded observation
     /// history.
@@ -156,6 +152,10 @@ pub(crate) struct CompactionState {
     /// state, and is cleared by a successful preparation.
     prepare_failure: Mutex<Option<String>>,
     recovery_ticket: Mutex<Option<ActiveRecoveryTicket>>,
+    /// The reduced body of one rejected logical request. Runtime's generic
+    /// transport driver retries the original ModelRequest without re-preparing
+    /// the prompt, so this bounded slot keeps those attempts on the new base.
+    recovery_retry: Mutex<Option<RecoveryRetry>>,
     /// Highest logical request that already consumed its one recovery for the
     /// current loop. `request_index` advances monotonically within a loop, so a
     /// single high-water mark blocks Driver re-entry and every older index
@@ -178,13 +178,19 @@ pub(crate) struct RequestSettings {
     pub(crate) summary_generation: u64,
 }
 
-/// Bounded session-local summaries of complete source groups. Source hashes
-/// and the preparing utility context must match before reuse across turns.
-/// This derived cache is never written to durable history.
+struct RecoveryRetry {
+    loop_id: LoopId,
+    request_index: u32,
+    original_hash: [u8; 32],
+    request: minicore_runtime::model::ModelRequest,
+}
+
+/// Bounded turn-local emergency reductions of complete source groups. Source
+/// hashes must match on every projection; settled history is promoted through
+/// the existing derived snapshot, never by rewriting the transcript.
 #[derive(Clone, Default)]
 pub(crate) struct EphemeralSummary {
     pub(crate) loop_id: Option<LoopId>,
-    context_hash: Option<[u8; 32]>,
     /// Ephemeral summary keyed by the owning loop's source range and content
     /// hash. The range is stable while the loop is live and the hash prevents
     /// reuse after the source history changes.
@@ -222,24 +228,6 @@ pub struct AutomaticCompactionView {
     pub last: Option<AutomaticCompactionObservation>,
 }
 
-impl EphemeralSummary {
-    fn for_loop(loop_id: LoopId) -> Self {
-        Self {
-            loop_id: Some(loop_id),
-            context_hash: None,
-            groups: BTreeMap::new(),
-        }
-    }
-}
-
-fn retain_automatic_observation(observation: &AutomaticCompactionObservation) -> bool {
-    observation.utility_usage.is_some()
-        || !matches!(
-            observation.outcome.as_str(),
-            "preparing" | "fit" | "fit_over_trigger"
-        )
-}
-
 pub(crate) struct HistoryProjection<'a> {
     pub(crate) summary: BoundedText,
     pub(crate) suffix: &'a [HistoryItem],
@@ -250,10 +238,10 @@ impl CompactionState {
         Arc::new(Self {
             snapshot: Mutex::new(None),
             ephemeral: Mutex::new(None),
-            automatic: Mutex::new(AutomaticCompactionView::default()),
             latest_request_tokens: Mutex::new(None),
             prepare_failure: Mutex::new(None),
             recovery_ticket: Mutex::new(None),
+            recovery_retry: Mutex::new(None),
             recovery_high_water: Mutex::new(None),
             recovery_observation: Mutex::new(None),
             settings: Mutex::new(RequestSettings::default()),
@@ -298,9 +286,103 @@ impl CompactionState {
         })
     }
 
-    /// Returns summaries bound to the active loop. Settled source-identical
-    /// groups can survive between turns; projection verifies their full source
-    /// hash and every request re-estimates them under its execution binding.
+    /// Returns only source-identical reductions installed by a successful
+    /// emergency reconstruction. Configuration changes affect future request
+    /// framing, not already covered source history.
+    pub(crate) fn emergency_groups(
+        &self,
+        loop_id: LoopId,
+        valid_keys: &BTreeSet<EphemeralGroupKey>,
+    ) -> BTreeMap<EphemeralGroupKey, BoundedText> {
+        let slot = self.ephemeral.lock().unwrap();
+        slot.as_ref()
+            .filter(|summary| summary.loop_id == Some(loop_id))
+            .map(|summary| {
+                summary
+                    .groups
+                    .iter()
+                    .filter(|(key, _)| valid_keys.contains(*key))
+                    .map(|(key, content)| (key.clone(), content.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn install_emergency_groups(
+        &self,
+        loop_id: LoopId,
+        groups: BTreeMap<EphemeralGroupKey, BoundedText>,
+    ) -> bool {
+        if groups.len() > MAX_EPHEMERAL_GROUPS
+            || groups.values().map(BoundedText::byte_len).sum::<usize>() > MAX_EPHEMERAL_BYTES
+        {
+            return false;
+        }
+        let mut slot = self.ephemeral.lock().unwrap();
+        if slot
+            .as_ref()
+            .and_then(|summary| summary.loop_id)
+            .is_some_and(|owner| owner != loop_id)
+        {
+            return false;
+        }
+        *slot = Some(EphemeralSummary {
+            loop_id: Some(loop_id),
+            groups,
+        });
+        let mut settings = self.settings.lock().unwrap();
+        settings.summary_generation = settings.summary_generation.wrapping_add(1);
+        true
+    }
+
+    /// Promote a settled turn's effective history without another model call.
+    /// Source ranges are validated against the raw Runtime report first; only
+    /// sanitized messages are encoded into the historical snapshot data.
+    pub(crate) fn settled_emergency_summary(
+        &self,
+        loop_id: LoopId,
+        base: &[HistoryItem],
+        appended: &[HistoryItem],
+        previous: Option<&BoundedText>,
+    ) -> Result<Option<BoundedText>, ()> {
+        let items = base.iter().chain(appended).collect::<Vec<_>>();
+        let ranges = auto::compressible_ranges(base.len(), &items, loop_id).map_err(|_| ())?;
+        let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
+        let groups = self.emergency_groups(loop_id, &valid);
+        if groups.is_empty() {
+            return Ok(None);
+        }
+        let mut messages = Vec::new();
+        if let Some(previous) = previous {
+            messages.push(summary_data_message(previous).map_err(|_| ())?);
+        }
+        let mut index = 0;
+        while index < items.len() {
+            if let Some((key, _)) = ranges
+                .iter()
+                .find(|(key, _)| key.start == index)
+                .filter(|(key, _)| groups.contains_key(key))
+            {
+                messages.push(summary_data_message(&groups[key]).map_err(|_| ())?);
+                index = key.end;
+            } else {
+                // Fold by raw source indexes, then sanitize uncovered items.
+                // Sanitization can remove opaque-only assistants, so indexing
+                // a pre-sanitized vector with raw group offsets is unsafe.
+                let sanitized =
+                    crate::history::sanitize_history(std::slice::from_ref(items[index]))
+                        .map_err(|_| ())?;
+                for item in sanitized.iter() {
+                    messages.push(utility::history_message(item).map_err(|_| ())?);
+                }
+                index += 1;
+            }
+        }
+        let content = serde_json::to_string(&messages).map_err(|_| ())?;
+        validate_summary_content(&content).map(Some).ok_or(())
+    }
+
+    /// Test-only observation of reductions bound to one active turn.
     #[cfg(test)]
     pub(crate) fn ephemeral(&self, loop_id: LoopId) -> Option<EphemeralSummary> {
         self.ephemeral
@@ -311,40 +393,6 @@ impl CompactionState {
             .cloned()
     }
 
-    pub(crate) fn ephemeral_for_context(
-        &self,
-        loop_id: LoopId,
-        context_hash: [u8; 32],
-        valid_keys: &BTreeSet<EphemeralGroupKey>,
-    ) -> Option<EphemeralSummary> {
-        let mut slot = self.ephemeral.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(EphemeralSummary::for_loop(loop_id));
-        }
-        let summary = slot
-            .as_mut()
-            .filter(|summary| summary.loop_id == Some(loop_id))?;
-        if summary.context_hash != Some(context_hash) {
-            summary.groups.clear();
-            summary.context_hash = Some(context_hash);
-        }
-        // History projection can move or remove source ranges between turns.
-        // Unreachable keys must not permanently occupy the bounded cache.
-        summary.groups.retain(|key, _| valid_keys.contains(key));
-        Some(summary.clone())
-    }
-
-    pub(crate) fn begin_ephemeral_loop(&self, loop_id: LoopId) {
-        let mut slot = self.ephemeral.lock().unwrap();
-        match slot.as_mut() {
-            Some(summary) => summary.loop_id = Some(loop_id),
-            None => *slot = Some(EphemeralSummary::for_loop(loop_id)),
-        }
-    }
-
-    /// Caches one ephemeral summary only when the session-local bounded cache can
-    /// retain it. The caller still uses a successful summary for the current
-    /// request when the cache is full.
     #[cfg(test)]
     pub(crate) fn cache_ephemeral(
         &self,
@@ -352,60 +400,12 @@ impl CompactionState {
         key: EphemeralGroupKey,
         summary: BoundedText,
     ) -> bool {
-        self.cache_ephemeral_for_context(loop_id, key, summary, None)
-    }
-
-    pub(crate) fn cache_ephemeral_for_context(
-        &self,
-        loop_id: LoopId,
-        key: EphemeralGroupKey,
-        summary: BoundedText,
-        context_hash: Option<[u8; 32]>,
-    ) -> bool {
-        let mut slot = self.ephemeral.lock().unwrap();
-        if let Some(context_hash) = context_hash {
-            // A utility request may finish after settings change or cleanup.
-            // Never install its old result into a newer context's cache.
-            if slot.as_ref().is_none_or(|entry| {
-                entry.loop_id != Some(loop_id) || entry.context_hash != Some(context_hash)
-            }) {
-                return false;
-            }
-        } else if slot.as_ref().and_then(|summary| summary.loop_id) != Some(loop_id) {
-            *slot = Some(EphemeralSummary::for_loop(loop_id));
-        }
-        let Some(ephemeral) = slot.as_mut() else {
-            return false;
-        };
-        let previous = ephemeral.groups.remove(&key);
-        ephemeral.groups.retain(|candidate, _| {
-            candidate.start != key.start
-                || candidate.end != key.end
-                || candidate.source_hash == key.source_hash
-        });
-        if summary.byte_len() > MAX_EPHEMERAL_BYTES {
-            if let Some(previous) = previous {
-                ephemeral.groups.insert(key, previous);
-            }
-            return false;
-        }
-        let existing_bytes = ephemeral
-            .groups
-            .values()
-            .map(BoundedText::byte_len)
-            .sum::<usize>();
-        if ephemeral.groups.len() >= MAX_EPHEMERAL_GROUPS
-            || existing_bytes.saturating_add(summary.byte_len()) > MAX_EPHEMERAL_BYTES
-        {
-            if let Some(previous) = previous {
-                ephemeral.groups.insert(key, previous);
-            }
-            return false;
-        }
-        ephemeral.groups.insert(key, summary);
-        let mut settings = self.settings.lock().unwrap();
-        settings.summary_generation = settings.summary_generation.wrapping_add(1);
-        true
+        let mut groups = self
+            .ephemeral(loop_id)
+            .map(|entry| entry.groups)
+            .unwrap_or_default();
+        groups.insert(key, summary);
+        self.install_emergency_groups(loop_id, groups)
     }
 
     pub(crate) fn clear_ephemeral(&self, loop_id: LoopId) {
@@ -414,10 +414,9 @@ impl CompactionState {
             .as_ref()
             .is_some_and(|summary| summary.loop_id == Some(loop_id))
         {
-            // Release turn ownership, not the source-validated summaries.
-            // Otherwise every subsequent turn repeats the same utility calls
-            // and changes the provider-visible prefix for unchanged history.
-            ephemeral.as_mut().unwrap().loop_id = None;
+            // The settled snapshot transition owns any cross-turn reduction.
+            // Never carry range indexes into a different turn.
+            *ephemeral = None;
         }
         let mut high_water = self.recovery_high_water.lock().unwrap();
         if high_water
@@ -430,17 +429,54 @@ impl CompactionState {
         if ticket.as_ref().is_some_and(|t| t.loop_id == loop_id) {
             *ticket = None;
         }
+        let mut retry = self.recovery_retry.lock().unwrap();
+        if retry
+            .as_ref()
+            .is_some_and(|request| request.loop_id == loop_id)
+        {
+            *retry = None;
+        }
     }
 
-    /// Records that a new execution configuration was installed. Every
-    /// settings change bumps the config generation, which invalidates tickets
-    /// and cached source bindings prepared under the previous configuration.
-    pub(crate) fn note_settings_installed(&self) {
-        let mut ephemeral = self.ephemeral.lock().unwrap();
-        if let Some(summary) = ephemeral.as_mut() {
-            summary.groups.clear();
-            summary.context_hash = None;
+    pub(crate) fn recovered_request(
+        &self,
+        loop_id: LoopId,
+        request_index: u32,
+        original_hash: [u8; 32],
+    ) -> Result<Option<minicore_runtime::model::ModelRequest>, ()> {
+        let mut slot = self.recovery_retry.lock().unwrap();
+        let Some(retry) = slot.as_ref() else {
+            return Ok(None);
+        };
+        if retry.loop_id != loop_id || retry.request_index != request_index {
+            *slot = None;
+            return Ok(None);
         }
+        if retry.original_hash != original_hash {
+            return Err(());
+        }
+        Ok(Some(retry.request.clone()))
+    }
+
+    pub(crate) fn retain_recovered_request(
+        &self,
+        loop_id: LoopId,
+        request_index: u32,
+        original_hash: [u8; 32],
+        request: minicore_runtime::model::ModelRequest,
+    ) {
+        *self.recovery_retry.lock().unwrap() = Some(RecoveryRetry {
+            loop_id,
+            request_index,
+            original_hash,
+            request,
+        });
+    }
+
+    /// Configuration changes invalidate pending request tickets, not already
+    /// installed emergency reductions. Their source identity remains valid
+    /// while request framing and hard budgets are recomputed.
+    pub(crate) fn note_settings_installed(&self) {
         let mut settings = self.settings.lock().unwrap();
         settings.config_generation = settings.config_generation.wrapping_add(1);
     }
@@ -610,12 +646,6 @@ impl CompactionState {
             outcome: "recovered".to_owned(),
             failure_kind: None,
         });
-        self.finish_automatic(
-            &format!("recovery-{loop_id}-{request_index}"),
-            "recovered",
-            after_tokens,
-            utility_usage,
-        );
     }
 
     pub(crate) fn record_recovery_failure(
@@ -635,12 +665,6 @@ impl CompactionState {
             outcome: "recovery_failed".to_owned(),
             failure_kind: Some(failure_kind.to_owned()),
         });
-        self.finish_automatic(
-            &format!("recovery-{loop_id}-{request_index}"),
-            failure_kind,
-            before_tokens,
-            utility_usage,
-        );
     }
 
     pub(crate) fn recovery_observation(&self) -> Option<RecoveryObservation> {
@@ -655,59 +679,8 @@ impl CompactionState {
         *self.latest_request_tokens.lock().unwrap()
     }
 
-    pub(crate) fn begin_automatic(&self, observation: AutomaticCompactionObservation) {
-        let mut automatic = self.automatic.lock().unwrap();
-        if let Some(previous) = automatic.current.replace(observation) {
-            if retain_automatic_observation(&previous) {
-                automatic.last = Some(previous);
-            }
-        }
-    }
-
-    pub(crate) fn update_automatic(
-        &self,
-        operation_id: &str,
-        update: impl FnOnce(&mut AutomaticCompactionObservation),
-    ) {
-        let mut automatic = self.automatic.lock().unwrap();
-        if automatic
-            .current
-            .as_ref()
-            .is_some_and(|current| current.operation_id == operation_id)
-        {
-            if let Some(current) = automatic.current.as_mut() {
-                update(current);
-            }
-        }
-    }
-
-    pub(crate) fn finish_automatic(
-        &self,
-        operation_id: &str,
-        outcome: &str,
-        after_tokens: Option<u64>,
-        utility_usage: Option<CompactionUtilityUsage>,
-    ) {
-        let mut automatic = self.automatic.lock().unwrap();
-        let Some(mut current) = automatic.current.take() else {
-            return;
-        };
-        if current.operation_id != operation_id {
-            automatic.current = Some(current);
-            return;
-        }
-        current.outcome = outcome.to_owned();
-        current.after_tokens = after_tokens.or(current.after_tokens);
-        if utility_usage.is_some() {
-            current.utility_usage = utility_usage;
-        }
-        if retain_automatic_observation(&current) {
-            automatic.last = Some(current);
-        }
-    }
-
     pub(crate) fn automatic_view(&self) -> AutomaticCompactionView {
-        self.automatic.lock().unwrap().clone()
+        AutomaticCompactionView::default()
     }
 
     pub(crate) fn note_prepare_failure(&self, kind: &str) {
@@ -880,141 +853,123 @@ fn valid_sha256(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn keyed_cache_prunes_unreachable_sources_and_rejects_late_writers() {
-        use super::*;
-        let state = CompactionState::new();
-        let old_loop = LoopId::new().unwrap();
-        state.begin_ephemeral_loop(old_loop);
-        let old_keys: BTreeSet<_> = (0..MAX_EPHEMERAL_GROUPS)
-            .map(|index| EphemeralGroupKey {
-                start: index * 2,
-                end: index * 2 + 2,
-                source_hash: [index as u8; 32],
-            })
-            .collect();
-        state
-            .ephemeral_for_context(old_loop, [1; 32], &old_keys)
-            .unwrap();
-        for key in &old_keys {
-            assert!(state.cache_ephemeral_for_context(
-                old_loop,
-                key.clone(),
-                BoundedText::new("old").unwrap(),
-                Some([1; 32])
-            ));
-        }
-        state.clear_ephemeral(old_loop);
-        let current = LoopId::new().unwrap();
-        state.begin_ephemeral_loop(current);
-        let key = EphemeralGroupKey {
-            start: 500,
-            end: 502,
-            source_hash: [99; 32],
-        };
-        let valid = BTreeSet::from([key.clone()]);
-        assert!(
-            state
-                .ephemeral_for_context(current, [1; 32], &valid)
-                .unwrap()
-                .groups
-                .is_empty()
-        );
-        assert!(state.cache_ephemeral_for_context(
-            current,
-            key.clone(),
-            BoundedText::new("current").unwrap(),
-            Some([1; 32])
-        ));
-        assert_eq!(
-            state
-                .ephemeral_for_context(current, [1; 32], &valid)
-                .unwrap()
-                .groups
-                .len(),
-            1
-        );
-        assert!(!state.cache_ephemeral_for_context(
-            old_loop,
-            key.clone(),
-            BoundedText::new("late loop").unwrap(),
-            Some([1; 32])
-        ));
-        state
-            .ephemeral_for_context(current, [2; 32], &valid)
-            .unwrap();
-        assert!(!state.cache_ephemeral_for_context(
-            current,
-            key.clone(),
-            BoundedText::new("late context").unwrap(),
-            Some([1; 32])
-        ));
-        state.note_settings_installed();
-        assert!(!state.cache_ephemeral_for_context(
-            current,
-            key,
-            BoundedText::new("late settings").unwrap(),
-            Some([2; 32])
-        ));
-    }
-
     use super::*;
 
     #[test]
-    fn ephemeral_cache_has_explicit_group_and_byte_caps() {
+    fn settlement_folds_raw_offsets_before_removing_opaque_only_assistants() {
+        use minicore_runtime::history::{
+            AssistantHistory, ToolResultHistory, UserHistory, UserMessageKind,
+        };
+        use minicore_runtime::model::{
+            AssistantPart, ModelFinishReason, ReasoningContent, ToolCall, Usage,
+        };
+        use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
+        let loop_id = LoopId::new().unwrap();
+        let assistant = |content| {
+            HistoryItem::Assistant(AssistantHistory {
+                loop_id,
+                request_index: 0,
+                model: "main".parse().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content,
+                finish_reason: ModelFinishReason::Stop,
+                usage: Usage::default(),
+            })
+        };
+        let exchange = |id: &str, output: &str| {
+            let call_id = minicore_runtime::ToolCallId::new(id).unwrap();
+            let call = ToolCall::new(
+                call_id.clone(),
+                "read".parse().unwrap(),
+                serde_json::json!({"path":"a.txt"}),
+                0,
+            )
+            .unwrap();
+            [
+                assistant(vec![AssistantPart::ToolCall(call)]),
+                HistoryItem::ToolResult(ToolResultHistory {
+                    loop_id,
+                    request_index: 0,
+                    call_id,
+                    tool_name: "read".parse().unwrap(),
+                    outcome: ToolResultOutcome::Success,
+                    output: ToolOutput::new(output).unwrap(),
+                }),
+            ]
+        };
+        let mut appended = vec![
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text("original task").unwrap(),
+            }),
+            assistant(vec![AssistantPart::Reasoning(
+                ReasoningContent::new(None, None, Some("encrypted-only".to_owned()), None).unwrap(),
+            )]),
+        ];
+        appended.extend(exchange("folded-call", "RAW-FOLDED"));
+        appended.extend(exchange("kept-call", "RAW-KEPT"));
+        appended.push(assistant(vec![AssistantPart::Text(
+            "final answer".to_owned(),
+        )]));
+        let items = appended.iter().collect::<Vec<_>>();
+        let key = auto::compressible_ranges(0, &items, loop_id).unwrap()[0]
+            .0
+            .clone();
+        assert_eq!((key.start, key.end), (2, 4));
+        let state = CompactionState::new();
+        assert!(state.install_emergency_groups(
+            loop_id,
+            BTreeMap::from([(key, BoundedText::new("FOLDED SUMMARY").unwrap())])
+        ));
+        let summary = state
+            .settled_emergency_summary(loop_id, &[], &appended, None)
+            .unwrap()
+            .unwrap();
+        let projected: Vec<ModelMessage> = serde_json::from_str(summary.as_str()).unwrap();
+        assert!(recovery::validate_clean_tool_exchanges(&projected));
+        assert!(summary.as_str().contains("FOLDED SUMMARY"));
+        assert!(summary.as_str().contains("RAW-KEPT"));
+        assert!(summary.as_str().contains("final answer"));
+        assert!(!summary.as_str().contains("RAW-FOLDED"));
+        assert!(!summary.as_str().contains("encrypted-only"));
+    }
+
+    #[test]
+    fn emergency_groups_keep_source_identity_and_bounded_installation() {
         let state = CompactionState::new();
         let loop_id = LoopId::new().unwrap();
-        for index in 0..MAX_EPHEMERAL_GROUPS {
-            assert!(state.cache_ephemeral(
-                loop_id,
-                EphemeralGroupKey {
-                    start: index,
-                    end: index + 1,
-                    source_hash: [index as u8; 32],
-                },
-                BoundedText::new("summary").unwrap(),
-            ));
-        }
-        assert!(!state.cache_ephemeral(
-            loop_id,
-            EphemeralGroupKey {
-                start: MAX_EPHEMERAL_GROUPS,
-                end: MAX_EPHEMERAL_GROUPS + 1,
-                source_hash: [255; 32],
-            },
-            BoundedText::new("summary").unwrap(),
-        ));
-        assert_eq!(
-            state.ephemeral(loop_id).unwrap().groups.len(),
-            MAX_EPHEMERAL_GROUPS
+        let key = EphemeralGroupKey {
+            start: 0,
+            end: 2,
+            source_hash: [1; 32],
+        };
+        assert!(state.cache_ephemeral(loop_id, key.clone(), BoundedText::new("summary").unwrap()));
+        state.note_settings_installed();
+        assert!(
+            state
+                .emergency_groups(loop_id, &BTreeSet::from([key.clone()]))
+                .contains_key(&key)
         );
-
-        let byte_state = CompactionState::new();
-        let large = BoundedText::new_with_max_bytes(
-            "x".repeat(MAX_EPHEMERAL_BYTES / 4),
-            BoundedText::MAX_BYTES,
-        )
-        .unwrap();
-        for index in 0..4 {
-            assert!(byte_state.cache_ephemeral(
-                loop_id,
-                EphemeralGroupKey {
-                    start: index,
-                    end: index + 1,
-                    source_hash: [index as u8; 32],
-                },
-                large.clone(),
-            ));
-        }
-        assert!(!byte_state.cache_ephemeral(
-            loop_id,
-            EphemeralGroupKey {
-                start: 4,
-                end: 5,
-                source_hash: [4; 32],
-            },
-            large,
-        ));
+        assert!(state.emergency_groups(loop_id, &BTreeSet::new()).is_empty());
+        let groups = (0..=MAX_EPHEMERAL_GROUPS)
+            .map(|i| {
+                (
+                    EphemeralGroupKey {
+                        start: i,
+                        end: i + 1,
+                        source_hash: [0; 32],
+                    },
+                    BoundedText::new("summary").unwrap(),
+                )
+            })
+            .collect();
+        assert!(!state.install_emergency_groups(loop_id, groups));
+        assert!(
+            state
+                .emergency_groups(loop_id, &BTreeSet::from([key.clone()]))
+                .contains_key(&key)
+        );
     }
 
     fn ticket_descriptor() -> minicore_runtime::model::ModelDescriptor {

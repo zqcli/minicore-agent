@@ -11,15 +11,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AnswerInteraction, CompactSession, SendMessage};
+use crate::agent::{Agent, AnswerInteraction, SendMessage};
 use crate::changes::{ChangesListRequest, change_deadline};
 use crate::diff::{ChangesDiffRequest, diff_deadline};
 use crate::error::AgentError;
 use crate::event::{AgentEventStream, HistoryPageView, SessionStateView, TurnResultView};
 use crate::read::{ReadSession, TurnResultRequest};
-use crate::sessions::{
-    TurnRef, await_compaction_completion, await_loop_preparation, await_turn_completion,
-};
+use crate::sessions::{TurnRef, await_compaction_completion, await_turn_completion};
 use crate::tool_data::{ToolOutputRequest, ToolReadRequest};
 use crate::workspace::listing::WorkspaceFilesRequest;
 use crate::workspace::query::{WORKSPACE_READ_DEADLINE, WorkspaceReadRequest};
@@ -624,19 +622,8 @@ impl RpcServer {
             }
             "turn.send" => {
                 let params: TurnSendParams = params_or_error(&id, params)?;
-                let automatic = match self.agent().automatic_compaction_enabled(params.session_id) {
-                    Ok(automatic) => automatic,
-                    Err(error) => return Err(agent_error(id, &error)),
-                };
                 if minicore_runtime::execution::UserInput::text(&params.text).is_err() {
                     return Err(invalid_params(Some(id)));
-                }
-                // Automatic admission may need a deferred response. Reserve
-                // waiter capacity before publishing the Session reservation;
-                // otherwise a full waiter set could leave a real loop with no
-                // response path.
-                if automatic && self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
-                    return Err(resource_exhausted(id));
                 }
                 let submission = self
                     .agent_mut()
@@ -654,33 +641,6 @@ impl RpcServer {
                                 accepted_at: accepted.accepted_at,
                             },
                         ))
-                    }
-                    Ok(crate::sessions::LoopSubmission::Preparing(waiter)) => {
-                        let operation_id = waiter.operation_id().to_owned();
-                        if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
-                            // Cancel the preparation we just started rather
-                            // than leave an unawaitable operation running.
-                            let _ = self.agent().cancel_compaction(CompactSession {
-                                session_id: params.session_id,
-                                operation_id,
-                            });
-                            return Err(resource_exhausted(id));
-                        }
-                        let outbound = self.outbound_tx.clone();
-                        self.waiters.spawn(async move {
-                            let response = match await_loop_preparation(waiter).await {
-                                Ok(accepted) => success(
-                                    &id,
-                                    TurnResult {
-                                        turn: accepted.turn,
-                                        accepted_at: accepted.accepted_at,
-                                    },
-                                ),
-                                Err(error) => agent_error(id, &error),
-                            };
-                            let _ = outbound.send(RpcOutbound::Response(response)).await;
-                        });
-                        Dispatch::Deferred
                     }
                     Err(error) => Dispatch::Response(agent_error(id, &error)),
                 }

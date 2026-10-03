@@ -273,6 +273,9 @@ async fn tui_discovery_create_history_and_reopen_flow() {
 
     // Second turn on the same session: history carries the first turn forward.
     process
+        .wait_post_turn_noop("first-settled", &session_id, &first_turn)
+        .await;
+    process
         .send(
             "send2",
             "turn.send",

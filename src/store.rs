@@ -344,7 +344,7 @@ pub(crate) struct StoredTurnSummary {
     pub(crate) outcome: StoredLoopOutcome,
     pub(crate) usage: Usage,
     pub(crate) requests: u32,
-    pub(crate) tool_rounds: u16,
+    pub(crate) tool_rounds: u64,
     pub(crate) final_config_revision: ConfigRevision,
     pub(crate) completed_at: String,
 }
@@ -360,7 +360,7 @@ pub(crate) struct StoredLoopRecord {
     pub(crate) items: Vec<HistoryItem>,
     pub(crate) usage: Usage,
     pub(crate) requests: u32,
-    pub(crate) tool_rounds: u16,
+    pub(crate) tool_rounds: u64,
     pub(crate) final_config_revision: ConfigRevision,
     pub(crate) completed_at: String,
     /// RFC3339 acceptance times aligned by User-item occurrence (Prompt first,

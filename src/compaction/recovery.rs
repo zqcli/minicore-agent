@@ -448,27 +448,8 @@ pub(crate) async fn reconstruct_for_recovery(
         }
     };
 
-    let context_hash = match auto.summary_context_hash(
-        &ticket.system,
-        &ticket.tools,
-        ticket.reasoning,
-        hard_tokens,
-        target_tokens,
-    ) {
-        Ok(hash) => hash,
-        Err(error) => {
-            return (
-                Err(RecoveryReconstructionError::Other(error.kind().to_owned())),
-                utility_usage,
-            );
-        }
-    };
     let valid_keys = ranges.iter().map(|(key, _)| key.clone()).collect();
-    let mut folded: BTreeMap<super::EphemeralGroupKey, BoundedText> = auto
-        .state
-        .ephemeral_for_context(loop_id, context_hash, &valid_keys)
-        .map(|summary| summary.groups)
-        .unwrap_or_default();
+    let mut folded = auto.state.emergency_groups(loop_id, &valid_keys);
 
     // A retry is only worthwhile when the real, provider-normalized body is
     // strictly smaller than the body that failed and stays inside the hard
@@ -483,27 +464,19 @@ pub(crate) async fn reconstruct_for_recovery(
             .then(left.start.cmp(&right.start))
     });
 
-    // Retained summaries may already satisfy the shrink gate; reuse them
-    // without a utility call. An empty cache must still fold at least one real
-    // group: dropping opaque replay alone is not a semantic reduction.
-    if !folded.is_empty() {
-        if let Some((request, tokens, bytes)) = measure_reconstruction(
-            ticket,
-            auto,
-            budget,
-            &fixed,
-            &history_messages,
-            loop_id,
-            request_index,
-            &folded,
-        ) {
-            if tokens <= hard_tokens && bytes < ticket.original_body_bytes {
-                return (Ok(request), utility_usage);
-            }
-        }
-    }
+    // Existing groups are already in the rejected request. A fresh rejection
+    // must reduce a new source group, not win merely by dropping opaque replay.
 
     for (key, _) in candidates {
+        if folded.contains_key(&key) {
+            continue;
+        }
+        if folded.len() >= super::MAX_EPHEMERAL_GROUPS {
+            return (
+                Err(RecoveryReconstructionError::Uncompressible),
+                utility_usage,
+            );
+        }
         if cancellation.is_cancelled() {
             return (Err(RecoveryReconstructionError::Cancelled), utility_usage);
         }
@@ -559,12 +532,6 @@ pub(crate) async fn reconstruct_for_recovery(
         };
 
         merge_utility_usage(&mut utility_usage, generation.utility_usage);
-        auto.state.cache_ephemeral_for_context(
-            loop_id,
-            key.clone(),
-            generation.content.clone(),
-            Some(context_hash),
-        );
         folded.insert(key, generation.content);
 
         if let Some((request, tokens, bytes)) = measure_reconstruction(
@@ -578,6 +545,18 @@ pub(crate) async fn reconstruct_for_recovery(
             &folded,
         ) {
             if tokens <= hard_tokens && bytes < ticket.original_body_bytes {
+                if cancellation.is_cancelled() {
+                    return (Err(RecoveryReconstructionError::Cancelled), utility_usage);
+                }
+                if Instant::now() >= deadline {
+                    return (Err(RecoveryReconstructionError::Timeout), utility_usage);
+                }
+                if !auto.state.install_emergency_groups(loop_id, folded) {
+                    return (
+                        Err(RecoveryReconstructionError::Uncompressible),
+                        utility_usage,
+                    );
+                }
                 return (Ok(request), utility_usage);
             }
         }
@@ -647,6 +626,65 @@ impl CompactingModel {
         let loop_id = context.loop_id;
         let request_index = context.request_index;
 
+        // A normal delivery retry re-enters with the original immutable
+        // Runtime request, not a freshly prepared projection. Match its exact
+        // framing, then continue using the already reduced request without
+        // granting another recovery opportunity.
+        let original_hash = compute_ticket_hash(
+            loop_id,
+            request_index,
+            request.messages(),
+            request.tools(),
+            request.limits(),
+            self.inner.descriptor(),
+            request.reasoning(),
+            0,
+            0,
+        )?;
+        if let Some(reduced) = self
+            .state
+            .recovered_request(loop_id, request_index, original_hash)
+            .map_err(|_| local_model_error(ModelErrorKind::InvalidRequest))?
+        {
+            if context.cancellation.is_cancelled() {
+                return Err(local_model_error(ModelErrorKind::Cancelled));
+            }
+            if Instant::now() >= context.deadline {
+                return Err(local_model_error(ModelErrorKind::Timeout));
+            }
+            let cancellation = context.cancellation.clone();
+            let deadline = tokio::time::Instant::from_std(context.deadline);
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(unknown_model_error(ModelErrorKind::Cancelled)),
+                _ = tokio::time::sleep_until(deadline) => Err(unknown_model_error(ModelErrorKind::Timeout)),
+                result = self.inner.start(reduced.clone(), context) => result,
+            };
+            if let Some(observation) = self.state.recovery_observation().filter(|observation| {
+                observation.loop_id == loop_id && observation.request_index == request_index
+            }) {
+                match &result {
+                    Ok(_) => self.state.record_recovery_success(
+                        loop_id,
+                        request_index,
+                        observation.before_tokens,
+                        self.budget
+                            .estimate_request_tokens(&reduced, Some(loop_id), Some(request_index))
+                            .ok(),
+                        observation.utility_usage,
+                    ),
+                    Err(error) => self.state.record_recovery_failure(
+                        loop_id,
+                        request_index,
+                        observation.before_tokens,
+                        observation.utility_usage,
+                        model_error_kind_str(error.kind()),
+                    ),
+                }
+            }
+            return result;
+        }
+
         // Capture actual before-start bytes and tokens snapshot before invocation.
         // If the provider call fails, replay may be cleared, so snapshotting here
         // accurately preserves original body and opaque continuation sizing.
@@ -655,6 +693,9 @@ impl CompactingModel {
             .estimate_request_bytes(&request, Some(loop_id), Some(request_index))
             .map(|bytes| (bytes, bytes.div_ceil(4) as u64))
             .unwrap_or((0, 0));
+        if original_body_bytes > 0 {
+            self.state.note_request_estimate(original_tokens);
+        }
 
         // Bind the Runtime-built request, including its actual `ModelLimits`,
         // to the preparation-time content hash. A content change under the
@@ -876,6 +917,13 @@ impl CompactingModel {
             .budget
             .estimate_request_tokens(&reduced_request, Some(loop_id), Some(request_index))
             .ok();
+
+        self.state.retain_recovered_request(
+            loop_id,
+            request_index,
+            original_hash,
+            reduced_request.clone(),
+        );
 
         // Second start call. The pre-start checks above already covered the
         // not-yet-sent case; once this future exists an interruption can only

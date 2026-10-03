@@ -185,6 +185,37 @@ impl RpcProcess {
         (turn, wait_id)
     }
 
+    /// Budget checks are independent operations, including an under-threshold
+    /// Noop. A sequential client must observe their terminal result before the
+    /// next prompt; waiting for turn.wait alone is intentionally insufficient.
+    pub async fn wait_post_turn_noop(&mut self, prefix: &str, session_id: &Value, turn: &Value) {
+        tokio::time::timeout(PROCESS_TIMEOUT, async {
+            for attempt in 0u64.. {
+                let id = format!("{prefix}-context-{attempt}");
+                self.send(&id, "session.context", json!({"session_id":session_id}))
+                    .await;
+                let context = self.response(&id).await;
+                let result = &context["result"];
+                assert!(
+                    context["error"].is_null(),
+                    "context query failed: {context}"
+                );
+                if result["current_operation"].is_null() {
+                    assert_eq!(
+                        result["last_result"]["operation_id"],
+                        json!(format!("auto-{}", turn["loop_id"].as_str().unwrap()))
+                    );
+                    assert_eq!(result["last_result"]["status"], json!("noop"));
+                    assert!(result["last_result"]["utility_usage"].is_null());
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-turn Noop must reach an authoritative terminal result");
+    }
+
     pub async fn event(&mut self, event_type: &str) -> Value {
         self.event_matching(event_type, |_| true).await
     }

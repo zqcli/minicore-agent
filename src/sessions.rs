@@ -25,9 +25,8 @@ use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
 use crate::compaction::{
-    AutoContext, AutomaticCompactionObservation, AutomaticCompactionView, CompactionInput,
-    CompactionPolicy, CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage,
-    generate_summary,
+    AutoContext, AutomaticCompactionView, CompactionInput, CompactionPolicy, CompactionResult,
+    CompactionState, CompactionStatus, CompactionUtilityUsage, generate_summary,
 };
 use crate::config::map_loop_start_error;
 use crate::error::{AgentError, StoreError};
@@ -48,7 +47,6 @@ use crate::tools::command::CommandOwners;
 use crate::tools::observe::ToolObserver;
 use crate::workspace::{Workspace, WorkspaceError};
 
-mod admission;
 mod compact;
 
 #[cfg(test)]
@@ -59,8 +57,6 @@ type WorkerGateEntry = (SessionId, Arc<WorkerGate>);
 static PAUSE_BEFORE_JOIN: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 static PAUSE_AFTER_COMPACTION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
-#[cfg(test)]
-static PAUSE_AFTER_ADMISSION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 type RuntimeStartGateEntry = (SessionId, Arc<RuntimeStartGate>);
 #[cfg(test)]
@@ -227,29 +223,8 @@ pub(crate) fn pause_next_compaction_after_result(session_id: SessionId, gate: Ar
 }
 
 #[cfg(test)]
-pub(crate) fn pause_next_admission_after_result(session_id: SessionId, gate: Arc<WorkerGate>) {
-    PAUSE_AFTER_ADMISSION_RESULT
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, gate));
-}
-
-#[cfg(test)]
 fn take_pause_after_compaction_result(session_id: SessionId) -> Option<Arc<WorkerGate>> {
     let mut gates = PAUSE_AFTER_COMPACTION_RESULT
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|(candidate, _)| *candidate == session_id)
-        .map(|position| gates.remove(position).1)
-}
-
-#[cfg(test)]
-fn take_pause_after_admission_result(session_id: SessionId) -> Option<Arc<WorkerGate>> {
-    let mut gates = PAUSE_AFTER_ADMISSION_RESULT
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap();
@@ -461,8 +436,8 @@ impl Sessions {
 impl Drop for Sessions {
     fn drop(&mut self) {
         // Ordinary Agent drop is intentionally non-blocking. Manual and
-        // startup-admission workers still receive cancellation through their
-        // Session-owned token; the async shutdown path above is the complete
+        // compaction workers receive cancellation through their Session-owned
+        // token; the async shutdown path above is the complete
         // join barrier.
         for session in self.loaded.values() {
             session.cancel_active_on_drop();
@@ -578,10 +553,8 @@ struct SessionInner {
     closing: bool,
     compaction: Option<Arc<CompactionOperation>>,
     compaction_progress: Option<CompactionProgress>,
-    admission: Option<Arc<AdmissionOperation>>,
     last_compaction_result: Option<CompactionResult>,
     policy: CompactionPolicy,
-    next_admission_id: u64,
     // Operation IDs stay reserved for this loaded Session so stale cancel
     // requests cannot target a later operation with the same identity.
     used_compaction_ids: BTreeSet<String>,
@@ -593,6 +566,7 @@ struct ActiveLoop {
     completion: watch::Receiver<Option<TurnCompletion>>,
     task: Option<Arc<SessionTask>>,
     execution_summary: Option<BoundedText>,
+    execution_history: Arc<[HistoryItem]>,
 }
 
 pub(crate) struct ExecutionInput {
@@ -601,52 +575,9 @@ pub(crate) struct ExecutionInput {
     pub(crate) summary: Option<BoundedText>,
 }
 
-/// One accepted submission: either a live loop, or an admission preparation
-/// that still owes its loop. The deferred waiter observes the preparation.
+/// An accepted submission always starts the ordinary execution path.
 pub(crate) enum LoopSubmission {
     Accepted(LoopAccepted),
-    Preparing(PreparationWaiter),
-}
-
-/// Deferred submission receiver. Dropping it cancels a still-running startup
-/// preparation, so an embedded caller that abandons `Agent::send` cannot leave
-/// a summary worker running without an owner waiting for its result.
-pub(crate) struct PreparationWaiter {
-    session: Session,
-    operation_id: String,
-    receiver: watch::Receiver<Option<PreparedLoop>>,
-}
-
-impl PreparationWaiter {
-    pub(crate) fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-}
-
-impl Drop for PreparationWaiter {
-    fn drop(&mut self) {
-        let _ = self.session.cancel_compaction(&self.operation_id);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreparationFailure {
-    Cancelled,
-    ContextUncompressible,
-    HistoryTooLarge,
-    SessionBlocked,
-    SessionBusy,
-    Compaction(&'static str),
-    Internal,
-}
-
-/// Result of one startup admission preparation: the loop it finally created,
-/// or the honest failure kind that prevented it. It never fabricates a LoopId
-/// before the summary work succeeds.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PreparedLoop {
-    Started(LoopAccepted),
-    Failed(PreparationFailure),
 }
 
 /// Frozen tool schemas for the current execution config, derived only from the
@@ -720,30 +651,17 @@ struct CompactionReservation {
     tool_schemas: Vec<ToolSpec>,
     previous_summary: Option<minicore_runtime::value::BoundedText>,
     previous_covered_item_count: usize,
-    /// Effective input token target for this operation. Automatic admission
-    /// uses the active policy; explicit manual compaction keeps its original
-    /// half-window target.
+    /// Automatic post-turn operations use the configured target; explicit
+    /// manual compaction keeps its original half-window target.
     target_tokens: u64,
     /// Effective model input ceiling for utility requests. Unlike the target,
     /// this is a hard boundary for deciding whether a result is usable.
     hard_tokens: u64,
-    /// Startup admission must avoid constructing an invalid full request before
-    /// the utility replaces over-limit history; manual compaction keeps exact
-    /// before-request accounting.
-    safe_before_estimate: bool,
-    /// Automatic admission may refresh an existing durable summary when a new
-    /// budget makes that summary too large. Manual compaction retains its
-    /// established no-op behavior once every history item is covered.
-    refresh_summary: bool,
+    /// Only post-turn operations use a soft trigger. Manual compaction keeps
+    /// its explicit half-window target and is never gated by this estimate.
+    automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
+    trigger_tokens: Option<u64>,
     deadline: Instant,
-}
-
-/// Publishes and owns the outcome of one admission preparation. The wait
-/// receiver is created before work starts so no completion can be lost.
-struct AdmissionOperation {
-    result: watch::Sender<Option<PreparedLoop>>,
-    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-    operation: Arc<CompactionOperation>,
 }
 
 struct CompletionGuard {
@@ -845,10 +763,8 @@ impl Session {
             closing: false,
             compaction: None,
             compaction_progress: None,
-            admission: None,
             last_compaction_result: None,
             policy,
-            next_admission_id: 0,
             used_compaction_ids: BTreeSet::new(),
         };
         Self {
@@ -1053,10 +969,6 @@ impl Session {
         self.shared.inner.lock().unwrap().policy
     }
 
-    pub(crate) fn automatic_compaction_enabled(&self) -> bool {
-        self.shared.inner.lock().unwrap().auto.is_some()
-    }
-
     pub(crate) fn info(&self, loaded: bool) -> SessionInfo {
         let inner = self.shared.inner.lock().unwrap();
         SessionInfo {
@@ -1212,28 +1124,12 @@ impl Session {
     }
 
     pub(crate) fn execution_input(&self, input: UserInput) -> Result<ExecutionInput, AgentError> {
-        self.build_execution_input(input, false)
-    }
-
-    /// Builds the startup projection for an admission worker that already owns
-    /// the Session's compaction slot; that ownership replaces the usual busy
-    /// rejection.
-    fn build_execution_input(
-        &self,
-        input: UserInput,
-        owned_admission: bool,
-    ) -> Result<ExecutionInput, AgentError> {
         let (history, config, options, system_prompt, auto) = {
             let inner = self.shared.inner.lock().unwrap();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            let busy = if owned_admission {
-                inner.closing || inner.active.is_some()
-            } else {
-                inner.closing || inner.active.is_some() || inner.compaction.is_some()
-            };
-            if busy {
+            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
             }
             (
@@ -1264,46 +1160,19 @@ impl Session {
     pub(crate) async fn start_loop(&self, input: UserInput) -> Result<LoopAccepted, AgentError> {
         self.cleanup_finished().await?;
         let execution = self.execution_input(input)?;
-        self.install_loop(execution, None)
+        self.install_loop(execution)
     }
 
-    /// Admits one user submission. Automatic-enabled sessions first use a
-    /// Session-owned preparation to perform the bounded startup decision; the
-    /// worker either starts the loop directly or creates a compliant summary
-    /// before any `AgentLoop` exists. The caller receives a real `TurnRef` only
-    /// after that decision succeeds.
+    /// Submission never starts a summary worker or a pre-turn handoff.
     pub(crate) async fn submit(&self, input: UserInput) -> Result<LoopSubmission, AgentError> {
-        self.cleanup_finished().await?;
-        let automatic = {
-            let inner = self.shared.inner.lock().unwrap();
-            if inner.blocked.is_some() {
-                return Err(AgentError::SessionBlocked);
-            }
-            inner.auto.is_some()
-        };
-        if !automatic {
-            return Ok(LoopSubmission::Accepted(self.start_loop(input).await?));
-        }
-        // Reserve the Session slot before any workspace read or model work.
-        // The admission worker makes the eventual decision, which keeps the
-        // RPC reader responsive even when AGENTS.md is slow to read.
-        let waiter = self.start_admission(input).await?;
-        Ok(LoopSubmission::Preparing(waiter))
+        Ok(LoopSubmission::Accepted(self.start_loop(input).await?))
     }
 
-    /// Installs a successfully created loop. When `admission` is given, the
-    /// admission is re-validated before the loop starts and its terminal state
-    /// plus the active loop are published under one lock, so an admission can
-    /// never be observed as both busy and started.
-    fn install_loop(
-        &self,
-        execution: ExecutionInput,
-        admission: Option<&Arc<AdmissionOperation>>,
-    ) -> Result<LoopAccepted, AgentError> {
+    fn install_loop(&self, execution: ExecutionInput) -> Result<LoopAccepted, AgentError> {
         let accepted_at = crate::store::utc_timestamp().ok();
         let turn = {
             let mut inner = self.shared.inner.lock().unwrap();
-            Self::validate_install_state(&inner, admission)?;
+            Self::validate_install_state(&inner)?;
             // Initialize current-loop observation before spawning the Runtime
             // task: the runner may reach Model::start synchronously.
             inner.presentation.reset_before_loop_start();
@@ -1313,6 +1182,7 @@ impl Session {
             // the cancellation/close race between validation and ownership.
             #[cfg(test)]
             let captured_options = execution.options.clone();
+            let execution_history = Arc::clone(&execution.request.history);
             let mut agent_loop = AgentLoop::start(execution.request, execution.options)
                 .map_err(map_loop_start_error)?;
             #[cfg(test)]
@@ -1339,25 +1209,13 @@ impl Session {
                 .push((turn.loop_id, captured_options));
             let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
             let (completion_tx, completion_rx) = watch::channel(None);
-            if let Some(admission) = admission {
-                inner.compaction_progress = None;
-                admission.operation.finish();
-                // Commit the admission observation before the loop task can
-                // begin a request-time observation. This preserves startup
-                // utility usage when the first request itself merely fits.
-                self.shared.compaction.finish_automatic(
-                    &admission.operation.operation_id,
-                    "started",
-                    None,
-                    None,
-                );
-            }
             inner.active = Some(ActiveLoop {
                 turn,
                 handle: handle.clone(),
                 completion: completion_rx,
                 task: None,
                 execution_summary: execution.summary,
+                execution_history,
             });
             inner
                 .presentation
@@ -1385,46 +1243,15 @@ impl Session {
         Ok(LoopAccepted { turn, accepted_at })
     }
 
-    /// Pre-flight for `install_loop`: fails before any `AgentLoop` is created
-    /// when the session is blocked, closing, already active, or the admission
-    /// was cancelled or replaced.
-    fn validate_install_state(
-        inner: &SessionInner,
-        admission: Option<&Arc<AdmissionOperation>>,
-    ) -> Result<(), AgentError> {
+    fn validate_install_state(inner: &SessionInner) -> Result<(), AgentError> {
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
         if inner.closing || inner.active.is_some() {
             return Err(AgentError::SessionBusy);
         }
-        match admission {
-            Some(admission) => {
-                let current = inner
-                    .admission
-                    .as_ref()
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, admission));
-                if !current {
-                    return Err(AgentError::SessionBusy);
-                }
-                if admission.operation.cancellation_requested() {
-                    // A preparation cancelled after its summary finished must
-                    // not install the loop.
-                    return Err(AgentError::InvalidState);
-                }
-                if !inner
-                    .compaction
-                    .as_ref()
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission.operation))
-                {
-                    return Err(AgentError::SessionBusy);
-                }
-            }
-            None => {
-                if inner.compaction.is_some() || inner.admission.is_some() {
-                    return Err(AgentError::SessionBusy);
-                }
-            }
+        if inner.compaction.is_some() {
+            return Err(AgentError::SessionBusy);
         }
         Ok(())
     }
@@ -1472,9 +1299,6 @@ impl Session {
             {
                 inner.active = None;
             }
-        }
-        if self.reap_finished_admission().await? {
-            return Ok(());
         }
         if self.reap_finished_compaction().await? {
             return Ok(());
@@ -1669,10 +1493,7 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing
-                || (inner.active.is_none()
-                    && (inner.compaction.is_some() || inner.admission.is_some()))
-            {
+            if inner.closing || (inner.active.is_none() && inner.compaction.is_some()) {
                 return Err(AgentError::SessionBusy);
             }
             inner
@@ -1746,20 +1567,22 @@ impl Session {
         // Every Session-owned query observes this token, so it is cancelled here
         // with the other owners; the workers are joined further down, after
         // every owner has been told to stop, so slow status cleanup can never
-        // delay cancelling the active loop, admission, or compaction.
+        // delay cancelling the active loop or compaction.
         self.shared.close.cancel();
-        let (active_handle, active_task, compaction, admission) = {
+        let (active_handle, active_task, compaction) = {
             let mut inner = self.shared.inner.lock().unwrap();
             let active_handle = inner.active.as_ref().map(|active| active.handle.clone());
             let active_task = inner.active.as_ref().and_then(|active| active.task.clone());
             let compaction = inner.compaction.clone();
-            let admission = inner.admission.clone();
             inner.closing = true;
-            (active_handle, active_task, compaction, admission)
+            (active_handle, active_task, compaction)
         };
         let mut first_error = None;
         if let Some(handle) = active_handle {
             let _ = handle.cancel();
+        }
+        if let Some(operation) = compaction.as_ref() {
+            let _ = operation.cancel();
         }
         if let Some(task) = active_task {
             if task.join().await.is_err() {
@@ -1773,20 +1596,6 @@ impl Session {
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
             {
                 inner.active = None;
-            }
-        }
-        if let Some(admission) = admission {
-            let _ = admission.operation.cancel();
-            if admission.join().await.is_err() && first_error.is_none() {
-                first_error = Some(AgentError::Internal);
-            }
-            let mut inner = self.shared.inner.lock().unwrap();
-            if inner
-                .admission
-                .as_ref()
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &admission))
-            {
-                inner.admission = None;
             }
         }
         if let Some(compaction) = compaction {
@@ -1919,7 +1728,6 @@ async fn run_active_loop(
     mut events: minicore_runtime::LoopEventStream,
     mut completion: CompletionGuard,
 ) {
-    session.shared.compaction.begin_ephemeral_loop(turn.loop_id);
     let _ephemeral_cleanup = EphemeralSummaryCleanup {
         state: Arc::clone(&session.shared.compaction),
         loop_id: turn.loop_id,
@@ -2066,6 +1874,27 @@ async fn run_active_loop(
         }
     };
 
+    if persistence == TurnPersistence::Persisted {
+        if let Err(kind) = session.settle_emergency_projection(turn, &report).await {
+            if let Some(observation) = session
+                .shared
+                .compaction
+                .recovery_observation()
+                .filter(|observation| observation.loop_id == turn.loop_id)
+            {
+                session.shared.compaction.record_recovery_failure(
+                    turn.loop_id,
+                    observation.request_index,
+                    observation.before_tokens,
+                    observation.utility_usage,
+                    kind,
+                );
+            }
+            tracing::warn!(session_id = %turn.session_id, loop_id = %turn.loop_id,
+                failure_kind = kind, "emergency projection could not be durably settled");
+        }
+    }
+
     let result = Arc::new(TurnResult {
         turn,
         report: Arc::clone(&report),
@@ -2078,9 +1907,34 @@ async fn run_active_loop(
     // or ToolOutcome, does not retry the loop, and does not touch history.jsonl.
     persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
 
-    // Authoritative completion precedes best-effort events: `turn.wait` may
-    // resolve before the `TurnFinished` event is observed.
+    // Own the join slot before reserving. Reservation excludes the next
+    // submit and close captures its cancellation owner under the same lock.
+    // There is no await between completion publication and handle installation.
+    let (operation, _) = CompactionOperation::new(format!("auto-{}", turn.loop_id));
+    let mut join_slot = operation.join.lock().await;
+    let reservation = if persistence == TurnPersistence::Persisted
+        && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)
+    {
+        session.reserve_post_turn(turn, Arc::clone(&operation))
+    } else {
+        None
+    };
+    let mut handoff = reservation
+        .as_ref()
+        .map(|_| compact::CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation)));
+
+    // Authoritative completion precedes summary model work and best-effort events.
     completion.publish_finished(Arc::clone(&result));
+    if let Some(reservation) = reservation {
+        *join_slot = Some(tokio::spawn(compact::run_compaction(
+            session.clone(),
+            reservation,
+        )));
+        if let Some(guard) = handoff.as_mut() {
+            guard.disarm();
+        }
+    }
+    drop(join_slot);
 
     session.shared.events.try_send(AgentEvent::TurnFinished {
         turn,
@@ -2494,37 +2348,6 @@ pub(crate) async fn await_compaction_completion(
     }
 }
 
-/// Awaits one startup admission preparation. It resolves only after the
-/// Session published either a real loop or an explicit failure kind.
-pub(crate) async fn await_loop_preparation(
-    mut waiter: PreparationWaiter,
-) -> Result<LoopAccepted, AgentError> {
-    loop {
-        {
-            let value = waiter.receiver.borrow();
-            if let Some(prepared) = value.as_ref() {
-                return match prepared {
-                    PreparedLoop::Started(accepted) => Ok(accepted.clone()),
-                    PreparedLoop::Failed(failure) => Err(match failure {
-                        PreparationFailure::Cancelled => AgentError::InvalidState,
-                        PreparationFailure::ContextUncompressible => {
-                            AgentError::ContextUncompressible
-                        }
-                        PreparationFailure::HistoryTooLarge => AgentError::HistoryTooLarge,
-                        PreparationFailure::SessionBlocked => AgentError::SessionBlocked,
-                        PreparationFailure::SessionBusy => AgentError::SessionBusy,
-                        PreparationFailure::Compaction(_) => AgentError::Internal,
-                        PreparationFailure::Internal => AgentError::Internal,
-                    }),
-                };
-            }
-        }
-        if waiter.receiver.changed().await.is_err() {
-            return Err(AgentError::Internal);
-        }
-    }
-}
-
 pub(crate) fn map_store_error(error: StoreError) -> AgentError {
     match error {
         StoreError::SessionNotFound => AgentError::SessionNotFound,
@@ -2616,6 +2439,7 @@ mod tests {
             },
             BoundedText::new("old").unwrap(),
         ));
+        state.clear_ephemeral(old_loop);
         assert!(state.cache_ephemeral(
             new_loop,
             EphemeralGroupKey {

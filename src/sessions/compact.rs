@@ -1,7 +1,7 @@
-//! Manual compaction work, commit, cancellation, and completion helpers.
+//! Manual and independent post-turn compaction share ownership and commit helpers.
 use super::*;
 
-struct CompactionCompletionGuard {
+pub(super) struct CompactionCompletionGuard {
     session: Session,
     operation: Arc<CompactionOperation>,
     armed: bool,
@@ -42,13 +42,6 @@ impl CompactionOperation {
     pub(super) fn cancellation_requested(&self) -> bool {
         self.state.load(Ordering::Acquire) == COMPACTION_CANCELLED
             || self.cancellation.is_cancelled()
-    }
-
-    /// Marks the operation terminal without publishing a manual result. Used
-    /// by a startup admission after it has taken ownership of its loop, so a
-    /// later cancel finds nothing to cancel.
-    pub(super) fn finish(&self) {
-        self.state.store(COMPACTION_COMPLETED, Ordering::Release);
     }
 
     fn try_begin_commit(&self) -> bool {
@@ -133,12 +126,16 @@ impl CompactionOperation {
 }
 
 impl CompactionCompletionGuard {
-    fn new(session: Session, operation: Arc<CompactionOperation>) -> Self {
+    pub(super) fn new(session: Session, operation: Arc<CompactionOperation>) -> Self {
         Self {
             session,
             operation,
             armed: true,
         }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
     }
 
     fn publish(&mut self, result: CompactionResult) {
@@ -169,6 +166,164 @@ impl Drop for CompactionCompletionGuard {
 }
 
 impl Session {
+    /// Existing emergency summaries may become durable only once the entire
+    /// source turn is definitely appended. No utility/model work happens here.
+    pub(super) async fn settle_emergency_projection(
+        &self,
+        turn: TurnRef,
+        report: &LoopReport,
+    ) -> Result<(), &'static str> {
+        let (history, record, previous, base) = {
+            let inner = self.shared.inner.lock().unwrap();
+            let active = inner
+                .active
+                .as_ref()
+                .filter(|active| active.turn == turn)
+                .ok_or("emergency_settlement_history_changed")?;
+            (
+                Arc::clone(&inner.history),
+                inner.record.clone(),
+                active.execution_summary.clone(),
+                Arc::clone(&active.execution_history),
+            )
+        };
+        let content = self
+            .shared
+            .compaction
+            .settled_emergency_summary(
+                turn.loop_id,
+                base.as_ref(),
+                report.appended.as_ref(),
+                previous.as_ref(),
+            )
+            .map_err(|_| "emergency_settlement_snapshot_too_large")?;
+        let Some(content) = content else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + crate::store::AUX_PERSIST_DEADLINE;
+        let source = tokio::time::timeout_at(
+            deadline.into(),
+            self.shared
+                .store
+                .capture_history_anchor(turn.session_id, &history),
+        )
+        .await
+        .map_err(|_| "emergency_settlement_timeout")?
+        .map_err(|_| "emergency_settlement_store")?
+        .ok_or("emergency_settlement_history_changed")?;
+        let bytes = crate::compaction::encode_snapshot(turn.session_id, &record, &source, &content)
+            .ok_or("emergency_settlement_snapshot_too_large")?;
+        let _io = tokio::time::timeout_at(deadline.into(), self.shared.io.lock())
+            .await
+            .map_err(|_| "emergency_settlement_timeout")?;
+        let session = self.clone();
+        let expected = Arc::clone(&history);
+        let committed = self
+            .shared
+            .store
+            .commit_summary(
+                turn.session_id,
+                &source,
+                history.as_ref(),
+                &bytes,
+                deadline,
+                move || {
+                    let inner = session.shared.inner.lock().unwrap();
+                    !inner.closing
+                        && Arc::ptr_eq(&inner.history, &expected)
+                        && inner
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| active.turn == turn)
+                },
+            )
+            .await
+            .map_err(|_| "emergency_settlement_store")?;
+        match committed {
+            SummaryCommit::Committed => {
+                let inner = self.shared.inner.lock().unwrap();
+                if inner.closing
+                    || !Arc::ptr_eq(&inner.history, &history)
+                    || inner
+                        .active
+                        .as_ref()
+                        .is_none_or(|active| active.turn != turn)
+                {
+                    return Err("emergency_settlement_history_changed");
+                }
+                self.shared
+                    .compaction
+                    .publish(content, source.covered_loop_count, history.len());
+                Ok(())
+            }
+            // Unknown/rejected writes keep the old projection. The current
+            // turn still has its original persisted transcript and outcome.
+            SummaryCommit::Unknown => Err("emergency_settlement_write_unknown"),
+            SummaryCommit::Rejected => Err("emergency_settlement_history_changed"),
+        }
+    }
+
+    /// Called only by the completed turn owner while holding the new
+    /// operation's join slot. Unlike manual start, this never cleans up or
+    /// joins the active task (which would be a self-join).
+    pub(super) fn reserve_post_turn(
+        &self,
+        turn: TurnRef,
+        operation: Arc<CompactionOperation>,
+    ) -> Option<CompactionReservation> {
+        let mut inner = self.shared.inner.lock().unwrap();
+        let auto = inner.auto.clone()?;
+        if !auto.policy.enabled
+            || inner.closing
+            || inner.blocked.is_some()
+            || inner.compaction.is_some()
+            || inner
+                .active
+                .as_ref()
+                .is_none_or(|active| active.turn != turn)
+        {
+            return None;
+        }
+        let previous = self.shared.compaction.project(&inner.history);
+        let (previous_summary, previous_covered_item_count) = previous
+            .map(|projection| {
+                (
+                    Some(projection.summary),
+                    inner.history.len() - projection.suffix.len(),
+                )
+            })
+            .unwrap_or((None, 0));
+        let budget = auto.policy.budget(auto.model.descriptor().context_window);
+        let reservation = CompactionReservation {
+            operation: Arc::clone(&operation),
+            model: Arc::clone(&auto.model),
+            record: inner.record.clone(),
+            history: Arc::clone(&inner.history),
+            workspace: Arc::clone(&inner.workspace),
+            tool_schemas: frozen_tool_specs(&inner.config, &inner.record),
+            previous_summary,
+            previous_covered_item_count,
+            hard_tokens: budget.hard_tokens,
+            target_tokens: budget.target_tokens,
+            automatic_budget: Some(Arc::clone(&auto.budget)),
+            trigger_tokens: Some(budget.trigger_tokens),
+            deadline: Instant::now()
+                .checked_add(inner.options.model_timeout)
+                .unwrap_or_else(Instant::now),
+        };
+        inner.compaction_progress = Some(CompactionProgress {
+            operation_id: operation.operation_id.clone(),
+            phase: CompactionPhase::Preparing,
+            covered_item_count: previous_covered_item_count,
+            retained_item_count: inner
+                .history
+                .len()
+                .saturating_sub(previous_covered_item_count),
+        });
+        inner.compaction = Some(operation);
+        Some(reservation)
+    }
+
     pub(crate) async fn start_compaction(
         &self,
         operation_id: String,
@@ -234,8 +389,8 @@ impl Session {
                 previous_covered_item_count,
                 hard_tokens: descriptor.context_window,
                 target_tokens,
-                safe_before_estimate: false,
-                refresh_summary: false,
+                automatic_budget: None,
+                trigger_tokens: None,
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
                     .unwrap_or_else(Instant::now),
@@ -252,9 +407,8 @@ impl Session {
 
 impl Session {
     pub(crate) fn cancel_compaction(&self, operation_id: &str) -> Result<bool, AgentError> {
-        // A startup preparation reserves the same `compaction` slot and
-        // operation id, so this cancels both a manual operation and a
-        // preparation that has not started its loop.
+        // Manual and post-turn operations share ownership; emergency recovery
+        // stays inside the active turn and is cancelled through turn.cancel.
         let operation = {
             let inner = self.shared.inner.lock().unwrap();
             inner
@@ -486,7 +640,7 @@ enum CompactionCommit {
     Store(SummaryCommit),
 }
 
-async fn run_compaction(session: Session, reservation: CompactionReservation) {
+pub(super) async fn run_compaction(session: Session, reservation: CompactionReservation) {
     let operation = Arc::clone(&reservation.operation);
     let mut completion = CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation));
     let result = run_compaction_inner(&session, &reservation).await;
@@ -507,10 +661,11 @@ pub(super) async fn run_compaction_inner(
     if reservation.operation.cancellation_requested() {
         return failed_compaction(&reservation.operation, "cancelled", history_len);
     }
-    if history_len == 0
-        || (retained_item_count == 0
-            && (!reservation.refresh_summary || reservation.previous_summary.is_none()))
-    {
+    // A promoted emergency projection covers every raw item, but its final
+    // answer/retained tail can still approach the budget. Automatic operations
+    // must estimate that effective summary and may refresh it. Manual's
+    // established fully-covered Noop semantics remain unchanged.
+    if history_len == 0 || (retained_item_count == 0 && reservation.trigger_tokens.is_none()) {
         return CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
             status: CompactionStatus::Noop,
@@ -593,9 +748,52 @@ pub(super) async fn run_compaction_inner(
         tool_schemas: reservation.tool_schemas.clone(),
         hard_tokens: reservation.hard_tokens,
         target_tokens: reservation.target_tokens,
-        safe_before_estimate: reservation.safe_before_estimate,
+        safe_before_estimate: false,
         operation_deadline: reservation.deadline,
     };
+    if let (Some(budget), Some(trigger)) =
+        (&reservation.automatic_budget, reservation.trigger_tokens)
+    {
+        let suffix = &reservation.history[reservation.previous_covered_item_count..];
+        let before = crate::compaction::auto_compose(
+            &input.project_instructions,
+            reservation.previous_summary.as_ref(),
+            suffix,
+            &[],
+        )
+        .ok()
+        .and_then(|(mut fixed, history)| {
+            fixed.extend(history);
+            minicore_runtime::model::ModelRequest::new(
+                fixed,
+                reservation.tool_schemas.clone(),
+                minicore_runtime::model::ModelLimits::default(),
+                reservation.record.reasoning,
+            )
+            .ok()
+        })
+        .and_then(|request| budget.estimate_request_tokens(&request, None, None).ok());
+        let Some(before) = before else {
+            return failed_compaction(
+                &reservation.operation,
+                "context_estimate_unavailable",
+                history_len,
+            );
+        };
+        if before < trigger {
+            return CompactionResult {
+                operation_id: reservation.operation.operation_id.clone(),
+                status: CompactionStatus::Noop,
+                before_tokens: Some(before),
+                after_tokens: Some(before),
+                covered_loop_count: 0,
+                covered_item_count: reservation.previous_covered_item_count,
+                retained_item_count,
+                utility_usage: None,
+                failure_kind: None,
+            };
+        }
+    }
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
     let mut mark_merging =
         || session.set_compaction_phase(&reservation.operation, CompactionPhase::Merging);
