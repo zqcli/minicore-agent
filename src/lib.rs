@@ -56,12 +56,12 @@ mod workspace;
 pub(crate) mod openai_mock;
 
 pub use agent::{
-    Agent, AnswerInteraction, CompactSession, CreateSession, GetHistory, HistoryPage, PingResponse,
-    RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk, ReadSession,
-    ReadSessionResult, ReadTurnSummary, ReloadResult, RenameSession, SendMessage, SessionInfo,
-    SessionState, SessionStatus, SessionUpdateResult, SteerMessage, TurnPersistence, TurnRef,
-    TurnResult, TurnResultAvailability, TurnResultPage, TurnResultRequest, UpdateSession,
-    agent_version,
+    Agent, AnswerInteraction, CompactSession, CoveredUsage, CreateSession, DisplayProjection,
+    GetHistory, HistoryPage, PingResponse, RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor,
+    ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary, ReadView, ReloadResult,
+    RenameSession, SendMessage, SessionInfo, SessionState, SessionStatus, SessionUpdateResult,
+    SteerMessage, TurnPersistence, TurnRef, TurnResult, TurnResultAvailability, TurnResultPage,
+    TurnResultRequest, UpdateSession, agent_version,
 };
 pub use changes::{
     ChangeCommitState, ChangeCoverage, ChangeCursor, ChangeKind, ChangeListConsistency,

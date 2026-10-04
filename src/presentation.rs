@@ -51,18 +51,20 @@ pub struct ToolDisplay {
     /// old/new text, apply_patch patch. Never the raw invocation object.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expanded_input: Option<String>,
-    /// Line count of the source input body.
+    /// Logical line count of the actual rendered input body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_line_count: Option<usize>,
     /// Displayable hidden rows this card would collapse: the source input
-    /// rows (expanded body rows for write/edit, otherwise the native JSON
-    /// argument rows) plus result rows actually available.
+    /// rows of whitelisted expanded input plus result rows actually available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_line_count: Option<usize>,
     /// The source above the display cap was truncated; the TUI must not
     /// promise more expandable rows than shown.
     #[serde(default)]
     pub truncated: bool,
+    /// Expanded body reached its display cap; shortened details do not count.
+    #[serde(default)]
+    pub body_truncated: bool,
 }
 
 impl fmt::Debug for ToolDisplay {
@@ -1068,13 +1070,6 @@ pub(crate) fn count_lines(text: &str) -> usize {
     }
 }
 
-fn json_line_count(arguments: Option<&serde_json::Value>) -> usize {
-    arguments
-        .filter(|arguments| !arguments.is_null())
-        .and_then(|arguments| serde_json::to_string_pretty(arguments).ok())
-        .map_or(0, |text| count_lines(&text))
-}
-
 /// Bounds a string at a char boundary; returns (copy, truncated).
 fn bounded(value: &str, max: usize) -> (String, bool) {
     if value.len() <= max {
@@ -1119,19 +1114,35 @@ fn single_line(value: &str, max: usize) -> (String, bool) {
 }
 
 /// A display-only line diff with an explicit format marker. Bound both the
-/// diff inputs and emitted text; the deadline prevents expensive alignments
-/// from delaying tool invocation/history projection. No raw argument object
+/// diff inputs and emitted text; fixed complexity limits keep projection
+/// deterministic and prevent expensive alignments. No raw argument object
 /// is ever exposed through this whitelist.
 fn bounded_edit_diff(old: &str, new: &str) -> (String, bool) {
     use similar::{Algorithm, ChangeTag, TextDiff};
     let (old, old_cut) = bounded(old, MAX_EXPANDED_INPUT_BYTES);
     let (new, new_cut) = bounded(new, MAX_EXPANDED_INPUT_BYTES);
-    let mut config = TextDiff::configure();
-    config
-        .algorithm(Algorithm::Myers)
-        .deadline(std::time::Instant::now() + std::time::Duration::from_millis(25));
-    let diff = config.diff_lines(&old, &new);
     let mut text = String::from("--- before\n+++ after\n@@\n");
+    // A clock deadline can choose different alignments for the same pinned
+    // history item. Keep small edits exact and larger edits linear and stable.
+    if old.len() + new.len() > 64 * 1024 || count_lines(&old) + count_lines(&new) > 2_000 {
+        for (prefix, body) in [('-', old.as_str()), ('+', new.as_str())] {
+            for line in body.split_inclusive('\n') {
+                let row = format!(
+                    "{prefix}{}\n",
+                    sanitize_multiline(line.trim_end_matches('\n'))
+                );
+                let (row, cut) = bounded(&row, MAX_EXPANDED_INPUT_BYTES - text.len());
+                text.push_str(&row);
+                if cut {
+                    return (text, true);
+                }
+            }
+        }
+        return (text, old_cut || new_cut);
+    }
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .diff_lines(&old, &new);
     for op in diff.ops() {
         for change in diff.iter_changes(op) {
             let prefix = match change.tag() {
@@ -1259,94 +1270,80 @@ pub(crate) fn build_tool_display(
         });
     truncated |= result_truncated;
 
-    let (expanded_input, input_line_count) = match name {
-        "bash" => arguments
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(|command| {
-                let sanitized = sanitize_multiline(command);
-                let (text, cut) = bounded(&sanitized, MAX_EXPANDED_INPUT_BYTES);
-                truncated |= cut;
-                (Some(text), Some(count_lines(command)))
-            })
-            .unwrap_or((None, None)),
-        "write" => {
-            let content = arguments.get("content").and_then(serde_json::Value::as_str);
-            content
-                .map(|content| {
-                    let line_count = count_lines(content);
-                    let sanitized = sanitize_multiline(content);
-                    let (text, cut) = bounded(&sanitized, MAX_EXPANDED_INPUT_BYTES);
-                    truncated |= cut;
-                    (Some(text), Some(line_count))
-                })
-                .unwrap_or((None, None))
-        }
-        "edit" => {
-            let old = arguments
+    let detail_truncated = truncated;
+    truncated = false;
+    let expanded_input = if name == "edit" {
+        match (
+            arguments
                 .get("old_text")
-                .and_then(serde_json::Value::as_str);
-            let new = arguments
+                .and_then(serde_json::Value::as_str),
+            arguments
                 .get("new_text")
-                .and_then(serde_json::Value::as_str);
-            match (old, new) {
-                (Some(old), Some(new)) => {
-                    let line_count = count_lines(old) + count_lines(new);
-                    let (text, cut) = bounded_edit_diff(old, new);
-                    truncated |= cut;
-                    (Some(text), Some(line_count))
-                }
-                (Some(old), None) => {
-                    let line_count = count_lines(old);
-                    let sanitized = sanitize_multiline(old);
-                    let (old, cut) = bounded(&sanitized, MAX_EXPANDED_INPUT_BYTES);
-                    truncated |= cut;
-                    (Some(old), Some(line_count))
-                }
-                (None, Some(new)) => {
-                    let line_count = count_lines(new);
-                    let sanitized = sanitize_multiline(new);
-                    let (new, cut) = bounded(&sanitized, MAX_EXPANDED_INPUT_BYTES);
-                    truncated |= cut;
-                    (Some(new), Some(line_count))
-                }
-                _ => (None, None),
+                .and_then(serde_json::Value::as_str),
+        ) {
+            (Some(old), Some(new)) => {
+                let (text, cut) = bounded_edit_diff(old, new);
+                truncated |= cut;
+                Some(text)
             }
+            (body, None) | (None, body) => body.map(|body| {
+                let (text, cut) = bounded(&sanitize_multiline(body), MAX_EXPANDED_INPUT_BYTES);
+                truncated |= cut;
+                text
+            }),
         }
-        "apply_patch" | "patch" => {
-            let patch = arguments.get("patch").and_then(serde_json::Value::as_str);
-            patch
-                .map(|patch| {
-                    let line_count = count_lines(patch);
-                    let sanitized = sanitize_multiline(patch);
-                    let (text, cut) = bounded(&sanitized, MAX_EXPANDED_INPUT_BYTES);
-                    truncated |= cut;
-                    (Some(text), Some(line_count))
-                })
-                .unwrap_or((None, None))
-        }
-        _ => (None, None),
+    } else {
+        let field = match name {
+            "bash" => "command",
+            "write" => "content",
+            "apply_patch" | "patch" => "patch",
+            _ => "",
+        };
+        (!field.is_empty())
+            .then(|| arguments.get(field))
+            .flatten()
+            .and_then(serde_json::Value::as_str)
+            .map(|body| {
+                let (text, cut) = bounded(&sanitize_multiline(body), MAX_EXPANDED_INPUT_BYTES);
+                truncated |= cut;
+                text
+            })
     };
 
-    let input_rows = match name {
-        "bash" | "write" | "edit" | "apply_patch" | "patch" if expanded_input.is_some() => {
-            expanded_input
-                .as_deref()
-                .filter(|text| !text.is_empty())
-                .map(count_lines)
-                .unwrap_or(0)
-        }
-        _ => json_line_count(args),
-    };
+    let input_rows = expanded_input.as_deref().map_or(0, count_lines);
+    let input_line_count = expanded_input.as_ref().map(|_| input_rows);
 
     let mut display = ToolDisplay {
         detail,
         expanded_input,
         input_line_count,
         hidden_line_count: (input_rows > 0).then_some(input_rows),
-        truncated,
+        body_truncated: truncated || result_truncated,
+        truncated: detail_truncated || truncated,
     };
     apply_result_to_display(&mut display, bounded_result.as_deref());
+    display
+}
+
+/// The compact card target is a command's first physical line or an explicit
+/// patch path. Body formatting remains shared with live/legacy displays.
+pub(crate) fn build_tool_card_display(name: &str, args: Option<&serde_json::Value>) -> ToolDisplay {
+    let mut display = build_tool_display(name, args, None);
+    let field = match name {
+        "bash" => "command",
+        "apply_patch" | "patch" => "path",
+        _ => return display,
+    };
+    let source = args
+        .and_then(|args| args.get(field))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(name)
+        .lines()
+        .next()
+        .unwrap_or("");
+    let (detail, cut) = single_line(source, MAX_DETAIL_BYTES);
+    display.detail = detail;
+    display.truncated = display.body_truncated || cut;
     display
 }
 

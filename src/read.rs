@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::LoopId;
@@ -58,6 +59,20 @@ pub struct ReadSession {
     pub captured_end: Option<u64>,
     #[serde(default)]
     pub history_revision: Option<String>,
+    #[serde(default)]
+    pub view: ReadView,
+    #[serde(default)]
+    pub projection_revision: Option<String>,
+}
+
+/// Canonical history remains the default. Display is a loaded-session-only,
+/// read-only projection; its chunk offsets never apply to canonical history.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadView {
+    #[default]
+    Canonical,
+    Display,
 }
 
 impl ReadSession {
@@ -66,6 +81,16 @@ impl ReadSession {
             return Err(AgentError::InvalidArguments);
         }
         validate_max_bytes(self.max_bytes)?;
+        if (self.view == ReadView::Canonical && self.projection_revision.is_some())
+            || self
+                .projection_revision
+                .as_deref()
+                .is_some_and(|v| !valid_revision(v))
+            || (self.view == ReadView::Display
+                && self.captured_end.is_some() != self.projection_revision.is_some())
+        {
+            return Err(AgentError::InvalidArguments);
+        }
         if self.captured_end.is_some() != self.history_revision.is_some()
             || self
                 .history_revision
@@ -128,6 +153,59 @@ pub struct ReadSessionResult {
     pub history_revision: String,
     pub captured_end: u64,
     pub trailing_incomplete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection: Option<DisplayProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DisplayProjection {
+    pub revision: String,
+    pub first_item: usize,
+    pub covered_item_count: usize,
+    pub covered_usage: CoveredUsage,
+}
+
+/// Totals from complete stored loops, independent of the visible transcript.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct CoveredUsage {
+    pub usage: Usage,
+    pub loop_count: u64,
+    pub last_loop_id: Option<LoopId>,
+    pub partial: bool,
+}
+
+impl CoveredUsage {
+    pub(crate) fn add(&mut self, loop_id: LoopId, next: Usage) {
+        let mut sum = |a: Option<u64>, b: Option<u64>| {
+            self.partial |= b.is_none();
+            match (a, b) {
+                (Some(a), Some(b)) => a.checked_add(b).or_else(|| {
+                    self.partial = true;
+                    Some(u64::MAX)
+                }),
+                (a, b) => a.or(b),
+            }
+        };
+        self.usage = Usage::from_optional(
+            sum(self.usage.input_tokens(), next.input_tokens()),
+            sum(self.usage.output_tokens(), next.output_tokens()),
+            sum(self.usage.reasoning_tokens(), next.reasoning_tokens()),
+        )
+        .with_cache_read_tokens(sum(
+            self.usage.cache_read_tokens(),
+            next.cache_read_tokens(),
+        ))
+        .with_cache_write_tokens(sum(
+            self.usage.cache_write_tokens(),
+            next.cache_write_tokens(),
+        ))
+        .with_provider_total_tokens(sum(
+            self.usage.provider_total_tokens(),
+            next.provider_total_tokens(),
+        ));
+        self.loop_count += 1;
+        self.last_loop_id = Some(loop_id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -190,111 +268,272 @@ pub(crate) async fn read_session(
 ) -> Result<ReadSessionResult, AgentError> {
     request.validate()?;
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
-    let cursor = request.cursor.unwrap_or_else(ReadCursor::start);
-    let limits = scan_limits(cancellation.clone());
-
-    if cancellation.is_cancelled() {
-        return Err(AgentError::QueryLimit);
+    let limits = scan_limits(cancellation);
+    check_read_budget(&limits.cancellation, limits.deadline)?;
+    let snapshot = loaded.as_ref().map(Session::read_snapshot);
+    let display = request.view == ReadView::Display;
+    let summary = if display {
+        loaded
+            .as_ref()
+            .ok_or(AgentError::SessionNotLoaded)?
+            .compaction_state()
+            .display_snapshot()
+    } else {
+        None
+    };
+    let covered = summary
+        .as_ref()
+        .map_or(0, |summary| summary.covered_item_count);
+    if snapshot
+        .as_ref()
+        .is_some_and(|snapshot| covered > snapshot.history.len())
+    {
+        return Err(AgentError::InvalidState);
     }
-
-    let (info, page, source_items, timestamps) = if let Some(session) = loaded {
-        let snapshot = session.read_snapshot();
-        let info = snapshot.info;
-        let history = snapshot.history;
-        let user_times = snapshot.user_times;
-        let mut page = store
-            .read_history_page(
-                request.session_id,
-                cursor.item,
-                request.limit,
-                Some(history.len()),
-                request.captured_end,
-                request.history_revision.as_deref(),
-                Some(history.as_ref()),
-                &limits,
-            )
-            .await
-            .map_err(map_read_store_error)?;
-        let visible = page.total_items.min(history.len());
-        validate_cursor(cursor, visible)?;
-        let end = cursor.item.saturating_add(request.limit).min(visible);
-        let timestamps = timestamps_for_range(history.as_ref(), &user_times, cursor.item, end);
-        if page.items.len() != end.saturating_sub(cursor.item) {
-            return Err(AgentError::InvalidState);
+    let first_item = covered.saturating_sub(1);
+    let projection_revision = display.then(|| {
+        let mut hash = Sha256::new();
+        hash.update(b"display-v1\0");
+        hash.update((covered as u64).to_le_bytes());
+        hash.update(std::env::var("HOME").unwrap_or_default().as_bytes());
+        hash.update(b"\0");
+        if let Some(summary) = &summary {
+            hash.update(summary.content.as_str().as_bytes());
         }
-        let source_items = std::mem::take(&mut page.items);
-        drop(std::mem::take(&mut page.user_times));
-        (info, page, source_items, timestamps)
+        format!("{:x}", hash.finalize())
+    });
+    if request
+        .projection_revision
+        .as_ref()
+        .is_some_and(|expected| Some(expected) != projection_revision.as_ref())
+    {
+        return Err(AgentError::InvalidState);
+    }
+    let mut cursor = request.cursor.unwrap_or_else(ReadCursor::start);
+    if display && request.captured_end.is_none() && cursor == ReadCursor::start() {
+        cursor.item = first_item;
+    }
+    if display && cursor.item < first_item {
+        return Err(AgentError::InvalidArguments);
+    }
+    let source_start = cursor.item.max(covered);
+    let info = if let Some(snapshot) = &snapshot {
+        snapshot.info.clone()
     } else {
         let record = store
             .load_record(request.session_id)
             .await
             .map_err(map_read_store_error)?;
-        let info = SessionInfo::from_record(&record, false);
-        let mut page = store
-            .read_history_page(
-                request.session_id,
-                cursor.item,
-                request.limit,
-                None,
-                request.captured_end,
-                request.history_revision.as_deref(),
-                None,
-                &limits,
-            )
-            .await
-            .map_err(map_read_store_error)?;
-        validate_cursor(cursor, page.total_items)?;
-        let items = std::mem::take(&mut page.items);
-        let timestamps = std::mem::take(&mut page.user_times);
-        (info, page, items, timestamps)
+        SessionInfo::from_record(&record, false)
     };
-
-    let encoded = encoded_items(cursor.item, &source_items, &timestamps)?;
-    let stored_records = page.turns;
-    let total = page.total_items;
-    let revision = page.revision.clone();
-    let captured_end = page.captured_end;
-    let trailing_incomplete = page.trailing_incomplete;
-    let records_truncated = page.turns_truncated;
-    let session = info.clone();
+    let page = store
+        .read_history_page(
+            request.session_id,
+            source_start,
+            request.limit - usize::from(summary.is_some() && cursor.item == first_item),
+            snapshot.as_ref().map(|snapshot| snapshot.history.len()),
+            request.captured_end,
+            request.history_revision.as_deref(),
+            snapshot.as_ref().map(|snapshot| snapshot.history.as_ref()),
+            display.then_some(covered),
+            &limits,
+        )
+        .await
+        .map_err(map_read_store_error)?;
+    validate_cursor(cursor, page.total_items)?;
+    if summary
+        .as_ref()
+        .is_some_and(|summary| page.covered_usage.loop_count != summary.covered_loop_count)
+    {
+        return Err(AgentError::InvalidState);
+    }
+    let projection = projection_revision.map(|revision| DisplayProjection {
+        revision,
+        first_item,
+        covered_item_count: covered,
+        covered_usage: page.covered_usage.clone(),
+    });
+    let timestamps = if let Some(snapshot) = &snapshot {
+        timestamps_for_range(
+            &snapshot.history,
+            &snapshot.user_times,
+            source_start,
+            source_start + page.items.len(),
+        )
+    } else {
+        page.user_times.clone()
+    };
+    let derived = summary
+        .as_ref()
+        .filter(|_| cursor.item == first_item)
+        .map(|summary| {
+            serde_json::to_string(&serde_json::json!({
+                "display": true,
+                "derived_summary": true,
+                "item": {"type": "summary", "data": {"content": summary.content.as_str()}}
+            }))
+            .map(|body| (first_item, body))
+            .map_err(|_| AgentError::RpcSerialization)
+        });
+    let tail: Box<dyn Iterator<Item = Result<(usize, String), AgentError>> + Send + '_> = if display
+    {
+        let history = &snapshot
+            .as_ref()
+            .ok_or(AgentError::SessionNotLoaded)?
+            .history;
+        Box::new(encoded_display_items(
+            request.session_id,
+            source_start,
+            &page.items,
+            &timestamps,
+            &history[covered..page.total_items],
+        )?)
+    } else {
+        Box::new(encoded_items(source_start, &page.items, &timestamps)?)
+    };
+    let encoded = derived.into_iter().chain(tail);
+    let mut result = ReadSessionResult {
+        session: info,
+        items: Vec::new(),
+        next_cursor: None,
+        total: page.total_items,
+        records: Vec::new(),
+        records_truncated: page.turns_truncated,
+        history_revision: page.revision,
+        captured_end: page.captured_end,
+        trailing_incomplete: page.trailing_incomplete,
+        projection,
+    };
     let (items, next_cursor) = pack_items(
         encoded,
         cursor,
-        total,
+        result.total,
         max_bytes,
         &limits.cancellation,
         limits.deadline,
         |items, next_cursor| {
-            let records = records_for_chunks(&stored_records, items);
-            serde_json::to_vec(&ReadSessionResult {
-                session: session.clone(),
-                items: items.to_vec(),
-                next_cursor,
-                total,
-                records: records.clone(),
-                records_truncated,
-                history_revision: revision.clone(),
-                captured_end,
-                trailing_incomplete,
-            })
-            .map_err(|_| AgentError::RpcSerialization)
+            let mut candidate = result.clone();
+            candidate.items = items.to_vec();
+            candidate.next_cursor = next_cursor;
+            candidate.records = records_for_chunks(&page.turns, items);
+            serde_json::to_vec(&candidate).map_err(|_| AgentError::RpcSerialization)
         },
     )
     .await?;
-    let records = records_for_chunks(&stored_records, &items);
+    result.records = records_for_chunks(&page.turns, &items);
+    result.items = items;
+    result.next_cursor = next_cursor;
+    Ok(result)
+}
 
-    Ok(ReadSessionResult {
-        session: info,
-        items,
-        next_cursor,
-        total,
-        records,
-        records_truncated,
-        history_revision: page.revision,
-        captured_end: page.captured_end,
-        trailing_incomplete: page.trailing_incomplete,
-    })
+/// Canonical tool bodies are never serialized into the display envelope.
+/// Whitelisted presentation metadata is regenerated by the one Agent formatter.
+fn encoded_display_items<'a>(
+    session_id: SessionId,
+    start: usize,
+    items: &'a [HistoryItem],
+    timestamps: &'a [Option<String>],
+    history: &'a [HistoryItem],
+) -> Result<impl Iterator<Item = Result<(usize, String), AgentError>> + 'a, AgentError> {
+    use minicore_runtime::model::AssistantPart;
+    if timestamps.len() != items.len() {
+        return Err(AgentError::Internal);
+    }
+    let mut calls = HashMap::new();
+    let mut results = HashMap::new();
+    for item in history {
+        match item {
+            HistoryItem::Assistant(assistant) => {
+                for part in &assistant.content {
+                    if let AssistantPart::ToolCall(call) = part {
+                        calls.insert(
+                            (
+                                assistant.loop_id,
+                                assistant.request_index,
+                                call.tool_call_id(),
+                            ),
+                            call,
+                        );
+                    }
+                }
+            }
+            HistoryItem::ToolResult(result) => {
+                results.insert(
+                    (result.loop_id, result.request_index, &result.call_id),
+                    result,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(items.iter().enumerate().map(move |(offset, item)| {
+        // Remove the potentially large bodies before serializing the item.
+        // Other Runtime fields retain exactly their canonical shape.
+        let value = match item {
+            HistoryItem::Assistant(assistant) => serde_json::json!({
+                "type": "assistant", "data": {
+                    "loop_id": assistant.loop_id, "request_index": assistant.request_index,
+                    "model": assistant.model, "reasoning": assistant.reasoning,
+                    "content": display_assistant_parts(assistant)?,
+                    "finish_reason": assistant.finish_reason, "usage": assistant.usage
+                }
+            }),
+            HistoryItem::ToolResult(result) => serde_json::json!({
+                "type": "tool_result", "data": {
+                    "loop_id": result.loop_id, "request_index": result.request_index,
+                    "call_id": result.call_id, "tool_name": result.tool_name, "outcome": result.outcome
+                }
+            }),
+            _ => serde_json::to_value(item).map_err(|_| AgentError::RpcSerialization)?,
+        };
+        let keys = match item {
+            HistoryItem::Assistant(assistant) => assistant.content.iter().filter_map(|part| part.as_tool_call().map(|call|
+                ((assistant.loop_id, assistant.request_index, call.tool_call_id()), call.name().as_str()))).collect::<Vec<_>>(),
+            HistoryItem::ToolResult(result) => vec![((result.loop_id, result.request_index, &result.call_id), result.tool_name.as_str())],
+            _ => Vec::new(),
+        };
+        let summaries = keys.into_iter().map(|(key, name)| {
+            let call = calls.get(&key);
+            let result = results.get(&key);
+            let mut display = crate::presentation::build_tool_card_display(name, call.map(|call| call.arguments()));
+            let input_truncated = display.body_truncated;
+            let (output_line_count, output_truncated) = result.map(|result| {
+                let (body, truncated) = crate::presentation::bounded_result_content(result.output.content().as_str(), crate::presentation::MAX_RESULT_DISPLAY_BYTES);
+                (Some(crate::presentation::count_lines(&body)), truncated)
+            }).unwrap_or((None, false));
+            let count_state = if result.is_none() {
+                if display.input_line_count.unwrap_or(0) > 0 { "lower_bound" } else { "unknown" }
+            } else if input_truncated || output_truncated
+                || (call.is_none() && matches!(name, "bash" | "write" | "edit" | "patch" | "apply_patch")) {
+                "lower_bound"
+            } else { "exact" };
+            display.expanded_input = None;
+            display.hidden_line_count = Some(display.input_line_count.unwrap_or(0) + output_line_count.unwrap_or(0));
+            serde_json::json!({
+                "tool_ref": ToolRef {session_id, loop_id: key.0, request_index: key.1, tool_call_id: key.2.clone()},
+                "tool_call_id": key.2, "name": name, "display": display,
+                "output_line_count": output_line_count, "output_truncated": output_truncated,
+                "count_state": count_state,
+                "state": result.map(|result| crate::tool_data::ToolExecutionState::from_outcome(result.outcome)),
+                "input_availability": null, "output_availability": null
+            })
+        }).collect::<Vec<_>>();
+        let envelope = serde_json::json!({"display": true, "item": value, "timestamp": timestamps[offset], "tool_summaries": summaries});
+        let encoded = serde_json::to_string(&envelope).map_err(|_| AgentError::RpcSerialization)?;
+        Ok((start + offset, encoded))
+    }))
+}
+
+fn display_assistant_parts(
+    assistant: &minicore_runtime::history::AssistantHistory,
+) -> Result<Vec<serde_json::Value>, AgentError> {
+    use minicore_runtime::model::AssistantPart;
+    assistant.content.iter().map(|part| match part {
+        AssistantPart::ToolCall(call) => Ok(serde_json::json!({"type": "tool_call", "data": {
+            "tool_call_id": call.tool_call_id(), "name": call.name(), "call_index": call.call_index()
+        }})),
+        _ => serde_json::to_value(part).map_err(|_| AgentError::RpcSerialization),
+    }).collect()
 }
 
 pub(crate) async fn turn_result(
@@ -527,7 +766,11 @@ pub(crate) async fn tool_read(
         &cancellation,
     )
     .await?;
-    record.project_read(&request.tool_ref, max_bytes)
+    if request.display {
+        record.project_display_read(&request.tool_ref, max_bytes)
+    } else {
+        record.project_read(&request.tool_ref, max_bytes)
+    }
 }
 
 pub(crate) async fn tool_output(
@@ -1089,6 +1332,88 @@ mod tests {
     use super::*;
     use crate::store::StoredLoopOutcome;
     use minicore_runtime::execution::ConfigRevision;
+
+    #[test]
+    fn display_projection_strips_bodies_and_only_uses_the_captured_prefix() {
+        use minicore_runtime::history::{AssistantHistory, ToolResultHistory};
+        use minicore_runtime::model::{
+            AssistantPart, ModelFinishReason, ReasoningPreference, ToolCall,
+        };
+        use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
+        let session_id = SessionId::new().unwrap();
+        let loop_id = LoopId::new().unwrap();
+        let call_id = minicore_runtime::ToolCallId::new("display-call").unwrap();
+        let call = ToolCall::new(
+            call_id.clone(),
+            "write".parse().unwrap(),
+            serde_json::json!({
+                "path": "file.txt", "content": "private body\nsecond", "secret": "raw secret"
+            }),
+            0,
+        )
+        .unwrap();
+        let mut history = vec![HistoryItem::Assistant(AssistantHistory {
+            loop_id,
+            request_index: 0,
+            model: "main".parse().unwrap(),
+            reasoning: ReasoningPreference::Auto,
+            content: vec![
+                AssistantPart::Text("visible".to_owned()),
+                AssistantPart::ToolCall(call),
+            ],
+            provider_replay: None,
+            finish_reason: ModelFinishReason::ToolCalls,
+            usage: Usage::new(1, 2, 0),
+        })];
+        let times = vec![None];
+        let encode = |history: &[HistoryItem], end: usize| {
+            encoded_display_items(session_id, 0, &history[..1], &times, &history[..end])
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .1
+        };
+        let original = encode(&history, 1);
+        assert!(!original.contains("private body"));
+        assert!(!original.contains("raw secret"));
+        assert!(original.contains("visible"));
+        history.push(HistoryItem::ToolResult(ToolResultHistory {
+            loop_id,
+            request_index: 0,
+            call_id,
+            tool_name: "write".parse().unwrap(),
+            outcome: ToolResultOutcome::Success,
+            output: ToolOutput::new("result outside pin").unwrap(),
+        }));
+        assert_eq!(encode(&history, 1), original);
+        assert_ne!(encode(&history, 2), original);
+        let complete: serde_json::Value = serde_json::from_str(&encode(&history, 2)).unwrap();
+        assert_eq!(
+            complete["tool_summaries"][0]["display"]["input_line_count"],
+            2
+        );
+        assert_eq!(complete["tool_summaries"][0]["output_line_count"], 1);
+        assert_eq!(complete["tool_summaries"][0]["count_state"], "exact");
+        assert!(complete["tool_summaries"][0]["input_availability"].is_null());
+    }
+
+    #[test]
+    fn covered_usage_preserves_known_partial_totals_without_filling_unknown_with_zero() {
+        let mut covered = CoveredUsage::default();
+        assert_eq!(covered.usage.input_tokens(), None);
+        covered.add(
+            LoopId::new().unwrap(),
+            Usage::from_optional(Some(7), None, Some(0)),
+        );
+        let last = LoopId::new().unwrap();
+        covered.add(last, Usage::from_optional(Some(3), Some(5), Some(0)));
+        assert_eq!(covered.usage.input_tokens(), Some(10));
+        assert_eq!(covered.usage.output_tokens(), Some(5));
+        assert!(covered.partial);
+        assert_eq!(covered.loop_count, 2);
+        assert_eq!(covered.last_loop_id, Some(last));
+    }
 
     #[derive(Clone, Serialize)]
     struct TestPage {

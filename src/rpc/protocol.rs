@@ -226,6 +226,10 @@ pub(crate) struct SessionReadParams {
     pub(crate) captured_end: Option<u64>,
     #[serde(default)]
     pub(crate) history_revision: Option<String>,
+    #[serde(default)]
+    pub(crate) view: crate::read::ReadView,
+    #[serde(default)]
+    pub(crate) projection_revision: Option<String>,
 }
 
 impl From<SessionReadParams> for ReadSession {
@@ -237,6 +241,8 @@ impl From<SessionReadParams> for ReadSession {
             max_bytes: value.max_bytes,
             captured_end: value.captured_end,
             history_revision: value.history_revision,
+            view: value.view,
+            projection_revision: value.projection_revision,
         }
     }
 }
@@ -277,6 +283,8 @@ pub(crate) struct ToolReadParams {
     pub(crate) tool_call_id: minicore_runtime::ToolCallId,
     #[serde(default)]
     pub(crate) max_bytes: Option<usize>,
+    #[serde(default)]
+    pub(crate) display: bool,
 }
 
 impl From<ToolReadParams> for ToolReadRequest {
@@ -289,6 +297,7 @@ impl From<ToolReadParams> for ToolReadRequest {
                 tool_call_id: value.tool_call_id,
             },
             max_bytes: value.max_bytes,
+            display: value.display,
         }
     }
 }

@@ -140,10 +140,10 @@ struct SummarySource {
 }
 
 #[derive(Clone)]
-struct LoadedSummary {
-    content: BoundedText,
-    covered_loop_count: u64,
-    covered_item_count: usize,
+pub(crate) struct LoadedSummary {
+    pub(crate) content: BoundedText,
+    pub(crate) covered_loop_count: u64,
+    pub(crate) covered_item_count: usize,
 }
 
 /// Session-local derived prompt state. It is deliberately separate from the
@@ -273,6 +273,10 @@ impl CompactionState {
             covered_loop_count,
             covered_item_count,
         });
+    }
+
+    pub(crate) fn display_snapshot(&self) -> Option<LoadedSummary> {
+        self.snapshot.lock().unwrap().clone()
     }
 
     pub(crate) fn coverage(&self) -> Option<(u64, usize)> {

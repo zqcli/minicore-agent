@@ -2824,7 +2824,7 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
         .as_ref()
         .expect("history tool display");
     assert_eq!(display.detail, "file.txt:1-32");
-    assert_eq!(display.hidden_line_count, Some(5));
+    assert_eq!(display.hidden_line_count, Some(1));
 }
 
 #[tokio::test]
@@ -2885,7 +2885,7 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
     assert_eq!(event_turn, turn);
     assert_eq!(request_index, 0);
     assert_eq!(display.detail, "file.txt:1-32");
-    assert_eq!(display.hidden_line_count, Some(5));
+    assert_eq!(display.hidden_line_count, Some(1));
     let (result_turn, result_request_index, result_tool_call_id, result) =
         tool_result.expect("tool result event");
     assert_eq!(result_turn, turn);
@@ -5189,6 +5189,8 @@ async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
 
     let read = agent
         .read_session(ReadSession {
+            view: crate::read::ReadView::Canonical,
+            projection_revision: None,
             session_id,
             cursor: None,
             limit: 100,
@@ -6469,6 +6471,7 @@ async fn read_tool(
 ) -> crate::tool_data::ToolReadResult {
     agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref,
             max_bytes: None,
         })
@@ -6584,6 +6587,7 @@ async fn tool_invocation_separates_requests_not_just_names() {
     assert!(matches!(
         agent
             .tool_read(crate::tool_data::ToolReadRequest {
+                display: false,
                 tool_ref: guessed,
                 max_bytes: None,
             })
@@ -6648,6 +6652,7 @@ async fn tool_invocation_is_isolated_across_sessions() {
     assert!(matches!(
         agent
             .tool_read(crate::tool_data::ToolReadRequest {
+                display: false,
                 tool_ref: cross_session,
                 max_bytes: None,
             })
@@ -7123,6 +7128,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
 
         let queried = agent
             .tool_read(crate::tool_data::ToolReadRequest {
+                display: false,
                 tool_ref: tool_ref.clone(),
                 max_bytes: None,
             })
@@ -7200,6 +7206,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
 
         let terminal = agent
             .tool_read(crate::tool_data::ToolReadRequest {
+                display: false,
                 tool_ref: tool_ref.clone(),
                 max_bytes: None,
             })
@@ -9481,6 +9488,8 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
     assert_eq!(listed[0].session_id, session_id);
     let read = agent
         .read_session(ReadSession {
+            view: crate::read::ReadView::Canonical,
+            projection_revision: None,
             session_id,
             cursor: None,
             limit: 100,
@@ -9520,6 +9529,7 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
     // generic path.
     let read_tool = agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: legacy_ref.clone(),
             max_bytes: None,
         })
@@ -10634,6 +10644,7 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
     for tool_ref in tool_refs {
         let read_res = agent
             .tool_read(crate::tool_data::ToolReadRequest {
+                display: false,
                 tool_ref: tool_ref.clone(),
                 max_bytes: Some(4096),
             })
@@ -10708,6 +10719,7 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
     // 1. In-memory record is marked Saved
     let live_read = agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: Some(4096),
         })
@@ -10840,6 +10852,7 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
     // Initial state is MemoryOnly
     let initial_read = agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: Some(4096),
         })
@@ -10911,6 +10924,7 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     // Verify in-memory state before closing
     let live_read = agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: None,
         })
@@ -10935,6 +10949,7 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     // 1. tool_read cold projection
     let cold_read = agent2
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: None,
         })
@@ -11079,6 +11094,7 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     // Cold read must succeed seamlessly
     let cold_read = agent2
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: None,
         })
@@ -11138,6 +11154,7 @@ async fn cold_read_missing_aux_or_unknown_tool_maps_to_tool_not_found() {
 
     let read_err = agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: non_existent_ref.clone(),
             max_bytes: None,
         })
@@ -11211,6 +11228,7 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     let read_res = tokio::time::timeout(
         std::time::Duration::from_millis(500),
         agent.tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: None,
         }),
@@ -11276,6 +11294,7 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
     // Verify initially saved
     let read_1 = agent
         .tool_read(crate::tool_data::ToolReadRequest {
+            display: false,
             tool_ref: tool_ref.clone(),
             max_bytes: None,
         })
@@ -11692,6 +11711,8 @@ async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_doe
                 loop {
                     let page = agent
                         .read_session(ReadSession {
+                            view: crate::read::ReadView::Canonical,
+                            projection_revision: None,
                             session_id: info.session_id,
                             cursor,
                             limit: 1,
@@ -11717,4 +11738,202 @@ async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_doe
         }
         agent.shutdown().await.unwrap();
     }
+}
+
+fn display_read(session_id: SessionId) -> ReadSession {
+    ReadSession {
+        session_id,
+        cursor: None,
+        limit: 100,
+        max_bytes: None,
+        captured_end: None,
+        history_revision: None,
+        view: crate::read::ReadView::Display,
+        projection_revision: None,
+    }
+}
+
+fn continue_display_read(request: &mut ReadSession, page: &crate::ReadSessionResult) {
+    request.cursor = page.next_cursor;
+    request.captured_end = Some(page.captured_end);
+    request.history_revision = Some(page.history_revision.clone());
+    request.projection_revision = Some(page.projection.as_ref().unwrap().revision.clone());
+}
+
+#[tokio::test]
+async fn display_history_projects_summary_tool_metadata_and_original_indexes() {
+    let (data_dir, _guard, session_id, history_path, before) =
+        synthetic_summary_session(&format!("display-history-{}", next_id()), true).await;
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    assert!(matches!(
+        agent.read_session(display_read(session_id)).await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    agent.open_session(session_id).await.unwrap();
+    let page = agent.read_session(display_read(session_id)).await.unwrap();
+    let projection = page.projection.as_ref().unwrap();
+    assert_eq!(
+        (
+            projection.first_item,
+            projection.covered_item_count,
+            page.total
+        ),
+        (1, 2, 5)
+    );
+    assert_eq!(projection.covered_usage.loop_count, 1);
+    assert_eq!(
+        projection.covered_usage.last_loop_id.unwrap().to_string(),
+        SUMMARY_COVERED_LOOP_ID
+    );
+    assert_eq!(projection.covered_usage.usage, Usage::new(1, 2, 0));
+    assert_eq!(
+        page.items.iter().map(|item| item.index).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    let values = page
+        .items
+        .iter()
+        .map(|item| serde_json::from_str::<serde_json::Value>(&item.data).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values[0]["derived_summary"], true);
+    assert_eq!(values[0]["item"]["data"]["content"], SUMMARY_CONTENT);
+    assert_eq!(
+        values[2]["tool_summaries"][0]["display"]["detail"],
+        "suffix.txt"
+    );
+    assert_eq!(values[2]["tool_summaries"][0]["output_line_count"], 1);
+    assert_eq!(values[2]["tool_summaries"][0]["count_state"], "exact");
+    assert_eq!(
+        values[2]["tool_summaries"][0]["tool_ref"]["session_id"],
+        SUMMARY_SESSION_ID
+    );
+    assert!(
+        values[2]["item"]["data"]["content"][0]["data"]
+            .get("arguments")
+            .is_none()
+    );
+    assert!(values[3]["item"]["data"].get("output").is_none());
+    let all = page
+        .items
+        .iter()
+        .map(|item| item.data.as_str())
+        .collect::<String>();
+    assert!(!all.contains("covered user"));
+    assert!(!all.contains("suffix tool result"));
+    assert!(!all.contains("expanded_input"));
+    let mut raw = display_read(session_id);
+    raw.view = crate::read::ReadView::Canonical;
+    let raw = agent.read_session(raw).await.unwrap();
+    assert!(raw.projection.is_none());
+    assert_eq!(raw.items[0].index, 0);
+    assert!(
+        raw.items
+            .iter()
+            .any(|item| item.data.contains("covered user"))
+    );
+    assert!(
+        raw.items
+            .iter()
+            .any(|item| item.data.contains("suffix tool result"))
+    );
+    assert_eq!(std::fs::read(history_path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn display_history_chunks_unicode_summary_and_rejects_summary_only_replacement() {
+    let (data_dir, _guard, session_id, _, _) =
+        synthetic_summary_session(&format!("display-chunks-{}", next_id()), true).await;
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    agent.open_session(session_id).await.unwrap();
+    let state = agent.loaded_session(session_id).unwrap().compaction_state();
+    let body = "中文🙂\\\"\n".repeat(1_000);
+    state.publish(BoundedText::new(&body).unwrap(), 1, 2);
+    let mut request = display_read(session_id);
+    request.limit = 1;
+    request.max_bytes = Some(2048);
+    let first = agent.read_session(request.clone()).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert!(!first.items[0].complete);
+    let original_revision = first.history_revision.clone();
+    let mut assembled = first.items[0].data.clone();
+    continue_display_read(&mut request, &first);
+    while request.cursor.is_some_and(|cursor| cursor.item == 1) {
+        let page = agent.read_session(request.clone()).await.unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 2048);
+        assert_eq!(page.items[0].index, 1);
+        assembled.push_str(&page.items[0].data);
+        continue_display_read(&mut request, &page);
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&assembled).unwrap()["item"]["data"]["content"],
+        body
+    );
+    let page = agent.read_session(request.clone()).await.unwrap();
+    assert_eq!(page.items[0].index, 2);
+    state.publish(
+        BoundedText::new("new summary, unchanged history").unwrap(),
+        1,
+        2,
+    );
+    assert!(matches!(
+        agent.read_session(request).await,
+        Err(AgentError::InvalidState)
+    ));
+    let fresh = agent.read_session(display_read(session_id)).await.unwrap();
+    assert_eq!(fresh.history_revision, original_revision);
+    assert_ne!(
+        fresh.projection.unwrap().revision,
+        first.projection.unwrap().revision
+    );
+}
+
+#[tokio::test]
+async fn display_history_invalid_summary_falls_back_and_never_crosses_valid_boundary() {
+    let (data_dir, _guard, session_id, history_path, _) =
+        synthetic_summary_session(&format!("display-fallback-{}", next_id()), false).await;
+    std::fs::write(
+        history_path.parent().unwrap().join("summary.json"),
+        b"invalid summary",
+    )
+    .unwrap();
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    agent.open_session(session_id).await.unwrap();
+    let page = agent.read_session(display_read(session_id)).await.unwrap();
+    assert_eq!(page.projection.as_ref().unwrap().covered_item_count, 0);
+    assert_eq!(page.items[0].index, 0);
+    let state = agent.loaded_session(session_id).unwrap().compaction_state();
+    state.publish(BoundedText::new("all loops covered").unwrap(), 2, 4);
+    let page = agent.read_session(display_read(session_id)).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].index, 3);
+    assert!(page.next_cursor.is_none());
+    assert_eq!(
+        page.projection.as_ref().unwrap().covered_usage.usage,
+        Usage::new(2, 4, 0)
+    );
+    let mut before_boundary = display_read(session_id);
+    continue_display_read(&mut before_boundary, &page);
+    before_boundary.cursor = Some(crate::ReadCursor::start());
+    assert!(matches!(
+        agent.read_session(before_boundary).await,
+        Err(AgentError::InvalidArguments)
+    ));
 }

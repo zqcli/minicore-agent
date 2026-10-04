@@ -155,6 +155,7 @@ impl Store {
         captured_end: Option<u64>,
         expected_revision: Option<&str>,
         expected_history: Option<&[HistoryItem]>,
+        usage_boundary: Option<usize>,
         limits: &HistoryScanLimits,
     ) -> Result<HistoryReadPage, StoreError> {
         if captured_end.is_some() != expected_revision.is_some() {
@@ -202,6 +203,7 @@ impl Store {
         let mut hasher = Sha256::new();
         let mut line_count = 0_usize;
         let mut total_items = 0_usize;
+        let mut covered_usage = crate::read::CoveredUsage::default();
         let mut items = Vec::new();
         let mut user_times = Vec::new();
         let page_end = item_offset.saturating_add(item_limit);
@@ -247,6 +249,14 @@ impl Store {
             let record_end = record_start
                 .checked_add(normalized.len())
                 .ok_or(StoreError::Corrupt)?;
+            if let Some(boundary) = usage_boundary {
+                if record_start < boundary && record_end > boundary {
+                    return Err(StoreError::HistoryChanged);
+                }
+                if record_end <= boundary {
+                    covered_usage.add(record.loop_id, record.usage);
+                }
+            }
             if let Some(expected) = expected_history {
                 let compared = visible_item_count
                     .map(|cap| normalized.len().min(cap.saturating_sub(record_start)))
@@ -343,6 +353,7 @@ impl Store {
             user_times,
             turns,
             turns_truncated,
+            covered_usage,
         })
     }
 
@@ -629,6 +640,7 @@ fn finish_empty_history_page(
         user_times: Vec::new(),
         turns: Vec::new(),
         turns_truncated: false,
+        covered_usage: crate::read::CoveredUsage::default(),
     })
 }
 

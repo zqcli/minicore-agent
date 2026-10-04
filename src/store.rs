@@ -334,6 +334,7 @@ pub(crate) struct HistoryReadPage {
     pub(crate) user_times: Vec<Option<String>>,
     pub(crate) turns: Vec<StoredTurnSummary>,
     pub(crate) turns_truncated: bool,
+    pub(crate) covered_usage: crate::read::CoveredUsage,
 }
 
 #[derive(Clone)]

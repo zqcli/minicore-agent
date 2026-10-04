@@ -85,6 +85,7 @@ fn invocation(call: &str, name: &str, arguments: Value) -> ToolInvocation {
 
 fn read_request(tool_ref: ToolRef, max_bytes: Option<usize>) -> ToolReadRequest {
     ToolReadRequest {
+        display: false,
         tool_ref,
         max_bytes,
     }
@@ -1310,4 +1311,65 @@ fn large_file_snapshots_are_evicted_by_real_capacity() {
     assert!(first_change.after_bytes.is_none());
     assert_eq!(data.file_change_records(session_id, None).len(), 8);
     assert!(data.get_record(&refs[7]).unwrap().file_change.is_some());
+}
+
+#[test]
+fn display_read_reuses_whitelist_and_never_sends_raw_input_json() {
+    let data = ToolData::new();
+    let tool_ref = make_tool_ref(session(20), loop_id(20), 0, "display-write");
+    data.note_invocation(
+        &tool_ref,
+        &invocation(
+            "display-write",
+            "write",
+            json!({
+                "path": "file.txt", "content": "one\ntwo", "secret": "never transmit"
+            }),
+        ),
+    );
+    data.note_result(&tool_ref, "written\n");
+    let mut request = read_request(tool_ref.clone(), None);
+    request.display = true;
+    let result = data.read(&request, 4096).unwrap();
+    assert!(result.invocation.is_none());
+    let display = result.display.unwrap();
+    assert_eq!(display.expanded_input.as_deref(), Some("one\ntwo"));
+    assert_eq!(display.input_line_count, Some(2));
+    assert_eq!(result.execution.output_line_count, Some(2));
+    assert!(
+        !serde_json::to_string(&display)
+            .unwrap()
+            .contains("never transmit")
+    );
+    request.display = false;
+    assert!(data.read(&request, 4096).unwrap().display.is_none());
+}
+
+#[test]
+fn display_read_is_bounded_and_marks_missing_input_without_inventing_empty_body() {
+    let mut record = ToolRecord::new("write".to_owned());
+    record.input =
+        serde_json::to_string(&json!({"path":"a", "content":"中\n".repeat(4000)})).unwrap();
+    record.input_seen = true;
+    record.input_total = record.input.len();
+    let tool_ref = make_tool_ref(session(21), loop_id(21), 0, "bounded-write");
+    let page = record.project_display_read(&tool_ref, 2048).unwrap();
+    assert!(serde_json::to_vec(&page).unwrap().len() <= 2048);
+    let display = page.display.unwrap();
+    assert!(display.body_truncated);
+    assert_eq!(
+        display.input_line_count,
+        Some(crate::presentation::count_lines(
+            display.expanded_input.as_deref().unwrap()
+        ))
+    );
+    record.input_truncated = true;
+    let missing = record
+        .project_display_read(&tool_ref, 2048)
+        .unwrap()
+        .display
+        .unwrap();
+    assert!(missing.expanded_input.is_none());
+    assert!(missing.input_line_count.is_none());
+    assert!(missing.body_truncated);
 }

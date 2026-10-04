@@ -48,6 +48,7 @@ fn tool_error_presentation_is_static_for_every_variant() {
 #[test]
 fn redacted_debug_never_exposes_raw_text() {
     let display = ToolDisplay {
+        body_truncated: false,
         detail: "$ rm -rf ~/secrets".to_owned(),
         expanded_input: Some("TOP SECRET CONTENT".to_owned()),
         input_line_count: Some(1),
@@ -88,7 +89,7 @@ fn whitelist_details_and_counts() {
         None,
     );
     assert_eq!(read.detail, "src/main.rs:10-14");
-    assert_eq!(read.hidden_line_count, Some(5));
+    assert_eq!(read.hidden_line_count, None);
 
     let edit = build_tool_display(
         "edit",
@@ -100,7 +101,7 @@ fn whitelist_details_and_counts() {
         edit.expanded_input.as_deref(),
         Some("--- before\n+++ after\n@@\n-x\n-y\n+z\n")
     );
-    assert_eq!(edit.input_line_count, Some(3));
+    assert_eq!(edit.input_line_count, Some(7));
 }
 
 #[test]
@@ -138,16 +139,15 @@ fn truncated_input_is_flagged_and_counts_reflect_displayable_rows() {
     );
     assert!(write.truncated);
     assert_eq!(write.detail, "x");
-    // input_line_count reflects the source arg; hidden rows reflect only
-    // what is actually expandable, so the TUI cannot promise rows it
-    // cannot show. The trailing newline creates one final empty row.
-    assert_eq!(write.input_line_count, Some(300_001));
+    // Both counts describe the actual bounded body, including its final empty row.
     let expandable = write
         .expanded_input
         .as_ref()
         .map(|text| count_lines(text))
         .unwrap();
     assert!(expandable < 300_001);
+    assert_eq!(write.input_line_count, Some(expandable));
+    assert!(write.body_truncated);
     assert_eq!(write.hidden_line_count, Some(expandable));
 }
 
@@ -166,7 +166,7 @@ fn generic_tool_detail_is_bounded_single_line_and_redacted() {
     assert!(!display.detail.contains("DO NOT DISPLAY"));
     assert!(!display.detail.contains("secret.txt"));
     assert!(display.expanded_input.is_none());
-    assert_eq!(display.hidden_line_count, Some(5));
+    assert_eq!(display.hidden_line_count, None);
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn editor_old_and_new_and_bash_hint_lines() {
         Some(&serde_json::json!({ "old_text": "a\nb\nc", "new_text": "d" })),
         Some("updated"),
     );
-    assert_eq!(edit.input_line_count, Some(4));
+    assert_eq!(edit.input_line_count, Some(8));
     // Three diff headers, four changed lines, final blank, and one result row.
     assert_eq!(edit.hidden_line_count, Some(9));
 }
@@ -363,7 +363,7 @@ fn patch_rows_count_actual_whitelisted_body_and_unknown_batch_stays_redacted() {
 
 #[test]
 fn hidden_counts_follow_the_fixed_tool_execution_estimator() {
-    for (result_rows, expected) in [(19, 20), (20, 21), (21, 22)] {
+    for (result_rows, expected) in [(19, 19), (20, 20), (21, 21)] {
         let result = (0..result_rows)
             .map(|line| format!("result {line}"))
             .collect::<Vec<_>>()
@@ -382,14 +382,14 @@ fn hidden_counts_follow_the_fixed_tool_execution_estimator() {
         })),
         Some("line 10\nline 11"),
     );
-    assert_eq!(read.hidden_line_count, Some(7));
+    assert_eq!(read.hidden_line_count, Some(2));
 
     let write = build_tool_display(
         "write",
         Some(&serde_json::json!({"path": "src/main.rs"})),
         Some("created"),
     );
-    assert_eq!(write.hidden_line_count, Some(4));
+    assert_eq!(write.hidden_line_count, Some(1));
 }
 
 #[test]
@@ -533,6 +533,7 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
         arguments: serde_json::json!({"command": "true"}),
     };
     let display = ToolDisplay {
+        body_truncated: false,
         detail: "$ true".to_owned(),
         expanded_input: None,
         input_line_count: None,
@@ -605,6 +606,7 @@ fn finishing_a_call_removes_its_live_entry() {
         Some(key),
         &invocation,
         ToolDisplay {
+            body_truncated: false,
             detail: "$ true".to_owned(),
             expanded_input: None,
             input_line_count: None,
@@ -998,4 +1000,48 @@ fn reported_context_guards_same_label_config_and_emergency_summary_generations()
     assert!(!compaction.install_emergency_groups(LoopId::new().unwrap(), Default::default()));
     assert_eq!(presentation.snapshot().context.tokens, Some(100));
     assert_eq!(std::iter::from_fn(|| events.try_recv().ok()).count(), 4);
+}
+
+#[test]
+fn large_edit_display_is_byte_stable_and_counts_rendered_diff_rows() {
+    let arguments = serde_json::json!({
+        "path": "file.txt", "old_text": "old\n".repeat(2000), "new_text": "new\n".repeat(2000)
+    });
+    let first = build_tool_display("edit", Some(&arguments), None);
+    let body = first.expanded_input.as_deref().unwrap();
+    assert!(body.starts_with("--- before\n+++ after\n@@\n-old\n"));
+    assert!(body.contains("\n+new\n"));
+    assert_eq!(first.input_line_count, Some(count_lines(body)));
+    for _ in 0..4 {
+        assert_eq!(build_tool_display("edit", Some(&arguments), None), first);
+    }
+    let short_body_long_path = build_tool_display(
+        "write",
+        Some(&serde_json::json!({
+            "path": "p".repeat(2000), "content": "one line"
+        })),
+        None,
+    );
+    assert!(short_body_long_path.truncated);
+    assert!(!short_body_long_path.body_truncated);
+    assert_eq!(short_body_long_path.input_line_count, Some(1));
+}
+
+#[test]
+fn compact_card_target_is_the_command_prefix_or_explicit_patch_path() {
+    let bash = build_tool_card_display(
+        "bash",
+        Some(&serde_json::json!({"command": "first command\nsecond command"})),
+    );
+    assert_eq!(bash.detail, "first command");
+    assert_eq!(
+        bash.expanded_input.as_deref(),
+        Some("first command\nsecond command")
+    );
+    let patch = build_tool_card_display(
+        "apply_patch",
+        Some(&serde_json::json!({"path":"src/a.rs", "patch":"@@\n-old\n+new"})),
+    );
+    assert_eq!(patch.detail, "src/a.rs");
+    assert_eq!(patch.input_line_count, Some(3));
 }

@@ -37,8 +37,8 @@ use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
 pub use crate::read::{
-    ReadCursor, ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary,
-    TurnResultAvailability, TurnResultPage, TurnResultRequest,
+    CoveredUsage, DisplayProjection, ReadCursor, ReadItemChunk, ReadSession, ReadSessionResult,
+    ReadTurnSummary, ReadView, TurnResultAvailability, TurnResultPage, TurnResultRequest,
 };
 pub use crate::sessions::{
     SessionContext, SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult,
@@ -48,9 +48,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RPC_PROTOCOL_VERSION: u32 = 1;
 pub const RPC_CAPABILITIES: &[&str] = &[
     "session.read",
+    "session.read.display",
     "session.context",
     "turn.result",
     "tool.read",
+    "tool.read.display",
     "tool.output",
     "session.history",
     "workspace.read",
