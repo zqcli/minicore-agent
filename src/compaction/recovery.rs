@@ -398,18 +398,6 @@ pub(crate) async fn reconstruct_for_recovery(
             utility_usage,
         );
     }
-    // The utility target is a whole-request budget in its own accounting, so
-    // it must leave room above the irreducible floor and below the hard
-    // ceiling; otherwise the utility would chase an unreachable target and
-    // burn calls without ever producing a usable summary.
-    let target_tokens = auto
-        .policy
-        .budget(hard_tokens)
-        .target_tokens
-        .max(minimal_tokens.saturating_add(1))
-        .min(hard_tokens.saturating_sub(1))
-        .max(1);
-
     let items: Vec<&HistoryItem> = ticket.base.iter().chain(ticket.appended.iter()).collect();
     let ranges = match compressible_ranges(ticket.base.len(), &items, loop_id) {
         Ok(r) => r,
@@ -505,7 +493,6 @@ pub(crate) async fn reconstruct_for_recovery(
                 system: &ticket.system,
                 tools: ticket.tools.clone(),
                 group,
-                target_tokens,
                 hard_tokens,
                 deadline,
             },
@@ -1725,6 +1712,99 @@ mod tests {
             result,
             Err(RecoveryReconstructionError::Uncompressible)
         ));
+    }
+
+    #[tokio::test]
+    async fn reconstruction_accounts_for_each_independent_group_once() {
+        let loop_id = LoopId::new().unwrap();
+        let (mut base, appended) = big_tool_exchange(loop_id, 20_000);
+        let (mut second, _) = big_tool_exchange(loop_id, 20_000);
+        let second_id = ToolCallId::new("call_second").unwrap();
+        if let HistoryItem::Assistant(assistant) = &mut second[0] {
+            assistant.content = vec![AssistantPart::ToolCall(
+                ToolCall::new(
+                    second_id.clone(),
+                    "read".parse().unwrap(),
+                    json!({"path":"second.txt"}),
+                    0,
+                )
+                .unwrap(),
+            )];
+        }
+        if let HistoryItem::ToolResult(result) = &mut second[1] {
+            result.call_id = second_id;
+        }
+        base.extend(second);
+        let original_history = serde_json::to_vec(&base).unwrap();
+        let mut ticket = ActiveRecoveryTicket {
+            loop_id,
+            request_index: 1,
+            content_hash: [0; 32],
+            ticket_hash: Some([0; 32]),
+            original_body_bytes: 0,
+            original_tokens: 0,
+            system: BoundedText::new("system").unwrap(),
+            summary: None,
+            base,
+            appended,
+            tools: Vec::new(),
+            limits: ModelLimits::default(),
+            reasoning: ReasoningPreference::Auto,
+            auto_binding: None,
+        };
+        let (mut fixed, history) =
+            auto_compose(&ticket.system, None, &ticket.base, &ticket.appended).unwrap();
+        fixed.extend(history);
+        let original = ModelRequest::new(
+            fixed,
+            Vec::new(),
+            ModelLimits::default(),
+            ReasoningPreference::Auto,
+        )
+        .unwrap();
+        ticket.original_body_bytes = DefaultProviderBudget
+            .estimate_request_bytes(&original, None, None)
+            .unwrap();
+        let utility = RawTestModel::new(RawBehavior::Summary("compact summary"));
+        let state = CompactionState::new();
+        let auto = recovery_auto(&state, Arc::clone(&utility));
+        // Either raw 80 KiB result alone exceeds the 64 KiB input window, so
+        // a successful reconstruction necessarily replaces both safe groups.
+        let (result, usage) = reconstruct_for_recovery(
+            &ticket,
+            &auto,
+            &DefaultProviderBudget,
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(5),
+            loop_id,
+            1,
+            None,
+        )
+        .await;
+        let request = result.expect("both complete exchanges can shrink");
+        assert_eq!(utility.calls.load(Ordering::SeqCst), 2);
+        let usage = usage.unwrap();
+        assert_eq!(usage.call_count, 2);
+        assert!(
+            !usage.complete,
+            "the fake supplies no usage, which stays unknown"
+        );
+        assert!(usage.usage.is_none());
+        assert!(validate_clean_tool_exchanges(request.messages()));
+        assert_eq!(
+            request
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, ModelMessage::User(text) if text == "read big"))
+                .count(),
+            1
+        );
+        let bytes = DefaultProviderBudget
+            .estimate_request_bytes(&request, None, None)
+            .unwrap();
+        assert!(bytes < ticket.original_body_bytes);
+        assert!(bytes.div_ceil(4) as u64 <= utility.descriptor().context_window);
+        assert_eq!(serde_json::to_vec(&ticket.base).unwrap(), original_history);
     }
 
     #[test]

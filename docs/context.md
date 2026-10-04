@@ -24,9 +24,8 @@ and tool rounds.
 
 ## Independent Manual And Post-Turn Operations
 
-Manual `session.compact` is available only while idle and uses the existing
-half-window target and full-coverage Noop semantics. It has an exact operation ID
-and deferred result. Manual creation rejects the reserved `auto-` prefix;
+Manual `session.compact` is available only while idle and retains full-coverage
+Noop semantics. It has an exact operation ID and deferred result. Manual creation rejects the reserved `auto-` prefix;
 cancellation accepts an actual automatic ID.
 
 With automatic compaction enabled, only a Completed turn whose history was
@@ -39,15 +38,43 @@ usage and does not consume the manual operation-ID quota.
 
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
-trigger it finishes Noop without a utility call; otherwise it uses the existing
-bounded summary engine and automatic target. Even a check that becomes Noop may
-briefly return `session_busy` to a new submit. `turn.wait` does not wait for this
+trigger it finishes Noop without a utility call; otherwise it uses the
+single-call summary engine. The configured target is advisory, not a reason
+to repeat a summary call. Even a check that becomes Noop may briefly return `session_busy` to a new submit. `turn.wait` does not wait for this
 operation, and submit does not secretly wait for a budget decision or queue an
 automatic resend. Clients retain drafts and reconcile state/context.
 
 Close cancels all captured turn/compaction owners before joining them. Cancelling
 an independent operation does not change an already completed turn. Reload does
 not retroactively cancel a reserved operation's captured configuration.
+
+## Single-Call Summary Projection
+
+Each selected source is projected into one bounded text request using the Pi
+initial/update summary prompts. User text, assistant text, visible reasoning
+text/summary, embedded historical summaries and complete tool-call arguments are
+retained. Provider replay, encrypted reasoning, signatures and history accounting
+metadata are excluded. Each tool result keeps its tool name, call ID and outcome,
+plus the first 2,000 Unicode scalar values of its text and an explicit omitted
+character count. This can omit important details at the end of a long result;
+the authoritative stored result is unchanged. This summary-only limit is separate
+from tool execution output limits.
+
+An existing summary is supplied once alongside only the uncovered history suffix.
+Project instructions and tool schemas remain in the ordinary request and its
+budget checks, but are not repeated in the tool-free summary request. The source
+builder is bounded to the Runtime's 256 KiB message limit and checks cancellation
+and deadline while writing. The complete framed, JSON-escaped request must fit
+the existing effective input budget before any model call. Oversized input fails
+explicitly; there is no chunking, map/reduce or silent trimming of other content.
+
+One successful generation must be nonempty, finish normally without tool calls,
+fit the existing 64 KiB summary limit, and produce a strictly smaller ordinary
+request within its hard budget. A fitting result is not summarized again merely
+to reach a preferred target. Model output configuration is unchanged. Emergency
+recovery may select several independent safe groups; each group uses at most one
+summary call, and all actual calls remain accounted. This does not add Pi's
+recent-token tail selection, split-turn summaries or file-operation ledger.
 
 ## Bounded Emergency Recovery
 

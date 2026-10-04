@@ -308,7 +308,6 @@ impl Session {
             previous_summary,
             previous_covered_item_count,
             hard_tokens: budget.hard_tokens,
-            target_tokens: budget.target_tokens,
             automatic_budget: Some(Arc::clone(&auto.budget)),
             trigger_tokens: Some(budget.trigger_tokens),
             deadline: Instant::now()
@@ -371,10 +370,6 @@ impl Session {
                 .history
                 .len()
                 .saturating_sub(previous_covered_item_count);
-            // Explicit manual compaction keeps its original half-window
-            // target. The Agent-global policy controls automatic compaction;
-            // changing it must not silently change manual behavior.
-            let target_tokens = descriptor.context_window / 2;
             inner.compaction = Some(Arc::clone(&operation));
             inner.used_compaction_ids.insert(operation_id.clone());
             inner.compaction_progress = Some(CompactionProgress {
@@ -393,7 +388,6 @@ impl Session {
                 previous_summary,
                 previous_covered_item_count,
                 hard_tokens: descriptor.context_window,
-                target_tokens,
                 automatic_budget: None,
                 trigger_tokens: None,
                 deadline: Instant::now()
@@ -753,7 +747,6 @@ pub(super) async fn run_compaction_inner(
         project_instructions: system_prompt,
         tool_schemas: reservation.tool_schemas.clone(),
         hard_tokens: reservation.hard_tokens,
-        target_tokens: reservation.target_tokens,
         safe_before_estimate: false,
         operation_deadline: reservation.deadline,
     };
@@ -802,15 +795,7 @@ pub(super) async fn run_compaction_inner(
         }
     }
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
-    let mut mark_merging =
-        || session.set_compaction_phase(&reservation.operation, CompactionPhase::Merging);
-    let generated = match generate_summary(
-        &input,
-        &reservation.operation.cancellation,
-        &mut mark_merging,
-    )
-    .await
-    {
+    let generated = match generate_summary(&input, &reservation.operation.cancellation).await {
         Ok(generated) => generated,
         Err(error) => {
             return failed_compaction_with_usage(

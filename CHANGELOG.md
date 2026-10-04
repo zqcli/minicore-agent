@@ -2,6 +2,13 @@
 
 ## 0.6.2 — 2026-10-04
 
+- Project selected history into one bounded, tool-free Pi-style summary request
+  instead of chunking and repeatedly merging/reducing. Keep visible reasoning and
+  complete tool arguments; summarize only the first 2,000 Unicode characters of
+  each tool result with an explicit truncation marker. Stored history is unchanged.
+- Reject oversized summary input before a model call; retain existing hard-budget,
+  cancellation, output validation, accounting and atomic snapshot safeguards.
+
 - Report the latest API request context usage in session presentation, using the
   provider total or complete normalized components and the physical model window.
   This is distinct from cumulative billing and is not a live request estimate.
