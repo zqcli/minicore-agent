@@ -238,6 +238,9 @@ impl ExecutionConfigFactory<'_> {
         };
         let model = crate::presentation::PresentationModel::new_with_observer(
             model,
+            self.models
+                .physical_context_window(&record.model)
+                .unwrap_or(0),
             Arc::clone(&presentation),
             Arc::clone(&observer),
         );
@@ -957,9 +960,6 @@ impl Agent {
         let active_revision = session
             .update(candidate.clone(), config, auto, options)
             .await?;
-        session
-            .presentation()
-            .set_model_label(candidate.model.clone());
         Ok(SessionUpdateResult {
             session: session.info(true),
             active_revision,
@@ -1243,7 +1243,11 @@ impl Agent {
         options: LoopOptions,
         compaction: Arc<CompactionState>,
     ) -> Result<SessionSetup, AgentError> {
-        let presentation = self.build_presentation(record.session_id, record.model.clone());
+        let presentation = self.build_presentation(
+            record.session_id,
+            record.model.clone(),
+            Arc::clone(&compaction),
+        );
         let tool_data = Arc::new(ToolData::new());
         let command_owners = CommandOwners::new();
         let observer = ToolObserver::new(
@@ -1292,16 +1296,22 @@ impl Agent {
             options,
             compaction,
         } = setup;
+        let context_history = Arc::clone(&history);
+        let context_model = self.models.get(&record.model).ok();
+        let physical_window = self
+            .models
+            .physical_context_window(&record.model)
+            .unwrap_or(0);
         let session = crate::sessions::Session::new(
             record,
             workspace,
             history,
             user_times,
-            presentation,
+            Arc::clone(&presentation),
             config,
             auto,
             options,
-            compaction,
+            Arc::clone(&compaction),
             self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
@@ -1309,6 +1319,16 @@ impl Agent {
             command_owners,
             observer,
         );
+        let active_history = compaction.project(&context_history);
+        if let Some(model) = context_model {
+            presentation.restore_context(
+                active_history
+                    .as_ref()
+                    .map_or(context_history.as_ref(), |projection| projection.suffix),
+                model.descriptor().model_ref.as_str(),
+                physical_window,
+            );
+        }
         let _ = self.sessions.insert(session_id, session);
         let info = self
             .sessions
@@ -1368,9 +1388,10 @@ impl Agent {
         &self,
         session_id: crate::ids::SessionId,
         model_label: String,
+        compaction: Arc<CompactionState>,
     ) -> Arc<crate::presentation::Presentation> {
         let presentation =
-            crate::presentation::Presentation::new(session_id, self.event_sink.clone());
+            crate::presentation::Presentation::new(session_id, self.event_sink.clone(), compaction);
         presentation.set_model_label(model_label);
         presentation
     }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.2 — 2026-10-04
+
+- Report the latest API request context usage in session presentation, using the
+  provider total or complete normalized components and the physical model window.
+  This is distinct from cumulative billing and is not a live request estimate.
+- Retain the last report between turns, recover eligible active-history usage on
+  reopen, and invalidate it after model changes or successful compaction.
+- Runtime remains pinned to 0.6.1; no provider schema or execution changes.
+
 ## 0.6.1 — 2026-10-03
 
 - Preserve bounded provider-owned Responses replay through the existing history

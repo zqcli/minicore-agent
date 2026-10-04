@@ -16,13 +16,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::StreamExt;
 use serde::Serialize;
 
 use minicore_runtime::history::{HistoryItem, UserMessageKind};
-use minicore_runtime::model::{Model, ModelCallContext, ModelDescriptor, ModelRequest};
+use minicore_runtime::model::{Model, ModelCallContext, ModelDescriptor, ModelRequest, Usage};
 use minicore_runtime::prompt::{PromptFuture, PromptProvider, PromptRequest};
 use minicore_runtime::tools::{Tool, ToolContext, ToolExecutionOutcome, ToolInvocation, ToolSpec};
 use minicore_runtime::{LoopId, ToolCallId};
@@ -157,15 +157,14 @@ impl fmt::Debug for AssistantDisplayPart {
     }
 }
 
-/// Honest status for context usage. No provider metering is available in
-/// MiniCore today, so this is always `Unknown` (the TUI shows `ctx ?`); the
-/// shape exists so a future provider estimate can be surfaced explicitly as
-/// `Estimated` instead of being mistaken for exact data.
+/// Source of the displayed context usage. Reported usage is the last API
+/// request's footprint, not an estimate of an in-flight or future request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextKind {
     Unknown,
     Estimated,
+    Reported,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -251,6 +250,9 @@ struct PresentationInner {
     last_loop: Option<LastLoop>,
     branch: Option<String>,
     model_label: Option<String>,
+    context: ContextUsageView,
+    context_settings: (u64, u64),
+    installed_model: Option<Weak<dyn Model>>,
     /// 1-based FIFO count of Accepted Steers in this loop (from
     /// `Session::steer`, serialized by the same session lock).
     accepted_steers: u64,
@@ -304,14 +306,20 @@ impl PresentationInner {
 pub(crate) struct Presentation {
     session_id: SessionId,
     events: AgentEventSink,
+    compaction: Arc<crate::compaction::CompactionState>,
     inner: Mutex<PresentationInner>,
 }
 
 impl Presentation {
-    pub(crate) fn new(session_id: SessionId, events: AgentEventSink) -> Arc<Self> {
+    pub(crate) fn new(
+        session_id: SessionId,
+        events: AgentEventSink,
+        compaction: Arc<crate::compaction::CompactionState>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
             events,
+            compaction,
             inner: Mutex::new(PresentationInner::default()),
         })
     }
@@ -372,7 +380,9 @@ impl Presentation {
     pub(crate) fn note_request_usage(
         &self,
         key: RequestKey,
-        usage: minicore_runtime::model::Usage,
+        usage: Usage,
+        context_generation: Option<u64>,
+        physical_window: u64,
     ) {
         let event = {
             let mut inner = self.lock();
@@ -383,6 +393,11 @@ impl Presentation {
                 return;
             }
             inner.request_usage.insert(key, usage);
+            let settings = self.compaction.request_settings();
+            if context_generation == Some(settings.config_generation) {
+                inner.context = reported_context(usage, physical_window);
+                inner.context_settings = (settings.config_generation, settings.summary_generation);
+            }
             Some(AgentEvent::RequestUsage {
                 turn: TurnRef {
                     session_id: self.session_id,
@@ -435,7 +450,57 @@ impl Presentation {
     }
 
     pub(crate) fn set_model_label(&self, model_label: String) {
-        self.lock().model_label = Some(model_label);
+        let mut inner = self.lock();
+        if inner.model_label.as_ref() != Some(&model_label) {
+            inner.context = ContextUsageView::default();
+        }
+        inner.model_label = Some(model_label);
+    }
+
+    /// Bind only when the execution config is installed, never while building
+    /// a candidate. Weak identity prevents old same-label wrappers from
+    /// claiming usage after a settings reload without creating a reference cycle.
+    pub(crate) fn install_model(&self, model: &Arc<dyn Model>) {
+        let mut inner = self.lock();
+        if inner.installed_model.is_some() {
+            inner.context = ContextUsageView::default();
+        }
+        inner.installed_model = Some(Arc::downgrade(model));
+    }
+
+    fn context_generation(&self, model: &dyn Model) -> Option<u64> {
+        let inner = self.lock();
+        inner
+            .installed_model
+            .as_ref()
+            .filter(|installed| std::ptr::addr_eq(installed.as_ptr(), model as *const dyn Model))
+            .map(|_| self.compaction.request_settings().config_generation)
+    }
+
+    /// The caller supplies only active post-compaction history. Do not carry
+    /// an older model's usage across a model boundary when reopening.
+    pub(crate) fn restore_context(
+        &self,
+        history: &[HistoryItem],
+        model_ref: &str,
+        physical_window: u64,
+    ) {
+        let mut inner = self.lock();
+        for item in history.iter().rev() {
+            if let HistoryItem::Assistant(assistant) = item {
+                if assistant.model.as_str() != model_ref {
+                    break;
+                }
+                let context = reported_context(assistant.usage, physical_window);
+                if context.tokens.is_some() {
+                    inner.context = context;
+                    let settings = self.compaction.request_settings();
+                    inner.context_settings =
+                        (settings.config_generation, settings.summary_generation);
+                    break;
+                }
+            }
+        }
     }
 
     pub(crate) fn record_prompt_time(&self, accepted_at: Option<String>) {
@@ -551,11 +616,19 @@ impl Presentation {
 
     pub(crate) fn snapshot(&self) -> PresentationView {
         let inner = self.lock();
+        let settings = self.compaction.request_settings();
+        let context = if inner.context_settings
+            == (settings.config_generation, settings.summary_generation)
+        {
+            inner.context.clone()
+        } else {
+            ContextUsageView::default()
+        };
         PresentationView {
             session_id: self.session_id,
             model_label: inner.model_label.clone(),
             git_branch: inner.branch.clone(),
-            context: ContextUsageView::default(),
+            context,
             cost_usd: None,
             using_subscription: None,
             last_loop: inner.last_loop.as_ref().map(|last_loop| LastLoopView {
@@ -581,6 +654,29 @@ impl Presentation {
     }
 }
 
+/// Usage components are normalized by the provider adapter into disjoint
+/// counts. Never guess a missing component is zero or sum a native total twice.
+fn reported_context(usage: Usage, physical_window: u64) -> ContextUsageView {
+    let tokens = usage.provider_total_tokens().or_else(|| {
+        usage
+            .input_tokens()?
+            .checked_add(usage.output_tokens()?)?
+            .checked_add(usage.reasoning_tokens()?)?
+            .checked_add(usage.cache_read_tokens()?)?
+            .checked_add(usage.cache_write_tokens()?)
+    });
+    let Some(tokens) = tokens else {
+        return ContextUsageView::default();
+    };
+    let window = (physical_window > 0).then_some(physical_window);
+    ContextUsageView {
+        tokens: Some(tokens),
+        window,
+        percent: window.map(|window| tokens as f64 / window as f64 * 100.0),
+        kind: ContextKind::Reported,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model / Tool wrappers (thin; identity + best-effort display only)
 // ---------------------------------------------------------------------------
@@ -589,6 +685,7 @@ impl Presentation {
 /// mirrors that boundary into the display-only steering cache, then delegates
 /// unchanged.
 pub(crate) struct PresentationModel {
+    physical_window: u64,
     inner: Arc<dyn Model>,
     presentation: Arc<Presentation>,
     observer: Arc<ToolObserver>,
@@ -597,11 +694,13 @@ pub(crate) struct PresentationModel {
 impl PresentationModel {
     pub(crate) fn new_with_observer(
         inner: Arc<dyn Model>,
+        physical_window: u64,
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner,
+            physical_window,
             presentation,
             observer,
         })
@@ -625,6 +724,8 @@ impl Model for PresentationModel {
         // Synchronous; no lock is held across an await.
         self.observer.note_request_start(key);
         self.presentation.note_request_start(key);
+        let context_generation = self.presentation.context_generation(self);
+        let physical_window = self.physical_window;
         let inner = self.inner.start(request, context);
         let presentation = Arc::clone(&self.presentation);
         Box::pin(async move {
@@ -635,7 +736,12 @@ impl Model for PresentationModel {
             // and error delivery are untouched.
             let observed = stream.inspect(move |item| {
                 if let Ok(minicore_runtime::model::ModelEvent::Usage { usage }) = item {
-                    presentation.note_request_usage(key, *usage);
+                    presentation.note_request_usage(
+                        key,
+                        *usage,
+                        context_generation,
+                        physical_window,
+                    );
                 }
             });
             Ok(Box::pin(observed) as minicore_runtime::model::ModelStream)

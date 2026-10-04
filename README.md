@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
-MiniCore Agent **0.6.1** is an RPC-first local agent core. It provides a Rust
+MiniCore Agent **0.6.2** is an RPC-first local agent core. It provides a Rust
 library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
 Tool data, and a stdio JSON-RPC service for a client UI.
 

@@ -344,7 +344,8 @@ impl Model for FakeModel {
                 ModelScript::TextWithUsage(text, input, output) => events(vec![
                     ModelEvent::text_delta(text).unwrap(),
                     ModelEvent::Usage {
-                        usage: Usage::new(input, output, 0),
+                        usage: Usage::new(input, output, 0)
+                            .with_provider_total_tokens(Some(input + output)),
                     },
                     ModelEvent::Finish {
                         reason: ModelFinishReason::Stop,
@@ -2956,6 +2957,76 @@ async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
     assert_eq!(tool_result.outcome, ToolResultOutcome::Failed);
     assert_eq!(tool_result.content, "tool failed");
     assert!(!tool_result.content.contains("missing-secret.txt"));
+}
+
+#[tokio::test]
+async fn reported_context_tracks_last_request_reopen_compaction_and_model_change() {
+    use crate::presentation::ContextKind;
+    let (data_dir, _guard) = fixture_dir(&format!("reported-context-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("reported-context-ws", "a.txt", b"hello");
+    let model = FakeModel::with_window(
+        "provider/main",
+        10_000,
+        [
+            ModelScript::TextWithUsage("first", 80, 20),
+            ModelScript::TextWithUsage("second", 180, 20),
+            ModelScript::Text("short summary"),
+            ModelScript::TextWithUsage("after compact", 40, 10),
+        ],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([
+            ("main".to_owned(), model),
+            ("other".to_owned(), FakeModel::new("provider/other", [])),
+        ]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let context = |agent: &Agent| agent.session_presentation(info.session_id).unwrap().context;
+    assert_eq!(context(&agent).kind, ContextKind::Unknown);
+    let turn = send_text(&mut agent, info.session_id, &"history ".repeat(256)).await;
+    wait_text(&agent, turn).await;
+    assert_eq!(context(&agent).tokens, Some(100));
+    assert_eq!(context(&agent).window, Some(10_000));
+    assert_eq!(context(&agent).percent, Some(1.0));
+    let turn = send_text(&mut agent, info.session_id, "next").await;
+    wait_text(&agent, turn).await;
+    assert_eq!(context(&agent).tokens, Some(200)); // Not cumulative 300.
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(context(&agent).tokens, Some(200));
+    let compact = agent
+        .compact(CompactSession {
+            session_id: info.session_id,
+            operation_id: "reported-context-compact".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        compact.status,
+        crate::compaction::CompactionStatus::Compacted
+    );
+    assert_eq!(context(&agent).kind, ContextKind::Unknown);
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(context(&agent).kind, ContextKind::Unknown);
+    let turn = send_text(&mut agent, info.session_id, "after compact").await;
+    wait_text(&agent, turn).await;
+    assert_eq!(context(&agent).tokens, Some(50));
+    agent
+        .update_session(UpdateSession {
+            session_id: info.session_id,
+            model: Some("other".to_owned()),
+            reasoning: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(context(&agent).kind, ContextKind::Unknown);
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(context(&agent).kind, ContextKind::Unknown);
 }
 
 #[tokio::test]
