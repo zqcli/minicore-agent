@@ -756,6 +756,24 @@ pub(crate) fn encode_snapshot(
     (bytes.len() <= MAX_SUMMARY_FILE_BYTES).then_some(bytes)
 }
 
+/// Shape-check a cold display candidate without loading a Session. The bounded
+/// history page scan must validate this exact source anchor before using it.
+pub(crate) fn display_snapshot_candidate(
+    bytes: &[u8],
+    session_id: SessionId,
+) -> Option<(LoadedSummary, HistoryPrefix)> {
+    let snapshot = decode_snapshot(bytes)?;
+    let summary = validate_snapshot_shape(&snapshot, session_id, usize::MAX)?;
+    let source = HistoryPrefix {
+        prefix_bytes: snapshot.source.prefix_bytes,
+        covered_loop_count: snapshot.source.covered_loop_count,
+        covered_item_count: snapshot.source.covered_item_count,
+        last_loop_id: snapshot.source.last_loop_id,
+        sha256: snapshot.source.sha256,
+    };
+    Some((summary, source))
+}
+
 /// Loads only a validated derived snapshot. Any snapshot problem returns an
 /// empty state; the already-loaded core history remains authoritative.
 pub(crate) async fn load_state(

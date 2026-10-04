@@ -65,8 +65,8 @@ pub struct ReadSession {
     pub projection_revision: Option<String>,
 }
 
-/// Canonical history remains the default. Display is a loaded-session-only,
-/// read-only projection; its chunk offsets never apply to canonical history.
+/// Canonical history remains the default. Display is a read-only projection
+/// for loaded or persisted sessions; its offsets never apply to canonical history.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadView {
@@ -268,55 +268,30 @@ pub(crate) async fn read_session(
 ) -> Result<ReadSessionResult, AgentError> {
     request.validate()?;
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
-    let limits = scan_limits(cancellation);
+    let mut limits = scan_limits(cancellation);
     check_read_budget(&limits.cancellation, limits.deadline)?;
     let snapshot = loaded.as_ref().map(Session::read_snapshot);
     let display = request.view == ReadView::Display;
-    let summary = if display {
-        loaded
-            .as_ref()
-            .ok_or(AgentError::SessionNotLoaded)?
-            .compaction_state()
-            .display_snapshot()
-    } else {
-        None
-    };
-    let covered = summary
-        .as_ref()
-        .map_or(0, |summary| summary.covered_item_count);
-    if snapshot
-        .as_ref()
-        .is_some_and(|snapshot| covered > snapshot.history.len())
-    {
-        return Err(AgentError::InvalidState);
-    }
-    let first_item = covered.saturating_sub(1);
-    let projection_revision = display.then(|| {
-        let mut hash = Sha256::new();
-        hash.update(b"display-v1\0");
-        hash.update((covered as u64).to_le_bytes());
-        hash.update(std::env::var("HOME").unwrap_or_default().as_bytes());
-        hash.update(b"\0");
-        if let Some(summary) = &summary {
-            hash.update(summary.content.as_str().as_bytes());
+    let (mut summary, mut cold_prefix) = if display {
+        if let Some(session) = &loaded {
+            (session.compaction_state().display_snapshot(), None)
+        } else {
+            let candidate = store
+                .read_summary_bytes(request.session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|bytes| {
+                    crate::compaction::display_snapshot_candidate(&bytes, request.session_id)
+                });
+            match candidate {
+                Some((summary, source)) => (Some(summary), Some(source)),
+                None => (None, None),
+            }
         }
-        format!("{:x}", hash.finalize())
-    });
-    if request
-        .projection_revision
-        .as_ref()
-        .is_some_and(|expected| Some(expected) != projection_revision.as_ref())
-    {
-        return Err(AgentError::InvalidState);
-    }
-    let mut cursor = request.cursor.unwrap_or_else(ReadCursor::start);
-    if display && request.captured_end.is_none() && cursor == ReadCursor::start() {
-        cursor.item = first_item;
-    }
-    if display && cursor.item < first_item {
-        return Err(AgentError::InvalidArguments);
-    }
-    let source_start = cursor.item.max(covered);
+    } else {
+        (None, None)
+    };
     let info = if let Some(snapshot) = &snapshot {
         snapshot.info.clone()
     } else {
@@ -326,20 +301,106 @@ pub(crate) async fn read_session(
             .map_err(map_read_store_error)?;
         SessionInfo::from_record(&record, false)
     };
-    let page = store
-        .read_history_page(
-            request.session_id,
-            source_start,
-            request.limit - usize::from(summary.is_some() && cursor.item == first_item),
-            snapshot.as_ref().map(|snapshot| snapshot.history.len()),
-            request.captured_end,
-            request.history_revision.as_deref(),
-            snapshot.as_ref().map(|snapshot| snapshot.history.as_ref()),
-            display.then_some(covered),
-            &limits,
-        )
-        .await
+    let (covered, first_item, projection_revision, cursor, source_start, mut page) = loop {
+        check_read_budget(&limits.cancellation, limits.deadline)?;
+        let covered = summary
+            .as_ref()
+            .map_or(0, |summary| summary.covered_item_count);
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| covered > snapshot.history.len())
+        {
+            return Err(AgentError::InvalidState);
+        }
+        let first_item = covered.saturating_sub(1);
+        let projection_revision = display.then(|| {
+            let mut hash = Sha256::new();
+            hash.update(b"display-v1\0");
+            hash.update((covered as u64).to_le_bytes());
+            hash.update(std::env::var("HOME").unwrap_or_default().as_bytes());
+            hash.update(b"\0");
+            if let Some(summary) = &summary {
+                hash.update(summary.content.as_str().as_bytes());
+            }
+            format!("{:x}", hash.finalize())
+        });
+        if cold_prefix.is_none()
+            && request
+                .projection_revision
+                .as_ref()
+                .is_some_and(|expected| Some(expected) != projection_revision.as_ref())
+        {
+            return Err(AgentError::InvalidState);
+        }
+        let mut cursor = request.cursor.unwrap_or_else(ReadCursor::start);
+        if display && request.captured_end.is_none() && cursor == ReadCursor::start() {
+            cursor.item = first_item;
+        }
+        if display && cold_prefix.is_none() && cursor.item < first_item {
+            return Err(AgentError::InvalidArguments);
+        }
+        let source_start = cursor.item.max(covered);
+        let page = if display && snapshot.is_none() {
+            store
+                .read_display_history_page(
+                    request.session_id,
+                    source_start,
+                    request.limit - usize::from(summary.is_some() && cursor.item == first_item),
+                    request.captured_end,
+                    request.history_revision.as_deref(),
+                    cold_prefix.as_ref(),
+                    &limits,
+                )
+                .await
+        } else {
+            store
+                .read_history_page(
+                    request.session_id,
+                    source_start,
+                    request.limit - usize::from(summary.is_some() && cursor.item == first_item),
+                    snapshot.as_ref().map(|snapshot| snapshot.history.len()),
+                    request.captured_end,
+                    request.history_revision.as_deref(),
+                    snapshot.as_ref().map(|snapshot| snapshot.history.as_ref()),
+                    display.then_some(covered),
+                    &limits,
+                )
+                .await
+        }
         .map_err(map_read_store_error)?;
+        if cold_prefix.is_some() && !page.summary_anchor_valid {
+            // Invalid optional snapshots do not hide source history. A retry
+            // stays inside the original aggregate scan budget and starts from
+            // the client's cursor/limit, never from the rejected summary slot.
+            // A pinned request fails the projection check on the next pass.
+            limits.max_bytes = limits.max_bytes.saturating_sub(page.scanned_bytes);
+            limits.max_lines = limits.max_lines.saturating_sub(page.scanned_lines);
+            summary = None;
+            cold_prefix = None;
+            continue;
+        }
+        // A cold candidate has no authority until the same scan verifies its
+        // anchor. In particular, an invalid optional file must not invalidate
+        // a continuation already pinned to the no-summary display projection.
+        if request
+            .projection_revision
+            .as_ref()
+            .is_some_and(|expected| Some(expected) != projection_revision.as_ref())
+        {
+            return Err(AgentError::InvalidState);
+        }
+        if display && cursor.item < first_item {
+            return Err(AgentError::InvalidArguments);
+        }
+        break (
+            covered,
+            first_item,
+            projection_revision,
+            cursor,
+            source_start,
+            page,
+        );
+    };
     validate_cursor(cursor, page.total_items)?;
     if summary
         .as_ref()
@@ -377,17 +438,23 @@ pub(crate) async fn read_session(
         });
     let tail: Box<dyn Iterator<Item = Result<(usize, String), AgentError>> + Send + '_> = if display
     {
-        let history = &snapshot
-            .as_ref()
-            .ok_or(AgentError::SessionNotLoaded)?
-            .history;
-        Box::new(encoded_display_items(
-            request.session_id,
-            source_start,
-            &page.items,
-            &timestamps,
-            &history[covered..page.total_items],
-        )?)
+        if let Some(snapshot) = &snapshot {
+            Box::new(encoded_display_items(
+                request.session_id,
+                source_start,
+                &page.items,
+                &timestamps,
+                &snapshot.history[covered..page.total_items],
+            )?)
+        } else {
+            Box::new(
+                page.display_items
+                    .take()
+                    .ok_or(AgentError::Internal)?
+                    .into_iter()
+                    .map(Ok),
+            )
+        }
     } else {
         Box::new(encoded_items(source_start, &page.items, &timestamps)?)
     };
@@ -428,7 +495,7 @@ pub(crate) async fn read_session(
 
 /// Canonical tool bodies are never serialized into the display envelope.
 /// Whitelisted presentation metadata is regenerated by the one Agent formatter.
-fn encoded_display_items<'a>(
+pub(crate) fn encoded_display_items<'a>(
     session_id: SessionId,
     start: usize,
     items: &'a [HistoryItem],

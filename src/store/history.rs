@@ -158,6 +158,63 @@ impl Store {
         usage_boundary: Option<usize>,
         limits: &HistoryScanLimits,
     ) -> Result<HistoryReadPage, StoreError> {
+        self.scan_history_page(
+            session_id,
+            item_offset,
+            item_limit,
+            visible_item_count,
+            captured_end,
+            expected_revision,
+            expected_history,
+            usage_boundary,
+            None,
+            limits,
+        )
+        .await
+    }
+
+    /// Cold display uses the same bounded, read-only scan as canonical reads.
+    /// A candidate summary is accepted only against this scan's exact bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn read_display_history_page(
+        &self,
+        session_id: SessionId,
+        item_offset: usize,
+        item_limit: usize,
+        captured_end: Option<u64>,
+        expected_revision: Option<&str>,
+        summary: Option<&HistoryPrefix>,
+        limits: &HistoryScanLimits,
+    ) -> Result<HistoryReadPage, StoreError> {
+        self.scan_history_page(
+            session_id,
+            item_offset,
+            item_limit,
+            None,
+            captured_end,
+            expected_revision,
+            None,
+            Some(summary.map_or(0, |source| source.covered_item_count as usize)),
+            Some(ColdDisplayScan { summary }),
+            limits,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_history_page(
+        &self,
+        session_id: SessionId,
+        item_offset: usize,
+        item_limit: usize,
+        visible_item_count: Option<usize>,
+        captured_end: Option<u64>,
+        expected_revision: Option<&str>,
+        expected_history: Option<&[HistoryItem]>,
+        usage_boundary: Option<usize>,
+        display: Option<ColdDisplayScan<'_>>,
+        limits: &HistoryScanLimits,
+    ) -> Result<HistoryReadPage, StoreError> {
         if captured_end.is_some() != expected_revision.is_some() {
             return Err(StoreError::InvalidArguments);
         }
@@ -206,6 +263,8 @@ impl Store {
         let mut covered_usage = crate::read::CoveredUsage::default();
         let mut items = Vec::new();
         let mut user_times = Vec::new();
+        let mut display_items = display.as_ref().map(|_| Vec::new());
+        let mut summary_anchor_valid = display.as_ref().is_none_or(|read| read.summary.is_none());
         let page_end = item_offset.saturating_add(item_limit);
         let mut turns = Vec::new();
         let mut turns_truncated = false;
@@ -250,7 +309,7 @@ impl Store {
                 .checked_add(normalized.len())
                 .ok_or(StoreError::Corrupt)?;
             if let Some(boundary) = usage_boundary {
-                if record_start < boundary && record_end > boundary {
+                if record_start < boundary && record_end > boundary && display.is_none() {
                     return Err(StoreError::HistoryChanged);
                 }
                 if record_end <= boundary {
@@ -282,6 +341,7 @@ impl Store {
                     return Err(StoreError::QueryLimit);
                 }
             }
+            let page_item_start = items.len();
             let times = record.normalized_user_times().unwrap_or_default();
             let mut user_occurrence = 0_usize;
             for (index, item) in normalized.iter().enumerate() {
@@ -296,6 +356,25 @@ impl Store {
                     items.push(item.clone());
                     user_times.push(timestamp);
                 }
+            }
+            if let Some(encoded) = display_items
+                .as_mut()
+                .filter(|_| items.len() > page_item_start)
+            {
+                // Tool identities are loop-local. Pair only within this complete
+                // stored loop, including counterparts outside the selected page.
+                encoded.extend(
+                    crate::read::encoded_display_items(
+                        session_id,
+                        record_start.max(item_offset),
+                        &items[page_item_start..],
+                        &user_times[page_item_start..],
+                        &normalized,
+                    )
+                    .map_err(|_| StoreError::Corrupt)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| StoreError::Corrupt)?,
+                );
             }
             if record_end > item_offset && record_start < page_end {
                 if turns.len() < MAX_READ_TURN_SUMMARIES {
@@ -319,6 +398,18 @@ impl Store {
             hasher.update(&line);
             hasher.update(b"\n");
             complete_end = scan_target - remaining;
+            if let Some(expected) = display.as_ref().and_then(|read| read.summary) {
+                if complete_end == expected.prefix_bytes {
+                    let actual = HistoryPrefix {
+                        prefix_bytes: complete_end,
+                        covered_loop_count: line_count as u64,
+                        covered_item_count: total_items as u64,
+                        last_loop_id: Some(record.loop_id),
+                        sha256: digest_hex(hasher.clone()),
+                    };
+                    summary_anchor_valid = &actual == expected;
+                }
+            }
             tokio::task::yield_now().await;
             if visible_item_count.is_some_and(|cap| cap > 0 && cap == total_items) {
                 stopped_at_visible_cap = true;
@@ -354,6 +445,10 @@ impl Store {
             turns,
             turns_truncated,
             covered_usage,
+            display_items,
+            summary_anchor_valid,
+            scanned_bytes: scan_target - remaining,
+            scanned_lines: line_count,
         })
     }
 
@@ -549,6 +644,10 @@ impl Store {
     }
 }
 
+struct ColdDisplayScan<'a> {
+    summary: Option<&'a HistoryPrefix>,
+}
+
 enum BoundedLine {
     End,
     Complete(Vec<u8>),
@@ -641,6 +740,10 @@ fn finish_empty_history_page(
         turns: Vec::new(),
         turns_truncated: false,
         covered_usage: crate::read::CoveredUsage::default(),
+        display_items: None,
+        summary_anchor_valid: true,
+        scanned_bytes: 0,
+        scanned_lines: 0,
     })
 }
 

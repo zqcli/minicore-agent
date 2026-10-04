@@ -11771,12 +11771,14 @@ async fn display_history_projects_summary_tool_metadata_and_original_indexes() {
         read_profile(),
     )
     .await;
-    assert!(matches!(
-        agent.read_session(display_read(session_id)).await,
-        Err(AgentError::SessionNotLoaded)
-    ));
+    let cold = agent.read_session(display_read(session_id)).await.unwrap();
+    assert!(!cold.session.loaded);
+    assert!(agent.loaded_session(session_id).is_none());
     agent.open_session(session_id).await.unwrap();
     let page = agent.read_session(display_read(session_id)).await.unwrap();
+    assert_eq!(cold.items, page.items);
+    assert_eq!(cold.projection, page.projection);
+    assert_eq!(cold.history_revision, page.history_revision);
     let projection = page.projection.as_ref().unwrap();
     assert_eq!(
         (
@@ -11915,6 +11917,10 @@ async fn display_history_invalid_summary_falls_back_and_never_crosses_valid_boun
         read_profile(),
     )
     .await;
+    let cold = agent.read_session(display_read(session_id)).await.unwrap();
+    assert_eq!(cold.projection.as_ref().unwrap().covered_item_count, 0);
+    assert_eq!(cold.items[0].index, 0);
+    assert!(!cold.session.loaded);
     agent.open_session(session_id).await.unwrap();
     let page = agent.read_session(display_read(session_id)).await.unwrap();
     assert_eq!(page.projection.as_ref().unwrap().covered_item_count, 0);
@@ -11936,4 +11942,142 @@ async fn display_history_invalid_summary_falls_back_and_never_crosses_valid_boun
         agent.read_session(before_boundary).await,
         Err(AgentError::InvalidArguments)
     ));
+}
+
+#[tokio::test]
+async fn cold_display_invalid_anchor_restores_cursor_and_limit_without_raw_tools() {
+    for (field, value) in [
+        ("sha256", json!("0".repeat(64))),
+        ("prefix_bytes", json!(SUMMARY_PREFIX_BYTES - 1)),
+        ("covered_item_count", json!(3)),
+        ("covered_loop_count", json!(2)),
+        ("last_loop_id", json!(SUMMARY_SUFFIX_LOOP_ID)),
+    ] {
+        let (data_dir, _guard, session_id, history_path, before) =
+            synthetic_summary_session(&format!("cold-display-invalid-{field}-{}", next_id()), true)
+                .await;
+        let summary_path = history_path.parent().unwrap().join("summary.json");
+        let mut summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+        summary["source"][field] = value;
+        let summary_bytes = serde_json::to_vec(&summary).unwrap();
+        std::fs::write(&summary_path, &summary_bytes).unwrap();
+        let model = FakeModel::new("main", []);
+        let agent = open_agent(
+            &data_dir,
+            BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+            read_profile(),
+        )
+        .await;
+        let mut request = display_read(session_id);
+        request.limit = 1;
+        let first = agent.read_session(request.clone()).await.unwrap();
+        assert_eq!(
+            first.projection.as_ref().unwrap().covered_item_count,
+            0,
+            "{field}"
+        );
+        assert_eq!(
+            first.items.len(),
+            1,
+            "fallback must restore reserved summary slot"
+        );
+        assert_eq!(
+            first.items[0].index, 0,
+            "fallback must restore original cursor"
+        );
+        assert!(first.items[0].data.contains("covered user"));
+        let mut all = first.items[0].data.clone();
+        continue_display_read(&mut request, &first);
+        while request.cursor.is_some() {
+            let page = agent.read_session(request.clone()).await.unwrap();
+            all.extend(page.items.iter().map(|item| item.data.as_str()));
+            continue_display_read(&mut request, &page);
+        }
+        assert!(all.contains("tool_summaries"));
+        assert!(!all.contains("suffix tool result"));
+        assert!(!all.contains("arguments"));
+        assert!(!all.contains("expanded_input"));
+        assert!(!first.session.loaded);
+        assert!(agent.loaded_session(session_id).is_none());
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&history_path).unwrap(), before);
+        assert_eq!(std::fs::read(&summary_path).unwrap(), summary_bytes);
+    }
+}
+
+#[tokio::test]
+async fn cold_display_unicode_pins_missing_workspace_and_partial_tail_are_read_only() {
+    let (data_dir, _guard, session_id, history_path, mut before) =
+        synthetic_summary_session(&format!("cold-display-pins-{}", next_id()), true).await;
+    let directory = history_path.parent().unwrap();
+    let record_path = directory.join("session.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["workspace"] = json!(data_dir.join("missing-workspace"));
+    record["model"] = json!("unavailable-model");
+    let record_bytes = serde_json::to_vec(&record).unwrap();
+    std::fs::write(&record_path, &record_bytes).unwrap();
+    let summary_path = directory.join("summary.json");
+    let mut summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+    let body = "中文🙂\\\"\n".repeat(1_000);
+    summary["summary"] = json!(body);
+    let summary_bytes = serde_json::to_vec(&summary).unwrap();
+    std::fs::write(&summary_path, &summary_bytes).unwrap();
+    before.extend_from_slice(b"{partial tail");
+    std::fs::write(&history_path, &before).unwrap();
+    let model = FakeModel::new("main", []);
+    let agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let mut request = display_read(session_id);
+    request.limit = 1;
+    request.max_bytes = Some(2048);
+    let first = agent.read_session(request.clone()).await.unwrap();
+    assert!(first.trailing_incomplete);
+    assert_eq!(first.session.model, "unavailable-model");
+    assert!(!first.items[0].complete);
+    let mut assembled = first.items[0].data.clone();
+    continue_display_read(&mut request, &first);
+    while request.cursor.is_some_and(|cursor| cursor.item == 1) {
+        let page = agent.read_session(request.clone()).await.unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 2048);
+        assembled.push_str(&page.items[0].data);
+        continue_display_read(&mut request, &page);
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&assembled).unwrap()["item"]["data"]["content"],
+        body
+    );
+    assert_eq!(std::fs::read(&history_path).unwrap(), before);
+    assert_eq!(std::fs::read(&record_path).unwrap(), record_bytes);
+    assert_eq!(std::fs::read(&summary_path).unwrap(), summary_bytes);
+    summary["summary"] = json!("replacement summary, identical source");
+    std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+    assert!(matches!(
+        agent.read_session(request.clone()).await,
+        Err(AgentError::InvalidState)
+    ));
+    std::fs::write(&summary_path, &summary_bytes).unwrap();
+    summary["source"]["sha256"] = json!("0".repeat(64));
+    std::fs::write(&summary_path, serde_json::to_vec(&summary).unwrap()).unwrap();
+    assert!(matches!(
+        agent.read_session(request.clone()).await,
+        Err(AgentError::InvalidState)
+    ));
+    std::fs::write(&summary_path, &summary_bytes).unwrap();
+    let changed = String::from_utf8(before.clone())
+        .unwrap()
+        .replace("covered user", "changed user");
+    std::fs::write(&history_path, changed).unwrap();
+    assert!(matches!(
+        agent.read_session(request).await,
+        Err(AgentError::InvalidState)
+    ));
+    assert!(agent.loaded_session(session_id).is_none());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }

@@ -1568,6 +1568,15 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
         Err(StoreError::QueryLimit)
     ));
 
+    for scan_limits in [&limits, &expired, &capped] {
+        assert!(matches!(
+            store
+                .read_display_history_page(session_id, 0, 1, None, None, None, scan_limits,)
+                .await,
+            Err(StoreError::QueryLimit)
+        ));
+    }
+
     let _ = fs::remove_dir_all(base).await;
 }
 
