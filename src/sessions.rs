@@ -1889,6 +1889,10 @@ async fn run_active_loop(
 
     if persistence == TurnPersistence::Persisted {
         if let Err(kind) = session.settle_emergency_projection(turn, &report).await {
+            session.shared.compaction.note_settlement_failure(
+                turn.loop_id,
+                kind == "emergency_settlement_write_unknown",
+            );
             if let Some(observation) = session
                 .shared
                 .compaction

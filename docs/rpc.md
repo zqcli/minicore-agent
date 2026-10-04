@@ -465,7 +465,10 @@ estimate after recovery; the reduced value is in `recovery.after_tokens`. The ma
 in `current` and `last`: operation ID, loop/request identity, before/after estimates,
 threshold/hard/target values, utility usage and outcome. Current is cleared before
 request start or terminal events, including on dropped preparation. These latest
-slots are not a cumulative usage ledger. Independent operations remain represented
+slots are not a cumulative usage ledger. Settlement failures qualify the existing
+outcome string with `_settlement_failed` or `_settlement_unknown`, preserving
+before/after and utility usage; qualified outcomes are not exactly `compacted`
+and must not be counted as unqualified durable success. Independent operations remain represented
 by `current_operation`/`last_result`.
 When automatic compaction is enabled, `input_budget_tokens`,
 `trigger_tokens`, and `target_tokens` describe the model's already-reduced

@@ -143,15 +143,34 @@ exits finitely. The installed source-hash-bound base survives subsequent request
 and ordinary delivery retries; later genuine context growth in a new logical
 request can have a new recovery opportunity, without imposing a tool-round cap.
 
-After source history is definitely persisted, existing emergency summaries can
-be promoted through the same atomic snapshot store without another utility call.
+After source history is definitely persisted, existing in-turn threshold or
+emergency reductions can be promoted through the same atomic snapshot store without another utility call.
 This encodes historical data, not a newly generated semantic summary. The
-existing 64 KiB summary-content limit still applies (including the encoded
-historical data); the entire snapshot file has a separate 256 KiB bound. A large remaining tail, source
-mismatch or write failure can prevent promotion. Such failures are explicitly
-observed as `recovery_failed` with `emergency_settlement_*` failure kinds; they do
-not change the original turn result or erase its history. The previous durable
+64 KiB generated-summary limit still applies to every utility output. The full
+settled projection is a different object: snapshots larger than 64 KiB are valid
+only as nonempty, sanitized, well-paired historical message arrays, with no
+provider replay or opaque reasoning fields. Literal historical text and tool
+arguments are preserved. The complete historical User envelope must fit Runtime's
+single-message bound and the actual JSON-escaped snapshot file must fit its
+unchanged 256 KiB limit. The whole-record source anchor and format version 1 are
+unchanged; loaded and cold readers apply the same validation. A large remaining
+tail, source mismatch or write failure can still prevent promotion. Such failures are explicitly
+observed as `recovery_failed` with `emergency_settlement_*` failure kinds when
+recovery was used. A request-boundary observation keeps its original values and
+utility usage, with `_settlement_failed` or `_settlement_unknown` appended to its
+outcome. Thus `compacted_settlement_unknown` is not an unqualified durable
+success or a confirmed rollback. They do not change the original turn result or
+erase its history. The previous durable
 in-memory projection remains, so a later turn may again encounter capacity limits.
+A successfully promoted snapshot survives post-turn Noop, utility failure or
+cancellation; those operations do not restore its covered raw history. Failed or
+cancelled turns can also promote their complete projection after their original
+history is persisted, while append failure and close-race rejection keep their
+existing behavior. Older builds that impose 64 KiB on every snapshot will reject
+a newer large projection and fall back to authoritative history. No history is
+lost, but that downgraded raw context can exceed Runtime history admission
+limits as well as model capacity. A compatible newer build may be needed;
+a larger model alone cannot relax Runtime history limits.
 There is no guarantee that an arbitrarily long turn can always be recovered.
 
 ## Estimates, Accounting And Failure Outcomes

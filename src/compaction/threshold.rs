@@ -231,6 +231,28 @@ impl CompactionState {
         tokens
     }
 
+    /// Qualify durability without erasing the original attempt or its usage.
+    /// In particular, an unknown write is not a confirmed rollback.
+    pub(crate) fn note_settlement_failure(&self, loop_id: LoopId, unknown: bool) {
+        let mut state = self.threshold.lock().unwrap();
+        if let Some(last) = state
+            .observation
+            .last
+            .as_mut()
+            .filter(|last| last.loop_id == Some(loop_id))
+        {
+            if !last.outcome.ends_with("_settlement_failed")
+                && !last.outcome.ends_with("_settlement_unknown")
+            {
+                last.outcome.push_str(if unknown {
+                    "_settlement_unknown"
+                } else {
+                    "_settlement_failed"
+                });
+            }
+        }
+    }
+
     pub(super) fn threshold_view(&self) -> AutomaticCompactionView {
         self.threshold.lock().unwrap().observation.clone()
     }

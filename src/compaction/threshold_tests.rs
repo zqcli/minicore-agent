@@ -620,3 +620,37 @@ async fn dropped_preparation_preserves_live_partial_utility_usage() {
     assert!(!usage.complete);
     assert_eq!(usage.usage.unwrap().provider_total_tokens(), Some(10));
 }
+
+#[test]
+fn settlement_qualifier_is_idempotent_and_preserves_failed_attempt_identity() {
+    let model = Stub::new(8_000, "summary", None);
+    let auto = context(&model);
+    let loop_id = LoopId::new().unwrap();
+    let original = AutomaticCompactionObservation {
+        operation_id: "auto-observed".into(),
+        loop_id: Some(loop_id),
+        request_index: Some(3),
+        before_tokens: Some(8_000),
+        after_tokens: None,
+        utility_before_tokens: None,
+        utility_after_tokens: None,
+        hard_tokens: 8_000,
+        trigger_tokens: 7_600,
+        target_tokens: 4_000,
+        utility_usage: Some(CompactionUtilityUsage {
+            call_count: 1,
+            complete: false,
+            usage: None,
+        }),
+        outcome: "no_progress".into(),
+    };
+    auto.state.threshold.lock().unwrap().observation.last = Some(original.clone());
+    auto.state
+        .note_settlement_failure(LoopId::new().unwrap(), false);
+    assert_eq!(auto.state.automatic_view().last, Some(original.clone()));
+    auto.state.note_settlement_failure(loop_id, false);
+    auto.state.note_settlement_failure(loop_id, false);
+    let mut expected = original;
+    expected.outcome = "no_progress_settlement_failed".into();
+    assert_eq!(auto.state.automatic_view().last, Some(expected));
+}

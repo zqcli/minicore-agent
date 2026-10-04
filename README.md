@@ -95,8 +95,10 @@ state/context without auto-resending. Manual operation IDs cannot use `auto-`.
 `tool_rounds` statistics are now `u64`; clients restricted to `u16` cannot read
 counts above 65,535. RPC version and storage formats do not mechanically change.
 
-Emergency reductions are promoted only after their source is persisted. The
-existing 64 KiB summary-content bound can prevent promotion of a large tail;
+In-turn threshold/emergency reductions are promoted only after their source is persisted. The
+generated semantic summary remains limited to 64 KiB. A complete settled
+projection, including its retained tail, instead uses the existing 256 KiB
+snapshot-file limit and the Runtime historical-message envelope limit.
 `emergency_settlement_*` failures preserve the original turn/history and old
 in-memory projection. UnknownWrite remains non-blocking and does not imply
 success or a disk reload from context queries. See [context and compaction](docs/context.md).
