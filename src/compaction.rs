@@ -13,6 +13,7 @@ use crate::store::{HistoryPrefix, MAX_SUMMARY_FILE_BYTES, SessionRecord, Store};
 
 pub(crate) mod auto;
 mod recovery;
+pub(crate) mod threshold;
 mod utility;
 
 pub(crate) use auto::AutoContext;
@@ -21,16 +22,15 @@ pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
     ActiveRecoveryTicket, CompactingModel, compute_content_hash, recovery_source_is_safe,
 };
-pub(crate) use utility::{CompactionInput, generate_summary};
+pub(crate) use utility::{CompactionInput, UtilityError, generate_summary};
 /// Failure kind recorded when request preparation cannot reduce a context
 /// without dropping user constraints or replaying tools.
 pub(crate) const CONTEXT_UNCOMPRESSIBLE: &str = "context_uncompressible";
 const MAX_EPHEMERAL_GROUPS: usize = 64;
 const MAX_EPHEMERAL_BYTES: usize = 512 * 1024;
 
-/// Agent-global policy for post-turn automatic compaction and bounded
-/// emergency recovery. Ordinary request preparation never summarizes;
-/// explicit manual compaction stays available regardless.
+/// Agent-global policy for request-boundary/post-turn compaction and bounded
+/// upstream capacity recovery. Manual compaction remains available regardless.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompactionPolicy {
     pub(crate) enabled: bool,
@@ -53,9 +53,8 @@ impl CompactionPolicy {
 /// safety margin, so these thresholds must not subtract a reserve again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InputBudget {
-    /// The effective model input ceiling. This is the only hard
-    /// uncompressible boundary; the trigger merely starts a compression
-    /// attempt.
+    /// The effective utility/recovery acceptance ceiling. Ordinary sends
+    /// are not vetoed by this heuristic; the trigger starts a bounded attempt.
     pub(crate) hard_tokens: u64,
     pub(crate) trigger_tokens: u64,
     pub(crate) target_tokens: u64,
@@ -170,6 +169,7 @@ pub(crate) struct CompactionState {
     /// without a bounded list that could evict entries.
     recovery_high_water: Mutex<Option<(LoopId, u32)>>,
     recovery_observation: Mutex<Option<RecoveryObservation>>,
+    threshold: Mutex<threshold::ThresholdState>,
     /// One immutable snapshot of the settings a request boundary binds:
     /// generations plus the utility binding they describe. Binding and
     /// generation change together under this lock so a request can never pair
@@ -207,7 +207,7 @@ pub(crate) struct EphemeralSummary {
 
 /// Stable identity for one ephemeral source group. The hash prevents a
 /// summary from being reused when the same range contains different history.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct EphemeralGroupKey {
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -252,6 +252,7 @@ impl CompactionState {
             recovery_retry: Mutex::new(None),
             recovery_high_water: Mutex::new(None),
             recovery_observation: Mutex::new(None),
+            threshold: Mutex::new(threshold::ThresholdState::default()),
             settings: Mutex::new(RequestSettings::default()),
         })
     }
@@ -361,15 +362,27 @@ impl CompactionState {
         let ranges = auto::compressible_ranges(base.len(), &items, loop_id).map_err(|_| ())?;
         let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
         let groups = self.emergency_groups(loop_id, &valid);
-        if groups.is_empty() {
+        let consolidated = self.consolidated(loop_id, previous, &valid);
+        if groups.is_empty() && consolidated.is_none() {
             return Ok(None);
         }
         let mut messages = Vec::new();
-        if let Some(previous) = previous {
-            messages.push(summary_data_message(previous).map_err(|_| ())?);
+        if let Some(summary) = consolidated
+            .as_ref()
+            .map(|value| &value.content)
+            .or(previous)
+        {
+            messages.push(summary_data_message(summary).map_err(|_| ())?);
         }
         let mut index = 0;
         while index < items.len() {
+            if let Some(key) = consolidated
+                .as_ref()
+                .and_then(|value| value.covered.iter().find(|key| key.start == index))
+            {
+                index = key.end;
+                continue;
+            }
             if let Some((key, _)) = ranges
                 .iter()
                 .find(|(key, _)| key.start == index)
@@ -421,6 +434,7 @@ impl CompactionState {
     }
 
     pub(crate) fn clear_ephemeral(&self, loop_id: LoopId) {
+        let mut projection_removed = self.clear_threshold(loop_id);
         let mut ephemeral = self.ephemeral.lock().unwrap();
         if ephemeral
             .as_ref()
@@ -428,7 +442,14 @@ impl CompactionState {
         {
             // The settled snapshot transition owns any cross-turn reduction.
             // Never carry range indexes into a different turn.
+            projection_removed |= ephemeral
+                .as_ref()
+                .is_some_and(|value| !value.groups.is_empty());
             *ephemeral = None;
+        }
+        if projection_removed {
+            let mut settings = self.settings.lock().unwrap();
+            settings.summary_generation = settings.summary_generation.wrapping_add(1);
         }
         let mut high_water = self.recovery_high_water.lock().unwrap();
         if high_water
@@ -692,7 +713,7 @@ impl CompactionState {
     }
 
     pub(crate) fn automatic_view(&self) -> AutomaticCompactionView {
-        AutomaticCompactionView::default()
+        self.threshold_view()
     }
 
     pub(crate) fn note_prepare_failure(&self, kind: &str) {

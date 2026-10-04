@@ -116,6 +116,7 @@ fn input(model: &Arc<Fake>, history: Vec<HistoryItem>) -> CompactionInput {
         hard_tokens: 100_000,
         safe_before_estimate: false,
         operation_deadline: Instant::now() + Duration::from_secs(30),
+        live_usage: None,
     }
 }
 

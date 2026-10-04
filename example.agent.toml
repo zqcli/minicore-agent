@@ -33,7 +33,7 @@ approval = "auto"
 # available when disabled. Requires 0 < target_percent < trigger_percent <= 100.
 # [compaction]
 # enabled = true
-# trigger_percent = 80
+# trigger_percent = 95
 # target_percent = 50
 
 [models.main]

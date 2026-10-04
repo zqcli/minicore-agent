@@ -6,9 +6,10 @@ and tool rounds.
 
 ## Ordinary Turns And Durable History
 
-- Ordinary requests append history and do not summarize merely because a soft
-  threshold was crossed. Session create/open, submit, context reads, and reload
-  do not start routine compaction. Existing validated summaries may be loaded.
+- Request preparation checks existing settled context before first user input,
+  then checks the effective projection before each subsequent assistant request.
+  Runtime has already accepted the turn, so utility work never blocks RPC submit.
+  Create/open, context reads and reload do not themselves invoke a model.
 - `history.jsonl` retains the complete sanitized turn and tool results. The Agent
   appends before merging in-memory history; an append failure blocks later turns.
   Reopen may truncate only a trailing incomplete line, not a malformed complete
@@ -21,6 +22,42 @@ and tool rounds.
   reload affects future operations. Neither restores raw history already covered
   by an active emergency reduction. Workspace `AGENTS.md` is reread at each
   preparation, with its existing 64 KiB prefix and UTF-8/control validation.
+
+## Pi-Style Request Boundaries
+
+The default trigger is `estimated_context >= 95% * effective_input_window`;
+existing explicit percentages are preserved. The denominator is physical context
+minus the configured output and safety allowances. This deliberately differs
+from Pi 1.0.1's strict `>` physical-window-minus-16384 condition and its recent-token
+cutoff. Target percent remains advisory.
+
+First-request checks exclude the newly accepted Prompt and Steers. Later checks
+run only after complete assistant/tool exchanges, under the active turn's normal
+cancellation and deadline. A single no-tools utility consolidates the effective
+old summary and all eligible old groups. Current User/Steer text and the newest
+unread complete tool exchange stay verbatim; incomplete exchanges are never cut.
+A previous fully covered summary may be refreshed after reopen/model change.
+
+Source range/hash coverage and the original summary hash bind each turn-local
+projection. Only a strictly smaller, well-paired complete provider request is
+installed. One logical request permits at most one threshold utility; a stable
+raw-source/binding fingerprint prevents another attempt for unchanged sources,
+including after a failed attempt. Generated summary text/generations are not new
+source. If the irreducible retained floor itself meets the soft trigger, there is
+no useful threshold reduction and no utility call is spent. These are bounded
+attempts, not a guarantee of reaching target or fitting arbitrary contexts.
+
+Threshold input is streamed from borrowed history through the existing 256 KiB
+source projection, with 2,000-character tool-result projection. It does not clone
+raw history or apply the separate 512 KiB recovery-ticket retention limit to
+safely projectable tool history. Pure prose that still exceeds the source cap
+fails explicitly. Failure preserves the old projection and the normal request
+can still be sent; cancellation/deadline ends preparation instead.
+
+A provider/binding/framing and summary-generation anchor proves when actual
+assistant usage may be combined with estimates for later content. Otherwise
+current provider-body bytes/4 is used. Compaction, changed normalization, reload
+or changed framing invalidate old usage; no missing usage component becomes zero.
 
 ## Independent Manual And Post-Turn Operations
 
@@ -70,7 +107,10 @@ explicitly; there is no chunking, map/reduce or silent trimming of other content
 
 One successful generation must be nonempty, finish normally without tool calls,
 fit the existing 64 KiB summary limit, and produce a strictly smaller ordinary
-request within its hard budget. A fitting result is not summarized again merely
+request. Manual/post-turn and recovery acceptance additionally require the
+reduced request to fit the hard budget; a threshold reduction does not promise
+that the complete ordinary request fits that heuristic ceiling. Utility input
+always retains its own hard budget. A result is not repeatedly summarized merely
 to reach a preferred target. Model output configuration is unchanged. Emergency
 recovery may select several independent safe groups; each group uses at most one
 summary call, and all actual calls remain accounted. This does not add Pi's
@@ -78,7 +118,7 @@ recent-token tail selection, split-turn summaries or file-operation ledger.
 
 ## Bounded Emergency Recovery
 
-Within an active turn, the only summary exception is a confirmed upstream
+Independent of request-boundary thresholds, emergency recovery requires a confirmed upstream
 context-capacity rejection with `ContextOverflow + NotStarted`, known-safe
 delivery and no text, reasoning or tool-call output. One bounded compaction and
 retry is allowed for that rejected logical model request, never for the whole
@@ -86,10 +126,14 @@ turn. Completed tools are not redispatched. Partial output, unknown delivery,
 generic network errors, length endings, and generic HTTP 400/413 are not evidence
 of this condition.
 
-Local serialized-body bytes/4 preflight is a conservative estimate, not an
-upstream rejection. Exceeding that local hard budget returns a distinct local
-`InvalidRequest` failure without a summary or model retry. Hard checks are not
-disabled to make the upstream recovery path reachable.
+Local serialized-body bytes/4 is a conservative estimate, not an upstream
+rejection. It no longer refuses ordinary HTTP requests. Explicit utility handles
+share the same provider transport/serializer but enforce the exact emitted-body
+input estimate before sending. No local estimate is renamed ContextOverflow.
+The existing Runtime admission history bounds and per-request message/item
+bounds remain; there is no new aggregate HTTP-body quota. A long live turn can
+still accumulate a large serialized body/allocation, an existing resource limit
+that the former post-serialization token veto did not prevent.
 
 Recovery shares the active request's cancellation/deadline and does not finish
 the turn early. It accumulates summaries locally, validates tool pairing and the
@@ -122,9 +166,12 @@ There is no guarantee that an arbitrarily long turn can always be recovered.
   estimate after successful recovery; the reduced value is in `recovery.after_tokens`.
 - Budget/trigger/target use the already-reduced effective model input window;
   output reserve and safety margin are not subtracted a second time.
-- `automatic` remains a required compatibility object with null `current` and
-  `last`. Independent operations use `current_operation` and `last_result`;
-  in-turn recovery has its separate bounded `recovery` observation.
+- `automatic.current` / `last` describe the active/latest request-boundary
+  threshold attempt, keyed by loop and request index. A drop-safe guard clears
+  current before request/terminal events, retaining observed utility usage.
+  These are bounded latest observations, not cumulative utility accounting.
+  Independent operations use `current_operation` and `last_result`; overflow
+  recovery uses `recovery`. Active threshold work is cancelled through the turn.
 - Utility usage is separate from ordinary turn usage; unknown fields are not
   filled with fabricated zeros. `tool_rounds` statistics are `u64`; the legacy
   configuration field remains `u16`, with zero meaning unlimited.

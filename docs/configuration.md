@@ -20,9 +20,13 @@ minicore-agent --config ./example.agent.toml --stdio
   `event_capacity`, `max_pending_steers`, `prompt_timeout_seconds`,
   `model_timeout_seconds`, `policy_timeout_seconds`, `tool_timeout_seconds`,
   `model_retry_attempts`, and `model_retry_base_delay_millis`.
-- `[compaction]` is optional. It defaults to enabled with an `80` percent
+- `[compaction]` is optional. It defaults to enabled with a `95` percent
   trigger and `50` percent target. The valid relationship is
-  `0 < target_percent < trigger_percent <= 100`.
+  `0 < target_percent < trigger_percent <= 100`. Explicit existing percentages
+  retain their meaning. Trigger comparison is `>=` against the effective input
+  window (physical window minus configured output and safety allowances), not
+  Pi's physical-window-minus-16384 formula. Target is advisory, not a guaranteed
+  output size or permission to repeatedly summarize.
 
 ## Profiles
 

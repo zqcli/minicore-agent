@@ -217,8 +217,12 @@ impl ExecutionConfigFactory<'_> {
             .models
             .get_budget(&record.model)
             .map_err(map_model_config_error)?;
+        let utility_model = self
+            .models
+            .get_utility(&record.model)
+            .map_err(map_model_config_error)?;
         let auto = self.policy.enabled.then(|| AutoContext {
-            model: Arc::clone(&model),
+            model: utility_model,
             budget: Arc::clone(&budget),
             policy: self.policy,
             max_prompt_messages: options.limits.max_prompt_messages,
@@ -1040,7 +1044,7 @@ impl Agent {
         let record = session.record();
         let model = self
             .models
-            .get(&record.model)
+            .get_utility(&record.model)
             .map_err(map_model_config_error)?;
         let descriptor = model.descriptor().clone();
         session

@@ -349,7 +349,9 @@ The result has a `session` member containing the created SessionInfo.
 
 Manual and independent post-turn compaction, loading of validated existing
 summaries, and bounded confirmed provider-overflow recovery are implemented.
-Ordinary submit/prepare/context reads do not start threshold-driven summaries.
+Prepare may run a bounded threshold summary before the first request or between
+assistant/tool rounds. Submit returns without awaiting utility; context reads are
+read-only. The default trigger is 95% of the effective input window.
 This document describes their wire behavior; recorded acceptance evidence and
 installation status are grouped in the [verification index](verification/README.md).
 
@@ -459,14 +461,18 @@ is the latest serialized request estimate recorded before the wrapped model
 starts, or `null` before an estimate is available. It is not a live context
 measure or provider metering and may retain the original rejected attempt's
 estimate after recovery; the reduced value is in `recovery.after_tokens`. The mandatory
-`automatic` compatibility object retains null `current` and `last`. Independent
-operations are represented by `current_operation`/`last_result`, not that shell.
+`automatic` object contains active/latest request-boundary threshold observations
+in `current` and `last`: operation ID, loop/request identity, before/after estimates,
+threshold/hard/target values, utility usage and outcome. Current is cleared before
+request start or terminal events, including on dropped preparation. These latest
+slots are not a cumulative usage ledger. Independent operations remain represented
+by `current_operation`/`last_result`.
 When automatic compaction is enabled, `input_budget_tokens`,
 `trigger_tokens`, and `target_tokens` describe the model's already-reduced
 context window and the active policy thresholds; they are `null` when the
 policy is disabled. `last_prepare_failure` is the most recent
 request-preparation failure kind (or `null`, for example before any failure)
-and is cleared by a successful preparation. `recovery` describes the latest
+and is cleared by a successful threshold reduction or disabled-auto preparation. `recovery` describes the latest
 provider `ContextOverflow + NotStarted` recovery observation (loop ID, request index,
 before/after tokens, independent utility usage, outcome, and failure kind) when
 an in-flight recovery has been attempted; the field is omitted when the loaded
@@ -774,17 +780,21 @@ provider request completes. It may be omitted if the clock was unavailable.
 `Session::submit` follows the normal loop installation path; there is no startup
 admission compaction or `LoopSubmission::Preparing`. Runtime structural history
 limits can still reject submission with `history_too_large`. A successfully
-installed turn may later fail request preparation or local serialized-budget
-preflight; `turn.wait`/`turn.result` report that failure and its persistence,
+installed turn may later fail request preparation, utility cancellation, or a
+provider request; `turn.wait`/`turn.result` report that failure and its persistence,
 rather than pretending that the already accepted submit never started.
 
-Crossing a soft threshold within a turn never starts a utility call. Only a
-confirmed safe pre-output upstream capacity rejection can compact and retry the
-rejected logical model request once. Recovery stays within the active turn,
+Request preparation may consolidate safe projected history once per logical
+request when the soft threshold is reached, preserving the new User/Steer and
+newest unread tool exchange. Failed/no-useful-source threshold attempts do not
+locally veto ordinary sends. A confirmed safe pre-output upstream capacity
+rejection can separately compact and retry the rejected logical request once. Recovery stays within the active turn,
 shares its cancellation/deadline, and never redispatches completed tools.
 An independent post-turn operation instead requires Completed + Persisted and
 automatic compaction enabled. `session.compact.cancel` cancels that operation,
-not the already completed turn; active recovery is cancelled through the turn.
+not the already completed turn; active threshold/recovery work is cancelled
+through the turn. Auto=false disables both automatic thresholds and capacity
+recovery; manual idle-only compaction remains available.
 
 `tool_rounds` in turn results and history/read summaries is an unsigned `u64`
 JSON integer. Old small integer records remain readable, but clients that decode
@@ -1857,7 +1867,8 @@ request.
 A safe model-error view may include `local_context_budget` with unsigned
 `estimated_tokens` and `input_budget_tokens`. Missing/null means no verified
 local numeric estimate. Only the exact locally generated InvalidRequest /
-NotStarted preflight diagnostic supplies this field; provider response bodies
+NotStarted preflight diagnostic in legacy errors supplies this field; new ordinary
+requests are no longer vetoed by that estimate. Provider response bodies
 and free-form diagnostics are never exposed. Stored legacy errors remain valid.
 
 Compaction results include `origin`, either `manual` or `automatic`, from the

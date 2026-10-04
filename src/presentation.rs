@@ -656,17 +656,21 @@ impl Presentation {
     }
 }
 
-/// Usage components are normalized by the provider adapter into disjoint
-/// counts. Never guess a missing component is zero or sum a native total twice.
-fn reported_context(usage: Usage, physical_window: u64) -> ContextUsageView {
-    let tokens = usage.provider_total_tokens().or_else(|| {
+pub(crate) fn context_tokens(usage: Usage) -> Option<u64> {
+    usage.provider_total_tokens().or_else(|| {
         usage
             .input_tokens()?
             .checked_add(usage.output_tokens()?)?
             .checked_add(usage.reasoning_tokens()?)?
             .checked_add(usage.cache_read_tokens()?)?
             .checked_add(usage.cache_write_tokens()?)
-    });
+    })
+}
+
+/// Usage components are normalized by the provider adapter into disjoint
+/// counts. Never guess a missing component is zero or sum a native total twice.
+fn reported_context(usage: Usage, physical_window: u64) -> ContextUsageView {
+    let tokens = context_tokens(usage);
     let Some(tokens) = tokens else {
         return ContextUsageView::default();
     };

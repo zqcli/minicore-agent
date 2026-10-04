@@ -460,3 +460,71 @@ fn terminal_only_refusal_preserves_refusal_finish_semantics() {
     assert_eq!(state.text, "cannot comply");
     extract(&state);
 }
+
+#[test]
+fn normalized_projection_invalidates_only_changed_legacy_reasoning_usage() {
+    let raw_model = std::sync::Arc::new(model("http://localhost/v1"));
+    let budget =
+        std::sync::Arc::clone(&raw_model) as std::sync::Arc<dyn crate::models::ProviderBudget>;
+    let state = crate::compaction::CompactionState::new();
+    let loop_id = LoopId::new().unwrap();
+    let original_request = basic_request(ReasoningPreference::Auto);
+    let replay = replay::capture(URL, MODEL, vec![message("answer")]).unwrap();
+    let mut raw = vec![HistoryItem::Assistant(AssistantHistory {
+        loop_id,
+        request_index: 0,
+        model: "main".parse().unwrap(),
+        reasoning: ReasoningPreference::Auto,
+        content: vec![AssistantPart::Text("answer".into())],
+        provider_replay: Some(replay),
+        finish_reason: ModelFinishReason::Stop,
+        usage: Usage::default().with_provider_total_tokens(Some(9_000)),
+    })];
+    state.note_issued_projection(
+        loop_id,
+        0,
+        raw_model.descriptor(),
+        &original_request,
+        &*budget,
+    );
+    let normalized = crate::history::normalize_history(&raw).unwrap();
+    assert_eq!(raw.as_slice(), normalized.as_ref());
+    state.note_normalized_projection(&raw, &normalized);
+    assert_eq!(
+        state.threshold_estimate(
+            raw_model.descriptor(),
+            &original_request,
+            &[&normalized[0]],
+            123,
+            &*budget
+        ),
+        9_000,
+        "unchanged validated replay remains usage-backed"
+    );
+    if let HistoryItem::Assistant(value) = &mut raw[0] {
+        value.provider_replay = None;
+        value.content.push(AssistantPart::Reasoning(
+            minicore_runtime::model::ReasoningContent::new(
+                Some("visible reasoning".into()),
+                None,
+                Some("legacy-encrypted".repeat(1000)),
+                Some("legacy-signature".into()),
+            )
+            .unwrap(),
+        ));
+    }
+    let normalized = crate::history::normalize_history(&raw).unwrap();
+    assert_ne!(raw.as_slice(), normalized.as_ref());
+    state.note_normalized_projection(&raw, &normalized);
+    assert_eq!(
+        state.threshold_estimate(
+            raw_model.descriptor(),
+            &original_request,
+            &[&normalized[0]],
+            123,
+            &*budget
+        ),
+        123,
+        "changed legacy opaque projection falls back to its current small estimate"
+    );
+}

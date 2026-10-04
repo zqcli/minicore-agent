@@ -60,6 +60,7 @@ pub(crate) struct CompactionInput {
     /// the precise request estimate used by the original compaction flow.
     pub(crate) safe_before_estimate: bool,
     pub(crate) operation_deadline: Instant,
+    pub(crate) live_usage: Option<Arc<std::sync::Mutex<Option<CompactionUtilityUsage>>>>,
 }
 
 pub(crate) struct SummaryGeneration {
@@ -191,38 +192,128 @@ async fn generate_summary_inner(
     utility_usage: &mut UtilityUsageAccumulator,
 ) -> Result<SummaryGeneration, UtilityError> {
     check_active(cancellation, input.operation_deadline)?;
-    let fixed = FixedPrompt::new(input)?;
     let message = source_message(input, cancellation)?;
-    // Count the actual complete framed request, including JSON escaping. This
-    // is the existing conservative byte estimate, not a provider tokenizer.
-    if fixed.utility_request_bytes(&message)? > fixed.hard_input_bytes {
-        return Err(UtilityError::Budget);
-    }
-    check_active(cancellation, input.operation_deadline)?;
     let before_tokens = estimate_before_tokens(input)?;
-    check_active(cancellation, input.operation_deadline)?;
-    let generated = call_model_accounted(
-        input,
-        &fixed,
-        message,
-        MAX_SUMMARY_CONTENT_BYTES,
-        cancellation,
-        utility_usage,
-    )
-    .await?;
-    check_active(cancellation, input.operation_deadline)?;
-    let after_tokens = estimate_after_tokens(input, &generated.content)?;
+    let content = generate_prepared_inner(input, message, cancellation, utility_usage).await?;
+    let after_tokens = estimate_after_tokens(input, &content)?;
     if after_tokens >= before_tokens || after_tokens > input.hard_tokens {
         return Err(UtilityError::NoProgress);
     }
-    let content =
-        validate_summary_content(generated.content.as_str()).ok_or(UtilityError::TooLarge)?;
     Ok(SummaryGeneration {
         content,
         before_tokens,
         after_tokens,
         utility_usage: utility_usage.snapshot(true),
     })
+}
+
+pub(crate) struct ProjectedGeneration {
+    pub(crate) content: BoundedText,
+    pub(crate) utility_usage: Option<CompactionUtilityUsage>,
+}
+
+/// A pre-projected, bounded source uses exactly the same utility lifecycle.
+/// The caller measures the complete effective request before/after; these are
+/// not invented utility token estimates for the borrowed source.
+pub(crate) async fn generate_projected_summary(
+    input: &CompactionInput,
+    source: ModelMessage,
+    cancellation: &CancellationToken,
+) -> Result<ProjectedGeneration, SummaryGenerationError> {
+    let mut usage = UtilityUsageAccumulator::default();
+    let result = std::panic::AssertUnwindSafe(generate_prepared_inner(
+        input,
+        source,
+        cancellation,
+        &mut usage,
+    ))
+    .catch_unwind()
+    .await;
+    match result {
+        Ok(Ok(content)) => Ok(ProjectedGeneration {
+            content,
+            utility_usage: usage.snapshot(true),
+        }),
+        result => Err(SummaryGenerationError {
+            error: match result {
+                Ok(Err(error)) => error,
+                _ => UtilityError::Serialization,
+            },
+            utility_usage: usage.snapshot(false),
+        }),
+    }
+}
+
+async fn generate_prepared_inner(
+    input: &CompactionInput,
+    message: ModelMessage,
+    cancellation: &CancellationToken,
+    usage: &mut UtilityUsageAccumulator,
+) -> Result<BoundedText, UtilityError> {
+    check_active(cancellation, input.operation_deadline)?;
+    let fixed = FixedPrompt::new(input)?;
+    if fixed.utility_request_bytes(&message)? > fixed.hard_input_bytes {
+        return Err(UtilityError::Budget);
+    }
+    let generated = call_model_accounted(
+        input,
+        &fixed,
+        message,
+        MAX_SUMMARY_CONTENT_BYTES,
+        cancellation,
+        usage,
+    )
+    .await?;
+    check_active(cancellation, input.operation_deadline)?;
+    let content =
+        validate_summary_content(generated.content.as_str()).ok_or(UtilityError::TooLarge)?;
+    if estimate_after_tokens(input, &content)? > input.hard_tokens {
+        return Err(UtilityError::NoProgress);
+    }
+    Ok(content)
+}
+
+pub(crate) enum SourcePart<'a> {
+    Item(&'a HistoryItem),
+    Summary(&'a BoundedText),
+}
+
+/// Streams borrowed effective sources through the existing 256 KiB writer.
+/// Large raw tool history does not become another history-sized allocation.
+pub(crate) fn projected_source_message<'a>(
+    previous: Option<&BoundedText>,
+    parts: impl IntoIterator<Item = SourcePart<'a>>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<ModelMessage, UtilityError> {
+    let mut writer = SourceWriter::new(cancellation, deadline);
+    writer.append(SOURCE_PREFIX)?;
+    writer.append("<conversation>\n")?;
+    for part in parts {
+        match part {
+            SourcePart::Item(item) => writer.project(item)?,
+            SourcePart::Summary(summary) => {
+                writer.labeled("[Historical summary]: ", summary.as_str())?
+            }
+        }
+    }
+    writer.append("</conversation>\n")?;
+    if let Some(summary) = previous {
+        writer.append("\n<previous-summary>\n")?;
+        writer.append(summary.as_str())?;
+        writer.append("\n</previous-summary>\n")?;
+    }
+    writer.append(SOURCE_SUFFIX)?;
+    writer.append("\n\n")?;
+    if previous.is_some() {
+        writer.append("The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\n")?;
+    }
+    writer.append(if previous.is_some() {
+        PI_UPDATE_PROMPT
+    } else {
+        PI_INITIAL_PROMPT
+    })?;
+    ModelMessage::user(writer.finish()?).map_err(|_| UtilityError::TooLarge)
 }
 
 fn check_active(cancellation: &CancellationToken, deadline: Instant) -> Result<(), UtilityError> {
@@ -243,27 +334,12 @@ fn source_message(
         .history
         .get(input.previous_covered_item_count..)
         .ok_or(UtilityError::InvalidResponse)?;
-    let mut writer = SourceWriter::new(cancellation, input.operation_deadline);
-    writer.append(SOURCE_PREFIX)?;
-    writer.append("<conversation>\n")?;
-    for item in history {
-        writer.project(item)?;
-    }
-    writer.append("</conversation>\n")?;
-    if let Some(summary) = &input.previous_summary {
-        writer.append("\n<previous-summary>\n")?;
-        writer.append(summary.as_str())?;
-        writer.append("\n</previous-summary>\n")?;
-    }
-    writer.append(SOURCE_SUFFIX)?;
-    writer.append("\n\n")?;
-    if input.previous_summary.is_some() {
-        writer.append("The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\n")?;
-        writer.append(PI_UPDATE_PROMPT)?;
-    } else {
-        writer.append(PI_INITIAL_PROMPT)?;
-    }
-    ModelMessage::user(writer.finish()?).map_err(|_| UtilityError::TooLarge)
+    projected_source_message(
+        input.previous_summary.as_ref(),
+        history.iter().map(SourcePart::Item),
+        cancellation,
+        input.operation_deadline,
+    )
 }
 
 /// Bounded derived text only: no HistoryItem JSON, provider replay, signatures,
@@ -522,9 +598,23 @@ async fn call_model(
                     // A duplicate usage event makes the call's total
                     // ambiguous; do not expose either event as a complete
                     // partial total.
+                    if let Some(live) = &input.live_usage {
+                        *live.lock().unwrap() = Some(CompactionUtilityUsage {
+                            call_count: 1,
+                            complete: false,
+                            usage: None,
+                        });
+                    }
                     return Err(CallError::new(UtilityError::InvalidResponse));
                 }
                 usage = Some(value);
+                if let Some(live) = &input.live_usage {
+                    *live.lock().unwrap() = Some(CompactionUtilityUsage {
+                        call_count: 1,
+                        complete: false,
+                        usage,
+                    });
+                }
             }
             ModelEvent::Finish { reason } => {
                 if reason != ModelFinishReason::Stop {
@@ -549,15 +639,24 @@ async fn call_model_accounted(
     utility_usage: &mut UtilityUsageAccumulator,
 ) -> Result<UtilityModelResponse, UtilityError> {
     utility_usage.start_call();
+    if let Some(live) = &input.live_usage {
+        *live.lock().unwrap() = utility_usage.snapshot(false);
+    }
     match call_model(input, fixed, user_message, max_output_bytes, cancellation).await {
         Ok(response) => {
             utility_usage.finish_call(response.usage);
+            if let Some(live) = &input.live_usage {
+                *live.lock().unwrap() = utility_usage.snapshot(true);
+            }
             Ok(response)
         }
         Err(error) => {
             // A failed call never counts as complete, but any usage its stream
             // already emitted is still a known partial total.
             utility_usage.fail_call(error.usage);
+            if let Some(live) = &input.live_usage {
+                *live.lock().unwrap() = utility_usage.snapshot(false);
+            }
             Err(error.error)
         }
     }

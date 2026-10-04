@@ -117,23 +117,8 @@ impl OpenAiResponsesModel {
         )?;
         let encoded =
             serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
-        let estimated_tokens = encoded.len().div_ceil(4) as u64;
-        if estimated_tokens > self.descriptor.context_window {
-            // Conservative byte/4 preflight of the exact emitted body,
-            // including opaque replay. This is not a provider capacity rejection
-            // and must never authorize emergency compaction.
-            return Err(ModelError::permanent(
-                ModelErrorKind::InvalidRequest,
-                DeliveryState::NotStarted,
-                DiagnosticSummary::new(
-                    DiagnosticCode::InvalidConfiguration,
-                    DiagnosticCategory::Model,
-                    BoundedText::new(format!("local serialized context estimate exceeds input budget: estimated_tokens={estimated_tokens}, input_budget_tokens={}; use /compact or a larger model", self.descriptor.context_window))
-                        .expect("static preflight diagnostic"),
-                    false,
-                ),
-            ));
-        }
+        // Ordinary requests are not rejected by a heuristic token estimate.
+        // Utility callers select the explicit provider-budget checked handle.
         Ok(encoded)
     }
 

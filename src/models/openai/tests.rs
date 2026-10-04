@@ -464,7 +464,7 @@ async fn request_replay_call_ids_validate_before_any_http_request() {
 }
 
 #[test]
-fn reasoning_request_mapping_and_preflight_overflow_are_conservative() {
+fn reasoning_mapping_preserves_structure_without_ordinary_estimate_veto() {
     let model = model("http://127.0.0.1:1");
     for (reasoning, expected) in [
         (ReasoningPreference::Auto, Value::Null),
@@ -516,22 +516,12 @@ fn reasoning_request_mapping_and_preflight_overflow_are_conservative() {
     );
     let mut too_small = settings("http://127.0.0.1:1");
     too_small.effective_context_window = estimated - 1;
-    let error = OpenAiResponsesModel::new(too_small)
-        .unwrap()
-        .build_request(&request)
-        .unwrap_err();
-    assert_error(
-        &error,
-        ModelErrorKind::InvalidRequest,
-        DeliveryState::NotStarted,
-        false,
-    );
-    assert!(
-        error
-            .diagnostic()
-            .message
-            .as_str()
-            .contains("local serialized context estimate")
+    assert_eq!(
+        OpenAiResponsesModel::new(too_small)
+            .unwrap()
+            .build_request(&request)
+            .unwrap(),
+        encoded
     );
 
     for reasoning in [
@@ -2582,3 +2572,30 @@ async fn reasoning_summary_part_lifecycle_separates_parts_within_one_item() {
 
 #[path = "replay_tests.rs"]
 mod replay_tests;
+
+#[tokio::test]
+async fn utility_handle_enforces_exact_provider_budget_before_http() {
+    let mut configured = settings("http://127.0.0.1:1");
+    configured.effective_context_window = 1;
+    let raw = std::sync::Arc::new(OpenAiResponsesModel::new(configured).unwrap());
+    let utility = super::super::BudgetCheckedModel {
+        inner: std::sync::Arc::clone(&raw) as std::sync::Arc<dyn Model>,
+        budget: raw as std::sync::Arc<dyn super::super::ProviderBudget>,
+    };
+    let error = match utility
+        .start(
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await
+    {
+        Ok(_) => panic!("utility estimate must be checked before HTTP"),
+        Err(error) => error,
+    };
+    assert_error(
+        &error,
+        ModelErrorKind::InvalidRequest,
+        DeliveryState::NotStarted,
+        false,
+    );
+}

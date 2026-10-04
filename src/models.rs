@@ -158,6 +158,59 @@ pub(crate) trait ProviderBudget: Send + Sync {
     ) -> Result<usize, ModelError>;
 }
 
+fn utility_budget_error(kind: minicore_runtime::model::ModelErrorKind) -> ModelError {
+    use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
+    ModelError::permanent(
+        kind,
+        minicore_runtime::model::DeliveryState::NotStarted,
+        DiagnosticSummary::new(
+            DiagnosticCode::InvalidConfiguration,
+            DiagnosticCategory::Model,
+            minicore_runtime::value::BoundedText::new(
+                "utility provider input budget or lifecycle check failed",
+            )
+            .expect("static utility diagnostic"),
+            false,
+        ),
+    )
+}
+
+struct BudgetCheckedModel {
+    inner: Arc<dyn Model>,
+    budget: Arc<dyn ProviderBudget>,
+}
+
+impl Model for BudgetCheckedModel {
+    fn descriptor(&self) -> &minicore_runtime::model::ModelDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn start(
+        &self,
+        request: ModelRequest,
+        context: minicore_runtime::model::ModelCallContext,
+    ) -> minicore_runtime::model::ModelStartFuture<'_> {
+        Box::pin(async move {
+            use minicore_runtime::model::ModelErrorKind;
+            if context.cancellation.is_cancelled() {
+                return Err(utility_budget_error(ModelErrorKind::Cancelled));
+            }
+            if std::time::Instant::now() >= context.deadline {
+                return Err(utility_budget_error(ModelErrorKind::Timeout));
+            }
+            let tokens = self.budget.estimate_request_tokens(
+                &request,
+                Some(context.loop_id),
+                Some(context.request_index),
+            )?;
+            if tokens > self.descriptor().context_window {
+                return Err(utility_budget_error(ModelErrorKind::InvalidRequest));
+            }
+            self.inner.start(request, context).await
+        })
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DefaultProviderBudget;
@@ -308,6 +361,14 @@ impl Models {
             .get(id)
             .map(|entry| Arc::clone(&entry.model))
             .ok_or(ModelConfigError::NotFound)
+    }
+
+    /// The same transport and serializer, with an explicit utility-only budget.
+    pub(crate) fn get_utility(&self, id: &str) -> Result<Arc<dyn Model>, ModelConfigError> {
+        Ok(Arc::new(BudgetCheckedModel {
+            inner: self.get(id)?,
+            budget: self.get_budget(id)?,
+        }))
     }
 
     pub(crate) fn physical_context_window(&self, id: &str) -> Option<u64> {

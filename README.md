@@ -77,14 +77,17 @@ provider metadata, excluded from RPC/read/summary prose and redacted Debug.
 See [the replay contract](docs/provider-replay.md) for identity fallback, bounds,
 usage uncertainty, and compatibility.
 
-## 0.6.1 Context And Compatibility
+## Context And Compatibility
 
-Ordinary turns append context without threshold-driven summaries. Automatic
-compaction is an independent operation after a Completed + Persisted turn;
-manual `/compact` remains idle-only. A confirmed safe pre-output upstream
+Automatic compaction checks settled context before the first request, then
+checks between completed assistant/tool rounds, and independently after a
+Completed + Persisted turn. The default trigger is 95% of the effective input
+window; explicitly configured percentages remain unchanged. New User/Steer text
+and the newest unread tool exchange remain verbatim. Manual `/compact` is idle-only. A confirmed safe pre-output upstream
 context-capacity rejection can compact and retry that logical model request
-once, without restarting the task or replaying tools. Local hard estimates,
-partial output, unknown delivery and generic HTTP 413 are not that exception.
+once, without restarting the task or replaying tools. Ordinary local token estimates do not veto provider requests. Utility calls
+retain explicit provider-aware budget checks. Partial output, unknown delivery
+and generic HTTP 413 are not capacity-recovery permission.
 
 `turn.wait` does not wait for post-turn compaction. Even a budget check that
 becomes Noop can briefly make submit busy; clients preserve drafts and reconcile

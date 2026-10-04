@@ -303,6 +303,7 @@ fn measure_reconstruction(
         &ticket.appended,
         loop_id,
         folded,
+        None,
     )
     .ok()?;
     if messages.len() > auto.max_prompt_messages || !validate_clean_tool_exchanges(&messages) {
@@ -411,6 +412,52 @@ pub(crate) async fn reconstruct_for_recovery(
             );
         }
     };
+
+    let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
+    if auto
+        .state
+        .consolidated(loop_id, ticket.summary.as_ref(), &valid)
+        .is_some()
+    {
+        let result = super::threshold::consolidate(
+            super::threshold::ProjectionInput {
+                auto,
+                system: &ticket.system,
+                summary: ticket.summary.as_ref(),
+                base: &ticket.base,
+                appended: &ticket.appended,
+                tools: &ticket.tools,
+                reasoning: ticket.reasoning,
+                limits: ticket.limits,
+                loop_id,
+                request_index,
+                deadline,
+                cancellation,
+                rejected_body_bytes: Some(ticket.original_body_bytes),
+            },
+            true,
+        )
+        .await;
+        return match result {
+            Ok(result) if result.compacted => {
+                merge_utility_usage(&mut utility_usage, result.usage);
+                (Ok(result.request), utility_usage)
+            }
+            Ok(_) => (
+                Err(RecoveryReconstructionError::Uncompressible),
+                utility_usage,
+            ),
+            Err(error) => {
+                merge_utility_usage(&mut utility_usage, error.usage);
+                let error = match error.error {
+                    super::UtilityError::Cancelled => RecoveryReconstructionError::Cancelled,
+                    super::UtilityError::Timeout => RecoveryReconstructionError::Timeout,
+                    other => RecoveryReconstructionError::Other(other.kind().into()),
+                };
+                (Err(error), utility_usage)
+            }
+        };
+    }
 
     // If there is no compressible group, recovery cannot shrink anything without dropping user constraints.
     if ranges.is_empty() {
@@ -561,6 +608,7 @@ pub(crate) async fn reconstruct_for_recovery(
         &ticket.appended,
         loop_id,
         &folded,
+        None,
     ) {
         Ok(messages) if !validate_clean_tool_exchanges(&messages) => {
             return (
@@ -643,6 +691,13 @@ impl CompactingModel {
             }
             let cancellation = context.cancellation.clone();
             let deadline = tokio::time::Instant::from_std(context.deadline);
+            self.state.note_issued_projection(
+                loop_id,
+                request_index,
+                self.inner.descriptor(),
+                &reduced,
+                &*self.budget,
+            );
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => Err(unknown_model_error(ModelErrorKind::Cancelled)),
@@ -742,6 +797,13 @@ impl CompactingModel {
             return Err(local_model_error(ModelErrorKind::Timeout));
         }
 
+        self.state.note_issued_projection(
+            loop_id,
+            request_index,
+            self.inner.descriptor(),
+            &request,
+            &*self.budget,
+        );
         let first_result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
@@ -917,6 +979,13 @@ impl CompactingModel {
         // Second start call. The pre-start checks above already covered the
         // not-yet-sent case; once this future exists an interruption can only
         // report `Unknown` delivery.
+        self.state.note_issued_projection(
+            loop_id,
+            request_index,
+            self.inner.descriptor(),
+            &reduced_request,
+            &*self.budget,
+        );
         let second_result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {

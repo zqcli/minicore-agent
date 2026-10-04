@@ -87,7 +87,7 @@ fn default_compaction_enabled() -> bool {
 }
 
 fn default_compaction_trigger_percent() -> u8 {
-    80
+    95
 }
 
 fn default_compaction_target_percent() -> u8 {
@@ -649,10 +649,10 @@ request_timeout_seconds = 30
     }
 
     #[test]
-    fn compaction_defaults_are_enabled_at_eighty_fifty() {
+    fn compaction_defaults_are_enabled_at_ninety_five_fifty() {
         let config = AgentConfig::from_toml(&config_with_prompt_spec(r#""system""#)).unwrap();
         assert!(config.compaction.enabled);
-        assert_eq!(config.compaction.trigger_percent, 80);
+        assert_eq!(config.compaction.trigger_percent, 95);
         assert_eq!(config.compaction.target_percent, 50);
     }
 

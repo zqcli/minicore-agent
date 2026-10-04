@@ -749,6 +749,7 @@ pub(super) async fn run_compaction_inner(
         hard_tokens: reservation.hard_tokens,
         safe_before_estimate: false,
         operation_deadline: reservation.deadline,
+        live_usage: None,
     };
     if let (Some(budget), Some(trigger)) =
         (&reservation.automatic_budget, reservation.trigger_tokens)
@@ -771,7 +772,16 @@ pub(super) async fn run_compaction_inner(
             )
             .ok()
         })
-        .and_then(|request| budget.estimate_request_tokens(&request, None, None).ok());
+        .and_then(|request| {
+            let fallback = budget.estimate_request_tokens(&request, None, None).ok()?;
+            Some(session.shared.compaction.threshold_estimate(
+                reservation.model.descriptor(),
+                &request,
+                &suffix.iter().collect::<Vec<_>>(),
+                fallback,
+                &**budget,
+            ))
+        });
         let Some(before) = before else {
             return failed_compaction(
                 &reservation.operation,

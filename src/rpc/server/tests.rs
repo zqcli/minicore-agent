@@ -4998,11 +4998,9 @@ async fn session_context_omits_budget_when_auto_disabled() {
     remove_base(&base).await;
 }
 
-/// An uncompressible request is rejected with a distinct domain error before
-/// any model call. The system prompt plus the current input alone exceed the
-/// tiny effective budget.
-#[tokio::test]
-async fn turn_send_accepts_then_local_preflight_fails_oversized_current_input_without_summary() {
+/// A locally oversized new user request still reaches the server and may
+/// succeed. Admission and control RPCs do not wait for a threshold summary.
+async fn oversized_current_input_server_acceptance(enabled: bool) {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-rpc-uncompressible-{}",
         SessionId::new().unwrap()
@@ -5011,13 +5009,15 @@ async fn turn_send_accepts_then_local_preflight_fails_oversized_current_input_wi
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
     config.compaction = CompactionConfig {
-        enabled: true,
+        enabled,
         trigger_percent: 80,
         target_percent: 50,
     };
-    // Real adapter preflight of the emitted body, not an admission planner.
-    // The oversized request must fail before this loopback endpoint is used.
-    let mut model = configured_model("provider-model", "http://127.0.0.1:1", "PATH");
+    let server = crate::openai_mock::MockServer::spawn([crate::openai_mock::MockResponse::sse(&[
+        json!({"type":"response.output_text.delta","delta":"accepted"}),
+        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_accepted","role":"assistant","content":[{"type":"output_text","text":"accepted"}]}]}}),
+    ])]).await;
+    let mut model = configured_model("provider-model", server.base_url(), "PATH");
     let ModelConfig::OpenAiResponses {
         physical_context_window,
         ..
@@ -5045,13 +5045,15 @@ async fn turn_send_accepts_then_local_preflight_fails_oversized_current_input_wi
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let result = harness.response(json!("wait")).await;
-    assert_eq!(result["result"]["outcome"]["type"], json!("failed"));
+    assert_eq!(result["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(result["result"]["persistence"], json!("persisted"));
-    let error = &result["result"]["outcome"]["model_error"];
-    assert_eq!(error["kind"], json!("invalid_request"));
-    assert_eq!(error["delivery"], json!("not_started"));
-    assert_eq!(error["retryable"], json!(false));
-    assert!(error["retry_after_millis"].is_null());
+    let captured = server.finish().await;
+    assert_eq!(captured.len(), 1);
+    assert!(
+        serde_json::to_string(&captured[0].json_body())
+            .unwrap()
+            .contains(&"x".repeat(20_000))
+    );
     harness
         .send(
             json!("context"),
@@ -5061,9 +5063,7 @@ async fn turn_send_accepts_then_local_preflight_fails_oversized_current_input_wi
         .await;
     let context = harness.response(json!("context")).await;
     assert!(context["result"]["recovery"].is_null());
-    assert!(context["result"]["current_operation"].is_null());
-    assert!(context["result"]["last_result"].is_null());
-    // The reader still serves control methods and the failed persisted turn is idle.
+    // The reader still serves control methods and the completed persisted turn is idle.
     harness
         .send(
             json!("state"),
@@ -6947,4 +6947,137 @@ async fn tool_output_deferred_query_shutdown_cancellation_cleans_up() {
     gate.release();
     harness.shutdown().await;
     remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_responsive() {
+    let base = std::env::temp_dir().join(format!("pi-rpc-first-{}", SessionId::new().unwrap()));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    tokio::fs::write(workspace.join("old.txt"), "old ".repeat(10_000))
+        .await
+        .unwrap();
+    let config = test_config(base.join("data"), &["read"], ApprovalMode::Auto);
+    let seed_model = FakeModel::new([
+        ModelScript::ToolCalls(vec![ToolCallScript {
+            name: "read",
+            arguments: json!({"path":"old.txt"}),
+        }]),
+        ModelScript::Text("seed done"),
+    ]);
+    let mut seed = Agent::open_with_models(config.clone(), test_models(seed_model))
+        .await
+        .unwrap();
+    let info = seed
+        .create_session(crate::agent::CreateSession {
+            workspace: workspace.clone(),
+            profile: String::new(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let turn = seed
+        .send(crate::agent::SendMessage {
+            session_id: info.session_id,
+            text: "seed old history".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        seed.wait_turn(turn).await.unwrap().report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    seed.close_session(info.session_id).await.unwrap();
+    drop(seed);
+    let entered = Arc::new(Notify::new());
+    let model =
+        FakeModel::with_context_window([ModelScript::BlockWithSignal(Arc::clone(&entered))], 8_000);
+    let mut config = config;
+    config.compaction = CompactionConfig {
+        enabled: true,
+        trigger_percent: 80,
+        target_percent: 50,
+    };
+    let mut agent = Agent::open_with_models(config, test_models(Arc::clone(&model)))
+        .await
+        .unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    let mut harness = RpcHarness::spawn(agent);
+    harness
+        .send(
+            json!("new"),
+            "turn.send",
+            Some(json!({"session_id": info.session_id,"text":"new input exact"})),
+        )
+        .await;
+    let accepted = tokio::time::timeout(Duration::from_secs(2), harness.response(json!("new")))
+        .await
+        .unwrap();
+    let turn = accepted["result"]["turn"].clone();
+    assert!(turn["loop_id"].is_string());
+    entered.notified().await;
+    for (id, method, params) in [
+        (
+            "state",
+            "session.state",
+            json!({"session_id":info.session_id}),
+        ),
+        (
+            "context",
+            "session.context",
+            json!({"session_id":info.session_id}),
+        ),
+        ("ping", "agent.ping", json!({})),
+    ] {
+        harness.send(json!(id), method, Some(params)).await;
+        let response = tokio::time::timeout(Duration::from_secs(2), harness.response(json!(id)))
+            .await
+            .unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        if id == "context" {
+            assert!(response["result"]["automatic"]["current"].is_object());
+        }
+    }
+    harness
+        .send(json!("cancel"), "turn.cancel", Some(turn_params(&turn)))
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), harness.response(json!("cancel")))
+            .await
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    harness
+        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
+        .await;
+    let result = harness.response(json!("wait")).await;
+    assert_eq!(result["result"]["outcome"]["type"], "cancelled");
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    harness
+        .send(
+            json!("settled"),
+            "session.context",
+            Some(json!({"session_id":info.session_id})),
+        )
+        .await;
+    let settled = harness.response(json!("settled")).await;
+    assert!(settled["result"]["automatic"]["current"].is_null());
+    assert_eq!(
+        settled["result"]["automatic"]["last"]["utility_usage"]["call_count"],
+        1
+    );
+    harness.shutdown().await;
+    remove_base(&base).await;
+}
+
+#[tokio::test]
+async fn turn_send_allows_server_to_accept_oversized_current_input() {
+    oversized_current_input_server_acceptance(true).await;
+}
+#[tokio::test]
+async fn auto_disabled_still_allows_server_to_accept_over_estimated_budget() {
+    oversized_current_input_server_acceptance(false).await;
 }
