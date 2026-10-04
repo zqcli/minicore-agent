@@ -404,7 +404,7 @@ impl CompactionState {
             }
         }
         let content = serde_json::to_string(&messages).map_err(|_| ())?;
-        validate_summary_content(&content).map(Some).ok_or(())
+        validate_snapshot_content(&content).map(Some).ok_or(())
     }
 
     /// Test-only observation of reductions bound to one active turn.
@@ -753,12 +753,40 @@ pub(crate) fn validate_summary_content(value: &str) -> Option<BoundedText> {
     Some(content)
 }
 
+/// Generated summaries remain capped at 64 KiB. A settled snapshot can also
+/// contain the complete sanitized effective projection, encoded as historical
+/// message data. That different object uses the existing Runtime envelope and
+/// 256 KiB snapshot-file bounds, not the model's semantic-output limit.
+fn validate_snapshot_content(value: &str) -> Option<BoundedText> {
+    if value.len() <= MAX_SUMMARY_CONTENT_BYTES {
+        return validate_summary_content(value);
+    }
+    let content = BoundedText::new(value).ok()?;
+    summary_data_message(&content).ok()?;
+    let messages: Vec<ModelMessage> = serde_json::from_str(value).ok()?;
+    if messages.is_empty()
+        || !recovery::validate_clean_tool_exchanges(&messages)
+        || messages.iter().any(|message| match message {
+            ModelMessage::AssistantWithReplay { .. } => true,
+            ModelMessage::Assistant(parts) => parts.iter().any(|part| {
+                matches!(part, minicore_runtime::model::AssistantPart::Reasoning(reasoning)
+                    if reasoning.encrypted().is_some() || reasoning.signature().is_some())
+            }),
+            _ => false,
+        })
+    {
+        return None;
+    }
+    Some(content)
+}
+
 pub(crate) fn encode_snapshot(
     session_id: SessionId,
     record: &SessionRecord,
     source: &HistoryPrefix,
     summary: &BoundedText,
 ) -> Option<Vec<u8>> {
+    validate_snapshot_content(summary.as_str())?;
     let snapshot = SummarySnapshot {
         format_version: SUMMARY_FORMAT_VERSION,
         session_id,
@@ -861,7 +889,7 @@ fn validate_snapshot_shape(
     if covered_item_count > history_len {
         return None;
     }
-    let content = validate_summary_content(&snapshot.summary)?;
+    let content = validate_snapshot_content(&snapshot.summary)?;
     Some(LoadedSummary {
         content,
         covered_loop_count: snapshot.source.covered_loop_count,
@@ -985,6 +1013,74 @@ mod tests {
         assert!(summary.as_str().contains("final answer"));
         assert!(!summary.as_str().contains("RAW-FOLDED"));
         assert!(!summary.as_str().contains("encrypted-only"));
+    }
+
+    #[test]
+    fn snapshot_projection_bound_is_separate_from_generated_summary_limit() {
+        use minicore_runtime::model::{AssistantPart, ProviderReplay, ReasoningContent, ToolCall};
+        use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
+        let literal = "encrypted signature provider_replay are historical words ".repeat(1_400);
+        let plain = serde_json::to_string(&vec![ModelMessage::user(&literal).unwrap()]).unwrap();
+        assert!(plain.len() > MAX_SUMMARY_CONTENT_BYTES);
+        assert!(validate_summary_content(&plain).is_none());
+        assert!(validate_snapshot_content(&plain).is_some());
+        assert!(validate_snapshot_content(&"plain semantic text ".repeat(4_000)).is_none());
+        assert!(validate_snapshot_content(&format!("[{}", "x".repeat(70_000))).is_none());
+
+        let call_id = minicore_runtime::ToolCallId::new("historical-call").unwrap();
+        let call = ToolCall::new(call_id.clone(), "read".parse().unwrap(),
+            serde_json::json!({"encrypted":"literal", "signature":"literal", "provider_replay":"literal"}), 0).unwrap();
+        let pair = vec![
+            ModelMessage::assistant(vec![AssistantPart::ToolCall(call)]).unwrap(),
+            ModelMessage::tool_with_outcome(
+                call_id,
+                ToolOutput::new(&literal).unwrap(),
+                ToolResultOutcome::Success,
+            )
+            .unwrap(),
+        ];
+        assert!(validate_snapshot_content(&serde_json::to_string(&pair).unwrap()).is_some());
+        assert!(validate_snapshot_content(&serde_json::to_string(&pair[1..]).unwrap()).is_none());
+        for part in [
+            AssistantPart::Reasoning(
+                ReasoningContent::new(Some(literal.clone()), None, Some("opaque".into()), None)
+                    .unwrap(),
+            ),
+            AssistantPart::Reasoning(
+                ReasoningContent::new(Some(literal.clone()), None, None, Some("signature".into()))
+                    .unwrap(),
+            ),
+        ] {
+            let value =
+                serde_json::to_string(&vec![ModelMessage::assistant(vec![part]).unwrap()]).unwrap();
+            assert!(validate_snapshot_content(&value).is_none());
+        }
+        let replay = ProviderReplay::new("fixture", serde_json::json!({"opaque":"value"})).unwrap();
+        let value = serde_json::to_string(&vec![
+            ModelMessage::assistant_with_provider_replay(
+                vec![AssistantPart::Text(literal)],
+                Some(replay),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        assert!(validate_snapshot_content(&value).is_none());
+    }
+
+    #[test]
+    fn snapshot_projection_must_fit_runtime_envelope_before_file_encoding() {
+        let overhead = serde_json::to_string(&vec![ModelMessage::user("x").unwrap()])
+            .unwrap()
+            .len()
+            - 1;
+        let value = serde_json::to_string(&vec![
+            ModelMessage::user("x".repeat(BoundedText::MAX_BYTES - overhead)).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(value.len(), BoundedText::MAX_BYTES);
+        let content = BoundedText::new(&value).unwrap();
+        assert!(summary_data_message(&content).is_err());
+        assert!(validate_snapshot_content(&value).is_none());
     }
 
     #[test]

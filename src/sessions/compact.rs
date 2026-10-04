@@ -170,7 +170,7 @@ impl Drop for CompactionCompletionGuard {
 }
 
 impl Session {
-    /// Existing emergency summaries may become durable only once the entire
+    /// In-turn threshold/emergency reductions become durable only once the entire
     /// source turn is definitely appended. No utility/model work happens here.
     pub(super) async fn settle_emergency_projection(
         &self,
