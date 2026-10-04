@@ -4,3 +4,4 @@
 
 # Runtime message text rejects CR; keep embedded prompt assets LF on Windows.
 /src/compaction/prompts/*.txt text eol=lf
+/src/compaction/fixtures/*.txt text eol=lf
