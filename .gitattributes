@@ -1,3 +1,6 @@
 # Preserve checksummed raw evidence bytes on every checkout platform.
 /docs/verification/followups/** -text
 /docs/verification/compaction/** -text
+
+# Runtime message text rejects CR; keep embedded prompt assets LF on Windows.
+/src/compaction/prompts/*.txt text eol=lf
