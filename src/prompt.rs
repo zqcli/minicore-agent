@@ -22,8 +22,9 @@ const TRUNCATED: &str = "[truncated]";
 ///
 /// `AGENTS.md` is re-read for every model request, so edits become visible at
 /// the next request boundary without a file cache or watcher. Ordinary
-/// preparation only appends history. A previously installed emergency
-/// projection is reused, but preparation never generates a summary.
+/// preparation checks the existing projection before new user input and
+/// between completed assistant/tool rounds. Bounded threshold summaries and
+/// emergency projections share source-validated, turn-local derived state.
 pub(crate) struct ProjectPromptProvider {
     workspace: Arc<Workspace>,
     system_prompt: BoundedText,
@@ -181,36 +182,80 @@ impl PromptProvider for ProjectPromptProvider {
                 }
                 return Ok(prepared);
             };
-            // History items are projected exactly as the runtime
-            // `DefaultPromptProvider` would, then kept separate from the
-            // system/durable-summary prefix so groups can be folded.
-            let (fixed, history_messages) = crate::compaction::auto_compose(
-                &system,
-                summary.as_ref(),
-                projected_base,
-                history.appended(),
+            let messages = match crate::compaction::threshold::consolidate(
+                crate::compaction::threshold::ProjectionInput {
+                    auto: &auto,
+                    system: &system,
+                    summary: summary.as_ref(),
+                    base: projected_base,
+                    appended: history.appended(),
+                    tools,
+                    reasoning,
+                    limits: minicore_runtime::model::ModelLimits::default(),
+                    loop_id,
+                    request_index,
+                    deadline: deadline.into_std(),
+                    cancellation: &cancellation,
+                    rejected_body_bytes: None,
+                },
+                false,
             )
-            .map_err(|_| PromptError::InvalidHistory)?;
-            let items = projected_base
-                .iter()
-                .chain(history.appended())
-                .collect::<Vec<_>>();
-            let ranges =
-                crate::compaction::auto::compressible_ranges(projected_base.len(), &items, loop_id)
-                    .map_err(|_| PromptError::InvalidHistory)?;
-            let valid_keys = ranges.into_iter().map(|(key, _)| key).collect();
-            let folded = auto.state.emergency_groups(loop_id, &valid_keys);
-            let messages = crate::compaction::auto::fold_history(
-                &fixed,
-                &history_messages,
-                projected_base,
-                history.appended(),
-                loop_id,
-                &folded,
-            )
-            .map_err(|_| PromptError::InvalidHistory)?;
+            .await
             {
-                auto.state.clear_prepare_failure();
+                Ok(result) => {
+                    if result.compacted {
+                        auto.state.clear_prepare_failure();
+                    }
+                    result.request.messages().to_vec()
+                }
+                Err(error)
+                    if matches!(
+                        error.error,
+                        crate::compaction::UtilityError::Cancelled
+                            | crate::compaction::UtilityError::Timeout
+                    ) =>
+                {
+                    return Err(PromptError::Cancelled);
+                }
+                Err(error) => {
+                    auto.state.note_prepare_failure(error.error.kind());
+                    // History items are projected exactly as the runtime
+                    // `DefaultPromptProvider` would, then kept separate from the
+                    // system/durable-summary prefix so groups can be folded.
+                    let (fixed, history_messages) = crate::compaction::auto_compose(
+                        &system,
+                        summary.as_ref(),
+                        projected_base,
+                        history.appended(),
+                    )
+                    .map_err(|_| PromptError::InvalidHistory)?;
+                    let items = projected_base
+                        .iter()
+                        .chain(history.appended())
+                        .collect::<Vec<_>>();
+                    let ranges = crate::compaction::auto::compressible_ranges(
+                        projected_base.len(),
+                        &items,
+                        loop_id,
+                    )
+                    .map_err(|_| PromptError::InvalidHistory)?;
+                    let valid_keys = ranges.iter().map(|(key, _)| key.clone()).collect();
+                    let folded = auto.state.emergency_groups(loop_id, &valid_keys);
+                    let consolidated =
+                        auto.state
+                            .consolidated(loop_id, summary.as_ref(), &valid_keys);
+                    crate::compaction::auto::fold_history_with_ranges(
+                        &fixed,
+                        &history_messages,
+                        items.len(),
+                        &ranges,
+                        &folded,
+                        consolidated.as_ref(),
+                    )
+                    .map_err(|_| PromptError::InvalidHistory)?
+                }
+            };
+            {
                 // Bound the retained recovery source before cloning any
                 // history item; an over-cap source is never copied.
                 let source_safe = crate::compaction::recovery_source_is_safe(

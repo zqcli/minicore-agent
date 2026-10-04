@@ -1192,7 +1192,7 @@ async fn automatic_submit_rejects_runtime_overlimit_without_startup_summary() {
 }
 
 #[tokio::test]
-async fn ordinary_requests_cross_soft_threshold_with_steer_without_summarizing() {
+async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
     let (data_dir, _guard) = fixture_dir(&format!("append-only-steer-{}", next_id()));
     let content = "ordinary result ".repeat(900);
     let (workspace, _workspace_guard) =
@@ -1248,7 +1248,7 @@ async fn ordinary_requests_cross_soft_threshold_with_steer_without_summarizing()
         assert!(!requests[0].tools().is_empty());
         assert!(
             !requests[1].tools().is_empty(),
-            "soft threshold cannot start utility before final answer"
+            "newest tool result must first reach the assistant verbatim"
         );
         assert!(
             requests[1]
@@ -8501,8 +8501,9 @@ async fn openai_overflow_loopback(preflight: bool) -> MockServer {
 
     let tool_move = MockResponse::sse(&[tool_call_event, tool_call_done, tool_turn_done]);
     let responses = if preflight {
-        // Conservative local estimation terminates before any second request.
-        vec![tool_move]
+        // Ordinary byte estimates do not veto the second request. The server
+        // can accept this replay even when the local estimate exceeds budget.
+        vec![tool_move, MockResponse::sse(&recovered_events)]
     } else {
         vec![
             tool_move,
@@ -8559,22 +8560,9 @@ async fn run_openai_overflow_loopback(preflight: bool) {
     let turn = send_text(&mut agent, info.session_id, "read file").await;
     let result = wait_text(&agent, turn).await;
     if preflight {
-        let minicore_runtime::LoopOutcome::Failed(failure) = &result.report.outcome else {
-            panic!("over-budget emitted-body estimate must terminate locally");
-        };
-        let error = failure
-            .model_error()
-            .expect("preflight is a local model rejection");
         assert_eq!(
-            error.kind(),
-            minicore_runtime::model::ModelErrorKind::InvalidRequest
-        );
-        assert!(
-            error
-                .diagnostic()
-                .message
-                .as_str()
-                .contains("local serialized context estimate")
+            result.report.outcome,
+            minicore_runtime::LoopOutcome::Completed
         );
         assert!(
             agent
@@ -8592,7 +8580,18 @@ async fn run_openai_overflow_loopback(preflight: bool) {
             1
         );
         let captured = server.finish().await;
-        assert_eq!(captured.len(), 1, "no utility or retry on a local estimate");
+        assert_eq!(
+            captured.len(),
+            2,
+            "tool then accepted ordinary continuation; no threshold utility for its unread result"
+        );
+        let body = captured[1].json_body();
+        assert!(
+            serde_json::to_string(&body)
+                .unwrap()
+                .contains(REPLAY_MARKER)
+        );
+        assert!(serde_json::to_vec(&body).unwrap().len().div_ceil(4) > 16_384);
         return;
     }
     assert_eq!(
@@ -8733,7 +8732,7 @@ async fn test_openai_loopback_http_overflow_recovery_real_loop() {
 }
 
 #[tokio::test]
-async fn test_openai_loopback_preflight_rejects_over_budget_replay_without_summary() {
+async fn test_openai_loopback_accepts_over_estimated_budget_without_local_veto() {
     run_openai_overflow_loopback(true).await;
 }
 
@@ -12080,4 +12079,433 @@ async fn cold_display_unicode_pins_missing_workspace_and_partial_tail_are_read_o
     ));
     assert!(agent.loaded_session(session_id).is_none());
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+}
+
+fn pi_history_exchange(loop_id: LoopId, index: u32, bytes: usize) -> Vec<HistoryItem> {
+    let call_id = ToolCallId::new(format!("pi-read-{index}")).unwrap();
+    vec![
+        HistoryItem::Assistant(AssistantHistory {
+            loop_id,
+            request_index: index,
+            model: "main".parse().unwrap(),
+            reasoning: ReasoningPreference::Auto,
+            content: vec![AssistantPart::ToolCall(
+                ToolCall::new(
+                    call_id.clone(),
+                    "read".parse().unwrap(),
+                    json!({"path":"old.txt"}),
+                    0,
+                )
+                .unwrap(),
+            )],
+            provider_replay: None,
+            finish_reason: ModelFinishReason::ToolCalls,
+            usage: Usage::default(),
+        }),
+        HistoryItem::ToolResult(ToolResultHistory {
+            loop_id,
+            request_index: index,
+            call_id,
+            tool_name: "read".parse().unwrap(),
+            outcome: ToolResultOutcome::Success,
+            output: ToolOutput::new("old ".repeat(bytes / 4)).unwrap(),
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer() {
+    let (data_dir, _guard) = fixture_dir(&format!("pi-in-run-{}", next_id()));
+    let content = "read-result ".repeat(900);
+    let (workspace, _workspace_guard) =
+        workspace_file("pi-in-run-workspace", "a.txt", content.as_bytes());
+    let gate = BlockGate::new();
+    let model = FakeModel::with_window(
+        "main",
+        5_000,
+        [
+            ModelScript::ToolCallAfterGate(gate.clone(), "read", json!({"path":"a.txt"})),
+            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
+            ModelScript::Text("First read was completed; keep its findings."),
+            ModelScript::Text("done"),
+        ],
+    );
+    let mut agent = open_agent_auto(
+        &data_dir,
+        BTreeMap::from([("main".into(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(
+        &mut agent,
+        info.session_id,
+        "read twice; preserve original input",
+    )
+    .await;
+    gate.entered.notified().await;
+    agent
+        .steer(super::SteerMessage {
+            turn,
+            text: "preserve this steer exactly".into(),
+        })
+        .unwrap();
+    gate.release.notify_waiters();
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.report.requests, 3,
+        "utility is not an ordinary request"
+    );
+    wait_post_turn_noop(&agent, info.session_id, turn.loop_id).await;
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[2].tools().is_empty(),
+            "summary precedes the third assistant request"
+        );
+        assert!(!requests[3].tools().is_empty());
+        for value in [
+            "read twice; preserve original input",
+            "preserve this steer exactly",
+        ] {
+            assert!(
+                requests[3]
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, ModelMessage::User(text) if text == value))
+            );
+        }
+        assert_eq!(
+            requests[3]
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, ModelMessage::Tool { .. }))
+                .count(),
+            1
+        );
+        assert!(requests[3].messages().iter().any(|message| matches!(message, ModelMessage::Tool { output, .. } if output.content().as_str().contains(&content))));
+    }
+    let context = agent.session_context(info.session_id).unwrap();
+    assert!(context.automatic.current.is_none());
+    assert_eq!(
+        context
+            .automatic
+            .last
+            .unwrap()
+            .utility_usage
+            .unwrap()
+            .call_count,
+        1
+    );
+    let history = read_store_history(&data_dir, info.session_id).await;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::ToolResult(_)))
+            .count(),
+        2,
+        "completed tools are never replayed"
+    );
+}
+
+#[tokio::test]
+async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
+    let gate = BlockGate::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let (_data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
+        &format!("pi-first-cancel-{}", next_id()),
+        true,
+        8_000,
+        pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
+        [ModelScript::BlockUntilDrop(
+            gate.clone(),
+            Arc::clone(&dropped),
+            "not reached",
+        )],
+        None,
+        None,
+    )
+    .await;
+    let turn = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        send_text(&mut agent, session_id, "new current input remains exact"),
+    )
+    .await
+    .unwrap();
+    gate.entered.notified().await;
+    let context = agent.session_context(session_id).unwrap();
+    assert_eq!(context.automatic.current.unwrap().request_index, Some(0));
+    assert!(context.current_operation.is_none());
+    assert!(agent.cancel(turn).unwrap());
+    let result = wait_text(&agent, turn).await;
+    assert!(matches!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(_)
+    ));
+    assert_eq!(
+        result.report.requests, 0,
+        "no ordinary model request was issued"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(result.report.appended.iter().any(|item| matches!(item, HistoryItem::User(user) if user.input.as_text() == "new current input remains exact")));
+    let view = agent.session_context(session_id).unwrap().automatic;
+    assert!(view.current.is_none());
+    assert_eq!(view.last.unwrap().utility_usage.unwrap().call_count, 1);
+}
+
+#[tokio::test]
+async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_input() {
+    let large_summary = Box::leak("old summary ".repeat(3_000).into_boxed_str());
+    let (data, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
+        &format!("pi-summary-reopen-{}", next_id()),
+        true,
+        20_000,
+        pi_history_exchange(LoopId::new().unwrap(), 0, 70_000),
+        [ModelScript::Text(large_summary)],
+        None,
+        None,
+    )
+    .await;
+    let result = agent
+        .compact(CompactSession {
+            session_id,
+            operation_id: "seed-covered-summary".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.status,
+        crate::compaction::CompactionStatus::Compacted
+    );
+    agent.close_session(session_id).await.unwrap();
+    drop(agent);
+    let smaller = FakeModel::with_window(
+        "main",
+        10_000,
+        [
+            ModelScript::Text("Refreshed historical facts."),
+            ModelScript::Text("answer"),
+        ],
+    );
+    let mut agent = open_agent_auto(
+        &data,
+        BTreeMap::from([("main".into(), Arc::clone(&smaller))]),
+        read_profile(),
+    )
+    .await;
+    agent.open_session(session_id).await.unwrap();
+    let turn = send_text(&mut agent, session_id, "new after reopening exact").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    {
+        let requests = smaller.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools().is_empty());
+        assert!(requests[1].messages().iter().any(
+        |message| matches!(message, ModelMessage::User(text) if text == "new after reopening exact")
+    ));
+        assert!(
+            serde_json::to_string(requests[1].messages())
+                .unwrap()
+                .contains("Refreshed historical facts.")
+        );
+        assert!(
+            !serde_json::to_string(requests[1].messages())
+                .unwrap()
+                .contains("old summary old summary")
+        );
+    }
+    agent.close_session(session_id).await.unwrap();
+    agent.open_session(session_id).await.unwrap();
+    assert!(
+        agent
+            .session_context(session_id)
+            .unwrap()
+            .coverage
+            .covered_item_count
+            > 0
+    );
+}
+
+#[tokio::test]
+async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summary() {
+    let gate = BlockGate::new();
+    let (_data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
+        &format!("pi-stale-prepare-{}", next_id()),
+        true,
+        8_000,
+        pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
+        [
+            ModelScript::BlockUntil(gate.clone(), "historical work summary"),
+            ModelScript::Text("new settings answer"),
+        ],
+        None,
+        None,
+    )
+    .await;
+    let turn = send_text(&mut agent, session_id, "original prompt exact").await;
+    gate.entered.notified().await;
+    agent
+        .steer(super::SteerMessage {
+            turn,
+            text: "steer while summary blocked".into(),
+        })
+        .unwrap();
+    agent
+        .update_session(UpdateSession {
+            session_id,
+            model: None,
+            reasoning: Some(ReasoningPreference::Low),
+        })
+        .await
+        .unwrap();
+    gate.release.notify_waiters();
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(result.report.requests, 1);
+    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one utility plus one current-settings ordinary request"
+    );
+    assert!(requests[0].tools().is_empty());
+    assert_eq!(requests[1].reasoning(), ReasoningPreference::Low);
+    for expected in ["original prompt exact", "steer while summary blocked"] {
+        assert!(
+            requests[1]
+                .messages()
+                .iter()
+                .any(|message| matches!(message, ModelMessage::User(text) if text == expected))
+        );
+    }
+    let contexts = model.contexts.lock().unwrap();
+    assert_eq!(contexts[1].request_index, 0);
+    assert!(
+        agent
+            .session_context(session_id)
+            .unwrap()
+            .automatic
+            .current
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_without_tools_replay() {
+    let (data, _guard) = fixture_dir(&format!("pi-consolidated-retry-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file(
+        "pi-consolidated-retry-ws",
+        "a.txt",
+        "read-result ".repeat(900).as_bytes(),
+    );
+    let first_summary = Box::leak("prior read facts retained. ".repeat(90).into_boxed_str());
+    let retryable = ModelError::not_started(
+        minicore_runtime::model::ModelErrorKind::RateLimited,
+        Some(std::time::Duration::from_millis(1)),
+        minicore_runtime::error::DiagnosticSummary::new(
+            minicore_runtime::error::DiagnosticCode::ModelUnavailable,
+            minicore_runtime::error::DiagnosticCategory::Model,
+            BoundedText::new("retry shortly").unwrap(),
+            true,
+        ),
+    );
+    let model = FakeModel::with_window(
+        "main",
+        5_000,
+        [
+            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
+            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
+            ModelScript::Text(first_summary),
+            ModelScript::ContextOverflowNotStarted,
+            ModelScript::Text("Recovered historical facts"),
+            ModelScript::Error(retryable),
+            ModelScript::Text("completed"),
+        ],
+    );
+    let mut agent = open_agent_auto(
+        &data,
+        BTreeMap::from([("main".into(), Arc::clone(&model))]),
+        read_profile(),
+    )
+    .await;
+    let session_id = create_session(&mut agent, &workspace).await.session_id;
+    let turn = send_text(&mut agent, session_id, "new user exact").await;
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(result.report.requests, 3);
+    assert_eq!(result.report.tool_rounds, 2);
+    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests[2].tools().is_empty() && requests[4].tools().is_empty());
+        assert_eq!(
+            requests[3]
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, ModelMessage::Tool { .. }))
+                .count(),
+            1,
+            "threshold keeps the newest exchange before the real capacity rejection"
+        );
+        assert_eq!(
+            serde_json::to_vec(&requests[5]).unwrap(),
+            serde_json::to_vec(&requests[6]).unwrap()
+        );
+        assert!(
+            serde_json::to_string(&requests[6])
+                .unwrap()
+                .contains("Recovered historical facts")
+        );
+        assert!(
+            !requests[6]
+                .messages()
+                .iter()
+                .any(|message| matches!(message, ModelMessage::Tool { .. }))
+        );
+        assert!(requests[6].messages().iter().any(
+            |message| matches!(message, ModelMessage::User(text) if text == "new user exact")
+        ));
+    }
+    let context = agent.session_context(session_id).unwrap();
+    assert_eq!(
+        context
+            .automatic
+            .last
+            .unwrap()
+            .utility_usage
+            .unwrap()
+            .call_count,
+        1
+    );
+    assert_eq!(
+        context.recovery.unwrap().utility_usage.unwrap().call_count,
+        1
+    );
+    assert_eq!(
+        read_store_history(&data, session_id)
+            .await
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::ToolResult(_)))
+            .count(),
+        2
+    );
 }

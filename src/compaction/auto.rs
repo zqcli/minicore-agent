@@ -9,7 +9,6 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::tools::ToolSpec;
 use minicore_runtime::value::BoundedText;
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::utility::{
@@ -125,11 +124,10 @@ fn group_key(
     start: usize,
     end: usize,
 ) -> Result<EphemeralGroupKey, UtilityError> {
-    let source = serde_json::to_vec(&items[start..end]).map_err(|_| UtilityError::Serialization)?;
     Ok(EphemeralGroupKey {
         start,
         end,
-        source_hash: Sha256::digest(source).into(),
+        source_hash: super::threshold::source_hash(&&items[start..end])?,
     })
 }
 
@@ -234,16 +232,38 @@ pub(crate) fn fold_history(
     appended: &[HistoryItem],
     loop_id: LoopId,
     folded: &BTreeMap<EphemeralGroupKey, BoundedText>,
+    consolidated: Option<&super::threshold::ConsolidatedSummary>,
 ) -> Result<Vec<ModelMessage>, UtilityError> {
     let items: Vec<&HistoryItem> = base.iter().chain(appended.iter()).collect();
     if history.len() != items.len() {
         return Err(UtilityError::InvalidResponse);
     }
     let ranges = compressible_ranges(base.len(), &items, loop_id)?;
+    fold_history_with_ranges(fixed, history, items.len(), &ranges, folded, consolidated)
+}
+
+pub(crate) fn fold_history_with_ranges(
+    fixed: &[ModelMessage],
+    history: &[ModelMessage],
+    item_count: usize,
+    ranges: &[(EphemeralGroupKey, usize)],
+    folded: &BTreeMap<EphemeralGroupKey, BoundedText>,
+    consolidated: Option<&super::threshold::ConsolidatedSummary>,
+) -> Result<Vec<ModelMessage>, UtilityError> {
     let mut result = Vec::with_capacity(fixed.len() + history.len());
-    result.extend_from_slice(fixed);
+    if let Some(consolidated) = consolidated {
+        result.extend(
+            fixed
+                .iter()
+                .filter(|message| matches!(message, ModelMessage::System(_)))
+                .cloned(),
+        );
+        result.push(summary_data_message(&consolidated.content).map_err(invalid)?);
+    } else {
+        result.extend_from_slice(fixed);
+    }
     let mut index = 0usize;
-    while index < items.len() {
+    while index < item_count {
         let Some((key, end)) = ranges
             .iter()
             .find(|(key, _)| key.start == index)
@@ -253,7 +273,9 @@ pub(crate) fn fold_history(
             index += 1;
             continue;
         };
-        if let Some(summary) = folded.get(key) {
+        if consolidated.is_some_and(|value| value.covered.contains(key)) {
+            index = end;
+        } else if let Some(summary) = folded.get(key) {
             result.push(summary_data_message(summary).map_err(invalid)?);
             index = end;
         } else {
@@ -379,6 +401,7 @@ pub(crate) async fn summarize_group(
         hard_tokens: request.hard_tokens,
         safe_before_estimate: false,
         operation_deadline: request.deadline,
+        live_usage: None,
     };
     generate_summary(&input, cancellation).await
 }

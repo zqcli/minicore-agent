@@ -12,7 +12,7 @@ verification evidence.
 - [Architecture](architecture.md): Agent, Session, Runtime, Tool, Store, and
   query ownership.
 - [Provider replay](provider-replay.md): durable output, identity, redaction, and bounds.
-- [Context](context.md): append-only ordinary turns, post-turn/manual summaries,
+- [Context](context.md): source-bound request-boundary and post-turn/manual summaries,
   bounded emergency recovery, and
   context estimates/errors.
 - [Security](security.md): local trust assumptions, Workspace limits, redaction,
