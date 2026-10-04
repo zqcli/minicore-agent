@@ -550,6 +550,9 @@ pub enum ToolRecordingState {
 /// really owned, so a policy wait is never reported as a running process.
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolExecutionData {
+    /// Logical rows of the retained model-facing output, never stdout+stderr.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_line_count: Option<usize>,
     pub tool_ref: ToolRef,
     pub name: String,
     pub state: ToolExecutionState,
@@ -606,6 +609,8 @@ impl fmt::Debug for ToolExecutionData {
 pub struct ToolReadRequest {
     pub tool_ref: ToolRef,
     #[serde(default)]
+    pub display: bool,
+    #[serde(default)]
     pub max_bytes: Option<usize>,
 }
 
@@ -634,6 +639,8 @@ impl ToolOutputRequest {
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct ToolReadResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<crate::presentation::ToolDisplay>,
     /// Absent until the invocation boundary was actually reached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invocation: Option<ToolInvocationData>,
@@ -695,6 +702,7 @@ pub(crate) struct ToolRecord {
     input_truncated: bool,
     input_expired: bool,
     result: String,
+    output_line_count: Option<usize>,
     result_total: usize,
     result_seen: bool,
     result_truncated: bool,
@@ -845,6 +853,7 @@ impl ToolRecord {
         if !self.result_seen {
             if stored.result_seen {
                 self.result = stored.result;
+                self.output_line_count = stored.output_line_count;
                 self.result_total = stored.result_total;
                 self.result_seen = true;
                 self.result_truncated = stored.result_truncated;
@@ -854,6 +863,7 @@ impl ToolRecord {
         } else if self.result_expired || self.result_corrupt {
             if stored.result_seen && !stored.result_expired && !stored.result_corrupt {
                 self.result = stored.result;
+                self.output_line_count = stored.output_line_count;
                 self.result_total = stored.result_total;
                 self.result_truncated = stored.result_truncated;
                 self.result_expired = false;
@@ -954,6 +964,7 @@ impl ToolRecord {
             input_truncated: false,
             input_expired: false,
             result: String::new(),
+            output_line_count: None,
             result_total: 0,
             result_seen: false,
             result_truncated: false,
@@ -1061,6 +1072,7 @@ impl ToolRecord {
 
     fn evict_result(&mut self) {
         self.result = String::new();
+        self.output_line_count = None;
         self.result_expired = true;
     }
 
@@ -1104,6 +1116,7 @@ impl ToolRecord {
 
     fn execution_data(&self, tool_ref: &ToolRef) -> ToolExecutionData {
         ToolExecutionData {
+            output_line_count: self.output_line_count,
             tool_ref: tool_ref.clone(),
             name: self.name.clone(),
             state: self.state,
@@ -1173,6 +1186,7 @@ impl ToolRecord {
             }
         });
         let mut result = ToolReadResult {
+            display: None,
             invocation,
             execution,
         };
@@ -1196,6 +1210,53 @@ impl ToolRecord {
                 invocation.input.preview = preview;
                 invocation.input.truncated = true;
             }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn project_display_read(
+        &self,
+        tool_ref: &ToolRef,
+        max_bytes: usize,
+    ) -> Result<ToolReadResult, AgentError> {
+        let arguments = (!self.input_truncated && !self.input_expired && !self.input_corrupt)
+            .then(|| serde_json::from_str(&self.input).ok())
+            .flatten();
+        let mut display =
+            crate::presentation::build_tool_card_display(&self.name, arguments.as_ref());
+        if arguments.is_none()
+            && matches!(
+                self.name.as_str(),
+                "write" | "edit" | "patch" | "apply_patch" | "bash"
+            )
+        {
+            display.body_truncated = true;
+        }
+        let mut result = ToolReadResult {
+            display: Some(display),
+            invocation: None,
+            execution: self.execution_data(tool_ref),
+        };
+        if encoded_len(&result)? > max_bytes {
+            let source = result
+                .display
+                .as_mut()
+                .and_then(|display| display.expanded_input.take())
+                .ok_or(AgentError::InvalidArguments)?;
+            let display = result.display.as_mut().ok_or(AgentError::Internal)?;
+            display.expanded_input = Some(String::new());
+            display.truncated = true;
+            display.body_truncated = true;
+            let template_len = encoded_len(&result)?;
+            if template_len > max_bytes {
+                return Err(AgentError::InvalidArguments);
+            }
+            let available = max_bytes.saturating_sub(template_len).saturating_add(2);
+            let (body, _) = fit_encoded_string(&source, available);
+            let display = result.display.as_mut().ok_or(AgentError::Internal)?;
+            display.input_line_count = Some(crate::presentation::count_lines(&body));
+            display.hidden_line_count = display.input_line_count;
+            display.expanded_input = Some(body);
         }
         Ok(result)
     }
@@ -1393,6 +1454,8 @@ impl ToolRecord {
             input_truncated: stored.input.truncated,
             input_expired: stored.input.expired,
             input_corrupt,
+            output_line_count: (!result_corrupt && stored.result.seen && !stored.result.expired)
+                .then(|| crate::presentation::count_lines(&result)),
             result,
             result_total: stored.result.total_bytes,
             result_seen: stored.result.seen,
@@ -1815,6 +1878,7 @@ impl ToolData {
         let (result, result_total, result_truncated) = bounded(content, MAX_TOOL_RESULT_BYTES);
         let mut inner = self.lock();
         inner.resize(tool_ref, |record| {
+            record.output_line_count = Some(crate::presentation::count_lines(&result));
             record.result = result;
             record.result_total = result_total;
             record.result_seen = true;
@@ -2030,6 +2094,7 @@ impl ToolData {
             }
             if let Some((content, total, truncated)) = captured {
                 inner.resize(&tool_ref, |record| {
+                    record.output_line_count = Some(crate::presentation::count_lines(&content));
                     record.result = content;
                     record.result_total = total;
                     record.result_seen = true;
@@ -2050,7 +2115,11 @@ impl ToolData {
         let Some(record) = inner.records.get(&request.tool_ref) else {
             return Err(AgentError::ToolNotFound);
         };
-        record.project_read(&request.tool_ref, max_bytes)
+        if request.display {
+            record.project_display_read(&request.tool_ref, max_bytes)
+        } else {
+            record.project_read(&request.tool_ref, max_bytes)
+        }
     }
 
     #[cfg(test)]

@@ -262,7 +262,7 @@ async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
         assert_eq!(entry.tool_rounds, count);
     }
     let page = reopened
-        .read_history_page(session_id, 0, 100, None, None, None, None, &limits)
+        .read_history_page(session_id, 0, 100, None, None, None, None, None, &limits)
         .await
         .unwrap();
     assert_eq!(
@@ -1537,7 +1537,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, &limits,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, None, &limits,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1550,7 +1550,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, &expired,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, None, &expired,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1563,7 +1563,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, &capped,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, None, &capped,)
             .await,
         Err(StoreError::QueryLimit)
     ));

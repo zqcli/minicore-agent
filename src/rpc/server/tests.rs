@@ -642,9 +642,11 @@ async fn capability_discovery_returns_ordered_lists() {
         ping["result"]["capabilities"],
         json!([
             "session.read",
+            "session.read.display",
             "session.context",
             "turn.result",
             "tool.read",
+            "tool.read.display",
             "tool.output",
             "session.history",
             "workspace.read",

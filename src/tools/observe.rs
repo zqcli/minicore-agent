@@ -383,6 +383,7 @@ mod tests {
         let bash_read = data
             .read(
                 &ToolReadRequest {
+                    display: false,
                     tool_ref: bash_ref.clone(),
                     max_bytes: None,
                 },
