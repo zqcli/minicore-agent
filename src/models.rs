@@ -204,6 +204,7 @@ impl std::io::Write for BudgetCountingWriter<'_> {
 
 #[derive(Clone)]
 pub(crate) struct ModelEntry {
+    pub(crate) physical_context_window: u64,
     pub(crate) model: Arc<dyn Model>,
     pub(crate) budget: Arc<dyn ProviderBudget>,
 }
@@ -273,6 +274,7 @@ impl Models {
                     };
                     let openai_model = Arc::new(openai::OpenAiResponsesModel::new(settings)?);
                     ModelEntry {
+                        physical_context_window: u64::from(*physical_context_window),
                         model: Arc::clone(&openai_model) as Arc<dyn Model>,
                         budget: Arc::clone(&openai_model) as Arc<dyn ProviderBudget>,
                     }
@@ -291,6 +293,7 @@ impl Models {
                 (
                     id,
                     ModelEntry {
+                        physical_context_window: model.descriptor().context_window,
                         model,
                         budget: Arc::new(DefaultProviderBudget),
                     },
@@ -305,6 +308,12 @@ impl Models {
             .get(id)
             .map(|entry| Arc::clone(&entry.model))
             .ok_or(ModelConfigError::NotFound)
+    }
+
+    pub(crate) fn physical_context_window(&self, id: &str) -> Option<u64> {
+        self.values
+            .get(id)
+            .map(|entry| entry.physical_context_window)
     }
 
     pub(crate) fn get_budget(&self, id: &str) -> Result<Arc<dyn ProviderBudget>, ModelConfigError> {
@@ -477,6 +486,10 @@ mod tests {
         let descriptor = models.get("profile-model").unwrap().descriptor().clone();
         assert_eq!(descriptor.model_ref.as_str(), "profile-model");
         assert_eq!(descriptor.context_window, 15_000);
+        assert_eq!(
+            models.physical_context_window("profile-model"),
+            Some(20_000)
+        );
         assert!(!descriptor.supports_tools);
         assert_eq!(
             descriptor.supported_reasoning,

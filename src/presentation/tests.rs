@@ -395,7 +395,11 @@ fn hidden_counts_follow_the_fixed_tool_execution_estimator() {
 #[test]
 fn steer_receipt_commits_only_at_real_start_and_emits_once_per_count() {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-    let presentation = Presentation::new(SessionId::new().unwrap(), AgentEventSink::new(sender));
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        crate::compaction::CompactionState::new(),
+    );
     let loop_r0 = LoopId::new().unwrap();
     let key_a = RequestKey {
         loop_id: loop_r0,
@@ -493,7 +497,11 @@ fn steer_receipt_commits_only_at_real_start_and_emits_once_per_count() {
 #[test]
 fn steer_times_still_feed_the_same_live_times_queue() {
     let (sender, _receiver) = tokio::sync::mpsc::channel(8);
-    let presentation = Presentation::new(SessionId::new().unwrap(), AgentEventSink::new(sender));
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        crate::compaction::CompactionState::new(),
+    );
     presentation.note_steer_accepted(Some("t0".into()));
     presentation.note_steer_accepted(None);
     assert_eq!(
@@ -508,7 +516,11 @@ fn steer_times_still_feed_the_same_live_times_queue() {
 #[test]
 fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
     let (sender, _receiver) = tokio::sync::mpsc::channel(8);
-    let presentation = Presentation::new(SessionId::new().unwrap(), AgentEventSink::new(sender));
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        crate::compaction::CompactionState::new(),
+    );
     let observer = ToolObserver::new(
         presentation.session_id(),
         Arc::new(ToolData::new()),
@@ -573,7 +585,11 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
 #[test]
 fn finishing_a_call_removes_its_live_entry() {
     let (sender, _receiver) = tokio::sync::mpsc::channel(8);
-    let presentation = Presentation::new(SessionId::new().unwrap(), AgentEventSink::new(sender));
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        crate::compaction::CompactionState::new(),
+    );
     let key = RequestKey {
         loop_id: LoopId::new().unwrap(),
         request_index: 0,
@@ -612,6 +628,7 @@ async fn presentation_tool_variants_share_binding_and_finish() {
     let presentation = Presentation::new(
         session_id,
         crate::event::AgentEventSink::new(presentation_sender),
+        crate::compaction::CompactionState::new(),
     );
     let (observer_sender, mut observer_events) = tokio::sync::mpsc::channel(16);
     let observer = ToolObserver::new(
@@ -761,4 +778,224 @@ async fn presentation_tool_variants_share_binding_and_finish() {
     assert!(observer_events.try_recv().is_err());
     assert!(presentation_events.try_recv().is_err());
     let _ = tokio::fs::remove_dir_all(base).await;
+}
+
+#[test]
+fn reported_context_uses_native_total_or_complete_disjoint_components() {
+    let complete = Usage::new(10, 20, 30)
+        .with_cache_read_tokens(Some(40))
+        .with_cache_write_tokens(Some(50));
+    let summed = reported_context(complete, 1_000);
+    assert_eq!(summed.tokens, Some(150));
+    assert_eq!(summed.percent, Some(15.0));
+    assert_eq!(summed.kind, ContextKind::Reported);
+    // A native total already includes cached and reasoning tokens.
+    let native = reported_context(complete.with_provider_total_tokens(Some(123)), 1_000);
+    assert_eq!(native.tokens, Some(123));
+    assert_eq!(native.percent, Some(12.3));
+    for partial in [
+        Usage::default(),
+        Usage::new(10, 20, 30),
+        complete.with_cache_write_tokens(None),
+        Usage::from_optional(None, Some(20), Some(30))
+            .with_cache_read_tokens(Some(40))
+            .with_cache_write_tokens(Some(50)),
+        Usage::new(u64::MAX, 1, 0)
+            .with_cache_read_tokens(Some(0))
+            .with_cache_write_tokens(Some(0)),
+    ] {
+        assert_eq!(
+            reported_context(partial, 1_000),
+            ContextUsageView::default()
+        );
+    }
+    let zero_window = reported_context(complete, 0);
+    assert_eq!(zero_window.tokens, Some(150));
+    assert_eq!(zero_window.percent, None);
+    assert_eq!(
+        reported_context(complete.with_provider_total_tokens(Some(0)), 1_000).percent,
+        Some(0.0)
+    );
+}
+
+#[test]
+fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        crate::compaction::CompactionState::new(),
+    );
+    presentation.set_model_label("main".to_owned());
+    let generation = Some(presentation.compaction.request_settings().config_generation);
+    let mut key = RequestKey {
+        loop_id: LoopId::new().unwrap(),
+        request_index: 0,
+    };
+    let usage = Usage::default().with_provider_total_tokens(Some(500));
+    presentation.note_request_usage(key, usage, generation, 10_000);
+    assert_eq!(presentation.snapshot().context.percent, Some(5.0));
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AgentEvent::RequestUsage { .. })
+    ));
+    // Duplicate usage is neither summed nor emitted again.
+    presentation.note_request_usage(
+        key,
+        usage.with_provider_total_tokens(Some(999)),
+        generation,
+        10_000,
+    );
+    assert_eq!(presentation.snapshot().context.tokens, Some(500));
+    assert!(receiver.try_recv().is_err());
+    presentation.reset_before_loop_start();
+    assert_eq!(presentation.snapshot().context.tokens, Some(500));
+    key.loop_id = LoopId::new().unwrap();
+    presentation.note_request_usage(
+        key,
+        usage.with_provider_total_tokens(Some(200)),
+        generation,
+        10_000,
+    );
+    assert_eq!(presentation.snapshot().context.tokens, Some(200));
+    presentation.compaction.publish(
+        minicore_runtime::value::BoundedText::new("summary").unwrap(),
+        1,
+        0,
+    );
+    key.request_index += 1;
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+    let after_compact = Some(presentation.compaction.request_settings().config_generation);
+    key.request_index += 1;
+    presentation.note_request_usage(key, usage, after_compact, 10_000);
+    assert_eq!(presentation.snapshot().context.tokens, Some(500));
+    presentation.set_model_label("other".to_owned());
+    presentation.compaction.note_settings_installed();
+    key.request_index += 1;
+    presentation.note_request_usage(key, usage, after_compact, 10_000);
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+    let other = Some(presentation.compaction.request_settings().config_generation);
+    key.request_index += 1;
+    presentation.note_request_usage(key, usage, other, 20_000);
+    assert_eq!(presentation.snapshot().context.percent, Some(2.5));
+    // A fresh incomplete report is unknown, never an old value labeled fresh.
+    key.request_index += 1;
+    presentation.note_request_usage(key, Usage::default(), other, 20_000);
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+}
+
+#[test]
+fn reported_context_restores_only_last_valid_active_matching_model_usage() {
+    use minicore_runtime::history::AssistantHistory;
+    use minicore_runtime::model::{ModelFinishReason, ReasoningPreference};
+    let (sender, _) = tokio::sync::mpsc::channel(1);
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        crate::compaction::CompactionState::new(),
+    );
+    presentation.set_model_label("main".to_owned());
+    let assistant = |model: &str, total: Option<u64>| {
+        HistoryItem::Assistant(AssistantHistory {
+            loop_id: LoopId::new().unwrap(),
+            request_index: 0,
+            model: model.parse().unwrap(),
+            reasoning: ReasoningPreference::Auto,
+            content: vec![],
+            provider_replay: None,
+            finish_reason: ModelFinishReason::Stop,
+            usage: Usage::default().with_provider_total_tokens(total),
+        })
+    };
+    let history = [
+        assistant("main", Some(900)),
+        assistant("main", Some(200)),
+        assistant("main", None),
+    ];
+    presentation.restore_context(&history, "main", 10_000);
+    assert_eq!(presentation.snapshot().context.tokens, Some(200));
+    presentation.compaction.publish(
+        minicore_runtime::value::BoundedText::new("summary").unwrap(),
+        1,
+        0,
+    );
+    // A fully compacted history has no active suffix to restore.
+    presentation.restore_context(&history[history.len()..], "main", 10_000);
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+    presentation.restore_context(
+        &[assistant("main", Some(900)), assistant("other", Some(200))],
+        "main",
+        10_000,
+    );
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+}
+
+#[test]
+fn reported_context_guards_same_label_config_and_emergency_summary_generations() {
+    struct InertModel(ModelDescriptor);
+    impl Model for InertModel {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.0
+        }
+        fn start(
+            &self,
+            _: ModelRequest,
+            _: ModelCallContext,
+        ) -> minicore_runtime::model::ModelStartFuture<'_> {
+            unimplemented!()
+        }
+    }
+    let model = || -> Arc<dyn Model> {
+        Arc::new(InertModel(
+            ModelDescriptor::new(
+                "main".parse().unwrap(),
+                10_000,
+                std::collections::BTreeSet::from([
+                    minicore_runtime::model::ReasoningPreference::Auto,
+                ]),
+                true,
+            )
+            .unwrap(),
+        ))
+    };
+    let (sender, mut events) = tokio::sync::mpsc::channel(8);
+    let compaction = crate::compaction::CompactionState::new();
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        AgentEventSink::new(sender),
+        Arc::clone(&compaction),
+    );
+    presentation.set_model_label("main".to_owned());
+    let old = model();
+    presentation.install_model(&old);
+    compaction.note_settings_installed();
+    let old_generation = presentation.context_generation(old.as_ref());
+    let mut key = RequestKey {
+        loop_id: LoopId::new().unwrap(),
+        request_index: 0,
+    };
+    let usage = Usage::default().with_provider_total_tokens(Some(100));
+    presentation.note_request_usage(key, usage, old_generation, 10_000);
+    assert_eq!(presentation.snapshot().context.tokens, Some(100));
+    let replacement = model(); // Same label, new provider/settings instance.
+    presentation.install_model(&replacement);
+    compaction.note_settings_installed();
+    assert_eq!(presentation.context_generation(old.as_ref()), None);
+    key.request_index += 1;
+    presentation.note_request_usage(key, usage, old_generation, 10_000);
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+    let generation = presentation.context_generation(replacement.as_ref());
+    key.request_index += 1;
+    presentation.note_request_usage(key, usage, generation, 20_000);
+    assert_eq!(presentation.snapshot().context.percent, Some(0.5));
+    // An emergency compaction invalidates immediately, even if retry aborts
+    // without Usage. A rejected installation must not invalidate fresh usage.
+    assert!(compaction.install_emergency_groups(key.loop_id, Default::default()));
+    assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
+    key.request_index += 1;
+    presentation.note_request_usage(key, usage, generation, 20_000);
+    assert_eq!(presentation.snapshot().context.tokens, Some(100));
+    assert!(!compaction.install_emergency_groups(LoopId::new().unwrap(), Default::default()));
+    assert_eq!(presentation.snapshot().context.tokens, Some(100));
+    assert_eq!(std::iter::from_fn(|| events.try_recv().ok()).count(), 4);
 }

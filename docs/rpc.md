@@ -1,6 +1,6 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.6.1 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.6.2 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
 ## Transport And Framing
@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.1","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.2","protocol_version":1,"capabilities":["session.read","session.context","turn.result","tool.read","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
 ```
 
 An error response has exactly one `error`:
@@ -139,7 +139,7 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.6.1",
+  "version": "0.6.2",
   "protocol_version": 1,
   "capabilities": [
     "session.read",
@@ -520,9 +520,16 @@ compatibility cache of one observed result. It is `null` for a non-Git,
 detached, unborn, or unavailable workspace, and an incomplete or failed status
 observation clears it rather than faking a branch.
 `model_label` is the configured Session model/profile ID, not a provider model
-identifier. Context, cost, and subscription fields are `null`/`unknown` when
-MiniCore has no reliable provider source; cumulative Usage is not treated as
-current context occupancy.
+identifier. Context `kind: "reported"` identifies the latest API request's
+reported token footprint, not current in-flight occupancy or a next-request
+estimate. The numerator prefers `provider_total_tokens`; otherwise it sums all
+five normalized, disjoint usage components only when every component is known.
+`window` is the physical context window, not the reserved input budget. Missing
+or overflowing counts stay `unknown`; cumulative billing Usage is never used.
+Reports survive loop starts and billing resets, but model changes and successful
+compaction invalidate them until fresh usage arrives. On reopen, the latest
+valid matching-model report in active post-compaction history is recovered.
+Cost and subscription fields remain `null` without a reliable provider source.
 
 ### `session.read`
 

@@ -750,6 +750,7 @@ impl Session {
         tool_observer: Arc<ToolObserver>,
     ) -> Self {
         compaction.note_settings_installed();
+        presentation.install_model(config.model());
         let inner = SessionInner {
             record,
             workspace,
@@ -1469,6 +1470,7 @@ impl Session {
         options: LoopOptions,
     ) {
         let mut inner = self.shared.inner.lock().unwrap();
+        inner.presentation.install_model(config.model());
         inner.config = config;
         inner.auto = auto.clone();
         inner.policy = policy;
@@ -1515,6 +1517,8 @@ impl Session {
             .map_err(map_store_error)?;
         let (handle, update_config) = {
             let mut inner = self.shared.inner.lock().unwrap();
+            inner.presentation.set_model_label(record.model.clone());
+            inner.presentation.install_model(config.model());
             inner.record = record;
             let update_config = config.clone();
             inner.config = config;
