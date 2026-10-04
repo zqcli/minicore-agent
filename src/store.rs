@@ -335,6 +335,11 @@ pub(crate) struct HistoryReadPage {
     pub(crate) turns: Vec<StoredTurnSummary>,
     pub(crate) turns_truncated: bool,
     pub(crate) covered_usage: crate::read::CoveredUsage,
+    /// Present only for cold display reads; never contains canonical tool bodies.
+    pub(crate) display_items: Option<Vec<(usize, String)>>,
+    pub(crate) summary_anchor_valid: bool,
+    pub(crate) scanned_bytes: u64,
+    pub(crate) scanned_lines: usize,
 }
 
 #[derive(Clone)]

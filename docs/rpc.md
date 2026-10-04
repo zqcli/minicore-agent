@@ -597,10 +597,15 @@ does not distinguish older Agent builds, and missing support must not fall back
 to raw bodies.
 
 `view: "canonical"` (the default) retains the complete existing archive contract.
-`view: "display"` requires an already-open Session and returns only its latest
-validated persisted compaction summary plus the uncovered history tail. Without
-a valid summary it exposes the same original index range; clients may keep their
-usual bounded tail window. It does not change model history or stored JSONL.
+`view: "display"` returns the latest validated compaction summary plus the
+uncovered history tail. Loaded Sessions retain their current branch projection;
+closed sessions are read directly from the Store without opening a Session or
+requiring its workspace or model. Their optional persisted summary is verified
+against the exact history prefix scanned for the response. Without a valid
+summary the same original index range is exposed through bounded display
+formatting, never raw tool bodies. An invalid-anchor retry shares the original
+scan-byte, line, cancellation, and deadline budget. Clients may keep their usual
+bounded tail window. Display reads never repair or rewrite stored JSONL.
 
 Display responses add `projection: {revision, first_item, covered_item_count,
 covered_usage}`. The first unpinned cursor at zero starts at `first_item`.
