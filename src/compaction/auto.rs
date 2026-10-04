@@ -351,7 +351,6 @@ pub(crate) struct GroupSummaryRequest<'a> {
     pub(crate) tools: Vec<ToolSpec>,
     pub(crate) group: Vec<HistoryItem>,
     pub(crate) hard_tokens: u64,
-    pub(crate) target_tokens: u64,
     pub(crate) deadline: Instant,
 }
 
@@ -378,12 +377,10 @@ pub(crate) async fn summarize_group(
         project_instructions: request.system.clone(),
         tool_schemas: request.tools,
         hard_tokens: request.hard_tokens,
-        target_tokens: request.target_tokens,
         safe_before_estimate: false,
         operation_deadline: request.deadline,
     };
-    let mut on_merge = || {};
-    generate_summary(&input, cancellation, &mut on_merge).await
+    generate_summary(&input, cancellation).await
 }
 
 pub(crate) fn invalid(_: ModelValueError) -> UtilityError {

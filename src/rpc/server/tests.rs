@@ -1500,8 +1500,8 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
             })
             .expect("manual compaction must issue an observable utility request");
         assert!(utility.request.tools().is_empty());
-        assert!(utility.request.messages().iter().any(|message| {
-            matches!(message, ModelMessage::System(text) if text.contains("read") && text.contains("input_schema"))
+        assert!(!utility.request.messages().iter().any(|message| {
+            matches!(message, ModelMessage::System(text) if text.contains("input_schema") || text.contains("RPC test system prompt"))
         }));
         assert_eq!(utility.context.request_index, 0);
         assert_ne!(utility.context.loop_id.to_string(), original_loop_id);
@@ -1895,53 +1895,124 @@ async fn missing_manual_utility_usage_remains_unknown() {
 }
 
 #[tokio::test]
-async fn manual_compaction_aggregates_usage_across_multiple_utility_calls() {
-    let mut scripts = vec![ModelScript::Text("settled")];
-    scripts.extend((0..32).map(|_| ModelScript::TextWithUsage("summary-part", 7, 11)));
-    let (agent, base, workspace) =
-        test_agent("context-utility-multiple", scripts, &[], ApprovalMode::Auto).await;
+async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot() {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-single-summary-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let model = FakeModel::new([
+        ModelScript::Text("first answer"),
+        ModelScript::Observe {
+            calls: Arc::clone(&observations),
+            text: "FIRST_SUMMARY",
+        },
+        ModelScript::Text("second answer"),
+        ModelScript::Observe {
+            calls: Arc::clone(&observations),
+            text: "UPDATED_SUMMARY",
+        },
+        ModelScript::Text("oversize settled answer"),
+    ]);
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), &[], ApprovalMode::Auto),
+        test_models(Arc::clone(&model)),
+    )
+    .await
+    .unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
-    let settled = "settled history ".repeat(7_000);
-    harness
-        .send(
-            json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled})),
-        )
-        .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
-
-    harness
-        .send(
-            json!("compact"),
-            "session.compact",
-            Some(json!({
-                "session_id": session_id,
-                "operation_id": "utility-multiple"
-            })),
-        )
-        .await;
-    let result = harness.response(json!("compact")).await;
-    assert_eq!(result["result"]["status"], json!("compacted"));
-    let call_count = result["result"]["utility_usage"]["call_count"]
-        .as_u64()
-        .expect("utility call count must be reported");
-    assert!(call_count > 1);
-    assert_eq!(result["result"]["utility_usage"]["complete"], json!(true));
-    assert_eq!(
-        result["result"]["utility_usage"]["usage"]["input_tokens"],
-        json!(call_count * 7)
-    );
-    assert_eq!(
-        result["result"]["utility_usage"]["usage"]["output_tokens"],
-        json!(call_count * 11)
-    );
-
+    let session_dir = base
+        .join("data")
+        .join("sessions")
+        .join(session_id.as_str().unwrap());
+    let summary_path = session_dir.join("summary.json");
+    let history_path = session_dir.join("history.jsonl");
+    let mut summary_before_failure = Vec::new();
+    let mut covered_before_failure = json!(null);
+    for index in 0..3 {
+        let text = if index == 2 {
+            "oversized source ".repeat(7_000)
+        } else {
+            format!("NEW_HISTORY_{index} {}", "bounded text ".repeat(200))
+        };
+        let send_id = json!(format!("single-send-{index}"));
+        harness
+            .send(
+                send_id.clone(),
+                "turn.send",
+                Some(json!({"session_id": session_id, "text": text})),
+            )
+            .await;
+        let turn = harness.response(send_id).await["result"]["turn"].clone();
+        let wait_id = json!(format!("single-wait-{index}"));
+        harness
+            .send(wait_id.clone(), "turn.wait", Some(turn_params(&turn)))
+            .await;
+        assert_eq!(
+            harness.response(wait_id).await["result"]["persistence"],
+            json!("persisted")
+        );
+        let history_before = std::fs::read(&history_path).unwrap();
+        let calls_before = model.calls.load(Ordering::SeqCst);
+        let compact_id = json!(format!("single-compact-{index}"));
+        harness.send(compact_id.clone(), "session.compact", Some(json!({"session_id": session_id, "operation_id": format!("single-operation-{index}")}))).await;
+        let result = harness.response(compact_id).await;
+        assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
+        if index < 2 {
+            assert_eq!(result["result"]["status"], json!("compacted"));
+            assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
+            assert_eq!(model.calls.load(Ordering::SeqCst), calls_before + 1);
+            summary_before_failure = std::fs::read(&summary_path).unwrap();
+            covered_before_failure = result["result"]["covered_item_count"].clone();
+        } else {
+            assert_eq!(result["result"]["status"], json!("failed"));
+            assert_eq!(result["result"]["failure_kind"], json!("budget_exceeded"));
+            assert!(result["result"]["utility_usage"].is_null());
+            assert_eq!(model.calls.load(Ordering::SeqCst), calls_before);
+            assert_eq!(
+                std::fs::read(&summary_path).unwrap(),
+                summary_before_failure
+            );
+            harness
+                .send(
+                    json!("single-context"),
+                    "session.context",
+                    Some(json!({"session_id": session_id})),
+                )
+                .await;
+            let context = harness.response(json!("single-context")).await;
+            assert_eq!(
+                context["result"]["coverage"]["covered_item_count"],
+                covered_before_failure
+            );
+        }
+    }
+    {
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        let projected = |index: usize| {
+            observations[index]
+                .request
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    ModelMessage::User(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        let first = projected(0);
+        assert!(first.contains("NEW_HISTORY_0"));
+        assert!(!first.contains("<previous-summary>"));
+        let update = projected(1);
+        assert!(!update.contains("NEW_HISTORY_0"));
+        assert!(update.contains("NEW_HISTORY_1"));
+        assert_eq!(update.matches("FIRST_SUMMARY").count(), 1);
+        assert!(update.contains("<previous-summary>\nFIRST_SUMMARY\n</previous-summary>"));
+    }
     harness.shutdown().await;
     remove_base(&base).await;
 }
@@ -2122,7 +2193,7 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
         let observations = observations.lock().unwrap();
         assert!(observations.iter().any(|call| {
             call.request.messages().iter().any(|message| {
-                matches!(message, ModelMessage::User(text) if text.contains("é🙂") && text.contains("\\n") && text.contains("\\\\"))
+                matches!(message, ModelMessage::User(text) if text.contains("é🙂") && text.contains('\n') && text.contains('\\'))
             })
         }));
         assert!(
@@ -2137,7 +2208,7 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
 }
 
 #[tokio::test]
-async fn manual_compaction_chunks_large_source_and_merges_within_call_bound() {
+async fn manual_compaction_summarizes_complete_large_source_once() {
     let base = std::env::temp_dir().join(format!(
         "minicore-agent-rpc-manual-chunk-{}",
         SessionId::new().unwrap()
@@ -2192,8 +2263,7 @@ async fn manual_compaction_chunks_large_source_and_merges_within_call_bound() {
     );
     {
         let observations = observations.lock().unwrap();
-        assert!(observations.len() >= 2);
-        assert!(observations.len() <= 32);
+        assert_eq!(observations.len(), 1);
         assert!(observations.iter().all(|call| {
             call.request.tools().is_empty()
                 && call.context.request_index == 0
@@ -2208,9 +2278,9 @@ async fn manual_compaction_chunks_large_source_and_merges_within_call_bound() {
                 matches!(message, ModelMessage::User(text) if text.contains("MINICORE HISTORICAL SOURCE DATA"))
             })
         }));
-        assert!(observations.iter().any(|call| {
-            call.request.messages().iter().any(|message| {
-                matches!(message, ModelMessage::User(text) if text.contains("MINICORE SUMMARY PARTS DATA"))
+        assert!(observations.iter().all(|call| {
+            call.request.messages().iter().all(|message| {
+                !matches!(message, ModelMessage::User(text) if text.contains("MINICORE SUMMARY PARTS DATA") || text.contains("chunk="))
             })
         }));
     }

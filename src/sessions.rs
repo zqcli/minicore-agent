@@ -652,14 +652,10 @@ struct CompactionReservation {
     tool_schemas: Vec<ToolSpec>,
     previous_summary: Option<minicore_runtime::value::BoundedText>,
     previous_covered_item_count: usize,
-    /// Automatic post-turn operations use the configured target; explicit
-    /// manual compaction keeps its original half-window target.
-    target_tokens: u64,
-    /// Effective model input ceiling for utility requests. Unlike the target,
-    /// this is a hard boundary for deciding whether a result is usable.
+    /// Effective model input ceiling for utility and reduced normal requests.
     hard_tokens: u64,
-    /// Only post-turn operations use a soft trigger. Manual compaction keeps
-    /// its explicit half-window target and is never gated by this estimate.
+    /// Only post-turn operations use a soft trigger. Manual compaction is
+    /// never gated by this estimate.
     automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
     trigger_tokens: Option<u64>,
     deadline: Instant,

@@ -3548,7 +3548,9 @@ async fn close_after_post_turn_result_still_joins_the_operation_worker() {
 async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_turn() {
     let gate = BlockGate::new();
     let dropped = Arc::new(AtomicBool::new(false));
-    let answer = Box::leak("answer ".repeat(2_000).into_boxed_str());
+    // Cross the post-turn trigger while leaving room for the single summary
+    // request framing inside the same 4,000-token hard input budget.
+    let answer = Box::leak("answer ".repeat(1_800).into_boxed_str());
     let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
         &format!("post-turn-independent-{}", next_id()),
         true,
@@ -7951,8 +7953,8 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
     std::fs::create_dir_all(&workspace).unwrap();
     // A tiny exchange is smaller than the labeled summary envelope, so the
     // utility can never produce a strictly smaller projection for it. The
-    // first summary starts the reduce loop, the second shrinks the content
-    // without winning the budget, and the third cannot shrink further.
+    // single summary cannot win the budget; no reduce or second raw start
+    // is attempted, and the remaining model scripts stay unused.
     std::fs::write(workspace.join("tiny.txt"), "x").unwrap();
 
     let model = FakeModel::with_window(
@@ -7981,8 +7983,8 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
         result.report.outcome,
         minicore_runtime::LoopOutcome::Failed(_)
     ));
-    // overflow plus three utility calls; no second raw start happens.
-    assert_eq!(model.calls.load(Ordering::SeqCst), 5);
+    // Tool call, overflow and one utility call; no second raw start happens.
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
 
     let context = agent.session_context(info.session_id).unwrap();
     let recovery = context
@@ -7990,7 +7992,7 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
         .expect("recovery observation must be recorded");
     assert_eq!(recovery.outcome, "recovery_failed");
     assert_eq!(recovery.failure_kind.as_deref(), Some("no_progress"));
-    assert!(recovery.utility_usage.is_some());
+    assert_eq!(recovery.utility_usage.unwrap().call_count, 1);
 }
 
 #[tokio::test]
@@ -8505,20 +8507,11 @@ async fn openai_overflow_loopback(preflight: bool) -> MockServer {
     MockServer::spawn(responses).await
 }
 
-/// Extracts the JSON-lines history records embedded in one utility source
-/// chunk message. `compaction/utility.rs` frames each chunk as the source
-/// prefix, a fixed instruction line, `chunk=<index>`, the records, and the
-/// source suffix; only the bytes between the chunk header and the suffix are
-/// returned, so consecutive chunks concatenate back into one record stream.
+/// Extract the single projected conversation from a utility source request.
 fn utility_source_payload(text: &str) -> Option<String> {
-    const BEGIN: &str = "[BEGIN MINICORE HISTORICAL SOURCE DATA]";
-    const END: &str = "[END MINICORE HISTORICAL SOURCE DATA]";
-    let start = text.find(BEGIN)? + BEGIN.len();
-    let end = text.rfind(END)?;
-    let inner = text.get(start..end)?;
-    let header = inner.find("chunk=")?;
-    let newline = inner[header..].find('\n')?;
-    inner.get(header + newline + 1..).map(str::to_owned)
+    let start = text.find("<conversation>\n")? + "<conversation>\n".len();
+    let end = text.rfind("</conversation>")?;
+    text.get(start..end).map(str::to_owned)
 }
 
 /// Drives one agent turn through the loopback fixture and asserts the
@@ -8658,9 +8651,8 @@ async fn run_openai_overflow_loopback(preflight: bool) {
     assert_eq!(utility, if preflight { 1 } else { 2 });
     assert!(encoded(utility).contains("MINICORE HISTORICAL SOURCE DATA"));
     assert!(!encoded(utility).contains(REPLAY_MARKER));
-    // The utility summarizer embeds real Runtime history records as JSON lines
-    // inside its source messages, so check that stream structurally instead of
-    // looking for provider wire items there.
+    // Summary projection retains the matching call and result identity while
+    // explicitly truncating only the result text, without changing history.
     let utility_payload = bodies[utility]["input"]
         .as_array()
         .expect("utility input array")
@@ -8669,44 +8661,25 @@ async fn run_openai_overflow_loopback(preflight: bool) {
         .filter_map(|content| content["text"].as_str())
         .filter_map(utility_source_payload)
         .collect::<String>();
-    let utility_records = utility_payload
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<HistoryItem>(line)
-                .expect("utility source records must be serialized history items")
-        })
-        .collect::<Vec<_>>();
-    let tool_results = utility_records
-        .iter()
-        .filter_map(|record| match record {
-            HistoryItem::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        tool_results.len(),
-        1,
-        "the utility source must contain the real tool result exactly once"
+    assert_eq!(utility_payload.matches("[Tool result:").count(), 1);
+    assert!(
+        utility_payload
+            .contains("[Tool result: name=read, call_id=call_read_1, outcome=\"success\"]: ")
     );
-    assert_eq!(tool_results[0].outcome, ToolResultOutcome::Success);
-    assert_eq!(tool_results[0].call_id.as_str(), "call_read_1");
-    assert_eq!(tool_results[0].tool_name.as_str(), "read");
+    let original_output = format!("1: {file_content}");
+    let head: String = original_output.chars().take(2000).collect();
+    assert!(utility_payload.contains(&head));
+    assert!(utility_payload.contains(&format!(
+        "[... {} more characters truncated]",
+        original_output.chars().count() - 2000
+    )));
     assert_eq!(
-        tool_results[0].output.content().as_str(),
-        format!("1: {file_content}")
+        utility_payload
+            .matches("[Assistant tool call: name=read, call_id=call_read_1]")
+            .count(),
+        1
     );
-    let matching_calls = utility_records
-        .iter()
-        .filter_map(|record| match record {
-            HistoryItem::Assistant(assistant) => Some(assistant),
-            _ => None,
-        })
-        .flat_map(|assistant| assistant.content.iter())
-        .filter_map(AssistantPart::as_tool_call)
-        .filter(|call| call.tool_call_id().as_str() == "call_read_1")
-        .count();
-    assert_eq!(matching_calls, 1, "the matching tool call must appear once");
+    assert!(utility_payload.contains("\"path\":\"file.txt\""));
 
     let folded = encoded(bodies.len() - 1);
     assert!(folded.contains("MINICORE HISTORICAL SUMMARY DATA"));
