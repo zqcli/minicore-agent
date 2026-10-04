@@ -9837,16 +9837,24 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     drop(session);
 
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
+    let mut child_pid = None;
     for _ in 0..500 {
-        if pid_file.exists() {
+        // Shell redirection can create the file before the PID is written.
+        child_pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0);
+        if child_pid.is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let Some(child_pid) = std::fs::read_to_string(&pid_file)
-        .ok()
-        .and_then(|text| text.trim().parse::<i32>().ok())
-    else {
+    let Some(child_pid) = child_pid.or_else(|| {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+    }) else {
         // A command may still be running without ever publishing a pid. Close
         // the Session first so its owners join and revert the command, then
         // fail: no other process cleanup is attempted.
