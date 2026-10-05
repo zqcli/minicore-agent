@@ -199,6 +199,21 @@ fn custom_tls_bundle_boots_ping_and_shutdown() {
     assert_fixed_config_boots(Some(&fixture));
 }
 
+#[test]
+fn custom_tls_bundle_with_chinese_path_boots_ping_and_shutdown() {
+    let temp_dir = fresh_temp_dir("tls-chinese-path");
+    let cert_dir = temp_dir.join("证书");
+    std::fs::create_dir(&cert_dir).unwrap();
+    let bundle_path = cert_dir.join("公司根证书.pem");
+    std::fs::write(
+        &bundle_path,
+        include_bytes!("fixtures/amazon-root-ca-3.pem"),
+    )
+    .unwrap();
+    assert_fixed_config_boots(Some(&bundle_path));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 fn assert_fixed_config_boots(ssl_cert_file: Option<&Path>) {
     let temp_dir = fresh_temp_dir("boot-health");
     let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
@@ -250,10 +265,25 @@ fn invalid_tls_bundle_fails_startup_without_leaking_paths_or_contents() {
     let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
     let bundle_path = temp_dir.join(format!("{SECRET_MARKER}.pem"));
     let missing_path = temp_dir.join(format!("{SECRET_MARKER}-missing.pem"));
+    #[cfg(unix)]
+    let missing_non_utf8_path = {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut filename = format!("{SECRET_MARKER}-missing-").into_bytes();
+        filename.extend_from_slice(b"\xff.pem");
+        temp_dir.join(std::ffi::OsString::from_vec(filename))
+    };
     let invalid_der = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
     for (label, path, contents) in [
         ("empty-path", Path::new(""), None),
         ("missing-file", missing_path.as_path(), None),
+        // Do not create this filename: macOS filesystems may reject raw bytes.
+        #[cfg(unix)]
+        (
+            "missing-non-utf8-file",
+            missing_non_utf8_path.as_path(),
+            None,
+        ),
         ("directory", temp_dir.as_path(), None),
         ("empty-bundle", bundle_path.as_path(), Some(Vec::new())),
         (

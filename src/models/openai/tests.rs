@@ -109,7 +109,8 @@ fn tls_client_rejects_empty_malformed_and_invalid_der_bundles() {
     }
 }
 
-#[cfg(unix)]
+// The macOS CI filesystem rejects this raw-byte filename before the client is built.
+#[cfg(target_os = "linux")]
 #[test]
 fn tls_client_accepts_non_utf8_bundle_path() {
     use std::os::unix::ffi::OsStrExt;
