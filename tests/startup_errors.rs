@@ -81,6 +81,7 @@ fn command_with_config(config_path: &Path, temp_dir: &Path) -> Command {
     command
         .args(["--config", config_path.to_str().unwrap(), "--stdio"])
         .env("MINICORE_STARTUP_TEMP", temp_dir)
+        .env_remove("SSL_CERT_FILE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -95,6 +96,11 @@ fn config_error_display_carries_predefined_static_cause() {
     assert_eq!(
         parse.to_string(),
         "invalid configuration: configuration could not be parsed (invalid syntax or unsupported fields)"
+    );
+    let trust_store = AgentError::Config(ConfigError::InvalidTlsTrustStore);
+    assert_eq!(
+        trust_store.to_string(),
+        "invalid configuration: Model TLS trust store is invalid"
     );
     let key = AgentError::Config(ConfigError::MissingModelApiKey);
     assert_eq!(
@@ -184,10 +190,23 @@ fn missing_or_empty_api_key_reports_distinct_safe_message() {
 /// over stdio, clean exit, and no provider call.
 #[test]
 fn fixed_config_boots_ping_and_shutdown_with_placeholder_key() {
+    assert_fixed_config_boots(None);
+}
+
+#[test]
+fn custom_tls_bundle_boots_ping_and_shutdown() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/amazon-root-ca-3.pem");
+    assert_fixed_config_boots(Some(&fixture));
+}
+
+fn assert_fixed_config_boots(ssl_cert_file: Option<&Path>) {
     let temp_dir = fresh_temp_dir("boot-health");
     let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
     let mut command = command_with_config(&config_path, &temp_dir);
     command.env(TEST_CREDENTIAL_ENV, "startup-health-placeholder-key");
+    if let Some(path) = ssl_cert_file {
+        command.env("SSL_CERT_FILE", path);
+    }
     let mut child = command.spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
     for request in [
@@ -222,5 +241,65 @@ fn fixed_config_boots_ping_and_shutdown_with_placeholder_key() {
         response_with_id(&responses, "shutdown")["result"]["ok"],
         serde_json::json!(true)
     );
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn invalid_tls_bundle_fails_startup_without_leaking_paths_or_contents() {
+    let temp_dir = fresh_temp_dir("tls-reject");
+    let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
+    let bundle_path = temp_dir.join(format!("{SECRET_MARKER}.pem"));
+    let missing_path = temp_dir.join(format!("{SECRET_MARKER}-missing.pem"));
+    let invalid_der = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    for (label, path, contents) in [
+        ("empty-path", Path::new(""), None),
+        ("missing-file", missing_path.as_path(), None),
+        ("directory", temp_dir.as_path(), None),
+        ("empty-bundle", bundle_path.as_path(), Some(Vec::new())),
+        (
+            "not-pem",
+            bundle_path.as_path(),
+            Some(SECRET_MARKER.as_bytes().to_vec()),
+        ),
+        (
+            "malformed-pem",
+            bundle_path.as_path(),
+            Some(
+                format!(
+                    "-----BEGIN CERTIFICATE-----\n!{SECRET_MARKER}!\n-----END CERTIFICATE-----\n"
+                )
+                .into_bytes(),
+            ),
+        ),
+        (
+            "invalid-der",
+            bundle_path.as_path(),
+            Some(invalid_der.to_vec()),
+        ),
+    ] {
+        if let Some(contents) = contents {
+            std::fs::write(path, contents).unwrap();
+        }
+        let mut command = command_with_config(&config_path, &temp_dir);
+        command
+            .env(TEST_CREDENTIAL_ENV, SECRET_MARKER)
+            .env("SSL_CERT_FILE", path);
+        let (_dir, stdout, stderr, status) = spawn_static(command);
+        assert!(!status.success(), "{label}: startup must fail closed");
+        assert!(stdout.is_empty(), "{label}: stdout must stay empty");
+        assert!(
+            stderr.contains(
+                "minicore-agent: invalid configuration: Model TLS trust store is invalid"
+            ),
+            "{label}: stderr must carry the static TLS cause, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains(SECRET_MARKER)
+                && !stderr.contains(temp_dir.to_str().unwrap())
+                && !stderr.contains("BEGIN CERTIFICATE")
+                && !stderr.contains("AQID"),
+            "{label}: stderr must not leak paths, bundle contents or credentials, got: {stderr}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

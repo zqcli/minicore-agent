@@ -1447,6 +1447,9 @@ fn map_model_config_error(error: ModelConfigError) -> AgentError {
         ModelConfigError::MissingApiKey => {
             AgentError::Config(crate::config::ConfigError::MissingModelApiKey)
         }
+        ModelConfigError::InvalidTlsTrustStore => {
+            AgentError::Config(crate::config::ConfigError::InvalidTlsTrustStore)
+        }
         ModelConfigError::InvalidConfiguration
         | ModelConfigError::ClientBuild
         | ModelConfigError::InvalidReference => {

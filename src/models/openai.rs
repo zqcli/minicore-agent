@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsStr;
 use std::pin::Pin;
 
 use std::time::{Duration, Instant, SystemTime};
@@ -86,13 +87,8 @@ impl OpenAiResponsesModel {
             settings.supports_tools,
         )
         .map_err(|_| ModelConfigError::InvalidConfiguration)?;
-        let mut client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(USER_AGENT);
-        if let Some(timeout) = settings.request_timeout {
-            client = client.timeout(timeout);
-        }
-        let client = client.build().map_err(|_| ModelConfigError::ClientBuild)?;
+        let ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
+        let client = build_http_client(settings.request_timeout, ssl_cert_file.as_deref())?;
         Ok(Self {
             descriptor,
             client,
@@ -229,6 +225,38 @@ impl OpenAiResponsesModel {
         );
         Ok(Box::pin(stream::unfold(state, next_stream_event)))
     }
+}
+
+fn build_http_client(
+    request_timeout: Option<Duration>,
+    ssl_cert_file: Option<&OsStr>,
+) -> Result<reqwest::Client, ModelConfigError> {
+    let mut client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT);
+    if let Some(timeout) = request_timeout {
+        client = client.timeout(timeout);
+    }
+    if let Some(path) = ssl_cert_file {
+        let pem = std::fs::read(path).map_err(|_| ModelConfigError::InvalidTlsTrustStore)?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|_| ModelConfigError::InvalidTlsTrustStore)?;
+        if certificates.is_empty() {
+            return Err(ModelConfigError::InvalidTlsTrustStore);
+        }
+        // An explicit bundle replaces the default roots; never fall back on failure.
+        client = client.tls_built_in_root_certs(false);
+        for certificate in certificates {
+            client = client.add_root_certificate(certificate);
+        }
+    }
+    client.build().map_err(|_| {
+        if ssl_cert_file.is_some() {
+            ModelConfigError::InvalidTlsTrustStore
+        } else {
+            ModelConfigError::ClientBuild
+        }
+    })
 }
 
 impl Model for OpenAiResponsesModel {

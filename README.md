@@ -35,6 +35,21 @@ The binary accepts `--version` or `--config <path> --stdio`. It has no
 `--help` option. The stdio service reads one JSON-RPC object per input line and
 writes responses/events as newline-delimited JSON; see [the RPC contract](docs/rpc.md).
 
+### Custom TLS Trust Store
+
+OpenAI Responses clients use reqwest's built-in trusted roots when `SSL_CERT_FILE`
+is unset. To use a custom CA bundle (for example, for a trusted TLS proxy), set
+`SSL_CERT_FILE` to a PEM file containing one or more CA certificates. The bundle
+replaces the built-in roots; include every CA your provider connections need.
+Relative paths resolve from the Agent process's working directory.
+
+An empty path, missing or unreadable file, bundle with no certificates, PEM
+parsing error reported by reqwest, or custom-client build failure stops startup
+with `ConfigError::InvalidTlsTrustStore`. PEM parsing follows reqwest's rules.
+The error does not expose the path or bundle contents, and there is no fallback
+to built-in roots. TLS certificate and hostname verification, proxy discovery,
+request timeouts, and the redirect policy remain enabled or unchanged.
+
 ## API And Design
 
 The public Rust entry point is [`src/lib.rs`](src/lib.rs). Generate local
