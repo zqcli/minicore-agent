@@ -421,6 +421,8 @@ pub enum ConfigError {
     InvalidModel,
     #[error("Model API key environment variable is missing or empty")]
     MissingModelApiKey,
+    #[error("Model TLS trust store is invalid")]
+    InvalidTlsTrustStore,
     #[error("configuration profile model was not found")]
     ProfileModelNotFound,
     #[error("configuration reasoning is unsupported")]

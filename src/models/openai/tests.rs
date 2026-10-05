@@ -27,6 +27,99 @@ use super::*;
 
 use crate::openai_mock::{MockResponse, MockServer, sse_body};
 
+const TEST_CA_BUNDLE: &[u8] = include_bytes!("../../../tests/fixtures/amazon-root-ca-3.pem");
+
+struct TlsTempDir(PathBuf);
+
+impl TlsTempDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "minicore-agent-tls-{}",
+            crate::ids::SessionId::new().unwrap()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TlsTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn tls_client_without_custom_bundle_builds() {
+    // Pass the setting explicitly: no process-wide environment mutations.
+    assert!(build_http_client(None, None).is_ok());
+    assert!(build_http_client(Some(Duration::from_secs(5)), None).is_ok());
+}
+
+#[test]
+fn tls_client_accepts_single_and_multiple_certificates() {
+    let temp = TlsTempDir::new();
+    let path = temp.0.join("ca.pem");
+    let text = std::str::from_utf8(TEST_CA_BUNDLE).unwrap();
+    for bundle in [
+        TEST_CA_BUNDLE.to_vec(),
+        TEST_CA_BUNDLE.repeat(2),
+        text.replace('\n', "\r\n").into_bytes(),
+        text.replace('\n', "\r").into_bytes(),
+        format!("# explanatory preamble\n\n{text}\n# between certificates\n\n{text}").into_bytes(),
+    ] {
+        std::fs::write(&path, bundle).unwrap();
+        assert!(build_http_client(None, Some(path.as_os_str())).is_ok());
+    }
+}
+
+#[test]
+fn tls_client_rejects_empty_missing_and_unreadable_paths() {
+    let temp = TlsTempDir::new();
+    let missing = temp.0.join("PRIVATE-PATH-MARKER-missing.pem");
+    for path in [OsStr::new(""), missing.as_os_str(), temp.0.as_os_str()] {
+        let error = build_http_client(None, Some(path)).unwrap_err();
+        assert_eq!(error, ModelConfigError::InvalidTlsTrustStore);
+        assert_eq!(error.to_string(), "model TLS trust store is invalid");
+        assert_eq!(format!("{error:?}"), "InvalidTlsTrustStore");
+    }
+}
+
+#[test]
+fn tls_client_rejects_empty_malformed_and_invalid_der_bundles() {
+    let temp = TlsTempDir::new();
+    let path = temp.0.join("PRIVATE-PATH-MARKER-ca.pem");
+    let malformed_pem =
+        b"-----BEGIN CERTIFICATE-----\n!PRIVATE-CONTENT-MARKER!\n-----END CERTIFICATE-----\n";
+    // This is valid PEM encoding but invalid certificate DER: client build must fail.
+    let invalid_der = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    for bundle in [
+        Vec::new(),
+        b" \n\t".to_vec(),
+        b"PRIVATE-CONTENT-MARKER".to_vec(),
+        malformed_pem.to_vec(),
+        invalid_der.to_vec(),
+        [TEST_CA_BUNDLE, malformed_pem].concat(),
+        [TEST_CA_BUNDLE, invalid_der].concat(),
+    ] {
+        std::fs::write(&path, bundle).unwrap();
+        let error = build_http_client(None, Some(path.as_os_str())).unwrap_err();
+        assert_eq!(error, ModelConfigError::InvalidTlsTrustStore);
+        assert_eq!(error.to_string(), "model TLS trust store is invalid");
+        assert_eq!(format!("{error:?}"), "InvalidTlsTrustStore");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn tls_client_accepts_non_utf8_bundle_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = TlsTempDir::new();
+    let path = temp.0.join(OsStr::from_bytes(b"ca-\xff.pem"));
+    std::fs::write(&path, TEST_CA_BUNDLE).unwrap();
+    assert!(build_http_client(None, Some(path.as_os_str())).is_ok());
+}
+
 fn settings(base_url: &str) -> OpenAiResponsesSettings {
     OpenAiResponsesSettings {
         model_ref: "main".parse().unwrap(),

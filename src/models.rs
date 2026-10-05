@@ -129,6 +129,8 @@ pub(crate) enum ModelConfigError {
     MissingApiKey,
     #[error("model HTTP client could not be constructed")]
     ClientBuild,
+    #[error("model TLS trust store is invalid")]
+    InvalidTlsTrustStore,
     #[error("model reference is invalid")]
     InvalidReference,
 }
