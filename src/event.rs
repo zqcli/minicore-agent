@@ -113,6 +113,20 @@ pub enum AgentEvent {
         display: crate::presentation::ToolDisplay,
         meta: EventMeta,
     },
+    /// Optional, self-contained and disposable input-generation display.
+    /// Even `Generated` is not validation, policy approval, or execution.
+    ToolArgumentsPreview {
+        turn: TurnRef,
+        request_index: u32,
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        attempt: u64,
+        revision: u64,
+        state: crate::presentation::ToolArgumentsPreviewState,
+        partial: bool,
+        display: crate::presentation::ToolDisplay,
+        meta: EventMeta,
+    },
     ToolProgress {
         turn: TurnRef,
         request_index: u32,
@@ -178,6 +192,7 @@ impl AgentEvent {
             | Self::ToolExecution { meta, .. }
             | Self::ToolProcess { meta, .. }
             | Self::ToolPresentation { meta, .. }
+            | Self::ToolArgumentsPreview { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
             | Self::InteractionRequested { meta, .. }
@@ -201,6 +216,7 @@ impl AgentEvent {
             | Self::ToolExecution { meta, .. }
             | Self::ToolProcess { meta, .. }
             | Self::ToolPresentation { meta, .. }
+            | Self::ToolArgumentsPreview { meta, .. }
             | Self::ToolProgress { meta, .. }
             | Self::ToolFinished { meta, .. }
             | Self::InteractionRequested { meta, .. }
@@ -857,6 +873,33 @@ impl Serialize for AgentEvent {
                     meta: *meta,
                 },
             ),
+            Self::ToolArgumentsPreview {
+                turn,
+                request_index,
+                tool_call_id,
+                tool_name,
+                attempt,
+                revision,
+                state,
+                partial,
+                display,
+                meta,
+            } => serialize_event(
+                serializer,
+                "tool_arguments_preview",
+                ToolArgumentsPreviewData {
+                    turn,
+                    request_index: *request_index,
+                    tool_call_id,
+                    tool_name,
+                    attempt: *attempt,
+                    revision: *revision,
+                    state: *state,
+                    partial: *partial,
+                    display,
+                    meta: *meta,
+                },
+            ),
             Self::ToolProgress {
                 turn,
                 request_index,
@@ -1054,6 +1097,20 @@ struct ToolPresentationData<'a> {
     request_index: u32,
     tool_call_id: &'a ToolCallId,
     tool_name: &'a str,
+    display: &'a crate::presentation::ToolDisplay,
+    meta: EventMeta,
+}
+
+#[derive(Serialize)]
+struct ToolArgumentsPreviewData<'a> {
+    turn: &'a TurnRef,
+    request_index: u32,
+    tool_call_id: &'a ToolCallId,
+    tool_name: &'a str,
+    attempt: u64,
+    revision: u64,
+    state: crate::presentation::ToolArgumentsPreviewState,
+    partial: bool,
     display: &'a crate::presentation::ToolDisplay,
     meta: EventMeta,
 }

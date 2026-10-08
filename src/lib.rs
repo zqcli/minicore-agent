@@ -86,7 +86,9 @@ pub use event::{
 };
 pub use ids::{SessionId, SessionIdError};
 pub use models::{ModelConfig, ModelInfo};
-pub use presentation::{AssistantDisplayPart, PresentationView, ToolDisplay};
+pub use presentation::{
+    AssistantDisplayPart, PresentationView, ToolArgumentsPreviewState, ToolDisplay,
+};
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use sessions::{

@@ -46,7 +46,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.2","protocol_version":1,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.6.2","protocol_version":1,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
 ```
 
 An error response has exactly one `error`:
@@ -156,7 +156,8 @@ protocol version, and ordered capability names:
     "workspace.status",
     "changes.list",
     "changes.diff",
-    "deferred.waiter_limit"
+    "deferred.waiter_limit",
+    "tool.arguments.preview"
   ]
 }
 ```
@@ -1754,6 +1755,10 @@ Loop-scoped events:
 - `request_started` (`turn`, `request_index`, `config_revision`, `model`, `reasoning`)
 - `output_delta` (`turn`, `request_index`, `channel` `text`/`reasoning`, `delta`, `meta`)
 - `tool_started` (`turn`, `request_index`, `tool_call_id`, `tool_name`, `meta`)
+- `tool_arguments_preview` (`turn`, `request_index`, `tool_call_id`, `tool_name`,
+  `attempt`, `revision`, `state`, `partial`, `display`, `meta`); optional,
+  disposable argument-generation display, described below. It is never an
+  invocation or execution fact.
 - `tool_invocation` (`turn`, `data`, `meta`); `data` is the same structured
   invocation record `tool.read` returns, emitted once the validated request
   reaches the policy boundary (before the approval decision and before the
@@ -1820,6 +1825,66 @@ panic payload.
 Presentation fields are additive and read-only. The Agent keeps the existing
 execution RPCs and sanitized history contract; clients may ignore unknown
 fields and unknown read-only event types.
+
+### Optional input-generation previews
+
+The additive `tool.arguments.preview` capability advertises
+`tool_arguments_preview` events. Clients must not require it: older Agents
+remain usable, and older clients can ignore the unknown event. Protocol
+version remains 1. Every event is a complete replacement snapshot, identified
+by `(session_id, loop_id, request_index, tool_call_id)` plus `attempt` and
+`revision`. An attempt increases at every real `Model::start` within a loaded
+session, including retries and model replacement. A new attempt invalidates
+all older provisional calls in that request, even if their call IDs differ.
+Revisions increase per call within an attempt; ignore older/duplicate snapshots.
+
+`state` is `generating`, `generated`, or `discarded`. `generated` means only
+that the provider ended the call's argument stream. It does **not** mean valid
+JSON, accepted tool input, policy approval, execution, success, or a file change.
+Only real invocation/execution or durable tool facts may establish those
+states. The original model events are forwarded without modification to the
+Runtime's existing assembler and tool path. Preview parsing never creates a
+ToolInvocation and never accesses the workspace, policy, or history.
+
+The incremental scanner exposes only top-level path (`path`/`file_path`),
+positive complete `read` offset/limit integers, and `write` content. `edit`
+previews show the path only; diffs come from the existing complete-input path.
+Other tools, unknown/nested fields, and raw JSON are omitted. Incomplete strings
+show only successfully decoded Unicode scalars; unfinished escapes/surrogate
+pairs are withheld. Duplicate display fields, wrong types, invalid escapes,
+or invalid JSON prefixes clear the speculative fields and set `partial`.
+`partial` also marks an incomplete final prefix or a bounded preview; ordinary
+in-progress strings alone do not set it. This deliberately conservative
+recognizer is not the Runtime's input validator.
+
+There is no cumulative raw-argument buffer. Retained sanitized display strings
+are capped at 128 KiB per call and 512 KiB per model stream, with at most 16
+previewed calls. Paths have the existing 512-byte detail cap, key recognition
+retains at most 32 bytes, and JSON nesting is capped at 64. Input is scanned
+incrementally once rather than reparsing every prefix; capped fields stop
+retaining additional bytes. `display.truncated` and `body_truncated` explicitly
+mark lost display bytes. Expansion must use only the actual retained body.
+Write cards can show the first 10 logical lines while collapsed; this is an
+input preview, not Bash output or process timing.
+
+Changed snapshots are cloned and emitted at most 30 times per second across
+the stream, driven only by incoming deltas. Call start, first visible path,
+call end, and discard are bounded immediate exceptions. No extra timer or task
+is created. The existing bounded event queue may drop any snapshot, including
+the first or last. Later snapshots are independently usable; no client-side
+JSON concatenation is needed. A receiver must not trigger `tool.read`,
+`tool.output`, or process timing for a provisional call.
+
+The stream must see both `Finish` and normal EOF to leave previews pending for
+an invocation. Errors, early drops (including assembler rejection), cancellation,
+and deadlines emit best-effort discard snapshots. Seeing `Finish` alone does
+not suppress cleanup. Clients must also clear orphan previews at authoritative
+turn termination, new request/loop/session, and durable replacement, because a
+discard event can itself be dropped. Authoritative facts always take priority
+over a late preview or discard. Previews never become durable history or a
+completed assistant answer.
+
+### Validated tool display
 
 `ToolDisplay` is generated by one Agent-owned whitelist formatter and is shared
 by live events and history. It exposes only a bounded detail line and, for
