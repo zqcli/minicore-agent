@@ -725,6 +725,26 @@ pub(super) async fn run_compaction_inner(
     else {
         return failed_compaction(&reservation.operation, "timeout", history_len);
     };
+    let eligible_prefix = anchors.prefix.as_ref().filter(|prefix| {
+        prefix.covered_item_count > reservation.previous_covered_item_count as u64
+    });
+    // Manual no-progress needs neither project instructions nor a utility
+    // budget. In particular, an unrelated invalid AGENTS.md cannot turn a
+    // short-history or repeated-compaction Noop into a workspace failure.
+    if reservation.trigger_tokens.is_none() && eligible_prefix.is_none() {
+        return CompactionResult {
+            operation_id: reservation.operation.operation_id.clone(),
+            origin: reservation.operation.origin,
+            status: CompactionStatus::Noop,
+            before_tokens: None,
+            after_tokens: None,
+            covered_loop_count: session.shared.compaction.coverage().map_or(0, |c| c.0),
+            covered_item_count: reservation.previous_covered_item_count,
+            retained_item_count,
+            utility_usage: None,
+            failure_kind: None,
+        };
+    }
     let agents = match tokio::time::timeout(
         remaining,
         reservation
@@ -763,7 +783,6 @@ pub(super) async fn run_compaction_inner(
         operation_deadline: reservation.deadline,
         live_usage: None,
     };
-    let mut automatic_before = None;
     if let (Some(budget), Some(trigger)) =
         (&reservation.automatic_budget, reservation.trigger_tokens)
     {
@@ -802,7 +821,6 @@ pub(super) async fn run_compaction_inner(
                 history_len,
             );
         };
-        automatic_before = Some(before);
         if before < trigger {
             return CompactionResult {
                 operation_id: reservation.operation.operation_id.clone(),
@@ -821,29 +839,15 @@ pub(super) async fn run_compaction_inner(
     // A fully-covered promoted emergency snapshot retains its original
     // automatic refresh path. It cannot recover raw covered items into a tail.
     let refresh_full = retained_item_count == 0 && reservation.trigger_tokens.is_some();
-    let source =
-        if refresh_full {
-            &anchors.full
-        } else if let Some(prefix) = anchors.prefix.as_ref().filter(|prefix| {
-            prefix.covered_item_count > reservation.previous_covered_item_count as u64
-        }) {
-            prefix
-        } else if reservation.trigger_tokens.is_some() {
-            return failed_compaction(&reservation.operation, "no_progress", history_len);
-        } else {
-            return CompactionResult {
-                operation_id: reservation.operation.operation_id.clone(),
-                origin: reservation.operation.origin,
-                status: CompactionStatus::Noop,
-                before_tokens: automatic_before,
-                after_tokens: automatic_before,
-                covered_loop_count: session.shared.compaction.coverage().map_or(0, |c| c.0),
-                covered_item_count: reservation.previous_covered_item_count,
-                retained_item_count,
-                utility_usage: None,
-                failure_kind: None,
-            };
-        };
+    let source = if refresh_full {
+        &anchors.full
+    } else if let Some(prefix) = eligible_prefix {
+        prefix
+    } else {
+        // Only automatic operations reach here, after the complete original
+        // request has been measured at or above its unchanged trigger.
+        return failed_compaction(&reservation.operation, "no_progress", history_len);
+    };
     let covered_item_count = source.covered_item_count as usize;
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
     let generation = if refresh_full {

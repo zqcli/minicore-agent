@@ -99,7 +99,10 @@ async fn default_compact_retains_answers_tools_and_real_next_request_after_cold_
     assert_eq!(snapshot["format_version"], 1);
     assert_eq!(snapshot["source"]["covered_item_count"], 4);
     assert!(snapshot["source"]["prefix_bytes"].as_u64().unwrap() < before.len() as u64);
+    let agents_path = data.join("workspace/AGENTS.md");
+    std::fs::write(&agents_path, [0xff, 0xfe]).unwrap();
     let again = compact(&mut agent, id, "tail-repeat").await;
+    std::fs::remove_file(agents_path).unwrap();
     assert_eq!(again.status, CompactionStatus::Noop);
     assert_eq!(again.covered_item_count, 4);
     assert_eq!(again.retained_item_count, original_count - 4);
