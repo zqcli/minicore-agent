@@ -17,6 +17,7 @@ fn parse_chunks(name: &str, source: &str, chunked: bool) -> PreviewParser {
         parser.feed(source, &mut bytes);
     }
     assert_eq!(bytes, parser.retained);
+    assert_eq!(bytes, display_capacity(&parser));
     parser
 }
 
@@ -108,7 +109,11 @@ fn only_top_level_whitelist_is_captured_and_unknown_fields_are_not_retained() {
     assert!(parser.complete());
     assert_eq!(parser.path.as_deref(), Some("right"));
     assert_eq!(parser.content.as_deref(), Some("yes"));
-    assert_eq!(parser.retained, 8);
+    assert_eq!(parser.retained, display_capacity(&parser));
+    assert_eq!(
+        parser.path.as_ref().unwrap().len() + parser.content.as_ref().unwrap().len(),
+        8
+    );
     let edit = parse_chunks(
         "edit",
         r#"{"path":"a","old_text":"old","new_text":"new","content":"unknown"}"#,
@@ -123,7 +128,8 @@ fn only_top_level_whitelist_is_captured_and_unknown_fields_are_not_retained() {
     );
     let parser = parse_chunks("read", &huge, true);
     assert!(parser.complete());
-    assert_eq!(parser.retained, 2);
+    assert_eq!(parser.retained, display_capacity(&parser));
+    assert_eq!(parser.path.as_ref().unwrap().len(), 2);
     assert!(parser.key.capacity() <= 32);
     assert_eq!(parser.scanned, huge.len());
 }
@@ -449,4 +455,95 @@ fn attempts_are_session_monotonic_and_exhaustion_disables_only_preview() {
     assert_eq!(presentation.next_preview_attempt(), Some(u64::MAX));
     assert_eq!(presentation.next_preview_attempt(), None);
     assert_eq!(presentation.next_preview_attempt(), None);
+}
+
+fn display_capacity(parser: &PreviewParser) -> usize {
+    parser.path.as_ref().map_or(0, String::capacity)
+        + parser.content.as_ref().map_or(0, String::capacity)
+}
+
+#[test]
+fn five_non_power_of_two_bodies_charge_actual_capacity_within_stream_budget() {
+    let mut charged = 0;
+    let mut parsers = Vec::new();
+    for _ in 0..5 {
+        let mut parser = PreviewParser::new("write");
+        parser.feed(r#"{"content":""#, &mut charged);
+        parser.feed(&"x".repeat(100_000), &mut charged);
+        parser.feed(r#""}"#, &mut charged);
+        assert!(parser.complete());
+        assert!(display_capacity(&parser) <= MAX_CALL_BYTES);
+        assert_eq!(parser.retained, display_capacity(&parser));
+        parsers.push(parser);
+        assert_eq!(charged, parsers.iter().map(display_capacity).sum::<usize>());
+        assert!(charged <= MAX_STREAM_BYTES);
+    }
+    assert_eq!(charged, MAX_STREAM_BYTES);
+    assert_eq!(parsers.iter().filter(|parser| parser.body_cut).count(), 1);
+    assert!(parsers[4].display().body_truncated);
+}
+
+#[test]
+fn capacity_limits_hold_after_every_unicode_scalar_across_multiple_calls() {
+    let mut charged = 0;
+    let mut parsers = Vec::new();
+    // Odd-sized paths leave non-power-of-two room for multi-byte content.
+    // The last call reaches the aggregate ceiling with an incomplete scalar's
+    // worth of free bytes; retaining a scalar is always all-or-nothing.
+    for index in 0..MAX_CALLS {
+        let mut parser = PreviewParser::new("write");
+        let source = format!(
+            r#"{{"path":"p{}","content":"{}"}}"#,
+            "中".repeat(index + 1),
+            "👩🏽‍💻é".repeat(8_000)
+        );
+        let previous: usize = parsers.iter().map(display_capacity).sum();
+        for ch in source.chars() {
+            parser.feed(&ch.to_string(), &mut charged);
+            assert_eq!(parser.retained, display_capacity(&parser));
+            assert!(parser.retained <= MAX_CALL_BYTES);
+            assert_eq!(charged, previous + parser.retained);
+            assert!(charged <= MAX_STREAM_BYTES);
+        }
+        assert!(parser.complete());
+        if let Some(body) = parser.content.as_deref() {
+            assert!("👩🏽‍💻é".repeat(8_000).starts_with(body));
+        }
+        parsers.push(parser);
+    }
+    assert!(parsers.iter().any(|parser| parser.body_cut));
+    assert!(charged <= MAX_STREAM_BYTES);
+}
+
+#[test]
+fn exact_capacity_ceiling_truncates_without_splitting_utf8_and_fail_releases_charge() {
+    let mut charged = 0;
+    let mut parsers = Vec::new();
+    for _ in 0..4 {
+        let mut parser = PreviewParser::new("write");
+        parser.feed(r#"{"content":""#, &mut charged);
+        parser.feed(&"x".repeat(MAX_CALL_BYTES - 3), &mut charged);
+        // 3 spare bytes cannot hold this 4-byte scalar. The buffer stays at
+        // its already charged ceiling, without growth or malformed UTF-8.
+        parser.feed("😀", &mut charged);
+        parser.feed(r#""}"#, &mut charged);
+        assert_eq!(display_capacity(&parser), MAX_CALL_BYTES);
+        assert_eq!(parser.content.as_ref().unwrap().len(), MAX_CALL_BYTES - 3);
+        assert!(parser.body_cut);
+        parsers.push(parser);
+    }
+    assert_eq!(charged, MAX_STREAM_BYTES);
+    // An invalid prefix releases actual capacity, including its unused tail.
+    parsers[0].feed("invalid after object", &mut charged);
+    assert!(parsers[0].invalid);
+    assert_eq!(parsers[0].retained, 0);
+    assert_eq!(charged, MAX_STREAM_BYTES - MAX_CALL_BYTES);
+    let mut replacement = PreviewParser::new("write");
+    replacement.feed(r#"{"content":""#, &mut charged);
+    replacement.feed(&"é".repeat(MAX_CALL_BYTES / 2), &mut charged);
+    replacement.feed(r#""}"#, &mut charged);
+    assert!(replacement.complete());
+    assert!(!replacement.body_cut);
+    assert_eq!(display_capacity(&replacement), MAX_CALL_BYTES);
+    assert_eq!(charged, MAX_STREAM_BYTES);
 }

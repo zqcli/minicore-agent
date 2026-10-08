@@ -1867,7 +1867,9 @@ recognizer is not the Runtime's input validator.
 
 There is no cumulative raw-argument buffer. Retained sanitized display strings
 are capped at 128 KiB per call and 512 KiB per model stream, with at most 16
-previewed calls. Paths have the existing 512-byte detail cap, key recognition
+previewed calls. The accounting includes allocated String capacity, not only
+visible byte length. Buffers grow geometrically within their remaining capacity
+budget; spare allocation can therefore make a preview truncate earlier. Paths have the existing 512-byte detail cap, key recognition
 retains at most 32 bytes, and JSON nesting is capped at 64. Input is scanned
 incrementally once rather than reparsing every prefix; capped fields stop
 retaining additional bytes. `display.truncated` and `body_truncated` explicitly

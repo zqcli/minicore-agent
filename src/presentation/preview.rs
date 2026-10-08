@@ -392,6 +392,7 @@ struct PreviewParser {
     content: Option<String>,
     offset: Option<u64>,
     limit: Option<u64>,
+    /// Actual capacity charged for path/content buffers, including spare bytes.
     retained: usize,
     path_cut: bool,
     body_cut: bool,
@@ -676,39 +677,74 @@ impl PreviewParser {
                 } else {
                     ch.encode_utf8(&mut utf8)
                 };
-                let field_len = if body {
-                    self.content.as_ref().map_or(0, String::len)
-                } else {
-                    self.path.as_ref().map_or(0, String::len)
-                };
-                let field_cap = if body {
-                    MAX_CALL_BYTES
-                } else {
-                    MAX_DETAIL_BYTES
-                };
-                if field_len + value.len() > field_cap
-                    || self.retained + value.len() > MAX_CALL_BYTES
-                    || *stream_bytes + value.len() > MAX_STREAM_BYTES
-                {
+                if !self.append_display(body, value, stream_bytes) {
                     if body {
                         self.body_cut = true;
                     } else {
                         self.path_cut = true;
                     }
-                    self.changes += 1;
-                    return;
                 }
-                if body {
-                    self.content.as_mut().unwrap().push_str(value);
-                } else {
-                    self.path.as_mut().unwrap().push_str(value);
-                }
-                self.retained += value.len();
-                *stream_bytes += value.len();
                 self.changes += 1;
             }
             _ => {}
         }
+    }
+
+    /// Geometric growth with an explicit capacity ceiling. String::push_str
+    /// normally doubles capacity, so charging only the appended byte length
+    /// would exceed the advertised per-call/stream memory limits. Reserving
+    /// exactly at the few growth boundaries remains amortized linear; there
+    /// is no per-character shrink/reallocation or cumulative JSON reparse.
+    fn append_display(&mut self, body: bool, value: &str, stream_bytes: &mut usize) -> bool {
+        let text = if body {
+            self.content.as_mut().unwrap()
+        } else {
+            self.path.as_mut().unwrap()
+        };
+        let previous_capacity = text.capacity();
+        let other_call_capacity = self.retained - previous_capacity;
+        let other_stream_capacity = *stream_bytes - previous_capacity;
+        let capacity_limit = if body {
+            MAX_CALL_BYTES
+        } else {
+            MAX_DETAIL_BYTES
+        }
+        .min(MAX_CALL_BYTES.saturating_sub(other_call_capacity))
+        .min(MAX_STREAM_BYTES.saturating_sub(other_stream_capacity));
+        let needed = text.len() + value.len();
+        if needed > capacity_limit {
+            return false;
+        }
+        if needed > previous_capacity {
+            let requested_capacity = previous_capacity
+                .saturating_mul(2)
+                .max(8)
+                .max(needed)
+                .min(capacity_limit);
+            let reserved = text
+                .try_reserve_exact(requested_capacity - text.len())
+                .is_ok();
+            let actual_capacity = text.capacity();
+            // Allocators are permitted to give reserve_exact more space than
+            // requested. Never retain that excess or undercount it. On this
+            // uncommon path, drop the speculative field instead of trying a
+            // per-character shrink or affecting the original model stream.
+            if actual_capacity > capacity_limit {
+                *text = String::new();
+                self.retained = other_call_capacity;
+                *stream_bytes = other_stream_capacity;
+                return false;
+            }
+            self.retained = other_call_capacity + actual_capacity;
+            *stream_bytes = other_stream_capacity + actual_capacity;
+            if !reserved {
+                return false;
+            }
+        }
+        // The explicit reservation above guarantees this append cannot grow.
+        debug_assert!(needed <= text.capacity());
+        text.push_str(value);
+        true
     }
 
     fn finish_key(&mut self, bytes: &mut usize) {
