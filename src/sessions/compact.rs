@@ -528,6 +528,7 @@ impl Session {
     async fn commit_compaction(
         &self,
         reservation: &CompactionReservation,
+        full_anchor: &crate::store::HistoryPrefix,
         source: &crate::store::HistoryPrefix,
         bytes: &[u8],
         summary: &minicore_runtime::value::BoundedText,
@@ -574,7 +575,7 @@ impl Session {
             .store
             .commit_summary(
                 session.session_id(),
-                source,
+                full_anchor,
                 expected_history.as_ref(),
                 bytes,
                 reservation.deadline,
@@ -615,7 +616,7 @@ impl Session {
                     self.shared.compaction.publish(
                         summary.clone(),
                         source.covered_loop_count,
-                        expected_history.len(),
+                        source.covered_item_count as usize,
                     );
                 }
                 Ok(CompactionCommit::Store(SummaryCommit::Committed))
@@ -679,6 +680,16 @@ pub(super) async fn run_compaction_inner(
         };
     }
 
+    let max_prefix_items = match crate::compaction::recent_tail_start(
+        &reservation.history,
+        reservation.previous_covered_item_count,
+        &reservation.operation.cancellation,
+        reservation.deadline,
+    ) {
+        Ok(maximum) => maximum,
+        Err(error) => return failed_compaction(&reservation.operation, error.kind(), history_len),
+    };
+
     let Some(remaining) = reservation
         .deadline
         .checked_duration_since(Instant::now())
@@ -686,12 +697,13 @@ pub(super) async fn run_compaction_inner(
     else {
         return failed_compaction(&reservation.operation, "timeout", history_len);
     };
-    let source = match tokio::time::timeout(
+    let anchors = match tokio::time::timeout(
         remaining,
-        session
-            .shared
-            .store
-            .capture_history_anchor(session.session_id(), reservation.history.as_ref()),
+        session.shared.store.capture_compaction_anchors(
+            session.session_id(),
+            reservation.history.as_ref(),
+            Some(max_prefix_items),
+        ),
     )
     .await
     {
@@ -751,6 +763,7 @@ pub(super) async fn run_compaction_inner(
         operation_deadline: reservation.deadline,
         live_usage: None,
     };
+    let mut automatic_before = None;
     if let (Some(budget), Some(trigger)) =
         (&reservation.automatic_budget, reservation.trigger_tokens)
     {
@@ -789,6 +802,7 @@ pub(super) async fn run_compaction_inner(
                 history_len,
             );
         };
+        automatic_before = Some(before);
         if before < trigger {
             return CompactionResult {
                 operation_id: reservation.operation.operation_id.clone(),
@@ -804,8 +818,45 @@ pub(super) async fn run_compaction_inner(
             };
         }
     }
+    // A fully-covered promoted emergency snapshot retains its original
+    // automatic refresh path. It cannot recover raw covered items into a tail.
+    let refresh_full = retained_item_count == 0 && reservation.trigger_tokens.is_some();
+    let source =
+        if refresh_full {
+            &anchors.full
+        } else if let Some(prefix) = anchors.prefix.as_ref().filter(|prefix| {
+            prefix.covered_item_count > reservation.previous_covered_item_count as u64
+        }) {
+            prefix
+        } else if reservation.trigger_tokens.is_some() {
+            return failed_compaction(&reservation.operation, "no_progress", history_len);
+        } else {
+            return CompactionResult {
+                operation_id: reservation.operation.operation_id.clone(),
+                origin: reservation.operation.origin,
+                status: CompactionStatus::Noop,
+                before_tokens: automatic_before,
+                after_tokens: automatic_before,
+                covered_loop_count: session.shared.compaction.coverage().map_or(0, |c| c.0),
+                covered_item_count: reservation.previous_covered_item_count,
+                retained_item_count,
+                utility_usage: None,
+                failure_kind: None,
+            };
+        };
+    let covered_item_count = source.covered_item_count as usize;
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
-    let generated = match generate_summary(&input, &reservation.operation.cancellation).await {
+    let generation = if refresh_full {
+        generate_summary(&input, &reservation.operation.cancellation).await
+    } else {
+        crate::compaction::generate_summary_with_tail(
+            &input,
+            covered_item_count,
+            &reservation.operation.cancellation,
+        )
+        .await
+    };
+    let generated = match generation {
         Ok(generated) => generated,
         Err(error) => {
             return failed_compaction_with_usage(
@@ -836,7 +887,7 @@ pub(super) async fn run_compaction_inner(
     let Some(bytes) = crate::compaction::encode_snapshot(
         session.session_id(),
         &reservation.record,
-        &source,
+        source,
         &generated.content,
     ) else {
         return failed_compaction_with_usage(
@@ -847,7 +898,13 @@ pub(super) async fn run_compaction_inner(
         );
     };
     let commit = match session
-        .commit_compaction(reservation, &source, &bytes, &generated.content)
+        .commit_compaction(
+            reservation,
+            &anchors.full,
+            source,
+            &bytes,
+            &generated.content,
+        )
         .await
     {
         Ok(commit) => commit,
@@ -868,8 +925,8 @@ pub(super) async fn run_compaction_inner(
             before_tokens: Some(generated.before_tokens),
             after_tokens: Some(generated.after_tokens),
             covered_loop_count: source.covered_loop_count,
-            covered_item_count: history_len,
-            retained_item_count: 0,
+            covered_item_count,
+            retained_item_count: history_len - covered_item_count,
             utility_usage: generated.utility_usage,
             failure_kind: None,
         },

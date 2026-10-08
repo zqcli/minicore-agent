@@ -2985,7 +2985,7 @@ async fn reported_context_tracks_last_request_reopen_compaction_and_model_change
     let (workspace, _workspace_guard) = workspace_file("reported-context-ws", "a.txt", b"hello");
     let model = FakeModel::with_window(
         "provider/main",
-        10_000,
+        40_000,
         [
             ModelScript::TextWithUsage("first", 80, 20),
             ModelScript::TextWithUsage("second", 180, 20),
@@ -3008,14 +3008,33 @@ async fn reported_context_tracks_last_request_reopen_compaction_and_model_change
     let turn = send_text(&mut agent, info.session_id, &"history ".repeat(256)).await;
     wait_text(&agent, turn).await;
     assert_eq!(context(&agent).tokens, Some(100));
-    assert_eq!(context(&agent).window, Some(10_000));
-    assert_eq!(context(&agent).percent, Some(1.0));
+    assert_eq!(context(&agent).window, Some(40_000));
+    assert_eq!(context(&agent).percent, Some(0.25));
     let turn = send_text(&mut agent, info.session_id, "next").await;
     wait_text(&agent, turn).await;
     assert_eq!(context(&agent).tokens, Some(200)); // Not cumulative 300.
     agent.close_session(info.session_id).await.unwrap();
     agent.open_session(info.session_id).await.unwrap();
     assert_eq!(context(&agent).tokens, Some(200));
+    agent.close_session(info.session_id).await.unwrap();
+    let mut tail = synthetic_loop_record(
+        LoopId::new().unwrap(),
+        &"recent ".repeat(12_000),
+        "unused",
+        false,
+    );
+    // This retained loop has no completed model request. After compaction no
+    // matching historical Usage remains to restore, preserving the test's
+    // unknown-context assertion without relying on full-history compaction.
+    tail.items.truncate(1);
+    tail.requests = 0;
+    tail.usage = Usage::default();
+    agent
+        .store
+        .append_loop(info.session_id, &tail)
+        .await
+        .unwrap();
+    agent.open_session(info.session_id).await.unwrap();
     let compact = agent
         .compact(CompactSession {
             session_id: info.session_id,
@@ -3470,8 +3489,9 @@ async fn agent_drop_cancels_a_manual_compaction_model_future() {
     let (workspace, _guard) = workspace_file("drop-compact-cancel-ws", "a.txt", b"hello");
     let gate = BlockGate::new();
     let dropped = Arc::new(AtomicBool::new(false));
-    let model = FakeModel::new(
+    let model = FakeModel::with_window(
         "main",
+        40_000,
         [
             ModelScript::Text("settled"),
             ModelScript::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "never returned"),
@@ -3486,6 +3506,19 @@ async fn agent_drop_cancels_a_manual_compaction_model_future() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "settled").await;
     wait_text(&agent, turn).await;
+    agent.close_session(info.session_id).await.unwrap();
+    let tail = synthetic_loop_record(
+        LoopId::new().unwrap(),
+        &"recent ".repeat(12_000),
+        "RECENT_TAIL_ANSWER",
+        false,
+    );
+    agent
+        .store
+        .append_loop(info.session_id, &tail)
+        .await
+        .unwrap();
+    agent.open_session(info.session_id).await.unwrap();
     let _receiver = agent
         .compact_session(CompactSession {
             session_id: info.session_id,
@@ -3567,14 +3600,20 @@ async fn close_after_post_turn_result_still_joins_the_operation_worker() {
 async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_turn() {
     let gate = BlockGate::new();
     let dropped = Arc::new(AtomicBool::new(false));
-    // Cross the post-turn trigger while leaving room for the single summary
-    // request framing inside the same 4,000-token hard input budget.
-    let answer = Box::leak("answer ".repeat(1_800).into_boxed_str());
+    // Cross the post-turn trigger with an older prefix plus a complete
+    // recent loop; the retained tail itself remains inside the hard budget.
+    let answer = Box::leak("answer ".repeat(12_000).into_boxed_str());
     let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
         &format!("post-turn-independent-{}", next_id()),
         true,
-        4_000,
-        Vec::new(),
+        40_000,
+        synthetic_loop_record(
+            LoopId::new().unwrap(),
+            &"older ".repeat(14_000),
+            "old answer",
+            false,
+        )
+        .items,
         [
             ModelScript::Text(answer),
             ModelScript::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "summary"),
@@ -3764,8 +3803,9 @@ async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
 async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
     let (data_dir, _guard) = fixture_dir(&format!("compact-close-cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("compact-close-cancel-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = FakeModel::with_window(
         "main",
+        40_000,
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
     );
     let mut agent = open_agent(
@@ -3778,6 +3818,19 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
     let settled_text = "settled history ".repeat(128);
     let turn = send_text(&mut agent, info.session_id, &settled_text).await;
     wait_text(&agent, turn).await;
+    agent.close_session(info.session_id).await.unwrap();
+    let tail = synthetic_loop_record(
+        LoopId::new().unwrap(),
+        &"recent ".repeat(12_000),
+        "RECENT_TAIL_ANSWER",
+        false,
+    );
+    agent
+        .store
+        .append_loop(info.session_id, &tail)
+        .await
+        .unwrap();
+    agent.open_session(info.session_id).await.unwrap();
 
     let gate = Arc::new(WorkerGate::new());
     pause_next_compaction_after_result(info.session_id, Arc::clone(&gate));
@@ -4985,8 +5038,9 @@ async fn reload_does_not_change_a_running_compaction_binding() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-compaction-{}", next_id()));
     let (workspace, _guard) = workspace_file("reload-compaction-ws", "a.txt", b"hello");
     let gate = BlockGate::new();
-    let model_a = FakeModel::new(
+    let model_a = FakeModel::with_window(
         "main",
+        40_000,
         [
             ModelScript::Text("settled"),
             ModelScript::BlockUntil(gate.clone(), "old summary"),
@@ -5006,6 +5060,19 @@ async fn reload_does_not_change_a_running_compaction_binding() {
     let settled_text = "settled history ".repeat(128);
     let turn = send_text(&mut agent, info.session_id, &settled_text).await;
     wait_text(&agent, turn).await;
+    agent.close_session(info.session_id).await.unwrap();
+    let tail = synthetic_loop_record(
+        LoopId::new().unwrap(),
+        &"recent ".repeat(12_000),
+        "RECENT_TAIL_ANSWER",
+        false,
+    );
+    agent
+        .store
+        .append_loop(info.session_id, &tail)
+        .await
+        .unwrap();
+    agent.open_session(info.session_id).await.unwrap();
 
     let mut result = agent
         .compact_session(CompactSession {
@@ -12282,7 +12349,7 @@ async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
 
 #[tokio::test]
 async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_input() {
-    let large_summary = Box::leak("old summary ".repeat(3_000).into_boxed_str());
+    let large_summary: &str = Box::leak("old summary ".repeat(3_000).into_boxed_str());
     let (data, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
         &format!("pi-summary-reopen-{}", next_id()),
         true,
@@ -12293,17 +12360,39 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
         None,
     )
     .await;
-    let result = agent
-        .compact(CompactSession {
-            session_id,
-            operation_id: "seed-covered-summary".into(),
-        })
+    // Seed an old-format, fully covered v1 snapshot directly. Ordinary
+    // compact now retains a recent tail; reopening legacy full coverage must
+    // still exercise the original threshold refresh behavior.
+    let history = read_store_history(&data, session_id).await;
+    let source = agent
+        .store
+        .capture_history_anchor(session_id, &history)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(
-        result.status,
-        crate::compaction::CompactionStatus::Compacted
-    );
+    let record = agent.loaded_session(session_id).unwrap().record();
+    let bytes = crate::compaction::encode_snapshot(
+        session_id,
+        &record,
+        &source,
+        &BoundedText::new(large_summary).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        agent
+            .store
+            .commit_summary(
+                session_id,
+                &source,
+                &history,
+                &bytes,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+                || true
+            )
+            .await
+            .unwrap(),
+        crate::store::SummaryCommit::Committed
+    ));
     agent.close_session(session_id).await.unwrap();
     drop(agent);
     let smaller = FakeModel::with_window(
@@ -13314,3 +13403,6 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
     );
     agent.shutdown().await.unwrap();
 }
+
+#[path = "recent_tail_tests.rs"]
+mod recent_tail;

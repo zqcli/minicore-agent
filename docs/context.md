@@ -61,8 +61,14 @@ or changed framing invalidate old usage; no missing usage component becomes zero
 
 ## Independent Manual And Post-Turn Operations
 
-Manual `session.compact` is available only while idle and retains full-coverage
-Noop semantics. It has an exact operation ID and deferred result. Manual creation rejects the reserved `auto-` prefix;
+Manual `session.compact` is available only while idle. By default it retains
+approximately 20,000 recent tokens, rounded toward older history to complete
+stored loop records. A loop, including its tool calls and results, is never split.
+The summary covers only the older prefix; display history and the next model
+request both retain the real recent answers. No raw history bytes are rewritten.
+Already summarized items never return to the retained tail. Empty/short history,
+an indivisible large loop, or repeating compact without a newer eligible prefix
+returns Noop without a utility call. It has an exact operation ID and deferred result. Manual creation rejects the reserved `auto-` prefix;
 cancellation accepts an actual automatic ID.
 
 With automatic compaction enabled, only a Completed turn whose history was
@@ -75,8 +81,12 @@ usage and does not consume the manual operation-ID quota.
 
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
-trigger it finishes Noop without a utility call; otherwise it uses the
-single-call summary engine. The configured target is advisory, not a reason
+trigger it finishes Noop without a utility call. At or above the trigger it uses
+the single-call summary engine only if a safe older prefix can advance. If the
+recent complete-loop tail leaves no progress or cannot fit with fixed request
+content and a summary, the operation fails explicitly without dropping that tail.
+An existing fully covered emergency projection keeps its automatic refresh path;
+manual compaction of fully covered history remains Noop. The configured target is advisory, not a reason
 to repeat a summary call. Even a check that becomes Noop may briefly return `session_busy` to a new submit. `turn.wait` does not wait for this
 operation, and submit does not secretly wait for a budget decision or queue an
 automatic resend. Clients retain drafts and reconcile state/context.
@@ -97,7 +107,13 @@ character count. This can omit important details at the end of a long result;
 the authoritative stored result is unchanged. This summary-only limit is separate
 from tool execution output limits.
 
-An existing summary is supplied once alongside only the uncovered history suffix.
+For manual/post-turn retention, an existing summary is supplied once alongside
+only the newly covered prefix. The before estimate includes the old summary and
+all uncovered history; the after estimate includes the new summary and the
+complete retained tail. Both include fixed instructions and tool schemas. Tail
+and fixed-content headroom are checked before the utility, then the complete
+result is checked against the hard budget and for actual progress before commit.
+Other threshold/emergency operations keep their own selected-source rules.
 Project instructions and tool schemas remain in the ordinary request and its
 budget checks, but are not repeated in the tool-free summary request. The source
 builder is bounded to the Runtime's 256 KiB message limit and checks cancellation
@@ -113,8 +129,11 @@ that the complete ordinary request fits that heuristic ceiling. Utility input
 always retains its own hard budget. A result is not repeatedly summarized merely
 to reach a preferred target. Model output configuration is unchanged. Emergency
 recovery may select several independent safe groups; each group uses at most one
-summary call, and all actual calls remain accounted. This does not add Pi's
-recent-token tail selection, split-turn summaries or file-operation ledger.
+summary call, and all actual calls remain accounted. The recent-token target is
+a bytes/4 heuristic, not a provider-tokenizer guarantee. Summary v1 only supports
+complete stored-loop prefixes: this does not add Pi's item-level split-turn
+summaries or file-operation ledger. Small windows or one oversized recent loop
+can therefore leave compaction unable to make safe progress.
 
 ## Bounded Emergency Recovery
 

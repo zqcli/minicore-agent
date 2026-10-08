@@ -5265,3 +5265,201 @@ async fn command_record_stdout_evicted_by_pressure_snapshot_commit_and_cold_proj
 
     let _ = fs::remove_dir_all(base).await;
 }
+
+#[tokio::test]
+async fn compaction_dual_anchor_uses_exact_loop_boundaries_inside_shared_buffers() {
+    let (base, store, id) = fixture("compact-dual-buffer").await;
+    store.create_session(&record(&store, id)).await.unwrap();
+    // Both an early newline sharing its buffer with later records, and a
+    // multi-buffer record followed by more records exercise exact hashing.
+    let records = [
+        loop_record(id, "first"),
+        loop_record_with_users(&["second", "third"]),
+        loop_record(id, &"z".repeat(20_000)),
+        loop_record(id, "last"),
+    ];
+    let mut history = Vec::new();
+    let mut boundaries = Vec::new();
+    for record in &records {
+        store.append_loop(id, record).await.unwrap();
+        history.extend(record.items.clone());
+        boundaries.push(
+            fs::metadata(
+                base.join("sessions")
+                    .join(id.to_string())
+                    .join("history.jsonl"),
+            )
+            .await
+            .unwrap()
+            .len(),
+        );
+    }
+    let raw_path = base
+        .join("sessions")
+        .join(id.to_string())
+        .join("history.jsonl");
+    let raw = fs::read(&raw_path).await.unwrap();
+    for (maximum, expected_items, record_index) in [(1, 1, 0), (2, 1, 0), (3, 3, 1), (4, 4, 2)] {
+        let anchors = store
+            .capture_compaction_anchors(id, &history, Some(maximum))
+            .await
+            .unwrap()
+            .unwrap();
+        let prefix = anchors.prefix.unwrap();
+        assert_eq!(prefix.covered_item_count, expected_items);
+        assert_eq!(prefix.prefix_bytes, boundaries[record_index]);
+        assert_eq!(
+            prefix.sha256,
+            digest_hex(Sha256::new().chain_update(&raw[..boundaries[record_index] as usize]))
+        );
+        assert_eq!(
+            anchors.full.sha256,
+            digest_hex(Sha256::new().chain_update(&raw))
+        );
+        assert_eq!(anchors.full.covered_item_count, 5);
+        assert_eq!(
+            store
+                .read_history_prefix(id, prefix.prefix_bytes, &history)
+                .await
+                .unwrap()
+                .unwrap(),
+            prefix
+        );
+    }
+    assert_eq!(fs::read(&raw_path).await.unwrap(), raw);
+    fs::remove_dir_all(base).await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_dual_anchor_rejects_same_length_prefix_tail_and_incomplete_changes() {
+    let (base, store, id) = fixture("compact-dual-tamper").await;
+    store.create_session(&record(&store, id)).await.unwrap();
+    let first = loop_record(id, "PREFIX_MARKER");
+    let tail = loop_record(id, "TAIL_MARKER");
+    store.append_loop(id, &first).await.unwrap();
+    store.append_loop(id, &tail).await.unwrap();
+    let history = [first.items.clone(), tail.items.clone()].concat();
+    let path = base
+        .join("sessions")
+        .join(id.to_string())
+        .join("history.jsonl");
+    let raw = fs::read(&path).await.unwrap();
+    let anchor = store
+        .capture_compaction_anchors(id, &history, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    for marker in ["PREFIX_MARKER", "TAIL_MARKER"] {
+        let mut changed = String::from_utf8(raw.clone()).unwrap();
+        let position = changed.find(marker).unwrap();
+        changed.replace_range(position..position + 1, "X");
+        assert_eq!(changed.len(), raw.len());
+        fs::write(&path, changed).await.unwrap();
+        assert!(
+            store
+                .capture_compaction_anchors(id, &history, Some(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .commit_summary(
+                    id,
+                    &anchor.full,
+                    &history,
+                    b"{}",
+                    Instant::now() + Duration::from_secs(10),
+                    || true
+                )
+                .await
+                .unwrap(),
+            SummaryCommit::Rejected
+        ));
+    }
+    fs::write(&path, &raw[..raw.len() - 1]).await.unwrap();
+    assert!(
+        store
+            .capture_compaction_anchors(id, &history, Some(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fs::read(&path).await.unwrap(), raw[..raw.len() - 1]);
+    let appended = [
+        raw.clone(),
+        serde_json::to_vec(&first).unwrap(),
+        b"\n".to_vec(),
+    ]
+    .concat();
+    fs::write(&path, appended).await.unwrap();
+    assert!(
+        store
+            .capture_compaction_anchors(id, &history, Some(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_dir_all(base).await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_commit_full_anchor_binds_retained_record_metadata() {
+    let (base, store, id) = fixture("compact-full-metadata").await;
+    store.create_session(&record(&store, id)).await.unwrap();
+    let first = loop_record(id, "old");
+    let tail = loop_record(id, "recent");
+    store.append_loop(id, &first).await.unwrap();
+    store.append_loop(id, &tail).await.unwrap();
+    let history = [first.items.clone(), tail.items.clone()].concat();
+    let anchors = store
+        .capture_compaction_anchors(id, &history, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let directory = base.join("sessions").join(id.to_string());
+    let path = directory.join("history.jsonl");
+    let raw = fs::read(&path).await.unwrap();
+    let split = anchors.prefix.as_ref().unwrap().prefix_bytes as usize;
+    let mut changed_tail: serde_json::Value =
+        serde_json::from_slice(&raw[split..raw.len() - 1]).unwrap();
+    let previous = changed_tail["completed_at"].as_str().unwrap().to_owned();
+    let replacement = if previous.starts_with('2') { "3" } else { "2" };
+    changed_tail["completed_at"] = json!(format!("{replacement}{}", &previous[1..]));
+    // Preserve the original JSON field ordering and bytes, changing only one
+    // metadata byte in the tail. Normalized item equality alone cannot catch it.
+    let tail_text = std::str::from_utf8(&raw[split..]).unwrap();
+    let changed = tail_text.replacen(&previous, changed_tail["completed_at"].as_str().unwrap(), 1);
+    let bytes = [&raw[..split], changed.as_bytes()].concat();
+    assert_eq!(bytes.len(), raw.len());
+    fs::write(&path, bytes).await.unwrap();
+    let actual = store
+        .capture_compaction_anchors(id, &history, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.prefix, anchors.prefix);
+    assert_ne!(actual.full.sha256, anchors.full.sha256);
+    fs::write(directory.join("summary.json"), b"old snapshot")
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .commit_summary(
+                id,
+                &anchors.full,
+                &history,
+                b"new snapshot",
+                Instant::now() + Duration::from_secs(10),
+                || true
+            )
+            .await
+            .unwrap(),
+        SummaryCommit::Rejected
+    ));
+    assert_eq!(
+        fs::read(directory.join("summary.json")).await.unwrap(),
+        b"old snapshot"
+    );
+    fs::remove_dir_all(base).await.unwrap();
+}

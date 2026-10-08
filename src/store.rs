@@ -318,6 +318,13 @@ pub(crate) struct HistoryPrefix {
     pub(crate) sha256: String,
 }
 
+/// One bounded scan proves both the full commit gate and a complete-loop
+/// prefix to summarize. The prefix never includes bytes from a later record.
+pub(crate) struct CompactionAnchors {
+    pub(crate) full: HistoryPrefix,
+    pub(crate) prefix: Option<HistoryPrefix>,
+}
+
 pub(crate) struct HistoryScanLimits {
     pub(crate) max_bytes: u64,
     pub(crate) max_lines: usize,
