@@ -403,8 +403,16 @@ identity, `request_index: 0`, an empty tool list, and the selected reasoning
 preference. History is sent as explicitly labeled data. The complete
 `history.jsonl` remains authoritative and unchanged; a successful bounded
 `summary.json` is a separately validated derived snapshot. On reopen, the
-summary is consumed as a non-system historical-data message and the next
-current User message remains a separate input.
+summary is consumed as a non-system historical-data message, followed by its
+retained raw tail; the next current User message remains a separate input.
+Manual and ordinary post-turn compaction retain approximately 20,000 recent
+tokens rounded to complete stored loops. Result coverage counts describe only
+the summarized prefix, and retained counts describe real remaining items.
+Manual operations with no newer eligible prefix return `noop`. Automatic checks
+below their trigger remain `noop`; above the trigger, no safe prefix yields
+`failed`/`no_progress`, and an unfit tail plus fixed content yields a budget
+failure. Neither case drops the tail or alters the previous snapshot. A fully
+covered emergency snapshot keeps its existing automatic refresh behavior.
 
 ### `session.context`
 

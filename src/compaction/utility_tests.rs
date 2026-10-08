@@ -542,3 +542,218 @@ fn invalid_covered_prefix_is_rejected() {
         Err(UtilityError::InvalidResponse)
     ));
 }
+
+#[test]
+fn recent_tail_selection_is_bounded_and_never_restores_covered_items() {
+    let cancel = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let choose = |history: &[HistoryItem], covered| {
+        recent_tail_start(history, covered, &cancel, deadline).unwrap()
+    };
+    assert_eq!(choose(&[], 0), 0);
+    assert_eq!(choose(&[user_item("short")], 0), 0);
+    assert_eq!(choose(&[user_item(&"x".repeat(100_000))], 0), 0);
+    let history = vec![
+        user_item("covered never resurrects"),
+        user_item("old candidate"),
+        user_item(&"x".repeat(41_000)),
+        user_item(&"y".repeat(41_000)),
+    ];
+    assert_eq!(choose(&history, 0), 2);
+    assert_eq!(choose(&history, 3), 3);
+    assert_eq!(choose(&[user_item(&"é\n\"".repeat(20_000))], 0), 0);
+    cancel.cancel();
+    assert_eq!(
+        recent_tail_start(&history, 0, &cancel, deadline),
+        Err(UtilityError::Cancelled)
+    );
+    assert_eq!(
+        recent_tail_start(&history, 0, &CancellationToken::new(), Instant::now()),
+        Err(UtilityError::Timeout)
+    );
+}
+
+#[tokio::test]
+async fn tail_generation_keeps_source_before_and_after_ranges_distinct() {
+    let model = Fake::new("small updated summary");
+    let mut input = input(
+        &model,
+        vec![
+            user_item("COVERED_RAW_NEVER_REPLAY"),
+            user_item(&format!("NEW_PREFIX {}", "old details ".repeat(2000))),
+            user_item(&format!("TAIL_USER {}", "recent text ".repeat(8000))),
+            assistant(vec![AssistantPart::Text("TAIL_ANSWER".into())]),
+        ],
+    );
+    input.previous_summary = Some(BoundedText::new("PREVIOUS_SUMMARY").unwrap());
+    input.previous_covered_item_count = 1;
+    let history_bytes = serde_json::to_vec(input.history.as_ref()).unwrap();
+    let generated = generate_summary_with_tail(&input, 2, &CancellationToken::new())
+        .await
+        .ok()
+        .unwrap();
+    let calls = model.requests.lock().unwrap();
+    let source = user_text(&calls[0].messages()[1]);
+    assert_eq!(source.matches("PREVIOUS_SUMMARY").count(), 1);
+    assert!(source.contains("NEW_PREFIX"));
+    assert!(!source.contains("COVERED_RAW_NEVER_REPLAY"));
+    assert!(!source.contains("TAIL_USER"));
+    assert!(!source.contains("TAIL_ANSWER"));
+    assert_eq!(
+        generated.before_tokens,
+        estimate_before_tokens(&input).unwrap()
+    );
+    assert_eq!(
+        generated.after_tokens,
+        estimate_after_tokens_with_tail(&input, &generated.content, &input.history[2..]).unwrap()
+    );
+    println!(
+        "COMPACT_BUDGET_EVIDENCE {}",
+        json!({
+            "before_tokens": generated.before_tokens,
+            "after_tokens": generated.after_tokens,
+            "utility_request": &calls[0],
+            "before_request": normal_request(&input, input.previous_summary.as_ref(), &input.history[1..]).unwrap(),
+            "after_request": normal_request(&input, Some(&generated.content), &input.history[2..]).unwrap(),
+        })
+    );
+    assert!(generated.after_tokens > 20_000);
+    assert!(generated.after_tokens < generated.before_tokens);
+    assert_eq!(
+        serde_json::to_vec(input.history.as_ref()).unwrap(),
+        history_bytes
+    );
+}
+
+#[tokio::test]
+async fn retained_tail_and_fixed_request_budget_fail_before_utility() {
+    let model = Fake::new("unused");
+    let mut input = input(
+        &model,
+        vec![
+            user_item(&"old ".repeat(2000)),
+            user_item(&"tail ".repeat(20_000)),
+        ],
+    );
+    input.hard_tokens = 20_000;
+    let error = generate_summary_with_tail(&input, 1, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.error, UtilityError::Budget);
+    assert_eq!(model.calls(), 0);
+    assert!(error.utility_usage.is_none());
+    input.hard_tokens = 30_000;
+    input.project_instructions = BoundedText::new("fixed ".repeat(10_000)).unwrap();
+    let error = generate_summary_with_tail(&input, 1, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.error, UtilityError::Budget);
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test]
+async fn complete_after_budget_counts_escaped_summary_with_tail() {
+    let model = Fake::new(&"\"".repeat(6000));
+    let mut input = input(
+        &model,
+        vec![
+            user_item(&"old ".repeat(6000)),
+            user_item(&"tail ".repeat(16_000)),
+        ],
+    );
+    let floor = estimate_after_tokens_with_tail(
+        &input,
+        &BoundedText::new("x").unwrap(),
+        &input.history[1..],
+    )
+    .unwrap();
+    input.hard_tokens = floor + 2000;
+    let error = generate_summary_with_tail(&input, 1, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.error, UtilityError::NoProgress);
+    assert_eq!(model.calls(), 1);
+}
+
+#[tokio::test]
+async fn summary_larger_than_new_prefix_is_not_progress_despite_large_tail() {
+    let model = Fake::new(&"summary bigger than prefix ".repeat(100));
+    let input = input(
+        &model,
+        vec![
+            user_item("short old prefix"),
+            user_item(&"tail ".repeat(20_000)),
+        ],
+    );
+    let error = generate_summary_with_tail(&input, 1, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.error, UtilityError::NoProgress);
+    assert_eq!(model.calls(), 1);
+}
+
+#[test]
+fn recent_tail_target_includes_exact_twenty_thousand_token_boundary() {
+    let probe = user_item("x");
+    let overhead = serde_json::to_vec(&probe).unwrap().len() - 1;
+    let exact = user_item(&"x".repeat(80_000 - overhead));
+    assert_eq!(serde_json::to_vec(&exact).unwrap().len(), 80_000);
+    let below = user_item(&"x".repeat(79_996 - overhead));
+    let choose = |last| {
+        recent_tail_start(
+            &[user_item("older"), last],
+            0,
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+    };
+    assert_eq!(choose(exact), 1);
+    assert_eq!(choose(below), 0);
+}
+
+#[tokio::test]
+async fn retained_tail_fits_without_schemas_but_fixed_schemas_prevent_utility() {
+    let model = Fake::new("summary");
+    let mut input = input(
+        &model,
+        vec![
+            user_item(&"old detail ".repeat(1000)),
+            user_item(&"tail ".repeat(20_000)),
+        ],
+    );
+    let floor = estimate_after_tokens_with_tail(
+        &input,
+        &BoundedText::new("x").unwrap(),
+        &input.history[1..],
+    )
+    .unwrap();
+    input.hard_tokens = floor + 128;
+    assert!(summary_budget_with_tail(&input, &input.history[1..]).is_ok());
+    let accepted = generate_summary_with_tail(&input, 1, &CancellationToken::new())
+        .await
+        .ok()
+        .unwrap();
+    assert!(accepted.after_tokens <= input.hard_tokens);
+    assert_eq!(model.calls(), 1);
+    input.tool_schemas.push(ToolSpec::new("read".parse().unwrap(), "schema budget fixture", json!({
+        "type":"object",
+        "properties":{"path":{"type":"string", "description":"schema detail ".repeat(1000)}},
+        "required":["path"], "additionalProperties":false,
+    })).unwrap());
+    let error = generate_summary_with_tail(&input, 1, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.error, UtilityError::Budget);
+    assert!(error.utility_usage.is_none());
+    assert_eq!(
+        model.calls(),
+        1,
+        "schemas must reject before another utility call"
+    );
+}

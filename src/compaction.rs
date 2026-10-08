@@ -22,7 +22,9 @@ pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
     ActiveRecoveryTicket, CompactingModel, compute_content_hash, recovery_source_is_safe,
 };
-pub(crate) use utility::{CompactionInput, UtilityError, generate_summary};
+pub(crate) use utility::{
+    CompactionInput, UtilityError, generate_summary, generate_summary_with_tail, recent_tail_start,
+};
 /// Failure kind recorded when request preparation cannot reduce a context
 /// without dropping user constraints or replaying tools.
 pub(crate) const CONTEXT_UNCOMPRESSIBLE: &str = "context_uncompressible";

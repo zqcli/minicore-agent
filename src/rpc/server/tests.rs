@@ -168,6 +168,10 @@ impl FakeModel {
         Self::with_context_and_capabilities(scripts, 16_384, fake_supported_reasoning(), true)
     }
 
+    fn for_compaction(scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
+        Self::with_context_window(scripts, 40_000)
+    }
+
     fn with_context_window(
         scripts: impl IntoIterator<Item = ModelScript>,
         context_window: u64,
@@ -416,6 +420,28 @@ async fn test_agent(
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let model = FakeModel::new(scripts);
+    let agent = Agent::open_with_models(
+        test_config(base.join("data"), tools, approval),
+        test_models(model),
+    )
+    .await
+    .unwrap();
+    (agent, base, workspace)
+}
+
+async fn test_compaction_agent(
+    label: &str,
+    scripts: impl IntoIterator<Item = ModelScript>,
+    tools: &[&str],
+    approval: ApprovalMode,
+) -> (Agent, PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!(
+        "minicore-agent-rpc-{label}-{}",
+        SessionId::new().unwrap()
+    ));
+    let workspace = base.join("workspace");
+    tokio::fs::create_dir_all(&workspace).await.unwrap();
+    let model = FakeModel::for_compaction(scripts);
     let agent = Agent::open_with_models(
         test_config(base.join("data"), tools, approval),
         test_models(model),
@@ -1215,8 +1241,72 @@ async fn create_and_open(harness: &mut RpcHarness, workspace: &Path) -> Value {
     session_id
 }
 
+/// Give lifecycle/budget tests a real legal prefix plus a complete recent
+/// loop above the default 20k retention target, without consuming fake model
+/// scripts. Reload through the public RPC so memory and durable bytes agree.
+async fn append_compaction_tail(harness: &mut RpcHarness, base: &Path, session_id: &Value) {
+    harness
+        .send(
+            json!("fixture-close"),
+            "session.close",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert_eq!(
+        harness.response(json!("fixture-close")).await["result"]["ok"],
+        true
+    );
+    let store = crate::store::Store::open(base.join("data")).await.unwrap();
+    let id: SessionId = session_id.as_str().unwrap().parse().unwrap();
+    let loop_id = minicore_runtime::LoopId::new().unwrap();
+    let record = crate::store::StoredLoopRecord {
+        loop_id,
+        outcome: crate::store::StoredLoopOutcome::Completed,
+        items: vec![
+            minicore_runtime::history::HistoryItem::User(minicore_runtime::history::UserHistory {
+                loop_id,
+                kind: minicore_runtime::history::UserMessageKind::Prompt,
+                input: minicore_runtime::execution::UserInput::text(format!(
+                    "RETAINED_TAIL {}",
+                    "recent ".repeat(12_000)
+                ))
+                .unwrap(),
+            }),
+            minicore_runtime::history::HistoryItem::Assistant(
+                minicore_runtime::history::AssistantHistory {
+                    loop_id,
+                    request_index: 0,
+                    model: "fake".parse().unwrap(),
+                    reasoning: ReasoningPreference::Auto,
+                    content: vec![minicore_runtime::model::AssistantPart::Text(
+                        "RECENT_TAIL_ANSWER".into(),
+                    )],
+                    provider_replay: None,
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: Usage::new(1, 1, 0),
+                },
+            ),
+        ],
+        usage: Usage::new(1, 1, 0),
+        requests: 1,
+        tool_rounds: 0,
+        final_config_revision: minicore_runtime::execution::ConfigRevision::INITIAL,
+        completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
+        user_times: None,
+    };
+    store.append_loop(id, &record).await.unwrap();
+    harness
+        .send(
+            json!("fixture-open"),
+            "session.open",
+            Some(json!({"session_id": session_id})),
+        )
+        .await;
+    assert!(harness.response(json!("fixture-open")).await["error"].is_null());
+}
+
 async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: &str) -> Value {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         label,
         [ModelScript::Text("settled"), script],
         &[],
@@ -1237,6 +1327,7 @@ async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: 
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     harness
         .send(
             json!("compact"),
@@ -1371,7 +1462,7 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
         calls: Arc::clone(&observations),
         text: "manual compact summary",
     }));
-    let model = FakeModel::new(scripts);
+    let model = FakeModel::for_compaction(scripts);
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &["read"], ApprovalMode::Auto),
         test_models(model),
@@ -1406,6 +1497,7 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
         let waited = harness.response(wait_id).await;
         assert_eq!(waited["result"]["persistence"], json!("persisted"));
     }
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     let original_loop_id = original_loop_id.expect("at least one settled turn is required");
 
     let session_key = session_id.as_str().unwrap();
@@ -1605,7 +1697,7 @@ async fn manual_compaction_completion_clears_authoritative_busy_state() {
 #[tokio::test]
 async fn session_context_reports_manual_busy_state_and_last_result() {
     let utility_started = Arc::new(Notify::new());
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "context-manual-busy",
         [
             ModelScript::Text("settled"),
@@ -1630,6 +1722,7 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
         .send(
@@ -1718,7 +1811,7 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
 
 #[tokio::test]
 async fn manual_compaction_reports_independent_utility_usage() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "context-utility-usage",
         [
             ModelScript::TextWithUsage("settled", 41, 43),
@@ -1743,6 +1836,7 @@ async fn manual_compaction_reports_independent_utility_usage() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let waited = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     assert_eq!(waited["result"]["usage"]["input_tokens"], json!(41));
 
     harness
@@ -1795,7 +1889,7 @@ async fn manual_compaction_reports_independent_utility_usage() {
 
 #[tokio::test]
 async fn failed_manual_utility_stream_keeps_known_partial_usage() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "context-utility-partial",
         [
             ModelScript::TextWithUsage("settled", 41, 43),
@@ -1820,6 +1914,7 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
         .send(
@@ -1851,7 +1946,7 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
 
 #[tokio::test]
 async fn missing_manual_utility_usage_remains_unknown() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "context-utility-unknown",
         [
             ModelScript::TextWithUsage("settled", 41, 43),
@@ -1876,6 +1971,7 @@ async fn missing_manual_utility_usage_remains_unknown() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
         .send(
@@ -1906,7 +2002,7 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let model = FakeModel::new([
+    let model = FakeModel::for_compaction([
         ModelScript::Text("first answer"),
         ModelScript::Observe {
             calls: Arc::clone(&observations),
@@ -1958,6 +2054,7 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
             harness.response(wait_id).await["result"]["persistence"],
             json!("persisted")
         );
+        append_compaction_tail(&mut harness, &base, &session_id).await;
         let history_before = std::fs::read(&history_path).unwrap();
         let calls_before = model.calls.load(Ordering::SeqCst);
         let compact_id = json!(format!("single-compact-{index}"));
@@ -2022,7 +2119,7 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
 
 #[tokio::test]
 async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "context-utility-cancel",
         [
             ModelScript::TextWithUsage("settled", 2, 3),
@@ -2047,6 +2144,7 @@ async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let gate = Arc::new(SummaryCommitGate::new());
     let typed_session_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
@@ -2123,6 +2221,7 @@ async fn manual_compaction_rejects_fixed_schema_budget_before_model_call() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
         .send(
@@ -2152,7 +2251,7 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let model = FakeModel::new([
+    let model = FakeModel::for_compaction([
         ModelScript::Text("settled"),
         ModelScript::Observe {
             calls: Arc::clone(&observations),
@@ -2180,6 +2279,7 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     harness
         .send(
             json!("compact"),
@@ -2224,7 +2324,7 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
         calls: Arc::clone(&observations),
         text: "partial summary",
     }));
-    let model = FakeModel::new(scripts);
+    let model = FakeModel::for_compaction(scripts);
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &[], ApprovalMode::Auto),
         test_models(model),
@@ -2246,6 +2346,7 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     harness
         .send(
             json!("compact"),
@@ -2418,7 +2519,7 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
 
 #[tokio::test]
 async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-cancel",
         [
             ModelScript::Text("settled"),
@@ -2444,6 +2545,7 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
         .send(
@@ -2534,7 +2636,7 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
 
 #[tokio::test]
 async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-owned-handle",
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
         &[],
@@ -2556,6 +2658,7 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let gate = Arc::new(WorkerGate::new());
     pause_next_compaction_after_result(
@@ -2616,7 +2719,7 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
 
 #[tokio::test]
 async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-write-failure",
         [
             ModelScript::TextWithUsage("settled", 2, 3),
@@ -2643,6 +2746,7 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     let session_dir = base
         .join("data")
         .join("sessions")
@@ -2684,6 +2788,7 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
         )
         .await;
     let _ = harness.response(json!("next-wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     let history_before = std::fs::read(&history_path).unwrap();
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
     fail_next_summary_write(typed_id);
@@ -2720,7 +2825,7 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
 
 #[tokio::test]
 async fn manual_compaction_rejects_model_failures_and_tool_events() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-model-failure",
         [ModelScript::Text("settled"), ModelScript::Fail],
         &[],
@@ -2741,6 +2846,7 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     harness
         .send(
             json!("compact"),
@@ -2757,7 +2863,7 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
     harness.shutdown().await;
     remove_base(&base).await;
 
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-tool-event",
         [
             ModelScript::Text("settled"),
@@ -2784,6 +2890,7 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     harness
         .send(
             json!("compact"),
@@ -2806,7 +2913,7 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
 
 #[tokio::test]
 async fn manual_compaction_reports_unknown_write_without_publishing_state() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-unknown-write",
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
         &[],
@@ -2828,6 +2935,7 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
     force_unknown_summary_write(session_id.as_str().unwrap().parse().unwrap());
     harness
         .send(
@@ -2863,7 +2971,7 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
 
 #[tokio::test]
 async fn manual_compaction_revalidates_history_before_commit() {
-    let (agent, base, workspace) = test_agent(
+    let (agent, base, workspace) = test_compaction_agent(
         "manual-revalidate",
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
         &[],
@@ -2885,6 +2993,7 @@ async fn manual_compaction_revalidates_history_before_commit() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let history_path = base
         .join("data")
@@ -2947,7 +3056,8 @@ async fn manual_compaction_deadline_covers_commit_wait() {
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
     config.loop_options.model_timeout_seconds = Some(1);
-    let model = FakeModel::new([ModelScript::Text("settled"), ModelScript::Text("summary")]);
+    let model =
+        FakeModel::for_compaction([ModelScript::Text("settled"), ModelScript::Text("summary")]);
     let agent = Agent::open_with_models(config, test_models(model))
         .await
         .unwrap();
@@ -2966,6 +3076,7 @@ async fn manual_compaction_deadline_covers_commit_wait() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
+    append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let gate = Arc::new(SummaryCommitGate::new());
     gate_next_summary_commit(
