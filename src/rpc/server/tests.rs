@@ -655,7 +655,8 @@ async fn capability_discovery_returns_ordered_lists() {
             "workspace.status",
             "changes.list",
             "changes.diff",
-            "deferred.waiter_limit"
+            "deferred.waiter_limit",
+            "tool.arguments.preview"
         ])
     );
 
