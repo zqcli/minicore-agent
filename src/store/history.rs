@@ -31,7 +31,11 @@ impl Store {
         let file = File::open(path)
             .await
             .map_err(|_| StoreError::Unavailable)?;
-        scan_history_prefix(file, prefix_bytes, expected_history).await
+        Ok(
+            scan_history_prefix(file, prefix_bytes, expected_history, None)
+                .await?
+                .map(|anchors| anchors.full),
+        )
     }
 
     /// Captures the complete raw history anchor without tail repair. The
@@ -42,6 +46,20 @@ impl Store {
         session_id: SessionId,
         expected_history: &[HistoryItem],
     ) -> Result<Option<HistoryPrefix>, StoreError> {
+        Ok(self
+            .capture_compaction_anchors(session_id, expected_history, None)
+            .await?
+            .map(|anchors| anchors.full))
+    }
+
+    /// Select the last complete loop ending at or before `max_prefix_items`,
+    /// while still validating every retained item and the full file length.
+    pub(crate) async fn capture_compaction_anchors(
+        &self,
+        session_id: SessionId,
+        expected_history: &[HistoryItem],
+        max_prefix_items: Option<usize>,
+    ) -> Result<Option<CompactionAnchors>, StoreError> {
         let directory = self.require_session_directory(session_id).await?;
         let path = directory.join(HISTORY_FILE);
         match path_state(&path)
@@ -60,7 +78,9 @@ impl Store {
             .await
             .map_err(|_| StoreError::Unavailable)?;
         let length = metadata.len();
-        let Some(anchor) = scan_history_prefix(file, length, expected_history).await? else {
+        let Some(anchors) =
+            scan_history_prefix(file, length, expected_history, max_prefix_items).await?
+        else {
             return Ok(None);
         };
         let final_length = fs::metadata(&path)
@@ -70,10 +90,12 @@ impl Store {
         if final_length != length {
             return Ok(None);
         }
-        if anchor.covered_item_count != u64::try_from(expected_history.len()).unwrap_or(u64::MAX) {
+        if anchors.full.covered_item_count
+            != u64::try_from(expected_history.len()).unwrap_or(u64::MAX)
+        {
             return Ok(None);
         }
-        Ok(Some(anchor))
+        Ok(Some(anchors))
     }
 
     /// Appends one completed loop as a single JSON line. On success the file
@@ -751,7 +773,8 @@ async fn scan_history_prefix(
     file: File,
     prefix_bytes: u64,
     expected_history: &[HistoryItem],
-) -> Result<Option<HistoryPrefix>, StoreError> {
+    max_prefix_items: Option<usize>,
+) -> Result<Option<CompactionAnchors>, StoreError> {
     let mut reader = BufReader::new(file);
     let mut remaining = prefix_bytes;
     let mut hasher = Sha256::new();
@@ -759,6 +782,7 @@ async fn scan_history_prefix(
     let mut covered_loop_count = 0_u64;
     let mut covered_item_count = 0_u64;
     let mut last_loop_id = None;
+    let mut prefix = None;
     // Bind the raw scan to the already-loaded sanitized history without
     // constructing a second history-sized collection.
     let mut expected_item_index = 0_usize;
@@ -775,13 +799,14 @@ async fn scan_history_prefix(
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let bytes = &chunk[..take];
-        hasher.update(bytes);
-
         let mut segment_start = 0;
         for (index, byte) in bytes.iter().enumerate() {
             if *byte != b'\n' {
                 continue;
             }
+            // Hash exactly through this newline, not the entire buffered
+            // chunk: later records may share the same BufReader buffer.
+            hasher.update(&bytes[segment_start..=index]);
             let segment = &bytes[segment_start..index];
             let line_length = line
                 .len()
@@ -818,11 +843,22 @@ async fn scan_history_prefix(
                 .checked_add(u64::try_from(normalized.len()).map_err(|_| StoreError::Corrupt)?)
                 .ok_or(StoreError::Corrupt)?;
             last_loop_id = Some(record.loop_id);
+            if max_prefix_items.is_some_and(|maximum| expected_item_index <= maximum) {
+                prefix = Some(HistoryPrefix {
+                    prefix_bytes: prefix_bytes - remaining
+                        + u64::try_from(index + 1).map_err(|_| StoreError::Corrupt)?,
+                    covered_loop_count,
+                    covered_item_count,
+                    last_loop_id,
+                    sha256: digest_hex(hasher.clone()),
+                });
+            }
             line.clear();
             segment_start = index + 1;
         }
         if segment_start < bytes.len() {
             let segment = &bytes[segment_start..];
+            hasher.update(segment);
             let line_length = line
                 .len()
                 .checked_add(segment.len())
@@ -834,23 +870,22 @@ async fn scan_history_prefix(
         }
         reader.consume(take);
         remaining -= u64::try_from(take).map_err(|_| StoreError::Corrupt)?;
+        // Keep a long ready-on-disk scan interruptible by the caller's timeout.
+        tokio::task::yield_now().await;
     }
 
     if !line.is_empty() {
         return Ok(None);
     }
-    let digest = hasher.finalize();
-    let mut sha256 = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(sha256, "{byte:02x}").expect("writing digest cannot fail");
-    }
-    Ok(Some(HistoryPrefix {
-        prefix_bytes,
-        covered_loop_count,
-        covered_item_count,
-        last_loop_id,
-        sha256,
+    Ok(Some(CompactionAnchors {
+        full: HistoryPrefix {
+            prefix_bytes,
+            covered_loop_count,
+            covered_item_count,
+            last_loop_id,
+            sha256: digest_hex(hasher),
+        },
+        prefix,
     }))
 }
 

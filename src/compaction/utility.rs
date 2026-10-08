@@ -19,6 +19,31 @@ use super::{
 };
 
 const BYTES_PER_TOKEN: u64 = 4;
+// Pi's default is a soft target. The Store rounds this item boundary toward
+// older history to retain complete StoredLoopRecords, including tool pairs.
+const KEEP_RECENT_TOKENS: u64 = 20_000;
+
+pub(crate) fn recent_tail_start(
+    history: &[HistoryItem],
+    previous_covered: usize,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<usize, UtilityError> {
+    let suffix = history
+        .get(previous_covered..)
+        .ok_or(UtilityError::InvalidResponse)?;
+    let mut bytes = CountingWriter { bytes: 0 };
+    for (offset, item) in suffix.iter().enumerate().rev() {
+        check_active(cancellation, deadline)?;
+        // The same bounded serialized-item bytes/4 fallback used by startup
+        // admission. It counts UTF-8 and JSON escaping, with no history clone.
+        serde_json::to_writer(&mut bytes, item).map_err(|_| UtilityError::Serialization)?;
+        if bytes_to_tokens(bytes.bytes) >= KEEP_RECENT_TOKENS {
+            return Ok(previous_covered + offset);
+        }
+    }
+    Ok(previous_covered)
+}
 // Pi 1.0.1 (MIT), copied verbatim; see THIRD_PARTY_NOTICES.md.
 const PI_SYSTEM_PROMPT: &str = include_str!("prompts/system.txt");
 const PI_INITIAL_PROMPT: &str = include_str!("prompts/initial.txt");
@@ -165,9 +190,31 @@ pub(crate) async fn generate_summary(
     input: &CompactionInput,
     cancellation: &CancellationToken,
 ) -> Result<SummaryGeneration, SummaryGenerationError> {
+    generate_selected_summary(input, input.history.len(), false, cancellation).await
+}
+
+/// Retain the exact selected tail in the normal request while summarizing
+/// only previous-summary + newly covered prefix. `input.history` remains the
+/// full original history so before/progress accounting cannot omit the tail.
+pub(crate) async fn generate_summary_with_tail(
+    input: &CompactionInput,
+    covered_item_count: usize,
+    cancellation: &CancellationToken,
+) -> Result<SummaryGeneration, SummaryGenerationError> {
+    generate_selected_summary(input, covered_item_count, true, cancellation).await
+}
+
+async fn generate_selected_summary(
+    input: &CompactionInput,
+    covered_item_count: usize,
+    reserve_tail_budget: bool,
+    cancellation: &CancellationToken,
+) -> Result<SummaryGeneration, SummaryGenerationError> {
     let mut utility_usage = UtilityUsageAccumulator::default();
     let result = std::panic::AssertUnwindSafe(generate_summary_inner(
         input,
+        covered_item_count,
+        reserve_tail_budget,
         cancellation,
         &mut utility_usage,
     ))
@@ -188,14 +235,33 @@ pub(crate) async fn generate_summary(
 
 async fn generate_summary_inner(
     input: &CompactionInput,
+    covered_item_count: usize,
+    reserve_tail_budget: bool,
     cancellation: &CancellationToken,
     utility_usage: &mut UtilityUsageAccumulator,
 ) -> Result<SummaryGeneration, UtilityError> {
     check_active(cancellation, input.operation_deadline)?;
-    let message = source_message(input, cancellation)?;
+    let tail = input
+        .history
+        .get(covered_item_count..)
+        .filter(|_| covered_item_count >= input.previous_covered_item_count)
+        .ok_or(UtilityError::InvalidResponse)?;
+    let message = source_message_through(input, covered_item_count, cancellation)?;
     let before_tokens = estimate_before_tokens(input)?;
-    let content = generate_prepared_inner(input, message, cancellation, utility_usage).await?;
-    let after_tokens = estimate_after_tokens(input, &content)?;
+    let max_output_bytes = if reserve_tail_budget {
+        summary_budget_with_tail(input, tail)?
+    } else {
+        MAX_SUMMARY_CONTENT_BYTES
+    };
+    let content = generate_prepared_inner(
+        input,
+        message,
+        max_output_bytes,
+        cancellation,
+        utility_usage,
+    )
+    .await?;
+    let after_tokens = estimate_after_tokens_with_tail(input, &content, tail)?;
     if after_tokens >= before_tokens || after_tokens > input.hard_tokens {
         return Err(UtilityError::NoProgress);
     }
@@ -224,6 +290,7 @@ pub(crate) async fn generate_projected_summary(
     let result = std::panic::AssertUnwindSafe(generate_prepared_inner(
         input,
         source,
+        MAX_SUMMARY_CONTENT_BYTES,
         cancellation,
         &mut usage,
     ))
@@ -247,6 +314,7 @@ pub(crate) async fn generate_projected_summary(
 async fn generate_prepared_inner(
     input: &CompactionInput,
     message: ModelMessage,
+    max_output_bytes: usize,
     cancellation: &CancellationToken,
     usage: &mut UtilityUsageAccumulator,
 ) -> Result<BoundedText, UtilityError> {
@@ -259,7 +327,7 @@ async fn generate_prepared_inner(
         input,
         &fixed,
         message,
-        MAX_SUMMARY_CONTENT_BYTES,
+        max_output_bytes,
         cancellation,
         usage,
     )
@@ -326,13 +394,22 @@ fn check_active(cancellation: &CancellationToken, deadline: Instant) -> Result<(
     }
 }
 
+#[cfg(test)]
 fn source_message(
     input: &CompactionInput,
     cancellation: &CancellationToken,
 ) -> Result<ModelMessage, UtilityError> {
+    source_message_through(input, input.history.len(), cancellation)
+}
+
+fn source_message_through(
+    input: &CompactionInput,
+    covered_item_count: usize,
+    cancellation: &CancellationToken,
+) -> Result<ModelMessage, UtilityError> {
     let history = input
         .history
-        .get(input.previous_covered_item_count..)
+        .get(input.previous_covered_item_count..covered_item_count)
         .ok_or(UtilityError::InvalidResponse)?;
     projected_source_message(
         input.previous_summary.as_ref(),
@@ -835,8 +912,32 @@ fn estimate_after_tokens(
     input: &CompactionInput,
     summary: &BoundedText,
 ) -> Result<u64, UtilityError> {
-    let request = normal_request(input, Some(summary), &input.history[input.history.len()..])?;
+    estimate_after_tokens_with_tail(input, summary, &[])
+}
+
+fn estimate_after_tokens_with_tail(
+    input: &CompactionInput,
+    summary: &BoundedText,
+    tail: &[HistoryItem],
+) -> Result<u64, UtilityError> {
+    let request = normal_request(input, Some(summary), tail)?;
     Ok(bytes_to_tokens(estimate_request_bytes(&request)?))
+}
+
+fn summary_budget_with_tail(
+    input: &CompactionInput,
+    tail: &[HistoryItem],
+) -> Result<usize, UtilityError> {
+    // Even a one-byte nonempty summary needs its complete framing, system
+    // instructions, schemas and retained tail. Never issue a futile utility
+    // call when that irreducible request already exceeds the hard ceiling.
+    let smallest = BoundedText::new("x").map_err(|_| UtilityError::TooLarge)?;
+    let floor = estimate_request_bytes(&normal_request(input, Some(&smallest), tail)?)?;
+    let hard = tokens_to_bytes(input.hard_tokens).ok_or(UtilityError::Budget)?;
+    let available = hard.checked_sub(floor).ok_or(UtilityError::Budget)?;
+    // Actual JSON escaping can cost more than raw summary bytes. This bound
+    // limits generation; the exact complete after request is still validated.
+    Ok(available.saturating_add(1).min(MAX_SUMMARY_CONTENT_BYTES))
 }
 
 fn normal_request(
