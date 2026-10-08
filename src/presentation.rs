@@ -16,9 +16,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use futures_util::StreamExt;
 use serde::Serialize;
 
 use minicore_runtime::history::{HistoryItem, UserMessageKind};
@@ -33,6 +33,9 @@ use crate::sessions::TurnRef;
 use crate::tool_data::ToolRef;
 use crate::tools::observe::{RequestKey, ToolObserver};
 use crate::tools::{NativeApplyPatchTool, NativeEditTool, NativeWriteTool};
+
+mod preview;
+pub use preview::ToolArgumentsPreviewState;
 
 /// Display text limits. Aligned with the existing per-argument/output caps so
 /// the expanded view can never promise rows that the Agent cannot show.
@@ -306,6 +309,7 @@ impl PresentationInner {
 /// read, and the per-loop worker. All access is short critical sections;
 /// callers never hold the lock across an await.
 pub(crate) struct Presentation {
+    preview_attempt: AtomicU64,
     session_id: SessionId,
     events: AgentEventSink,
     compaction: Arc<crate::compaction::CompactionState>,
@@ -319,11 +323,28 @@ impl Presentation {
         compaction: Arc<crate::compaction::CompactionState>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            preview_attempt: AtomicU64::new(0),
             session_id,
             events,
             compaction,
             inner: Mutex::new(PresentationInner::default()),
         })
+    }
+
+    fn next_preview_attempt(&self) -> Option<u64> {
+        let mut previous = self.preview_attempt.load(Ordering::Relaxed);
+        loop {
+            let next = previous.checked_add(1)?;
+            match self.preview_attempt.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(next),
+                Err(actual) => previous = actual,
+            }
+        }
     }
 
     #[cfg(test)]
@@ -732,25 +753,25 @@ impl Model for PresentationModel {
         self.presentation.note_request_start(key);
         let context_generation = self.presentation.context_generation(self);
         let physical_window = self.physical_window;
+        // This presentation belongs to a session, so replacing a model cannot
+        // reuse an attempt within an active request. Overflow disables only
+        // the optional preview; execution and usage observation still work.
+        let attempt = self.presentation.next_preview_attempt();
         let inner = self.inner.start(request, context);
         let presentation = Arc::clone(&self.presentation);
         Box::pin(async move {
             let stream = inner.await?;
-            // Pass-through observation: every event is forwarded unchanged;
-            // only real provider `Usage` before a tool-request boundary lands
-            // in the per-request cache. Cancellation, deadlines, ordering,
-            // and error delivery are untouched.
-            let observed = stream.inspect(move |item| {
-                if let Ok(minicore_runtime::model::ModelEvent::Usage { usage }) = item {
-                    presentation.note_request_usage(
-                        key,
-                        *usage,
-                        context_generation,
-                        physical_window,
-                    );
-                }
-            });
-            Ok(Box::pin(observed) as minicore_runtime::model::ModelStream)
+            // A pass-through stream also observes normal EOF. Merely seeing
+            // Finish is insufficient: assembler rejection/drop afterwards must
+            // discard speculative cards. There is no extra task or timer.
+            Ok(Box::pin(preview::PreviewStream::new(
+                stream,
+                presentation,
+                key,
+                attempt,
+                context_generation,
+                physical_window,
+            )) as minicore_runtime::model::ModelStream)
         })
     }
 }

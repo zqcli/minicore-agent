@@ -62,6 +62,7 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "changes.list",
     "changes.diff",
     "deferred.waiter_limit",
+    "tool.arguments.preview",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
