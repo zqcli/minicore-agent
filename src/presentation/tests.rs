@@ -394,10 +394,10 @@ fn hidden_counts_follow_the_fixed_tool_execution_estimator() {
 
 #[test]
 fn steer_receipt_commits_only_at_real_start_and_emits_once_per_count() {
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let (sink, mut receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     let loop_r0 = LoopId::new().unwrap();
@@ -409,9 +409,9 @@ fn steer_receipt_commits_only_at_real_start_and_emits_once_per_count() {
         loop_id: loop_r0,
         request_index: 1,
     };
-    let drain = |receiver: &mut tokio::sync::mpsc::Receiver<AgentEvent>| -> Vec<AgentEvent> {
+    let drain = |receiver: &mut crate::event::AgentEventStream| -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        while let Ok(event) = receiver.try_recv() {
+        while let Some(event) = receiver.try_recv() {
             events.push(event);
         }
         events
@@ -496,10 +496,10 @@ fn steer_receipt_commits_only_at_real_start_and_emits_once_per_count() {
 
 #[test]
 fn steer_times_still_feed_the_same_live_times_queue() {
-    let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+    let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     presentation.note_steer_accepted(Some("t0".into()));
@@ -515,16 +515,16 @@ fn steer_times_still_feed_the_same_live_times_queue() {
 /// the `ToolRef` is captured per execution, never looked up or reused.
 #[test]
 fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
-    let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+    let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     let observer = ToolObserver::new(
         presentation.session_id,
         Arc::new(ToolData::new()),
-        AgentEventSink::new(tokio::sync::mpsc::channel(8).0),
+        AgentEventSink::channel(8).0,
     );
     let call_id = ToolCallId::new("call-a").unwrap();
     let invocation = ToolInvocation {
@@ -585,10 +585,10 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
 /// not relying on stale bookkeeping to reach an owned command.
 #[test]
 fn finishing_a_call_removes_its_live_entry() {
-    let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+    let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     let key = RequestKey {
@@ -633,18 +633,11 @@ async fn presentation_tool_variants_share_binding_and_finish() {
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(crate::Workspace::open(root).await.unwrap());
 
-    let (presentation_sender, mut presentation_events) = tokio::sync::mpsc::channel(16);
-    let presentation = Presentation::new(
-        session_id,
-        crate::event::AgentEventSink::new(presentation_sender),
-        crate::compaction::CompactionState::new(),
-    );
-    let (observer_sender, mut observer_events) = tokio::sync::mpsc::channel(16);
-    let observer = ToolObserver::new(
-        session_id,
-        Arc::new(ToolData::new()),
-        crate::event::AgentEventSink::new(observer_sender),
-    );
+    let (sink, mut presentation_events) = crate::event::AgentEventSink::channel(16);
+    let presentation =
+        Presentation::new(session_id, sink, crate::compaction::CompactionState::new());
+    let (sink, mut observer_events) = crate::event::AgentEventSink::channel(16);
+    let observer = ToolObserver::new(session_id, Arc::new(ToolData::new()), sink);
     let owners = CommandOwners::new();
     let plain = crate::tools::tests::build_tools(
         &["read".to_owned()],
@@ -784,8 +777,8 @@ async fn presentation_tool_variants_share_binding_and_finish() {
         assert!(presentation.lock().live_tools.is_empty());
     }
 
-    assert!(observer_events.try_recv().is_err());
-    assert!(presentation_events.try_recv().is_err());
+    assert!(observer_events.try_recv().is_none());
+    assert!(presentation_events.try_recv().is_none());
 }
 
 #[test]
@@ -828,10 +821,10 @@ fn reported_context_uses_native_total_or_complete_disjoint_components() {
 
 #[test]
 fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+    let (sink, mut receiver) = AgentEventSink::channel(16);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     presentation.set_model_label("main".to_owned());
@@ -845,7 +838,7 @@ fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
     assert_eq!(presentation.snapshot().context.percent, Some(5.0));
     assert!(matches!(
         receiver.try_recv(),
-        Ok(AgentEvent::RequestUsage { .. })
+        Some(AgentEvent::RequestUsage { .. })
     ));
     // Duplicate usage is neither summed nor emitted again.
     presentation.note_request_usage(
@@ -855,7 +848,7 @@ fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
         10_000,
     );
     assert_eq!(presentation.snapshot().context.tokens, Some(500));
-    assert!(receiver.try_recv().is_err());
+    assert!(receiver.try_recv().is_none());
     presentation.reset_before_loop_start();
     assert_eq!(presentation.snapshot().context.tokens, Some(500));
     key.loop_id = LoopId::new().unwrap();
@@ -896,10 +889,10 @@ fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
 fn reported_context_restores_only_last_valid_active_matching_model_usage() {
     use minicore_runtime::history::AssistantHistory;
     use minicore_runtime::model::{ModelFinishReason, ReasoningPreference};
-    let (sender, _) = tokio::sync::mpsc::channel(1);
+    let (sink, _) = AgentEventSink::channel(1);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     presentation.set_model_label("main".to_owned());
@@ -941,13 +934,9 @@ fn reported_context_restores_only_last_valid_active_matching_model_usage() {
 #[test]
 fn reported_context_guards_same_label_config_and_emergency_summary_generations() {
     let model = || -> Arc<dyn Model> { crate::test_support::ScriptedModel::inert("main", 10_000) };
-    let (sender, mut events) = tokio::sync::mpsc::channel(8);
+    let (sink, mut events) = AgentEventSink::channel(8);
     let compaction = crate::compaction::CompactionState::new();
-    let presentation = Presentation::new(
-        SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
-        Arc::clone(&compaction),
-    );
+    let presentation = Presentation::new(SessionId::new().unwrap(), sink, Arc::clone(&compaction));
     presentation.set_model_label("main".to_owned());
     let old = model();
     presentation.install_model(&old);
@@ -980,7 +969,7 @@ fn reported_context_guards_same_label_config_and_emergency_summary_generations()
     assert_eq!(presentation.snapshot().context.tokens, Some(100));
     assert!(!compaction.install_emergency_groups(LoopId::new().unwrap(), Default::default()));
     assert_eq!(presentation.snapshot().context.tokens, Some(100));
-    assert_eq!(std::iter::from_fn(|| events.try_recv().ok()).count(), 4);
+    assert_eq!(std::iter::from_fn(|| events.try_recv()).count(), 4);
 }
 
 #[test]

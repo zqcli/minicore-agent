@@ -375,15 +375,11 @@ mod tests {
         let workspace = Arc::new(Workspace::open(root.clone()).await.unwrap());
 
         // No event consumer is present: authoritative facts must still be queryable.
-        let (event_sender, event_receiver) = tokio::sync::mpsc::channel(1);
-        drop(event_receiver);
+        let (events, event_stream) = AgentEventSink::channel(1);
+        drop(event_stream);
         let data = Arc::new(ToolData::new());
         let owners = crate::tools::command::CommandOwners::new();
-        let observer = ToolObserver::new(
-            session_id,
-            Arc::clone(&data),
-            AgentEventSink::new(event_sender),
-        );
+        let observer = ToolObserver::new(session_id, Arc::clone(&data), events);
         let bash = Arc::new(OwnedBashTool::with_binding(
             Arc::clone(&workspace),
             CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),

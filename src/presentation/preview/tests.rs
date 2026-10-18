@@ -1,10 +1,9 @@
 use super::*;
-use crate::event::AgentEventSink;
+use crate::event::{AgentEventSink, AgentEventStream};
 use crate::ids::SessionId;
 use futures_util::{StreamExt, stream};
 use minicore_runtime::LoopId;
 use minicore_runtime::model::{DeliveryState, ModelErrorKind, ModelFinishReason};
-use tokio::sync::mpsc;
 
 pub(super) fn panic_preview(key: RequestKey) {
     assert!(!PANIC_PREVIEWS.hit(&key), "injected preview panic");
@@ -84,11 +83,11 @@ fn parse_chunks(name: &str, source: &str, chunked: bool) -> PreviewParser {
     parser
 }
 
-fn fixture(capacity: usize) -> (PreviewObserver, mpsc::Receiver<AgentEvent>) {
-    let (sender, receiver) = mpsc::channel(capacity);
+fn fixture(capacity: usize) -> (PreviewObserver, AgentEventStream) {
+    let (sink, receiver) = AgentEventSink::channel(capacity);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
-        AgentEventSink::new(sender),
+        sink,
         crate::compaction::CompactionState::new(),
     );
     (
@@ -135,12 +134,8 @@ fn error() -> Result<ModelEvent, ModelError> {
         .unwrap(),
     ))
 }
-fn drain(receiver: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
-    let mut values = Vec::new();
-    while let Ok(event) = receiver.try_recv() {
-        values.push(event);
-    }
-    values
+fn drain(receiver: &mut AgentEventStream) -> Vec<AgentEvent> {
+    std::iter::from_fn(|| receiver.try_recv()).collect()
 }
 fn state(event: &AgentEvent) -> ToolArgumentsPreviewState {
     match event {
@@ -521,24 +516,34 @@ fn queue_drop_does_not_backpressure_and_later_snapshot_recovers() {
     let (mut observer, mut receiver) = fixture(1);
     let now = Instant::now();
     observer.observe(&start("c", "write"), now);
-    observer.observe(&delta("c", r#"{"path":"path","content":"body"}"#), now);
-    assert_eq!(receiver.len(), 1);
-    drain(&mut receiver);
-    observer.observe(&end("c"), now);
-    match receiver.try_recv().unwrap() {
-        AgentEvent::ToolArgumentsPreview {
-            display,
-            revision,
-            meta,
-            state,
-            ..
-        } => {
-            assert_eq!(revision, 3);
-            assert_eq!(state, ToolArgumentsPreviewState::Generated);
+    // Start and the first input snapshot are protected lifecycle transitions;
+    // later Generating revisions compete for the single streaming slot.
+    observer.observe(&delta("c", r#"{"path":"path","content":"b"#), now);
+    observer.observe(&delta("c", "o"), now + UPDATE_INTERVAL);
+    observer.observe(&delta("c", r#"dy"}"#), now + UPDATE_INTERVAL * 2);
+    observer.observe(&end("c"), now + UPDATE_INTERVAL * 2);
+    let events = drain(&mut receiver);
+    let revisions: Vec<_> = events
+        .iter()
+        .map(|event| match event {
+            AgentEvent::ToolArgumentsPreview { revision, .. } => *revision,
+            _ => panic!("unexpected event"),
+        })
+        .collect();
+    // Lifecycle is delivered first; the dropped revision 4 is reported once.
+    assert_eq!(revisions, [1, 2, 5, 3]);
+    assert_eq!(events[0].meta().dropped_before, 1);
+    assert!(
+        events[1..]
+            .iter()
+            .all(|event| event.meta().dropped_before == 0)
+    );
+    match &events[2] {
+        AgentEvent::ToolArgumentsPreview { display, state, .. } => {
+            assert_eq!(*state, ToolArgumentsPreviewState::Generated);
             assert_eq!(display.expanded_input.as_deref(), Some("body"));
-            assert!(meta.dropped_before > 0);
         }
-        _ => panic!("unexpected event"),
+        _ => unreachable!(),
     }
 }
 

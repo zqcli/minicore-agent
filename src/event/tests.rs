@@ -1,13 +1,18 @@
 use super::*;
 
-impl AgentEventSink {
-    // Single-queue wiring for producer tests that inspect sends synchronously.
-    pub(crate) fn new(sender: mpsc::Sender<AgentEvent>) -> Self {
-        Self {
-            lifecycle: sender.clone(),
-            sender,
-            drop_state: Arc::new(Mutex::new(DropState { pending: 0 })),
-        }
+impl AgentEventStream {
+    /// Synchronous `recv` for producer tests: same lane priority and drop accounting.
+    pub(crate) fn try_recv(&mut self) -> Option<AgentEvent> {
+        let event = self
+            .lifecycle
+            .try_recv()
+            .or_else(|_| self.receiver.try_recv())
+            .ok()?;
+        Some(self.delivered(event))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.lifecycle.len() + self.receiver.len()
     }
 }
 
@@ -39,13 +44,46 @@ async fn streaming_pressure_cannot_displace_lifecycle_and_drops_follow_delivery(
     );
     let terminal = stream.recv().await.unwrap();
     assert!(matches!(terminal, AgentEvent::TurnFinished { .. }));
-    assert_eq!(terminal.dropped_before(), 4);
+    assert_eq!(terminal.meta().dropped_before, 4);
     assert_eq!(sink.try_send(delta()), AgentSendResult::Dropped);
     let queued = stream.recv().await.unwrap();
     assert!(matches!(queued, AgentEvent::OutputDelta { .. }));
-    assert_eq!(queued.dropped_before(), 1);
+    assert_eq!(queued.meta().dropped_before, 1);
     drop(sink);
     assert!(stream.recv().await.is_none());
+}
+
+#[test]
+fn process_output_chunks_stream_while_command_state_stays_lifecycle() {
+    let session_id = SessionId::new().unwrap();
+    let process = |chunk: bool| AgentEvent::ToolProcess {
+        turn: TurnRef {
+            session_id,
+            loop_id: LoopId::new().unwrap(),
+        },
+        data: crate::tool_data::ToolProcessData {
+            tool_ref: crate::tool_data::ToolRef {
+                session_id,
+                loop_id: LoopId::new().unwrap(),
+                request_index: 0,
+                tool_call_id: minicore_runtime::ToolCallId::new("call").unwrap(),
+            },
+            chunk: chunk.then(|| crate::tool_data::ToolProcessChunk {
+                stream: crate::tool_data::ToolDataStream::Stdout,
+                encoding: "base64",
+                data: String::new(),
+                base_offset: 0,
+                next_offset: 0,
+                observed_end: 0,
+                dropped: false,
+                expired: false,
+            }),
+            command: None,
+        },
+        meta: EventMeta::session(session_id),
+    };
+    assert!(process(false).is_lifecycle());
+    assert!(!process(true).is_lifecycle());
 }
 
 #[tokio::test]
@@ -65,7 +103,7 @@ async fn lifecycle_capacity_is_bounded_and_both_lanes_drain_on_close() {
     let mut dropped = 0;
     while let Some(event) = stream.recv().await {
         delivered += 1;
-        dropped += event.dropped_before();
+        dropped += event.meta().dropped_before;
     }
     assert_eq!((delivered, dropped), (64, 1));
 }
@@ -98,7 +136,7 @@ async fn preview_updates_cannot_displace_their_terminal_transition() {
     }
     assert_eq!(sink.try_send(preview), AgentSendResult::Sent);
     let terminal = stream.recv().await.unwrap();
-    assert_eq!(terminal.dropped_before(), 16);
+    assert_eq!(terminal.meta().dropped_before, 16);
     assert!(matches!(
         terminal,
         AgentEvent::ToolArgumentsPreview {

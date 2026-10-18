@@ -189,6 +189,7 @@ pub enum AgentEvent {
 
 macro_rules! event_meta {
     ($($variant:ident),+ $(,)?) => {
+        #[cfg(test)]
         pub(crate) fn meta(&self) -> &EventMeta {
             match self { $(Self::$variant { meta, .. })|+ => meta }
         }
@@ -209,13 +210,10 @@ impl AgentEvent {
                 *revision <= 2
                     || *state != crate::presentation::ToolArgumentsPreviewState::Generating
             }
-            Self::ToolProcess { data, .. } => data.command.is_some(),
+            // Output chunks stream; chunkless command-state notifications are lifecycle.
+            Self::ToolProcess { data, .. } => data.chunk.is_none(),
             _ => true,
         }
-    }
-
-    pub(crate) fn dropped_before(&self) -> u64 {
-        self.meta().dropped_before
     }
 
     pub(crate) fn set_dropped_before(&mut self, dropped_before: u64) {
@@ -285,14 +283,7 @@ impl AgentEventSink {
         )
     }
 
-    pub(crate) fn try_send(&self, mut event: AgentEvent) -> AgentSendResult {
-        let mut pending = self
-            .drop_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.pending = pending.pending.saturating_add(event.dropped_before());
-        // recv replaces this enqueue snapshot with delivery-order accounting.
-        event.set_dropped_before(pending.pending);
+    pub(crate) fn try_send(&self, event: AgentEvent) -> AgentSendResult {
         let sender = if event.is_lifecycle() {
             &self.lifecycle
         } else {
@@ -301,7 +292,7 @@ impl AgentEventSink {
         match sender.try_send(event) {
             Ok(()) => AgentSendResult::Sent,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                pending.pending = pending.pending.saturating_add(1);
+                self.record_core_drops(1);
                 AgentSendResult::Dropped
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AgentSendResult::Closed,
@@ -677,18 +668,23 @@ pub struct AgentEventStream {
 
 impl AgentEventStream {
     pub async fn recv(&mut self) -> Option<AgentEvent> {
-        let mut event = tokio::select! {
+        let event = tokio::select! {
             biased;
             Some(event) = self.lifecycle.recv() => event,
             Some(event) = self.receiver.recv() => event,
             else => return None,
         };
+        Some(self.delivered(event))
+    }
+
+    /// Attaches every drop recorded since the previous delivery.
+    fn delivered(&self, mut event: AgentEvent) -> AgentEvent {
         let mut drops = self
             .drop_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         event.set_dropped_before(std::mem::take(&mut drops.pending));
-        Some(event)
+        event
     }
 }
 
