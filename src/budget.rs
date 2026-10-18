@@ -20,9 +20,18 @@ pub(crate) fn check_budget(
     }
 }
 
+/// Returns a query result only if its JSON representation fits the page budget.
+pub(crate) fn encoded_result<T: Serialize>(result: T, max_bytes: usize) -> Result<T, AgentError> {
+    if encoded_len(&result) > max_bytes {
+        Err(AgentError::InvalidArguments)
+    } else {
+        Ok(result)
+    }
+}
+
 /// Encoded JSON size of a result value. Result types are plain data with
 /// string keys, so serialization cannot fail.
-pub(crate) fn encoded_len<T: Serialize>(value: &T) -> usize {
+pub(crate) fn encoded_len<T: Serialize + ?Sized>(value: &T) -> usize {
     serde_json::to_vec(value)
         .expect("query results serialize to JSON")
         .len()

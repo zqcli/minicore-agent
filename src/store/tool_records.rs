@@ -34,7 +34,7 @@ impl Store {
         check_aux_deadline(deadline)?;
         validate_stored_tool_record(&snapshot.record, &snapshot.tool_ref)?;
 
-        let blobs = snapshot_blobs(snapshot);
+        let blobs = snapshot.blobs();
         for ((_, bytes), (_, expected_len, expected_sha)) in
             blobs.into_iter().zip(stored_blobs(&snapshot.record))
         {
@@ -1412,18 +1412,7 @@ async fn read_change_blob(path: &Path, revision: &ChangeRevision) -> (Option<Vec
     (Some(value), false)
 }
 
-fn snapshot_blobs(snapshot: &ToolPersistenceSnapshot) -> [(&str, Option<&[u8]>); 6] {
-    [
-        (TOOL_INPUT_FILE, snapshot.input_bytes.as_deref()),
-        (TOOL_RESULT_FILE, snapshot.result_bytes.as_deref()),
-        (TOOL_STDOUT_FILE, snapshot.stdout_bytes.as_deref()),
-        (TOOL_STDERR_FILE, snapshot.stderr_bytes.as_deref()),
-        (TOOL_BEFORE_FILE, snapshot.file_change_before.as_deref()),
-        (TOOL_AFTER_FILE, snapshot.file_change_after.as_deref()),
-    ]
-}
-
-// The four core blobs use the same order as snapshot_blobs; change snapshots follow them.
+// The core blobs match ToolPersistenceSnapshot::blobs; change snapshots follow them.
 fn stored_blobs(stored: &StoredToolRecord) -> [(&str, usize, Option<&str>); 4] {
     [
         (
