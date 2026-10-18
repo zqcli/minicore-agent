@@ -13,7 +13,7 @@ use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
 use serde_json::json;
 
 // This is an input contract fixture, not a model-quality oracle.
-const REPORT_STAGE_3: &str = include_str!("fixtures/report-stage-3.txt");
+const REPORT_STAGE_3: &str = include_str!("../fixtures/report-stage-3.txt");
 
 struct Fake {
     descriptor: ModelDescriptor,

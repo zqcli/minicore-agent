@@ -2664,7 +2664,6 @@ async fn reasoning_summary_part_lifecycle_separates_parts_within_one_item() {
     );
 }
 
-#[path = "replay_tests.rs"]
 mod replay_tests;
 
 #[tokio::test]

@@ -13404,5 +13404,4 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
     agent.shutdown().await.unwrap();
 }
 
-#[path = "recent_tail_tests.rs"]
 mod recent_tail;

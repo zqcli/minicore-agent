@@ -686,5 +686,4 @@ impl Drop for ObservationGuard<'_> {
 }
 
 #[cfg(test)]
-#[path = "threshold_tests.rs"]
 mod tests;

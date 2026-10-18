@@ -1052,5 +1052,4 @@ impl Drop for CancelOnDrop {
 }
 
 #[cfg(test)]
-#[path = "utility_tests.rs"]
 mod tests;
