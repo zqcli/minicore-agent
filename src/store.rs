@@ -31,7 +31,7 @@ use crate::tool_data::{
 use crate::tools::KNOWN_TOOL_NAMES;
 
 mod history;
-use history::HistoryLine;
+pub(crate) use history::HistoryLine;
 mod tool_records;
 use tool_records::AuxLedger;
 #[cfg(test)]
@@ -87,6 +87,12 @@ pub(crate) const CHANGE_SCAN_BLOB_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const AUX_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 
 static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+pub(crate) static SESSION_LOAD_GATES: crate::test_support::Registry<
+    SessionId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 #[cfg(test)]
 pub(crate) static APPEND_FAILURES: crate::test_support::Registry<SessionId, bool> =
@@ -210,10 +216,11 @@ pub(crate) fn normalize_title(title: &str) -> Result<Option<String>, ()> {
     }
 }
 
-/// A loaded session: its persistent record plus a sanitized in-memory history.
+/// Session data read from disk, including an unpublished history index.
 pub(crate) struct StoredSession {
     pub(crate) record: SessionRecord,
     pub(crate) history: std::sync::Arc<[HistoryItem]>,
+    pub(crate) history_index: Vec<HistoryLine>,
     /// `(loop_id, occurrence)` -> RFC3339 acceptance time, collected from the
     /// loop records so history views can show persisted user timestamps.
     pub(crate) user_times: std::collections::HashMap<(LoopId, usize), String>,
@@ -774,10 +781,6 @@ impl Store {
             self.remove_created_session_directory(&directory).await;
             return Err(error);
         }
-        self.history_indexes
-            .lock()
-            .unwrap()
-            .insert(record.session_id, Vec::new());
         Ok(())
     }
 
@@ -787,10 +790,15 @@ impl Store {
     ) -> Result<StoredSession, StoreError> {
         let directory = self.require_session_directory(session_id).await?;
         let record = Self::read_record(&directory.join(SESSION_RECORD_FILE), session_id).await?;
-        let (history, user_times) = self.load_history(session_id).await?;
+        let (history, user_times, history_index) = self.load_history(session_id).await?;
+        #[cfg(test)]
+        if let Some(gate) = SESSION_LOAD_GATES.take(&session_id) {
+            gate.pass().await;
+        }
         Ok(StoredSession {
             record,
             history,
+            history_index,
             user_times,
         })
     }
@@ -1036,6 +1044,13 @@ impl Store {
 
     pub(crate) fn unload_history(&self, session_id: SessionId) {
         self.history_indexes.lock().unwrap().remove(&session_id);
+    }
+
+    pub(crate) fn install_history_index(&self, session_id: SessionId, index: Vec<HistoryLine>) {
+        self.history_indexes
+            .lock()
+            .unwrap()
+            .insert(session_id, index);
     }
 
     pub(crate) async fn load_record(

@@ -558,8 +558,10 @@ Workspace, validate the configured Model, initialize Tools or PromptProvider,
 start a loop, repair `history.jsonl`, or update `session.json`. An already loaded
 Session uses its committed snapshot's item count and an in-memory index of
 complete JSONL lines. The index supplies prefix offsets and SHA-256 revisions;
-only the lines needed for the page are read and parsed. It is initialized on
-creation/load, extended on append, and discarded on unload or a failed open. Loaded canonical/display reads and
+only the lines needed for the page are read and parsed. The index is built with
+loaded data and published only when the Session is installed; failed or cancelled
+opens leave cold reads unindexed. It is extended on append and discarded on
+unload. Loaded canonical/display reads and
 stored `turn.result` lookups do not rescan the full file. The query also works
 for a closed Session whose Workspace was deleted or whose Model/Profile is no
 longer configured.
@@ -1075,9 +1077,12 @@ remains readable. `saved` is not a
 promise of indefinite retention: the Store applies per-tool (3 MiB), per-Session
 (16 MiB/1024 records), and Store-wide (256 MiB/8192 records) auxiliary budgets.
 A shared in-memory ledger is initialized by one directory scan, then updated
-on commit, oldest-first eviction, and Session deletion. A failed temporary-file
-cleanup invalidates it so the next reservation accounts for any surviving bytes.
-Foreign or corrupt
+on commit, oldest-first eviction, and Session deletion. Failed or cancelled
+record eviction and failed temporary-file cleanup invalidate it so the next
+reservation accounts for surviving bytes. Removing an empty `tools/` parent is
+best-effort and does not undo successful record eviction. Entry-local metadata
+or enumeration failures are warned about and skipped, retaining known byte
+counts; Store-root and deadline failures still fail the scan. Foreign or corrupt
 entries are warned about and skipped without following symlinks; known bytes
 still count against the budgets. These budgets coordinate one Store and its
 clones; independent writers or external data-directory changes during the

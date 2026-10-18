@@ -787,6 +787,7 @@ impl Agent {
             workspace,
             Vec::new().into(),
             std::collections::HashMap::new(),
+            Vec::new(),
             setup,
         );
         tracing::info!(session_id = %session_id, "session created");
@@ -801,17 +802,6 @@ impl Agent {
             tracing::debug!(session_id = %session_id, "session already loaded");
             return Ok(session.info(true));
         }
-        let result = self.open_unloaded_session(session_id).await;
-        if result.is_err() {
-            self.store.unload_history(session_id);
-        }
-        result
-    }
-
-    async fn open_unloaded_session(
-        &mut self,
-        session_id: crate::ids::SessionId,
-    ) -> Result<SessionInfo, AgentError> {
         let record = self
             .store
             .load_record(session_id)
@@ -862,6 +852,7 @@ impl Agent {
             workspace,
             stored.history,
             stored.user_times,
+            stored.history_index,
             setup,
         );
         tracing::info!(session_id = %session_id, "session opened");
@@ -1301,6 +1292,7 @@ impl Agent {
         workspace: Arc<Workspace>,
         history: Arc<[minicore_runtime::history::HistoryItem]>,
         user_times: std::collections::HashMap<(minicore_runtime::LoopId, usize), String>,
+        history_index: Vec<crate::store::HistoryLine>,
         setup: SessionSetup,
     ) -> SessionInfo {
         let session_id = record.session_id;
@@ -1347,6 +1339,7 @@ impl Agent {
                 physical_window,
             );
         }
+        self.store.install_history_index(session_id, history_index);
         let _ = self.sessions.insert(session_id, session);
         let info = self
             .sessions

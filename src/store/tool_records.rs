@@ -2,6 +2,12 @@
 use super::*;
 
 #[cfg(test)]
+pub(crate) static AUX_PARENT_CLEANUP_GATES: crate::test_support::Registry<
+    PathBuf,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
+#[cfg(test)]
 pub(crate) static AUX_BLOB_WRITE_FAILURES: crate::test_support::Registry<SessionId, usize> =
     crate::test_support::Registry::new();
 #[cfg(test)]
@@ -723,7 +729,13 @@ impl Store {
         // The read-query entry ceiling must not prevent budget eviction at startup.
         while let Some(entry) = next_aux_entry(&mut sessions, deadline).await? {
             let path = entry.path();
-            let meta = fs::symlink_metadata(&path).await.map_err(unavailable)?;
+            let meta = match fs::symlink_metadata(&path).await {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(entry = ?path, error_kind = ?error.kind(), "skipping unreadable auxiliary entry");
+                    continue;
+                }
+            };
             let session_id = entry
                 .file_name()
                 .to_str()
@@ -746,14 +758,41 @@ impl Store {
                     continue;
                 }
             }
-            let mut entries = fs::read_dir(&tools).await.map_err(unavailable)?;
-            while let Some(entry) = next_aux_entry(&mut entries, deadline).await? {
+            let mut entries = match fs::read_dir(&tools).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    ledger.note_foreign(
+                        Some(session_id),
+                        fs::symlink_metadata(&tools)
+                            .await
+                            .map_or(0, |meta| meta.len()),
+                    );
+                    tracing::warn!(entry = ?tools, error_kind = ?error.kind(), "skipping unreadable auxiliary directory");
+                    continue;
+                }
+            };
+            loop {
+                check_aux_deadline(deadline)?;
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(entry = ?tools, error_kind = ?error.kind(), "stopping unreadable auxiliary directory scan");
+                        break;
+                    }
+                };
                 let path = entry.path();
-                let meta = fs::symlink_metadata(&path).await.map_err(unavailable)?;
+                let meta = match fs::symlink_metadata(&path).await {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        tracing::warn!(entry = ?path, error_kind = ?error.kind(), "skipping unreadable auxiliary entry");
+                        continue;
+                    }
+                };
                 let name = entry.file_name();
                 let name = name.to_str().unwrap_or("");
                 let (bytes, valid_files) = if meta.is_dir() {
-                    scan_aux_files(&path, deadline).await?
+                    scan_aux_files(&path, deadline, meta.len()).await?
                 } else {
                     (meta.len(), false)
                 };
@@ -772,13 +811,15 @@ impl Store {
                             && tool_ref_hash(&record.tool_ref) == name
                             && validate_stored_tool_record(&record, &record.tool_ref).is_ok()
                         {
-                            ledger.insert(AuxDirectoryEntry {
-                                session_id,
-                                path,
-                                bytes,
-                                mtime: meta.modified().map_err(unavailable)?,
-                            });
-                            continue;
+                            if let Ok(mtime) = meta.modified() {
+                                ledger.insert(AuxDirectoryEntry {
+                                    session_id,
+                                    path,
+                                    bytes,
+                                    mtime,
+                                });
+                                continue;
+                            }
                         }
                     }
                 }
@@ -800,29 +841,33 @@ impl Store {
         if ledger.is_none() {
             *ledger = Some(self.scan_aux_ledger(deadline).await?);
         }
-        let ledger = ledger.as_mut().unwrap();
         loop {
-            let (bytes, records) = ledger
+            let current = ledger.as_mut().unwrap();
+            let (bytes, records) = current
                 .sessions
                 .get(&target_session)
                 .copied()
                 .unwrap_or_default();
             let session_full = bytes.saturating_add(reserve) > limits.session_bytes
                 || records + 1 > limits.session_records;
-            let global_full = ledger.global_bytes.saturating_add(reserve) > limits.global_bytes
-                || ledger.entries.len() + 1 > limits.global_records;
+            let global_full = current.global_bytes.saturating_add(reserve) > limits.global_bytes
+                || current.entries.len() + 1 > limits.global_records;
             if !session_full && !global_full {
                 return Ok(());
             }
             check_aux_deadline(deadline)?;
-            let victim = ledger
+            let victim = current
                 .entries
                 .iter()
                 .find(|(_, entry)| !session_full || entry.session_id == target_session)
                 .map(|(key, entry)| (key.clone(), entry.path.clone()))
                 .ok_or(StoreError::Unavailable)?;
-            remove_aux_directory(&victim.1).await?;
-            ledger.remove(&victim.0);
+            // A failed or cancelled removal may have deleted only part of the record.
+            let mut current = ledger.take().unwrap();
+            fs::remove_dir_all(&victim.1).await.map_err(unavailable)?;
+            current.remove(&victim.0);
+            *ledger = Some(current);
+            cleanup_aux_parent(&victim.1).await;
         }
     }
 }
@@ -958,14 +1003,31 @@ async fn next_aux_entry(
     entries.next_entry().await.map_err(unavailable)
 }
 
-async fn scan_aux_files(path: &Path, deadline: Instant) -> Result<(u64, bool), StoreError> {
-    let mut entries = fs::read_dir(path).await.map_err(unavailable)?;
+async fn scan_aux_files(
+    path: &Path,
+    deadline: Instant,
+    directory_bytes: u64,
+) -> Result<(u64, bool), StoreError> {
+    let mut entries = match fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok((directory_bytes, false)),
+    };
     let mut bytes = 0;
     let mut valid = true;
-    while let Some(entry) = next_aux_entry(&mut entries, deadline).await? {
-        let meta = fs::symlink_metadata(entry.path())
-            .await
-            .map_err(unavailable)?;
+    loop {
+        check_aux_deadline(deadline)?;
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => return Ok((bytes, false)),
+        };
+        let meta = match fs::symlink_metadata(entry.path()).await {
+            Ok(meta) => meta,
+            Err(_) => {
+                valid = false;
+                continue;
+            }
+        };
         bytes += meta.len();
         valid &= meta.is_file()
             && entry
@@ -994,22 +1056,20 @@ async fn load_tool_metadata(path: &Path) -> Result<Option<StoredToolRecord>, Sto
 }
 
 async fn remove_aux_directory(path: &Path) -> Result<(), StoreError> {
+    fs::remove_dir_all(path).await.map_err(unavailable)?;
+    cleanup_aux_parent(path).await;
+    Ok(())
+}
+
+async fn cleanup_aux_parent(path: &Path) {
     let parent = path
         .parent()
         .expect("auxiliary directory has a tools parent");
-    fs::remove_dir_all(path).await.map_err(unavailable)?;
-    match fs::remove_dir(parent).await {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(_) => Err(StoreError::Unavailable),
+    #[cfg(test)]
+    if let Some(gate) = AUX_PARENT_CLEANUP_GATES.take(&path.to_path_buf()) {
+        gate.pass().await;
     }
+    let _ = fs::remove_dir(parent).await;
 }
 
 async fn discard_aux_temp(path: &Path, ledger: &mut Option<AuxLedger>) {

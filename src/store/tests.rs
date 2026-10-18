@@ -4809,10 +4809,189 @@ fn history_limits(max_bytes: u64, max_lines: usize) -> HistoryScanLimits {
     }
 }
 
+async fn index_history(store: &Store, id: SessionId) {
+    let loaded = store.load_session(id).await.unwrap();
+    store.install_history_index(id, loaded.history_index);
+}
+
+#[cfg(unix)]
+fn run_as_unprivileged(test: &str) -> bool {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    assert!(uid.status.success());
+    if uid.stdout != b"0\n" {
+        return false;
+    }
+    // The remote build runs as root, whose executable lives beneath /root.
+    let directory = crate::test_support::TempDir::new("store-unprivileged");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = directory.path().join("tests");
+    std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = std::process::Command::new(binary)
+        .args([test, "--exact", "--nocapture"])
+        .gid(65534)
+        .uid(65534)
+        .status()
+        .unwrap();
+    assert!(status.success(), "unprivileged test failed");
+    true
+}
+
+#[cfg(unix)]
+struct RestorePermissions(PathBuf, std::fs::Permissions);
+
+#[cfg(unix)]
+impl RestorePermissions {
+    fn set(path: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self(path.to_path_buf(), original)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn aux_permission_failures_are_isolated_and_eviction_finishes() {
+    if run_as_unprivileged(
+        "store::tests::aux_permission_failures_are_isolated_and_eviction_finishes",
+    ) {
+        return;
+    }
+    let (_directory, store, id) = fixture("aux-permissions").await;
+    store.create_session(&record(id)).await.unwrap();
+    let mut permissions = Vec::new();
+    for name in [
+        None,
+        Some("foreign"),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    ] {
+        let foreign = SessionId::new().unwrap();
+        store.create_session(&record(foreign)).await.unwrap();
+        let tools = store.session_directory(foreign).join(AUX_TOOLS_DIR);
+        let unreadable = name.map_or(tools.clone(), |name| tools.join(name));
+        fs::create_dir_all(&unreadable).await.unwrap();
+        permissions.push(RestorePermissions::set(&unreadable, 0o000));
+        assert_eq!(
+            fs::read_dir(&unreadable).await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+    let store = store.with_aux_limits(AuxLimits {
+        session_records: 1,
+        ..DEFAULT_AUX_LIMITS
+    });
+    let first = empty_snapshot(make_tool_ref(id, "first"));
+    store
+        .commit_tool_record(&first, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_tool_record(&first.tool_ref)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let victim = store
+        .session_directory(id)
+        .join(AUX_TOOLS_DIR)
+        .join(tool_ref_hash(&first.tool_ref));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    super::tool_records::AUX_PARENT_CLEANUP_GATES.arm(victim.clone(), Arc::clone(&gate));
+    let second = empty_snapshot(make_tool_ref(id, "second"));
+    let committing = tokio::spawn({
+        let store = store.clone();
+        let second = second.clone();
+        async move {
+            store
+                .commit_tool_record(&second, Instant::now() + Duration::from_secs(10))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+        .await
+        .unwrap();
+    assert!(!victim.exists());
+    let session_dir = store.session_directory(id);
+    let protected = RestorePermissions::set(&session_dir, 0o555);
+    assert_eq!(
+        fs::remove_dir(session_dir.join(AUX_TOOLS_DIR))
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    gate.release();
+    committing.await.unwrap().unwrap();
+    let third = empty_snapshot(make_tool_ref(id, "third"));
+    store
+        .commit_tool_record(&third, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_tool_record(&second.tool_ref)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_tool_record(&third.tool_ref)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(protected);
+    let third_dir = session_dir
+        .join(AUX_TOOLS_DIR)
+        .join(tool_ref_hash(&third.tool_ref));
+    let protected = RestorePermissions::set(&third_dir, 0o555);
+    let fourth = empty_snapshot(make_tool_ref(id, "fourth"));
+    assert!(matches!(
+        store
+            .commit_tool_record(&fourth, Instant::now() + Duration::from_secs(10))
+            .await,
+        Err(StoreError::Unavailable)
+    ));
+    assert!(store.aux_lock.lock().await.is_none());
+    drop(protected);
+    store
+        .commit_tool_record(&fourth, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_tool_record(&third.tool_ref)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_tool_record(&fourth.tool_ref)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(permissions);
+}
+
 #[tokio::test]
 async fn indexed_history_seeks_past_the_cold_scan_limit() {
     let (_directory, store, id) = fixture("indexed-large-history").await;
     store.create_session(&record(id)).await.unwrap();
+    store.install_history_index(id, Vec::new());
     let text = "x".repeat(64 * 1024);
     let mut entry = loop_record_with_users(&[text.as_str(); 64]);
     for _ in 0..17 {
@@ -4842,7 +5021,7 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
     assert_eq!(page.total_items, 17 * 64);
     assert_eq!(page.items, entry.items[..1]);
     assert_eq!(page.covered_usage.loop_count, 16);
-    store.load_session(id).await.unwrap();
+    index_history(&store, id).await;
     assert_eq!(
         store
             .read_loop_record(id, entry.loop_id, &history_limits(8 * 1024 * 1024, 1))
@@ -4895,7 +5074,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
         .append_loop(id, &loop_record_with_users(&["one", "two"]))
         .await
         .unwrap();
-    store.load_session(id).await.unwrap();
+    index_history(&store, id).await;
     let limits = history_limits(32 * 1024 * 1024, 100);
     let first = store
         .read_history_page(id, 0, 1, Some(2), None, None, None, &limits)
@@ -4941,7 +5120,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
         .await
         .unwrap();
     assert_eq!(cold.items, next.items);
-    store.load_session(id).await.unwrap();
+    index_history(&store, id).await;
     let current = store
         .read_history_page(id, 2, 1, Some(3), None, None, None, &limits)
         .await
@@ -4959,7 +5138,7 @@ async fn partial_append_rolls_back_or_reports_unknown_and_load_repairs() {
         store.create_session(&record(id)).await.unwrap();
         let first = loop_record("kept");
         store.append_loop(id, &first).await.unwrap();
-        store.load_session(id).await.unwrap();
+        index_history(&store, id).await;
         let path = store.session_directory(id).join(HISTORY_FILE);
         let original = fs::read(&path).await.unwrap();
         APPEND_FAILURES.arm(id, rollback_fails);

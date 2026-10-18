@@ -6420,6 +6420,59 @@ async fn immediate_send_after_completion_does_not_report_busy() {
 }
 
 #[tokio::test]
+async fn cancelled_open_does_not_publish_a_history_index() {
+    let (data_dir, _guard) = fixture_dir(&format!("cancel-open-{}", next_id()));
+    let (workspace, _guard) = workspace_file("cancel-open-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "saved").await;
+    wait_text(&agent, turn).await;
+    agent.close_session(info.session_id).await.unwrap();
+
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::store::SESSION_LOAD_GATES.arm(info.session_id, Arc::clone(&gate));
+    let mut opening = Box::pin(agent.open_session(info.session_id));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut opening => panic!("open completed before the gate: {result:?}"),
+            _ = gate.wait_started() => {}
+        }
+    })
+    .await
+    .unwrap();
+    drop(opening);
+    assert!(matches!(
+        agent.session_state(info.session_id),
+        Err(AgentError::SessionNotLoaded)
+    ));
+
+    let history = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("history.jsonl");
+    let mut bytes = std::fs::read(&history).unwrap();
+    bytes.insert(0, b' ');
+    std::fs::write(&history, &bytes).unwrap();
+    let page = agent
+        .read_session(ReadSession {
+            view: crate::read::ReadView::Canonical,
+            ..display_read(info.session_id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.history_revision, crate::store::hash_bytes(&bytes));
+    assert_eq!(page.captured_end, bytes.len() as u64);
+    agent.open_session(info.session_id).await.unwrap();
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
     let (data_dir, _guard) = fixture_dir(&format!("ws-identity-{}", next_id()));
     let (workspace, _guard) = workspace_file("ws-identity-ws", "a.txt", b"hello");

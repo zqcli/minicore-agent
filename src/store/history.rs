@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct HistoryLine {
+pub(crate) struct HistoryLine {
     end: u64,
     items: usize,
     hash: Sha256,
@@ -705,6 +705,7 @@ impl Store {
         (
             std::sync::Arc<[HistoryItem]>,
             std::collections::HashMap<(LoopId, usize), String>,
+            Vec<HistoryLine>,
         ),
         StoreError,
     > {
@@ -804,11 +805,7 @@ impl Store {
             }
         }
         let history = items.into();
-        self.history_indexes
-            .lock()
-            .unwrap()
-            .insert(session_id, index);
-        Ok((history, times))
+        Ok((history, times, index))
     }
 }
 
