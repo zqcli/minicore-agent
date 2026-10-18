@@ -49,7 +49,7 @@ pub(crate) fn recent_tail_start(
     }
     Ok(previous_covered)
 }
-// Pi 1.0.1 (MIT), with bounded update instructions; see THIRD_PARTY_NOTICES.md.
+// Pi 1.0.1 (MIT), with bounded update instructions; see prompts/LICENSE.
 const PI_SYSTEM_PROMPT: &str = include_str!("prompts/system.txt");
 const PI_INITIAL_PROMPT: &str = include_str!("prompts/initial.txt");
 const PI_UPDATE_PROMPT: &str = include_str!("prompts/update.txt");

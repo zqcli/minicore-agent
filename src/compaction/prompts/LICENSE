@@ -1,6 +1,6 @@
 Pi compaction prompts
 
-The system, initial, and update prompts in src/compaction/prompts are copied
+The system, initial, and update prompts in this directory are copied
 from @earendil-works/pi-coding-agent 1.0.1, dist/core/compaction/utils.js
 (SUMMARIZATION_SYSTEM_PROMPT) and compaction.js (SUMMARIZATION_PROMPT and
 UPDATE_SUMMARIZATION_INSTRUCTIONS).

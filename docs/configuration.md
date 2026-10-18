@@ -105,6 +105,21 @@ unknown when the corresponding cache/reasoning breakdown is unavailable. Present
 counters must still have valid types and consistent totals. Empty text and refusal
 deltas are ignored.
 
+### Custom TLS Trust Store
+
+Responses clients use reqwest's built-in trusted roots when `SSL_CERT_FILE` is
+unset. To use a custom CA bundle (for example, for a trusted TLS proxy), set
+`SSL_CERT_FILE` to a PEM file containing one or more CA certificates. The bundle
+replaces the built-in roots; include every CA your provider connections need.
+Relative paths resolve from the Agent process's working directory.
+
+An empty path, missing or unreadable file, bundle with no certificates, PEM
+parsing error reported by reqwest, or custom-client build failure stops startup
+with `ConfigError::InvalidTlsTrustStore`. The error does not expose the path or
+bundle contents, and there is no fallback to built-in roots. Certificate and
+hostname verification, proxy discovery, request timeouts, and the redirect
+policy are unchanged.
+
 ## Paths And Prompt Files
 
 `AgentConfig::load` and `Agent::open_file` make the supplied config path
