@@ -275,10 +275,10 @@ pub(crate) fn minimal_messages(
 ) -> Result<Vec<ModelMessage>, UtilityError> {
     let mut messages = Vec::with_capacity(current_users.len() + 1);
     if !system.is_empty() {
-        messages.push(ModelMessage::system(system.as_str().to_owned()).map_err(invalid)?);
+        messages.push(ModelMessage::system(system.as_str()).map_err(invalid)?);
     }
     for text in current_users {
-        messages.push(ModelMessage::user((*text).to_owned()).map_err(invalid)?);
+        messages.push(ModelMessage::user(*text).map_err(invalid)?);
     }
     Ok(messages)
 }
@@ -295,7 +295,7 @@ pub(crate) fn compose(
 ) -> Result<(Vec<ModelMessage>, Vec<ModelMessage>), UtilityError> {
     let mut fixed = Vec::with_capacity(2);
     if !system.is_empty() {
-        fixed.push(ModelMessage::system(system.as_str().to_owned()).map_err(invalid)?);
+        fixed.push(ModelMessage::system(system.as_str()).map_err(invalid)?);
     }
     if let Some(summary) = summary {
         fixed.push(summary_data_message(summary).map_err(invalid)?);
@@ -421,8 +421,9 @@ impl<'a> Projection<'a> {
                 }
             }
             count += 1;
-            bytes +=
-                crate::sessions::estimate_history_bytes(std::slice::from_ref(self.items[index]));
+            bytes += minicore_runtime::history::estimate_history_bytes(std::slice::from_ref(
+                self.items[index],
+            ));
             index += 1;
         }
         (count, bytes)

@@ -151,7 +151,7 @@ impl FixedPrompt {
         let mut normal_messages = Vec::with_capacity(2);
         if !input.project_instructions.is_empty() {
             normal_messages.push(
-                ModelMessage::system(input.project_instructions.as_str().to_owned())
+                ModelMessage::system(input.project_instructions.as_str())
                     .map_err(|_| UtilityError::TooLarge)?,
             );
         }
@@ -167,8 +167,7 @@ impl FixedPrompt {
     fn utility_request(&self, user_message: ModelMessage) -> Result<ModelRequest, UtilityError> {
         make_request(
             vec![
-                ModelMessage::system(self.system.as_str().to_owned())
-                    .map_err(|_| UtilityError::TooLarge)?,
+                ModelMessage::system(self.system.as_str()).map_err(|_| UtilityError::TooLarge)?,
                 user_message,
             ],
             Vec::new(),
@@ -908,7 +907,7 @@ fn normal_request(
     let mut messages = Vec::with_capacity(history.len() + 2);
     if !input.project_instructions.is_empty() {
         messages.push(
-            ModelMessage::system(input.project_instructions.as_str().to_owned())
+            ModelMessage::system(input.project_instructions.as_str())
                 .map_err(|_| UtilityError::TooLarge)?,
         );
     }

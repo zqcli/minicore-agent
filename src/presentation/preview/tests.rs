@@ -68,7 +68,8 @@ fn error() -> Result<ModelEvent, ModelError> {
             minicore_runtime::error::DiagnosticCategory::Model,
             minicore_runtime::value::BoundedText::new("synthetic stream error").unwrap(),
             false,
-        ),
+        )
+        .unwrap(),
     ))
 }
 fn drain(receiver: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {

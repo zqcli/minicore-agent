@@ -206,7 +206,7 @@ fn projection_keeps_visible_reasoning_arguments_and_embedded_summary_only() {
     let thinking = "thinking é🙂".repeat(400);
     let arguments = json!({"path":"src/example.rs", "content":"arg text ".repeat(800)});
     let mut item = assistant(vec![
-        AssistantPart::Text("VISIBLE_ANSWER".to_owned()),
+        AssistantPart::Text("VISIBLE_ANSWER".into()),
         AssistantPart::Reasoning(
             ReasoningContent::new(
                 Some(thinking.clone()),

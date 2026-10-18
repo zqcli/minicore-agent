@@ -12,9 +12,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::execution::{ConfigRevision, ExecutionConfig, UserInput};
-use minicore_runtime::history::HistoryItem;
+use minicore_runtime::history::{HistoryItem, estimate_history_bytes};
 use minicore_runtime::interaction::InteractionAnswer;
-use minicore_runtime::model::{AssistantPart, Model, ModelDescriptor};
+use minicore_runtime::model::{Model, ModelDescriptor};
 use minicore_runtime::tools::{ToolName, ToolSpec};
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
@@ -107,6 +107,7 @@ pub enum SessionStatus {
     WaitingForInput,
     Finishing,
     Blocked,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -845,6 +846,7 @@ impl Session {
                         }
                         minicore_runtime::LoopStatus::Finishing
                         | minicore_runtime::LoopStatus::Finished => SessionStatus::Finishing,
+                        _ => SessionStatus::Unknown,
                     }
                 }
             }
@@ -868,8 +870,9 @@ impl Session {
             .as_ref()
             .map_or(&inner.history[..], |projection| projection.suffix);
         let estimated_history_items = projected_history.len();
-        let estimated_history_bytes =
-            estimate_history_bytes_for_context(projected_history, &inner.options.limits);
+        let estimated_history_bytes = (estimated_history_items
+            <= inner.options.limits.max_history_items)
+            .then(|| estimate_history_bytes(projected_history));
         let within_runtime_limits =
             if estimated_history_items > inner.options.limits.max_history_items {
                 Some(false)
@@ -1356,7 +1359,7 @@ impl Session {
         inner.closing = true;
         self.shared.close.cancel();
         if let Some(active) = &inner.active {
-            active.handle.cancel();
+            active.handle.shutdown();
         }
         for operation in inner.compaction.iter().chain(&inner.pending_compaction) {
             operation.cancel();
@@ -1438,76 +1441,6 @@ fn history_fits_runtime_limits(
 ) -> bool {
     history.len() <= limits.max_history_items
         && estimate_history_bytes(history) <= limits.max_history_bytes
-}
-
-/// Mirrors `minicore_runtime::history::estimate_history_bytes` at the pinned
-/// Runtime revision `9082184`. This narrow
-/// copy is only for the pre-start `LoopRequest.history` admission check; it is
-/// not a full prompt or provider-context estimate. The over-item and over-byte
-/// startup tests are the contract boundary for keeping this copy aligned.
-pub(crate) fn estimate_history_bytes(history: &[HistoryItem]) -> usize {
-    history
-        .iter()
-        .map(estimate_history_item_bytes)
-        .fold(0, usize::saturating_add)
-}
-
-/// Produces a bounded context-query estimate. The item count is checked before
-/// scanning, and byte accumulation stops once the Runtime byte limit is known
-/// to be exceeded, so `session.context` never scans an unbounded history.
-fn estimate_history_bytes_for_context(
-    history: &[HistoryItem],
-    limits: &minicore_runtime::LoopLimits,
-) -> Option<usize> {
-    if history.len() > limits.max_history_items {
-        return None;
-    }
-    let mut total = 0usize;
-    for item in history {
-        total = total.saturating_add(estimate_history_item_bytes(item));
-        if total > limits.max_history_bytes {
-            return Some(total);
-        }
-    }
-    Some(total)
-}
-
-fn estimate_history_item_bytes(item: &HistoryItem) -> usize {
-    match item {
-        HistoryItem::User(user) => user.input.as_text().len(),
-        HistoryItem::Assistant(assistant) => assistant
-            .content
-            .iter()
-            .map(estimate_assistant_part_bytes)
-            .sum::<usize>()
-            .saturating_add(
-                assistant
-                    .provider_replay
-                    .as_ref()
-                    .map_or(0, |replay| replay.byte_len()),
-            ),
-        HistoryItem::ToolResult(result) => {
-            result.call_id.as_str().len()
-                + result.tool_name.as_str().len()
-                + result.output.content().as_str().len()
-        }
-        HistoryItem::Summary(summary) => summary.content.as_str().len(),
-    }
-}
-
-fn estimate_assistant_part_bytes(part: &AssistantPart) -> usize {
-    match part {
-        AssistantPart::Text(text) => text.len(),
-        AssistantPart::Reasoning(reasoning) => reasoning
-            .text()
-            .map_or(0, str::len)
-            .saturating_add(reasoning.summary().map_or(0, str::len))
-            .saturating_add(reasoning.encrypted().map_or(0, str::len))
-            .saturating_add(reasoning.signature().map_or(0, str::len)),
-        AssistantPart::ToolCall(call) => {
-            call.name().as_str().len() + call.arguments().to_string().len()
-        }
-    }
 }
 
 fn bytes_to_tokens(bytes: usize) -> u64 {
@@ -2062,12 +1995,14 @@ impl LoopOutcomeView {
                     minicore_runtime::CancelReason::OwnerDropped => CancelReasonView::OwnerDropped,
                     minicore_runtime::CancelReason::Shutdown => CancelReasonView::Shutdown,
                     minicore_runtime::CancelReason::Deadline => CancelReasonView::Deadline,
+                    _ => CancelReasonView::Unknown,
                 },
             },
             minicore_runtime::LoopOutcome::Failed(failure) => Self::Failed {
                 kind: loop_failure_kind(&failure.kind).to_owned(),
                 model_error: failure.model_error().map(ModelErrorView::from_model),
             },
+            _ => Self::Unknown,
         }
     }
 }

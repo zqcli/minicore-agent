@@ -873,6 +873,7 @@ fn model_error_diagnostic(kind: ModelErrorKind) -> minicore_runtime::error::Diag
         BoundedText::new(message).expect("static diagnostic text"),
         false,
     )
+    .expect("valid diagnostic text")
 }
 
 fn check_start(context: &ModelCallContext) -> Result<(), ModelError> {

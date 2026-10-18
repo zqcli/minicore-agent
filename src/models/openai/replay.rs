@@ -26,8 +26,9 @@ pub(super) fn capture(
         } else if item_type(&item) == Some("message") {
             // Missing identity disables raw replay, not canonical message text.
             let text = visible_text(std::slice::from_ref(&item))?;
-            reusable
-                .push(serde_json::to_value(InputMessage::assistant(None, text)).map_err(|_| ())?);
+            reusable.push(
+                serde_json::to_value(InputMessage::assistant(None, text.into())).map_err(|_| ())?,
+            );
         }
         // Anonymous reasoning cannot be replayed, especially its ciphertext.
     }
@@ -269,11 +270,14 @@ fn validate_parts(output: &[Value], parts: &[AssistantPart]) -> Result<(), ()> {
     let text = parts
         .iter()
         .filter_map(|part| match part {
-            AssistantPart::Text(text) => Some(text.as_str()),
+            AssistantPart::Text(text) => Some(text.as_ref()),
             _ => None,
         })
         .collect::<String>();
-    if visible_text(output)? != text {
+    let projected =
+        ModelMessage::assistant(vec![AssistantPart::Text(visible_text(output)?.into())])
+            .map_err(|_| ())?;
+    if projected != ModelMessage::Assistant(vec![AssistantPart::Text(text.into())]) {
         return Err(());
     }
     Ok(())

@@ -80,7 +80,7 @@ fn plaintext_warning_is_once_per_remote_model_and_redacts_endpoint_and_key() {
 }
 
 #[tokio::test]
-async fn empty_text_and_refusal_deltas_do_not_emit_events_or_change_finish_reason() {
+async fn empty_text_and_refusal_deltas_reach_runtime_without_changing_finish_reason() {
     let server = MockServer::spawn([MockResponse::sse(&[
         json!({"type":"response.output_text.delta", "delta":""}),
         json!({"type":"response.refusal.delta", "delta":""}),
@@ -111,8 +111,71 @@ async fn empty_text_and_refusal_deltas_do_not_emit_events_or_change_finish_reaso
             .iter()
             .filter(|event| matches!(event, ModelEvent::TextDelta { .. }))
             .count(),
-        1
+        4
     );
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn runtime_normalizes_provider_text_and_ignores_empty_deltas() {
+    let text = format!("{}\r\n\x1b\rfin\t", "a".repeat(MAX_EVENT_BYTES / 3 - 1));
+    let controls = "\x01".repeat(MAX_EVENT_BYTES);
+    let expected = format!(
+        "{}\n�\nfin\t{}",
+        "a".repeat(MAX_EVENT_BYTES / 3 - 1),
+        "�".repeat(MAX_EVENT_BYTES)
+    );
+    let server = MockServer::spawn([MockResponse::sse(&[
+        json!({"type":"response.output_text.delta", "delta":""}),
+        json!({"type":"response.output_text.delta", "delta":text}),
+        json!({"type":"response.output_text.delta", "delta":controls}),
+        json!({"type":"response.reasoning_summary_text.delta", "delta":"why\r\n\x1b"}),
+        json!({"type":"response.output_text.delta", "delta":""}),
+        completed(usage()),
+    ])])
+    .await;
+    let config = minicore_runtime::execution::ExecutionConfig::new(
+        Arc::new(model(server.base_url())),
+        ReasoningPreference::Auto,
+        minicore_runtime::tools::ToolSet::default(),
+        None,
+        Arc::new(minicore_runtime::prompt::DefaultPromptProvider::new(None)),
+    )
+    .unwrap();
+    let request = minicore_runtime::LoopRequest::new(
+        Arc::from(Vec::<minicore_runtime::history::HistoryItem>::new()),
+        minicore_runtime::execution::UserInput::text("answer").unwrap(),
+        config,
+    );
+    let mut runner = minicore_runtime::AgentLoop::start(
+        request,
+        minicore_runtime::LoopOptions::default_checked().unwrap(),
+    )
+    .unwrap();
+    let mut events = runner.take_events().unwrap();
+    let report = runner.join().await.unwrap();
+    assert_eq!(report.outcome, minicore_runtime::LoopOutcome::Completed);
+    let parts = report
+        .appended
+        .iter()
+        .filter_map(|item| match item {
+            minicore_runtime::history::HistoryItem::Assistant(assistant) => {
+                Some(&assistant.content)
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(parts.len(), 2);
+    assert!(matches!(parts[0], AssistantPart::Text(text) if text.as_ref() == expected));
+    assert!(
+        matches!(parts[1], AssistantPart::Reasoning(reasoning) if reasoning.text() == Some("why\n�"))
+    );
+    while let Some(event) = events.next().await {
+        if let minicore_runtime::LoopEvent::OutputDelta { delta, .. } = event.event {
+            assert!(!delta.as_str().is_empty());
+        }
+    }
     server.finish().await;
 }
 
@@ -610,7 +673,7 @@ fn history_request(reasoning: ReasoningPreference) -> ModelRequest {
                     ReasoningContent::new(Some("private reasoning".to_owned()), None, None, None)
                         .unwrap(),
                 ),
-                AssistantPart::Text("prior answer".to_owned()),
+                AssistantPart::Text("prior answer".into()),
                 AssistantPart::ToolCall(call),
             ])
             .unwrap(),
@@ -759,7 +822,7 @@ fn assert_error(
         matches!(error.retry_hint(), RetryHint::Retryable { .. }),
         retryable
     );
-    assert!(!error.diagnostic().message.as_str().contains("SECRET"));
+    assert!(!error.diagnostic().message().as_str().contains("SECRET"));
 }
 
 #[tokio::test]
@@ -1583,12 +1646,8 @@ async fn large_provider_text_is_split_on_utf8_boundaries() {
 }
 
 #[tokio::test]
-async fn unsafe_or_oversized_sse_and_invalid_tool_lifecycle_fail_closed() {
+async fn oversized_sse_and_invalid_tool_lifecycle_fail_closed() {
     let cases = vec![
-        MockResponse::sse(&[json!({
-            "type": "response.output_text.delta",
-            "delta": "bad\u{1}text"
-        })]),
         MockResponse::sse_bytes({
             let mut body = b"data: ".to_vec();
             body.extend(std::iter::repeat_n(b'x', MAX_SSE_LINE_BYTES + 1));

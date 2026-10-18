@@ -29,7 +29,7 @@ fn display_projection_strips_bodies_and_only_uses_the_captured_prefix() {
         model: "main".parse().unwrap(),
         reasoning: ReasoningPreference::Auto,
         content: vec![
-            AssistantPart::Text("visible".to_owned()),
+            AssistantPart::Text("visible".into()),
             AssistantPart::ToolCall(call),
         ],
         provider_replay: None,

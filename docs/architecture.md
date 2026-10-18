@@ -29,7 +29,9 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
   history, execution configuration, compaction state, `ToolData`,
   `CommandOwners`, `ToolObserver`, Presentation state, and Session-owned query
   workers. Close cancels and joins those workers before unloading the Session.
-- The Runtime owns the `AgentLoop` semantics and model/tool scheduling. The
+- Runtime 0.7.0 owns the `AgentLoop` semantics, model-text normalization, and
+  model/tool scheduling. Immutable text, arguments, replay, and request payloads
+  share storage across clones. The
   Agent's Session task observes the loop, persists the durably normalized result (including validated private replay), merges
   settled history, and publishes Agent-level completion.
 - `ToolObserver` captures the real request/Tool identity at Runtime boundaries.
@@ -48,11 +50,16 @@ Session lifecycle mutations reserve the affected ID until completion; reload
 reserves catalog replacement against concurrent deferred mutations. Shutdown
 signals all Sessions before joining any, drains deferred operations, and joins
 Session barriers concurrently. The loaded map retains Sessions until their
-workers are joined.
+workers are joined. Session close and Agent shutdown use `LoopHandle::shutdown()`;
+only explicit turn cancellation uses the user-cancellation path.
 
 Events use derived tagged serialization, and stored outcomes and public outcome
 views share the same redacted types. Byte-level event and history-record golden
-tests protect the existing wire and storage formats.
+tests protect the existing wire and storage formats. Future non-exhaustive Runtime
+statuses, cancellation reasons, and outcomes map to explicit `unknown` values.
+Runtime's `history::estimate_history_bytes` is the single admission estimator for
+start checks, context queries, and compaction triggers. Context queries skip the
+byte scan above the item cap; otherwise they report the full estimate.
 
 ## Warm, Live, And Cold Data
 

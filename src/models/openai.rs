@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::pin::Pin;
-
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -486,7 +486,7 @@ struct InputMessage {
 }
 
 impl InputMessage {
-    fn assistant(id: Option<String>, text: String) -> Self {
+    fn assistant(id: Option<String>, text: Arc<str>) -> Self {
         Self {
             item_type: "message",
             role: "assistant",
@@ -505,7 +505,7 @@ impl InputMessage {
 struct InputContent {
     #[serde(rename = "type")]
     content_type: &'static str,
-    text: String,
+    text: Arc<str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotations: Option<Vec<Value>>,
 }
@@ -832,6 +832,7 @@ struct StreamState {
     output_items: Option<BTreeMap<u32, Value>>,
     output_item_bytes: usize,
     replay_identity: Option<(String, String)>,
+    replay_text_compatible: bool,
     text: String,
     trace: Option<RequestTraceContext>,
     provider_event_seen: bool,
@@ -874,6 +875,7 @@ impl StreamState {
             output_items: Some(BTreeMap::new()),
             output_item_bytes: 0,
             replay_identity,
+            replay_text_compatible: true,
             text: String::new(),
             trace,
             provider_event_seen: false,
@@ -993,6 +995,9 @@ impl StreamState {
         }
         if replay::visible_text(output.values())? != self.text {
             return Err(());
+        }
+        if !self.replay_text_compatible {
+            return self.without_replay();
         }
         let output = self
             .output_items
@@ -1288,7 +1293,7 @@ struct ReasoningParts {
     last_lifecycle: u64,
     /// True once any nonempty reasoning text was handed to the stream.
     emitted: bool,
-    /// Whether the last emitted nonempty text ends with a raw newline.
+    /// Whether the last emitted nonempty text normalizes to a trailing newline.
     last_ends_newline: bool,
     /// A boundary observed on an EMPTY delta (e.g. a new `summary_index` with
     /// no text): the next nonempty delta emits the separator without the
@@ -1346,11 +1351,11 @@ fn queue_reasoning_delta(
     let needs_separator = boundary
         && state.reasoning_parts.emitted
         && !state.reasoning_parts.last_ends_newline
-        && !delta.starts_with('\n');
+        && !delta.starts_with(['\n', '\r']);
     if needs_separator {
         queue_text(state, "\n".to_owned(), true)?;
     }
-    let last_ends_newline = delta.ends_with('\n');
+    let last_ends_newline = delta.ends_with(['\n', '\r']);
     queue_text(state, delta, true)?;
     if boundary {
         state.reasoning_parts.last_key = merged;
@@ -1506,13 +1511,12 @@ struct IncompleteDetails {
 }
 
 fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<(), ()> {
-    if text
-        .chars()
-        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
-    {
-        return Err(());
-    }
     if !reasoning {
+        // Runtime normalizes per delta. A CRLF split across deltas becomes two
+        // newlines, which a raw replay message cannot reproduce canonically.
+        if state.text.ends_with('\r') && text.starts_with('\n') {
+            state.replay_text_compatible = false;
+        }
         state.text.push_str(&text);
     }
     for chunk in event_text_chunks(&text) {
@@ -1527,14 +1531,18 @@ fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<
     Ok(())
 }
 
-fn event_text_chunks(mut value: &str) -> impl Iterator<Item = &str> {
+fn event_text_chunks(value: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(value);
     std::iter::from_fn(move || {
-        if value.is_empty() {
-            return None;
+        let value = remaining.take()?;
+        // Runtime normalization can expand a one-byte control to U+FFFD.
+        let mut end = crate::text::floor_char_boundary(value, MAX_EVENT_BYTES / 3);
+        // Do not turn one CRLF into two newlines at an adapter-created boundary.
+        if value[..end].ends_with('\r') && value[end..].starts_with('\n') {
+            end -= 1;
         }
-        let (chunk, rest) =
-            value.split_at(crate::text::floor_char_boundary(value, MAX_EVENT_BYTES));
-        value = rest;
+        let (chunk, rest) = value.split_at(end);
+        remaining = (!rest.is_empty()).then_some(rest);
         Some(chunk)
     })
 }
@@ -1568,10 +1576,7 @@ fn start_tool(
             ended: false,
         },
     );
-    if !item.arguments.is_empty() {
-        append_tool_arguments(state, output_index, &item.arguments)?;
-    }
-    Ok(())
+    append_tool_arguments(state, output_index, &item.arguments)
 }
 
 fn append_tool_arguments(
@@ -1579,9 +1584,6 @@ fn append_tool_arguments(
     output_index: u32,
     delta: &str,
 ) -> Result<(), ()> {
-    if delta.is_empty() {
-        return Ok(());
-    }
     let tool = state.tools.get_mut(&output_index).ok_or(())?;
     if tool.arguments_done || tool.item_done {
         return Err(());
@@ -1607,6 +1609,10 @@ fn reconcile_arguments(
 ) -> Result<(), ()> {
     let current = &state.tools.get(&output_index).ok_or(())?.arguments;
     let remainder = complete.strip_prefix(current).ok_or(())?;
+    // Done events repeat the complete arguments after streaming has ended.
+    if remainder.is_empty() {
+        return Ok(());
+    }
     append_tool_arguments(state, output_index, remainder)
 }
 
@@ -1859,6 +1865,7 @@ fn diagnostic(kind: ModelErrorKind, retryable: bool) -> DiagnosticSummary {
         BoundedText::new(message).expect("static model diagnostic must fit"),
         retryable,
     )
+    .expect("valid diagnostic text")
 }
 
 #[cfg(test)]

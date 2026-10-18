@@ -117,7 +117,9 @@ pub(crate) fn assistant_display_parts(
     for part in content {
         match part {
             minicore_runtime::model::AssistantPart::Text(text) => {
-                parts.push(AssistantDisplayPart::Text { text: text.clone() });
+                parts.push(AssistantDisplayPart::Text {
+                    text: text.to_string(),
+                });
             }
             minicore_runtime::model::AssistantPart::Reasoning(reasoning) => {
                 let mut text = String::new();

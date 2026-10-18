@@ -110,9 +110,10 @@ cancellation to its active loop, compaction, and queries. It then drains deferre
 operations and joins Sessions concurrently, plus pre-existing waiter/query tasks
 and the event pump, before queuing its response last. EOF, Ctrl-C,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
-MiniCore Agent v0.6.1 uses the Runtime user-cancellation path when closing or
-shutting down an active Session;
-it does not currently preserve a distinct shutdown cancellation reason.
+Closing or shutting down an active Session uses Runtime shutdown cancellation,
+so the turn outcome records `{"type":"cancelled","reason":"shutdown"}` when
+that request wins the Runtime completion race. A prior cancellation or completed
+outcome is not overwritten; `turn.cancel` still requests reason `user`.
 
 ## Method Index
 
@@ -322,16 +323,15 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
 - `session.close` cancels any active loop and manual/post-turn compaction, joins all
-  Session-owned workers, and returns `{"ok":true}`. MiniCore Agent v0.6.1 uses
-  the Runtime user-cancellation path when closing or shutting down an active
-  Session; it does not currently preserve a distinct shutdown cancellation
-  reason.
+  Session-owned workers, and returns `{"ok":true}`. Active loops receive Runtime
+  shutdown cancellation, preserving reason `shutdown` rather than `user`.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`.
 - `session.state` takes a loaded Session ID and returns the current Session
   state projection. While manual or post-turn compaction is in progress, the optional
   `compaction` member reports only its safe operation ID, phase, and item counts;
   clients use its presence, rather than the ordinary loop `status`, to observe
-  compaction busy.
+  compaction busy. Future Runtime statuses map to `unknown` in both Session and
+  active-loop status views.
 - `session.context` takes a loaded Session ID and returns the current manual or
   post-turn compaction operation, validated-summary coverage, latest operation
   result, and the estimated Runtime history budget. It is read-only and responds
@@ -860,8 +860,10 @@ response arrives:
 }
 ```
 
-`outcome.type` is `completed`, `cancelled` (with `reason`), or `failed` (with
-`kind` and optionally `model_error`). `persistence` is `persisted` or `failed`.
+`outcome.type` is `completed`, `cancelled` (with `reason`), `failed` (with
+`kind` and optionally `model_error`), or `unknown` for a future Runtime outcome.
+Cancellation reasons are `user`, `owner_dropped`, `shutdown`, `deadline`, or
+`unknown` for a future Runtime reason. `persistence` is `persisted` or `failed`.
 `persistence: persisted` means the Agent's history append and `sync_data`
 completed. Metadata/summary replacements sync the parent directory after rename;
 creating a Session and repairing a partial history tail are also synced. These

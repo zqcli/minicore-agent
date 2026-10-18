@@ -221,7 +221,7 @@ async fn default_ninety_five_projects_large_tool_history_without_raw_ticket_cap(
     .unwrap();
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     assert!(result.request.messages().iter().any(
-        |message| matches!(message, ModelMessage::User(value) if value == "new input exact ✓")
+        |message| matches!(message, ModelMessage::User(value) if value.as_ref() == "new input exact ✓")
     ));
     assert!(
         !result
@@ -310,13 +310,9 @@ async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
         result.request.messages()
     ));
     for expected in ["keep exact A", "steer exact B"] {
-        assert!(
-            result
-                .request
-                .messages()
-                .iter()
-                .any(|message| matches!(message, ModelMessage::User(value) if value == expected))
-        );
+        assert!(result.request.messages().iter().any(
+            |message| matches!(message, ModelMessage::User(value) if value.as_ref() == expected)
+        ));
     }
     let outputs = result
         .request
@@ -677,8 +673,8 @@ async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
             let limits = &mut auto.binding.limits;
             if by_bytes {
                 limits.max_history_bytes = 2
-                    * (crate::sessions::estimate_history_bytes(&base)
-                        + crate::sessions::estimate_history_bytes(settled))
+                    * (minicore_runtime::history::estimate_history_bytes(&base)
+                        + minicore_runtime::history::estimate_history_bytes(settled))
                     + 1;
             } else {
                 limits.max_history_items = 2 * (base.len() + settled.len()) + 1;
@@ -710,7 +706,7 @@ async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
             .unwrap();
             assert!(at.compacted);
             assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-            assert!(at.request.messages().iter().any(|message| matches!(message, ModelMessage::User(text) if text == "preserve current input")));
+            assert!(at.request.messages().iter().any(|message| matches!(message, ModelMessage::User(text) if text.as_ref() == "preserve current input")));
         }
     }
 }
@@ -727,7 +723,7 @@ async fn admission_pressure_returns_only_when_effective_history_grows() {
             let base = (0..10)
                 .flat_map(|index| exchange(old, index, 2_000))
                 .collect::<Vec<_>>();
-            let base_bytes = crate::sessions::estimate_history_bytes(&base);
+            let base_bytes = minicore_runtime::history::estimate_history_bytes(&base);
             if by_bytes {
                 auto.binding.limits.max_history_bytes = 2 * base_bytes;
             } else {

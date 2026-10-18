@@ -40,7 +40,8 @@ fn error(kind: ModelErrorKind, delivery: DeliveryState, text: &str) -> ModelErro
             DiagnosticCategory::Model,
             BoundedText::new(text).unwrap(),
             false,
-        ),
+        )
+        .unwrap(),
     )
 }
 const VALID: &str = "local serialized context estimate exceeds input budget: estimated_tokens=32001, input_budget_tokens=32000; use /compact or a larger model";

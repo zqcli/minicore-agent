@@ -7,8 +7,8 @@ library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
 Tool data, and a stdio JSON-RPC service for a client UI.
 
 - Rust edition: 2024; MSRV: **1.85**
-- Runtime: `minicore-runtime 0.6.1`, pinned to Git revision
-  `9082184e929508b30cf19f553a6837d075e2fed3`.
+- Runtime: `minicore-runtime 0.7.0`, pinned to Git revision
+  `9814432b9400d748ea535cd022df9af5116fb96d`.
 - RPC protocol version: **1**
 - Versioned source delivery uses the `dev` branch and annotated release tags;
   this does not imply a package-registry publication or binary installation.
@@ -64,7 +64,9 @@ Start with `Agent`, `AgentConfig`, `Workspace`, the session/turn DTOs,
 async constructor used by the binary; `Agent::open` is the embedded constructor
 without a reload source. `Agent::shutdown` is the async cleanup barrier for
 embedded callers; dropping an `Agent` with live work does not synchronously wait
-for its loop tasks.
+for its loop tasks. Session close and Agent shutdown request Runtime shutdown
+cancellation (`reason: "shutdown"`); explicit turn cancellation remains `"user"`.
+A cancellation that loses the Runtime completion race does not rewrite the outcome.
 
 A Session runs at most one active Runtime loop. Its persisted `session.json`,
 `history.jsonl`, and derived `summary.json` live below:
@@ -96,6 +98,11 @@ See [the replay contract](docs/provider-replay.md) for identity fallback, bounds
 usage uncertainty, and compatibility.
 
 ## Context And Compatibility
+
+Runtime owns model-text normalization: within each delta CRLF/CR become LF,
+other controls except LF/TAB become U+FFFD, and empty deltas emit no progress.
+Unknown future Runtime statuses, cancellation reasons, and outcomes map explicitly
+to `unknown` in Agent views rather than being mistaken for known states.
 
 Automatic compaction checks settled context before the first request, then
 checks between completed assistant/tool rounds, and independently after a

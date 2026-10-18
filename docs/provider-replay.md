@@ -1,4 +1,4 @@
-# Durable Responses Replay (0.6.1)
+# Durable Responses Replay
 
 Provider replay is an optional attachment to an assistant history item, not a
 second session history manager or a request cache. The existing Runtime history,
@@ -16,6 +16,12 @@ Known payloads validate shape, unique IDs/order, canonical text and canonical
 call IDs/names/JSON arguments before use. Matching replay atomically replaces the
 whole canonical assistant request projection. The separately stored tool result
 is sent once. Canonical parts alone control tool execution and display.
+
+Text consistency uses Runtime 0.7.0 normalization while raw replay remains exact:
+CRLF/CR become LF and controls other than LF/TAB become U+FFFD. If a CRLF is
+split across provider deltas, Runtime emits two newlines, unlike normalization
+of the combined raw message. The adapter omits replay for that response and
+retains its canonical content rather than persisting inconsistent metadata.
 
 A different endpoint/model or unknown format falls back to canonical parts.
 An opaque-only item has no canonical fallback, so incompatible replay fails
@@ -42,7 +48,7 @@ opaque-only response fails because it has neither usable replay nor canonical co
 
 The entire serialized Runtime replay envelope is limited to 256 KiB, depth 32,
 and 16,384 JSON nodes. Agent permits at most 256 output items per response.
-Replay bytes count toward the Runtime and mirrored Agent 2 MiB history limit;
+Replay bytes count toward the shared Runtime/Agent 2 MiB history limit;
 the existing 16 MiB JSONL record cap remains. No ciphertext is truncated. When
 capture exceeds a Runtime replay bound (including envelope framing), the adapter
 omits the entire replay attachment and keeps non-empty canonical text, reasoning,

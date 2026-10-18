@@ -173,7 +173,8 @@ fn utility_budget_error(kind: minicore_runtime::model::ModelErrorKind) -> ModelE
             )
             .expect("static utility diagnostic"),
             false,
-        ),
+        )
+        .expect("valid diagnostic text"),
     )
 }
 

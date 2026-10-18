@@ -55,9 +55,7 @@ fn settlement_folds_raw_offsets_before_removing_opaque_only_assistants() {
     ];
     appended.extend(exchange("folded-call", "RAW-FOLDED"));
     appended.extend(exchange("kept-call", "RAW-KEPT"));
-    appended.push(assistant(vec![AssistantPart::Text(
-        "final answer".to_owned(),
-    )]));
+    appended.push(assistant(vec![AssistantPart::Text("final answer".into())]));
     let items = appended.iter().collect::<Vec<_>>();
     let key = auto::compressible_ranges(0, &items, loop_id).unwrap()[0]
         .0
@@ -124,7 +122,7 @@ fn snapshot_projection_bound_is_separate_from_generated_summary_limit() {
     let replay = ProviderReplay::new("fixture", serde_json::json!({"opaque":"value"})).unwrap();
     let value = serde_json::to_string(&vec![
         ModelMessage::assistant_with_provider_replay(
-            vec![AssistantPart::Text(literal)],
+            vec![AssistantPart::Text(literal.into())],
             Some(replay),
         )
         .unwrap(),

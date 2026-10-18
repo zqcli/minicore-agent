@@ -201,10 +201,10 @@ fn assistant_parts_preserve_visible_order_and_redact_debug() {
     )
     .unwrap();
     let parts = assistant_display_parts(&[
-        minicore_runtime::model::AssistantPart::Text("before".to_owned()),
+        minicore_runtime::model::AssistantPart::Text("before".into()),
         minicore_runtime::model::AssistantPart::Reasoning(reasoning),
         minicore_runtime::model::AssistantPart::ToolCall(tool_call),
-        minicore_runtime::model::AssistantPart::Text("after".to_owned()),
+        minicore_runtime::model::AssistantPart::Text("after".into()),
     ]);
     assert!(matches!(&parts[0], AssistantDisplayPart::Text { text } if text == "before"));
     assert!(

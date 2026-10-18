@@ -73,7 +73,8 @@ impl Model for RawTestModel {
                     minicore_runtime::error::DiagnosticCategory::Model,
                     BoundedText::new("context window exceeded").unwrap(),
                     false,
-                );
+                )
+                .unwrap();
                 Err(ModelError::permanent(
                     ModelErrorKind::ContextOverflow,
                     DeliveryState::NotStarted,
@@ -746,7 +747,9 @@ async fn reconstruction_accounts_for_each_independent_group_once() {
         request
             .messages()
             .iter()
-            .filter(|message| matches!(message, ModelMessage::User(text) if text == "read big"))
+            .filter(
+                |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "read big")
+            )
             .count(),
         1
     );

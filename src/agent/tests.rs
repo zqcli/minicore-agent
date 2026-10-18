@@ -379,7 +379,8 @@ impl Model for FakeModel {
                         minicore_runtime::value::BoundedText::new("context window exceeded")
                             .unwrap(),
                         false,
-                    );
+                    )
+                    .unwrap();
                     Err(ModelError::permanent(
                         minicore_runtime::model::ModelErrorKind::ContextOverflow,
                         minicore_runtime::model::DeliveryState::NotStarted,
@@ -620,7 +621,7 @@ fn synthetic_loop_record(
             request_index: 0,
             model: "main".parse::<ModelRef>().unwrap(),
             reasoning: ReasoningPreference::Auto,
-            content: vec![AssistantPart::Text(assistant_text.to_owned())],
+            content: vec![AssistantPart::Text(assistant_text.into())],
             finish_reason: ModelFinishReason::Stop,
             usage: Usage::new(1, 2, 0),
         }),
@@ -889,7 +890,8 @@ async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary:
         .limits;
     assert!(
         loaded.history.len() > limits.max_history_items
-            || crate::sessions::estimate_history_bytes(&loaded.history) > limits.max_history_bytes
+            || minicore_runtime::history::estimate_history_bytes(&loaded.history)
+                > limits.max_history_bytes
     );
     if install_summary {
         install_valid_summary(&data_dir, session_id).await;
@@ -978,7 +980,7 @@ async fn valid_summary_allows_history_over_runtime_byte_limit_to_start() {
                 request_index: u32::try_from(index).unwrap(),
                 model: "main".parse::<ModelRef>().unwrap(),
                 reasoning: ReasoningPreference::Auto,
-                content: vec![AssistantPart::Text("x".repeat(chunk_len))],
+                content: vec![AssistantPart::Text("x".repeat(chunk_len).into())],
                 finish_reason: ModelFinishReason::Stop,
                 usage: Usage::default(),
             })
@@ -1283,7 +1285,7 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
                 .messages()
                 .iter()
                 .any(|message| matches!(message,
-        ModelMessage::User(text) if text == "keep the answer concise"))
+        ModelMessage::User(text) if text.as_ref() == "keep the answer concise"))
         );
         assert!(
             !requests[1]
@@ -2215,7 +2217,7 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
     let systems = messages
         .iter()
         .filter_map(|message| match message {
-            ModelMessage::System(text) => Some(text.as_str()),
+            ModelMessage::System(text) => Some(text.as_ref()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2238,33 +2240,33 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
         ModelMessage::User(text) => text,
         _ => unreachable!("summary index is selected from User messages"),
     };
-    assert_eq!(summary_text.as_str(), EXPECTED_SUMMARY_ENVELOPE);
-    assert_ne!(summary_text.as_str(), SUMMARY_CONTENT);
+    assert_eq!(summary_text.as_ref(), EXPECTED_SUMMARY_ENVELOPE);
+    assert_ne!(summary_text.as_ref(), SUMMARY_CONTENT);
 
     let suffix_user_index = messages
         .iter()
-        .position(|message| matches!(message, ModelMessage::User(text) if text == "suffix user"))
+        .position(
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "suffix user"),
+        )
         .expect("uncovered suffix user must remain in the request");
     let suffix_assistant_index = messages
         .iter()
         .position(|message| {
-            matches!(message, ModelMessage::Assistant(parts) if parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "suffix assistant")))
+            matches!(message, ModelMessage::Assistant(parts) if parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text.as_ref() == "suffix assistant")))
         })
         .expect("uncovered suffix assistant must remain in the request");
     let current_user_index = messages
         .iter()
-        .position(|message| matches!(message, ModelMessage::User(text) if text == "current user"))
+        .position(|message| matches!(message, ModelMessage::User(text) if text.as_ref() == "current user"))
         .expect("current user must remain in the request");
     assert!(summary_index < suffix_user_index);
     assert!(suffix_user_index < suffix_assistant_index);
     assert!(suffix_assistant_index < current_user_index);
-    assert!(
-        !messages.iter().any(|message| {
-            matches!(message, ModelMessage::User(text) if text == "covered user")
-        })
-    );
     assert!(!messages.iter().any(|message| {
-        matches!(message, ModelMessage::Assistant(parts) if parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "covered assistant")))
+        matches!(message, ModelMessage::User(text) if text.as_ref() == "covered user")
+    }));
+    assert!(!messages.iter().any(|message| {
+        matches!(message, ModelMessage::Assistant(parts) if parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text.as_ref() == "covered assistant")))
     }));
 
     // The request reached a completed Agent loop, so the final projected
@@ -2332,24 +2334,20 @@ async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
             .count(),
         1
     );
-    assert!(
-        messages
-            .iter()
-            .any(|message| matches!(message, ModelMessage::User(text) if text == "suffix user"))
-    );
+    assert!(messages.iter().any(
+        |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "suffix user")
+    ));
     assert!(messages.iter().any(|message| {
         matches!(message, ModelMessage::Tool { tool_call_id, .. } if tool_call_id.as_str() == "suffix-read-call")
     }));
     assert!(
         messages.iter().any(
-            |message| matches!(message, ModelMessage::User(text) if text == "same loop current")
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "same loop current")
         )
     );
-    assert!(
-        !messages
-            .iter()
-            .any(|message| matches!(message, ModelMessage::User(text) if text == "covered user"))
-    );
+    assert!(!messages.iter().any(
+        |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "covered user")
+    ));
 }
 
 #[tokio::test]
@@ -2531,22 +2529,22 @@ async fn invalid_external_summary_falls_back_to_full_history() {
         let messages = requests[0].messages();
         assert!(
             messages.iter().any(|message| {
-                matches!(message, ModelMessage::User(text) if text == "covered user")
+                matches!(message, ModelMessage::User(text) if text.as_ref() == "covered user")
             }),
             "covered user missing for {variant}"
         );
         assert!(messages.iter().any(|message| {
-            matches!(message, ModelMessage::Assistant(parts) if parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "covered assistant")))
+            matches!(message, ModelMessage::Assistant(parts) if parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text.as_ref() == "covered assistant")))
         }), "covered assistant missing for {variant}");
         assert!(
             messages.iter().any(|message| {
-                matches!(message, ModelMessage::User(text) if text == "suffix user")
+                matches!(message, ModelMessage::User(text) if text.as_ref() == "suffix user")
             }),
             "suffix user missing for {variant}"
         );
         assert!(
             messages.iter().any(|message| {
-                matches!(message, ModelMessage::User(text) if text == "fallback current user")
+                matches!(message, ModelMessage::User(text) if text.as_ref() == "fallback current user")
             }),
             "current user missing for {variant}"
         );
@@ -2612,11 +2610,9 @@ async fn summary_symlink_is_ignored_but_core_symlink_is_not() {
     let requests = model.requests();
     {
         let requests = requests.lock().unwrap();
-        assert!(
-            requests[0].messages().iter().any(
-                |message| matches!(message, ModelMessage::User(text) if text == "covered user")
-            )
-        );
+        assert!(requests[0].messages().iter().any(
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "covered user")
+        ));
         assert!(!requests[0].messages().iter().any(|message| {
             matches!(message, ModelMessage::User(text) if text.contains(SUMMARY_CONTENT))
         }));
@@ -2664,7 +2660,9 @@ async fn projected_summary_keeps_suffix_tool_exchange_and_current_user() {
         .expect("tool suffix request must contain the summary data message");
     let suffix_user_index = messages
         .iter()
-        .position(|message| matches!(message, ModelMessage::User(text) if text == "suffix user"))
+        .position(
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "suffix user"),
+        )
         .expect("tool suffix user must remain");
     let call_index = messages
         .iter()
@@ -2681,7 +2679,7 @@ async fn projected_summary_keeps_suffix_tool_exchange_and_current_user() {
     let current_index = messages
         .iter()
         .position(
-            |message| matches!(message, ModelMessage::User(text) if text == "tool current user"),
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "tool current user"),
         )
         .expect("current user must remain");
     assert!(summary_index < suffix_user_index);
@@ -2701,7 +2699,7 @@ fn flatten_texts(items: &[HistoryItem]) -> Vec<String> {
             HistoryItem::Assistant(assistant) => {
                 for part in &assistant.content {
                     if let minicore_runtime::model::AssistantPart::Text(text) = part {
-                        texts.push(text.clone());
+                        texts.push(text.to_string());
                     }
                 }
             }
@@ -3445,9 +3443,28 @@ async fn close_active_session_cancels_and_waits() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let _turn = send_text(&mut agent, info.session_id, "do work").await;
+    let turn = send_text(&mut agent, info.session_id, "do work").await;
+    let completion = agent.wait_turn_receiver(turn).unwrap();
+    gate.entered.notified().await;
 
     agent.close_session(info.session_id).await.unwrap();
+    let result = crate::sessions::await_turn_completion(completion)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::Shutdown,)
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+    assert_eq!(
+        crate::event::LoopOutcomeView::from_report(&result.report),
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::Shutdown
+        }
+    );
     gate.release.notify_waiters();
     // No orphan task: reopening and running a fresh loop keeps working.
     agent.open_session(info.session_id).await.unwrap();
@@ -3548,7 +3565,11 @@ async fn agent_drop_cancels_a_manual_compaction_model_future() {
 async fn active_shutdown_waits_for_the_session_owned_worker() {
     let (data_dir, _guard) = fixture_dir(&format!("shutdown-active-{}", next_id()));
     let (workspace, _guard) = workspace_file("shutdown-active-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model_gate = BlockGate::new();
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::BlockUntil(model_gate.clone(), "blocked")],
+    );
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -3558,14 +3579,27 @@ async fn active_shutdown_waits_for_the_session_owned_worker() {
     let info = create_session(&mut agent, &workspace).await;
     let gate = Arc::new(Gate::new());
     PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
-    let _turn = send_text(&mut agent, info.session_id, "shutdown").await;
+    let turn = send_text(&mut agent, info.session_id, "shutdown").await;
+    let completion = agent.wait_turn_receiver(turn).unwrap();
     gate.wait_started().await;
+    model_gate.entered.notified().await;
 
     let mut shutdown = tokio::spawn(agent.shutdown());
     let pending = tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown).await;
     assert!(pending.is_err(), "shutdown must wait for the owned worker");
     gate.release();
     assert!(shutdown.await.unwrap().is_ok());
+    let result = crate::sessions::await_turn_completion(completion)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::Shutdown,)
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
 }
 
 #[tokio::test]
@@ -3767,7 +3801,8 @@ async fn post_turn_eligibility_excludes_failed_cancelled_disabled_and_unpersiste
                 minicore_runtime::error::DiagnosticCategory::Model,
                 BoundedText::new("partial response failed").unwrap(),
                 false,
-            ),
+            )
+            .unwrap(),
         );
         let gate = BlockGate::new();
         let script = match mode {
@@ -5626,7 +5661,7 @@ async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
             .messages()
             .iter()
             .find_map(|message| match message {
-                ModelMessage::System(text) => Some(text.as_str()),
+                ModelMessage::System(text) => Some(text.as_ref()),
                 _ => None,
             })
             .expect("reloaded request must have a system prompt");
@@ -5648,7 +5683,7 @@ async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
         .messages()
         .iter()
         .find_map(|message| match message {
-            ModelMessage::System(text) => Some(text.as_str()),
+            ModelMessage::System(text) => Some(text.as_ref()),
             _ => None,
         })
         .expect("new-session request must have a system prompt");
@@ -5899,7 +5934,7 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
     let has_final_text = assistant_b.content.iter().any(|part| {
         matches!(
             part,
-            minicore_runtime::model::AssistantPart::Text(text) if text == "from model b"
+            minicore_runtime::model::AssistantPart::Text(text) if text.as_ref() == "from model b"
         )
     });
     assert!(
@@ -8364,7 +8399,8 @@ async fn non_recoverable_model_failures_are_not_retried_as_recovery() {
             minicore_runtime::error::DiagnosticCategory::Model,
             minicore_runtime::value::BoundedText::new("injected model failure").unwrap(),
             false,
-        );
+        )
+        .unwrap();
         let error = match delivery {
             minicore_runtime::model::DeliveryState::Unknown => {
                 ModelError::unknown(kind, diagnostic)
@@ -8432,7 +8468,8 @@ async fn test_driver_retry_reentry_does_not_reset_recovery_quota() {
             minicore_runtime::error::DiagnosticCategory::Model,
             minicore_runtime::value::BoundedText::new("retry shortly").unwrap(),
             true,
-        ),
+        )
+        .unwrap(),
     );
 
     // The second start fails with a Driver-retryable error, so the Driver
@@ -12618,12 +12655,9 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
             "read twice; preserve original input",
             "preserve this steer exactly",
         ] {
-            assert!(
-                requests[3]
-                    .messages()
-                    .iter()
-                    .any(|message| matches!(message, ModelMessage::User(text) if text == value))
-            );
+            assert!(requests[3].messages().iter().any(
+                |message| matches!(message, ModelMessage::User(text) if text.as_ref() == value)
+            ));
         }
         assert_eq!(
             requests[3]
@@ -12779,7 +12813,7 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
         assert_eq!(requests.len(), 2);
         assert!(requests[0].tools().is_empty());
         assert!(requests[1].messages().iter().any(
-        |message| matches!(message, ModelMessage::User(text) if text == "new after reopening exact")
+        |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "new after reopening exact")
     ));
         assert!(
             serde_json::to_string(requests[1].messages())
@@ -12853,12 +12887,9 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
     assert!(requests[0].tools().is_empty());
     assert_eq!(requests[1].reasoning(), ReasoningPreference::Low);
     for expected in ["original prompt exact", "steer while summary blocked"] {
-        assert!(
-            requests[1]
-                .messages()
-                .iter()
-                .any(|message| matches!(message, ModelMessage::User(text) if text == expected))
-        );
+        assert!(requests[1].messages().iter().any(
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == expected)
+        ));
     }
     let contexts = model.contexts.lock().unwrap();
     assert_eq!(contexts[1].request_index, 0);
@@ -12889,7 +12920,8 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
             minicore_runtime::error::DiagnosticCategory::Model,
             BoundedText::new("retry shortly").unwrap(),
             true,
-        ),
+        )
+        .unwrap(),
     );
     let model = FakeModel::with_window(
         "main",
@@ -12949,7 +12981,7 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
                 .any(|message| matches!(message, ModelMessage::Tool { .. }))
         );
         assert!(requests[6].messages().iter().any(
-            |message| matches!(message, ModelMessage::User(text) if text == "new user exact")
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "new user exact")
         ));
     }
     let context = agent.session_context(session_id).unwrap();
@@ -12986,7 +13018,8 @@ fn settled_projection_model_error() -> ModelError {
             minicore_runtime::error::DiagnosticCategory::Model,
             BoundedText::new("synthetic failure").unwrap(),
             false,
-        ),
+        )
+        .unwrap(),
     )
 }
 

@@ -126,7 +126,8 @@ fn fake_model_error() -> ModelError {
             DiagnosticCategory::Internal,
             minicore_runtime::BoundedText::new("fake model failure").unwrap(),
             false,
-        ),
+        )
+        .unwrap(),
     )
 }
 
@@ -1596,7 +1597,7 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
                 call.request.messages().iter().any(|message| {
                     matches!(message, ModelMessage::User(text) if text.contains("settled-0"))
                 }) && !call.request.messages().iter().any(|message| {
-                    matches!(message, ModelMessage::User(text) if text == current_user)
+                    matches!(message, ModelMessage::User(text) if text.as_ref() == current_user)
                 })
             })
             .expect("manual compaction must issue an observable utility request");
@@ -1614,14 +1615,14 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
                 .any(|message| { matches!(message, ModelMessage::Tool { .. }) })
         );
         assert!(!utility.request.messages().iter().any(|message| {
-            matches!(message, ModelMessage::User(text) if text == current_user)
+            matches!(message, ModelMessage::User(text) if text.as_ref() == current_user)
         }));
 
         let next = observations
             .iter()
             .find(|call| {
                 call.request.messages().iter().any(
-                    |message| matches!(message, ModelMessage::User(text) if text == current_user),
+                    |message| matches!(message, ModelMessage::User(text) if text.as_ref() == current_user),
                 )
             })
             .expect("reopened session must issue the next real model request");
@@ -1630,7 +1631,7 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
             .messages()
             .iter()
             .filter_map(|message| match message {
-                ModelMessage::System(text) => Some(text.as_str()),
+                ModelMessage::System(text) => Some(text.as_ref()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1651,7 +1652,7 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
         assert!(summary_message.contains("not a new user instruction"));
         assert!(summary_message.ends_with("[END MINICORE HISTORICAL SUMMARY DATA]"));
         assert!(next.request.messages().iter().any(|message| {
-            matches!(message, ModelMessage::User(text) if text == current_user)
+            matches!(message, ModelMessage::User(text) if text.as_ref() == current_user)
         }));
         assert!(!next.request.tools().is_empty());
         assert!(!next.request.messages().iter().any(|message| {
@@ -2105,7 +2106,7 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
                 .messages()
                 .iter()
                 .filter_map(|message| match message {
-                    ModelMessage::User(text) => Some(text.as_str()),
+                    ModelMessage::User(text) => Some(text.as_ref()),
                     _ => None,
                 })
                 .collect::<String>()

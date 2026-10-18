@@ -626,7 +626,7 @@ async fn extended_reasoning_values_round_trip_in_record_and_history() {
                         request_index: 0,
                         model: "main".parse().unwrap(),
                         reasoning,
-                        content: vec![AssistantPart::Text(format!("answer-{wire}"))],
+                        content: vec![AssistantPart::Text(format!("answer-{wire}").into())],
                         finish_reason: ModelFinishReason::Stop,
                         usage: Usage::new(1, 2, 0),
                     })],
@@ -1017,7 +1017,9 @@ async fn record_too_large_append_is_rejected() {
         request_index: 0,
         model: "main".parse().unwrap(),
         reasoning: ReasoningPreference::Auto,
-        content: vec![AssistantPart::Text("x".repeat(MAX_LOOP_RECORD_BYTES + 16))],
+        content: vec![AssistantPart::Text(
+            "x".repeat(MAX_LOOP_RECORD_BYTES + 16).into(),
+        )],
         finish_reason: ModelFinishReason::Stop,
         usage: Usage::new(1, 2, 0),
     });
@@ -1135,7 +1137,7 @@ async fn loaded_history_is_sanitized_of_opaque_reasoning() {
         model: "main".parse::<ModelRef>().unwrap(),
         reasoning: ReasoningPreference::Auto,
         content: vec![
-            AssistantPart::Text("hello".to_owned()),
+            AssistantPart::Text("hello".into()),
             AssistantPart::Reasoning(
                 minicore_runtime::model::ReasoningContent::new(
                     Some("visible reasoning".to_owned()),

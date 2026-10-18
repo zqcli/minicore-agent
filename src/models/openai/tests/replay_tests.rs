@@ -90,6 +90,62 @@ fn extract(state: &StreamState) -> ProviderReplay {
 }
 
 #[test]
+fn normalized_text_preserves_raw_replay_and_rejects_mismatched_history() {
+    let raw = "answer\r\nwith\x1bcontrols\r";
+    let canonical = "answer\nwith�controls\n";
+    let mut state = state();
+    frame(
+        &mut state,
+        json!({"type":"response.output_text.delta", "delta":raw}),
+    )
+    .unwrap();
+    finish(&mut state, vec![message(raw)]).unwrap();
+    let replay = extract(&state);
+    let parts = vec![AssistantPart::Text(canonical.into())];
+    replay::validate_history(&replay, &parts).unwrap();
+    assert!(replay::validate_history(&replay, &[AssistantPart::Text("different".into())]).is_err());
+    let wire = model("http://localhost/v1")
+        .build_request(&request(parts, replay))
+        .unwrap();
+    let body: Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(body["input"][1], message(raw));
+}
+
+#[test]
+fn crlf_split_across_deltas_keeps_canonical_text_without_incompatible_replay() {
+    let mut state = state();
+    for delta in ["first\r", "", "\nsecond"] {
+        frame(
+            &mut state,
+            json!({"type":"response.output_text.delta", "delta":delta}),
+        )
+        .unwrap();
+    }
+    finish(&mut state, vec![message("first\r\nsecond")]).unwrap();
+    let text = state
+        .pending
+        .iter()
+        .filter_map(|event| match event {
+            Ok(ModelEvent::TextDelta { delta }) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(text, "first\n\nsecond");
+    assert!(
+        !state
+            .pending
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
+    );
+    assert!(matches!(
+        state.pending.back(),
+        Some(Ok(ModelEvent::Finish {
+            reason: ModelFinishReason::Stop
+        }))
+    ));
+}
+
+#[test]
 fn encrypted_only_response_retains_real_metadata_without_display_text() {
     let mut state = state();
     finish(&mut state, vec![reasoning()]).unwrap();

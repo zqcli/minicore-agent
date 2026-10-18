@@ -366,6 +366,7 @@ impl fmt::Debug for ToolResultView {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LoopOutcomeView {
+    Unknown,
     Completed,
     Cancelled {
         reason: CancelReasonView,
@@ -379,6 +380,7 @@ pub enum LoopOutcomeView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelReasonView {
+    Unknown,
     User,
     OwnerDropped,
     Shutdown,
@@ -388,6 +390,7 @@ pub enum CancelReasonView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopStatusView {
+    Unknown,
     Starting,
     RunningModel,
     RunningTools,
@@ -438,7 +441,7 @@ impl LocalContextBudgetFailure {
         {
             return None;
         }
-        let text = diagnostic.message.as_str();
+        let text = diagnostic.message().as_str();
         let numbers = text
             .strip_prefix(
                 "local serialized context estimate exceeds input budget: estimated_tokens=",
@@ -608,6 +611,7 @@ impl From<&SessionState> for SessionStateView {
                     }
                     minicore_runtime::LoopStatus::Finishing => LoopStatusView::Finishing,
                     minicore_runtime::LoopStatus::Finished => LoopStatusView::Finished,
+                    _ => LoopStatusView::Unknown,
                 },
                 request_index: loop_state.request_index,
                 config_revision: loop_state.config_revision,

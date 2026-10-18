@@ -22,8 +22,8 @@ verification evidence.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
 These guides describe the current source package **0.6.2**, Rust 2024/MSRV 1.85,
-Runtime `0.6.1` at revision
-`9082184e929508b30cf19f553a6837d075e2fed3`, and RPC protocol version `1`.
+Runtime `0.7.0` at revision
+`9814432b9400d748ea535cd022df9af5116fb96d`, and RPC protocol version `1`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 
