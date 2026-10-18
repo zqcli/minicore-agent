@@ -516,6 +516,14 @@ impl Session {
                 .is_some_and(|candidate| std::ptr::eq(candidate.as_ref(), operation));
             let should_emit = should_clear && inner.compaction_progress.take().is_some();
             let result = operation.publish(result);
+            if result.origin == CompactionOrigin::Automatic
+                && matches!(
+                    result.failure_kind.as_deref(),
+                    Some("cancelled" | "timeout")
+                )
+            {
+                self.shared.compaction.clear_post_turn_source();
+            }
             inner.last_compaction_result = Some(result);
             should_emit
         };

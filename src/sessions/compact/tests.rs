@@ -199,6 +199,44 @@ async fn post_turn_retries_only_when_a_new_complete_prefix_is_available() {
 }
 
 #[tokio::test]
+async fn cancellation_during_post_turn_commit_allows_the_same_source_again() {
+    let (_temp, agent, session, model) = fixture("summary", 4_000).await;
+    append_text(&session, 6_000).await;
+    append_text(&session, 4_000).await;
+    let first = reservation(&session, &model, 1_000);
+    let operation = Arc::clone(&first.operation);
+    session.lock_inner().compaction = Some(Arc::clone(&operation));
+    let gate = Arc::new(Gate::new());
+    crate::store::SUMMARY_COMMIT_GATES.arm(session.session_id(), Arc::clone(&gate));
+    let worker = tokio::spawn(run_compaction(session.clone(), first));
+    gate.wait_started().await;
+    assert!(operation.cancel());
+    gate.release();
+    worker.await.unwrap();
+    assert_eq!(
+        operation
+            .result
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .failure_kind
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert!(session.shared.compaction.post_turn_source().is_none());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    let retry = reservation(&session, &model, 1_000);
+    session.lock_inner().compaction = Some(Arc::clone(&retry.operation));
+    run_compaction(session.clone(), retry).await;
+    assert_eq!(
+        session.context().last_result.unwrap().status,
+        CompactionStatus::Compacted
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn turn_wait_does_not_wait_for_projection_settlement() {
     let (_temp, mut agent, session, model) = fixture("summary", 8_000).await;
     let old = LoopId::new().unwrap();

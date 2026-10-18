@@ -684,6 +684,10 @@ impl CompactionState {
         *self.post_turn_source.lock().unwrap() = Some(source);
     }
 
+    pub(crate) fn clear_post_turn_source(&self) {
+        *self.post_turn_source.lock().unwrap() = None;
+    }
+
     pub(crate) fn automatic_view(&self) -> AutomaticCompactionView {
         self.threshold_view()
     }

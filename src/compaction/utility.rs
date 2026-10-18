@@ -5,8 +5,8 @@ use std::time::Instant;
 use futures_util::{FutureExt, StreamExt};
 use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::{
-    AssistantPart, Model, ModelCallContext, ModelEvent, ModelFinishReason, ModelLimits,
-    ModelMessage, ModelRequest, ReasoningPreference, Usage,
+    AssistantPart, Model, ModelCallContext, ModelErrorKind, ModelEvent, ModelFinishReason,
+    ModelLimits, ModelMessage, ModelRequest, ReasoningPreference, Usage,
 };
 use minicore_runtime::tools::ToolSpec;
 use minicore_runtime::value::BoundedText;
@@ -597,7 +597,7 @@ async fn call_model(
         result = tokio::time::timeout(remaining, input.model.start(request, context)) => {
             match result {
                 Ok(Ok(stream)) => stream,
-                Ok(Err(_)) => return Err(CallError::new(UtilityError::Model)),
+                Ok(Err(error)) => return Err(CallError::new(if error.kind() == ModelErrorKind::Timeout { UtilityError::Timeout } else { UtilityError::Model })),
                 Err(_) => return Err(CallError::new(UtilityError::Timeout)),
             }
         }
@@ -648,7 +648,16 @@ async fn call_model(
         };
         let event = match event {
             Ok(event) => event,
-            Err(_) => return Err(CallError::with_usage(UtilityError::Model, usage)),
+            Err(error) => {
+                return Err(CallError::with_usage(
+                    if error.kind() == ModelErrorKind::Timeout {
+                        UtilityError::Timeout
+                    } else {
+                        UtilityError::Model
+                    },
+                    usage,
+                ));
+            }
         };
         if finished {
             return Err(CallError::with_usage(UtilityError::InvalidResponse, usage));

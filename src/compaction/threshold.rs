@@ -482,14 +482,14 @@ pub(crate) async fn consolidate(
             );
         }
     }
+    let source_message =
+        utility::projected_source_message(previous, parts, input.cancellation, input.deadline)?;
     let now = Instant::now();
     let utility_deadline = if recovery {
         input.deadline
     } else {
         now + input.deadline.saturating_duration_since(now) / 2
     };
-    let source_message =
-        utility::projected_source_message(previous, parts, input.cancellation, utility_deadline)?;
     let utility_input = CompactionInput {
         model: Arc::clone(&auto.model),
         reasoning: input.reasoning,

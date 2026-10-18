@@ -22,6 +22,7 @@ struct Stub {
     output: String,
     gate: Option<Arc<Notify>>,
     partial_usage: bool,
+    timeout: bool,
 }
 impl Stub {
     fn new(window: u64, output: &str, gate: Option<Arc<Notify>>) -> Arc<Self> {
@@ -38,6 +39,7 @@ impl Stub {
             output: output.into(),
             gate,
             partial_usage: false,
+            timeout: false,
         })
     }
 }
@@ -49,6 +51,19 @@ impl Model for Stub {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(request);
         Box::pin(async move {
+            if self.timeout {
+                return Err(minicore_runtime::model::ModelError::permanent(
+                    minicore_runtime::model::ModelErrorKind::Timeout,
+                    minicore_runtime::model::DeliveryState::NotStarted,
+                    minicore_runtime::error::DiagnosticSummary::new(
+                        minicore_runtime::error::DiagnosticCode::ModelTimeout,
+                        minicore_runtime::error::DiagnosticCategory::Model,
+                        BoundedText::new("utility timed out").unwrap(),
+                        false,
+                    )
+                    .unwrap(),
+                ));
+            }
             if self.partial_usage {
                 use futures_util::StreamExt;
                 let gate = Arc::clone(self.gate.as_ref().unwrap());
@@ -661,8 +676,9 @@ impl ProjectionResult {
 
 #[tokio::test]
 async fn utility_timeout_preserves_a_fitting_request_but_not_an_overfull_one() {
-    for fits in [true, false] {
-        let model = Stub::new(8_000, "unused", Some(Arc::new(Notify::new())));
+    for (fits, provider_timeout) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut model = Stub::new(8_000, "unused", Some(Arc::new(Notify::new())));
+        Arc::get_mut(&mut model).unwrap().timeout = provider_timeout;
         let mut auto = context(&model);
         auto.binding.policy.trigger_percent = 50;
         let current = LoopId::new().unwrap();
