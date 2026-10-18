@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 
+use super::{NativeApplyPatchTool, NativeEditTool, NativeWriteTool};
 use base64::Engine as _;
-use minicore_runtime::LoopId;
+use minicore_runtime::tools::{Tool, ToolContext, ToolExecutionOutcome, ToolInvocation};
+use minicore_runtime::{LoopId, ToolCallId};
 
 use crate::event::{AgentEvent, AgentEventSink, EventMeta};
 use crate::ids::SessionId;
@@ -205,6 +207,118 @@ impl CommandStreamSink for ToolObserver {
 
     fn note_stream_cut(&self, tool_ref: &ToolRef, stream: ToolDataStream) {
         self.tool_data.note_stream_cut(tool_ref, stream);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum ToolImpl {
+    Plain(Arc<dyn Tool>),
+    Bash(Arc<crate::tools::OwnedBashTool>),
+    Write(Arc<NativeWriteTool>),
+    Edit(Arc<NativeEditTool>),
+    ApplyPatch(Arc<NativeApplyPatchTool>),
+}
+
+impl ToolImpl {
+    pub(crate) fn tool(&self) -> &dyn Tool {
+        match self {
+            ToolImpl::Plain(inner) => inner.as_ref(),
+            ToolImpl::Bash(inner) => inner.as_ref(),
+            ToolImpl::Write(inner) => inner.as_ref(),
+            ToolImpl::Edit(inner) => inner.as_ref(),
+            ToolImpl::ApplyPatch(inner) => inner.as_ref(),
+        }
+    }
+    pub(crate) async fn execute_bound(
+        self,
+        invocation: ToolInvocation,
+        context: ToolContext,
+        tool_ref: Option<ToolRef>,
+        tool_data: Arc<crate::tool_data::ToolData>,
+    ) -> Result<ToolExecutionOutcome, minicore_runtime::tools::ToolError> {
+        macro_rules! execute_native {
+            ($tool:expr) => {
+                $tool
+                    .execute_bound(invocation, context, tool_ref, Some(tool_data))
+                    .await
+            };
+        }
+        match self {
+            ToolImpl::Plain(inner) => inner.execute(invocation, context).await,
+            ToolImpl::Bash(inner) => inner.execute_bound(invocation, context, tool_ref).await,
+            ToolImpl::Write(inner) => execute_native!(inner),
+            ToolImpl::Edit(inner) => execute_native!(inner),
+            ToolImpl::ApplyPatch(inner) => execute_native!(inner),
+        }
+    }
+}
+
+impl ToolObserver {
+    pub(crate) fn tool_ref(
+        &self,
+        key: Option<RequestKey>,
+        tool_call_id: &ToolCallId,
+    ) -> Option<ToolRef> {
+        key.map(|key| ToolRef {
+            session_id: self.session_id(),
+            loop_id: key.loop_id,
+            request_index: key.request_index,
+            tool_call_id: tool_call_id.clone(),
+        })
+    }
+}
+
+/// Reads the request identity from `ToolObserver` at the policy boundary and
+/// publishes the validated invocation before any approval decision. This is
+/// what makes invocation data obtainable while a tool is still waiting for
+/// approval; `Running` is not set here, because the tool has not been invoked
+/// yet. Delegation, fallback decisions, and error paths are unchanged.
+pub(crate) struct PresentationPolicy {
+    inner: Arc<dyn minicore_runtime::tools::ToolPolicy>,
+    observer: Arc<ToolObserver>,
+}
+
+impl PresentationPolicy {
+    pub(crate) fn new_with_observer(
+        inner: Arc<dyn minicore_runtime::tools::ToolPolicy>,
+        observer: Arc<ToolObserver>,
+    ) -> Arc<Self> {
+        Arc::new(Self { inner, observer })
+    }
+}
+
+impl minicore_runtime::tools::ToolPolicy for PresentationPolicy {
+    fn decide<'a>(
+        &'a self,
+        request: minicore_runtime::tools::ToolPolicyRequest,
+    ) -> minicore_runtime::tools::ToolPolicyFuture<'a> {
+        let tool_ref = self.observer.tool_ref(
+            self.observer.request_key(),
+            request.invocation.tool_call_id(),
+        );
+        if let Some(tool_ref) = &tool_ref {
+            if let Some(data) = self
+                .observer
+                .tool_data()
+                .note_invocation(tool_ref, &request.invocation)
+            {
+                self.observer.emit_tool_invocation(data);
+            }
+        }
+        let observer = Arc::clone(&self.observer);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let decision = inner.decide(request).await;
+            if let (Some(tool_ref), Ok(decision)) = (&tool_ref, &decision) {
+                if matches!(
+                    decision,
+                    minicore_runtime::tools::ToolDecision::RequireApproval { .. }
+                ) {
+                    observer.tool_data().mark_awaiting_policy(tool_ref);
+                }
+            }
+            decision
+        })
     }
 }
 
