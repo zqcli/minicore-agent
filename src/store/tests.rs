@@ -4814,16 +4814,23 @@ async fn cancelled_delete_is_hidden_and_reclaimed_on_open() {
             .collect::<Vec<_>>(),
         vec![other]
     );
+    // Dropping the caller mid-rename must not release the auxiliary lock before
+    // the deleted session leaves the ledger; otherwise quota eviction would pick it.
     drop(deleting);
     let hidden = store
         .sessions_directory()
         .join(format!("{DELETING_PREFIX}{id}"));
     assert!(hidden.is_dir());
     let second = empty_snapshot(make_tool_ref(other, "retained"));
-    store
-        .commit_tool_record(&second, Instant::now() + Duration::from_secs(10))
-        .await
-        .unwrap();
+    let commit = store.commit_tool_record(&second, Instant::now() + Duration::from_secs(10));
+    tokio::pin!(commit);
+    tokio::select! {
+        biased;
+        result = &mut commit => panic!("commit overtook the in-flight delete: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    gate.release();
+    commit.await.unwrap();
     let reopened = Store::open(directory.path().to_path_buf()).await.unwrap();
     assert!(!hidden.exists());
     assert!(

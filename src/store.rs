@@ -1021,28 +1021,37 @@ impl Store {
     }
 
     pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
-        let mut ledger = self.aux_lock.lock().await;
+        let mut ledger = Arc::clone(&self.aux_lock).lock_owned().await;
         let directory = self.require_session_directory(session_id).await?;
         let sessions = self.sessions_directory();
         let deleting = sessions.join(format!("{DELETING_PREFIX}{session_id}"));
         if path_state(&deleting).await? != PathState::Missing {
             return Err(StoreError::Corrupt);
         }
-        // Cancellation or an uncertain rename must not leave authoritative old accounting.
-        let mut cached = ledger.take();
-        fs::rename(directory, &deleting)
-            .await
-            .map_err(unavailable)?;
         self.unload_history(session_id);
-        if let Some(ledger) = cached.as_mut() {
-            ledger.remove_session(session_id);
-        }
-        *ledger = cached;
-        sync_directory(&sessions).await.map_err(unavailable)?;
-        #[cfg(test)]
-        if let Some(gate) = DELETE_GATES.take(&session_id) {
-            gate.pass().await;
-        }
+        // The rename, its accounting and the parent sync finish together even if
+        // this caller is dropped: the owned guard keeps auxiliary commits out.
+        let target = deleting.clone();
+        tokio::task::spawn_blocking(move || {
+            let renamed = std::fs::rename(directory, &target).and_then(|()| {
+                #[cfg(test)]
+                if let Some(gate) = DELETE_GATES.take(&session_id) {
+                    gate.pass_blocking();
+                }
+                if let Some(ledger) = ledger.as_mut() {
+                    ledger.remove_session(session_id);
+                }
+                sync_directory_blocking(&sessions)
+            });
+            if renamed.is_err() {
+                // An uncertain rename must not leave authoritative old accounting.
+                *ledger = None;
+            }
+            renamed
+        })
+        .await
+        .map_err(|_| StoreError::Unavailable)?
+        .map_err(unavailable)?;
         if let Err(error) = fs::remove_dir_all(deleting).await {
             unavailable(error);
         }
@@ -1296,10 +1305,7 @@ async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit,
         }
     }
     let temp_path = unique_temp_path(path)?;
-    if let Err(error) = write_sync_file(&temp_path, bytes).await {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(error);
-    }
+    write_sync_file(&temp_path, bytes).await?;
     if let Err(error) = fs::rename(&temp_path, path).await {
         unavailable(error);
         let _ = fs::remove_file(&temp_path).await;
@@ -1323,6 +1329,8 @@ fn unique_temp_path(path: &Path) -> Result<PathBuf, StoreError> {
     Ok(path.with_file_name(format!(".{name}.tmp-{}-{id:032x}", std::process::id())))
 }
 
+/// Creates `path` exclusively and syncs `bytes` into it. A failed write removes
+/// only the file this call created; a pre-existing entry is never touched.
 async fn write_sync_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -1330,9 +1338,18 @@ async fn write_sync_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         .open(path)
         .await
         .map_err(unavailable)?;
-    file.write_all(bytes).await.map_err(unavailable)?;
-    file.flush().await.map_err(unavailable)?;
-    file.sync_all().await.map_err(unavailable)
+    let written = async {
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await
+    }
+    .await;
+    if let Err(error) = written {
+        drop(file);
+        let _ = fs::remove_file(path).await;
+        return Err(unavailable(error));
+    }
+    Ok(())
 }
 
 fn valid_temp_suffix(suffix: &str) -> bool {
@@ -1403,18 +1420,18 @@ async fn safe_open_read(path: &Path) -> io::Result<File> {
 }
 
 async fn sync_directory(path: &Path) -> io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sync_directory_blocking(&path))
+        .await
+        .map_err(|_| io::Error::other("sync_directory worker panicked"))?
+}
+
+fn sync_directory_blocking(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    {
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
-            .await
-            .map_err(|_| io::Error::other("sync_directory worker panicked"))?
-    }
+    std::fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    let _ = path;
+    Ok(())
 }
 
 fn valid_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
