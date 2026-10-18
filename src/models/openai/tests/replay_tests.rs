@@ -92,7 +92,7 @@ fn extract(state: &StreamState) -> ProviderReplay {
 #[test]
 fn normalized_text_preserves_raw_replay_and_rejects_mismatched_history() {
     let raw = "answer\r\nwith\x1bcontrols\r";
-    let canonical = "answer\nwith�controls\n";
+    let canonical = "answer\nwith controls\n";
     let mut state = state();
     frame(
         &mut state,
@@ -112,7 +112,7 @@ fn normalized_text_preserves_raw_replay_and_rejects_mismatched_history() {
 }
 
 #[test]
-fn crlf_split_across_deltas_keeps_canonical_text_without_incompatible_replay() {
+fn crlf_split_across_deltas_keeps_replay_for_normalized_history() {
     let mut state = state();
     for delta in ["first\r", "", "\nsecond"] {
         frame(
@@ -130,13 +130,15 @@ fn crlf_split_across_deltas_keeps_canonical_text_without_incompatible_replay() {
             _ => None,
         })
         .collect::<String>();
-    assert_eq!(text, "first\n\nsecond");
-    assert!(
-        !state
-            .pending
-            .iter()
-            .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
-    );
+    assert_eq!(text, "first\r\nsecond");
+    let replay = extract(&state);
+    let parts = vec![AssistantPart::Text("first\nsecond".into())];
+    replay::validate_history(&replay, &parts).unwrap();
+    let wire = model("http://localhost/v1")
+        .build_request(&request(parts, replay))
+        .unwrap();
+    let body: Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(body["input"][1], message("first\r\nsecond"));
     assert!(matches!(
         state.pending.back(),
         Some(Ok(ModelEvent::Finish {

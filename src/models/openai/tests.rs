@@ -118,19 +118,22 @@ async fn empty_text_and_refusal_deltas_reach_runtime_without_changing_finish_rea
 
 #[tokio::test]
 async fn runtime_normalizes_provider_text_and_ignores_empty_deltas() {
-    let text = format!("{}\r\n\x1b\rfin\t", "a".repeat(MAX_EVENT_BYTES / 3 - 1));
+    let text = format!("{}\r\n\x1b\rfin\t\r", "a".repeat(MAX_EVENT_BYTES - 1));
     let controls = "\x01".repeat(MAX_EVENT_BYTES);
     let expected = format!(
-        "{}\n�\nfin\t{}",
-        "a".repeat(MAX_EVENT_BYTES / 3 - 1),
-        "�".repeat(MAX_EVENT_BYTES)
+        "{}\n \nfin\t\n{}",
+        "a".repeat(MAX_EVENT_BYTES - 1),
+        " ".repeat(MAX_EVENT_BYTES)
     );
     let server = MockServer::spawn([MockResponse::sse(&[
         json!({"type":"response.output_text.delta", "delta":""}),
         json!({"type":"response.output_text.delta", "delta":text}),
-        json!({"type":"response.output_text.delta", "delta":controls}),
-        json!({"type":"response.reasoning_summary_text.delta", "delta":"why\r\n\x1b"}),
+        json!({"type":"response.reasoning_summary_text.delta", "summary_index":0, "delta":"why\r"}),
         json!({"type":"response.output_text.delta", "delta":""}),
+        json!({"type":"response.output_text.delta", "delta":"\n"}),
+        json!({"type":"response.output_text.delta", "delta":controls}),
+        json!({"type":"response.reasoning_summary_text.delta", "summary_index":0, "delta":"\n\x1b"}),
+        json!({"type":"response.reasoning_summary_text.delta", "summary_index":1, "delta":"\rnext"}),
         completed(usage()),
     ])])
     .await;
@@ -169,7 +172,7 @@ async fn runtime_normalizes_provider_text_and_ignores_empty_deltas() {
     assert_eq!(parts.len(), 2);
     assert!(matches!(parts[0], AssistantPart::Text(text) if text.as_ref() == expected));
     assert!(
-        matches!(parts[1], AssistantPart::Reasoning(reasoning) if reasoning.text() == Some("why\n�"))
+        matches!(parts[1], AssistantPart::Reasoning(reasoning) if reasoning.text() == Some("why\n \nnext"))
     );
     while let Some(event) = events.next().await {
         if let minicore_runtime::LoopEvent::OutputDelta { delta, .. } = event.event {

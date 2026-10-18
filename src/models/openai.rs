@@ -832,7 +832,6 @@ struct StreamState {
     output_items: Option<BTreeMap<u32, Value>>,
     output_item_bytes: usize,
     replay_identity: Option<(String, String)>,
-    replay_text_compatible: bool,
     text: String,
     trace: Option<RequestTraceContext>,
     provider_event_seen: bool,
@@ -875,7 +874,6 @@ impl StreamState {
             output_items: Some(BTreeMap::new()),
             output_item_bytes: 0,
             replay_identity,
-            replay_text_compatible: true,
             text: String::new(),
             trace,
             provider_event_seen: false,
@@ -995,9 +993,6 @@ impl StreamState {
         }
         if replay::visible_text(output.values())? != self.text {
             return Err(());
-        }
-        if !self.replay_text_compatible {
-            return self.without_replay();
         }
         let output = self
             .output_items
@@ -1512,11 +1507,6 @@ struct IncompleteDetails {
 
 fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<(), ()> {
     if !reasoning {
-        // Runtime normalizes per delta. A CRLF split across deltas becomes two
-        // newlines, which a raw replay message cannot reproduce canonically.
-        if state.text.ends_with('\r') && text.starts_with('\n') {
-            state.replay_text_compatible = false;
-        }
         state.text.push_str(&text);
     }
     for chunk in event_text_chunks(&text) {
@@ -1535,13 +1525,8 @@ fn event_text_chunks(value: &str) -> impl Iterator<Item = &str> {
     let mut remaining = Some(value);
     std::iter::from_fn(move || {
         let value = remaining.take()?;
-        // Runtime normalization can expand a one-byte control to U+FFFD.
-        let mut end = crate::text::floor_char_boundary(value, MAX_EVENT_BYTES / 3);
-        // Do not turn one CRLF into two newlines at an adapter-created boundary.
-        if value[..end].ends_with('\r') && value[end..].starts_with('\n') {
-            end -= 1;
-        }
-        let (chunk, rest) = value.split_at(end);
+        let (chunk, rest) =
+            value.split_at(crate::text::floor_char_boundary(value, MAX_EVENT_BYTES));
         remaining = (!rest.is_empty()).then_some(rest);
         Some(chunk)
     })

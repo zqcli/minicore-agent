@@ -8,7 +8,7 @@ Tool data, and a stdio JSON-RPC service for a client UI.
 
 - Rust edition: 2024; MSRV: **1.85**
 - Runtime: `minicore-runtime 0.7.0`, pinned to Git revision
-  `9814432b9400d748ea535cd022df9af5116fb96d`.
+  `3bd8101eb02e55e5972839fc2a0bd39a4f3e7eee`.
 - RPC protocol version: **1**
 - Versioned source delivery uses the `dev` branch and annotated release tags;
   this does not imply a package-registry publication or binary installation.
@@ -99,8 +99,9 @@ usage uncertainty, and compatibility.
 
 ## Context And Compatibility
 
-Runtime owns model-text normalization: within each delta CRLF/CR become LF,
-other controls except LF/TAB become U+FFFD, and empty deltas emit no progress.
+Runtime owns model-text normalization: CRLF/CR become LF, other controls except
+LF/TAB become one space, and empty deltas emit no progress. Normalization never
+expands bytes; CRLF split across deltas or adapter chunks still produces one LF.
 Unknown future Runtime statuses, cancellation reasons, and outcomes map explicitly
 to `unknown` in Agent views rather than being mistaken for known states.
 

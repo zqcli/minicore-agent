@@ -18,10 +18,9 @@ whole canonical assistant request projection. The separately stored tool result
 is sent once. Canonical parts alone control tool execution and display.
 
 Text consistency uses Runtime 0.7.0 normalization while raw replay remains exact:
-CRLF/CR become LF and controls other than LF/TAB become U+FFFD. If a CRLF is
-split across provider deltas, Runtime emits two newlines, unlike normalization
-of the combined raw message. The adapter omits replay for that response and
-retains its canonical content rather than persisting inconsistent metadata.
+CRLF/CR become LF and controls other than LF/TAB become one space. Runtime
+normalizes split CRLF across deltas and adapter chunks to one LF, so canonical
+text remains consistent with the combined raw message and replay is retained.
 
 A different endpoint/model or unknown format falls back to canonical parts.
 An opaque-only item has no canonical fallback, so incompatible replay fails
