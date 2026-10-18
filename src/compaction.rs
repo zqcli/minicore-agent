@@ -176,6 +176,7 @@ pub(crate) struct CompactionState {
     recovery: Mutex<RecoveryState>,
     recovery_observation: Mutex<Option<RecoveryObservation>>,
     threshold: Mutex<threshold::ThresholdState>,
+    post_turn_source: Mutex<Option<[u8; 32]>>,
     /// One immutable snapshot of the settings a request boundary binds:
     /// generations plus the utility binding they describe. Binding and
     /// generation change together under this lock so a request can never pair
@@ -266,6 +267,7 @@ impl CompactionState {
             recovery: Mutex::new(RecoveryState::default()),
             recovery_observation: Mutex::new(None),
             threshold: Mutex::new(threshold::ThresholdState::default()),
+            post_turn_source: Mutex::new(None),
             settings: Mutex::new(RequestSettings::default()),
         })
     }
@@ -688,6 +690,14 @@ impl CompactionState {
 
     pub(crate) fn latest_request_tokens(&self) -> Option<u64> {
         *self.latest_request_tokens.lock().unwrap()
+    }
+
+    pub(crate) fn post_turn_source(&self) -> Option<[u8; 32]> {
+        *self.post_turn_source.lock().unwrap()
+    }
+
+    pub(crate) fn note_post_turn_source(&self, source: [u8; 32]) {
+        *self.post_turn_source.lock().unwrap() = Some(source);
     }
 
     pub(crate) fn automatic_view(&self) -> AutomaticCompactionView {

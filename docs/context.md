@@ -99,13 +99,14 @@ usage and does not consume the manual operation-ID quota.
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
 token trigger and both Runtime history triggers it finishes Noop without a
-utility call. At or above any trigger it uses the single-call summary engine
+utility call or scanning history anchors. At or above any trigger it uses the single-call summary engine
 only if a safe older prefix can advance. If the
 recent complete-loop tail leaves no progress or cannot fit with fixed request
 content and a summary, the operation fails explicitly without dropping that tail.
 An existing fully covered emergency projection keeps its automatic refresh path;
-manual compaction of fully covered history remains Noop. The configured target is advisory, not a reason
-to repeat a summary call. Even a check that becomes Noop may briefly return `session_busy` to a new submit. `turn.wait` does not wait for this
+manual compaction of fully covered history remains Noop. An unchanged eligible prefix and request binding are not summarized again after
+an attempt; cancellation and timeout leave that source retryable. The configured
+target is advisory, not a reason to repeat a summary call. Even a check that becomes Noop may briefly return `session_busy` to a new submit. `turn.wait` does not wait for this
 operation, and submit does not secretly wait for a budget decision or queue an
 automatic resend. Clients retain drafts and reconcile state/context.
 
@@ -191,8 +192,12 @@ fails to shrink its group. Failure, no reduction or a second overflow exits fini
 and ordinary delivery retries; later genuine context growth in a new logical
 request can have a new recovery opportunity, without imposing a tool-round cap.
 
-After source history is definitely persisted, existing in-turn threshold or
-emergency reductions can be promoted through the same atomic snapshot store without another utility call.
+After source history is definitely persisted and turn completion has been
+published, existing in-turn threshold or emergency reductions can be promoted
+through the same atomic snapshot store without another utility call. `turn.wait`
+does not wait for promotion. The session-owned task still owns settlement, and
+close/next-submit cleanup joins it. A reserved post-turn operation adopts the
+promoted snapshot before starting, rather than restoring covered raw history.
 This encodes historical data, not a newly generated semantic summary. The
 64 KiB generated-summary limit still applies to every utility output. The full
 settled projection is a different object: snapshots larger than 64 KiB are valid

@@ -1607,6 +1607,34 @@ async fn run_active_loop(
         }
     };
 
+    let result = Arc::new(TurnResult {
+        turn,
+        report: Arc::clone(&report),
+        persistence,
+    });
+
+    // Own the join slot before reserving. Reservation excludes the next
+    // submit and close captures its cancellation owner under the same lock.
+    // The active task owns settlement; a reserved operation also owns cancellation
+    // while completion waiters are released before its worker is installed.
+    let (operation, _) = CompactionOperation::new(
+        format!("auto-{}", turn.loop_id),
+        CompactionOrigin::Automatic,
+    );
+    let mut join_slot = operation.join.lock().await;
+    let reservation = if persistence == TurnPersistence::Persisted
+        && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)
+    {
+        session.reserve_post_turn(turn, Arc::clone(&operation))
+    } else {
+        None
+    };
+    let mut handoff = reservation
+        .as_ref()
+        .map(|_| compact::CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation)));
+
+    // Authoritative completion precedes summary model work and best-effort events.
+    completion.publish_finished(Arc::clone(&result));
     if persistence == TurnPersistence::Persisted {
         if let Err(kind) = session.settle_emergency_projection(turn, &report).await {
             session.shared.compaction.note_settlement_failure(
@@ -1632,34 +1660,23 @@ async fn run_active_loop(
         }
     }
 
-    let result = Arc::new(TurnResult {
-        turn,
-        report: Arc::clone(&report),
-        persistence,
-    });
-
-    // Own the join slot before reserving. Reservation excludes the next
-    // submit and close captures its cancellation owner under the same lock.
-    // There is no await between completion publication and handle installation.
-    let (operation, _) = CompactionOperation::new(
-        format!("auto-{}", turn.loop_id),
-        CompactionOrigin::Automatic,
-    );
-    let mut join_slot = operation.join.lock().await;
-    let reservation = if persistence == TurnPersistence::Persisted
-        && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)
-    {
-        session.reserve_post_turn(turn, Arc::clone(&operation))
-    } else {
-        None
-    };
-    let mut handoff = reservation
-        .as_ref()
-        .map(|_| compact::CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation)));
-
-    // Authoritative completion precedes summary model work and best-effort events.
-    completion.publish_finished(Arc::clone(&result));
-    if let Some(reservation) = reservation {
+    if let Some(mut reservation) = reservation {
+        // Settlement may have promoted the entire reserved history while waiters
+        // observed completion. Never let post-turn work restore its raw sources.
+        if let Some(projection) = session
+            .shared
+            .compaction
+            .project(&reservation.history)
+            .filter(|projection| projection.suffix.is_empty())
+        {
+            reservation.previous_summary = Some(projection.summary);
+            reservation.previous_covered_item_count = reservation.history.len();
+            reservation.history_triggered = false;
+            if let Some(progress) = session.lock_inner().compaction_progress.as_mut() {
+                progress.covered_item_count = reservation.history.len();
+                progress.retained_item_count = 0;
+            }
+        }
         *join_slot = Some(tokio::spawn(compact::run_compaction(
             session.clone(),
             reservation,

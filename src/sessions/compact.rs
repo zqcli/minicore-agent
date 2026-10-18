@@ -687,19 +687,58 @@ pub(super) async fn run_compaction_inner(
     // must estimate that effective summary and may refresh it. Manual's
     // established fully-covered Noop semantics remain unchanged.
     if history_len == 0 || (retained_item_count == 0 && reservation.trigger_tokens.is_none()) {
-        return CompactionResult {
-            operation_id: reservation.operation.operation_id.clone(),
-            origin: reservation.operation.origin,
-            status: CompactionStatus::Noop,
-            before_tokens: None,
-            after_tokens: None,
-            covered_loop_count: 0,
-            covered_item_count: reservation.previous_covered_item_count,
-            retained_item_count: 0,
-            utility_usage: None,
-            failure_kind: None,
-        };
+        return noop_compaction(reservation, 0, None);
     }
+
+    let automatic_input = if let (Some(budget), Some(trigger)) =
+        (&reservation.automatic_budget, reservation.trigger_tokens)
+    {
+        let input = match prepare_compaction_input(reservation).await {
+            Ok(input) => input,
+            Err(kind) => return failed_compaction(&reservation.operation, kind, history_len),
+        };
+        let suffix = &reservation.history[reservation.previous_covered_item_count..];
+        let before = crate::compaction::auto_compose(
+            &input.project_instructions,
+            reservation.previous_summary.as_ref(),
+            suffix,
+            &[],
+        )
+        .ok()
+        .and_then(|(mut fixed, history)| {
+            fixed.extend(history);
+            minicore_runtime::model::ModelRequest::new(
+                fixed,
+                reservation.tool_schemas.clone(),
+                minicore_runtime::model::ModelLimits::default(),
+                reservation.record.reasoning,
+            )
+            .ok()
+        })
+        .and_then(|request| {
+            let fallback = budget.estimate_request_tokens(&request, None, None).ok()?;
+            Some(session.shared.compaction.threshold_estimate(
+                reservation.model.descriptor(),
+                &request,
+                &suffix.iter().collect::<Vec<_>>(),
+                fallback,
+                &**budget,
+            ))
+        });
+        let Some(before) = before else {
+            return failed_compaction(
+                &reservation.operation,
+                "context_estimate_unavailable",
+                history_len,
+            );
+        };
+        if before < trigger && !reservation.history_triggered {
+            return noop_compaction(reservation, 0, Some(before));
+        }
+        Some(input)
+    } else {
+        None
+    };
 
     let max_prefix_items = match crate::compaction::recent_tail_start(
         &reservation.history,
@@ -740,13 +779,6 @@ pub(super) async fn run_compaction_inner(
     if reservation.operation.cancellation_requested() {
         return failed_compaction(&reservation.operation, "cancelled", history_len);
     }
-    let Some(remaining) = reservation
-        .deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-    else {
-        return failed_compaction(&reservation.operation, "timeout", history_len);
-    };
     let eligible_prefix = anchors.prefix.as_ref().filter(|prefix| {
         prefix.covered_item_count > reservation.previous_covered_item_count as u64
     });
@@ -754,109 +786,19 @@ pub(super) async fn run_compaction_inner(
     // budget. In particular, an unrelated invalid AGENTS.md cannot turn a
     // short-history or repeated-compaction Noop into a workspace failure.
     if reservation.trigger_tokens.is_none() && eligible_prefix.is_none() {
-        return CompactionResult {
-            operation_id: reservation.operation.operation_id.clone(),
-            origin: reservation.operation.origin,
-            status: CompactionStatus::Noop,
-            before_tokens: None,
-            after_tokens: None,
-            covered_loop_count: session.shared.compaction.coverage().map_or(0, |c| c.0),
-            covered_item_count: reservation.previous_covered_item_count,
-            retained_item_count,
-            utility_usage: None,
-            failure_kind: None,
-        };
+        return noop_compaction(
+            reservation,
+            session.shared.compaction.coverage().map_or(0, |c| c.0),
+            None,
+        );
     }
-    let agents = match tokio::time::timeout(
-        remaining,
-        reservation
-            .workspace
-            .read_prefix(crate::prompt::AGENTS_PATH, crate::prompt::MAX_AGENTS_BYTES),
-    )
-    .await
-    {
-        Ok(Ok(prefix)) => match crate::prompt::decode_agents(&prefix) {
-            Ok(content) => (!content.is_empty()).then_some(content),
-            Err(_) => return failed_compaction(&reservation.operation, "workspace", history_len),
+    let input = match automatic_input {
+        Some(input) => input,
+        None => match prepare_compaction_input(reservation).await {
+            Ok(input) => input,
+            Err(kind) => return failed_compaction(&reservation.operation, kind, history_len),
         },
-        Ok(Err(WorkspaceError::NotFound)) => None,
-        Ok(Err(_)) => return failed_compaction(&reservation.operation, "workspace", history_len),
-        Err(_) => return failed_compaction(&reservation.operation, "timeout", history_len),
     };
-    let system_prompt =
-        match minicore_runtime::value::BoundedText::new(reservation.record.system_prompt.clone())
-            .ok()
-            .and_then(|system| crate::prompt::build_system_prompt(&system, agents).ok())
-        {
-            Some(system_prompt) => system_prompt,
-            None => return failed_compaction(&reservation.operation, "prompt", history_len),
-        };
-
-    let input = CompactionInput {
-        model: Arc::clone(&reservation.model),
-        reasoning: reservation.record.reasoning,
-        history: Arc::clone(&reservation.history),
-        previous_summary: reservation.previous_summary.clone(),
-        previous_covered_item_count: reservation.previous_covered_item_count,
-        project_instructions: system_prompt,
-        tool_schemas: reservation.tool_schemas.clone(),
-        hard_tokens: reservation.hard_tokens,
-        operation_deadline: reservation.deadline,
-        live_usage: None,
-    };
-    if let (Some(budget), Some(trigger)) =
-        (&reservation.automatic_budget, reservation.trigger_tokens)
-    {
-        let suffix = &reservation.history[reservation.previous_covered_item_count..];
-        let before = crate::compaction::auto_compose(
-            &input.project_instructions,
-            reservation.previous_summary.as_ref(),
-            suffix,
-            &[],
-        )
-        .ok()
-        .and_then(|(mut fixed, history)| {
-            fixed.extend(history);
-            minicore_runtime::model::ModelRequest::new(
-                fixed,
-                reservation.tool_schemas.clone(),
-                minicore_runtime::model::ModelLimits::default(),
-                reservation.record.reasoning,
-            )
-            .ok()
-        })
-        .and_then(|request| {
-            let fallback = budget.estimate_request_tokens(&request, None, None).ok()?;
-            Some(session.shared.compaction.threshold_estimate(
-                reservation.model.descriptor(),
-                &request,
-                &suffix.iter().collect::<Vec<_>>(),
-                fallback,
-                &**budget,
-            ))
-        });
-        let Some(before) = before else {
-            return failed_compaction(
-                &reservation.operation,
-                "context_estimate_unavailable",
-                history_len,
-            );
-        };
-        if before < trigger && !reservation.history_triggered {
-            return CompactionResult {
-                operation_id: reservation.operation.operation_id.clone(),
-                origin: reservation.operation.origin,
-                status: CompactionStatus::Noop,
-                before_tokens: Some(before),
-                after_tokens: Some(before),
-                covered_loop_count: 0,
-                covered_item_count: reservation.previous_covered_item_count,
-                retained_item_count,
-                utility_usage: None,
-                failure_kind: None,
-            };
-        }
-    }
     // A fully-covered promoted emergency snapshot retains its original
     // automatic refresh path. It cannot recover raw covered items into a tail.
     let refresh_full = retained_item_count == 0 && reservation.trigger_tokens.is_some();
@@ -868,6 +810,32 @@ pub(super) async fn run_compaction_inner(
         // Only automatic operations reach here, after the complete original
         // request has been measured at or above its unchanged trigger.
         return failed_compaction(&reservation.operation, "no_progress", history_len);
+    };
+    let fingerprint = if reservation.trigger_tokens.is_some() {
+        let fingerprint = match crate::compaction::threshold::source_hash(&(
+            &source.sha256,
+            reservation.model.descriptor().model_ref.as_str(),
+            reservation.hard_tokens,
+            reservation.record.reasoning,
+            &input.project_instructions,
+            &reservation.tool_schemas,
+            Arc::as_ptr(&reservation.model) as *const () as usize,
+        )) {
+            Ok(value) => value,
+            Err(error) => {
+                return failed_compaction(&reservation.operation, error.kind(), history_len);
+            }
+        };
+        if session.shared.compaction.post_turn_source() == Some(fingerprint) {
+            return noop_compaction(
+                reservation,
+                session.shared.compaction.coverage().map_or(0, |c| c.0),
+                None,
+            );
+        }
+        Some(fingerprint)
+    } else {
+        None
     };
     let covered_item_count = source.covered_item_count as usize;
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
@@ -881,6 +849,13 @@ pub(super) async fn run_compaction_inner(
         )
         .await
     };
+    if !reservation.operation.cancellation_requested()
+        && !matches!(&generation, Err(error) if matches!(error.error, crate::compaction::UtilityError::Cancelled | crate::compaction::UtilityError::Timeout))
+    {
+        if let Some(fingerprint) = fingerprint {
+            session.shared.compaction.note_post_turn_source(fingerprint);
+        }
+    }
     let generated = match generation {
         Ok(generated) => generated,
         Err(error) => {
@@ -988,6 +963,71 @@ pub(super) async fn run_compaction_inner(
             failure_kind: Some("write_outcome_unknown".to_owned()),
         },
     }
+}
+
+fn noop_compaction(
+    reservation: &CompactionReservation,
+    covered_loop_count: u64,
+    before_tokens: Option<u64>,
+) -> CompactionResult {
+    CompactionResult {
+        operation_id: reservation.operation.operation_id.clone(),
+        origin: reservation.operation.origin,
+        status: CompactionStatus::Noop,
+        before_tokens,
+        after_tokens: before_tokens,
+        covered_loop_count,
+        covered_item_count: reservation.previous_covered_item_count,
+        retained_item_count: reservation.history.len() - reservation.previous_covered_item_count,
+        utility_usage: None,
+        failure_kind: None,
+    }
+}
+
+async fn prepare_compaction_input(
+    reservation: &CompactionReservation,
+) -> Result<CompactionInput, &'static str> {
+    let remaining = reservation
+        .deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("timeout")?;
+    let agents = match tokio::time::timeout(
+        remaining,
+        reservation
+            .workspace
+            .read_prefix(crate::prompt::AGENTS_PATH, crate::prompt::MAX_AGENTS_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(prefix)) => match crate::prompt::decode_agents(&prefix) {
+            Ok(content) => (!content.is_empty()).then_some(content),
+            Err(_) => return Err("workspace"),
+        },
+        Ok(Err(WorkspaceError::NotFound)) => None,
+        Ok(Err(_)) => return Err("workspace"),
+        Err(_) => return Err("timeout"),
+    };
+    let system_prompt =
+        match minicore_runtime::value::BoundedText::new(reservation.record.system_prompt.clone())
+            .ok()
+            .and_then(|system| crate::prompt::build_system_prompt(&system, agents).ok())
+        {
+            Some(system_prompt) => system_prompt,
+            None => return Err("prompt"),
+        };
+
+    Ok(CompactionInput {
+        model: Arc::clone(&reservation.model),
+        reasoning: reservation.record.reasoning,
+        history: Arc::clone(&reservation.history),
+        previous_summary: reservation.previous_summary.clone(),
+        previous_covered_item_count: reservation.previous_covered_item_count,
+        project_instructions: system_prompt,
+        tool_schemas: reservation.tool_schemas.clone(),
+        hard_tokens: reservation.hard_tokens,
+        operation_deadline: reservation.deadline,
+        live_usage: None,
+    })
 }
 
 fn failed_compaction(
