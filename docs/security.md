@@ -17,9 +17,16 @@ Agent environment, except configured credential variables are removed and
 continues to use PowerShell with `-NoProfile`.
 
 Unix cancellation sends SIGTERM to the process group and allows a 500 ms grace
-while draining both output pipes, then sends SIGKILL and reaps it. Model-visible output keeps head and tail with an
-omitted-bytes marker; stdout and stderr share one output budget. Use an init
-process (for example container `--init`) to reap orphaned descendants in containers.
+while draining both output pipes, then sends SIGKILL and reaps it. Model-visible
+output keeps head and tail with an omitted-bytes marker; stdout and stderr share
+one output budget. If the Agent would be PID 1 in a container, run an init process
+(`--init` or tini) to reap orphaned descendants. Otherwise orphaned children can
+remain zombies and prevent confirmation that the process group is gone.
+
+Process-group signals use the numeric leader PID. There is a theoretical PID-reuse
+window between reaping the leader and a later group signal: if that number is
+reused as another process group's ID, the signal could target the unrelated group.
+Process-group cleanup is not a defense against a hostile same-user process.
 
 The stdio RPC transport has no network authentication layer. Keep the process
 and its pipes local to the intended client. Presentation responses/events are a
@@ -37,6 +44,12 @@ explicit unknown outcome if a post-rename directory sync fails. Replacing an
 existing file preserves its permission bits, including private and executable
 modes; ownership and extended attributes are not preserved. These checks apply
 to `write`, `edit`, and `apply_patch`.
+
+Atomic commits run on the blocking pool, not on an async runtime worker. Once a
+commit is started it finishes and records its file-change observation even if the
+Tool future is dropped. Cancellation or timeout may therefore return before the
+file is replaced; neither means the mutation was rolled back. Path preflight and
+source reads remain cancellable before the commit starts.
 
 These checks are not a defense against an adversarial process running as the
 same user. Such a process can race path components or replace files between

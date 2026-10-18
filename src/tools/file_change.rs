@@ -9,6 +9,7 @@ use crate::workspace::{
 };
 use crate::{Workspace, WorkspaceError};
 use minicore_runtime::tools::ToolError;
+use std::sync::Arc;
 
 pub(super) async fn read_source_before(
     workspace: &Workspace,
@@ -47,16 +48,29 @@ pub(super) fn source_failure(
 
 pub(super) async fn commit_text(
     workspace: &Workspace,
-    tool_ref: Option<&ToolRef>,
-    tool_data: Option<&ToolData>,
-    path: &str,
+    tool_ref: Option<ToolRef>,
+    tool_data: Option<Arc<ToolData>>,
+    path: String,
     before: FileBefore,
-    bytes: &[u8],
+    bytes: Vec<u8>,
 ) -> Result<(), ToolError> {
     let observation = workspace
-        .write_atomic_observed(path, bytes, expected_file_state(&before))
+        .write_atomic_observed(
+            path,
+            bytes,
+            expected_file_state(&before),
+            move |path, bytes, observation| {
+                record_file_change(
+                    tool_data.as_deref(),
+                    tool_ref.as_ref(),
+                    path,
+                    before,
+                    bytes,
+                    observation,
+                );
+            },
+        )
         .await;
-    record_file_change(tool_data, tool_ref, path, before, bytes, &observation);
     observation.outcome.map_err(map_workspace_error)
 }
 

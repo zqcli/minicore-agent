@@ -134,11 +134,11 @@ impl ApplyPatchTool {
                 emit_phase(&context, "committing");
                 commit_text(
                     &self.workspace,
-                    tool_ref.as_ref(),
-                    tool_data.as_deref(),
-                    &input.path,
+                    tool_ref,
+                    tool_data,
+                    input.path,
                     before,
-                    result.as_bytes(),
+                    result.into_bytes(),
                 )
                 .await?;
                 Ok(ToolExecutionOutcome::Completed(output))

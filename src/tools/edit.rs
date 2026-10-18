@@ -128,8 +128,8 @@ impl EditTool {
                 ))
                 .map_err(|_| ToolError::Internal)?;
                 emit_phase(&context, "committing");
-                commit_text(&self.workspace, tool_ref.as_ref(), tool_data.as_deref(),
-                    &input.path, before, result.as_bytes()).await?;
+                commit_text(&self.workspace, tool_ref, tool_data,
+                    input.path, before, result.into_bytes()).await?;
                 Ok(ToolExecutionOutcome::Completed(output))
             })
             .await

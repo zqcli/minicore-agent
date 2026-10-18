@@ -528,137 +528,106 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
     cleanup(&base).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancellation_during_commit_returns_the_real_commit_result() {
-    let (base, workspace, tool) = fixture("commit-cancel").await;
-    let root = base.join("root");
-    tokio::fs::write(root.join("value"), b"old").await.unwrap();
-    let target = workspace.resolve_for_write("value").await.unwrap();
-    let gate = Arc::new(crate::test_support::Gate::new());
-    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
-    let cancellation = CancellationToken::new();
-    let task_cancellation = cancellation.clone();
-    let task = tokio::spawn(async move {
-        tool.execute(
-            invocation(json!({"path": "value", "content": "complete-new"})),
-            context(task_cancellation, Instant::now() + Duration::from_secs(5)),
-        )
-        .await
-    });
-
-    gate.wait_started().await;
-    cancellation.cancel();
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    let finished_before_release = task.is_finished();
-    gate.release();
-    let result = task.await.unwrap();
-    let target_contents = tokio::fs::read(&target).await.unwrap();
-    let mut entries = tokio::fs::read_dir(&root).await.unwrap();
-    let mut temp_found = false;
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        temp_found |= entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with(".minicore-write-"));
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn interrupted_writes_finish_and_record_without_blocking_the_async_worker() {
+    for stop in ["cancel", "deadline", "drop"] {
+        for sync_fails in [false, true] {
+            let (base, workspace, tool) = fixture("detached-commit").await;
+            let root = base.join("root");
+            tokio::fs::write(root.join("value"), b"old").await.unwrap();
+            let target = workspace.resolve_for_write("value").await.unwrap();
+            if sync_fails {
+                DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
+            }
+            let gate = Arc::new(crate::test_support::Gate::new());
+            BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
+            let data = Arc::new(ToolData::new());
+            let tool_ref = bound_ref();
+            data.note_requested(&tool_ref, TOOL_NAME);
+            let cancellation = CancellationToken::new();
+            let deadline = Instant::now()
+                + if stop == "deadline" {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_secs(10)
+                };
+            let mut task = tokio::spawn({
+                let data = Arc::clone(&data);
+                let tool_ref = tool_ref.clone();
+                let cancellation = cancellation.clone();
+                async move {
+                    tool.execute_bound(
+                        invocation(json!({"path": "value", "content": "complete-new"})),
+                        context(cancellation, deadline),
+                        Some(tool_ref),
+                        Some(data),
+                    )
+                    .await
+                }
+            });
+            gate.wait_started().await;
+            // With only one async worker, this cannot run if fsync/rename is
+            // blocking that worker. Release the gate on failure to allow cleanup.
+            let responsive =
+                tokio::time::timeout(Duration::from_secs(1), tokio::spawn(async {})).await;
+            if responsive.is_err() {
+                gate.release();
+            }
+            responsive
+                .expect("atomic commit blocked the async worker")
+                .unwrap();
+            match stop {
+                "cancel" => cancellation.cancel(),
+                "drop" => task.abort(),
+                "deadline" => {}
+                _ => unreachable!(),
+            }
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+            gate.release();
+            let result = result.expect("caller remained stuck in the commit");
+            match stop {
+                "cancel" => assert_eq!(result.unwrap(), Err(ToolError::Cancelled)),
+                "deadline" => assert_eq!(result.unwrap(), Err(ToolError::TimedOut)),
+                "drop" => assert!(result.unwrap_err().is_cancelled()),
+                _ => unreachable!(),
+            }
+            let records = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let records =
+                        data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
+                    if !records.is_empty() {
+                        break records;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("commit observation was lost after dropping its awaiter");
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].commit_state,
+                if sync_fails {
+                    crate::ChangeCommitState::Unknown
+                } else {
+                    crate::ChangeCommitState::Applied
+                }
+            );
+            assert_eq!(records[0].before, crate::changes::content_revision(b"old"));
+            assert_eq!(
+                records[0].after,
+                crate::changes::content_revision(b"complete-new")
+            );
+            assert_eq!(tokio::fs::read(&target).await.unwrap(), b"complete-new");
+            let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                assert!(
+                    !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".minicore-write-")
+                );
+            }
+            cleanup(&base).await;
+        }
     }
-    cleanup(&base).await;
-
-    assert!(!finished_before_release);
-    let ToolExecutionOutcome::Completed(output) = result.unwrap() else {
-        panic!("write must not request input");
-    };
-    assert_eq!(output.content().as_str(), "wrote 12 bytes to value");
-    assert_eq!(target_contents, b"complete-new");
-    assert!(!temp_found);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deadline_during_commit_returns_post_rename_unknown_outcome() {
-    let (base, workspace, tool) = fixture("commit-deadline-unknown").await;
-    let root = base.join("root");
-    tokio::fs::write(root.join("value"), b"old").await.unwrap();
-    let target = workspace.resolve_for_write("value").await.unwrap();
-    DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
-    let gate = Arc::new(crate::test_support::Gate::new());
-    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
-    let deadline = Instant::now() + Duration::from_millis(1000);
-    let task = tokio::spawn(async move {
-        tool.execute(
-            invocation(json!({"path": "value", "content": "complete-new"})),
-            context(CancellationToken::new(), deadline),
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
-        .await
-        .expect("worker reached pre-rename gate before deadline");
-    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline) + Duration::from_millis(25))
-        .await;
-    let finished_before_release = task.is_finished();
-    gate.release();
-    let result = task.await.unwrap();
-    let target_contents = tokio::fs::read(&target).await.unwrap();
-    let mut entries = tokio::fs::read_dir(&root).await.unwrap();
-    let mut temp_found = false;
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        temp_found |= entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with(".minicore-write-"));
-    }
-    cleanup(&base).await;
-
-    assert!(!finished_before_release);
-    assert_eq!(result, Err(ToolError::Failed));
-    assert_eq!(target_contents, b"complete-new");
-    assert!(!temp_found);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bound_write_deadline_keeps_the_mutation_and_records_it() {
-    let (base, workspace, tool) = fixture("bound-commit-deadline").await;
-    let root = base.join("root");
-    tokio::fs::write(root.join("value"), b"old").await.unwrap();
-    let target = workspace.resolve_for_write("value").await.unwrap();
-    DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
-    let gate = Arc::new(crate::test_support::Gate::new());
-    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
-    let data = Arc::new(ToolData::new());
-    let tool_ref = bound_ref();
-    data.note_requested(&tool_ref, TOOL_NAME);
-    let deadline = Instant::now() + Duration::from_millis(1000);
-    let task_data = Arc::clone(&data);
-    let task_ref = tool_ref.clone();
-    let task = tokio::spawn(async move {
-        tool.execute_bound(
-            invocation(json!({"path": "value", "content": "complete-new"})),
-            context(CancellationToken::new(), deadline),
-            Some(task_ref),
-            Some(task_data),
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
-        .await
-        .expect("worker reached pre-rename gate before deadline");
-    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline) + Duration::from_millis(25))
-        .await;
-    gate.release();
-    let result = task.await.unwrap();
-    let target_contents = tokio::fs::read(&target).await.unwrap();
-    cleanup(&base).await;
-
-    // The timeout must not pretend nothing happened: the file really
-    // changed and the bound record still describes that real mutation.
-    assert_eq!(result, Err(ToolError::Failed));
-    assert_eq!(target_contents, b"complete-new");
-    let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].commit_state, crate::ChangeCommitState::Unknown);
-    assert_eq!(
-        records[0].after,
-        crate::changes::content_revision(b"complete-new")
-    );
 }

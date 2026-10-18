@@ -101,11 +101,11 @@ impl WriteTool {
                 };
                 commit_text(
                     &self.workspace,
-                    tool_ref.as_ref(),
-                    tool_data.as_deref(),
-                    &input.path,
+                    tool_ref,
+                    tool_data,
+                    input.path,
                     before,
-                    input.content.as_bytes(),
+                    input.content.into_bytes(),
                 )
                 .await
             })

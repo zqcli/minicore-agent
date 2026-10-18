@@ -335,25 +335,27 @@ impl Workspace {
         })
     }
 
+    /// Once started, the blocking commit and its observer finish together even
+    /// if the caller stops awaiting them. Path preflight remains cancellable.
     pub(crate) async fn write_atomic_observed(
         &self,
-        path: &str,
-        bytes: &[u8],
+        path: String,
+        bytes: Vec<u8>,
         expected: Option<ExpectedFileState>,
+        observe: impl FnOnce(&str, &[u8], &AtomicWriteObservation) + Send + 'static,
     ) -> AtomicWriteObservation {
-        let resolved = match self.resolve_for_write(path).await {
-            Ok(resolved) => resolved,
-            Err(error) => return failed_observation(error),
-        };
-        let Some(file_name) = resolved.file_name().map(OsString::from) else {
-            return failed_observation(WorkspaceError::InvalidPath);
-        };
-        let Some(parent) = resolved.parent() else {
-            return failed_observation(WorkspaceError::InvalidPath);
-        };
-        // Runtime may drop the future only at yield points. Keep every mutation below
-        // this boundary in one synchronous poll through the final directory sync.
-        commit_write(self.root.as_path(), parent, &file_name, bytes, expected)
+        let resolved = self.resolve_for_write(&path).await;
+        let root = Arc::clone(&self.root);
+        tokio::task::spawn_blocking(move || {
+            let observation = match resolved {
+                Ok(target) => commit_write(&root, &target, &bytes, expected),
+                Err(error) => failed_observation(error),
+            };
+            observe(&path, &bytes, &observation);
+            observation
+        })
+        .await
+        .unwrap_or_else(|_| failed_observation(WorkspaceError::UnknownOutcome))
     }
 
     async fn canonicalize_inside(&self, path: &Path) -> Result<PathBuf, WorkspaceError> {
@@ -433,11 +435,16 @@ async fn validate_write_target(target: &Path) -> Result<(), WorkspaceError> {
 
 fn commit_write(
     root: &Path,
-    parent: &Path,
-    file_name: &OsString,
+    target: &Path,
     bytes: &[u8],
     expected: Option<ExpectedFileState>,
 ) -> AtomicWriteObservation {
+    let parent = target
+        .parent()
+        .expect("resolved write targets have a parent");
+    let file_name = target
+        .file_name()
+        .expect("resolved write targets have a file name");
     let parent = match ensure_parent_directory(root, parent) {
         Ok(parent) => parent,
         Err(error) => return failed_observation(error),
