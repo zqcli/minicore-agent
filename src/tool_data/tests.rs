@@ -2,7 +2,7 @@
 fn historical_memory_only_record_needs_stored_details() {
     let mut record = super::ToolRecord::new("bash".to_owned());
     record.state = super::ToolExecutionState::Succeeded;
-    record.outcome = Some(super::ToolResultOutcome::Success);
+    record.outcome = Some(ToolResultOutcome::Success);
     record.result_seen = true;
     assert!(record.needs_stored());
 }
@@ -11,7 +11,7 @@ fn historical_memory_only_record_needs_stored_details() {
 fn complete_empty_streams_do_not_need_stored_details() {
     let mut record = super::ToolRecord::new("bash".to_owned());
     record.state = super::ToolExecutionState::Succeeded;
-    record.outcome = Some(super::ToolResultOutcome::Success);
+    record.outcome = Some(ToolResultOutcome::Success);
     record.input_seen = true;
     record.result_seen = true;
     record.recording = super::ToolRecordingState::Saved;
@@ -36,7 +36,17 @@ use serde_json::json;
 
 use crate::changes::FileChange;
 
+use super::data::SNAPSHOT_GATES;
+use super::paging::fit_encoded_string;
 use super::*;
+use crate::budget::encoded_len;
+use crate::error::AgentError;
+use crate::ids::SessionId;
+use base64::Engine as _;
+use minicore_runtime::history::HistoryItem;
+use minicore_runtime::tools::{ToolInvocation, ToolResultOutcome};
+use minicore_runtime::{LoopId, ToolCallId};
+use serde_json::Value;
 
 pub(super) fn wait_snapshot_gate(tool_ref: &ToolRef) {
     if let Some(gate) = SNAPSHOT_GATES.take(tool_ref) {
