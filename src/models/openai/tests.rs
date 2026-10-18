@@ -1,6 +1,7 @@
+use crate::test_support::TempDir;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, resume_unwind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,25 +30,6 @@ use crate::openai_mock::{MockResponse, MockServer, sse_body};
 
 const TEST_CA_BUNDLE: &[u8] = include_bytes!("../../../tests/fixtures/amazon-root-ca-3.pem");
 
-struct TlsTempDir(PathBuf);
-
-impl TlsTempDir {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "minicore-agent-tls-{}",
-            crate::ids::SessionId::new().unwrap()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TlsTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 fn tls_client_without_custom_bundle_builds() {
     // Pass the setting explicitly: no process-wide environment mutations.
@@ -56,9 +38,393 @@ fn tls_client_without_custom_bundle_builds() {
 }
 
 #[test]
+fn plaintext_warning_is_once_per_remote_model_and_redacts_endpoint_and_key() {
+    let temp = TempDir::new("model-warning");
+    let output = temp.path().join("trace.log");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(std::fs::File::create(&output).unwrap())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for url in [
+            "http://localhost/private-path",
+            "http://127.0.0.2/private-path",
+            "http://[::1]/private-path",
+            "https://remote.invalid/private-path",
+        ] {
+            model(url);
+        }
+        assert!(std::fs::read(&output).unwrap().is_empty());
+        for url in [
+            "http://remote.invalid/private-path",
+            "http://192.168.1.2/private-path",
+            "http://[2001:db8::1]/private-path",
+        ] {
+            let mut settings = settings(url);
+            settings.api_key = "PRIVATE-API-KEY".into();
+            OpenAiResponsesModel::new(settings).unwrap();
+        }
+    });
+    let log = std::fs::read_to_string(output).unwrap();
+    assert_eq!(log.matches("bearer credentials in plaintext").count(), 3);
+    for secret in [
+        "PRIVATE-API-KEY",
+        "private-path",
+        "remote.invalid",
+        "192.168.1.2",
+        "2001:db8",
+    ] {
+        assert!(!log.contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn empty_text_and_refusal_deltas_do_not_emit_events_or_change_finish_reason() {
+    let server = MockServer::spawn([MockResponse::sse(&[
+        json!({"type":"response.output_text.delta", "delta":""}),
+        json!({"type":"response.refusal.delta", "delta":""}),
+        json!({"type":"response.output_text.delta", "delta":"answer"}),
+        json!({"type":"response.output_text.delta", "delta":""}),
+        completed(usage()),
+    ])])
+    .await;
+    let events = run_model(
+        &model(server.base_url()),
+        basic_request(ReasoningPreference::Auto),
+        context(CancellationToken::new(), Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        events.iter().filter_map(event_text).collect::<String>(),
+        "answer"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::Finish {
+            reason: ModelFinishReason::Stop
+        })
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::TextDelta { .. }))
+            .count(),
+        1
+    );
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn omitted_usage_details_are_unknown_not_zero() {
+    for mask in 0..8 {
+        let mut raw = json!({"input_tokens":20,"output_tokens":11});
+        if mask & 1 != 0 {
+            raw["total_tokens"] = json!(31);
+        }
+        if mask & 2 != 0 {
+            raw["input_tokens_details"] = usage()["input_tokens_details"].clone();
+        }
+        if mask & 4 != 0 {
+            raw["output_tokens_details"] = usage()["output_tokens_details"].clone();
+        }
+        let server = MockServer::spawn([MockResponse::sse(&[
+            json!({"type":"response.output_text.delta","delta":"answer"}),
+            completed(raw),
+        ])])
+        .await;
+        let events = run_model(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                ModelEvent::Usage { usage } => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(usage.provider_total_tokens(), (mask & 1 != 0).then_some(31));
+        assert_eq!(usage.input_tokens(), (mask & 2 != 0).then_some(12));
+        assert_eq!(usage.cache_read_tokens(), (mask & 2 != 0).then_some(5));
+        assert_eq!(usage.cache_write_tokens(), (mask & 2 != 0).then_some(3));
+        assert_eq!(usage.output_tokens(), (mask & 4 != 0).then_some(7));
+        assert_eq!(usage.reasoning_tokens(), (mask & 4 != 0).then_some(4));
+        assert!(matches!(events.last(), Some(ModelEvent::Finish { .. })));
+        server.finish().await;
+    }
+    for details in [Value::Null, json!({})] {
+        let usage = provider_usage(
+            serde_json::from_value(json!({
+                "input_tokens":1, "output_tokens":1, "total_tokens":null,
+                "input_tokens_details":details, "output_tokens_details":details,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(usage, Usage::default());
+    }
+}
+
+#[tokio::test]
+async fn terminal_drain_is_bounded_and_never_parses_trailing_events() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (tail, expected_polls) in [
+        (vec![Bytes::from_static(b"not SSE")], 2),
+        (
+            vec![
+                Bytes::from(vec![0; MAX_DRAIN_BYTES]),
+                Bytes::from_static(b"unread"),
+            ],
+            1,
+        ),
+    ] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&polls);
+        let terminal = Bytes::from(sse_body(&[completed(usage())]));
+        let mut chunks = std::iter::once(terminal).chain(tail);
+        let bytes: ByteStream = Box::pin(stream::poll_fn(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(chunks.next().map(Ok))
+        }));
+        let mut state = StreamState::new(
+            bytes,
+            CancellationToken::new(),
+            TokioInstant::now() + Duration::from_secs(1),
+        );
+        let mut events = Vec::new();
+        while let Some((event, next)) = next_stream_event(state).await {
+            events.push(event.unwrap());
+            state = next;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1 + expected_polls);
+        assert!(matches!(events.last(), Some(ModelEvent::Finish { .. })));
+    }
+}
+
+#[tokio::test]
+async fn terminal_drain_skips_near_deadline_or_cancelled_response() {
+    for cancelled in [false, true] {
+        let cancellation = CancellationToken::new();
+        let token = cancellation.clone();
+        let terminal = Bytes::from(sse_body(&[completed(usage())]));
+        let bytes: ByteStream = Box::pin(
+            stream::once(async move {
+                if cancelled {
+                    token.cancel();
+                }
+                Ok(terminal)
+            })
+            .chain(stream::poll_fn(|_| {
+                panic!("unnecessary terminal body poll")
+            })),
+        );
+        let state = StreamState::new(
+            bytes,
+            cancellation,
+            TokioInstant::now()
+                + if cancelled {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(20)
+                },
+        );
+        let (event, state) = tokio::time::timeout(Duration::from_secs(1), next_stream_event(state))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(event.is_ok());
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::Finish { .. })))
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_drain_allows_two_requests_on_one_http_connection() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let model = model(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        for _ in 0..2 {
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    socket.read_line(&mut line).await.unwrap(),
+                    0,
+                    "connection closed before reuse"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            socket
+                .read_exact(&mut vec![0; length.unwrap()])
+                .await
+                .unwrap();
+            let terminal = sse_body(&[
+                json!({"type":"response.output_text.delta", "delta":"answer"}),
+                completed(usage()),
+            ]);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                terminal.len(),
+                terminal
+            );
+            socket
+                .get_mut()
+                .write_all(headers.as_bytes())
+                .await
+                .unwrap();
+            // The terminal SSE event is not the end of the HTTP message.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket
+                .get_mut()
+                .write_all(b"e\r\ndata: [DONE]\n\n\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..2 {
+            let events = run_model(
+                &model,
+                basic_request(ReasoningPreference::Auto),
+                context(CancellationToken::new(), Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(events.last(), Some(ModelEvent::Finish { .. })));
+        }
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_completes_before_deadline_when_terminal_http_body_never_ends() {
+    let terminal = sse_body(&[
+        json!({"type":"response.output_text.delta", "delta":"finished"}),
+        completed(usage()),
+    ])
+    .into_bytes();
+    let (response, gate) = MockResponse::sse_bytes(Vec::new())
+        .with_chunks([terminal, vec![b' ']])
+        .with_chunk_gate();
+    gate.release(); // Deliver the terminal event, but leave the HTTP body open.
+    let server = MockServer::spawn([response]).await;
+    let temp = TempDir::new("terminal-driver");
+    let models = Models::from_values(BTreeMap::from([(
+        "main".into(),
+        Arc::new(model(server.base_url())) as Arc<dyn Model>,
+    )]));
+    let config = AgentConfig {
+        data_dir: temp.path().join("data"),
+        event_capacity: 256,
+        default_profile: "test".into(),
+        profiles: BTreeMap::from([(
+            "test".into(),
+            Profile {
+                model: "main".into(),
+                reasoning: ReasoningPreference::Auto,
+                system_prompt: "Answer briefly.".into(),
+                tools: vec![],
+                max_tool_rounds: 0,
+                approval: ApprovalMode::Auto,
+            },
+        )]),
+        models: BTreeMap::from([("main".into(), agent_model_config(server.base_url()))]),
+        loop_options: LoopOverrides {
+            model_timeout_seconds: Some(1),
+            ..LoopOverrides::default()
+        },
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        },
+    };
+    let mut agent = Agent::open_with_models(config, models).await.unwrap();
+    let session = agent
+        .create_session(CreateSession {
+            workspace: temp.path().to_owned(),
+            profile: String::new(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: session.session_id,
+            text: "answer".into(),
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_millis(800), agent.wait_turn(turn)).await;
+    gate.release(); // Release the mock even when the assertion below fails.
+    let result = result
+        .expect("terminal response waited for the HTTP body")
+        .unwrap();
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+    agent.shutdown().await.unwrap();
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn retryable_status_survives_a_truncated_error_body() {
+    for status in [503, 529] {
+        let server = MockServer::spawn([MockResponse::json(status, b"{\"error\":".to_vec())
+            .with_declared_length(1024)
+            .with_header("Retry-After", "7")])
+        .await;
+        let error = start_error(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await;
+        assert_error(
+            &error,
+            ModelErrorKind::ProviderUnavailable,
+            DeliveryState::NotStarted,
+            true,
+        );
+        assert!(
+            matches!(error.retry_hint(), RetryHint::Retryable { retry_after: Some(delay) }
+            if *delay > Duration::from_secs(6) && *delay <= Duration::from_secs(7))
+        );
+        server.finish().await;
+    }
+}
+
+#[test]
 fn tls_client_accepts_single_and_multiple_certificates() {
-    let temp = TlsTempDir::new();
-    let path = temp.0.join("ca.pem");
+    let temp = TempDir::new("agent-tls");
+    let path = temp.path().join("ca.pem");
     let text = std::str::from_utf8(TEST_CA_BUNDLE).unwrap();
     for bundle in [
         TEST_CA_BUNDLE.to_vec(),
@@ -74,9 +440,9 @@ fn tls_client_accepts_single_and_multiple_certificates() {
 
 #[test]
 fn tls_client_rejects_empty_missing_and_unreadable_paths() {
-    let temp = TlsTempDir::new();
-    let missing = temp.0.join("PRIVATE-PATH-MARKER-missing.pem");
-    for path in [OsStr::new(""), missing.as_os_str(), temp.0.as_os_str()] {
+    let temp = TempDir::new("agent-tls");
+    let missing = temp.path().join("PRIVATE-PATH-MARKER-missing.pem");
+    for path in [OsStr::new(""), missing.as_os_str(), temp.path().as_os_str()] {
         let error = build_http_client(None, Some(path)).unwrap_err();
         assert_eq!(error, ModelConfigError::InvalidTlsTrustStore);
         assert_eq!(error.to_string(), "model TLS trust store is invalid");
@@ -86,8 +452,8 @@ fn tls_client_rejects_empty_missing_and_unreadable_paths() {
 
 #[test]
 fn tls_client_rejects_empty_malformed_and_invalid_der_bundles() {
-    let temp = TlsTempDir::new();
-    let path = temp.0.join("PRIVATE-PATH-MARKER-ca.pem");
+    let temp = TempDir::new("agent-tls");
+    let path = temp.path().join("PRIVATE-PATH-MARKER-ca.pem");
     let malformed_pem =
         b"-----BEGIN CERTIFICATE-----\n!PRIVATE-CONTENT-MARKER!\n-----END CERTIFICATE-----\n";
     // This is valid PEM encoding but invalid certificate DER: client build must fail.
@@ -115,8 +481,8 @@ fn tls_client_rejects_empty_malformed_and_invalid_der_bundles() {
 fn tls_client_accepts_non_utf8_bundle_path() {
     use std::os::unix::ffi::OsStrExt;
 
-    let temp = TlsTempDir::new();
-    let path = temp.0.join(OsStr::from_bytes(b"ca-\xff.pem"));
+    let temp = TempDir::new("agent-tls");
+    let path = temp.path().join(OsStr::from_bytes(b"ca-\xff.pem"));
     std::fs::write(&path, TEST_CA_BUNDLE).unwrap();
     assert!(build_http_client(None, Some(path.as_os_str())).is_ok());
 }
@@ -979,21 +1345,9 @@ async fn malformed_usage_fails_the_terminal_without_usage_or_finish() {
     let cases = [
         json!({}),
         json!({"input_tokens": 1}),
-        json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
-        json!({
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-            "input_tokens_details": {},
-            "output_tokens_details": {"reasoning_tokens": 0}
-        }),
-        json!({
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "total_tokens": 2,
-            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-            "output_tokens_details": {}
-        }),
+        json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": "2"}),
+        json!({"input_tokens": 1, "output_tokens": 1, "input_tokens_details": []}),
+        json!({"input_tokens": 1, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": -1}}),
         json!({
             "input_tokens": u64::MAX,
             "output_tokens": 0,
@@ -1613,6 +1967,30 @@ async fn http_status_connect_timeout_and_non_sse_errors_have_conservative_delive
             false,
         ),
         (
+            MockResponse::json(502, b"{}".to_vec()),
+            ModelErrorKind::ProviderUnavailable,
+            DeliveryState::Unknown,
+            false,
+        ),
+        (
+            MockResponse::json(504, b"{}".to_vec()),
+            ModelErrorKind::ProviderUnavailable,
+            DeliveryState::Unknown,
+            false,
+        ),
+        (
+            MockResponse::json(503, b"{}".to_vec()).with_header("Retry-After", "7"),
+            ModelErrorKind::ProviderUnavailable,
+            DeliveryState::NotStarted,
+            true,
+        ),
+        (
+            MockResponse::json(529, b"{}".to_vec()).with_header("Retry-After", "7"),
+            ModelErrorKind::ProviderUnavailable,
+            DeliveryState::NotStarted,
+            true,
+        ),
+        (
             MockResponse::json(200, b"{}".to_vec()),
             ModelErrorKind::InvalidProviderResponse,
             DeliveryState::Unknown,
@@ -1629,7 +2007,7 @@ async fn http_status_connect_timeout_and_non_sse_errors_have_conservative_delive
         )
         .await;
         assert_error(&error, kind, delivery, retryable);
-        if kind == ModelErrorKind::RateLimited {
+        if retryable {
             let delay = match error.retry_hint() {
                 RetryHint::Retryable {
                     retry_after: Some(delay),
@@ -2131,27 +2509,6 @@ fn assert_live_usage(usage: &Usage) {
 
 const LIVE_SMOKE_TOKEN: &str = "MINICORE_TUI_SMOKE_7F42";
 
-struct LiveTempDir {
-    path: PathBuf,
-}
-
-impl LiveTempDir {
-    fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!(
-                "minicore-agent-openai-live-{}",
-                crate::ids::SessionId::new().expect("live temp directory ID")
-            )),
-        }
-    }
-}
-
-impl Drop for LiveTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 struct LiveToolEvidence {
     turn: TurnRef,
     outcome: minicore_runtime::LoopOutcome,
@@ -2271,8 +2628,8 @@ async fn openai_live_text_smoke() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_live_reasoning_tool_smoke() {
     let live = live_reasoning_tool_config();
-    let temp = LiveTempDir::new();
-    let workspace = temp.path.join("workspace");
+    let temp = TempDir::new("agent-openai-live");
+    let workspace = temp.path().join("workspace");
     tokio::fs::create_dir_all(&workspace)
         .await
         .unwrap_or_else(|_| panic!("live workspace creation failed"));
@@ -2280,7 +2637,7 @@ async fn openai_live_reasoning_tool_smoke() {
         .await
         .unwrap_or_else(|_| panic!("live smoke file creation failed"));
     let config = AgentConfig {
-        data_dir: temp.path.join("data"),
+        data_dir: temp.path().join("data"),
         event_capacity: 256,
         default_profile: "live".to_owned(),
         profiles: BTreeMap::from([(
@@ -2308,7 +2665,7 @@ async fn openai_live_reasoning_tool_smoke() {
         Ok(events) => events,
         Err(_) => {
             let shutdown = AssertUnwindSafe(agent.shutdown()).catch_unwind().await;
-            let _ = tokio::fs::remove_dir_all(&temp.path).await;
+            let _ = tokio::fs::remove_dir_all(temp.path()).await;
             match shutdown {
                 Err(payload) => resume_unwind(payload),
                 Ok(Err(_)) => panic!("live Agent shutdown failed"),
@@ -2338,7 +2695,7 @@ async fn openai_live_reasoning_tool_smoke() {
         .await;
     let shutdown = AssertUnwindSafe(agent.shutdown()).catch_unwind().await;
     let reasoning_by_turn = collector.await;
-    let _ = tokio::fs::remove_dir_all(&temp.path).await;
+    let _ = tokio::fs::remove_dir_all(temp.path()).await;
 
     let evidence = match execution {
         Ok(Ok(evidence)) => evidence,
@@ -2691,4 +3048,14 @@ async fn utility_handle_enforces_exact_provider_budget_before_http() {
         DeliveryState::NotStarted,
         false,
     );
+}
+
+impl StreamState {
+    fn new(
+        bytes: ByteStream,
+        cancellation: tokio_util::sync::CancellationToken,
+        deadline: TokioInstant,
+    ) -> Self {
+        Self::new_with_replay(bytes, cancellation, deadline, None, None)
+    }
 }

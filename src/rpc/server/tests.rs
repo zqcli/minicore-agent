@@ -5212,7 +5212,7 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
             crate::compaction::auto::minimal_messages(&system, &[candidate.as_str()])
                 .and_then(|messages| {
                     crate::compaction::auto::estimate_tokens_with_budget(
-                        &crate::models::DefaultProviderBudget,
+                        &crate::models::tests::DefaultProviderBudget,
                         messages,
                         &[],
                         ReasoningPreference::Auto,
