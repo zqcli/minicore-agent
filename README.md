@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
-MiniCore Agent **0.6.2** is an RPC-first local agent core. It provides a Rust
+MiniCore Agent **0.7.0** is an RPC-first local agent core. It provides a Rust
 library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
 Tool data, and a stdio JSON-RPC service for a client UI.
 
 - Rust edition: 2024; MSRV: **1.85**
 - Runtime: `minicore-runtime 0.7.0`, pinned to Git revision
-  `3bd8101eb02e55e5972839fc2a0bd39a4f3e7eee`.
+  `86fba7893a09a6cdab76c52da07f5fc93c307a90`.
 - RPC protocol version: **1**
 - Versioned source delivery uses the `dev` branch and annotated release tags;
   this does not imply a package-registry publication or binary installation.
@@ -102,6 +102,10 @@ See [the replay contract](docs/provider-replay.md) for identity fallback, bounds
 usage uncertainty, and compatibility.
 
 ## Context And Compatibility
+
+Client-visible 0.7.0 behavior changes (shutdown cancellation reason, deferred
+settlement after `turn.wait`, separate lifecycle event queue, path-based scan
+cursors, credential admission) are listed in the [changelog](CHANGELOG.md).
 
 Runtime owns model-text normalization: CRLF/CR become LF, other controls except
 LF/TAB become one space, and empty deltas emit no progress. Normalization never

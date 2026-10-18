@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.7.0 — 2026-10-17
+
+Compatibility (RPC protocol stays 1; history, snapshot and auxiliary formats,
+history revision strings and event wire shapes are unchanged):
+
+- Pin Runtime 0.7.0 at `86fba7893a09a6cdab76c52da07f5fc93c307a90`. Runtime owns
+  model-text normalization (CRLF/CR become LF, other controls except LF/TAB one
+  space, never expanding bytes); the adapter no longer rejects control text.
+  Future Runtime statuses, cancellation reasons and outcomes map to `unknown`.
+- `session.close` and `agent.shutdown` cancel an active turn with reason
+  `shutdown` instead of `user`; `turn.cancel` still uses `user`.
+- `turn.wait` returns before emergency-projection settlement, auxiliary tool
+  record saves and post-turn compaction. Close and the next submit join them.
+- Lifecycle events use a separate 64-entry queue drained first;
+  `event_capacity` bounds only streaming events (deltas, progress, process
+  chunks, intermediate previews). `dropped_before` is attached at delivery.
+- `workspace.files`/`workspace.search` cursors carry the last processed path
+  instead of an entry ordinal; cursors issued by 0.6 are rejected.
+- `changes.list` orders by observation time; its cursors bind that order, and
+  detail warnings describe only the returned page.
+- Models not referenced by any profile no longer need credentials at startup
+  or reload. Keys are read from the process environment; rotate by restarting.
+
+Sessions and RPC:
+
+- The dispatcher admits requests in order but runs disk work, worker joins and
+  reload in bounded owned tasks; Session lifecycle mutations reserve their ID
+  (`session_busy` on conflict), and cancellation registers at admission.
+- Unix SIGTERM and Ctrl-C use orderly shutdown; the binary exits without waiting
+  for stdin EOF. Responses are encoded once and output is flushed in batches.
+- An oversized frame still reports a parse error and stops the process.
+
+Persistence:
+
+- Loaded Sessions keep an index of JSONL lines, so pages, revisions and stored
+  `turn.result` lookups read only the needed lines; cold reads keep the bounded
+  scan.
+- A failed append that was rejected or rolled back leaves the Session usable;
+  only a failed rollback blocks it. A valid final record missing only its
+  newline is kept on repair.
+- `session.delete` renames the directory to `.deleting-<id>` before reclaiming
+  it; startup finishes interrupted deletes and removes stale metadata temps.
+- Auxiliary tool records use an in-memory ledger built by one tolerant scan.
+  Store warnings keep `io::ErrorKind` without paths; cold tool queries
+  distinguish missing, unavailable and corrupt records.
+
+Models:
+
+- Responses: 10-second connect timeout (no idle read timeout, since reasoning
+  streams can be silent), a warning for non-loopback `http://`, retryable 503
+  and 529 honoring `Retry-After`, and a bounded post-terminal drain for
+  connection reuse.
+- In-stream context-overflow, quota and rate-limit codes are classified;
+  rejections before any output are `NotStarted`, so compaction recovery and
+  retries apply. Encrypted reasoning is requested only for models with explicit
+  reasoning levels. Token estimates use max(bytes / 4, non-ASCII characters).
+
+Workspace and Tools:
+
+- Bash runs `/bin/bash -c` (falling back to `/bin/sh -c`), not a login shell,
+  and drains pipes during the termination grace.
+- Atomic writes run on blocking workers. A started commit is owned by the
+  Session, so loop completion and close join it before tool records persist.
+- Listings escape non-UTF-8 names and skip entries that vanish mid-scan;
+  `.minicore-write-*.tmp` artifacts are hidden. Roots whose resolved path is
+  not UTF-8 are rejected rather than converted lossily.
+- `edit` translates LF multiline input for CRLF files. `apply_patch` accepts
+  `diff --git`/`index` headers, trailing blank lines and blank context lines;
+  matching otherwise stays exact.
+
+Compaction:
+
+- Runtime `estimate_history_bytes` is the single admission estimator, applied
+  to the effective projected history.
+- In-turn utility calls get half of the remaining preparation time; a timeout
+  leaves a request that still fits unreduced. Utility reasoning is capped at
+  `low` where the model supports it. Tool-call arguments are truncated in the
+  summary source like tool results; the retained tail is the smaller of 20k
+  tokens and a quarter of the hard input budget.
+- Unchanged post-turn sources are not summarized again; cancellation releases
+  them for retry. Preview failures disable previews without affecting turns.
+
+Tool data:
+
+- Stream tails use ring buffers, and persistence snapshots are hashed outside
+  the ToolData lock. Diff planning is deterministic.
+
+Tests are reorganized around shared fixtures (`ScriptedModel`, `AgentFixture`,
+`RpcFixture`) with one `it` integration target plus `rpc_soak`.
+
 ## 0.6.2 — 2026-10-04
 
 - Project selected history into one bounded, tool-free Pi-style summary request
