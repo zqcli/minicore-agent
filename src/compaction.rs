@@ -44,19 +44,14 @@ pub(crate) struct CompactionPolicy {
 impl CompactionPolicy {
     pub(crate) fn history_triggered(
         self,
-        base: &[HistoryItem],
-        appended: &[HistoryItem],
+        items: usize,
+        bytes: usize,
         limits: &minicore_runtime::LoopLimits,
     ) -> bool {
         let reached = |value: usize, limit: usize| {
             value as u128 * 100 >= limit as u128 * u128::from(self.trigger_percent)
         };
-        reached(base.len() + appended.len(), limits.max_history_items)
-            || reached(
-                crate::sessions::estimate_history_bytes(base)
-                    .saturating_add(crate::sessions::estimate_history_bytes(appended)),
-                limits.max_history_bytes,
-            )
+        reached(items, limits.max_history_items) || reached(bytes, limits.max_history_bytes)
     }
 
     pub(crate) const fn budget(self, context_window: u64) -> InputBudget {

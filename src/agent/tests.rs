@@ -3742,6 +3742,8 @@ async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() 
         wait_text(&agent, next).await.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     ));
+    wait_post_turn_noop(&agent, session_id, next.loop_id).await;
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
     agent.close_session(session_id).await.unwrap();
 }
 

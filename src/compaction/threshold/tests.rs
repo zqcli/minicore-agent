@@ -714,3 +714,73 @@ async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
         }
     }
 }
+
+#[tokio::test]
+async fn admission_pressure_returns_only_when_effective_history_grows() {
+    for by_bytes in [false, true] {
+        for emergency in [false, true] {
+            let model = Stub::new(1_000_000, "historical summary", None);
+            let mut auto = context(&model);
+            auto.binding.policy.trigger_percent = 50;
+            let old = LoopId::new().unwrap();
+            let current = LoopId::new().unwrap();
+            let base = (0..10)
+                .flat_map(|index| exchange(old, index, 2_000))
+                .collect::<Vec<_>>();
+            let base_bytes = crate::sessions::estimate_history_bytes(&base);
+            if by_bytes {
+                auto.binding.limits.max_history_bytes = 2 * base_bytes;
+            } else {
+                auto.binding.limits.max_history_items = 2 * base.len();
+            }
+            let system = BoundedText::new("system").unwrap();
+            let cancel = CancellationToken::new();
+            let mut appended = vec![user(current, "current input", false)];
+            let initial_calls = if emergency {
+                let items = base.iter().collect::<Vec<_>>();
+                let groups = super::super::auto::compressible_ranges(base.len(), &items, current)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(key, _)| (key, BoundedText::new("group summary").unwrap()))
+                    .collect();
+                assert!(auto.state.install_emergency_groups(current, groups));
+                0
+            } else {
+                let result = consolidate(
+                    input(&auto, &system, None, &base, &appended, current, 0, &cancel),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert!(result.compacted);
+                1
+            };
+            // Consolidation removes the old groups; emergency summaries each retain one item.
+            let growth_rounds = if emergency { 5 } else { 10 };
+            for round in 1..=growth_rounds {
+                let returns = round == growth_rounds;
+                appended.extend(exchange(
+                    current,
+                    round - 1,
+                    if returns && by_bytes { base_bytes } else { 100 },
+                ));
+                let result = consolidate(
+                    input(
+                        &auto, &system, None, &base, &appended, current, round, &cancel,
+                    ),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.compacted, returns,
+                    "bytes={by_bytes}, emergency={emergency}, round={round}"
+                );
+                assert_eq!(
+                    model.calls.load(Ordering::SeqCst),
+                    initial_calls + usize::from(returns)
+                );
+            }
+        }
+    }
+}

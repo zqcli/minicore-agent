@@ -308,8 +308,8 @@ impl Session {
             automatic_budget: Some(Arc::clone(&auto.budget)),
             trigger_tokens: Some(budget.trigger_tokens),
             history_triggered: auto.policy.history_triggered(
-                &inner.history[previous_covered_item_count..],
-                &[],
+                inner.history.len() - previous_covered_item_count,
+                estimate_history_bytes(&inner.history[previous_covered_item_count..]),
                 &auto.limits,
             ),
             deadline: Instant::now()

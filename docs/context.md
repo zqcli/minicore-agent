@@ -31,9 +31,14 @@ minus the configured output and safety allowances. This deliberately differs
 from Pi 1.0.1's strict `>` physical-window-minus-16384 condition and its recent-token
 cutoff. The same configured trigger percentage also applies to Runtime's
 `max_history_items` and `max_history_bytes` admission limits: reaching either
-settled-history threshold starts a reduction attempt even with a large model
-window. First-request checks exclude newly accepted User/Steer items; later
-checks include the accumulated history. These are proactive attempts, not a
+effective-history threshold starts a reduction attempt even with a large model
+window. Covered source ranges no longer count: emergency groups count as their
+replacement summary messages, while durable/consolidated summaries remain in
+the fixed prompt outside Runtime history admission. Post-turn checks likewise
+measure only the suffix not covered by the durable snapshot. First-request
+checks exclude newly accepted User/Steer items; later checks include accumulated
+uncovered history, so admission pressure can fall after a reduction and return
+as new exchanges grow. These are proactive attempts, not a
 startup bypass: history already over Runtime's admission limits is still rejected.
 Target percent remains advisory.
 

@@ -365,15 +365,15 @@ pub(crate) async fn consolidate(
             &*auto.budget,
         )
     };
-    let history_triggered = auto.policy.history_triggered(
-        input.base,
-        if input.request_index == 0 {
-            &[]
-        } else {
-            input.appended
-        },
-        &auto.limits,
-    );
+    let history_end = if input.request_index == 0 {
+        input.base.len()
+    } else {
+        projection.items.len()
+    };
+    let (history_items, history_bytes) = projection.history_size(history_end);
+    let history_triggered =
+        auto.policy
+            .history_triggered(history_items, history_bytes, &auto.limits);
     if !recovery && trigger_before < budget.trigger_tokens && !history_triggered {
         return Ok(ProjectionResult::unchanged(before_request));
     }
