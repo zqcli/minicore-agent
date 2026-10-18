@@ -1,6 +1,7 @@
 //! Provider-owned, durable Responses output. Never serialize this as prose.
 use super::*;
 use minicore_runtime::model::ProviderReplay;
+use sha2::{Digest, Sha256};
 
 const FORMAT: &str = "openai-responses-v1";
 
@@ -18,27 +19,15 @@ pub(super) fn capture(
     output: Vec<Value>,
 ) -> Result<Option<ProviderReplay>, ()> {
     validate_output(&output)?;
-    let mut ids = output
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
     let mut reusable = Vec::with_capacity(output.len());
-    for (index, item) in output.into_iter().enumerate() {
+    for item in output {
         if item.get("id").is_some() || item_type(&item) == Some("function_call") {
             reusable.push(item);
         } else if item_type(&item) == Some("message") {
             // Missing identity disables raw replay, not canonical message text.
             let text = visible_text(std::slice::from_ref(&item))?;
-            let mut index = index;
-            let id = loop {
-                let id = format!("msg_minicore_{index}");
-                if ids.insert(id.clone()) {
-                    break id;
-                }
-                index += 1;
-            };
-            reusable.push(serde_json::to_value(InputMessage::assistant(id, text)).map_err(|_| ())?);
+            reusable
+                .push(serde_json::to_value(InputMessage::assistant(None, text)).map_err(|_| ())?);
         }
         // Anonymous reasoning cannot be replayed, especially its ciphertext.
     }
@@ -79,7 +68,7 @@ fn payload(replay: &ProviderReplay) -> Result<Option<Payload>, ()> {
     if payload
         .output
         .iter()
-        .any(|item| item_type(item) != Some("function_call") && item.get("id").is_none())
+        .any(|item| item_type(item) == Some("reasoning") && item.get("id").is_none())
     {
         return Err(());
     }
@@ -188,7 +177,7 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
     Ok(())
 }
 
-fn validate_output(output: &[Value]) -> Result<(), ()> {
+pub(super) fn validate_output(output: &[Value]) -> Result<(), ()> {
     if output.is_empty() || output.len() > MAX_REPLAY_ITEMS_PER_RESPONSE {
         return Err(());
     }
@@ -238,10 +227,10 @@ fn has_content(output: &[Value]) -> bool {
     })
 }
 
-pub(super) fn visible_text(output: &[Value]) -> Result<String, ()> {
+pub(super) fn visible_text<'a>(output: impl IntoIterator<Item = &'a Value>) -> Result<String, ()> {
     let mut text = String::new();
     for item in output
-        .iter()
+        .into_iter()
         .filter(|item| item_type(item) == Some("message"))
     {
         for part in item.get("content").and_then(Value::as_array).ok_or(())? {
@@ -290,25 +279,48 @@ fn validate_parts(output: &[Value], parts: &[AssistantPart]) -> Result<(), ()> {
     Ok(())
 }
 
-/// The terminal event may supply late ciphertext, but cannot rewrite anything
-/// already observed. No other late changes are accepted.
-pub(super) fn terminal_matches(done: &Value, terminal: &Value) -> bool {
-    if done == terminal {
-        return true;
+/// Bounded reconciliation evidence survives discarding oversized raw replay.
+pub(super) struct ItemEvidence {
+    exact: [u8; 32],
+    before_encryption: Option<[u8; 32]>,
+    pub(super) text: String,
+}
+
+impl ItemEvidence {
+    pub(super) fn new(item: &Value) -> Result<Self, ()> {
+        Ok(Self {
+            exact: fingerprint(item, false),
+            before_encryption: (item_type(item) == Some("reasoning")
+                && item.get("encrypted_content").is_none_or(Value::is_null))
+            .then(|| fingerprint(item, true)),
+            text: visible_text(std::iter::once(item))?,
+        })
     }
-    if item_type(done) != Some("reasoning")
-        || item_type(terminal) != Some("reasoning")
-        || !done.get("encrypted_content").is_none_or(Value::is_null)
-        || !terminal
-            .get("encrypted_content")
-            .is_some_and(Value::is_string)
-    {
-        return false;
+
+    pub(super) fn matches(&self, terminal: &Value) -> bool {
+        self.exact == fingerprint(terminal, false)
+            || self.before_encryption.is_some_and(|before| {
+                terminal
+                    .get("encrypted_content")
+                    .is_some_and(Value::is_string)
+                    && before == fingerprint(terminal, true)
+            })
     }
-    let mut enriched = done.clone();
-    enriched.as_object_mut().expect("reasoning object").insert(
-        "encrypted_content".to_owned(),
-        terminal["encrypted_content"].clone(),
-    );
-    enriched == *terminal
+}
+
+fn fingerprint(item: &Value, omit_encrypted: bool) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    if omit_encrypted {
+        let fields = item
+            .as_object()
+            .expect("validated item")
+            .iter()
+            .filter(|(key, _)| key.as_str() != "encrypted_content")
+            .collect::<BTreeMap<_, _>>();
+        serde_json::to_writer(&mut digest, &fields)
+    } else {
+        serde_json::to_writer(&mut digest, item)
+    }
+    .expect("JSON value serialization");
+    digest.finalize().into()
 }

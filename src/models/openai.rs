@@ -23,11 +23,12 @@ use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES};
 use minicore_runtime::{LoopId, ToolCallId};
 
-use super::ModelConfigError;
+use super::{ModelConfigError, ProviderBudget};
 
 const USER_AGENT: &str = concat!("minicore-agent/", env!("CARGO_PKG_VERSION"));
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_DRAIN_BYTES: usize = 64 * 1024;
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_SSE_FRAMES: usize = 4_096;
@@ -115,38 +116,7 @@ impl OpenAiResponsesModel {
             request,
             Some(self.endpoint.as_str()),
         )?;
-        let encoded =
-            serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
-        // Ordinary requests are not rejected by a heuristic token estimate.
-        // Utility callers select the explicit provider-budget checked handle.
-        Ok(encoded)
-    }
-
-    pub(super) fn estimate_budget_bytes(
-        &self,
-        request: &ModelRequest,
-        _loop_id: Option<LoopId>,
-        _request_index: Option<u32>,
-    ) -> Result<usize, ModelError> {
-        let body = ResponsesRequest::from_runtime(
-            &self.provider_model,
-            self.output_budget_tokens,
-            request,
-            Some(self.endpoint.as_str()),
-        )?;
-        serde_json::to_vec(&body)
-            .map(|bytes| bytes.len())
-            .map_err(|_| local_error(ModelErrorKind::InvalidRequest))
-    }
-
-    pub(super) fn estimate_budget_tokens(
-        &self,
-        request: &ModelRequest,
-        loop_id: Option<LoopId>,
-        request_index: Option<u32>,
-    ) -> Result<u64, ModelError> {
-        let bytes = self.estimate_budget_bytes(request, loop_id, request_index)?;
-        Ok(bytes.div_ceil(4) as u64)
+        serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))
     }
 
     async fn start_request(
@@ -310,23 +280,33 @@ impl Model for OpenAiResponsesModel {
     }
 }
 
-impl super::ProviderBudget for OpenAiResponsesModel {
+impl ProviderBudget for OpenAiResponsesModel {
     fn estimate_request_tokens(
         &self,
         request: &ModelRequest,
         loop_id: Option<LoopId>,
         request_index: Option<u32>,
     ) -> Result<u64, ModelError> {
-        self.estimate_budget_tokens(request, loop_id, request_index)
+        Ok(self
+            .estimate_request_bytes(request, loop_id, request_index)?
+            .div_ceil(4) as u64)
     }
 
     fn estimate_request_bytes(
         &self,
         request: &ModelRequest,
-        loop_id: Option<LoopId>,
-        request_index: Option<u32>,
+        _loop_id: Option<LoopId>,
+        _request_index: Option<u32>,
     ) -> Result<usize, ModelError> {
-        self.estimate_budget_bytes(request, loop_id, request_index)
+        let body = ResponsesRequest::from_runtime(
+            &self.provider_model,
+            self.output_budget_tokens,
+            request,
+            Some(self.endpoint.as_str()),
+        )?;
+        serde_json::to_vec(&body)
+            .map(|bytes| bytes.len())
+            .map_err(|_| local_error(ModelErrorKind::InvalidRequest))
     }
 }
 
@@ -371,28 +351,23 @@ impl<'a> ResponsesRequest<'a> {
         let mut input = Vec::new();
         for (message_index, message) in request.messages().iter().enumerate() {
             match message {
-                ModelMessage::System(text) => input.push(InputItem::Message(InputMessage {
-                    item_type: "message",
-                    role: "developer",
-                    content: vec![InputContent {
-                        content_type: "input_text",
-                        text: text.clone(),
-                        annotations: None,
-                    }],
-                    status: None,
-                    id: None,
-                })),
-                ModelMessage::User(text) => input.push(InputItem::Message(InputMessage {
-                    item_type: "message",
-                    role: "user",
-                    content: vec![InputContent {
-                        content_type: "input_text",
-                        text: text.clone(),
-                        annotations: None,
-                    }],
-                    status: None,
-                    id: None,
-                })),
+                ModelMessage::System(text) | ModelMessage::User(text) => {
+                    input.push(InputItem::Message(InputMessage {
+                        item_type: "message",
+                        role: if matches!(message, ModelMessage::System(_)) {
+                            "developer"
+                        } else {
+                            "user"
+                        },
+                        content: vec![InputContent {
+                            content_type: "input_text",
+                            text: text.clone(),
+                            annotations: None,
+                        }],
+                        status: None,
+                        id: None,
+                    }))
+                }
                 ModelMessage::Assistant(parts)
                 | ModelMessage::AssistantWithReplay { parts, .. } => {
                     if let ModelMessage::AssistantWithReplay {
@@ -417,7 +392,7 @@ impl<'a> ResponsesRequest<'a> {
                         match part {
                             AssistantPart::Text(text) => {
                                 input.push(InputItem::Message(InputMessage::assistant(
-                                    format!("msg_minicore_{message_index}_{part_index}"),
+                                    Some(format!("msg_minicore_{message_index}_{part_index}")),
                                     text.clone(),
                                 )));
                             }
@@ -452,37 +427,20 @@ impl<'a> ResponsesRequest<'a> {
                 parameters: tool.input_schema().clone(),
             })
             .collect();
-        let reasoning = match request.reasoning() {
+        let effort = match request.reasoning() {
             ReasoningPreference::Auto => None,
-            ReasoningPreference::Disabled => Some(ReasoningWire {
-                effort: "none",
-                summary: None,
-            }),
-            ReasoningPreference::Low => Some(ReasoningWire {
-                effort: "low",
-                summary: Some("auto"),
-            }),
-            ReasoningPreference::Medium => Some(ReasoningWire {
-                effort: "medium",
-                summary: Some("auto"),
-            }),
-            ReasoningPreference::High => Some(ReasoningWire {
-                effort: "high",
-                summary: Some("auto"),
-            }),
-            ReasoningPreference::XHigh => Some(ReasoningWire {
-                effort: "xhigh",
-                summary: Some("auto"),
-            }),
-            ReasoningPreference::Max => Some(ReasoningWire {
-                effort: "max",
-                summary: Some("auto"),
-            }),
-            ReasoningPreference::Ultra => Some(ReasoningWire {
-                effort: "ultra",
-                summary: Some("auto"),
-            }),
+            ReasoningPreference::Disabled => Some("none"),
+            ReasoningPreference::Low => Some("low"),
+            ReasoningPreference::Medium => Some("medium"),
+            ReasoningPreference::High => Some("high"),
+            ReasoningPreference::XHigh => Some("xhigh"),
+            ReasoningPreference::Max => Some("max"),
+            ReasoningPreference::Ultra => Some("ultra"),
         };
+        let reasoning = effort.map(|effort| ReasoningWire {
+            effort,
+            summary: (effort != "none").then_some("auto"),
+        });
         Ok(Self {
             model,
             input,
@@ -528,7 +486,7 @@ struct InputMessage {
 }
 
 impl InputMessage {
-    fn assistant(id: String, text: String) -> Self {
+    fn assistant(id: Option<String>, text: String) -> Self {
         Self {
             item_type: "message",
             role: "assistant",
@@ -538,7 +496,7 @@ impl InputMessage {
                 annotations: Some(Vec::new()),
             }],
             status: Some("completed"),
-            id: Some(id),
+            id,
         }
     }
 }
@@ -618,15 +576,13 @@ struct ReasoningWire {
 
 #[derive(Deserialize)]
 struct ErrorEnvelope {
-    #[serde(default)]
     error: Option<ProviderErrorCode>,
 }
 
 #[derive(Deserialize)]
 struct ProviderErrorCode {
-    #[serde(default)]
     code: Option<String>,
-    #[serde(default, rename = "type")]
+    #[serde(rename = "type")]
     error_type: Option<String>,
 }
 
@@ -641,17 +597,19 @@ async fn classify_http_error(
     let retry_target = retry_target(response.headers(), received_monotonic, received_system);
     let body = match collect_error_body(response, cancellation, deadline).await {
         Ok(body) => body,
+        Err(error)
+            if matches!(status.as_u16(), 503 | 529)
+                && error.kind() == ModelErrorKind::RequestOutcomeUnknown =>
+        {
+            Vec::new()
+        }
         Err(error) => return error,
     };
-    let envelope = serde_json::from_slice::<ErrorEnvelope>(&body).ok();
-    let code = envelope
-        .as_ref()
-        .and_then(|envelope| envelope.error.as_ref())
-        .and_then(|error| error.code.as_deref());
-    let error_type = envelope
-        .as_ref()
-        .and_then(|envelope| envelope.error.as_ref())
-        .and_then(|error| error.error_type.as_deref());
+    let error = serde_json::from_slice::<ErrorEnvelope>(&body)
+        .ok()
+        .and_then(|envelope| envelope.error);
+    let code = error.as_ref().and_then(|error| error.code.as_deref());
+    let error_type = error.as_ref().and_then(|error| error.error_type.as_deref());
     let context_overflow = [code, error_type].into_iter().flatten().any(|value| {
         matches!(
             value,
@@ -869,11 +827,10 @@ struct StreamState {
     tools: BTreeMap<u32, ToolState>,
     tool_ids: BTreeSet<ToolCallId>,
     tool_order: Vec<u32>,
-    output_item_indexes: BTreeSet<u32>,
+    output_evidence: BTreeMap<u32, replay::ItemEvidence>,
+    output_ids: BTreeSet<String>,
     output_items: Option<BTreeMap<u32, Value>>,
     output_item_bytes: usize,
-    replay_too_large: bool,
-    output_text: BTreeMap<u32, String>,
     replay_identity: Option<(String, String)>,
     text: String,
     trace: Option<RequestTraceContext>,
@@ -903,7 +860,6 @@ impl StreamState {
         replay_identity: Option<(String, String)>,
         trace: Option<RequestTraceContext>,
     ) -> Self {
-        let output_items = Some(BTreeMap::new());
         Self {
             bytes,
             cancellation,
@@ -913,11 +869,10 @@ impl StreamState {
             tools: BTreeMap::new(),
             tool_ids: BTreeSet::new(),
             tool_order: Vec::new(),
-            output_item_indexes: BTreeSet::new(),
-            output_items,
+            output_evidence: BTreeMap::new(),
+            output_ids: BTreeSet::new(),
+            output_items: Some(BTreeMap::new()),
             output_item_bytes: 0,
-            replay_too_large: false,
-            output_text: BTreeMap::new(),
             replay_identity,
             text: String::new(),
             trace,
@@ -962,40 +917,29 @@ impl StreamState {
         let Some(terminal_output) = terminal_output else {
             return Ok(());
         };
-        if terminal_output.len() > MAX_REPLAY_ITEMS_PER_RESPONSE
-            || terminal_output
-                .iter()
-                .any(|item| replay::validate_item(item).is_err())
-        {
-            return Err(());
+        if !terminal_output.is_empty() {
+            replay::validate_output(&terminal_output)?;
         }
-        let output_item_bytes = serialized_output_item_bytes(terminal_output.iter())?;
-        self.replay_too_large |= output_item_bytes > MAX_REPLAY_BYTES;
-        for (output_index, done_item) in self.output_items.iter().flatten() {
+        for (output_index, evidence) in &self.output_evidence {
             let output_index = usize::try_from(*output_index).map_err(|_| ())?;
             if !terminal_output
                 .get(output_index)
-                .is_some_and(|terminal| replay::terminal_matches(done_item, terminal))
+                .is_some_and(|terminal| evidence.matches(terminal))
             {
                 return Err(());
             }
         }
-        let output_items = terminal_output
-            .into_iter()
-            .enumerate()
-            .map(|(output_index, item)| {
-                u32::try_from(output_index)
-                    .map(|output_index| (output_index, item))
-                    .map_err(|_| ())
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        self.output_item_indexes = output_items.keys().copied().collect();
-        self.output_items = Some(output_items);
-        self.output_item_bytes = output_item_bytes;
+        self.output_items = Some(
+            terminal_output
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| (index as u32, item))
+                .collect(),
+        );
         Ok(())
     }
 
-    fn replay_event(&self) -> Result<Option<ModelEvent>, ()> {
+    fn replay_event(&mut self) -> Result<Option<ModelEvent>, ()> {
         let Some((endpoint, model)) = &self.replay_identity else {
             return Ok(None);
         };
@@ -1033,10 +977,10 @@ impl StreamState {
                 continue;
             }
             let tool = self.tools.get(index).ok_or(())?;
-            let item: FunctionCallItem = from_value(item.clone())?;
-            if item.call_id != tool.tool_call_id.as_str()
-                || item.name != tool.name.as_str()
-                || serde_json::from_str::<Value>(&item.arguments).map_err(|_| ())?
+            if item["call_id"] != tool.tool_call_id.as_str()
+                || item["name"] != tool.name.as_str()
+                || serde_json::from_str::<Value>(item["arguments"].as_str().ok_or(())?)
+                    .map_err(|_| ())?
                     != serde_json::from_str::<Value>(&tool.arguments).map_err(|_| ())?
             {
                 return Err(());
@@ -1047,13 +991,15 @@ impl StreamState {
                 return Err(());
             }
         }
-        let output = output.values().cloned().collect::<Vec<_>>();
-        if replay::visible_text(&output)? != self.text {
+        if replay::visible_text(output.values())? != self.text {
             return Err(());
         }
-        if self.replay_too_large {
-            return self.without_replay();
-        }
+        let output = self
+            .output_items
+            .take()
+            .expect("checked output")
+            .into_values()
+            .collect();
         match replay::capture(endpoint, model, output)? {
             Some(replay) => Ok(Some(ModelEvent::ProviderReplay { replay })),
             None => self.without_replay(),
@@ -1110,6 +1056,7 @@ async fn next_stream_event(
                 }
                 if state.terminal_seen {
                     drain_body(&mut state).await;
+                    state.bytes = Box::pin(stream::empty());
                 }
             }
             Some(Err(error)) => {
@@ -1138,12 +1085,16 @@ async fn next_stream_event(
 
 // A terminal result is authoritative; draining is only a pooling optimization.
 async fn drain_body(state: &mut StreamState) {
+    let deadline = TokioInstant::now() + DRAIN_TIMEOUT;
+    if deadline + DRAIN_TIMEOUT >= state.deadline {
+        return;
+    }
     let mut remaining = MAX_DRAIN_BYTES;
     loop {
         let chunk = tokio::select! {
             biased;
             _ = state.cancellation.cancelled() => break,
-            _ = tokio::time::sleep_until(state.deadline) => break,
+            _ = tokio::time::sleep_until(deadline) => break,
             chunk = state.bytes.next() => chunk,
         };
         match chunk {
@@ -1196,10 +1147,7 @@ impl SseParser {
                 if self.frame_data.last() == Some(&b'\n') {
                     self.frame_data.pop();
                 }
-                let queued = self
-                    .queued_frame_bytes
-                    .checked_add(self.frame_data.len())
-                    .ok_or(())?;
+                let queued = self.queued_frame_bytes + self.frame_data.len();
                 if queued > MAX_SSE_FRAME_BYTES || self.frames.len() >= MAX_QUEUED_SSE_FRAMES {
                     return Err(());
                 }
@@ -1215,11 +1163,7 @@ impl SseParser {
         }
         if let Some(data) = line.strip_prefix(b"data:") {
             let data = data.strip_prefix(b" ").unwrap_or(data);
-            let new_len = self
-                .frame_data
-                .len()
-                .checked_add(data.len() + 1)
-                .ok_or(())?;
+            let new_len = self.frame_data.len() + data.len() + 1;
             if new_len > MAX_SSE_FRAME_BYTES {
                 return Err(());
             }
@@ -1287,7 +1231,7 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         }
         "response.function_call_arguments.done" => {
             let event: ArgumentsDoneEvent = from_value(value)?;
-            finish_tool_arguments(state, event.output_index, &event.arguments, true)?;
+            finish_tool_arguments(state, event.output_index, &event.arguments)?;
         }
         "response.output_item.done" => {
             let event: OutputItemEvent = from_value(value)?;
@@ -1362,12 +1306,9 @@ struct ReasoningPartKey {
 #[derive(Deserialize)]
 struct ReasoningSummaryDeltaEvent {
     delta: String,
-    #[serde(default)]
-    output_index: Option<serde_json::Value>,
-    #[serde(default)]
+    output_index: Option<Value>,
     item_id: Option<String>,
-    #[serde(default)]
-    summary_index: Option<serde_json::Value>,
+    summary_index: Option<Value>,
 }
 
 impl ReasoningParts {
@@ -1461,16 +1402,19 @@ fn value_to_u32(value: &Value) -> Option<u32> {
 
 fn capture_output_item(state: &mut StreamState, output_index: u32, item: &Value) -> Result<(), ()> {
     replay::validate_item(item)?;
-    if state.output_item_indexes.len() >= MAX_REPLAY_ITEMS_PER_RESPONSE
-        || !state.output_item_indexes.insert(output_index)
+    if state.output_evidence.len() >= MAX_REPLAY_ITEMS_PER_RESPONSE
+        || state
+            .output_evidence
+            .insert(output_index, replay::ItemEvidence::new(item)?)
+            .is_some()
+        || item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !state.output_ids.insert(id.to_owned()))
     {
         return Err(());
     }
     if item_type(item) == Some("message") {
-        state.output_text.insert(
-            output_index,
-            replay::visible_text(std::slice::from_ref(item))?,
-        );
         state.refusal_seen |= item["content"]
             .as_array()
             .ok_or(())?
@@ -1478,31 +1422,14 @@ fn capture_output_item(state: &mut StreamState, output_index: u32, item: &Value)
             .any(|part| item_type(part) == Some("refusal"));
     }
     if let Some(output_items) = state.output_items.as_mut() {
-        state.output_item_bytes += serialized_output_item_len(item)?;
+        state.output_item_bytes += crate::budget::encoded_len(item);
         if state.output_item_bytes > MAX_REPLAY_BYTES {
-            state.replay_too_large = true;
             state.output_items = None;
         } else {
             output_items.insert(output_index, item.clone());
         }
     }
     Ok(())
-}
-
-fn serialized_output_item_len(item: &Value) -> Result<usize, ()> {
-    serde_json::to_vec(item)
-        .map(|encoded| encoded.len())
-        .map_err(|_| ())
-}
-
-fn serialized_output_item_bytes<'a>(
-    items: impl IntoIterator<Item = &'a Value>,
-) -> Result<usize, ()> {
-    items.into_iter().try_fold(0_usize, |total, item| {
-        total
-            .checked_add(serialized_output_item_len(item)?)
-            .ok_or(())
-    })
 }
 
 fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, ()> {
@@ -1547,13 +1474,9 @@ struct TerminalEvent {
 
 #[derive(Deserialize)]
 struct ProviderResponse {
-    #[serde(default)]
     status: Option<String>,
-    #[serde(default)]
     usage: Option<ProviderUsage>,
-    #[serde(default)]
     incomplete_details: Option<IncompleteDetails>,
-    #[serde(default)]
     output: Option<Vec<Value>>,
 }
 
@@ -1569,7 +1492,6 @@ struct ProviderUsage {
 #[derive(Deserialize)]
 struct InputTokenDetails {
     cached_tokens: Option<u64>,
-    #[serde(default)]
     cache_write_tokens: Option<u64>,
 }
 
@@ -1580,7 +1502,6 @@ struct OutputTokenDetails {
 
 #[derive(Deserialize)]
 struct IncompleteDetails {
-    #[serde(default)]
     reason: Option<String>,
 }
 
@@ -1684,11 +1605,8 @@ fn reconcile_arguments(
     output_index: u32,
     complete: &str,
 ) -> Result<(), ()> {
-    let current = state.tools.get(&output_index).ok_or(())?.arguments.clone();
-    if complete == current {
-        return Ok(());
-    }
-    let remainder = complete.strip_prefix(&current).ok_or(())?;
+    let current = &state.tools.get(&output_index).ok_or(())?.arguments;
+    let remainder = complete.strip_prefix(current).ok_or(())?;
     append_tool_arguments(state, output_index, remainder)
 }
 
@@ -1696,7 +1614,6 @@ fn finish_tool_arguments(
     state: &mut StreamState,
     output_index: u32,
     arguments: &str,
-    arguments_done: bool,
 ) -> Result<(), ()> {
     if state
         .tools
@@ -1707,9 +1624,7 @@ fn finish_tool_arguments(
     }
     reconcile_arguments(state, output_index, arguments)?;
     let tool = state.tools.get_mut(&output_index).ok_or(())?;
-    if arguments_done {
-        tool.arguments_done = true;
-    }
+    tool.arguments_done = true;
     end_tool_once(state, output_index)
 }
 
@@ -1718,17 +1633,16 @@ fn finish_tool_item(
     output_index: u32,
     item: FunctionCallItem,
 ) -> Result<(), ()> {
-    if !state.tools.contains_key(&output_index) {
-        start_tool(state, output_index, item)?;
-    } else {
-        let tool = state.tools.get(&output_index).ok_or(())?;
-        if tool.tool_call_id.to_string() != item.call_id || tool.name.as_str() != item.name {
+    if let Some(tool) = state.tools.get(&output_index) {
+        if tool.tool_call_id.as_str() != item.call_id || tool.name.as_str() != item.name {
             return Err(());
         }
         if tool.item_done {
             return Err(());
         }
         reconcile_arguments(state, output_index, &item.arguments)?;
+    } else {
+        start_tool(state, output_index, item)?;
     }
     state.tools.get_mut(&output_index).ok_or(())?.item_done = true;
     end_tool_once(state, output_index)
@@ -1796,9 +1710,13 @@ fn finish_response(
             .filter_map(|item| item.get("content").and_then(Value::as_array))
             .flatten()
             .any(|part| item_type(part) == Some("refusal"));
-        replay::visible_text(&output.values().cloned().collect::<Vec<_>>())?
+        replay::visible_text(output.values())?
     } else {
-        state.output_text.values().map(String::as_str).collect()
+        state
+            .output_evidence
+            .values()
+            .map(|item| item.text.as_str())
+            .collect()
     };
     if !text.is_empty() && text != state.text {
         let suffix = text.strip_prefix(&state.text).ok_or(())?.to_owned();
@@ -1882,15 +1800,15 @@ fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
 }
 
 fn local_error(kind: ModelErrorKind) -> ModelError {
-    error_with_delivery(kind, DeliveryState::NotStarted)
+    ModelError::permanent(kind, DeliveryState::NotStarted, diagnostic(kind, false))
 }
 
 fn unknown_error(kind: ModelErrorKind) -> ModelError {
-    error_with_delivery(kind, DeliveryState::Unknown)
+    ModelError::unknown(kind, diagnostic(kind, false))
 }
 
 fn started_error(kind: ModelErrorKind) -> ModelError {
-    error_with_delivery(kind, DeliveryState::Started)
+    ModelError::started(kind, diagnostic(kind, false))
 }
 
 fn retryable_error(kind: ModelErrorKind, retry_after: Option<Duration>) -> ModelError {
@@ -1902,15 +1820,6 @@ fn stream_error(kind: ModelErrorKind, provider_event_seen: bool) -> ModelError {
         started_error(kind)
     } else {
         unknown_error(kind)
-    }
-}
-
-fn error_with_delivery(kind: ModelErrorKind, delivery: DeliveryState) -> ModelError {
-    let diagnostic = diagnostic(kind, false);
-    match delivery {
-        DeliveryState::NotStarted => ModelError::permanent(kind, delivery, diagnostic),
-        DeliveryState::Started => ModelError::started(kind, diagnostic),
-        DeliveryState::Unknown => ModelError::unknown(kind, diagnostic),
     }
 }
 

@@ -34,7 +34,7 @@ provider cache-hit fix.
 
 A missing message/reasoning item ID disables raw replay for that item, not the
 response. Anonymous reasoning (including ciphertext) is omitted; anonymous messages
-use only canonical text with a locally generated message ID. Other identified items
+use only canonical text without an input message ID. Other identified items
 remain replayable. Malformed IDs that are present are still rejected. An anonymous
 opaque-only response fails because it has neither usable replay nor canonical content.
 
@@ -49,7 +49,9 @@ omits the entire replay attachment and keeps non-empty canonical text, reasoning
 and tool calls from the already-billed response. A replay-only response still fails
 if its attachment cannot fit. Provider shape, canonical text/tool consistency, and
 the 256-item limit remain enforced; overflow is not permission to accept malformed
-provider output.
+provider output. Compact SHA-256 reconciliation evidence and item IDs survive raw
+replay disposal, so terminal output cannot rewrite completed items or introduce
+duplicate IDs after overflow.
 
 Durable normalization retains validated replay. Public RPC, session/turn reads,
 export-like encoded items, Debug, and summary source prose remove it. Compaction

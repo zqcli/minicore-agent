@@ -68,11 +68,13 @@ a request was sent.
 The Responses client has a 10-second connect timeout. `request_timeout_seconds`,
 when set, bounds the whole HTTP request; the Runtime model deadline and cancellation
 also apply. After a terminal event the adapter drains up to 64 KiB of additional
-body data within the remaining deadline to allow connection reuse. Trailing data
+body data for at most 200 ms to allow connection reuse, only when more than 400 ms
+remain before the model deadline. Otherwise it closes the body immediately. Trailing data
 is not interpreted as model output, and drain errors do not replace a terminal result.
 HTTP 503 and 529 are retryable and honor `Retry-After` (or `retry-after-ms`), like
 non-quota 429 responses. HTTP 408, 500, 502, and 504 retain unknown-delivery semantics
-and are not automatically retried, since the upstream may have processed the request.
+and are not automatically retried, since the upstream may have processed the request. A truncated/reset error body does
+not change a known 503/529 classification; cancellation and deadlines still abort.
 
 Compatible gateways may omit `total_tokens` and input/output token details.
 Missing counters remain unknown, not zero; disjoint input/output partitions remain

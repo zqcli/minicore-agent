@@ -207,7 +207,7 @@ async fn terminal_drain_is_bounded_and_never_parses_trailing_events() {
 }
 
 #[tokio::test]
-async fn terminal_drain_stops_at_deadline_or_cancellation_without_losing_completion() {
+async fn terminal_drain_skips_near_deadline_or_cancelled_response() {
     for cancelled in [false, true] {
         let cancellation = CancellationToken::new();
         let token = cancellation.clone();
@@ -219,12 +219,19 @@ async fn terminal_drain_stops_at_deadline_or_cancellation_without_losing_complet
                 }
                 Ok(terminal)
             })
-            .chain(stream::pending()),
+            .chain(stream::poll_fn(|_| {
+                panic!("unnecessary terminal body poll")
+            })),
         );
         let state = StreamState::new(
             bytes,
             cancellation,
-            TokioInstant::now() + Duration::from_millis(20),
+            TokioInstant::now()
+                + if cancelled {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(20)
+                },
         );
         let (event, state) = tokio::time::timeout(Duration::from_secs(1), next_stream_event(state))
             .await
@@ -308,6 +315,110 @@ async fn terminal_drain_allows_two_requests_on_one_http_connection() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_completes_before_deadline_when_terminal_http_body_never_ends() {
+    let terminal = sse_body(&[
+        json!({"type":"response.output_text.delta", "delta":"finished"}),
+        completed(usage()),
+    ])
+    .into_bytes();
+    let (response, gate) = MockResponse::sse_bytes(Vec::new())
+        .with_chunks([terminal, vec![b' ']])
+        .with_chunk_gate();
+    gate.release(); // Deliver the terminal event, but leave the HTTP body open.
+    let server = MockServer::spawn([response]).await;
+    let temp = TempDir::new("terminal-driver");
+    let models = Models::from_values(BTreeMap::from([(
+        "main".into(),
+        Arc::new(model(server.base_url())) as Arc<dyn Model>,
+    )]));
+    let config = AgentConfig {
+        data_dir: temp.path().join("data"),
+        event_capacity: 256,
+        default_profile: "test".into(),
+        profiles: BTreeMap::from([(
+            "test".into(),
+            Profile {
+                model: "main".into(),
+                reasoning: ReasoningPreference::Auto,
+                system_prompt: "Answer briefly.".into(),
+                tools: vec![],
+                max_tool_rounds: 0,
+                approval: ApprovalMode::Auto,
+            },
+        )]),
+        models: BTreeMap::from([("main".into(), agent_model_config(server.base_url()))]),
+        loop_options: LoopOverrides {
+            model_timeout_seconds: Some(1),
+            ..LoopOverrides::default()
+        },
+        compaction: CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        },
+    };
+    let mut agent = Agent::open_with_models(config, models).await.unwrap();
+    let session = agent
+        .create_session(CreateSession {
+            workspace: temp.path().to_owned(),
+            profile: String::new(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let turn = agent
+        .send(SendMessage {
+            session_id: session.session_id,
+            text: "answer".into(),
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_millis(800), agent.wait_turn(turn)).await;
+    gate.release(); // Release the mock even when the assertion below fails.
+    let result = result
+        .expect("terminal response waited for the HTTP body")
+        .unwrap();
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+    agent.shutdown().await.unwrap();
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn retryable_status_survives_a_truncated_error_body() {
+    for status in [503, 529] {
+        let server = MockServer::spawn([MockResponse::json(status, b"{\"error\":".to_vec())
+            .with_declared_length(1024)
+            .with_header("Retry-After", "7")])
+        .await;
+        let error = start_error(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await;
+        assert_error(
+            &error,
+            ModelErrorKind::ProviderUnavailable,
+            DeliveryState::NotStarted,
+            true,
+        );
+        assert!(
+            matches!(error.retry_hint(), RetryHint::Retryable { retry_after: Some(delay) }
+            if *delay > Duration::from_secs(6) && *delay <= Duration::from_secs(7))
+        );
+        server.finish().await;
+    }
 }
 
 #[test]

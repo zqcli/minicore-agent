@@ -212,7 +212,7 @@ fn durable_tool_projection_preserves_raw_order_arguments_and_one_result() {
         (Some(LoopId::new().unwrap()), Some(9)),
     ] {
         assert_eq!(
-            model.estimate_budget_bytes(&req, loop_id, index).unwrap(),
+            model.estimate_request_bytes(&req, loop_id, index).unwrap(),
             bytes.len()
         );
     }
@@ -406,7 +406,9 @@ fn replay_envelope_overflow_and_structural_limits_keep_nonempty_canonical_output
     let mut oversized = reasoning();
     oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES - 250));
     let output = vec![oversized, message("answer")];
-    assert!(serialized_output_item_bytes(&output).unwrap() < ProviderReplay::MAX_BYTES);
+    assert!(
+        output.iter().map(crate::budget::encoded_len).sum::<usize>() < ProviderReplay::MAX_BYTES
+    );
     assert!(
         replay::capture(URL, MODEL, output.clone())
             .unwrap()
@@ -471,6 +473,83 @@ fn oversized_replay_does_not_bypass_terminal_text_tool_or_shape_validation() {
                 .iter()
                 .any(|event| matches!(event, Ok(ModelEvent::Finish { .. })))
         );
+    }
+}
+
+#[test]
+fn overflow_preserves_done_only_reconciliation_and_duplicate_id_checks() {
+    for terminal in [false, true] {
+        let mut response = state();
+        let mut oversized = reasoning();
+        oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES));
+        done(&mut response, 0, oversized.clone()).unwrap();
+        done(&mut response, 1, message("original")).unwrap();
+        assert!(response.output_items.is_none());
+        if terminal {
+            assert!(finish(&mut response, vec![oversized, message("rewritten")]).is_err());
+        } else {
+            assert!(done(&mut response, 2, message("duplicate id")).is_err());
+        }
+        assert!(
+            !response
+                .pending
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::Finish { .. })))
+        );
+    }
+    let mut oversized = reasoning();
+    oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES));
+    let mut response = state();
+    done(&mut response, 0, oversized.clone()).unwrap();
+    assert!(
+        finish(
+            &mut response,
+            vec![oversized, message("first"), message("duplicate")]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn independently_captured_anonymous_responses_have_no_input_ids() {
+    let mut messages = vec![ModelMessage::user("first question").unwrap()];
+    for answer in ["first answer", "second answer"] {
+        let mut item = message(answer);
+        item.as_object_mut().unwrap().remove("id");
+        let replay = capture(URL, MODEL, vec![item]).unwrap();
+        let replay = serde_json::from_slice(&serde_json::to_vec(&replay).unwrap()).unwrap();
+        messages.push(
+            ModelMessage::assistant_with_provider_replay(
+                vec![AssistantPart::Text(answer.into())],
+                Some(replay),
+            )
+            .unwrap(),
+        );
+        messages.push(ModelMessage::user("next question").unwrap());
+    }
+    let request = ModelRequest::new(
+        messages,
+        vec![],
+        ModelLimits::default(),
+        ReasoningPreference::Auto,
+    )
+    .unwrap();
+    let body: Value = serde_json::from_slice(
+        &model("http://localhost/v1")
+            .build_request(&request)
+            .unwrap(),
+    )
+    .unwrap();
+    let assistants = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistants.len(), 2);
+    for (item, expected) in assistants.iter().zip(["first answer", "second answer"]) {
+        assert!(item.get("id").is_none());
+        assert_eq!(item["content"][0]["text"], expected);
     }
 }
 
@@ -642,7 +721,7 @@ fn generic_utility_budget_includes_replay_conservatively_without_fake_identity_s
     let bytes = actual.build_request(&req).unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains(SECRET));
     assert_eq!(
-        actual.estimate_budget_bytes(&req, None, None).unwrap(),
+        actual.estimate_request_bytes(&req, None, None).unwrap(),
         bytes.len()
     );
     assert!(generic.len() > bytes.len());
