@@ -12,7 +12,6 @@ use minicore_runtime::tools::{ApprovalRisk, ToolInputAnswerKind, ToolProgress, T
 use minicore_runtime::{InteractionId, LoopId, ToolCallId};
 
 use crate::agent::SessionInfo;
-use crate::history::{HistoryItemView, HistoryPage};
 use crate::ids::SessionId;
 use crate::sessions::{
     CompactionProgress, SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef,
@@ -28,18 +27,26 @@ pub struct EventMeta {
 }
 
 impl EventMeta {
-    pub(crate) fn for_loop(session_id: SessionId, loop_id: LoopId) -> Self {
+    pub(crate) fn session(session_id: SessionId) -> Self {
         Self {
             session_id,
-            loop_id: Some(loop_id),
+            loop_id: None,
             dropped_before: 0,
+        }
+    }
+
+    pub(crate) fn for_turn(turn: TurnRef) -> Self {
+        Self {
+            loop_id: Some(turn.loop_id),
+            ..Self::session(turn.session_id)
         }
     }
 }
 
 /// Best-effort live events. Events never participate in correctness; the
 /// authoritative results are `turn.wait` and `session.history`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     SessionOpened {
         session: SessionInfo,
@@ -50,6 +57,7 @@ pub enum AgentEvent {
         meta: EventMeta,
     },
     SessionState {
+        #[serde(serialize_with = "serialize_session_state")]
         state: SessionState,
         meta: EventMeta,
     },
@@ -179,6 +187,17 @@ pub enum AgentEvent {
     },
 }
 
+macro_rules! event_meta {
+    ($($variant:ident),+ $(,)?) => {
+        pub(crate) fn meta(&self) -> &EventMeta {
+            match self { $(Self::$variant { meta, .. })|+ => meta }
+        }
+        pub(crate) fn meta_mut(&mut self) -> &mut EventMeta {
+            match self { $(Self::$variant { meta, .. })|+ => meta }
+        }
+    };
+}
+
 impl AgentEvent {
     pub(crate) fn dropped_before(&self) -> u64 {
         self.meta().dropped_before
@@ -188,53 +207,27 @@ impl AgentEvent {
         self.meta_mut().dropped_before = dropped_before;
     }
 
-    pub(crate) fn meta(&self) -> &EventMeta {
-        match self {
-            Self::SessionOpened { meta, .. }
-            | Self::SessionClosed { meta, .. }
-            | Self::SessionState { meta, .. }
-            | Self::TurnStarted { meta, .. }
-            | Self::RequestStarted { meta, .. }
-            | Self::RequestUsage { meta, .. }
-            | Self::OutputDelta { meta, .. }
-            | Self::ToolStarted { meta, .. }
-            | Self::ToolInvocation { meta, .. }
-            | Self::ToolExecution { meta, .. }
-            | Self::ToolProcess { meta, .. }
-            | Self::ToolPresentation { meta, .. }
-            | Self::ToolArgumentsPreview { meta, .. }
-            | Self::ToolProgress { meta, .. }
-            | Self::ToolFinished { meta, .. }
-            | Self::InteractionRequested { meta, .. }
-            | Self::InteractionResolved { meta, .. }
-            | Self::SteerProgress { meta, .. }
-            | Self::TurnFinished { meta, .. } => meta,
-        }
-    }
-
-    pub(crate) fn meta_mut(&mut self) -> &mut EventMeta {
-        match self {
-            Self::SessionOpened { meta, .. }
-            | Self::SessionClosed { meta, .. }
-            | Self::SessionState { meta, .. }
-            | Self::TurnStarted { meta, .. }
-            | Self::RequestStarted { meta, .. }
-            | Self::RequestUsage { meta, .. }
-            | Self::OutputDelta { meta, .. }
-            | Self::ToolStarted { meta, .. }
-            | Self::ToolInvocation { meta, .. }
-            | Self::ToolExecution { meta, .. }
-            | Self::ToolProcess { meta, .. }
-            | Self::ToolPresentation { meta, .. }
-            | Self::ToolArgumentsPreview { meta, .. }
-            | Self::ToolProgress { meta, .. }
-            | Self::ToolFinished { meta, .. }
-            | Self::InteractionRequested { meta, .. }
-            | Self::InteractionResolved { meta, .. }
-            | Self::SteerProgress { meta, .. }
-            | Self::TurnFinished { meta, .. } => meta,
-        }
-    }
+    event_meta!(
+        SessionOpened,
+        SessionClosed,
+        SessionState,
+        TurnStarted,
+        RequestStarted,
+        RequestUsage,
+        OutputDelta,
+        ToolStarted,
+        ToolInvocation,
+        ToolExecution,
+        ToolProcess,
+        ToolPresentation,
+        ToolArgumentsPreview,
+        ToolProgress,
+        ToolFinished,
+        InteractionRequested,
+        InteractionResolved,
+        SteerProgress,
+        TurnFinished
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -370,7 +363,7 @@ impl fmt::Debug for ToolResultView {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LoopOutcomeView {
     Completed,
@@ -383,30 +376,13 @@ pub enum LoopOutcomeView {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelReasonView {
     User,
     OwnerDropped,
     Shutdown,
     Deadline,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionStatusView {
-    Idle,
-    Running,
-    WaitingForInput,
-    Finishing,
-    Blocked,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionBlockReasonView {
-    Persistence,
-    Internal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -433,9 +409,9 @@ pub struct LoopStateView {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SessionStateView {
     pub session_id: SessionId,
-    pub status: SessionStatusView,
+    pub status: SessionStatus,
     pub active_loop: Option<LoopStateView>,
-    pub block_reason: Option<SessionBlockReasonView>,
+    pub block_reason: Option<SessionBlockReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionProgress>,
 }
@@ -484,13 +460,13 @@ impl LocalContextBudgetFailure {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct ModelErrorView {
     pub kind: String,
     pub delivery: String,
     pub retryable: bool,
     pub retry_after_millis: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_context_budget: Option<LocalContextBudgetFailure>,
 }
 
@@ -508,16 +484,6 @@ impl ModelErrorView {
             retryable: error.diagnostic().retryable,
             retry_after_millis,
             local_context_budget: LocalContextBudgetFailure::from_model(error),
-        }
-    }
-
-    pub(crate) fn from_stored(error: &crate::store::StoredModelError) -> Self {
-        Self {
-            kind: error.kind.clone(),
-            delivery: error.delivery.clone(),
-            retryable: error.retryable,
-            retry_after_millis: error.retry_after_millis,
-            local_context_budget: error.local_context_budget,
         }
     }
 }
@@ -543,58 +509,6 @@ impl TurnResultView {
             tool_rounds: result.report.tool_rounds,
             final_config_revision: result.report.final_config_revision,
             persistence: result.persistence,
-        }
-    }
-}
-
-impl LoopOutcomeView {
-    pub(crate) fn from_stored(outcome: &crate::store::StoredLoopOutcome) -> Self {
-        match outcome {
-            crate::store::StoredLoopOutcome::Completed => Self::Completed,
-            crate::store::StoredLoopOutcome::Cancelled { reason } => Self::Cancelled {
-                reason: match reason {
-                    crate::store::StoredCancelReason::User => CancelReasonView::User,
-                    crate::store::StoredCancelReason::OwnerDropped => {
-                        CancelReasonView::OwnerDropped
-                    }
-                    crate::store::StoredCancelReason::Shutdown => CancelReasonView::Shutdown,
-                    crate::store::StoredCancelReason::Deadline => CancelReasonView::Deadline,
-                },
-            },
-            crate::store::StoredLoopOutcome::Failed { kind, model_error } => Self::Failed {
-                kind: kind.clone(),
-                model_error: model_error.as_ref().map(ModelErrorView::from_stored),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct HistoryPageView {
-    pub items: Vec<IndexedHistoryItemView>,
-    pub next_offset: Option<usize>,
-    pub total: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct IndexedHistoryItemView {
-    pub index: usize,
-    pub item: HistoryItemView,
-}
-
-impl From<&HistoryPage> for HistoryPageView {
-    fn from(page: &HistoryPage) -> Self {
-        Self {
-            items: page
-                .items
-                .iter()
-                .map(|item| IndexedHistoryItemView {
-                    index: item.index,
-                    item: item.item.clone(),
-                })
-                .collect(),
-            next_offset: page.next_offset,
-            total: page.total,
         }
     }
 }
@@ -682,13 +596,7 @@ impl From<&SessionState> for SessionStateView {
     fn from(state: &SessionState) -> Self {
         Self {
             session_id: state.session_id,
-            status: match state.status {
-                SessionStatus::Idle => SessionStatusView::Idle,
-                SessionStatus::Running => SessionStatusView::Running,
-                SessionStatus::WaitingForInput => SessionStatusView::WaitingForInput,
-                SessionStatus::Finishing => SessionStatusView::Finishing,
-                SessionStatus::Blocked => SessionStatusView::Blocked,
-            },
+            status: state.status,
             active_loop: state.active_loop.as_ref().map(|loop_state| LoopStateView {
                 loop_id: loop_state.loop_id,
                 status: match loop_state.status {
@@ -712,457 +620,21 @@ impl From<&SessionState> for SessionStateView {
                     .as_ref()
                     .map(PendingInteractionView::from),
             }),
-            block_reason: state.block_reason.map(|reason| match reason {
-                SessionBlockReason::Persistence => SessionBlockReasonView::Persistence,
-                SessionBlockReason::Internal => SessionBlockReasonView::Internal,
-            }),
+            block_reason: state.block_reason,
             compaction: state.compaction.clone(),
         }
     }
 }
 
-impl Serialize for AgentEvent {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::SessionOpened { session, meta } => serialize_event(
-                serializer,
-                "session_opened",
-                SessionOpenedData {
-                    session,
-                    meta: *meta,
-                },
-            ),
-            Self::SessionClosed { session_id, meta } => serialize_event(
-                serializer,
-                "session_closed",
-                SessionClosedData {
-                    session_id: *session_id,
-                    meta: *meta,
-                },
-            ),
-            Self::SessionState { state, meta } => serialize_event(
-                serializer,
-                "session_state",
-                SessionStateData {
-                    state: SessionStateView::from(state),
-                    meta: *meta,
-                },
-            ),
-            Self::TurnStarted { turn, meta } => {
-                serialize_event(serializer, "turn_started", TurnData { turn, meta: *meta })
-            }
-            Self::RequestStarted {
-                turn,
-                request_index,
-                config_revision,
-                model,
-                reasoning,
-                meta,
-            } => serialize_event(
-                serializer,
-                "request_started",
-                RequestStartedData {
-                    turn,
-                    request_index: *request_index,
-                    config_revision: *config_revision,
-                    model,
-                    reasoning: *reasoning,
-                    meta: *meta,
-                },
-            ),
-            Self::RequestUsage {
-                turn,
-                request_index,
-                usage,
-                meta,
-            } => serialize_event(
-                serializer,
-                "request_usage",
-                RequestUsageData {
-                    turn,
-                    request_index: *request_index,
-                    usage,
-                    meta: *meta,
-                },
-            ),
-            Self::OutputDelta {
-                turn,
-                request_index,
-                channel,
-                delta,
-                meta,
-            } => serialize_event(
-                serializer,
-                "output_delta",
-                OutputDeltaData {
-                    turn,
-                    request_index: *request_index,
-                    channel,
-                    delta,
-                    meta: *meta,
-                },
-            ),
-            Self::SteerProgress {
-                turn,
-                request_index,
-                applied_count,
-                meta,
-            } => serialize_event(
-                serializer,
-                "steer_progress",
-                SteerProgressData {
-                    turn,
-                    request_index: *request_index,
-                    applied_count: *applied_count,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolStarted {
-                turn,
-                request_index,
-                tool_call_id,
-                tool_name,
-                meta,
-            } => serialize_event(
-                serializer,
-                "tool_started",
-                ToolStartedData {
-                    turn,
-                    request_index: *request_index,
-                    tool_call_id,
-                    tool_name,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolInvocation { turn, data, meta } => serialize_event(
-                serializer,
-                "tool_invocation",
-                ToolInvocationDataWire {
-                    turn,
-                    data,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolExecution { turn, data, meta } => serialize_event(
-                serializer,
-                "tool_execution",
-                ToolExecutionDataWire {
-                    turn,
-                    data,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolProcess { turn, data, meta } => serialize_event(
-                serializer,
-                "tool_process",
-                ToolProcessDataWire {
-                    turn,
-                    data,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolPresentation {
-                turn,
-                request_index,
-                tool_call_id,
-                tool_name,
-                display,
-                meta,
-            } => serialize_event(
-                serializer,
-                "tool_presentation",
-                ToolPresentationData {
-                    turn,
-                    request_index: *request_index,
-                    tool_call_id,
-                    tool_name,
-                    display,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolArgumentsPreview {
-                turn,
-                request_index,
-                tool_call_id,
-                tool_name,
-                attempt,
-                revision,
-                state,
-                partial,
-                display,
-                meta,
-            } => serialize_event(
-                serializer,
-                "tool_arguments_preview",
-                ToolArgumentsPreviewData {
-                    turn,
-                    request_index: *request_index,
-                    tool_call_id,
-                    tool_name,
-                    attempt: *attempt,
-                    revision: *revision,
-                    state: *state,
-                    partial: *partial,
-                    display,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolProgress {
-                turn,
-                request_index,
-                tool_call_id,
-                progress,
-                meta,
-            } => serialize_event(
-                serializer,
-                "tool_progress",
-                ToolProgressData {
-                    turn,
-                    request_index: *request_index,
-                    tool_call_id,
-                    progress,
-                    meta: *meta,
-                },
-            ),
-            Self::ToolFinished {
-                turn,
-                request_index,
-                tool_call_id,
-                result,
-                meta,
-            } => serialize_event(
-                serializer,
-                "tool_finished",
-                ToolFinishedData {
-                    turn,
-                    request_index: *request_index,
-                    tool_call_id,
-                    result,
-                    meta: *meta,
-                },
-            ),
-            Self::InteractionRequested {
-                turn,
-                interaction,
-                meta,
-            } => serialize_event(
-                serializer,
-                "interaction_requested",
-                InteractionRequestedData {
-                    turn,
-                    interaction,
-                    meta: *meta,
-                },
-            ),
-            Self::InteractionResolved {
-                turn,
-                interaction_id,
-                meta,
-            } => serialize_event(
-                serializer,
-                "interaction_resolved",
-                InteractionResolvedData {
-                    turn,
-                    interaction_id: *interaction_id,
-                    meta: *meta,
-                },
-            ),
-            Self::TurnFinished {
-                turn,
-                outcome,
-                persistence,
-                meta,
-            } => serialize_event(
-                serializer,
-                "turn_finished",
-                TurnFinishedData {
-                    turn,
-                    outcome,
-                    persistence: *persistence,
-                    meta: *meta,
-                },
-            ),
-        }
-    }
+fn serialize_session_state<S: Serializer>(
+    state: &SessionState,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    SessionStateView::from(state).serialize(serializer)
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-#[derive(Serialize)]
-struct EventWire<T> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    data: T,
-}
-
-fn serialize_event<S, T>(
-    serializer: S,
-    event_type: &'static str,
-    data: T,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    T: Serialize,
-{
-    EventWire { event_type, data }.serialize(serializer)
-}
-
-#[derive(Serialize)]
-struct SessionOpenedData<'a> {
-    session: &'a SessionInfo,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct SessionClosedData {
-    session_id: SessionId,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct SessionStateData {
-    state: SessionStateView,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct TurnData<'a> {
-    turn: &'a TurnRef,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct RequestStartedData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    config_revision: ConfigRevision,
-    model: &'a str,
-    reasoning: minicore_runtime::model::ReasoningPreference,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct RequestUsageData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    usage: &'a minicore_runtime::model::Usage,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct SteerProgressData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    applied_count: u64,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct OutputDeltaData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    channel: &'a OutputChannel,
-    delta: &'a str,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolStartedData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    tool_call_id: &'a ToolCallId,
-    tool_name: &'a str,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolInvocationDataWire<'a> {
-    turn: &'a TurnRef,
-    data: &'a ToolInvocationData,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolExecutionDataWire<'a> {
-    turn: &'a TurnRef,
-    data: &'a ToolExecutionData,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolProcessDataWire<'a> {
-    turn: &'a TurnRef,
-    data: &'a ToolProcessData,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolPresentationData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    tool_call_id: &'a ToolCallId,
-    tool_name: &'a str,
-    display: &'a crate::presentation::ToolDisplay,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolArgumentsPreviewData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    tool_call_id: &'a ToolCallId,
-    tool_name: &'a str,
-    attempt: u64,
-    revision: u64,
-    state: crate::presentation::ToolArgumentsPreviewState,
-    partial: bool,
-    display: &'a crate::presentation::ToolDisplay,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolProgressData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    tool_call_id: &'a ToolCallId,
-    progress: &'a ToolProgressView,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct ToolFinishedData<'a> {
-    turn: &'a TurnRef,
-    request_index: u32,
-    tool_call_id: &'a ToolCallId,
-    result: &'a ToolResultView,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct InteractionRequestedData<'a> {
-    turn: &'a TurnRef,
-    interaction: &'a PendingInteractionView,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct InteractionResolvedData<'a> {
-    turn: &'a TurnRef,
-    interaction_id: InteractionId,
-    meta: EventMeta,
-}
-
-#[derive(Serialize)]
-struct TurnFinishedData<'a> {
-    turn: &'a TurnRef,
-    outcome: &'a LoopOutcomeView,
-    persistence: TurnPersistence,
-    meta: EventMeta,
 }
 
 /// Requests one paginated history slice through an Agent-owned session.
@@ -1182,136 +654,6 @@ impl AgentEventStream {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_result_debug_redacts_display_content() {
-        let view = ToolResultView {
-            outcome: ToolResultOutcome::Success,
-            content_bytes: 42,
-            content: Some("secret command output".to_owned()),
-            content_truncated: true,
-        };
-
-        let debug = format!("{view:?}");
-        assert!(!debug.contains("secret command output"));
-        assert!(debug.contains("content_len"));
-        assert!(debug.contains("content_truncated"));
-    }
-
-    #[test]
-    fn tool_progress_debug_redacts_message() {
-        let view = ToolProgressView {
-            message: Some("secret progress path".to_owned()),
-            completed: Some(1),
-            total: Some(2),
-        };
-        let debug = format!("{view:?}");
-        assert!(!debug.contains("secret progress path"));
-        assert!(debug.contains("message_len"));
-    }
-}
-
+mod snapshots;
 #[cfg(test)]
-mod local_budget_tests {
-    use super::*;
-    use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
-    use minicore_runtime::model::{DeliveryState, ModelErrorKind};
-    use minicore_runtime::value::BoundedText;
-
-    fn error(kind: ModelErrorKind, delivery: DeliveryState, text: &str) -> ModelError {
-        ModelError::permanent(
-            kind,
-            delivery,
-            DiagnosticSummary::new(
-                DiagnosticCode::InvalidConfiguration,
-                DiagnosticCategory::Model,
-                BoundedText::new(text).unwrap(),
-                false,
-            ),
-        )
-    }
-    const VALID: &str = "local serialized context estimate exceeds input budget: estimated_tokens=32001, input_budget_tokens=32000; use /compact or a larger model";
-
-    #[test]
-    fn only_exact_local_numeric_preflight_is_exposed_and_persisted() {
-        let error = error(
-            ModelErrorKind::InvalidRequest,
-            DeliveryState::NotStarted,
-            VALID,
-        );
-        let view = ModelErrorView::from_model(&error);
-        assert_eq!(
-            view.local_context_budget,
-            Some(LocalContextBudgetFailure {
-                estimated_tokens: 32001,
-                input_budget_tokens: 32000
-            })
-        );
-        let stored = crate::store::StoredModelError::from_model(&error);
-        let encoded = serde_json::to_vec(&stored).unwrap();
-        let restored: crate::store::StoredModelError = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(ModelErrorView::from_stored(&restored), view);
-        assert!(
-            !String::from_utf8(encoded)
-                .unwrap()
-                .contains("serialized context estimate")
-        );
-    }
-    #[test]
-    fn provider_diagnostics_and_lookalike_numbers_are_not_exposed() {
-        for text in [
-            "provider private body",
-            "local serialized context estimate exceeds input budget; use /compact or a larger model",
-            &VALID.replace("32001", "032001"),
-            &VALID.replace("32001", "+32001"),
-            &VALID.replace("32001", "32000"),
-            &VALID.replace("32001", "18446744073709551616"),
-            &format!("{VALID} secret"),
-        ] {
-            assert!(
-                LocalContextBudgetFailure::from_model(&error(
-                    ModelErrorKind::InvalidRequest,
-                    DeliveryState::NotStarted,
-                    text
-                ))
-                .is_none()
-            );
-        }
-        for delivery in [DeliveryState::Started, DeliveryState::Unknown] {
-            assert!(
-                LocalContextBudgetFailure::from_model(&error(
-                    ModelErrorKind::InvalidRequest,
-                    delivery,
-                    VALID
-                ))
-                .is_none()
-            );
-        }
-        assert!(
-            LocalContextBudgetFailure::from_model(&error(
-                ModelErrorKind::ContextOverflow,
-                DeliveryState::NotStarted,
-                VALID
-            ))
-            .is_none()
-        );
-    }
-    #[test]
-    fn legacy_and_nullable_stored_errors_keep_optional_field_absent() {
-        for suffix in ["", ",\"local_context_budget\":null"] {
-            let old = format!(
-                "{{\"kind\":\"invalid_request\",\"delivery\":\"not_started\",\"retryable\":false,\"retry_after_millis\":null{suffix}}}"
-            );
-            let stored: crate::store::StoredModelError = serde_json::from_str(&old).unwrap();
-            assert!(stored.local_context_budget.is_none());
-            assert!(
-                serde_json::to_value(ModelErrorView::from_stored(&stored))
-                    .unwrap()
-                    .get("local_context_budget")
-                    .is_none()
-            );
-        }
-    }
-}
+mod tests;

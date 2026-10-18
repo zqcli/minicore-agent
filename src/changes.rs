@@ -1,13 +1,11 @@
 use std::fmt;
-#[cfg(test)]
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use minicore_runtime::LoopId;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::budget::check_budget;
+use crate::budget::{check_budget, encoded_len, encoded_result};
 use crate::error::AgentError;
 use crate::store::Store;
 use crate::tool_data::{ToolData, ToolRef};
@@ -621,7 +619,6 @@ async fn plan_page_end(
     page_end: Option<usize>,
     reservation: (&CancellationToken, Instant),
 ) -> Result<usize, AgentError> {
-    request.validate()?;
     // Blob verification can add `RecordsSkipped` and flip `complete` to false
     // after the pre-plan, while `DetailsUnavailable` only ever disappears. Plan
     // against the reserved superset so the final page can only shrink and no
@@ -635,61 +632,44 @@ async fn plan_page_end(
         return Err(AgentError::InvalidArguments);
     }
     let bound = page_end.unwrap_or(total).min(total).max(offset);
+    let header = ChangesListResult {
+        session_id: request.session_id,
+        scope: request.scope.clone(),
+        records: Vec::new(),
+        next_cursor: None,
+        total,
+        complete: false,
+        stale: false,
+        consistency,
+        observed_at_unix_ms,
+        warnings: reserved,
+    };
+    // Subtract the null cursor; each candidate supplies its actual cursor size.
+    let base_bytes = encoded_len(&header) - encoded_len(&None::<ChangeCursor>);
+    let mut cursor = ChangeCursor {
+        session_id: request.session_id,
+        scope: request.scope.clone(),
+        offset,
+        observation: Some(observation.to_owned()),
+    };
+    let mut record_bytes = 0;
     let mut end = offset;
-    for _ in records[offset..bound].iter().take(request.limit) {
+    for record in records[offset..bound].iter().take(request.limit) {
         let (cancellation, deadline) = reservation;
         check_budget(cancellation, deadline)?;
-        end = end.saturating_add(1);
-        let candidate = CandidateResult {
-            session_id: request.session_id,
-            scope: &request.scope,
-            records: &records[offset..end],
-            next_cursor: (end < total).then_some(ChangeCursor {
-                session_id: request.session_id,
-                scope: request.scope.clone(),
-                offset: end,
-                observation: Some(observation.to_owned()),
-            }),
-            total,
-            // `false` is the longer encoding, so this stays an upper bound even
-            // when blob verification flips `complete` after the pre-plan.
-            complete: false,
-            stale: false,
-            consistency,
-            observed_at_unix_ms,
-            warnings: &reserved,
-        };
-        if serde_json::to_vec(&candidate)
-            .map_err(|_| AgentError::RpcSerialization)?
-            .len()
-            > request.max_bytes()
-        {
-            end = end.saturating_sub(1);
+        record_bytes += encoded_len(record) + usize::from(end > offset);
+        cursor.offset = end + 1;
+        let next_cursor = (cursor.offset < total).then_some(&cursor);
+        if base_bytes + record_bytes + encoded_len(&next_cursor) > request.max_bytes() {
             break;
         }
+        end += 1;
         tokio::task::yield_now().await;
     }
     if end == offset && offset < total {
         return Err(AgentError::InvalidArguments);
     }
     Ok(end)
-}
-
-/// Borrowed mirror of `ChangesListResult` used only to measure an encoded page
-/// without cloning the records it already contains.
-#[derive(Serialize)]
-struct CandidateResult<'a> {
-    session_id: crate::ids::SessionId,
-    scope: &'a ChangeScope,
-    records: &'a [ChangeRecord],
-    next_cursor: Option<ChangeCursor>,
-    total: usize,
-    complete: bool,
-    stale: bool,
-    consistency: ChangeListConsistency,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    observed_at_unix_ms: Option<u64>,
-    warnings: &'a [ChangeListWarning],
 }
 
 pub(crate) async fn list_tool_changes(
@@ -702,11 +682,7 @@ pub(crate) async fn list_tool_changes(
     request.validate()?;
     check_budget(&cancellation, deadline)?;
     #[cfg(test)]
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => return Err(AgentError::QueryLimit),
-        _ = check_change_list_gate(request.session_id) => {}
-    }
+    tests::check_change_list_gate(request.session_id, &cancellation).await?;
     let loop_id = match &request.scope {
         ChangeScope::Turn { loop_id } => Some(*loop_id),
         ChangeScope::Workspace | ChangeScope::Session => None,
@@ -721,7 +697,7 @@ pub(crate) async fn list_tool_changes(
     {
         Ok(scan) => scan,
         Err(error) => {
-            let mapped = crate::sessions::map_store_error(error);
+            let mapped = AgentError::from(error);
             if matches!(&mapped, AgentError::QueryLimit) || warm_records.is_empty() {
                 return Err(mapped);
             }
@@ -731,7 +707,7 @@ pub(crate) async fn list_tool_changes(
 
     let mut records = warm_records;
     let mut warnings = Vec::new();
-    let mut complete = scan.complete;
+    let mut complete = !scan.skipped;
     if scan.skipped {
         push_warning(&mut warnings, ChangeListWarning::RecordsSkipped);
     }
@@ -826,8 +802,7 @@ pub(crate) async fn list_tool_changes(
                 deadline,
                 &mut blob_budget,
             )
-            .await
-            .map_err(crate::sessions::map_store_error)?;
+            .await?;
         record.details_available = available;
         if blob_budget.exhausted {
             complete = false;
@@ -901,21 +876,6 @@ fn tool_observation(records: &[ChangeRecord], scan_observation: &str, complete: 
     crate::store::hash_bytes(&bytes)
 }
 
-fn encoded_result(
-    result: ChangesListResult,
-    max_bytes: usize,
-) -> Result<ChangesListResult, AgentError> {
-    if serde_json::to_vec(&result)
-        .map_err(|_| AgentError::RpcSerialization)?
-        .len()
-        > max_bytes
-    {
-        Err(AgentError::InvalidArguments)
-    } else {
-        Ok(result)
-    }
-}
-
 fn push_warning(warnings: &mut Vec<ChangeListWarning>, warning: ChangeListWarning) {
     if !warnings.contains(&warning) {
         warnings.push(warning);
@@ -923,51 +883,10 @@ fn push_warning(warnings: &mut Vec<ChangeListWarning>, warning: ChangeListWarnin
 }
 
 #[cfg(test)]
-pub(crate) struct ChangeListGate {
-    entered: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl ChangeListGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            entered: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.entered.notified().await;
-    }
-}
-
-#[cfg(test)]
-type ChangeListGateEntry = (crate::ids::SessionId, Arc<ChangeListGate>);
-#[cfg(test)]
-static CHANGE_LIST_GATES: OnceLock<Mutex<Vec<ChangeListGateEntry>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn gate_next_change_list(session_id: crate::ids::SessionId, gate: Arc<ChangeListGate>) {
-    let mutex = CHANGE_LIST_GATES.get_or_init(|| Mutex::new(Vec::new()));
-    mutex.lock().unwrap().push((session_id, gate));
-}
-
-/// Holds one `changes.list` query until its owning caller or Session cancels it,
-/// so tests can observe the shared deferred-query pool without a fake request.
-#[cfg(test)]
-async fn check_change_list_gate(session_id: crate::ids::SessionId) {
-    let gate = {
-        let Some(mutex) = CHANGE_LIST_GATES.get() else {
-            return;
-        };
-        let mut entries = mutex.lock().unwrap();
-        let Some(position) = entries.iter().position(|(id, _)| *id == session_id) else {
-            return;
-        };
-        entries.remove(position).1
-    };
-    gate.entered.notify_one();
-    std::future::pending::<()>().await;
-}
+pub(crate) static CHANGE_LIST_GATES: crate::test_support::Registry<
+    crate::ids::SessionId,
+    std::sync::Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 fn default_change_limit() -> usize {
     DEFAULT_CHANGE_LIMIT

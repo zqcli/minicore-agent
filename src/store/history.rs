@@ -1,7 +1,197 @@
 //! JSONL history read, write, scan, and anchor implementation.
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct HistoryLine {
+    end: u64,
+    items: usize,
+    hash: Sha256,
+    usage: crate::read::CoveredUsage,
+}
+
+fn index_line(
+    index: &mut Vec<HistoryLine>,
+    bytes: &[u8],
+    record: &StoredLoopRecord,
+    item_count: usize,
+) {
+    let mut line = index.last().cloned().unwrap_or(HistoryLine {
+        end: 0,
+        items: 0,
+        hash: Sha256::new(),
+        usage: crate::read::CoveredUsage::default(),
+    });
+    line.end += bytes.len() as u64;
+    line.items += item_count;
+    line.hash.update(bytes);
+    line.usage.add(record.loop_id, record.usage);
+    index.push(line);
+}
+
+struct IndexedPage {
+    start: u64,
+    end: u64,
+    first_item: usize,
+    page: HistoryReadPage,
+}
+
+fn indexed_page(
+    index: &[HistoryLine],
+    offset: usize,
+    limit: usize,
+    visible: Option<usize>,
+    captured: Option<u64>,
+    revision: Option<&str>,
+    usage_boundary: Option<usize>,
+) -> Result<IndexedPage, StoreError> {
+    let end = captured.map_or_else(
+        || {
+            visible.map_or(index.len(), |cap| {
+                index.partition_point(|line| line.items <= cap)
+            })
+        },
+        |end| index.partition_point(|line| line.end <= end),
+    );
+    let index = &index[..end];
+    let last = index.last();
+    let captured_end = last.map_or(0, |line| line.end);
+    let total_items = last.map_or(0, |line| line.items);
+    if captured.is_some_and(|end| end != captured_end)
+        || visible.is_some_and(|cap| total_items > cap)
+    {
+        return Err(StoreError::HistoryChanged);
+    }
+    let hash = last.map_or_else(Sha256::new, |line| line.hash.clone());
+    let actual_revision = digest_hex(hash);
+    if revision.is_some_and(|revision| revision != actual_revision) {
+        return Err(StoreError::HistoryChanged);
+    }
+    let mut page = HistoryReadPage {
+        captured_end,
+        revision: actual_revision,
+        total_items,
+        summary_anchor_valid: true,
+        ..HistoryReadPage::default()
+    };
+    if let Some(boundary) = usage_boundary {
+        let count = index.partition_point(|line| line.items <= boundary);
+        let covered = index[..count].last();
+        if covered.map_or(0, |line| line.items) != boundary {
+            return Err(StoreError::HistoryChanged);
+        }
+        if let Some(covered) = covered {
+            page.covered_usage = covered.usage.clone();
+        }
+    }
+    let first = index.partition_point(|line| line.items <= offset);
+    let start = first.checked_sub(1).map(|i| &index[i]);
+    let last = index.partition_point(|line| line.items < offset.saturating_add(limit));
+    let end = if limit == 0 || first == index.len() {
+        start.map_or(0, |line| line.end)
+    } else {
+        index[last.min(index.len() - 1)].end
+    };
+    Ok(IndexedPage {
+        start: start.map_or(0, |line| line.end),
+        end,
+        first_item: start.map_or(0, |line| line.items),
+        page,
+    })
+}
+
 impl Store {
+    async fn require_history_file(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(PathBuf, u64), StoreError> {
+        let path = self
+            .require_session_directory(session_id)
+            .await?
+            .join(HISTORY_FILE);
+        let metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::Corrupt);
+            }
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        if !metadata.is_file() {
+            return Err(StoreError::Corrupt);
+        }
+        Ok((path, metadata.len()))
+    }
+
+    async fn read_indexed_page(
+        &self,
+        session_id: SessionId,
+        mut indexed: IndexedPage,
+        offset: usize,
+        limit: usize,
+        limits: &HistoryScanLimits,
+    ) -> Result<HistoryReadPage, StoreError> {
+        check_history_scan(limits)?;
+        let (path, _) = self.require_history_file(session_id).await?;
+        let mut file = File::open(path).await.map_err(unavailable)?;
+        file.seek(std::io::SeekFrom::Start(indexed.start))
+            .await
+            .map_err(unavailable)?;
+        let mut reader = BufReader::new(file);
+        let mut remaining = indexed.end - indexed.start;
+        let mut item_start = indexed.first_item;
+        let page = &mut indexed.page;
+        while remaining > 0 {
+            if page.scanned_lines >= limits.max_lines || page.scanned_bytes >= limits.max_bytes {
+                return Err(StoreError::QueryLimit);
+            }
+            let BoundedLine::Complete(line) =
+                read_bounded_line(&mut reader, &mut remaining, Some(limits)).await?
+            else {
+                return Err(StoreError::HistoryChanged);
+            };
+            page.scanned_bytes += line.len() as u64 + 1;
+            if page.scanned_bytes > limits.max_bytes {
+                return Err(StoreError::QueryLimit);
+            }
+            page.scanned_lines += 1;
+            let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
+            let items = normalize_history(&record.items).map_err(corrupt)?;
+            let item_end = item_start + items.len();
+            let times = record.normalized_user_times().unwrap_or_default();
+            let mut occurrence = 0;
+            for (i, item) in items.iter().enumerate() {
+                let time = if matches!(item, HistoryItem::User(_)) {
+                    let time = times.get(occurrence).cloned().flatten();
+                    occurrence += 1;
+                    time
+                } else {
+                    None
+                };
+                if (offset..offset.saturating_add(limit)).contains(&(item_start + i)) {
+                    page.items.push(item.clone());
+                    page.user_times.push(time);
+                }
+            }
+            if page.turns.len() < MAX_READ_TURN_SUMMARIES {
+                page.turns.push(StoredTurnSummary {
+                    item_start,
+                    item_end,
+                    loop_id: record.loop_id,
+                    outcome: record.outcome,
+                    usage: record.usage,
+                    requests: record.requests,
+                    tool_rounds: record.tool_rounds,
+                    final_config_revision: record.final_config_revision,
+                    completed_at: record.completed_at,
+                });
+            } else {
+                page.turns_truncated = true;
+            }
+            item_start = item_end;
+            tokio::task::yield_now().await;
+        }
+        Ok(indexed.page)
+    }
+
     /// Scans one raw history prefix without invoking the normal tail repair.
     /// The result exists only when the requested byte offset ends immediately
     /// after a complete StoredLoopRecord line.
@@ -11,26 +201,11 @@ impl Store {
         prefix_bytes: u64,
         expected_history: &[HistoryItem],
     ) -> Result<Option<HistoryPrefix>, StoreError> {
-        let directory = self.require_session_directory(session_id).await?;
-        let path = directory.join(HISTORY_FILE);
-        match path_state(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
-            PathState::RegularFile => {}
-            PathState::Missing | PathState::Directory | PathState::Symlink | PathState::Other => {
-                return Err(StoreError::Corrupt);
-            }
-        }
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if prefix_bytes > metadata.len() {
+        let (path, length) = self.require_history_file(session_id).await?;
+        if prefix_bytes > length {
             return Ok(None);
         }
-        let file = File::open(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        let file = File::open(path).await.map_err(unavailable)?;
         Ok(
             scan_history_prefix(file, prefix_bytes, expected_history, None)
                 .await?
@@ -60,33 +235,14 @@ impl Store {
         expected_history: &[HistoryItem],
         max_prefix_items: Option<usize>,
     ) -> Result<Option<CompactionAnchors>, StoreError> {
-        let directory = self.require_session_directory(session_id).await?;
-        let path = directory.join(HISTORY_FILE);
-        match path_state(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
-            PathState::RegularFile => {}
-            PathState::Missing | PathState::Directory | PathState::Symlink | PathState::Other => {
-                return Err(StoreError::Corrupt);
-            }
-        }
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        let file = File::open(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        let length = metadata.len();
+        let (path, length) = self.require_history_file(session_id).await?;
+        let file = File::open(&path).await.map_err(unavailable)?;
         let Some(anchors) =
             scan_history_prefix(file, length, expected_history, max_prefix_items).await?
         else {
             return Ok(None);
         };
-        let final_length = fs::metadata(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-            .len();
+        let final_length = fs::metadata(&path).await.map_err(unavailable)?.len();
         if final_length != length {
             return Ok(None);
         }
@@ -104,33 +260,17 @@ impl Store {
         &self,
         session_id: SessionId,
         record: &StoredLoopRecord,
-    ) -> Result<(), StoreError> {
-        let directory = self.require_session_directory(session_id).await?;
-        #[cfg(test)]
-        if should_fail_append(session_id) {
-            return Err(StoreError::Unavailable);
-        }
-        let path = directory.join(HISTORY_FILE);
-        match path_state(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
-            PathState::Missing => return Err(StoreError::Corrupt),
-            PathState::RegularFile => {}
-            PathState::Directory | PathState::Symlink | PathState::Other => {
-                return Err(StoreError::Corrupt);
-            }
-        }
+    ) -> Result<(), AppendError> {
+        let (path, previous_len) = self.require_history_file(session_id).await?;
         // Keep legacy raw record bytes unchanged. New replay-bearing records
         // must pass durable admission before any append is attempted.
+        let normalized_items = normalize_history(&record.items).map_err(corrupt)?;
         let normalized_record = if record.items.iter().any(|item| {
             matches!(item,
             HistoryItem::Assistant(assistant) if assistant.provider_replay.is_some())
         }) {
             let mut normalized = record.clone();
-            normalized.items = normalize_history(&record.items)
-                .map_err(|_| StoreError::Corrupt)?
-                .to_vec();
+            normalized.items = normalized_items.to_vec();
             Some(normalized)
         } else {
             None
@@ -143,27 +283,36 @@ impl Store {
             normalized.user_times = record.normalized_user_times();
             serde_json::to_vec(&normalized)
         }
-        .map_err(|_| StoreError::Corrupt)?;
+        .map_err(corrupt)?;
         if bytes.len() > MAX_LOOP_RECORD_BYTES && record.user_times.is_some() {
             // Presentation metadata must not make an otherwise storable core
             // loop record cross the single-line limit.
             let mut without_metadata = record.clone();
             without_metadata.user_times = None;
-            bytes = serde_json::to_vec(&without_metadata).map_err(|_| StoreError::Corrupt)?;
+            bytes = serde_json::to_vec(&without_metadata).map_err(corrupt)?;
         }
         if bytes.len() > MAX_LOOP_RECORD_BYTES {
-            return Err(StoreError::RecordTooLarge);
+            return Err(StoreError::RecordTooLarge.into());
         }
         bytes.push(b'\n');
         let mut file = OpenOptions::new()
             .append(true)
             .open(&path)
             .await
-            .map_err(|_| StoreError::Unavailable)?;
-        file.write_all(&bytes)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        file.flush().await.map_err(|_| StoreError::Unavailable)?;
+            .map_err(unavailable)?;
+        #[cfg(test)]
+        if let Some(rollback_fails) = APPEND_FAILURES.take(&session_id) {
+            return tests::fail_append(file, &path, &bytes, previous_len, rollback_fails).await;
+        }
+        if file.write_all(&bytes).await.is_err()
+            || file.flush().await.is_err()
+            || file.sync_data().await.is_err()
+        {
+            return Err(rollback_append(&file, previous_len).await);
+        }
+        if let Some(index) = self.history_indexes.lock().unwrap().get_mut(&session_id) {
+            index_line(index, &bytes, record, normalized_items.len());
+        }
         Ok(())
     }
 
@@ -176,7 +325,6 @@ impl Store {
         visible_item_count: Option<usize>,
         captured_end: Option<u64>,
         expected_revision: Option<&str>,
-        expected_history: Option<&[HistoryItem]>,
         usage_boundary: Option<usize>,
         limits: &HistoryScanLimits,
     ) -> Result<HistoryReadPage, StoreError> {
@@ -187,7 +335,6 @@ impl Store {
             visible_item_count,
             captured_end,
             expected_revision,
-            expected_history,
             usage_boundary,
             None,
             limits,
@@ -215,7 +362,6 @@ impl Store {
             None,
             captured_end,
             expected_revision,
-            None,
             Some(summary.map_or(0, |source| source.covered_item_count as usize)),
             Some(ColdDisplayScan { summary }),
             limits,
@@ -232,7 +378,6 @@ impl Store {
         visible_item_count: Option<usize>,
         captured_end: Option<u64>,
         expected_revision: Option<&str>,
-        expected_history: Option<&[HistoryItem]>,
         usage_boundary: Option<usize>,
         display: Option<ColdDisplayScan<'_>>,
         limits: &HistoryScanLimits,
@@ -240,23 +385,34 @@ impl Store {
         if captured_end.is_some() != expected_revision.is_some() {
             return Err(StoreError::InvalidArguments);
         }
-        let directory = self.require_session_directory(session_id).await?;
-        let path = directory.join(HISTORY_FILE);
-        match path_state(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
-            PathState::RegularFile => {}
-            PathState::Missing => return Err(StoreError::Corrupt),
-            PathState::Directory | PathState::Symlink | PathState::Other => {
-                return Err(StoreError::Corrupt);
-            }
+        let indexed = if display.is_none() {
+            self.history_indexes
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .map(|index| {
+                    indexed_page(
+                        index,
+                        item_offset,
+                        item_limit,
+                        visible_item_count,
+                        captured_end,
+                        expected_revision,
+                        usage_boundary,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(indexed) = indexed {
+            return self
+                .read_indexed_page(session_id, indexed, item_offset, item_limit, limits)
+                .await;
         }
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        let target = captured_end.unwrap_or(metadata.len());
-        if target > metadata.len() {
+        let (path, length) = self.require_history_file(session_id).await?;
+        let target = captured_end.unwrap_or(length);
+        if target > length {
             return Err(StoreError::HistoryChanged);
         }
         if let Some(expected) = expected_revision {
@@ -272,9 +428,7 @@ impl Store {
             return finish_empty_history_page(0, expected_revision);
         }
 
-        let file = File::open(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        let file = File::open(&path).await.map_err(unavailable)?;
         let mut reader = BufReader::new(file);
         let scan_target = target.min(limits.max_bytes);
         let mut remaining = scan_target;
@@ -290,7 +444,6 @@ impl Store {
         let page_end = item_offset.saturating_add(item_limit);
         let mut turns = Vec::new();
         let mut turns_truncated = false;
-        let mut expected_index = 0_usize;
         let mut stopped_at_visible_cap = false;
         let mut trailing_incomplete = false;
         let retained_source_limit = limits
@@ -306,7 +459,7 @@ impl Store {
             if line_count >= limits.max_lines {
                 return Err(StoreError::QueryLimit);
             }
-            let line = match read_bounded_line(&mut reader, &mut remaining, limits).await? {
+            let line = match read_bounded_line(&mut reader, &mut remaining, Some(limits)).await? {
                 BoundedLine::Complete(line) => line,
                 BoundedLine::Partial => {
                     if captured_end.is_some() {
@@ -323,9 +476,8 @@ impl Store {
             if line.is_empty() {
                 return Err(StoreError::Corrupt);
             }
-            let record: StoredLoopRecord =
-                serde_json::from_slice(&line).map_err(|_| StoreError::Corrupt)?;
-            let normalized = normalize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
+            let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
+            let normalized = normalize_history(&record.items).map_err(corrupt)?;
             let record_start = total_items;
             let record_end = record_start
                 .checked_add(normalized.len())
@@ -338,26 +490,13 @@ impl Store {
                     covered_usage.add(record.loop_id, record.usage);
                 }
             }
-            if let Some(expected) = expected_history {
-                let compared = visible_item_count
-                    .map(|cap| normalized.len().min(cap.saturating_sub(record_start)))
-                    .unwrap_or(normalized.len());
-                for item in normalized.iter().take(compared) {
-                    let Some(expected_item) = expected.get(expected_index) else {
-                        return Err(StoreError::HistoryChanged);
-                    };
-                    if item != expected_item {
-                        return Err(StoreError::HistoryChanged);
-                    }
-                    expected_index = expected_index.checked_add(1).ok_or(StoreError::Corrupt)?;
-                }
-            }
+
             if visible_item_count.is_some_and(|cap| record_end > cap) {
                 return Err(StoreError::HistoryChanged);
             }
             if record_end > item_offset && record_start < page_end {
                 retained_source_bytes = retained_source_bytes
-                    .checked_add(u64::try_from(line.len()).map_err(|_| StoreError::Corrupt)?)
+                    .checked_add(u64::try_from(line.len()).map_err(corrupt)?)
                     .ok_or(StoreError::QueryLimit)?;
                 if retained_source_bytes > retained_source_limit {
                     return Err(StoreError::QueryLimit);
@@ -393,9 +532,9 @@ impl Store {
                         &user_times[page_item_start..],
                         &normalized,
                     )
-                    .map_err(|_| StoreError::Corrupt)?
+                    .map_err(corrupt)?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| StoreError::Corrupt)?,
+                    .map_err(corrupt)?,
                 );
             }
             if record_end > item_offset && record_start < page_end {
@@ -448,11 +587,7 @@ impl Store {
         if captured_end.is_some() && complete_end != target {
             return Err(StoreError::HistoryChanged);
         }
-        if let Some(expected) = expected_history {
-            if expected_index != total_items || total_items > expected.len() {
-                return Err(StoreError::HistoryChanged);
-            }
-        }
+
         let revision = digest_hex(hasher);
         if expected_revision.is_some_and(|expected| expected != revision) {
             return Err(StoreError::HistoryChanged);
@@ -480,27 +615,53 @@ impl Store {
         loop_id: LoopId,
         limits: &HistoryScanLimits,
     ) -> Result<Option<StoredLoopRecord>, StoreError> {
-        let directory = self.require_session_directory(session_id).await?;
-        let path = directory.join(HISTORY_FILE);
-        match path_state(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
-            PathState::RegularFile => {}
-            PathState::Missing => return Err(StoreError::Corrupt),
-            PathState::Directory | PathState::Symlink | PathState::Other => {
-                return Err(StoreError::Corrupt);
-            }
-        }
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
         check_history_scan(limits)?;
-        let file = File::open(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        let indexed = self
+            .history_indexes
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|index| {
+                index
+                    .iter()
+                    .position(|line| line.usage.last_loop_id == Some(loop_id))
+                    .map(|position| {
+                        (
+                            position.checked_sub(1).map_or(0, |i| index[i].end),
+                            index[position].end,
+                        )
+                    })
+            });
+        if let Some(range) = indexed {
+            let Some((start, end)) = range else {
+                return Ok(None);
+            };
+            if end - start > limits.max_bytes || limits.max_lines == 0 {
+                return Err(StoreError::QueryLimit);
+            }
+            let (path, _) = self.require_history_file(session_id).await?;
+            let mut file = File::open(path).await.map_err(unavailable)?;
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(unavailable)?;
+            return match read_bounded_line(
+                &mut BufReader::new(file),
+                &mut (end - start),
+                Some(limits),
+            )
+            .await?
+            {
+                BoundedLine::Complete(line) => {
+                    serde_json::from_slice(&line).map(Some).map_err(corrupt)
+                }
+                _ => Err(StoreError::HistoryChanged),
+            };
+        }
+        let (path, length) = self.require_history_file(session_id).await?;
+        check_history_scan(limits)?;
+        let file = File::open(path).await.map_err(unavailable)?;
         let mut reader = BufReader::new(file);
-        let target = metadata.len();
+        let target = length;
         let scan_target = target.min(limits.max_bytes);
         let mut remaining = scan_target;
         let mut line_count = 0_usize;
@@ -515,7 +676,7 @@ impl Store {
             if line_count >= limits.max_lines {
                 return Err(StoreError::QueryLimit);
             }
-            let line = match read_bounded_line(&mut reader, &mut remaining, limits).await? {
+            let line = match read_bounded_line(&mut reader, &mut remaining, Some(limits)).await? {
                 BoundedLine::Complete(line) => line,
                 BoundedLine::Partial => {
                     if scan_target < target {
@@ -528,8 +689,7 @@ impl Store {
             if line.is_empty() {
                 return Err(StoreError::Corrupt);
             }
-            let record: StoredLoopRecord =
-                serde_json::from_slice(&line).map_err(|_| StoreError::Corrupt)?;
+            let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
             if record.loop_id == loop_id {
                 return Ok(Some(record));
             }
@@ -540,36 +700,23 @@ impl Store {
 
     pub(super) async fn load_history(
         &self,
-        path: &Path,
         session_id: SessionId,
     ) -> Result<
         (
             std::sync::Arc<[HistoryItem]>,
             std::collections::HashMap<(LoopId, usize), String>,
+            Vec<HistoryLine>,
         ),
         StoreError,
     > {
-        match path_state(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
-            PathState::RegularFile => {}
-            // A valid v0.3 record always pairs `session.json` with
-            // `history.jsonl`; a missing history for a present record is
-            // corrupt data, never an empty conversation.
-            PathState::Missing => return Err(StoreError::Corrupt),
-            PathState::Directory | PathState::Symlink | PathState::Other => {
-                return Err(StoreError::Corrupt);
-            }
-        }
-        let file = File::open(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        let (path, _) = self.require_history_file(session_id).await?;
+        let file = File::open(&path).await.map_err(unavailable)?;
         let mut reader = BufReader::new(file);
         let mut items = Vec::new();
         let mut times = std::collections::HashMap::new();
         let mut buffer = Vec::new();
         let mut last_complete_offset = 0u64;
+        let mut index = Vec::new();
         let mut saw_partial = false;
         loop {
             buffer.clear();
@@ -580,10 +727,7 @@ impl Store {
             let mut oversized = false;
             let mut is_complete = false;
             let reached_eof = loop {
-                let chunk = reader
-                    .fill_buf()
-                    .await
-                    .map_err(|_| StoreError::Unavailable)?;
+                let chunk = reader.fill_buf().await.map_err(unavailable)?;
                 if chunk.is_empty() {
                     break true;
                 }
@@ -626,8 +770,7 @@ impl Store {
             if buffer.is_empty() {
                 return Err(StoreError::Corrupt);
             }
-            let record: StoredLoopRecord =
-                serde_json::from_slice(&buffer).map_err(|_| StoreError::Corrupt)?;
+            let record: StoredLoopRecord = serde_json::from_slice(&buffer).map_err(corrupt)?;
             let user_count = record
                 .items
                 .iter()
@@ -647,27 +790,35 @@ impl Store {
                     user_occurrence += 1;
                 }
             }
-            items.extend(record.items);
-            last_complete_offset = reader
-                .stream_position()
-                .await
-                .map_err(|_| StoreError::Unavailable)?;
+            last_complete_offset += buffer.len() as u64 + 1;
+            buffer.push(b'\n');
+            let normalized = normalize_history(&record.items).map_err(corrupt)?;
+            index_line(&mut index, &buffer, &record, normalized.len());
+            items.extend(normalized.iter().cloned());
         }
         if saw_partial {
             // The only allowed repair: truncate back to the last complete
             // line. Works for a first-segment partial too (offset 0).
-            let had_partial = tail_repair(path, last_complete_offset).await?;
+            let had_partial = tail_repair(&path, last_complete_offset).await?;
             if had_partial {
                 tracing::warn!(session_id = %session_id, "history tail repaired");
             }
         }
-        let history = normalize_history(&items).map_err(|_| StoreError::Corrupt)?;
-        Ok((history, times))
+        let history = items.into();
+        Ok((history, times, index))
     }
 }
 
 struct ColdDisplayScan<'a> {
     summary: Option<&'a HistoryPrefix>,
+}
+
+pub(super) async fn rollback_append(file: &File, previous_len: u64) -> AppendError {
+    if file.set_len(previous_len).await.is_ok() && file.sync_data().await.is_ok() {
+        AppendError::NotWritten(StoreError::Unavailable)
+    } else {
+        AppendError::Unknown
+    }
 }
 
 enum BoundedLine {
@@ -679,7 +830,7 @@ enum BoundedLine {
 async fn read_bounded_line<R>(
     reader: &mut R,
     remaining: &mut u64,
-    limits: &HistoryScanLimits,
+    limits: Option<&HistoryScanLimits>,
 ) -> Result<BoundedLine, StoreError>
 where
     R: AsyncBufRead + Unpin,
@@ -694,11 +845,10 @@ where
                 Ok(BoundedLine::Partial)
             };
         }
-        check_history_scan(limits)?;
-        let chunk = reader
-            .fill_buf()
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        if let Some(limits) = limits {
+            check_history_scan(limits)?;
+        }
+        let chunk = reader.fill_buf().await.map_err(unavailable)?;
         if chunk.is_empty() {
             return Ok(BoundedLine::End);
         }
@@ -716,7 +866,7 @@ where
                 }
             }
             reader.consume(position + 1);
-            *remaining -= u64::try_from(position + 1).map_err(|_| StoreError::Corrupt)?;
+            *remaining -= u64::try_from(position + 1).map_err(corrupt)?;
             if oversized {
                 return Err(StoreError::Corrupt);
             }
@@ -731,7 +881,7 @@ where
             }
         }
         reader.consume(take);
-        *remaining -= u64::try_from(take).map_err(|_| StoreError::Corrupt)?;
+        *remaining -= u64::try_from(take).map_err(corrupt)?;
         tokio::task::yield_now().await;
     }
 }
@@ -755,17 +905,8 @@ fn finish_empty_history_page(
     Ok(HistoryReadPage {
         captured_end,
         revision,
-        trailing_incomplete: false,
-        total_items: 0,
-        items: Vec::new(),
-        user_times: Vec::new(),
-        turns: Vec::new(),
-        turns_truncated: false,
-        covered_usage: crate::read::CoveredUsage::default(),
-        display_items: None,
         summary_anchor_valid: true,
-        scanned_bytes: 0,
-        scanned_lines: 0,
+        ..HistoryReadPage::default()
     })
 }
 
@@ -778,7 +919,6 @@ async fn scan_history_prefix(
     let mut reader = BufReader::new(file);
     let mut remaining = prefix_bytes;
     let mut hasher = Sha256::new();
-    let mut line = Vec::new();
     let mut covered_loop_count = 0_u64;
     let mut covered_item_count = 0_u64;
     let mut last_loop_id = None;
@@ -788,94 +928,46 @@ async fn scan_history_prefix(
     let mut expected_item_index = 0_usize;
 
     while remaining > 0 {
-        let chunk = reader
-            .fill_buf()
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if chunk.is_empty() {
+        let BoundedLine::Complete(line) =
+            read_bounded_line(&mut reader, &mut remaining, None).await?
+        else {
             return Ok(None);
+        };
+        hasher.update(&line);
+        hasher.update(b"\n");
+        if line.is_empty() {
+            return Err(StoreError::Corrupt);
         }
-        let take = chunk
-            .len()
-            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        let bytes = &chunk[..take];
-        let mut segment_start = 0;
-        for (index, byte) in bytes.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
+        let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
+        let normalized = normalize_history(&record.items).map_err(corrupt)?;
+        for item in normalized.iter() {
+            let Some(expected) = expected_history.get(expected_item_index) else {
+                return Ok(None);
+            };
+            if item != expected {
+                return Ok(None);
             }
-            // Hash exactly through this newline, not the entire buffered
-            // chunk: later records may share the same BufReader buffer.
-            hasher.update(&bytes[segment_start..=index]);
-            let segment = &bytes[segment_start..index];
-            let line_length = line
-                .len()
-                .checked_add(segment.len())
-                .ok_or(StoreError::Corrupt)?;
-            if line_length > MAX_LOOP_RECORD_BYTES {
-                return Err(StoreError::Corrupt);
-            }
-            line.extend_from_slice(segment);
-            if line.is_empty() {
-                return Err(StoreError::Corrupt);
-            }
-            let record: StoredLoopRecord =
-                serde_json::from_slice(&line).map_err(|_| StoreError::Corrupt)?;
-            let normalized = normalize_history(&record.items).map_err(|_| StoreError::Corrupt)?;
-            for item in normalized.iter() {
-                let Some(expected) = expected_history.get(expected_item_index) else {
-                    return Ok(None);
-                };
-                let actual_bytes = serde_json::to_vec(item).map_err(|_| StoreError::Corrupt)?;
-                let expected_bytes =
-                    serde_json::to_vec(expected).map_err(|_| StoreError::Corrupt)?;
-                if actual_bytes != expected_bytes {
-                    return Ok(None);
-                }
-                expected_item_index = expected_item_index
-                    .checked_add(1)
-                    .ok_or(StoreError::Corrupt)?;
-            }
-            covered_loop_count = covered_loop_count
+            expected_item_index = expected_item_index
                 .checked_add(1)
                 .ok_or(StoreError::Corrupt)?;
-            covered_item_count = covered_item_count
-                .checked_add(u64::try_from(normalized.len()).map_err(|_| StoreError::Corrupt)?)
-                .ok_or(StoreError::Corrupt)?;
-            last_loop_id = Some(record.loop_id);
-            if max_prefix_items.is_some_and(|maximum| expected_item_index <= maximum) {
-                prefix = Some(HistoryPrefix {
-                    prefix_bytes: prefix_bytes - remaining
-                        + u64::try_from(index + 1).map_err(|_| StoreError::Corrupt)?,
-                    covered_loop_count,
-                    covered_item_count,
-                    last_loop_id,
-                    sha256: digest_hex(hasher.clone()),
-                });
-            }
-            line.clear();
-            segment_start = index + 1;
         }
-        if segment_start < bytes.len() {
-            let segment = &bytes[segment_start..];
-            hasher.update(segment);
-            let line_length = line
-                .len()
-                .checked_add(segment.len())
-                .ok_or(StoreError::Corrupt)?;
-            if line_length > MAX_LOOP_RECORD_BYTES {
-                return Err(StoreError::Corrupt);
-            }
-            line.extend_from_slice(segment);
+        covered_loop_count = covered_loop_count
+            .checked_add(1)
+            .ok_or(StoreError::Corrupt)?;
+        covered_item_count = covered_item_count
+            .checked_add(u64::try_from(normalized.len()).map_err(corrupt)?)
+            .ok_or(StoreError::Corrupt)?;
+        last_loop_id = Some(record.loop_id);
+        if max_prefix_items.is_some_and(|maximum| expected_item_index <= maximum) {
+            prefix = Some(HistoryPrefix {
+                prefix_bytes: prefix_bytes - remaining,
+                covered_loop_count,
+                covered_item_count,
+                last_loop_id,
+                sha256: digest_hex(hasher.clone()),
+            });
         }
-        reader.consume(take);
-        remaining -= u64::try_from(take).map_err(|_| StoreError::Corrupt)?;
-        // Keep a long ready-on-disk scan interruptible by the caller's timeout.
         tokio::task::yield_now().await;
-    }
-
-    if !line.is_empty() {
-        return Ok(None);
     }
     Ok(Some(CompactionAnchors {
         full: HistoryPrefix {
@@ -892,9 +984,7 @@ async fn scan_history_prefix(
 /// If the file ends without a newline, truncate it back to the last complete
 /// line. Returns whether a repair happened.
 async fn tail_repair(path: &Path, complete_offset: u64) -> Result<bool, StoreError> {
-    let metadata = fs::metadata(path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
+    let metadata = fs::metadata(path).await.map_err(unavailable)?;
     if metadata.len() == complete_offset {
         return Ok(false);
     }
@@ -902,10 +992,9 @@ async fn tail_repair(path: &Path, complete_offset: u64) -> Result<bool, StoreErr
         .write(true)
         .open(path)
         .await
-        .map_err(|_| StoreError::Unavailable)?;
-    file.set_len(complete_offset)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
-    file.flush().await.map_err(|_| StoreError::Unavailable)?;
+        .map_err(unavailable)?;
+    file.set_len(complete_offset).await.map_err(unavailable)?;
+    file.flush().await.map_err(unavailable)?;
+    file.sync_data().await.map_err(unavailable)?;
     Ok(true)
 }

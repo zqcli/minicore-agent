@@ -86,7 +86,7 @@ fn context(model: &Arc<Stub>) -> AutoContext {
     AutoContext {
         binding: crate::compaction::auto::AutoContextBinding {
             model: Arc::clone(model) as Arc<dyn Model>,
-            budget: Arc::new(crate::models::DefaultProviderBudget),
+            budget: Arc::new(crate::models::tests::DefaultProviderBudget),
             policy: super::super::CompactionPolicy {
                 enabled: true,
                 trigger_percent: 95,
@@ -507,7 +507,7 @@ fn usage_anchor_requires_matching_framing_and_projection_generation() {
         ),
         7_999
     );
-    let other_binding = Arc::new(crate::models::DefaultProviderBudget);
+    let other_binding = Arc::new(crate::models::tests::DefaultProviderBudget);
     assert_eq!(
         auto.state.threshold_estimate(
             model.descriptor(),

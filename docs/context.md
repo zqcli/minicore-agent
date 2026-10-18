@@ -11,7 +11,8 @@ and tool rounds.
   Runtime has already accepted the turn, so utility work never blocks RPC submit.
   Create/open, context reads and reload do not themselves invoke a model.
 - `history.jsonl` retains the complete sanitized turn and tool results. The Agent
-  appends before merging in-memory history; an append failure blocks later turns.
+  appends before merging in-memory history. An unknown append outcome blocks
+  later turns; a confirmed rollback preserves the old history and permits a retry.
   Reopen may truncate only a trailing incomplete line, not a malformed complete
   record. Provider-private fields excluded by sanitization are not promised to
   survive across turns.

@@ -272,14 +272,15 @@ impl PresentationInner {
             return None;
         }
         self.applied_steer = Some((applied_count, key));
+        let turn = TurnRef {
+            session_id,
+            loop_id: key.loop_id,
+        };
         Some(AgentEvent::SteerProgress {
-            turn: TurnRef {
-                session_id,
-                loop_id: key.loop_id,
-            },
+            turn,
             request_index: key.request_index,
             applied_count,
-            meta: EventMeta::for_loop(session_id, key.loop_id),
+            meta: EventMeta::for_turn(turn),
         })
     }
 }
@@ -391,14 +392,15 @@ impl Presentation {
                 inner.context = reported_context(usage, physical_window);
                 inner.context_settings = (settings.config_generation, settings.summary_generation);
             }
+            let turn = TurnRef {
+                session_id: self.session_id,
+                loop_id: key.loop_id,
+            };
             AgentEvent::RequestUsage {
-                turn: TurnRef {
-                    session_id: self.session_id,
-                    loop_id: key.loop_id,
-                },
+                turn,
                 request_index: key.request_index,
                 usage,
-                meta: EventMeta::for_loop(self.session_id, key.loop_id),
+                meta: EventMeta::for_turn(turn),
             }
         };
         let _ = self.events.try_send(event);
@@ -557,16 +559,17 @@ impl Presentation {
         let Some(key) = key else {
             return;
         };
+        let turn = TurnRef {
+            session_id: self.session_id,
+            loop_id: key.loop_id,
+        };
         let _ = self.events.try_send(AgentEvent::ToolPresentation {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id: key.loop_id,
-            },
+            turn,
             request_index: key.request_index,
             tool_call_id: tool_call_id.clone(),
             tool_name,
             display,
-            meta: EventMeta::for_loop(self.session_id, key.loop_id),
+            meta: EventMeta::for_turn(turn),
         });
     }
 

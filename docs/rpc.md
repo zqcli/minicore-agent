@@ -22,12 +22,13 @@ across deferred-waiter, signal, and writer-status wakeups, so a request may
 arrive in arbitrarily fragmented reads without losing its prefix. A frame's
 bytes leave the retained buffer only when the frame completes, at EOF, or when
 the frame is rejected as oversized, which discards the accumulated bytes and
-reports a parse error.
+reports a parse error, then stops the process through orderly shutdown. It does
+not discard just that line and resume accepting requests.
 
 ## Deferred Waiter Capacity
 
-At most 4 read queries may run at once, and at most 32 deferred waiters and
-read queries may be registered in total. When either limit is reached, further
+At most 4 read queries may run at once, and at most 32 deferred operations,
+waiters, and read queries may be registered in total. When either limit is reached, further
 deferred requests fail immediately with `-32019` (`resource_exhausted`,
 retryable). The reader remains serviceable, so a client can still use ping,
 cancel, and shutdown to drain or cancel its work.
@@ -70,13 +71,12 @@ be recovered.
 
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. Ordinary
-requests are dispatched sequentially. The server registers a bounded owned
-waiter/query task and immediately continues reading requests for `turn.wait`,
-`session.compact`, `session.read`, `workspace.read`, `workspace.files`,
-`workspace.search`, `workspace.status`, `changes.list`, `changes.diff`,
-`tool.read`, `tool.output`, and `turn.result`. `turn.send` uses the normal
-Session submit path and returns an installed Turn, without a startup summary
-worker or a deferred preparation waiter. A read-query waiter observes a result
+requests are admitted sequentially, but disk work and worker joins run in bounded
+owned tasks. This includes `agent.reload`, `session.list/create/open/close/delete`,
+`session.update/rename/compact`, `turn.send/wait`, and all read queries. Completed
+operations apply their results to the Agent on the dispatcher before replying.
+`turn.send` still returns an installed Turn without a startup summary worker.
+A read-query waiter observes a result
 but is not the worker owner. Workspace scan queries own one retained blocking worker and normally join
 it before returning; their Drop guard signals cooperative stop when the query
 future is dropped, but dropping an awaiter is not itself a join barrier. Session
@@ -92,10 +92,8 @@ The following orderings are not guaranteed:
 - a `turn.send` response before the corresponding `turn_started` event;
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
-- a deferred response for `turn.wait`, `session.compact`, `session.read`,
-  `workspace.read`, `workspace.files`, `workspace.search`, `workspace.status`,
-  `changes.list`, `changes.diff`, `tool.read`, `tool.output`, or `turn.result`
-  before responses to later requests.
+- any deferred response before responses to later requests. Wait for the response
+  before sending a request that depends on that operation completing.
 
 A successful persisted turn can reserve an independent post-turn compaction
 before publishing completion. `turn.wait` does not wait for that operation;
@@ -107,8 +105,10 @@ Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
 history query results, not the event stream.
 
-`agent.shutdown` waits for the Agent, its active workers, pre-existing
-waiter/query tasks, and event pump, then queues its response last. EOF, Ctrl-C,
+`agent.shutdown` first marks every loaded Session closing and broadcasts
+cancellation to its active loop, compaction, and queries. It then drains deferred
+operations and joins Sessions concurrently, plus pre-existing waiter/query tasks
+and the event pump, before queuing its response last. EOF, Ctrl-C,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
 MiniCore Agent v0.6.1 uses the Runtime user-cancellation path when closing or
 shutting down an active Session;
@@ -189,9 +189,12 @@ Agent-level `event_capacity` require restart.
 `Agent::open` creates an embedded Agent without a reload source and therefore
 returns `reload_unavailable`; the binary uses `Agent::open_file` so its startup
 configuration can be reloaded. A profile that names the removed `subagent`
-Tool fails the reload with `invalid_profile`; the current catalog, loaded
-Sessions, and configuration stay unchanged. A failed reload leaves the current
-catalog, loaded Sessions, and configuration unchanged. The reload operation
+Tool fails the reload with non-retryable `config_error` (`-32023`), as do other
+configuration failures. A failed reload leaves the current catalog, loaded
+Sessions, and configuration unchanged. Loading configuration runs off the
+dispatch loop; ping, cancellation, and shutdown remain serviceable. Reload and
+other pending deferred Agent operations are mutually exclusive: conflicting
+requests return `session_busy` rather than installing stale configuration. The reload operation
 does not reload the Agent binary or previously stored Session system-prompt
 snapshots; workspace `AGENTS.md` remains request-level behavior.
 
@@ -308,6 +311,13 @@ The result has a `session` member containing the created SessionInfo.
 
 ### Other Session Methods
 
+Pending `session.open`, `session.close`, and `session.delete` reserve their Session
+ID. A concurrent open/close/delete (or another mutating request) for that ID
+returns retryable `session_busy`. The reservation lasts through completion and
+response preparation. Open prepares disk data off the dispatch loop and installs
+it only on completion; close replies only after joining owned work. Other
+Sessions, ping, cancellation, and shutdown remain responsive.
+
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
@@ -334,12 +344,14 @@ The result has a `session` member containing the created SessionInfo.
   `auto-{completed_loop_id}` IDs do not consume that quota. The bounded manual
   set resets on close/reopen, and a new manual ID at
   the cap is rejected as invalid input. Compaction is admitted only for a
-  loaded, idle, settled, unblocked Session; a busy or duplicate request is
-  rejected. `turn.send` and `session.update` are also
+  loaded, idle, settled, unblocked Session. Other active work yields retryable
+  `session_busy`; reusing an operation ID yields non-retryable `invalid_state`. `turn.send` and `session.update` are also
   rejected while it is owned by the Session, while metadata-only
   `session.rename` remains allowed.
 - `session.compact.cancel` takes the same full identity and returns
-  `{"cancelled":true}` only when that exact operation is still owned. A wrong
+  `{"cancelled":true}` only when that exact operation is still owned. The identity
+  and cancellation token are registered at admission, before deferred preparation;
+  cancelling at that point prevents the summary model call. A wrong
   or stale ID returns `{"cancelled":false}` and, during that loaded Session
   lifetime, cannot cancel a later operation. Cancellation is cooperative; a
   write already in its atomic commit phase is allowed to finish and an uncertain
@@ -556,10 +568,15 @@ Cost and subscription fields remain `null` without a reliable provider source.
 `session.read` is a read-only query. It does not load a closed Session, open its
 Workspace, validate the configured Model, initialize Tools or PromptProvider,
 start a loop, repair `history.jsonl`, or update `session.json`. An already loaded
-Session is read from one committed in-memory snapshot and is bounded by that
-snapshot's item count. The query therefore continues to work for a closed
-Session whose Workspace was deleted or whose Model/Profile is no longer
-configured.
+Session uses its committed snapshot's item count and an in-memory index of
+complete JSONL lines. The index supplies prefix offsets and SHA-256 revisions;
+only the lines needed for the page are read and parsed. The index is built with
+loaded data and published only when the Session is installed; failed or cancelled
+opens leave cold reads unindexed. It is extended on append and discarded on
+unload. Loaded canonical/display reads and
+stored `turn.result` lookups do not rescan the full file. The query also works
+for a closed Session whose Workspace was deleted or whose Model/Profile is no
+longer configured.
 
 ```json
 {
@@ -598,13 +615,21 @@ only summaries for turns represented by at least one item chunk in this
 response; a small byte budget therefore does not inherit summaries for items
 that were not emitted. `history_revision` is a SHA-256 of the
 captured complete prefix ending at `captured_end`. Continuation requests must
-send both values; a same-length replacement or a non-boundary prefix returns
-`invalid_state`. A final incomplete JSONL tail is reported as
-`trailing_incomplete` and is never repaired. If the read-only scan reaches its
-work/deadline/cancellation bound before establishing the requested prefix, it
-returns retryable `query_limit` rather than claiming a complete total; retrying
-with a smaller `limit` can reduce retained source work. The item chunks remain
-the continuation mechanism when one item itself is larger than the page.
+send both values; a changed revision or a non-boundary prefix returns
+`invalid_state`. Revision bytes are identical across load/unload. The loaded
+index is authoritative; external modifications while a Session is loaded are
+not supported. Cold scans detect even same-length replacements. A final
+incomplete JSONL tail is reported by cold reads as `trailing_incomplete` and is
+never repaired by a query.
+
+Unloaded Session scans are limited to 64 MiB, 100,000 complete lines, and a
+10-second deadline, with cancellation support. Exceeding a scan bound returns
+`query_limit`, not a partial total. Reducing `limit` may reduce retained source
+work but cannot overcome the cold prefix-scan ceiling; load the Session to use
+indexed reads for larger histories. Loaded queries retain per-query byte, line,
+deadline, and cancellation bounds on the selected lines, not the full prefix.
+The item chunks remain the continuation mechanism when one item itself is
+larger than the page.
 
 #### Display projection
 
@@ -837,11 +862,16 @@ response arrives:
 
 `outcome.type` is `completed`, `cancelled` (with `reason`), or `failed` (with
 `kind` and optionally `model_error`). `persistence` is `persisted` or `failed`.
-`persistence: persisted` means the Agent's append operation completed
-successfully in the running process. The Store is not a transactional ledger and
-does not provide an end-to-end crash-durability proof. A failed JSONL append
-returns the completed loop report with `persistence: failed` and blocks the
-Session from further turns.
+`persistence: persisted` means the Agent's history append and `sync_data`
+completed. Metadata/summary replacements sync the parent directory after rename;
+creating a Session and repairing a partial history tail are also synced. These
+writes are not a transaction across all Session files. A failed JSONL append
+returns the completed loop report with `persistence: failed` and leaves committed
+in-memory history unchanged. If the record was rejected before writing, or a
+failed write was rolled back to the previous length and synced, the Session
+remains usable. Only a failed rollback leaves an uncertain append outcome and
+blocks further turns (`block_reason: "persistence"`); close/reopen is required.
+An uncertain failed turn may be present on disk after reopening.
 
 ### `turn.result`
 
@@ -1050,13 +1080,25 @@ never reports a fabricated exit code. A requested `cancel` is recorded as
 process.
 
 `execution.recording` reports the auxiliary write result: `memory_only`,
-`saved`, or `failed`. Saving follows main History persistence and precedes Turn
-completion. A failed auxiliary save does not change the real tool outcome or
-main Turn persistence, and retained memory remains readable. `saved` is not a
+`saved`, or `failed`. Saving runs after authoritative Turn completion is
+published, inside the owned Session task; close/shutdown still join it.
+`turn.wait` and `turn.result` do not wait for this best-effort save, so a completed
+Turn may temporarily report `memory_only`. A failed auxiliary save does not
+change the real tool outcome or main Turn persistence, and retained memory
+remains readable. `saved` is not a
 promise of indefinite retention: the Store applies per-tool (3 MiB), per-Session
 (16 MiB/1024 records), and Store-wide (256 MiB/8192 records) auxiliary budgets.
-These budgets coordinate one Store and its clones; independent writers sharing
-a data directory are not supported. Public queries prefer loaded memory and use
+A shared in-memory ledger is initialized by one directory scan, then updated
+on commit, oldest-first eviction, and Session deletion. Failed or cancelled
+record eviction and failed temporary-file cleanup invalidate it so the next
+reservation accounts for surviving bytes. Removing an empty `tools/` parent is
+best-effort and does not undo successful record eviction. Entry-local metadata
+or enumeration failures are warned about and skipped, retaining known byte
+counts; Store-root and deadline failures still fail the scan. Foreign or corrupt
+entries are warned about and skipped without following symlinks; known bytes
+still count against the budgets. These budgets coordinate one Store and its
+clones; independent writers or external data-directory changes during the
+Store's lifetime are not supported. Public queries prefer loaded memory and use
 durable auxiliary storage for unloaded Sessions or evicted bytes.
 
 `availability` is per stream: `pending` while the call is still running and
@@ -1086,7 +1128,7 @@ Session. It does not create, open, or load a Session, does not start a model
 call, does not append history, and does not mutate the file, so a frontend can
 page through a file while a turn is in flight. A closed or unknown Session is
 rejected with `-32002` (`session_not_loaded`); closing the owning Session
-cancels its in-flight reads with `-32020` (`query_limit`). The query never
+cancels its in-flight reads with `-32002` (`session_not_loaded`). The query never
 derives a root from a path. It holds one of the 4 concurrent read-query slots
 described above.
 
@@ -1189,7 +1231,10 @@ and `too_large` return empty content, no next range, and `truncated: false`.
 
 Cancellation and deadlines wrap the actual IO: the session close token, RPC
 shutdown, and the shared 10 s query deadline each interrupt a pending open,
-read, or metadata call and return retryable `-32020` (`query_limit`). Finishing
+read, or metadata call. Session closure returns non-retryable `-32002`
+(`session_not_loaded`); caller cancellation or a deadline returns retryable
+`-32020` (`query_limit`). Caller/RPC cancellation takes precedence over Session
+closure when both tokens are cancelled, so shutdown reports `query_limit`. Finishing
 or cancelling a query releases its slot, and shutdown cancels and joins all
 owned queries before the shutdown response.
 
@@ -1298,8 +1343,9 @@ operations. When it expires the scan stops with `stopped_by: deadline`, keeps th
 entries already found, reports `truncated` with `scan_complete: false`, and
 returns no `next_cursor` on purpose: a timeout is answered with a narrower
 request or a later retry, never with a continuation. Session close, RPC shutdown,
-and caller cancellation are not stops: they fail the query with `-32020`, and the
-worker is joined before that error is returned. A single blocking read on a
+and caller cancellation are not stops: caller/RPC cancellation yields `-32020`
+(`query_limit`), taking precedence over Session closure (`-32002`,
+`session_not_loaded`). The worker is joined before that error is returned. A single blocking read on a
 stalled remote filesystem can outlast the deadline, so the timeout is enforced
 at operation granularity rather than as a hard preemption guarantee; results
 already produced still appear in the partial page. `truncated` is true whenever
@@ -1688,9 +1734,20 @@ context, and hunk/line/offset; `base_version` and `target_version` are carried
 by the result. A different diff returns `stale: true` instead of continuing a
 new comparison under an old cursor. A start tuple that is not a real position
 inside the plan (a hunk/line index past its range, a byte offset past the line,
-or a non-UTF-8-boundary offset) is rejected as invalid arguments. The CPU
-comparison runs under one absolute deadline in an owned Store worker set
-(max four). `DiffQuery` is a wait-only observation handle; its Drop
+or a non-UTF-8-boundary offset) is rejected as invalid arguments. Cursors do
+not contain a `tool_ref` lookup hint; clients must return the cursor as issued.
+
+Alignment is deterministic: common leading and trailing lines are trimmed,
+then Myers runs without an algorithm deadline when the remaining middle has
+at most 2,048 lines across both sides. Larger middles are emitted as one
+replacement hunk (with the requested surrounding context). This coarser
+alignment retains every changed byte; it does not by itself set `truncated`.
+The fingerprint includes the alignment path, so CPU load cannot invalidate a
+continuation. The separate 100,000 combined-line ceiling still returns a
+truncated plan without hunks. Query cancellation or deadline expiry returns
+`query_limit`, never a time-dependent partial alignment.
+
+The comparison runs in an owned Store worker set (max four). `DiffQuery` is a wait-only observation handle; its Drop
 unconditionally calls `child_cancel.cancel()`, which requests child stop but is
 not the Store ownership or cleanup barrier. Store ownership retains the join
 handle; Session close joins that Session's workers, while Agent shutdown joins
@@ -1823,10 +1880,16 @@ errors:
 | `-32020` | `query_limit` |
 | `-32021` | `tool_not_found` |
 | `-32022` | `context_uncompressible` |
+| `-32023` | `config_error` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or
-panic payload.
+panic payload. `store_error` is retryable for temporary Store unavailability,
+not corrupt or invalid stored data. An `interaction.answer` after its turn ended
+returns `turn_not_found`, matching `turn.steer`. Duplicate compaction IDs and
+configuration errors are non-retryable. Query cancellation/deadlines return
+`query_limit`; closure of the owning Session returns `session_not_loaded`.
+Caller/RPC cancellation wins when both cancellation sources are signalled.
 
 ## Presentation Data And Local Permission
 

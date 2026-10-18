@@ -44,6 +44,8 @@ pub use crate::sessions::{
     SessionContext, SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult,
 };
 
+type AgentFuture<T> = futures_util::future::BoxFuture<'static, Result<T, AgentError>>;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RPC_PROTOCOL_VERSION: u32 = 1;
 pub const RPC_CAPABILITIES: &[&str] = &[
@@ -134,6 +136,12 @@ pub struct UpdateSession {
     pub reasoning: Option<ReasoningPreference>,
 }
 
+impl UpdateSession {
+    pub(crate) fn has_field(&self) -> bool {
+        self.model.is_some() || self.reasoning.is_some()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenameSession {
@@ -187,6 +195,12 @@ impl SessionInfo {
     }
 }
 
+pub(crate) struct PreparedSession {
+    stored: crate::store::StoredSession,
+    workspace: Arc<Workspace>,
+    compaction: Arc<CompactionState>,
+}
+
 struct ResolvedSessionSettings {
     profile: String,
     model: String,
@@ -196,19 +210,49 @@ struct ResolvedSessionSettings {
 struct ExecutionConfigFactory<'a> {
     models: &'a Models,
     command_environment: &'a CommandEnvironment,
-    compaction: Arc<CompactionState>,
     policy: crate::compaction::CompactionPolicy,
 }
 
 impl ExecutionConfigFactory<'_> {
+    fn setup(
+        &self,
+        record: &SessionRecord,
+        workspace: Arc<Workspace>,
+        options: LoopOptions,
+        compaction: Arc<CompactionState>,
+        events: &AgentEventSink,
+    ) -> Result<SessionSetup, AgentError> {
+        let presentation = crate::presentation::Presentation::new(
+            record.session_id,
+            events.clone(),
+            Arc::clone(&compaction),
+        );
+        presentation.set_model_label(record.model.clone());
+        let tool_data = Arc::new(ToolData::new());
+        let command_owners = CommandOwners::new();
+        let observer = ToolObserver::new(record.session_id, Arc::clone(&tool_data), events.clone());
+        let parts = SessionParts {
+            presentation,
+            observer,
+            command_owners,
+            compaction,
+        };
+        let (config, auto) = self.build(record, workspace, &parts, &options)?;
+        Ok(SessionSetup {
+            parts,
+            tool_data,
+            config,
+            auto,
+            options,
+        })
+    }
+
     fn build(
         &self,
         record: &SessionRecord,
         workspace: Arc<Workspace>,
-        presentation: Arc<crate::presentation::Presentation>,
-        observer: Arc<ToolObserver>,
-        command_owners: Arc<CommandOwners>,
-        options: LoopOptions,
+        parts: &SessionParts,
+        options: &LoopOptions,
     ) -> Result<(ExecutionConfig, Option<AutoContext>), AgentError> {
         let model = self
             .models
@@ -229,7 +273,7 @@ impl ExecutionConfigFactory<'_> {
                 policy: self.policy,
                 limits: options.limits,
             },
-            state: Arc::clone(&self.compaction),
+            state: Arc::clone(&parts.compaction),
         });
         // The binding is published only when the Session actually installs
         // this config (`Session::new`/`update`/`replace_future_config`).
@@ -241,7 +285,7 @@ impl ExecutionConfigFactory<'_> {
         // behavior) instead of paying the wrapper's per-request content and
         // ticket hashing for nothing.
         let model: Arc<dyn minicore_runtime::model::Model> = if auto.is_some() {
-            crate::compaction::CompactingModel::new(model, budget, Arc::clone(&self.compaction))
+            crate::compaction::CompactingModel::new(model, budget, Arc::clone(&parts.compaction))
         } else {
             model
         };
@@ -249,17 +293,17 @@ impl ExecutionConfigFactory<'_> {
             model,
             self.models
                 .physical_context_window(&record.model)
-                .unwrap_or(0),
-            Arc::clone(&presentation),
-            Arc::clone(&observer),
+                .expect("validated model"),
+            Arc::clone(&parts.presentation),
+            Arc::clone(&parts.observer),
         );
         let tools = crate::tools::build_tools_with_presentation(
             &record.tools,
             Arc::clone(&workspace),
             self.command_environment.clone(),
-            &presentation,
-            &observer,
-            &command_owners,
+            &parts.presentation,
+            &parts.observer,
+            &parts.command_owners,
         )
         .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
@@ -267,7 +311,7 @@ impl ExecutionConfigFactory<'_> {
         } else {
             Some(crate::presentation::PresentationPolicy::new_with_observer(
                 Arc::new(Policy::new(record.approval)),
-                Arc::clone(&observer),
+                Arc::clone(&parts.observer),
             ))
         };
         let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
@@ -275,12 +319,12 @@ impl ExecutionConfigFactory<'_> {
                 ProjectPromptProvider::with_auto(
                     workspace,
                     record.system_prompt.clone(),
-                    Arc::clone(&self.compaction),
+                    Arc::clone(&parts.compaction),
                     auto.clone(),
                 )
                 .map_err(|_| AgentError::InvalidSessionSettings)?,
             ),
-            presentation,
+            Arc::clone(&parts.presentation),
         );
         let config = ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
             .map_err(|_| AgentError::InvalidSessionSettings)?;
@@ -288,15 +332,19 @@ impl ExecutionConfigFactory<'_> {
     }
 }
 
-struct SessionSetup {
-    presentation: Arc<crate::presentation::Presentation>,
-    tool_data: Arc<ToolData>,
-    command_owners: Arc<CommandOwners>,
-    observer: Arc<ToolObserver>,
-    config: ExecutionConfig,
-    auto: Option<AutoContext>,
-    options: LoopOptions,
-    compaction: Arc<CompactionState>,
+pub(crate) struct SessionParts {
+    pub(crate) presentation: Arc<crate::presentation::Presentation>,
+    pub(crate) command_owners: Arc<CommandOwners>,
+    pub(crate) observer: Arc<ToolObserver>,
+    pub(crate) compaction: Arc<CompactionState>,
+}
+
+pub(crate) struct SessionSetup {
+    pub(crate) parts: SessionParts,
+    pub(crate) tool_data: Arc<ToolData>,
+    pub(crate) config: ExecutionConfig,
+    pub(crate) auto: Option<AutoContext>,
+    pub(crate) options: LoopOptions,
 }
 
 /// Top-level coordinator for the local Store and loaded Sessions.
@@ -318,6 +366,18 @@ pub struct Agent {
 }
 
 impl Agent {
+    fn execution_factory(&self) -> ExecutionConfigFactory<'_> {
+        ExecutionConfigFactory {
+            models: &self.models,
+            command_environment: &self.command_environment,
+            policy: self.config.compaction.policy(),
+        }
+    }
+
+    fn session(&self, id: crate::ids::SessionId) -> Result<&crate::sessions::Session, AgentError> {
+        self.sessions.get(id).ok_or(AgentError::SessionNotLoaded)
+    }
+
     pub async fn open(config: AgentConfig) -> Result<Self, AgentError> {
         config.validate().map_err(AgentError::Config)?;
         let models = Models::from_config(&config.models)
@@ -337,15 +397,6 @@ impl Agent {
         Self::open_parts(config, models, Some(path)).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn open_with_models(
-        config: AgentConfig,
-        models: Models,
-    ) -> Result<Self, AgentError> {
-        config.validate().map_err(AgentError::Config)?;
-        Self::open_parts(config, models, None).await
-    }
-
     async fn open_parts(
         config: AgentConfig,
         models: Models,
@@ -353,9 +404,7 @@ impl Agent {
     ) -> Result<Self, AgentError> {
         let command_environment = command_environment(&config);
         let profiles = config.profiles();
-        let store = Store::open(config.data_dir.clone())
-            .await
-            .map_err(crate::sessions::map_store_error)?;
+        let store = Store::open(config.data_dir.clone()).await?;
         let (events_tx, events_rx) = mpsc::channel(config.event_capacity);
         let event_sink = AgentEventSink::new(events_tx);
         let agent = Self {
@@ -380,46 +429,33 @@ impl Agent {
     /// Reloads the retained startup file into future-turn state. The
     /// fallible candidate build completes before any in-memory swap.
     pub async fn reload(&mut self) -> Result<ReloadResult, AgentError> {
+        let (config, models) = self.prepare_reload()?.await?;
+        self.apply_reload_settings(config, models)
+    }
+
+    pub(crate) fn prepare_reload(&self) -> Result<AgentFuture<(AgentConfig, Models)>, AgentError> {
         let path = self
             .config_path
             .clone()
             .ok_or(AgentError::ReloadUnavailable)?;
-        let config = AgentConfig::load(&path).map_err(AgentError::Config)?;
-        self.reload_settings(config).await
+        let data_dir = self.config.data_dir.clone();
+        let event_capacity = self.config.event_capacity;
+        Ok(Box::pin(async move {
+            let config = tokio::task::spawn_blocking(move || AgentConfig::load(&path))
+                .await
+                .map_err(|_| AgentError::Internal)?
+                .map_err(AgentError::Config)?;
+            if config.data_dir != data_dir || config.event_capacity != event_capacity {
+                return Err(AgentError::ReloadRequiresRestart);
+            }
+            let models = Models::from_config(&config.models)
+                .await
+                .map_err(map_model_config_error)?;
+            Ok((config, models))
+        }))
     }
 
-    pub(crate) async fn reload_settings(
-        &mut self,
-        candidate: AgentConfig,
-    ) -> Result<ReloadResult, AgentError> {
-        candidate.validate().map_err(AgentError::Config)?;
-        if candidate.data_dir != self.config.data_dir
-            || candidate.event_capacity != self.config.event_capacity
-        {
-            return Err(AgentError::ReloadRequiresRestart);
-        }
-        let models = Models::from_config(&candidate.models)
-            .await
-            .map_err(map_model_config_error)?;
-        self.apply_reload_settings(candidate, models)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reload_settings_with_models(
-        &mut self,
-        candidate: AgentConfig,
-        models: Models,
-    ) -> Result<ReloadResult, AgentError> {
-        candidate.validate().map_err(AgentError::Config)?;
-        if candidate.data_dir != self.config.data_dir
-            || candidate.event_capacity != self.config.event_capacity
-        {
-            return Err(AgentError::ReloadRequiresRestart);
-        }
-        self.apply_reload_settings(candidate, models)
-    }
-
-    fn apply_reload_settings(
+    pub(crate) fn apply_reload_settings(
         &mut self,
         candidate: AgentConfig,
         models: Models,
@@ -430,24 +466,15 @@ impl Agent {
         for session in self.sessions.iter() {
             let record = session.record();
             let workspace = session.workspace();
-            let presentation = session.presentation();
             let options = candidate
-                .loop_options_for_model(record.max_tool_rounds, &record.model)
+                .loop_options_for_model(&record.model)
                 .map_err(AgentError::Config)?;
             let factory = ExecutionConfigFactory {
                 models: &models,
                 command_environment: &command_environment,
-                compaction: session.compaction_state(),
                 policy: candidate.compaction.policy(),
             };
-            let (config, auto) = factory.build(
-                &record,
-                workspace,
-                presentation,
-                session.tool_observer(),
-                session.command_owners(),
-                options.clone(),
-            )?;
+            let (config, auto) = factory.build(&record, workspace, &session.parts(), &options)?;
             session_candidates.push((
                 session.clone(),
                 config,
@@ -498,36 +525,28 @@ impl Agent {
         &self,
         request: ReadSession,
     ) -> Result<ReadSessionResult, AgentError> {
-        let loaded = self.loaded_session(request.session_id);
-        tokio::time::timeout(
-            crate::read::READ_DEADLINE,
-            crate::read::read_session(
-                self.store.clone(),
-                loaded,
-                request,
-                CancellationToken::new(),
-            ),
+        request.validate()?;
+        crate::queries::prepare_session_read(
+            self.store.clone(),
+            self.loaded_session(request.session_id),
+            request,
+            CancellationToken::new(),
         )
         .await
-        .map_err(|_| AgentError::QueryLimit)?
     }
 
     pub async fn turn_result(
         &self,
         request: TurnResultRequest,
     ) -> Result<TurnResultPage, AgentError> {
-        let loaded = self.loaded_session(request.turn.session_id);
-        tokio::time::timeout(
-            crate::read::READ_DEADLINE,
-            crate::read::turn_result(
-                self.store.clone(),
-                loaded,
-                request,
-                CancellationToken::new(),
-            ),
+        request.validate()?;
+        crate::queries::prepare_turn_result(
+            self.store.clone(),
+            self.loaded_session(request.turn.session_id),
+            request,
+            CancellationToken::new(),
         )
         .await
-        .map_err(|_| AgentError::QueryLimit)?
     }
 
     /// Reads one bounded page of a workspace file. Only a loaded Session
@@ -538,22 +557,8 @@ impl Agent {
         request: crate::WorkspaceReadRequest,
     ) -> Result<crate::WorkspaceReadResult, AgentError> {
         request.validate()?;
-        let session = self
-            .loaded_session(request.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        let session_cancellation = session.query_cancellation();
-        let workspace = session.workspace();
-        tokio::time::timeout(
-            crate::workspace::query::WORKSPACE_READ_DEADLINE,
-            crate::workspace::query::read(
-                workspace,
-                request,
-                session_cancellation,
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .map_err(|_| AgentError::QueryLimit)?
+        let session = self.session(request.session_id)?.clone();
+        crate::queries::prepare_workspace_read(session, request, CancellationToken::new()).await
     }
 
     /// Lists one bounded page of Workspace entries. Only a loaded Session
@@ -566,18 +571,8 @@ impl Agent {
         request: crate::WorkspaceFilesRequest,
     ) -> Result<crate::WorkspaceFilesResult, AgentError> {
         request.validate()?;
-        let session = self
-            .loaded_session(request.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        let session_cancellation = session.query_cancellation();
-        let workspace = session.workspace();
-        crate::workspace::listing::files(
-            workspace,
-            request,
-            session_cancellation,
-            CancellationToken::new(),
-        )
-        .await
+        let session = self.session(request.session_id)?.clone();
+        crate::queries::prepare_workspace_files(session, request, CancellationToken::new()).await
     }
 
     /// Searches one bounded page of literal matches in Workspace files. Only a
@@ -588,18 +583,8 @@ impl Agent {
         request: crate::WorkspaceSearchRequest,
     ) -> Result<crate::WorkspaceSearchResult, AgentError> {
         request.validate()?;
-        let session = self
-            .loaded_session(request.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        let session_cancellation = session.query_cancellation();
-        let workspace = session.workspace();
-        crate::workspace::search::search(
-            workspace,
-            request,
-            session_cancellation,
-            CancellationToken::new(),
-        )
-        .await
+        let session = self.session(request.session_id)?.clone();
+        crate::queries::prepare_workspace_search(session, request, CancellationToken::new()).await
     }
 
     /// Observes the Workspace's Git status. Only a loaded Session locates its
@@ -611,9 +596,7 @@ impl Agent {
         request: crate::WorkspaceStatusRequest,
     ) -> Result<crate::WorkspaceStatusResult, AgentError> {
         request.validate()?;
-        let session = self
-            .loaded_session(request.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(request.session_id)?.clone();
         // The Session owns the worker that runs the query, so closing the
         // Session stops and reaps this query's child even if this caller goes
         // away first. Registration happens synchronously inside `prepare`.
@@ -685,7 +668,7 @@ impl Agent {
         request: crate::tool_data::ToolReadRequest,
     ) -> Result<crate::tool_data::ToolReadResult, AgentError> {
         let tool_data = self.tool_data(request.tool_ref.session_id).ok();
-        crate::read::tool_read(
+        crate::queries::prepare_tool_read(
             self.store.clone(),
             tool_data,
             request,
@@ -702,7 +685,7 @@ impl Agent {
         request: crate::tool_data::ToolOutputRequest,
     ) -> Result<crate::tool_data::ToolOutputPage, AgentError> {
         let tool_data = self.tool_data(request.tool_ref.session_id).ok();
-        crate::read::tool_output(
+        crate::queries::prepare_tool_output(
             self.store.clone(),
             tool_data,
             request,
@@ -730,11 +713,11 @@ impl Agent {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, AgentError> {
-        let records = self
-            .store
-            .list_sessions()
-            .await
-            .map_err(crate::sessions::map_store_error)?;
+        let records = self.store.list_sessions().await?;
+        Ok(self.session_infos(records))
+    }
+
+    pub(crate) fn session_infos(&self, records: Vec<SessionRecord>) -> Vec<SessionInfo> {
         let mut sessions = Vec::with_capacity(records.len());
         for record in records {
             let session_id = record.session_id;
@@ -745,54 +728,76 @@ impl Agent {
             }
         }
         sessions.sort_by_key(|info| info.session_id);
-        Ok(sessions)
+        sessions
     }
 
     pub async fn create_session(
         &mut self,
         request: CreateSession,
     ) -> Result<SessionInfo, AgentError> {
+        let session_id = crate::ids::SessionId::new().map_err(|_| AgentError::Internal)?;
+        let (stored, workspace, setup) = self.prepare_create(request, session_id)?.await?;
+        Ok(self.install_session(stored, workspace, setup))
+    }
+
+    pub(crate) fn prepare_create(
+        &self,
+        request: CreateSession,
+        session_id: crate::ids::SessionId,
+    ) -> Result<AgentFuture<(crate::store::StoredSession, Arc<Workspace>, SessionSetup)>, AgentError>
+    {
         let settings = self.resolve_session_settings(&request)?;
         let profile = self
             .profiles
             .get(&settings.profile)
             .cloned()
             .ok_or(AgentError::ProfileNotFound)?;
-        let workspace = Arc::new(
-            Workspace::open(request.workspace)
-                .await
-                .map_err(|_| AgentError::Workspace)?,
-        );
-        let canonical_workspace = workspace.root().to_path_buf();
-        let session_id = crate::ids::SessionId::new().map_err(|_| AgentError::Internal)?;
-        let record = build_record(
-            session_id,
-            &settings,
-            &profile,
-            request.title,
-            canonical_workspace,
-        )?;
         let options = self
             .config
-            .loop_options_for_model(record.max_tool_rounds, &record.model)
+            .loop_options_for_model(&settings.model)
             .map_err(AgentError::Config)?;
-        let compaction = CompactionState::new();
-        // Every predictable configuration error must fail before the store write.
-        let setup =
-            self.prepare_session_setup(&record, Arc::clone(&workspace), options, compaction)?;
-        self.store
-            .create_session(&record)
-            .await
-            .map_err(crate::sessions::map_store_error)?;
-        let info = self.install_session(
-            record,
-            workspace,
-            Vec::new().into(),
-            std::collections::HashMap::new(),
-            setup,
-        );
-        tracing::info!(session_id = %session_id, "session created");
-        Ok(info)
+        let models = self.models.clone();
+        let command_environment = self.command_environment.clone();
+        let policy = self.config.compaction.policy();
+        let store = self.store.clone();
+        let events = self.event_sink.clone();
+        Ok(Box::pin(async move {
+            let workspace = Arc::new(
+                Workspace::open(request.workspace)
+                    .await
+                    .map_err(|_| AgentError::Workspace)?,
+            );
+            let record = build_record(
+                session_id,
+                &settings,
+                &profile,
+                request.title,
+                workspace.root().to_path_buf(),
+            )?;
+            let setup = ExecutionConfigFactory {
+                models: &models,
+                command_environment: &command_environment,
+                policy,
+            }
+            .setup(
+                &record,
+                Arc::clone(&workspace),
+                options,
+                CompactionState::new(),
+                &events,
+            )?;
+            store.create_session(&record).await?;
+            Ok((
+                crate::store::StoredSession {
+                    record,
+                    history: Vec::new().into(),
+                    history_index: Vec::new(),
+                    user_times: Default::default(),
+                },
+                workspace,
+                setup,
+            ))
+        }))
     }
 
     pub async fn open_session(
@@ -800,22 +805,23 @@ impl Agent {
         session_id: crate::ids::SessionId,
     ) -> Result<SessionInfo, AgentError> {
         if let Some(session) = self.sessions.get(session_id) {
-            tracing::debug!(session_id = %session_id, "session already loaded");
             return Ok(session.info(true));
         }
-        let record = self
-            .store
-            .load_record(session_id)
-            .await
-            .map_err(crate::sessions::map_store_error)?;
+        let prepared = Self::prepare_open(self.store.clone(), session_id).await?;
+        self.install_open(prepared)
+    }
+
+    pub(crate) async fn prepare_open(
+        store: Store,
+        session_id: crate::ids::SessionId,
+    ) -> Result<PreparedSession, AgentError> {
+        // load_session repairs incomplete history tails. Reject removed tool
+        // settings before that write: unsupported sessions remain read-only.
+        let record = store.load_record(session_id).await?;
         if contains_removed_tool(&record.tools) {
             return Err(AgentError::InvalidSessionSettings);
         }
-        let stored = self
-            .store
-            .load_session(session_id)
-            .await
-            .map_err(crate::sessions::map_store_error)?;
+        let stored = store.load_session(session_id).await?;
         if contains_removed_tool(&stored.record.tools) {
             return Err(AgentError::InvalidSessionSettings);
         }
@@ -837,24 +843,36 @@ impl Agent {
             );
             return Err(AgentError::Workspace);
         }
+        let compaction = load_state(&store, session_id, &stored.history).await;
+        Ok(PreparedSession {
+            stored,
+            workspace,
+            compaction,
+        })
+    }
+
+    pub(crate) fn install_open(
+        &mut self,
+        prepared: PreparedSession,
+    ) -> Result<SessionInfo, AgentError> {
+        let PreparedSession {
+            stored,
+            workspace,
+            compaction,
+        } = prepared;
+        let session_id = stored.record.session_id;
         let options = self
             .config
-            .loop_options_for_model(stored.record.max_tool_rounds, &stored.record.model)
+            .loop_options_for_model(&stored.record.model)
             .map_err(AgentError::Config)?;
-        let compaction = load_state(&self.store, session_id, &stored.history).await;
-        let setup = self.prepare_session_setup(
+        let setup = self.execution_factory().setup(
             &stored.record,
             Arc::clone(&workspace),
             options,
             compaction,
+            &self.event_sink,
         )?;
-        let info = self.install_session(
-            stored.record,
-            workspace,
-            stored.history,
-            stored.user_times,
-            setup,
-        );
+        let info = self.install_session(stored, workspace, setup);
         tracing::info!(session_id = %session_id, "session opened");
         Ok(info)
     }
@@ -869,28 +887,22 @@ impl Agent {
         &mut self,
         session_id: crate::ids::SessionId,
     ) -> Result<(), AgentError> {
-        let session = self
-            .sessions
-            .get(session_id)
-            .cloned()
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(session_id)?.clone();
         let result = session.shutdown().await;
+        self.finish_close(session_id);
+        result
+    }
+
+    pub(crate) fn finish_close(&mut self, session_id: crate::ids::SessionId) {
         // The map retains the Session until its complete shutdown barrier has
         // joined every owned task. This prevents a dropped local owner from
         // detaching a manual-compaction worker during close.
         self.sessions.remove(session_id);
         self.event_sink.try_send(AgentEvent::SessionClosed {
             session_id,
-            meta: EventMeta {
-                session_id,
-                loop_id: None,
-                dropped_before: 0,
-            },
+            meta: EventMeta::session(session_id),
         });
-        if result.is_ok() {
-            tracing::info!(session_id = %session_id, "session closed");
-        }
-        result
+        tracing::info!(session_id = %session_id, "session closed");
     }
 
     pub async fn delete_session(
@@ -904,7 +916,7 @@ impl Agent {
             .store
             .delete_session(session_id)
             .await
-            .map_err(crate::sessions::map_store_error);
+            .map_err(AgentError::from);
         if result.is_ok() {
             tracing::info!(session_id = %session_id, "session deleted");
         }
@@ -935,15 +947,18 @@ impl Agent {
         &mut self,
         request: UpdateSession,
     ) -> Result<SessionUpdateResult, AgentError> {
-        if request.model.is_none() && request.reasoning.is_none() {
+        self.prepare_update(request)?.await
+    }
+
+    pub(crate) fn prepare_update(
+        &self,
+        request: UpdateSession,
+    ) -> Result<AgentFuture<SessionUpdateResult>, AgentError> {
+        if !request.has_field() {
             return Err(AgentError::InvalidArguments);
         }
         let session_id = request.session_id;
-        let session = self
-            .sessions
-            .get(session_id)
-            .cloned()
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(session_id)?.clone();
         let workspace = session.workspace();
         let mut candidate = session.record();
         if let Some(model) = &request.model {
@@ -954,25 +969,21 @@ impl Agent {
         }
         let options = self
             .config
-            .loop_options_for_model(candidate.max_tool_rounds, &candidate.model)
+            .loop_options_for_model(&candidate.model)
             .map_err(AgentError::Config)?;
-        let (config, auto) = self.execution_config(
-            &candidate,
-            workspace,
-            session.presentation(),
-            session.tool_observer(),
-            session.command_owners(),
-            options.clone(),
-            session.compaction_state(),
-            session.policy(),
-        )?;
-        let active_revision = session
-            .update(candidate.clone(), config, auto, options)
-            .await?;
-        Ok(SessionUpdateResult {
-            session: session.info(true),
-            active_revision,
-        })
+        let (config, auto) = ExecutionConfigFactory {
+            models: &self.models,
+            command_environment: &self.command_environment,
+            policy: session.policy(),
+        }
+        .build(&candidate, workspace, &session.parts(), &options)?;
+        Ok(Box::pin(async move {
+            let active_revision = session.update(candidate, config, auto, options).await?;
+            Ok(SessionUpdateResult {
+                session: session.info(true),
+                active_revision,
+            })
+        }))
     }
 
     /// Returns only after the updated SessionInfo is persisted successfully.
@@ -983,86 +994,79 @@ impl Agent {
         &mut self,
         request: RenameSession,
     ) -> Result<SessionInfo, AgentError> {
+        self.prepare_rename(request)?.await
+    }
+
+    pub(crate) fn prepare_rename(
+        &self,
+        request: RenameSession,
+    ) -> Result<AgentFuture<SessionInfo>, AgentError> {
         let title =
             crate::store::normalize_title(&request.title).map_err(|_| AgentError::InvalidInput)?;
-        let session_id = request.session_id;
-        if let Some(session) = self.sessions.get(session_id).cloned() {
-            session.rename(title).await?;
-            return Ok(session.info(true));
-        }
-
-        let mut record = self
-            .store
-            .load_record(session_id)
-            .await
-            .map_err(crate::sessions::map_store_error)?;
-        record.title = title;
-        record.updated_at = crate::store::utc_timestamp().map_err(|_| AgentError::Store)?;
-        self.store
-            .write_record(&record)
-            .await
-            .map_err(crate::sessions::map_store_error)?;
-        Ok(SessionInfo::from_record(&record, false))
+        let session = self.loaded_session(request.session_id);
+        let store = self.store.clone();
+        Ok(Box::pin(async move {
+            if let Some(session) = session {
+                session.rename(title).await?;
+                return Ok(session.info(true));
+            }
+            let mut record = store.load_record(request.session_id).await?;
+            record.title = title;
+            record.updated_at = crate::store::utc_timestamp().map_err(|_| AgentError::Store)?;
+            store.write_record(&record).await?;
+            Ok(SessionInfo::from_record(&record, false))
+        }))
     }
 
     /// Starts an ordinary user turn without pre-turn summarization.
     pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
-        let session = self
-            .sessions
-            .get(request.session_id)
-            .cloned()
-            .ok_or(AgentError::SessionNotLoaded)?;
         let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
-        match session.submit(input).await? {
+        match self.prepare_submit(request.session_id, input)?.await? {
             crate::sessions::LoopSubmission::Accepted(accepted) => Ok(accepted.turn),
         }
     }
 
-    /// Starts one submission for the RPC server through the normal turn path.
-    pub(crate) async fn submit_accepted(
-        &mut self,
-        request: SendMessage,
-    ) -> Result<crate::sessions::LoopSubmission, AgentError> {
-        let session = self
-            .sessions
-            .get(request.session_id)
-            .cloned()
-            .ok_or(AgentError::SessionNotLoaded)?;
-        let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
-        session.submit(input).await
+    pub(crate) fn prepare_submit(
+        &self,
+        session_id: crate::ids::SessionId,
+        input: UserInput,
+    ) -> Result<AgentFuture<crate::sessions::LoopSubmission>, AgentError> {
+        let session = self.session(session_id)?.clone();
+        Ok(Box::pin(async move { session.submit(input).await }))
     }
 
     pub(crate) async fn compact_session(
         &mut self,
         request: CompactSession,
     ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
+        self.prepare_compact(request)?.await
+    }
+
+    pub(crate) fn prepare_compact(
+        &self,
+        request: CompactSession,
+    ) -> Result<AgentFuture<watch::Receiver<Option<CompactionResult>>>, AgentError> {
         if !valid_operation_id(&request.operation_id) || request.operation_id.starts_with("auto-") {
             return Err(AgentError::InvalidInput);
         }
-        let session = self
-            .sessions
-            .get(request.session_id)
-            .cloned()
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(request.session_id)?.clone();
         let record = session.record();
         let model = self
             .models
             .get_utility(&record.model)
             .map_err(map_model_config_error)?;
         let descriptor = model.descriptor().clone();
-        session
-            .start_compaction(request.operation_id, model, descriptor)
-            .await
+        let admission = session.admit_compaction(request.operation_id)?;
+        Ok(Box::pin(async move {
+            session.start_compaction(admission, model, descriptor).await
+        }))
     }
 
     pub fn cancel_compaction(&self, request: CompactSession) -> Result<bool, AgentError> {
         if !valid_operation_id(&request.operation_id) {
             return Err(AgentError::InvalidInput);
         }
-        let session = self
-            .sessions
-            .get(request.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(request.session_id)?;
         session.cancel_compaction(&request.operation_id)
     }
 
@@ -1087,10 +1091,7 @@ impl Agent {
         &self,
         request: SteerMessage,
     ) -> Result<crate::sessions::SteerAccepted, AgentError> {
-        let session = self
-            .sessions
-            .get(request.turn.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(request.turn.session_id)?;
         session.steer(request.turn, request.text)
     }
 
@@ -1100,67 +1101,20 @@ impl Agent {
         &self,
         session_id: crate::ids::SessionId,
     ) -> Result<crate::presentation::PresentationView, AgentError> {
-        let session = self
-            .sessions
-            .get(session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(session_id)?;
         Ok(session.presentation_view())
     }
 
     pub fn cancel(&self, turn: TurnRef) -> Result<bool, AgentError> {
-        let session = self
-            .sessions
-            .get(turn.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(turn.session_id)?;
         session.cancel(turn)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn abort_active_task_for_test(
-        &self,
-        session_id: crate::ids::SessionId,
-    ) -> Result<(), AgentError> {
-        let session = self
-            .sessions
-            .get(session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        session.abort_active_task()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn runtime_loop_finished_for_test(
-        &self,
-        session_id: crate::ids::SessionId,
-    ) -> Result<bool, AgentError> {
-        let session = self
-            .sessions
-            .get(session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        Ok(session.runtime_loop_finished())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn forward_runtime_event_for_test(
-        &self,
-        session_id: crate::ids::SessionId,
-        envelope: minicore_runtime::LoopEventEnvelope,
-    ) -> Result<(), AgentError> {
-        let session = self
-            .sessions
-            .get(session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
-        crate::sessions::forward_loop_event(session_id, envelope, session);
-        Ok(())
     }
 
     pub async fn wait_turn(
         &self,
         turn: TurnRef,
     ) -> Result<Arc<crate::sessions::TurnResult>, AgentError> {
-        let session = self
-            .sessions
-            .get(turn.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(turn.session_id)?;
         session.wait(turn).await
     }
 
@@ -1168,26 +1122,21 @@ impl Agent {
         &self,
         turn: TurnRef,
     ) -> Result<watch::Receiver<Option<TurnCompletion>>, AgentError> {
-        let session = self
-            .sessions
-            .get(turn.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(turn.session_id)?;
         session.wait_receiver(turn)
     }
 
     pub async fn answer(&self, request: AnswerInteraction) -> Result<(), AgentError> {
-        let session = self
-            .sessions
-            .get(request.turn.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        self.answer_interaction(request)
+    }
+
+    pub(crate) fn answer_interaction(&self, request: AnswerInteraction) -> Result<(), AgentError> {
+        let session = self.session(request.turn.session_id)?;
         session.answer(request.turn, request.interaction_id, request.answer)
     }
 
     pub fn history(&self, request: GetHistory) -> Result<HistoryPage, AgentError> {
-        let session = self
-            .sessions
-            .get(request.session_id)
-            .ok_or(AgentError::SessionNotLoaded)?;
+        let session = self.session(request.session_id)?;
         session.history(&request)
     }
 
@@ -1202,6 +1151,13 @@ impl Agent {
     /// MiniCore Agent v0.3 uses the Runtime user-cancellation path when closing
     /// or shutting down an active Session; it does not currently preserve a distinct
     /// shutdown cancellation reason.
+    pub(crate) fn begin_shutdown(&self) {
+        self.store.cancel_diff_workers();
+        for session in self.sessions.iter() {
+            session.begin_shutdown();
+        }
+    }
+
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
         self.store.cancel_diff_workers();
@@ -1245,164 +1201,47 @@ impl Agent {
         })
     }
 
-    fn prepare_session_setup(
-        &self,
-        record: &SessionRecord,
-        workspace: Arc<Workspace>,
-        options: LoopOptions,
-        compaction: Arc<CompactionState>,
-    ) -> Result<SessionSetup, AgentError> {
-        let presentation = self.build_presentation(
-            record.session_id,
-            record.model.clone(),
-            Arc::clone(&compaction),
-        );
-        let tool_data = Arc::new(ToolData::new());
-        let command_owners = CommandOwners::new();
-        let observer = ToolObserver::new(
-            record.session_id,
-            Arc::clone(&tool_data),
-            self.event_sink.clone(),
-        );
-        let (config, auto) = self.execution_config(
-            record,
-            workspace,
-            Arc::clone(&presentation),
-            Arc::clone(&observer),
-            Arc::clone(&command_owners),
-            options.clone(),
-            Arc::clone(&compaction),
-            self.config.compaction.policy(),
-        )?;
-        Ok(SessionSetup {
-            presentation,
-            tool_data,
-            command_owners,
-            observer,
-            config,
-            auto,
-            options,
-            compaction,
-        })
-    }
-
-    fn install_session(
+    pub(crate) fn install_session(
         &mut self,
-        record: SessionRecord,
+        mut stored: crate::store::StoredSession,
         workspace: Arc<Workspace>,
-        history: Arc<[minicore_runtime::history::HistoryItem]>,
-        user_times: std::collections::HashMap<(minicore_runtime::LoopId, usize), String>,
         setup: SessionSetup,
     ) -> SessionInfo {
+        let record = &stored.record;
         let session_id = record.session_id;
-        let SessionSetup {
-            presentation,
-            tool_data,
-            command_owners,
-            observer,
-            config,
-            auto,
-            options,
-            compaction,
-        } = setup;
-        let context_history = Arc::clone(&history);
-        let context_model = self.models.get(&record.model).ok();
+        let presentation = Arc::clone(&setup.parts.presentation);
+        let compaction = Arc::clone(&setup.parts.compaction);
+        let context_history = Arc::clone(&stored.history);
+        let model_ref = setup.config.descriptor().model_ref.clone();
         let physical_window = self
             .models
             .physical_context_window(&record.model)
-            .unwrap_or(0);
+            .expect("validated model");
+        let history_index = std::mem::take(&mut stored.history_index);
         let session = crate::sessions::Session::new(
-            record,
+            stored,
             workspace,
-            history,
-            user_times,
-            Arc::clone(&presentation),
-            config,
-            auto,
-            options,
-            Arc::clone(&compaction),
+            setup,
             self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
-            tool_data,
-            command_owners,
-            observer,
         );
         let active_history = compaction.project(&context_history);
-        if let Some(model) = context_model {
-            presentation.restore_context(
-                active_history
-                    .as_ref()
-                    .map_or(context_history.as_ref(), |projection| projection.suffix),
-                model.descriptor().model_ref.as_str(),
-                physical_window,
-            );
-        }
-        let _ = self.sessions.insert(session_id, session);
-        let info = self
-            .sessions
-            .get(session_id)
-            .expect("installed session is loaded")
-            .info(true);
+        presentation.restore_context(
+            active_history
+                .as_ref()
+                .map_or(context_history.as_ref(), |projection| projection.suffix),
+            model_ref.as_str(),
+            physical_window,
+        );
+        let info = session.info(true);
+        self.store.install_history_index(session_id, history_index);
+        self.sessions.insert(session_id, session);
         self.event_sink.try_send(AgentEvent::SessionOpened {
             session: info.clone(),
-            meta: EventMeta {
-                session_id,
-                loop_id: None,
-                dropped_before: 0,
-            },
+            meta: EventMeta::session(session_id),
         });
         info
-    }
-
-    /// Assembles a complete runtime `ExecutionConfig` from the session record:
-    /// model, tools, policy, and the project prompt provider. The same
-    /// settings are reused across every turn and replaced atomically on
-    /// update. Model and tools use the Session-owned observer for execution
-    /// facts, while the per-session presentation remains bounded display
-    /// state only.
-    #[allow(clippy::too_many_arguments)]
-    fn execution_config(
-        &self,
-        record: &SessionRecord,
-        workspace: Arc<Workspace>,
-        presentation: Arc<crate::presentation::Presentation>,
-        observer: Arc<ToolObserver>,
-        command_owners: Arc<CommandOwners>,
-        options: minicore_runtime::LoopOptions,
-        compaction: Arc<CompactionState>,
-        policy: crate::compaction::CompactionPolicy,
-    ) -> Result<(ExecutionConfig, Option<AutoContext>), AgentError> {
-        let factory = ExecutionConfigFactory {
-            models: &self.models,
-            command_environment: &self.command_environment,
-            compaction,
-            policy,
-        };
-        factory.build(
-            record,
-            workspace,
-            presentation,
-            observer,
-            command_owners,
-            options,
-        )
-    }
-
-    /// Per-session display state wired into this session's model/tool wrappers
-    /// and the `session.presentation` read. Execution observation is owned by
-    /// the Session separately. The branch starts unknown and is
-    /// projected only when an explicit `workspace.status` query completes.
-    fn build_presentation(
-        &self,
-        session_id: crate::ids::SessionId,
-        model_label: String,
-        compaction: Arc<CompactionState>,
-    ) -> Arc<crate::presentation::Presentation> {
-        let presentation =
-            crate::presentation::Presentation::new(session_id, self.event_sink.clone(), compaction);
-        presentation.set_model_label(model_label);
-        presentation
     }
 }
 

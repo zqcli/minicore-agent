@@ -1,6 +1,7 @@
 //! Provider-owned, durable Responses output. Never serialize this as prose.
 use super::*;
 use minicore_runtime::model::ProviderReplay;
+use sha2::{Digest, Sha256};
 
 const FORMAT: &str = "openai-responses-v1";
 
@@ -16,18 +17,33 @@ pub(super) fn capture(
     endpoint: &str,
     model: &str,
     output: Vec<Value>,
-) -> Result<ProviderReplay, ()> {
+) -> Result<Option<ProviderReplay>, ()> {
     validate_output(&output)?;
-    ProviderReplay::new(
-        FORMAT,
-        serde_json::to_value(Payload {
-            endpoint: endpoint.to_owned(),
-            model: model.to_owned(),
-            output,
-        })
-        .map_err(|_| ())?,
-    )
-    .map_err(|_| ())
+    let mut reusable = Vec::with_capacity(output.len());
+    for item in output {
+        if item.get("id").is_some() || item_type(&item) == Some("function_call") {
+            reusable.push(item);
+        } else if item_type(&item) == Some("message") {
+            // Missing identity disables raw replay, not canonical message text.
+            let text = visible_text(std::slice::from_ref(&item))?;
+            reusable
+                .push(serde_json::to_value(InputMessage::assistant(None, text)).map_err(|_| ())?);
+        }
+        // Anonymous reasoning cannot be replayed, especially its ciphertext.
+    }
+    let output = reusable;
+    if !has_content(&output) {
+        return Ok(None);
+    }
+    let payload = serde_json::to_value(Payload {
+        endpoint: endpoint.to_owned(),
+        model: model.to_owned(),
+        output,
+    })
+    .map_err(|_| ())?;
+    // Shape was validated above and the format is constant; runtime rejection
+    // here means its envelope byte/depth/node budget was exceeded.
+    Ok(ProviderReplay::new(FORMAT, payload).ok())
 }
 
 fn payload(replay: &ProviderReplay) -> Result<Option<Payload>, ()> {
@@ -49,6 +65,13 @@ fn payload(replay: &ProviderReplay) -> Result<Option<Payload>, ()> {
         return Err(());
     }
     validate_output(&payload.output)?;
+    if payload
+        .output
+        .iter()
+        .any(|item| item_type(item) == Some("reasoning") && item.get("id").is_none())
+    {
+        return Err(());
+    }
     Ok(Some(payload))
 }
 
@@ -106,7 +129,7 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
     }
     match kind {
         "message" => {
-            if string(item, "role")? != "assistant" || string(item, "id")?.is_empty() {
+            if string(item, "role")? != "assistant" {
                 return Err(());
             }
             let content = item.get("content").and_then(Value::as_array).ok_or(())?;
@@ -126,9 +149,6 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
             }
         }
         "reasoning" => {
-            if string(item, "id")?.is_empty() {
-                return Err(());
-            }
             if let Some(encrypted) = item.get("encrypted_content") {
                 if !encrypted.is_null() && !encrypted.is_string() {
                     return Err(());
@@ -144,7 +164,7 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
             }
         }
         "function_call" => {
-            validate_openai_call_id(string(item, "call_id")?).map_err(|_| ())?;
+            openai_tool_call_id(string(item, "call_id")?)?;
             string(item, "name")?.parse::<ToolName>().map_err(|_| ())?;
             let arguments: Value =
                 serde_json::from_str(string(item, "arguments")?).map_err(|_| ())?;
@@ -157,13 +177,12 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
     Ok(())
 }
 
-fn validate_output(output: &[Value]) -> Result<(), ()> {
+pub(super) fn validate_output(output: &[Value]) -> Result<(), ()> {
     if output.is_empty() || output.len() > MAX_REPLAY_ITEMS_PER_RESPONSE {
         return Err(());
     }
     let mut ids = BTreeSet::new();
     let mut calls = BTreeSet::new();
-    let mut meaningful = false;
     for item in output {
         validate_item(item)?;
         if let Some(id) = item.get("id").and_then(Value::as_str) {
@@ -171,43 +190,47 @@ fn validate_output(output: &[Value]) -> Result<(), ()> {
                 return Err(());
             }
         }
-        match item_type(item) {
-            Some("function_call") => {
-                if !calls.insert(string(item, "call_id")?) {
-                    return Err(());
-                }
-                meaningful = true;
-            }
-            Some("message") => meaningful |= !visible_text(std::slice::from_ref(item))?.is_empty(),
-            Some("reasoning") => {
-                meaningful |= item
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty());
-                meaningful |= item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .is_some_and(|parts| {
-                        parts.iter().any(|p| {
-                            p.get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(|s| !s.is_empty())
-                        })
-                    });
-            }
-            _ => return Err(()),
+        if item_type(item) == Some("function_call") && !calls.insert(string(item, "call_id")?) {
+            return Err(());
         }
     }
-    if !meaningful {
+    if !has_content(output) {
         return Err(());
     }
     Ok(())
 }
 
-pub(super) fn visible_text(output: &[Value]) -> Result<String, ()> {
+fn has_content(output: &[Value]) -> bool {
+    let nonempty = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty());
+    output.iter().any(|item| match item_type(item) {
+        Some("function_call") => true,
+        Some("message") => item["content"]
+            .as_array()
+            .expect("validated content")
+            .iter()
+            .any(|part| {
+                nonempty(
+                    &part[if item_type(part) == Some("refusal") {
+                        "refusal"
+                    } else {
+                        "text"
+                    }],
+                )
+            }),
+        Some("reasoning") => {
+            nonempty(&item["encrypted_content"])
+                || item["summary"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| nonempty(&part["text"])))
+        }
+        _ => unreachable!("validated output item"),
+    })
+}
+
+pub(super) fn visible_text<'a>(output: impl IntoIterator<Item = &'a Value>) -> Result<String, ()> {
     let mut text = String::new();
     for item in output
-        .iter()
+        .into_iter()
         .filter(|item| item_type(item) == Some("message"))
     {
         for part in item.get("content").and_then(Value::as_array).ok_or(())? {
@@ -256,25 +279,48 @@ fn validate_parts(output: &[Value], parts: &[AssistantPart]) -> Result<(), ()> {
     Ok(())
 }
 
-/// The terminal event may supply late ciphertext, but cannot rewrite anything
-/// already observed. No other late changes are accepted.
-pub(super) fn terminal_matches(done: &Value, terminal: &Value) -> bool {
-    if done == terminal {
-        return true;
+/// Bounded reconciliation evidence survives discarding oversized raw replay.
+pub(super) struct ItemEvidence {
+    exact: [u8; 32],
+    before_encryption: Option<[u8; 32]>,
+    pub(super) text: String,
+}
+
+impl ItemEvidence {
+    pub(super) fn new(item: &Value) -> Result<Self, ()> {
+        Ok(Self {
+            exact: fingerprint(item, false),
+            before_encryption: (item_type(item) == Some("reasoning")
+                && item.get("encrypted_content").is_none_or(Value::is_null))
+            .then(|| fingerprint(item, true)),
+            text: visible_text(std::iter::once(item))?,
+        })
     }
-    if item_type(done) != Some("reasoning")
-        || item_type(terminal) != Some("reasoning")
-        || !done.get("encrypted_content").is_none_or(Value::is_null)
-        || !terminal
-            .get("encrypted_content")
-            .is_some_and(Value::is_string)
-    {
-        return false;
+
+    pub(super) fn matches(&self, terminal: &Value) -> bool {
+        self.exact == fingerprint(terminal, false)
+            || self.before_encryption.is_some_and(|before| {
+                terminal
+                    .get("encrypted_content")
+                    .is_some_and(Value::is_string)
+                    && before == fingerprint(terminal, true)
+            })
     }
-    let mut enriched = done.clone();
-    enriched.as_object_mut().expect("reasoning object").insert(
-        "encrypted_content".to_owned(),
-        terminal["encrypted_content"].clone(),
-    );
-    enriched == *terminal
+}
+
+fn fingerprint(item: &Value, omit_encrypted: bool) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    if omit_encrypted {
+        let fields = item
+            .as_object()
+            .expect("validated item")
+            .iter()
+            .filter(|(key, _)| key.as_str() != "encrypted_content")
+            .collect::<BTreeMap<_, _>>();
+        serde_json::to_writer(&mut digest, &fields)
+    } else {
+        serde_json::to_writer(&mut digest, item)
+    }
+    .expect("JSON value serialization");
+    digest.finalize().into()
 }

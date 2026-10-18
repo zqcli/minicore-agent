@@ -11,9 +11,3 @@ fn origin_is_owned_by_operation_not_inferred_from_identifier() {
         assert_eq!(failed_compaction(&operation, "timeout", 0).origin, origin);
     }
 }
-
-pub(super) async fn pause_after_result(session_id: SessionId) {
-    if let Some(gate) = PAUSE_AFTER_RESULT.take(&session_id) {
-        gate.pass().await;
-    }
-}

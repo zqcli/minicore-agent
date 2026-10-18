@@ -1,9 +1,9 @@
+#[cfg(test)]
+use crate::test_support::{Gate, Registry};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(test)]
-use std::sync::{Condvar, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ use crate::compaction::{
     CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage, generate_summary,
 };
 use crate::config::map_loop_start_error;
-use crate::error::{AgentError, StoreError};
+use crate::error::AgentError;
 use crate::event::{
     AgentEvent, AgentEventSink, CancelReasonView, EventMeta, LoopOutcomeView, ModelErrorView,
     OutputChannel, ToolProgressView, ToolResultView,
@@ -38,178 +38,24 @@ use crate::history::{GetHistory, HistoryPage, normalize_history, page_history};
 use crate::ids::SessionId;
 use crate::presentation::SteerReceiptPrompt;
 use crate::prompt::ProjectPromptProvider;
-use crate::store::{
-    Store, StoredCancelReason, StoredLoopOutcome, StoredLoopRecord, StoredModelError,
-    SummaryCommit, utc_timestamp,
-};
+use crate::store::{Store, StoredLoopOutcome, StoredLoopRecord, SummaryCommit, utc_timestamp};
 use crate::tool_data::ToolData;
 use crate::tools::command::CommandOwners;
 use crate::tools::observe::ToolObserver;
 use crate::workspace::{Workspace, WorkspaceError};
 
-pub(crate) mod compact;
+mod compact;
 
 #[cfg(test)]
-static PANIC_WORKERS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
+pub(crate) static PANIC_WORKERS: Registry<SessionId> = Registry::new();
 #[cfg(test)]
-type WorkerGateEntry = (SessionId, Arc<WorkerGate>);
+pub(crate) static PAUSE_BEFORE_JOIN: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
-static PAUSE_BEFORE_JOIN: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
+pub(crate) static PAUSE_AFTER_COMPACTION_RESULT: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
-type RuntimeStartGateEntry = (SessionId, Arc<RuntimeStartGate>);
+pub(crate) static PAUSE_AFTER_RUNTIME_START: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
-static PAUSE_AFTER_RUNTIME_START: OnceLock<Mutex<Vec<RuntimeStartGateEntry>>> = OnceLock::new();
-/// Records the `LoopOptions` a started Runtime loop actually captured. The
-/// Runtime owns those options privately, so this test-only observation is the
-/// only way to prove that a model update does not hot-modify a running loop.
-/// The entries are keyed by `LoopId` and never read outside tests.
-#[cfg(test)]
-static INSTALLED_LOOP_OPTIONS: OnceLock<Mutex<Vec<(LoopId, LoopOptions)>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct WorkerGate {
-    started: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl WorkerGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            started: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.started.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct RuntimeStartGate {
-    started: tokio::sync::Notify,
-    released: Mutex<bool>,
-    release: Condvar,
-}
-
-#[cfg(test)]
-impl RuntimeStartGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            started: tokio::sync::Notify::new(),
-            released: Mutex::new(false),
-            release: Condvar::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.started.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_one();
-    }
-
-    pub(crate) fn enter_and_wait(&self) {
-        self.started.notify_one();
-        self.wait_release();
-    }
-
-    fn wait_release(&self) {
-        let mut released = self.released.lock().unwrap();
-        while !*released {
-            released = self.release.wait(released).unwrap();
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn panic_next_worker(session_id: SessionId) {
-    PANIC_WORKERS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(session_id);
-}
-
-#[cfg(test)]
-fn should_panic_worker(session_id: SessionId) -> bool {
-    let mut workers = PANIC_WORKERS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    workers
-        .iter()
-        .position(|candidate| *candidate == session_id)
-        .map(|position| {
-            workers.remove(position);
-            true
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-pub(crate) fn pause_next_worker_before_join(session_id: SessionId, gate: Arc<WorkerGate>) {
-    PAUSE_BEFORE_JOIN
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, gate));
-}
-
-#[cfg(test)]
-pub(crate) fn pause_next_runtime_start_before_bind(
-    session_id: SessionId,
-    gate: Arc<RuntimeStartGate>,
-) {
-    PAUSE_AFTER_RUNTIME_START
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, gate));
-}
-
-#[cfg(test)]
-pub(crate) fn installed_loop_options_for_test(loop_id: LoopId) -> Option<LoopOptions> {
-    INSTALLED_LOOP_OPTIONS.get().and_then(|options| {
-        options
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(candidate, _)| *candidate == loop_id)
-            .map(|(_, options)| options.clone())
-    })
-}
-
-#[cfg(test)]
-fn take_pause_after_runtime_start(session_id: SessionId) -> Option<Arc<RuntimeStartGate>> {
-    let mut gates = PAUSE_AFTER_RUNTIME_START
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|(candidate, _)| *candidate == session_id)
-        .map(|position| gates.remove(position).1)
-}
-
-#[cfg(test)]
-fn take_pause_before_join(session_id: SessionId) -> Option<Arc<WorkerGate>> {
-    let mut gates = PAUSE_BEFORE_JOIN
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|(candidate, _)| *candidate == session_id)
-        .map(|position| gates.remove(position).1)
-}
+pub(crate) static INSTALLED_LOOP_OPTIONS: Registry<LoopId, LoopOptions> = Registry::new();
 
 /// A user turn maps one-to-one to one runtime `AgentLoop`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -379,6 +225,7 @@ impl Sessions {
 
     pub(crate) fn remove(&mut self, session_id: SessionId) -> Option<Session> {
         let session = self.loaded.remove(&session_id)?;
+        session.shared.store.unload_history(session_id);
         // Workspace queries are owned by the loaded Session; closing it stops
         // them instead of reading a Workspace whose Session is gone.
         session.cancel_queries();
@@ -392,21 +239,17 @@ impl Sessions {
     pub(crate) async fn shutdown_all(&mut self) -> Result<(), AgentError> {
         let mut ids = self.loaded.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
-        let mut first_error = None;
-        for session_id in ids {
-            let Some(session) = self.loaded.get(&session_id).cloned() else {
-                continue;
-            };
-            if let Err(error) = session.shutdown().await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-            // Keep the Session in the map until its shutdown barrier has
-            // joined every owned worker, including manual compaction.
-            self.remove(session_id);
+        for session in self.loaded.values() {
+            session.begin_shutdown();
         }
-        first_error.map_or(Ok(()), Err)
+        let results = futures_util::future::join_all(
+            ids.iter().map(|id| self.loaded[id].clone().join_shutdown()),
+        )
+        .await;
+        for id in ids {
+            self.remove(id);
+        }
+        results.into_iter().collect()
     }
 }
 
@@ -529,6 +372,8 @@ struct SessionInner {
     blocked: Option<SessionBlockReason>,
     closing: bool,
     compaction: Option<Arc<CompactionOperation>>,
+    // Cancellable admission while completed workers are still being reaped.
+    pending_compaction: Option<Arc<CompactionOperation>>,
     compaction_progress: Option<CompactionProgress>,
     last_compaction_result: Option<CompactionResult>,
     policy: CompactionPolicy,
@@ -541,7 +386,7 @@ struct ActiveLoop {
     turn: TurnRef,
     handle: LoopHandle,
     completion: watch::Receiver<Option<TurnCompletion>>,
-    task: Option<Arc<SessionTask>>,
+    task: Arc<SessionTask>,
     execution_summary: Option<BoundedText>,
     execution_history: Arc<[HistoryItem]>,
 }
@@ -586,22 +431,28 @@ impl SessionTask {
     }
 
     async fn join(&self) -> Result<(), AgentError> {
-        let mut slot = self.join.lock().await;
-        let Some(handle) = slot.as_mut() else {
-            return Ok(());
-        };
-        let result = std::pin::Pin::new(handle).await;
-        slot.take();
-        result.map_err(|_| AgentError::Internal)
+        join_task(&self.join).await
     }
+}
 
-    #[cfg(test)]
-    fn abort(&self) {
-        if let Ok(slot) = self.join.try_lock() {
-            if let Some(handle) = slot.as_ref() {
-                handle.abort();
-            }
-        }
+async fn join_task(join: &tokio::sync::Mutex<Option<JoinHandle<()>>>) -> Result<(), AgentError> {
+    let mut slot = join.lock().await;
+    let Some(handle) = slot.as_mut() else {
+        return Ok(());
+    };
+    let result = std::pin::Pin::new(handle).await;
+    slot.take();
+    result.map_err(|_| AgentError::Internal)
+}
+
+pub(crate) struct CompactionAdmission {
+    session: Session,
+    operation: Arc<CompactionOperation>,
+}
+
+impl Drop for CompactionAdmission {
+    fn drop(&mut self) {
+        self.session.lock_inner().pending_compaction = None;
     }
 }
 
@@ -687,12 +538,7 @@ impl Drop for EphemeralSummaryCleanup {
 
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        mark_internal(&self.session);
-        self.sender.send_replace(Some(TurnCompletion::Internal));
-        self.session.emit_state();
+        self.publish_internal();
     }
 }
 
@@ -703,26 +549,40 @@ pub(crate) enum TurnCompletion {
 }
 
 impl Session {
-    // These fields are the Session ownership boundary; keeping construction
-    // explicit makes the model/tool/presentation wiring auditable.
-    #[allow(clippy::too_many_arguments)]
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, SessionInner> {
+        self.shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn new(
-        record: crate::store::SessionRecord,
+        stored: crate::store::StoredSession,
         workspace: Arc<Workspace>,
-        history: Arc<[HistoryItem]>,
-        user_times: std::collections::HashMap<(LoopId, usize), String>,
-        presentation: Arc<crate::presentation::Presentation>,
-        config: ExecutionConfig,
-        auto: Option<AutoContext>,
-        options: LoopOptions,
-        compaction: Arc<CompactionState>,
+        setup: crate::agent::SessionSetup,
         policy: CompactionPolicy,
         store: Store,
         events: AgentEventSink,
-        tool_data: Arc<ToolData>,
-        command_owners: Arc<CommandOwners>,
-        tool_observer: Arc<ToolObserver>,
     ) -> Self {
+        let crate::store::StoredSession {
+            record,
+            history,
+            user_times,
+            history_index: _,
+        } = stored;
+        let crate::agent::SessionSetup {
+            parts,
+            tool_data,
+            config,
+            auto,
+            options,
+        } = setup;
+        let crate::agent::SessionParts {
+            presentation,
+            observer: tool_observer,
+            command_owners,
+            compaction,
+        } = parts;
         compaction.note_settings_installed();
         presentation.install_model(config.model());
         let inner = SessionInner {
@@ -738,6 +598,7 @@ impl Session {
             blocked: None,
             closing: false,
             compaction: None,
+            pending_compaction: None,
             compaction_progress: None,
             last_compaction_result: None,
             policy,
@@ -760,23 +621,17 @@ impl Session {
     }
 
     pub(crate) fn session_id(&self) -> SessionId {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.record.session_id
     }
 
     pub(crate) fn record(&self) -> crate::store::SessionRecord {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.record.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn options_for_test(&self) -> LoopOptions {
-        let inner = self.shared.inner.lock().unwrap();
-        inner.options.clone()
-    }
-
     pub(crate) fn workspace(&self) -> Arc<Workspace> {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         Arc::clone(&inner.workspace)
     }
 
@@ -796,7 +651,7 @@ impl Session {
         result: &crate::WorkspaceStatusResult,
         cancellation: &CancellationToken,
     ) {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         if inner.closing || self.shared.close.is_cancelled() || cancellation.is_cancelled() {
             return;
         }
@@ -834,71 +689,60 @@ impl Session {
         shutdown_cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<StatusQuery, AgentError> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let child_cancel = CancellationToken::new();
-        let session_cancellation = self.shared.close.clone();
-        let worker_child_cancel = child_cancel.clone();
-        let mut workers = self.shared.status_workers.lock().unwrap();
-        workers.reap_finished();
-        // The token is checked under the same lock as the closing flag, so a
-        // registration cannot slip between the flag and the cancellation.
-        if workers.closing
-            || session_cancellation.is_cancelled()
-            || workers.workers.len() >= MAX_STATUS_QUERY_WORKERS
-        {
-            return Err(AgentError::QueryLimit);
-        }
-        let handle = tokio::spawn(async move {
-            let result = crate::workspace::status::status_with_deadline(
+        self.register_worker(move |session_cancel, child_cancel| async move {
+            crate::workspace::status::status_with_deadline(
                 &workspace,
                 &request,
-                &session_cancellation,
+                &session_cancel,
                 &shutdown_cancellation,
-                &worker_child_cancel,
+                &child_cancel,
                 deadline,
             )
-            .await;
-            let _ = sender.send(result);
-        });
-        workers.workers.push(handle);
-        Ok(StatusQuery {
-            receiver,
-            child_cancel,
+            .await
         })
     }
 
-    /// Registers bounded Git source reads in the existing Session-owned worker set.
     pub(crate) fn spawn_workspace_diff(
         &self,
         request: crate::ChangesDiffRequest,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> Result<StatusQuery<crate::diff::DiffSources>, AgentError> {
-        request.validate()?;
         let workspace = self.workspace();
-        let session_cancel = self.shared.close.clone();
-        let child_cancel = CancellationToken::new();
-        let worker_cancel = child_cancel.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let mut workers = self.shared.status_workers.lock().unwrap();
-        workers.reap_finished();
-        if workers.closing
-            || session_cancel.is_cancelled()
-            || workers.workers.len() >= MAX_STATUS_QUERY_WORKERS
-        {
-            return Err(AgentError::QueryLimit);
-        }
-        workers.workers.push(tokio::spawn(async move {
-            let result = crate::workspace::status::diff_sources(
+        self.register_worker(move |session_cancel, child_cancel| async move {
+            crate::workspace::status::diff_sources(
                 &workspace,
                 &request,
                 &session_cancel,
                 &cancellation,
-                &worker_cancel,
+                &child_cancel,
                 deadline,
             )
-            .await;
-            let _ = sender.send(result);
+            .await
+        })
+    }
+
+    fn register_worker<T, F>(
+        &self,
+        work: impl FnOnce(CancellationToken, CancellationToken) -> F,
+    ) -> Result<StatusQuery<T>, AgentError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, AgentError>> + Send + 'static,
+    {
+        let mut workers = self.shared.status_workers.lock().unwrap();
+        workers.reap_finished();
+        if workers.closing || self.shared.close.is_cancelled() {
+            return Err(AgentError::SessionNotLoaded);
+        }
+        if workers.workers.len() >= MAX_STATUS_QUERY_WORKERS {
+            return Err(AgentError::QueryLimit);
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let child_cancel = CancellationToken::new();
+        let future = work(self.shared.close.clone(), child_cancel.clone());
+        workers.workers.push(tokio::spawn(async move {
+            let _ = sender.send(future.await);
         }));
         Ok(StatusQuery {
             receiver,
@@ -918,20 +762,6 @@ impl Session {
         }
     }
 
-    /// Test-only evidence that no owned status worker is still running, used by
-    /// the process-level Unix tests.
-    #[cfg(all(test, unix))]
-    pub(crate) fn active_status_workers(&self) -> usize {
-        self.shared
-            .status_workers
-            .lock()
-            .unwrap()
-            .workers
-            .iter()
-            .filter(|handle| !handle.is_finished())
-            .count()
-    }
-
     /// Stops in-flight workspace queries owned by this loaded Session.
     pub(crate) fn cancel_queries(&self) {
         self.shared.close.cancel();
@@ -942,26 +772,15 @@ impl Session {
     }
 
     pub(crate) fn policy(&self) -> CompactionPolicy {
-        self.shared.inner.lock().unwrap().policy
+        self.lock_inner().policy
     }
 
     pub(crate) fn info(&self, loaded: bool) -> SessionInfo {
-        let inner = self.shared.inner.lock().unwrap();
-        SessionInfo {
-            session_id: inner.record.session_id,
-            title: inner.record.title.clone(),
-            profile: inner.record.profile.clone(),
-            workspace: inner.record.workspace.clone(),
-            model: inner.record.model.clone(),
-            reasoning: inner.record.reasoning,
-            loaded,
-            created_at: inner.record.created_at.clone(),
-            updated_at: inner.record.updated_at.clone(),
-        }
+        SessionInfo::from_record(&self.lock_inner().record, loaded)
     }
 
     pub(crate) fn state(&self) -> SessionState {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         let completion = inner
             .active
             .as_ref()
@@ -1003,7 +822,7 @@ impl Session {
     }
 
     pub(crate) fn context(&self) -> SessionContext {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         let (covered_loop_count, covered_item_count) =
             self.shared.compaction.coverage().unwrap_or((0, 0));
         let retained_item_count = inner.history.len().saturating_sub(covered_item_count);
@@ -1101,13 +920,8 @@ impl Session {
 
     pub(crate) fn execution_input(&self, input: UserInput) -> Result<ExecutionInput, AgentError> {
         let (history, config, options, system_prompt, auto) = {
-            let inner = self.shared.inner.lock().unwrap();
-            if inner.blocked.is_some() {
-                return Err(AgentError::SessionBlocked);
-            }
-            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
-                return Err(AgentError::SessionBusy);
-            }
+            let inner = self.lock_inner();
+            Self::validate_install_state(&inner)?;
             (
                 Arc::clone(&inner.history),
                 inner.config.clone(),
@@ -1147,7 +961,7 @@ impl Session {
     fn install_loop(&self, execution: ExecutionInput) -> Result<LoopAccepted, AgentError> {
         let accepted_at = crate::store::utc_timestamp().ok();
         let turn = {
-            let mut inner = self.shared.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             Self::validate_install_state(&inner)?;
             // Initialize current-loop observation before spawning the Runtime
             // task: the runner may reach Model::start synchronously.
@@ -1162,15 +976,8 @@ impl Session {
             let mut agent_loop = AgentLoop::start(execution.request, execution.options)
                 .map_err(map_loop_start_error)?;
             #[cfg(test)]
-            let runtime_start_gate = take_pause_after_runtime_start(inner.record.session_id);
-            #[cfg(test)]
-            if let Some(gate) = runtime_start_gate {
-                // The Runtime may need the Session lock to reach Model::start.
-                // Release it only while the deterministic test gate waits;
-                // production startup keeps the original ownership boundary.
-                drop(inner);
-                tokio::task::block_in_place(|| gate.enter_and_wait());
-                inner = self.shared.inner.lock().unwrap();
+            {
+                inner = tests::pause_runtime_start(self, inner);
             }
             let handle = agent_loop.handle();
             let turn = TurnRef {
@@ -1178,25 +985,9 @@ impl Session {
                 loop_id: handle.id(),
             };
             #[cfg(test)]
-            INSTALLED_LOOP_OPTIONS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap()
-                .push((turn.loop_id, captured_options));
+            INSTALLED_LOOP_OPTIONS.arm(turn.loop_id, captured_options);
             let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
             let (completion_tx, completion_rx) = watch::channel(None);
-            inner.active = Some(ActiveLoop {
-                turn,
-                handle: handle.clone(),
-                completion: completion_rx,
-                task: None,
-                execution_summary: execution.summary,
-                execution_history,
-            });
-            inner
-                .presentation
-                .bind_started_loop(turn.loop_id, accepted_at.clone());
-            inner.presentation.record_prompt_time(accepted_at.clone());
             let task = Arc::new(SessionTask::new(tokio::spawn(run_active_loop(
                 self.clone(),
                 turn,
@@ -1204,11 +995,18 @@ impl Session {
                 events,
                 CompletionGuard::new(self.clone(), completion_tx),
             ))));
+            inner.active = Some(ActiveLoop {
+                turn,
+                handle: handle.clone(),
+                completion: completion_rx,
+                task,
+                execution_summary: execution.summary,
+                execution_history,
+            });
             inner
-                .active
-                .as_mut()
-                .expect("newly inserted active loop")
-                .task = Some(task);
+                .presentation
+                .bind_started_loop(turn.loop_id, accepted_at.clone());
+            inner.presentation.record_prompt_time(accepted_at.clone());
             turn
         };
         tracing::info!(
@@ -1223,18 +1021,29 @@ impl Session {
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
-        if inner.closing || inner.active.is_some() {
-            return Err(AgentError::SessionBusy);
-        }
-        if inner.compaction.is_some() {
+        if inner.closing
+            || inner.active.is_some()
+            || inner.compaction.is_some()
+            || inner.pending_compaction.is_some()
+        {
             return Err(AgentError::SessionBusy);
         }
         Ok(())
     }
 
+    fn clear_active_task(inner: &mut SessionInner, task: &Arc<SessionTask>) {
+        if inner
+            .active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.task, task))
+        {
+            inner.active = None;
+        }
+    }
+
     pub(crate) async fn cleanup_finished(&self) -> Result<(), AgentError> {
         let active_task = {
-            let inner = self.shared.inner.lock().unwrap();
+            let inner = self.lock_inner();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
@@ -1244,37 +1053,22 @@ impl Session {
                     .borrow()
                     .is_some()
                     .then(|| active.task.clone())
-                    .flatten()
             })
         };
         if let Some(task) = active_task {
             if task.join().await.is_err() {
-                let mut inner = self.shared.inner.lock().unwrap();
-                if inner
-                    .active
-                    .as_ref()
-                    .and_then(|active| active.task.as_ref())
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
-                {
-                    inner.active = None;
-                }
+                let mut inner = self.lock_inner();
+                Self::clear_active_task(&mut inner, &task);
                 inner.blocked = Some(SessionBlockReason::Internal);
                 drop(inner);
                 self.emit_state();
                 return Err(AgentError::SessionBlocked);
             }
-            let mut inner = self.shared.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner
-                .active
-                .as_ref()
-                .and_then(|active| active.task.as_ref())
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
-            {
-                inner.active = None;
-            }
+            Self::clear_active_task(&mut inner, &task);
         }
         if self.reap_finished_compaction().await? {
             return Ok(());
@@ -1284,33 +1078,12 @@ impl Session {
 
     fn cancel_active_on_drop(&self) {
         let handle = {
-            let inner = self.shared.inner.lock().unwrap();
+            let inner = self.lock_inner();
             inner.active.as_ref().map(|active| active.handle.clone())
         };
         if let Some(handle) = handle {
             let _ = handle.cancel();
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn abort_active_task(&self) -> Result<(), AgentError> {
-        let inner = self.shared.inner.lock().unwrap();
-        let task = inner
-            .active
-            .as_ref()
-            .and_then(|active| active.task.as_ref())
-            .ok_or(AgentError::TurnNotFound)?;
-        task.abort();
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn runtime_loop_finished(&self) -> bool {
-        let inner = self.shared.inner.lock().unwrap();
-        inner
-            .active
-            .as_ref()
-            .is_some_and(|active| active.handle.is_finished())
     }
 
     /// Agent-level completion: the runtime loop has joined and the report has
@@ -1319,7 +1092,7 @@ impl Session {
         &self,
         turn: TurnRef,
     ) -> Result<watch::Receiver<Option<TurnCompletion>>, AgentError> {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner
             .active
             .as_ref()
@@ -1329,7 +1102,7 @@ impl Session {
     }
 
     pub(crate) fn read_snapshot(&self) -> ReadSnapshot {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         ReadSnapshot {
             info: SessionInfo::from_record(&inner.record, true),
             history: Arc::clone(&inner.history),
@@ -1341,7 +1114,7 @@ impl Session {
         &self,
         turn: TurnRef,
     ) -> Result<Option<Option<Arc<TurnResult>>>, AgentError> {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         let Some(active) = inner.active.as_ref().filter(|active| active.turn == turn) else {
             return Ok(None);
         };
@@ -1359,11 +1132,12 @@ impl Session {
 
     pub(crate) fn steer(&self, turn: TurnRef, text: String) -> Result<SteerAccepted, AgentError> {
         let input = UserInput::text(text).map_err(|_| AgentError::InvalidInput)?;
-        let inner = self.shared.inner.lock().unwrap();
-        let active = inner.active.as_ref().ok_or(AgentError::TurnNotFound)?;
-        if active.turn != turn {
-            return Err(AgentError::TurnNotFound);
-        }
+        let inner = self.lock_inner();
+        let active = inner
+            .active
+            .as_ref()
+            .filter(|active| active.turn == turn)
+            .ok_or(AgentError::TurnNotFound)?;
         active.handle.steer(input).map_err(map_steer_error)?;
         let accepted_at = crate::store::utc_timestamp().ok();
         let steer_index = inner.presentation.note_steer_accepted(accepted_at.clone());
@@ -1374,11 +1148,12 @@ impl Session {
     }
 
     pub(crate) fn cancel(&self, turn: TurnRef) -> Result<bool, AgentError> {
-        let inner = self.shared.inner.lock().unwrap();
-        let active = inner.active.as_ref().ok_or(AgentError::TurnNotFound)?;
-        if active.turn != turn {
-            return Err(AgentError::TurnNotFound);
-        }
+        let inner = self.lock_inner();
+        let active = inner
+            .active
+            .as_ref()
+            .filter(|active| active.turn == turn)
+            .ok_or(AgentError::TurnNotFound)?;
         if active.handle.is_finished() {
             return Ok(false);
         }
@@ -1391,11 +1166,12 @@ impl Session {
         interaction_id: InteractionId,
         answer: InteractionAnswer,
     ) -> Result<(), AgentError> {
-        let inner = self.shared.inner.lock().unwrap();
-        let active = inner.active.as_ref().ok_or(AgentError::TurnNotFound)?;
-        if active.turn != turn {
-            return Err(AgentError::TurnNotFound);
-        }
+        let inner = self.lock_inner();
+        let active = inner
+            .active
+            .as_ref()
+            .filter(|active| active.turn == turn)
+            .ok_or(AgentError::TurnNotFound)?;
         active
             .handle
             .answer(interaction_id, answer)
@@ -1404,7 +1180,7 @@ impl Session {
 
     pub(crate) fn history(&self, request: &GetHistory) -> Result<HistoryPage, AgentError> {
         request.validate()?;
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         Ok(page_history(
             &inner.history,
             request.offset,
@@ -1414,7 +1190,7 @@ impl Session {
     }
 
     pub(crate) fn presentation(&self) -> Arc<crate::presentation::Presentation> {
-        let inner = self.shared.inner.lock().unwrap();
+        let inner = self.lock_inner();
         Arc::clone(&inner.presentation)
     }
 
@@ -1426,8 +1202,13 @@ impl Session {
         Arc::clone(&self.shared.command_owners)
     }
 
-    pub(crate) fn tool_observer(&self) -> Arc<ToolObserver> {
-        Arc::clone(&self.shared.tool_observer)
+    pub(crate) fn parts(&self) -> crate::agent::SessionParts {
+        crate::agent::SessionParts {
+            presentation: self.presentation(),
+            observer: Arc::clone(&self.shared.tool_observer),
+            command_owners: self.command_owners(),
+            compaction: self.compaction_state(),
+        }
     }
 
     pub(crate) fn presentation_view(&self) -> crate::presentation::PresentationView {
@@ -1443,10 +1224,10 @@ impl Session {
         policy: CompactionPolicy,
         options: LoopOptions,
     ) {
-        let mut inner = self.shared.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.presentation.install_model(config.model());
         inner.config = config;
-        inner.auto = auto.clone();
+        inner.auto = auto;
         inner.policy = policy;
         inner.options = options;
         // A reload is a settings change: bumping the config generation in one
@@ -1466,11 +1247,14 @@ impl Session {
     ) -> Result<Option<ConfigRevision>, AgentError> {
         let _io = self.shared.io.lock().await;
         let active_summary = {
-            let inner = self.shared.inner.lock().unwrap();
+            let inner = self.lock_inner();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || (inner.active.is_none() && inner.compaction.is_some()) {
+            if inner.closing
+                || inner.pending_compaction.is_some()
+                || (inner.active.is_none() && inner.compaction.is_some())
+            {
                 return Err(AgentError::SessionBusy);
             }
             inner
@@ -1484,19 +1268,15 @@ impl Session {
             record.system_prompt.clone(),
             auto.clone(),
         )?;
-        self.shared
-            .store
-            .write_record(&record)
-            .await
-            .map_err(map_store_error)?;
+        self.shared.store.write_record(&record).await?;
         let (handle, update_config) = {
-            let mut inner = self.shared.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             inner.presentation.set_model_label(record.model.clone());
             inner.presentation.install_model(config.model());
             inner.record = record;
             let update_config = config.clone();
             inner.config = config;
-            inner.auto = auto.clone();
+            inner.auto = auto;
             inner.options = options;
             self.shared.compaction.note_settings_installed();
             (
@@ -1512,7 +1292,6 @@ impl Session {
             // The loop sealed while the update was in flight; the session
             // settings still persist for the next turn.
             Err(UpdateError::NotActive) => Ok(None),
-            Err(UpdateError::InvalidConfig) => Err(AgentError::Internal),
             Err(_) => Err(AgentError::Internal),
         }
     }
@@ -1523,66 +1302,58 @@ impl Session {
         let _io = self.shared.io.lock().await;
         let updated_at = utc_timestamp().map_err(|_| AgentError::Store)?;
         let record = {
-            let inner = self.shared.inner.lock().unwrap();
+            let inner = self.lock_inner();
             let mut record = inner.record.clone();
             record.title = title;
             record.updated_at = updated_at;
             record
         };
-        self.shared
-            .store
-            .write_record(&record)
-            .await
-            .map_err(map_store_error)?;
-        let mut inner = self.shared.inner.lock().unwrap();
+        self.shared.store.write_record(&record).await?;
+        let mut inner = self.lock_inner();
         inner.record = record;
         Ok(())
     }
 
-    /// Cancels the active loop (if any), awaits its Agent-owned task, and
-    /// drains any child workers owned by this Session.
-    pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
-        let session_id = self.session_id();
-        // Every Session-owned query observes this token, so it is cancelled here
-        // with the other owners; the workers are joined further down, after
-        // every owner has been told to stop, so slow status cleanup can never
-        // delay cancelling the active loop or compaction.
+    pub(crate) fn begin_shutdown(&self) {
+        let mut inner = self.lock_inner();
+        inner.closing = true;
         self.shared.close.cancel();
-        let (active_handle, active_task, compaction) = {
-            let mut inner = self.shared.inner.lock().unwrap();
-            let active_handle = inner.active.as_ref().map(|active| active.handle.clone());
-            let active_task = inner.active.as_ref().and_then(|active| active.task.clone());
-            let compaction = inner.compaction.clone();
-            inner.closing = true;
-            (active_handle, active_task, compaction)
+        if let Some(active) = &inner.active {
+            active.handle.cancel();
+        }
+        for operation in inner.compaction.iter().chain(&inner.pending_compaction) {
+            operation.cancel();
+        }
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
+        self.begin_shutdown();
+        self.join_shutdown().await
+    }
+
+    /// Joins all owned work after `begin_shutdown` has stopped new admission.
+    pub(crate) async fn join_shutdown(self) -> Result<(), AgentError> {
+        let session_id = self.session_id();
+        let (active_task, compaction) = {
+            let inner = self.lock_inner();
+            (
+                inner.active.as_ref().map(|active| active.task.clone()),
+                inner.compaction.clone(),
+            )
         };
         let mut first_error = None;
-        if let Some(handle) = active_handle {
-            let _ = handle.cancel();
-        }
-        if let Some(operation) = compaction.as_ref() {
-            let _ = operation.cancel();
-        }
         if let Some(task) = active_task {
             if task.join().await.is_err() {
                 first_error = Some(AgentError::Internal);
             }
-            let mut inner = self.shared.inner.lock().unwrap();
-            if inner
-                .active
-                .as_ref()
-                .and_then(|active| active.task.as_ref())
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &task))
-            {
-                inner.active = None;
-            }
+            let mut inner = self.lock_inner();
+            Self::clear_active_task(&mut inner, &task);
         }
         if let Some(compaction) = compaction {
-            let _ = compaction.cancel();
             if compaction.join().await.is_err() && first_error.is_none() {
                 first_error = Some(AgentError::Internal);
             }
-            let mut inner = self.shared.inner.lock().unwrap();
+            let mut inner = self.lock_inner();
             if inner
                 .compaction
                 .as_ref()
@@ -1633,12 +1404,15 @@ fn history_fits_runtime_limits(
 }
 
 /// Mirrors `minicore_runtime::history::estimate_history_bytes` at the pinned
-/// Runtime revision `df00602d35008fb4ef1c655e943d8db3d6465331`. This narrow
+/// Runtime revision `9082184`. This narrow
 /// copy is only for the pre-start `LoopRequest.history` admission check; it is
 /// not a full prompt or provider-context estimate. The over-item and over-byte
 /// startup tests are the contract boundary for keeping this copy aligned.
 pub(crate) fn estimate_history_bytes(history: &[HistoryItem]) -> usize {
-    history.iter().map(estimate_history_item_bytes).sum()
+    history
+        .iter()
+        .map(estimate_history_item_bytes)
+        .fold(0, usize::saturating_add)
 }
 
 /// Produces a bounded context-query estimate. The item count is checked before
@@ -1718,14 +1492,9 @@ async fn run_active_loop(
         loop_id: turn.loop_id,
     };
     #[cfg(test)]
-    if should_panic_worker(turn.session_id) {
-        panic!("injected Agent worker panic");
-    }
+    tests::panic_worker(turn.session_id);
     #[cfg(test)]
-    if let Some(gate) = take_pause_before_join(turn.session_id) {
-        gate.started.notify_one();
-        gate.release.notified().await;
-    }
+    tests::pause_worker(&PAUSE_BEFORE_JOIN, turn.session_id).await;
     let join = agent_loop.join();
     tokio::pin!(join);
     let mut events_open = true;
@@ -1822,6 +1591,11 @@ async fn run_active_loop(
             .await
         {
             Ok(()) => {
+                let history = Arc::clone(&session.shared.inner.lock().unwrap().history);
+                let mut merged = Vec::with_capacity(history.len() + sanitized.len());
+                merged.extend(history.iter().cloned());
+                merged.extend(sanitized.iter().cloned());
+                let merged = merged.into();
                 {
                     let mut inner = session.shared.inner.lock().unwrap();
                     // Persisted user timestamps align by (loop_id, occurrence).
@@ -1840,10 +1614,7 @@ async fn run_active_loop(
                             occurrence += 1;
                         }
                     }
-                    let mut merged = Vec::with_capacity(inner.history.len() + sanitized.len());
-                    merged.extend(inner.history.iter().cloned());
-                    merged.extend(sanitized.iter().cloned());
-                    inner.history = merged.into();
+                    inner.history = merged;
                     inner.blocked = None;
                 }
                 session.presentation().clear_user_times();
@@ -1857,9 +1628,10 @@ async fn run_active_loop(
                     error_kind = error.kind(),
                     "history.jsonl append failed"
                 );
-                let mut inner = session.shared.inner.lock().unwrap();
-                inner.blocked = Some(SessionBlockReason::Persistence);
-                drop(inner);
+                if matches!(error, crate::store::AppendError::Unknown) {
+                    session.shared.inner.lock().unwrap().blocked =
+                        Some(SessionBlockReason::Persistence);
+                }
                 TurnPersistence::Failed
             }
         }
@@ -1896,12 +1668,6 @@ async fn run_active_loop(
         persistence,
     });
 
-    // Best-effort auxiliary tool persistence: save native tool facts and
-    // streams to the store's auxiliary directory before publishing turn completion.
-    // Failure is logged as a warning; it does not change TurnResult persistence
-    // or ToolOutcome, does not retry the loop, and does not touch history.jsonl.
-    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
-
     // Own the join slot before reserving. Reservation excludes the next
     // submit and close captures its cancellation owner under the same lock.
     // There is no await between completion publication and handle installation.
@@ -1934,15 +1700,14 @@ async fn run_active_loop(
     }
     drop(join_slot);
 
+    // Remain in the owned task so close/shutdown still join auxiliary writes.
+    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
+
     session.shared.events.try_send(AgentEvent::TurnFinished {
         turn,
         outcome: LoopOutcomeView::from_report(&report),
         persistence,
-        meta: EventMeta {
-            session_id: turn.session_id,
-            loop_id: Some(turn.loop_id),
-            dropped_before: 0,
-        },
+        meta: EventMeta::for_turn(turn),
     });
     session.emit_state();
 }
@@ -1990,11 +1755,7 @@ async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loo
 }
 
 fn mark_internal(session: &Session) {
-    let mut inner = session
-        .shared
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut inner = session.lock_inner();
     inner.blocked = Some(SessionBlockReason::Internal);
 }
 
@@ -2003,7 +1764,7 @@ async fn touch_updated_at_best_effort(session: &Session) {
         return;
     };
     let record = {
-        let mut inner = session.shared.inner.lock().unwrap();
+        let mut inner = session.lock_inner();
         let mut record = inner.record.clone();
         record.updated_at = updated_at.clone();
         inner.record = record.clone();
@@ -2290,79 +2051,31 @@ fn loop_failure_kind(kind: &minicore_runtime::LoopFailureKind) -> &'static str {
     }
 }
 
-impl StoredLoopOutcome {
-    pub(crate) fn from_report(report: &LoopReport) -> Self {
-        match &report.outcome {
-            minicore_runtime::LoopOutcome::Completed => Self::Completed,
-            minicore_runtime::LoopOutcome::Cancelled(reason) => Self::Cancelled {
-                reason: match reason {
-                    minicore_runtime::CancelReason::User => StoredCancelReason::User,
-                    minicore_runtime::CancelReason::OwnerDropped => {
-                        StoredCancelReason::OwnerDropped
-                    }
-                    minicore_runtime::CancelReason::Shutdown => StoredCancelReason::Shutdown,
-                    minicore_runtime::CancelReason::Deadline => StoredCancelReason::Deadline,
-                },
-            },
-            minicore_runtime::LoopOutcome::Failed(failure) => Self::Failed {
-                kind: loop_failure_kind(&failure.kind).to_owned(),
-                model_error: failure.model_error().map(StoredModelError::from_model),
-            },
-        }
-    }
-}
-
 /// Awaits an Agent-level turn completion. Used by `Session::wait` and the RPC
 /// deferred waiter; never waits on a raw runtime `LoopHandle`.
 pub(crate) async fn await_turn_completion(
-    mut receiver: watch::Receiver<Option<TurnCompletion>>,
+    receiver: watch::Receiver<Option<TurnCompletion>>,
 ) -> Result<Arc<TurnResult>, AgentError> {
-    loop {
-        {
-            let value = receiver.borrow();
-            if let Some(completion) = value.as_ref() {
-                return match completion {
-                    TurnCompletion::Finished(result) => Ok(Arc::clone(result)),
-                    TurnCompletion::Internal => Err(AgentError::Internal),
-                };
-            }
-        }
-        if receiver.changed().await.is_err() {
-            return Err(AgentError::Internal);
-        }
+    match await_completion(receiver).await? {
+        TurnCompletion::Finished(result) => Ok(result),
+        TurnCompletion::Internal => Err(AgentError::Internal),
     }
 }
 
 pub(crate) async fn await_compaction_completion(
-    mut receiver: watch::Receiver<Option<CompactionResult>>,
+    receiver: watch::Receiver<Option<CompactionResult>>,
 ) -> Result<CompactionResult, AgentError> {
-    loop {
-        {
-            let value = receiver.borrow();
-            if let Some(result) = value.as_ref() {
-                return Ok(result.clone());
-            }
-        }
-        if receiver.changed().await.is_err() {
-            return Err(AgentError::Internal);
-        }
-    }
+    await_completion(receiver).await
 }
 
-pub(crate) fn map_store_error(error: StoreError) -> AgentError {
-    match error {
-        StoreError::SessionNotFound => AgentError::SessionNotFound,
-        StoreError::SessionAlreadyExists
-        | StoreError::InvalidRoot
-        | StoreError::InvalidRecord
-        | StoreError::UnsupportedFormat
-        | StoreError::Corrupt
-        | StoreError::RecordTooLarge
-        | StoreError::Unavailable => AgentError::Store,
-        StoreError::HistoryChanged => AgentError::InvalidState,
-        StoreError::QueryLimit => AgentError::QueryLimit,
-        StoreError::InvalidArguments => AgentError::InvalidArguments,
-    }
+async fn await_completion<T: Clone>(
+    mut receiver: watch::Receiver<Option<T>>,
+) -> Result<T, AgentError> {
+    let value = receiver
+        .wait_for(Option::is_some)
+        .await
+        .map_err(|_| AgentError::Internal)?;
+    Ok(value.as_ref().expect("waited for completion").clone())
 }
 
 fn map_steer_error(error: SteerError) -> AgentError {
@@ -2378,79 +2091,10 @@ fn map_steer_error(error: SteerError) -> AgentError {
 fn map_answer_error(error: AnswerError) -> AgentError {
     match error {
         AnswerError::InteractionNotFound => AgentError::InteractionNotFound,
-        AnswerError::WrongInteraction | AnswerError::NotActive => AgentError::InvalidInteraction,
+        AnswerError::NotActive => AgentError::TurnNotFound,
         _ => AgentError::InvalidInteraction,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::compaction::EphemeralGroupKey;
-    use crate::event::{AgentEvent, AgentEventSink, EventMeta, LoopOutcomeView};
-    use crate::ids::SessionId;
-
-    #[tokio::test]
-    async fn ignored_finished_drops_accumulate_into_subsequent_agent_event() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-        let sink = AgentEventSink::new(sender);
-        let turn = TurnRef {
-            session_id: SessionId::new().unwrap(),
-            loop_id: LoopId::new().unwrap(),
-        };
-        // The runner drains the loop event stream to close after `join`, so
-        // the ignored runtime `Finished` envelope still records its cumulative
-        // drop count (here 7) on the Agent sink.
-        sink.record_core_drops(7);
-        sink.try_send(AgentEvent::TurnFinished {
-            turn,
-            outcome: LoopOutcomeView::Completed,
-            persistence: TurnPersistence::Persisted,
-            meta: EventMeta {
-                session_id: turn.session_id,
-                loop_id: Some(turn.loop_id),
-                dropped_before: 0,
-            },
-        });
-        let received = receiver
-            .recv()
-            .await
-            .expect("agent event must be delivered");
-        let AgentEvent::TurnFinished { meta, .. } = received else {
-            panic!("expected a turn finished event");
-        };
-        assert_eq!(meta.dropped_before, 7);
-    }
-
-    #[test]
-    fn an_old_loop_cleanup_cannot_clear_a_new_loop_summary() {
-        let state = CompactionState::new();
-        let old_loop = LoopId::new().unwrap();
-        let new_loop = LoopId::new().unwrap();
-        let cleanup = EphemeralSummaryCleanup {
-            state: Arc::clone(&state),
-            loop_id: old_loop,
-        };
-        assert!(state.cache_ephemeral(
-            old_loop,
-            EphemeralGroupKey {
-                start: 0,
-                end: 1,
-                source_hash: [1; 32],
-            },
-            BoundedText::new("old").unwrap(),
-        ));
-        state.clear_ephemeral(old_loop);
-        assert!(state.cache_ephemeral(
-            new_loop,
-            EphemeralGroupKey {
-                start: 0,
-                end: 1,
-                source_hash: [2; 32],
-            },
-            BoundedText::new("new").unwrap(),
-        ));
-        drop(cleanup);
-        assert!(state.ephemeral(new_loop).is_some());
-    }
-}
+mod tests;

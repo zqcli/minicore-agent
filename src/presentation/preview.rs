@@ -218,14 +218,15 @@ impl PreviewObserver {
                     || (call.ended && !call.parser.complete()),
             )
         };
+        let turn = TurnRef {
+            session_id: self.presentation.session_id,
+            loop_id: self.key.loop_id,
+        };
         let _ = self
             .presentation
             .events
             .try_send(AgentEvent::ToolArgumentsPreview {
-                turn: TurnRef {
-                    session_id: self.presentation.session_id,
-                    loop_id: self.key.loop_id,
-                },
+                turn,
                 request_index: self.key.request_index,
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -234,7 +235,7 @@ impl PreviewObserver {
                 state,
                 partial,
                 display,
-                meta: EventMeta::for_loop(self.presentation.session_id, self.key.loop_id),
+                meta: EventMeta::for_turn(turn),
             });
         self.last_update = Some(now);
     }

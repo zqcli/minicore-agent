@@ -363,7 +363,6 @@ pub(crate) async fn read_session(
                     snapshot.as_ref().map(|snapshot| snapshot.history.len()),
                     request.captured_end,
                     request.history_revision.as_deref(),
-                    snapshot.as_ref().map(|snapshot| snapshot.history.as_ref()),
                     display.then_some(covered),
                     &limits,
                 )
@@ -681,56 +680,10 @@ fn pending_turn_page(turn: TurnRef, max_bytes: usize) -> Result<TurnResultPage, 
 }
 
 #[cfg(test)]
-pub(crate) struct ToolReadGate {
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl ToolReadGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.entered.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-type ToolReadGateEntry = (ToolRef, Arc<ToolReadGate>);
-#[cfg(test)]
-static TOOL_READ_GATES: std::sync::OnceLock<std::sync::Mutex<Vec<ToolReadGateEntry>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn gate_next_tool_read(tool_ref: ToolRef, gate: Arc<ToolReadGate>) {
-    let mutex = TOOL_READ_GATES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    mutex.lock().unwrap().push((tool_ref, gate));
-}
-
-#[cfg(test)]
-async fn check_tool_read_gate(tool_ref: &ToolRef) {
-    let gate = {
-        let Some(mutex) = TOOL_READ_GATES.get() else {
-            return;
-        };
-        let mut entries = mutex.lock().unwrap();
-        let Some(pos) = entries.iter().position(|(r, _)| r == tool_ref) else {
-            return;
-        };
-        entries.remove(pos).1
-    };
-    gate.entered.notify_one();
-    gate.release.notified().await;
-}
+pub(crate) static TOOL_READ_GATES: crate::test_support::Registry<
+    ToolRef,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 async fn resolve_tool_record(
     store: &Store,
@@ -771,7 +724,9 @@ async fn cold_read_and_merge(
     deadline: Instant,
 ) -> Result<ToolRecord, AgentError> {
     #[cfg(test)]
-    check_tool_read_gate(tool_ref).await;
+    if let Some(gate) = TOOL_READ_GATES.take(tool_ref) {
+        gate.pass().await;
+    }
 
     let disk_result = store
         .read_tool_record_with_deadline(tool_ref, deadline)
@@ -783,13 +738,8 @@ async fn cold_read_and_merge(
             Ok(mem)
         }
         Ok(None) => Ok(mem),
-        Err(store_err) => {
-            if matches!(store_err, crate::error::StoreError::QueryLimit) {
-                Err(AgentError::QueryLimit)
-            } else {
-                Ok(mem)
-            }
-        }
+        Err(crate::error::StoreError::QueryLimit) => Err(AgentError::QueryLimit),
+        Err(_) => Ok(mem),
     }
 }
 
@@ -799,7 +749,9 @@ async fn cold_read_only(
     deadline: Instant,
 ) -> Result<ToolRecord, AgentError> {
     #[cfg(test)]
-    check_tool_read_gate(tool_ref).await;
+    if let Some(gate) = TOOL_READ_GATES.take(tool_ref) {
+        gate.pass().await;
+    }
 
     let disk_result = store
         .read_tool_record_with_deadline(tool_ref, deadline)
@@ -808,13 +760,8 @@ async fn cold_read_only(
     match disk_result {
         Ok(Some(disk_record)) => Ok(disk_record),
         Ok(None) => Err(AgentError::ToolNotFound),
-        Err(store_err) => {
-            if matches!(store_err, crate::error::StoreError::QueryLimit) {
-                Err(AgentError::QueryLimit)
-            } else {
-                Err(AgentError::ToolNotFound)
-            }
-        }
+        Err(crate::error::StoreError::QueryLimit) => Err(AgentError::QueryLimit),
+        Err(_) => Err(AgentError::ToolNotFound),
     }
 }
 
@@ -920,7 +867,7 @@ async fn stored_turn_page(
     let base = TurnResultPage {
         turn,
         availability: TurnResultAvailability::Stored,
-        outcome: Some(LoopOutcomeView::from_stored(&record.outcome)),
+        outcome: Some(record.outcome.clone()),
         persistence: Some(TurnPersistence::Persisted),
         usage: Some(record.usage),
         requests: Some(record.requests),
@@ -1301,7 +1248,7 @@ impl ReadTurnSummary {
     fn from_stored(summary: &StoredTurnSummary) -> Self {
         Self {
             loop_id: summary.loop_id,
-            outcome: LoopOutcomeView::from_stored(&summary.outcome),
+            outcome: summary.outcome.clone(),
             usage: summary.usage,
             requests: summary.requests,
             tool_rounds: summary.tool_rounds,
@@ -1365,7 +1312,7 @@ fn map_read_store_error(error: crate::error::StoreError) -> AgentError {
         crate::error::StoreError::HistoryChanged => AgentError::InvalidState,
         crate::error::StoreError::QueryLimit => AgentError::QueryLimit,
         crate::error::StoreError::InvalidArguments => AgentError::InvalidArguments,
-        other => crate::sessions::map_store_error(other),
+        other => AgentError::from(other),
     }
 }
 

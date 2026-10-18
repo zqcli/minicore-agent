@@ -3,6 +3,20 @@ use serde_json::json;
 use super::*;
 use crate::workspace::status::{WorkspaceStatusEntry, WorkspaceStatusEntryKind};
 
+pub(super) async fn check_change_list_gate(
+    session_id: crate::ids::SessionId,
+    cancellation: &CancellationToken,
+) -> Result<(), AgentError> {
+    if let Some(gate) = CHANGE_LIST_GATES.take(&session_id) {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AgentError::QueryLimit),
+            _ = gate.pass() => {},
+        }
+    }
+    Ok(())
+}
+
 fn session() -> crate::ids::SessionId {
     "ses_00000000000000000000000000000001".parse().unwrap()
 }
@@ -221,6 +235,92 @@ async fn blob_verification_warnings_cannot_push_a_selected_record_past_the_budge
     assert_eq!(result.records.len(), 1);
     assert!(result.next_cursor.is_some());
     assert!(serde_json::to_vec(&result).unwrap().len() <= max_bytes);
+}
+
+#[tokio::test]
+async fn incremental_page_sizes_match_json_at_cursor_and_budget_boundaries() {
+    let session_id = session();
+    let observation = "a".repeat(64);
+    let records: Vec<_> = (0..600)
+        .map(|index| ChangeRecord {
+            change_ref: format!("tool:{index:064x}"),
+            path: format!("{index:04}-é-\"quoted\"-\\path\n"),
+            kind: ChangeKind::Modified,
+            origin: ChangeOrigin::Tool,
+            tool_ref: None,
+            original_path: None,
+            before: ChangeRevision::Unknown,
+            after: ChangeRevision::Unknown,
+            commit_state: ChangeCommitState::Applied,
+            details_available: false,
+            coverage: ChangeCoverage::Unavailable,
+        })
+        .collect();
+    let warnings = vec![
+        ChangeListWarning::DetailsUnavailable,
+        ChangeListWarning::RecordsSkipped,
+    ];
+    for (offset, count) in [(0, 500), (8, 3), (98, 3), (597, 3)] {
+        let end = offset + count;
+        let expected = ChangesListResult {
+            session_id,
+            scope: ChangeScope::Session,
+            records: records[offset..end].to_vec(),
+            next_cursor: (end < records.len()).then(|| ChangeCursor {
+                session_id,
+                scope: ChangeScope::Session,
+                offset: end,
+                observation: Some(observation.clone()),
+            }),
+            total: records.len(),
+            complete: false,
+            stale: false,
+            consistency: ChangeListConsistency::Cold,
+            observed_at_unix_ms: None,
+            warnings: warnings.clone(),
+        };
+        let exact_bytes = encoded_len(&expected);
+        for budget in [exact_bytes - 1, exact_bytes] {
+            let request = ChangesListRequest {
+                session_id,
+                scope: ChangeScope::Session,
+                cursor: Some(ChangeCursor {
+                    session_id,
+                    scope: ChangeScope::Session,
+                    offset,
+                    observation: Some(observation.clone()),
+                }),
+                limit: 1_000,
+                max_bytes: Some(budget),
+            };
+            let result = page_records(
+                &request,
+                records.clone(),
+                observation.clone(),
+                ChangeListConsistency::Cold,
+                None,
+                warnings.clone(),
+                false,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(5),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.records.len(),
+                count - usize::from(budget < exact_bytes)
+            );
+            assert_eq!(
+                result.records,
+                records[offset..offset + result.records.len()]
+            );
+            assert!(encoded_len(&result) <= budget);
+            if budget == exact_bytes {
+                assert_eq!(result, expected);
+            }
+        }
+    }
 }
 
 #[test]
