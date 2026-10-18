@@ -208,8 +208,9 @@ async fn compaction_cancel_before_preparation_prevents_the_summary_call() {
 
 #[tokio::test]
 async fn dropping_unpolled_compaction_preparation_releases_admission() {
-    let (mut agent, base, workspace) =
-        test_agent("dropped-compaction", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("dropped-compaction", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let mut agent = fixture.open().await;
     let session = create(&mut agent, &workspace).await;
     let request = crate::CompactSession {
         session_id: session.session_id,
@@ -232,7 +233,6 @@ async fn dropping_unpolled_compaction_preparation_releases_admission() {
         .unwrap();
     assert_eq!(result.status, crate::CompactionStatus::Noop);
     agent.shutdown().await.unwrap();
-    remove_base(&base).await;
 }
 
 #[tokio::test]
@@ -560,8 +560,9 @@ async fn all_query_paths_prefer_caller_cancellation_over_session_closure() {
     fn erase<T: Send + 'static>(future: QueryFuture<T>) -> QueryFuture<()> {
         future.map(|result| result.map(|_| ())).boxed()
     }
-    let (mut agent, base, workspace) =
-        test_agent("query-precedence", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("query-precedence", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let mut agent = fixture.open().await;
     for (cancel_caller, cancel_session) in [(true, false), (false, true), (true, true)] {
         let info = create(&mut agent, &workspace).await;
         let id = info.session_id;
@@ -655,5 +656,4 @@ async fn all_query_paths_prefer_caller_cancellation_over_session_closure() {
         agent.close_session(id).await.unwrap();
     }
     agent.shutdown().await.unwrap();
-    remove_base(&base).await;
 }

@@ -9,8 +9,10 @@ async fn lifecycle_disk_work_is_deferred_and_reserves_the_session() {
         "session.delete",
         "session.compact",
     ] {
-        let (agent, base, workspace) =
-            test_agent("deferred-lifecycle", [], &[], ApprovalMode::Auto).await;
+        let fixture = RpcFixture::new("deferred-lifecycle", [], &[], ApprovalMode::Auto);
+        let base = fixture.base.path().to_owned();
+        let workspace = fixture.workspace.clone();
+        let agent = fixture.open().await;
         let mut harness = RpcHarness::spawn(agent);
         let session = create_and_open(&mut harness, &workspace).await;
         if matches!(method, "session.open" | "session.delete") {
@@ -61,15 +63,16 @@ async fn lifecycle_disk_work_is_deferred_and_reserves_the_session() {
                 .is_some()
         );
         harness.shutdown().await;
-        remove_base(&base).await;
     }
 }
 
 #[tokio::test]
 async fn create_reserves_its_id_before_the_record_can_be_discovered() {
     use super::super::{Dispatch, RpcId, RpcRequest};
-    let (agent, base, workspace) =
-        test_agent("create-reservation", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("create-reservation", [], &[], ApprovalMode::Auto);
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(8);
     let mut server = RpcServer {
         agent: Some(agent),
@@ -116,18 +119,18 @@ async fn create_reserves_its_id_before_the_record_can_be_discovered() {
         json!(session_id)
     );
     server.agent.take().unwrap().shutdown().await.unwrap();
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn slow_close_allows_other_turn_cancellation_and_shutdown_waits_for_it() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "close-responsive",
         [ModelScript::Block, ModelScript::Block],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let first = create_and_open(&mut harness, &workspace).await;
     let second = create_and_open(&mut harness, &workspace).await;
@@ -184,18 +187,18 @@ async fn slow_close_allows_other_turn_cancellation_and_shutdown_waits_for_it() {
     );
     assert!(harness.next_frame().await.is_none());
     harness.join().await.unwrap();
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn answers_after_completion_report_turn_not_found() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "ended-answer",
         [ModelScript::Text("done")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
     harness
@@ -232,12 +235,12 @@ async fn answers_after_completion_report_turn_not_found() {
         json!({"kind":"turn_not_found","retryable":false})
     );
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn oversized_frame_reports_parse_error_then_stops() {
-    let (agent, base, _) = test_agent("oversized-service", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("oversized-service", [], &[], ApprovalMode::Auto);
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let mut frame = vec![b' '; MAX_RPC_LINE_BYTES + 1];
     frame.push(b'\n');
@@ -255,13 +258,14 @@ async fn oversized_frame_reports_parse_error_then_stops() {
     );
     assert!(harness.next_frame().await.is_none());
     harness.join().await.unwrap();
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn shutdown_signal_is_observed_while_a_close_is_pending() {
-    let (mut agent, base, workspace) =
-        test_agent("signal-during-close", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("signal-during-close", [], &[], ApprovalMode::Auto);
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let mut agent = fixture.open().await;
     let info = agent
         .create_session(crate::CreateSession {
             workspace,
@@ -331,7 +335,6 @@ async fn shutdown_signal_is_observed_while_a_close_is_pending() {
         .unwrap();
     // stdin remained open: only the signal could have initiated shutdown.
     drop(input);
-    remove_base(&base).await;
 }
 
 #[test]

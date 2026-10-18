@@ -2,13 +2,10 @@ use super::*;
 
 #[tokio::test]
 async fn capability_discovery_returns_ordered_lists() {
-    let (agent, base, _workspace) =
-        test_agent("capability", [], &["read"], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("capability", [], &["read"], ApprovalMode::Auto);
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
-    harness
-        .send(json!("p"), "agent.ping", Some(json!({})))
-        .await;
-    let ping = harness.response(json!("p")).await;
+    let ping = harness.call_ok("agent.ping", Some(json!({}))).await;
     assert_eq!(ping["result"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(ping["result"]["protocol_version"], json!(1));
     assert_eq!(
@@ -33,16 +30,10 @@ async fn capability_discovery_returns_ordered_lists() {
         ])
     );
 
-    harness
-        .send(json!("profiles"), "profile.list", Some(json!({})))
-        .await;
-    let profiles = harness.response(json!("profiles")).await;
+    let profiles = harness.call_ok("profile.list", Some(json!({}))).await;
     assert_eq!(profiles["result"]["profiles"][0]["id"], json!("test"));
 
-    harness
-        .send(json!("models"), "model.list", Some(json!({})))
-        .await;
-    let models = harness.response(json!("models")).await;
+    let models = harness.call_ok("model.list", Some(json!({}))).await;
     assert_eq!(models["result"]["models"][0]["id"], json!("fake"));
     assert_eq!(
         models["result"]["models"][0]["supported_reasoning"],
@@ -51,25 +42,19 @@ async fn capability_discovery_returns_ordered_lists() {
         ])
     );
 
-    harness
-        .send(json!("sessions"), "session.list", Some(json!({})))
-        .await;
-    let sessions = harness.response(json!("sessions")).await;
+    let sessions = harness.call_ok("session.list", Some(json!({}))).await;
     assert_eq!(sessions["result"]["sessions"], json!([]));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn agent_reload_requires_empty_params_and_a_file_source() {
-    let (agent, base, _workspace) = test_agent("reload-rpc", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("reload-rpc", [], &[], ApprovalMode::Auto);
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
 
-    harness
-        .send(json!("reload"), "agent.reload", Some(json!({})))
-        .await;
-    let reload = harness.response(json!("reload")).await;
+    let reload = harness.call("agent.reload", Some(json!({}))).await;
     assert_eq!(reload["error"]["code"], json!(-32018));
     assert_eq!(
         reload["error"]["data"],
@@ -79,29 +64,20 @@ async fn agent_reload_requires_empty_params_and_a_file_source() {
         })
     );
 
-    harness
-        .send(
-            json!("reload-path"),
+    let reload_path = harness
+        .call_err(
             "agent.reload",
             Some(json!({"path": "/tmp/other.agent.toml"})),
+            -32602,
+            "invalid_params",
         )
         .await;
-    let reload_path = harness.response(json!("reload-path")).await;
-    assert_eq!(reload_path["error"]["code"], json!(-32602));
-    assert_eq!(
-        reload_path["error"]["data"]["kind"],
-        json!("invalid_params")
-    );
     assert!(!reload_path.to_string().contains("other.agent.toml"));
 
-    harness
-        .send(json!("reload-omitted"), "agent.reload", None)
-        .await;
-    let reload_omitted = harness.response(json!("reload-omitted")).await;
+    let reload_omitted = harness.call("agent.reload", None).await;
     assert_eq!(reload_omitted["error"]["code"], json!(-32018));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// P1 regression: the private `Result` boundary must return the exact same
@@ -110,7 +86,8 @@ async fn agent_reload_requires_empty_params_and_a_file_source() {
 /// the unknown-method fallback through `dispatch_inner`.
 #[tokio::test]
 async fn dispatch_inner_propagates_the_full_error_object() {
-    let (agent, base, _workspace) = test_agent("dispatch-error", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("dispatch-error", [], &[], ApprovalMode::Auto);
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
 
     let cases = [
@@ -162,5 +139,4 @@ async fn dispatch_inner_propagates_the_full_error_object() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

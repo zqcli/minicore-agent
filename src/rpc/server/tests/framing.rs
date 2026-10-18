@@ -6,7 +6,7 @@ use super::*;
 #[tokio::test]
 async fn fragmented_frame_survives_deferred_waiter_interleaving() {
     let probe = ConcurrencyProbe::new();
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "half-frame-interleave",
         [
             ModelScript::Gate(Arc::clone(&probe)),
@@ -14,8 +14,9 @@ async fn fragmented_frame_survives_deferred_waiter_interleaving() {
         ],
         &["read"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let (reader, input) = chunked_input();
     let mut harness =
         RpcHarness::spawn_with(agent, BufReader::new(reader), Box::new(input.clone()));
@@ -64,7 +65,6 @@ async fn fragmented_frame_survives_deferred_waiter_interleaving() {
     assert!(ping_response["result"]["version"].is_string());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// Direct regression for the same cancellation: a frame split across a
@@ -135,13 +135,14 @@ async fn read_frame_limit_covers_cumulative_length_after_cancellation() {
 #[tokio::test]
 async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
     let probe = ConcurrencyProbe::new();
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "waiter-limit",
         [ModelScript::Gate(Arc::clone(&probe))],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
@@ -172,20 +173,21 @@ async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
             .await;
     }
 
-    harness
-        .send(json!("wait-over"), "turn.wait", Some(turn_params(&turn)))
+    let over = harness
+        .call_err(
+            "turn.wait",
+            Some(turn_params(&turn)),
+            -32019,
+            "resource_exhausted",
+        )
         .await;
-    let over = harness.response(json!("wait-over")).await;
-    assert_eq!(over["error"]["code"], json!(-32019));
-    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
     assert_eq!(over["error"]["data"]["retryable"], json!(true));
 
     // The capped compaction request is rejected before the Session-owned
     // operation starts, while the waiter slots are still full and the turn is
     // still gated.
-    harness
-        .send(
-            json!("compact-over"),
+    let compact = harness
+        .call(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -193,7 +195,6 @@ async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
             })),
         )
         .await;
-    let compact = harness.response(json!("compact-over")).await;
     assert_eq!(compact["error"]["code"], json!(-32019));
 
     // The reader still serves control methods, and no compaction was launched.
@@ -201,14 +202,9 @@ async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
         .send(json!("ping"), "agent.ping", Some(json!({})))
         .await;
     assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
-    harness
-        .send(
-            json!("state"),
-            "session.state",
-            Some(json!({"session_id": session_id})),
-        )
+    let state = harness
+        .call_ok("session.state", Some(json!({"session_id": session_id})))
         .await;
-    let state = harness.response(json!("state")).await;
     assert!(state["result"]["compaction"].is_null());
     harness
         .send(json!("cancel"), "turn.cancel", Some(turn_params(&turn)))
@@ -226,5 +222,4 @@ async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
     }
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

@@ -2,18 +2,17 @@ use super::*;
 
 #[tokio::test]
 async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
-    let (agent, base, workspace) =
-        test_agent("extended-reasoning", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("extended-reasoning", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
 
-    harness
-        .send(
-            json!("create-xhigh"),
+    let created = harness
+        .call_ok(
             "session.create",
             Some(json!({"workspace": workspace, "reasoning": "xhigh"})),
         )
         .await;
-    let created = harness.response(json!("create-xhigh")).await;
     assert_eq!(created["result"]["session"]["reasoning"], json!("xhigh"));
     assert_eq!(
         serde_json::from_value::<ReasoningPreference>(
@@ -64,14 +63,9 @@ async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
         json!({"ok": true})
     );
 
-    harness
-        .send(
-            json!("reopen"),
-            "session.open",
-            Some(json!({"session_id": session_id})),
-        )
+    let reopened = harness
+        .call_ok("session.open", Some(json!({"session_id": session_id})))
         .await;
-    let reopened = harness.response(json!("reopen")).await;
     assert_eq!(reopened["result"]["session"]["reasoning"], json!("ultra"));
     let reopened_event = harness.event("session_opened").await;
     assert_eq!(
@@ -92,29 +86,27 @@ async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_rename_is_a_separate_rpc_and_persists_title_without_config_revision() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "rename-basic",
         [ModelScript::Text("done")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("rename"),
+    let renamed = harness
+        .call_ok(
             "session.rename",
             Some(json!({"session_id": session_id, "title": "  Unicode 名称  "})),
         )
         .await;
-    let renamed = harness.response(json!("rename")).await;
     assert_eq!(renamed["result"]["session"]["title"], json!("Unicode 名称"));
     assert!(renamed["result"].get("active_revision").is_none());
     assert_eq!(renamed["result"]["session"]["model"], json!("fake"));
@@ -132,26 +124,22 @@ async fn session_rename_is_a_separate_rpc_and_persists_title_without_config_revi
         json!({"ok": true})
     );
 
-    harness
-        .send(
-            json!("reopen"),
-            "session.open",
-            Some(json!({"session_id": session_id})),
-        )
+    let reopened = harness
+        .call_ok("session.open", Some(json!({"session_id": session_id})))
         .await;
-    let reopened = harness.response(json!("reopen")).await;
     assert_eq!(
         reopened["result"]["session"]["title"],
         json!("Unicode 名称")
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_rename_supports_unloaded_sessions_and_clears_title() {
-    let (agent, base, workspace) = test_agent("rename-unloaded", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("rename-unloaded", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
@@ -167,44 +155,36 @@ async fn session_rename_supports_unloaded_sessions_and_clears_title() {
         json!({"ok": true})
     );
 
-    harness
-        .send(
-            json!("rename-unloaded"),
+    let renamed = harness
+        .call_ok(
             "session.rename",
             Some(json!({"session_id": session_id, "title": "  Unloaded  "})),
         )
         .await;
-    let renamed = harness.response(json!("rename-unloaded")).await;
     assert_eq!(renamed["result"]["session"]["title"], json!("Unloaded"));
     assert_eq!(renamed["result"]["session"]["loaded"], json!(false));
 
-    harness
-        .send(
-            json!("clear"),
+    let cleared = harness
+        .call_ok(
             "session.rename",
             Some(json!({"session_id": session_id, "title": " \t "})),
         )
         .await;
-    let cleared = harness.response(json!("clear")).await;
     assert!(cleared["result"]["session"]["title"].is_null());
 
-    harness
-        .send(
-            json!("open"),
-            "session.open",
-            Some(json!({"session_id": session_id})),
-        )
+    let reopened = harness
+        .call_ok("session.open", Some(json!({"session_id": session_id})))
         .await;
-    let reopened = harness.response(json!("open")).await;
     assert!(reopened["result"]["session"]["title"].is_null());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_rename_rejects_invalid_titles_and_unknown_fields() {
-    let (agent, base, workspace) = test_agent("rename-invalid", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("rename-invalid", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
@@ -219,83 +199,73 @@ async fn session_rename_rejects_invalid_titles_and_unknown_fields() {
             )
             .await;
         let response = harness.response(id).await;
-        assert_eq!(response["error"]["code"], json!(-32602));
-        assert_eq!(response["error"]["data"]["kind"], json!("invalid_params"));
+        assert_rpc_error(&response, -32602, "invalid_params");
         assert!(!response.to_string().contains("bad"));
     }
 
-    harness
-        .send(
-            json!("unknown"),
+    let unknown = harness
+        .call(
             "session.rename",
             Some(json!({"session_id": session_id, "title": "ok", "extra": true})),
         )
         .await;
-    let unknown = harness.response(json!("unknown")).await;
     assert_eq!(unknown["error"]["code"], json!(-32602));
 
     let missing_id = SessionId::new().unwrap();
     harness
-        .send(
-            json!("missing"),
+        .call_err(
             "session.rename",
             Some(json!({
                 "session_id": missing_id,
                 "title": "missing"
             })),
+            -32001,
+            "session_not_found",
         )
         .await;
-    let missing = harness.response(json!("missing")).await;
-    assert_eq!(missing["error"]["code"], json!(-32001));
-    assert_eq!(missing["error"]["data"]["kind"], json!("session_not_found"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_rename_write_failure_does_not_change_loaded_state() {
-    let (agent, base, workspace) =
-        test_agent("rename-write-failure", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("rename-write-failure", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
     crate::store::RECORD_WRITE_FAILURES.arm(typed_id, ());
 
-    harness
-        .send(
-            json!("rename"),
+    let failure = harness
+        .call_err(
             "session.rename",
             Some(json!({"session_id": session_id, "title": "not persisted"})),
+            -32011,
+            "store_error",
         )
         .await;
-    let failure = harness.response(json!("rename")).await;
-    assert_eq!(failure["error"]["code"], json!(-32011));
-    assert_eq!(failure["error"]["data"]["kind"], json!("store_error"));
     assert!(!failure.to_string().contains("not persisted"));
 
-    harness
-        .send(json!("list"), "session.list", Some(json!({})))
-        .await;
-    let listed = harness.response(json!("list")).await;
+    let listed = harness.call_ok("session.list", Some(json!({}))).await;
     assert_eq!(
         listed["result"]["sessions"][0]["title"],
         json!("rpc session")
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_rename_is_allowed_while_a_loop_is_busy() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "rename-busy-rpc",
         [ModelScript::Block],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -346,18 +316,18 @@ async fn session_rename_is_allowed_while_a_loop_is_busy() {
     assert_eq!(waited["result"]["persistence"], json!("persisted"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_rename_is_allowed_for_a_blocked_session() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "rename-blocked-rpc",
         [ModelScript::Text("done")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
@@ -398,18 +368,18 @@ async fn session_rename_is_allowed_for_a_blocked_session() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn create_open_history_and_send_wait_deferred() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "flow",
         [ModelScript::Text("complete")],
         &["read"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
@@ -457,10 +427,7 @@ async fn create_open_history_and_send_wait_deferred() {
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
-    harness
-        .send(json!("ping"), "agent.ping", Some(json!({})))
-        .await;
-    let ping = harness.response(json!("ping")).await;
+    let ping = harness.call_ok("agent.ping", Some(json!({}))).await;
     assert_eq!(ping["result"]["version"], env!("CARGO_PKG_VERSION"));
 
     let waited = harness.response(json!("wait")).await;
@@ -468,14 +435,12 @@ async fn create_open_history_and_send_wait_deferred() {
     assert_eq!(waited["result"]["persistence"], json!("persisted"));
     assert_eq!(waited["result"]["turn"]["loop_id"], turn["loop_id"]);
 
-    harness
-        .send(
-            json!("presentation-after"),
+    let presentation_after = harness
+        .call_ok(
             "session.presentation",
             Some(json!({"session_id": session_id})),
         )
         .await;
-    let presentation_after = harness.response(json!("presentation-after")).await;
     assert_eq!(
         presentation_after["result"]["last_loop"]["loop_id"],
         turn["loop_id"]
@@ -483,40 +448,36 @@ async fn create_open_history_and_send_wait_deferred() {
     assert!(presentation_after["result"]["last_loop"]["started_at"].is_string());
     assert!(presentation_after["result"]["last_loop"]["finished_at"].is_string());
 
-    harness
-        .send(
-            json!("history2"),
+    let history2 = harness
+        .call_ok(
             "session.history",
             Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
         )
         .await;
-    let history2 = harness.response(json!("history2")).await;
     assert_eq!(history2["result"]["total"], 2);
     assert!(history2["result"]["next_offset"].is_null());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "wait-concurrent",
         [ModelScript::Block],
         &["read"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
-    harness
-        .send(
-            json!("send"),
+    let sent = harness
+        .call_ok(
             "turn.send",
             Some(json!({"session_id": session_id, "text": "hello"})),
         )
         .await;
-    let sent = harness.response(json!("send")).await;
     let turn = sent["result"]["turn"].clone();
 
     harness
@@ -524,9 +485,8 @@ async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
         .await;
 
     // steer while wait pending
-    harness
-        .send(
-            json!("steer"),
+    let steer = harness
+        .call_ok(
             "turn.steer",
             Some(json!({
                 "session_id": session_id,
@@ -535,65 +495,53 @@ async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
             })),
         )
         .await;
-    let steer = harness.response(json!("steer")).await;
     assert_eq!(steer["result"]["ok"], json!(true));
     assert!(steer["result"]["accepted_at"].is_string());
 
     // session.update while wait pending
-    harness
-        .send(
-            json!("update"),
+    let update = harness
+        .call_ok(
             "session.update",
             Some(json!({"session_id": session_id, "reasoning": "high"})),
         )
         .await;
-    let update = harness.response(json!("update")).await;
     assert!(update["result"]["active_revision"].is_number());
     assert_eq!(update["result"]["session"]["reasoning"], json!("high"));
 
     // cancel while wait pending
-    harness
-        .send(json!("cancel"), "turn.cancel", Some(turn_params(&turn)))
+    let cancel = harness
+        .call_ok("turn.cancel", Some(turn_params(&turn)))
         .await;
-    let cancel = harness.response(json!("cancel")).await;
     assert_eq!(cancel["result"]["cancelled"], json!(true));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_update_requires_an_unknown_field_free_shape_and_model_change() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "update",
         [ModelScript::Text("done")],
         &["read"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("noop"),
-            "session.update",
-            Some(json!({"session_id": session_id})),
-        )
+    let noop = harness
+        .call("session.update", Some(json!({"session_id": session_id})))
         .await;
-    let noop = harness.response(json!("noop")).await;
     assert_eq!(noop["error"]["code"], json!(-32602));
 
-    harness
-        .send(
-            json!("missing-model"),
+    let missing = harness
+        .call(
             "session.update",
             Some(json!({"session_id": session_id, "model": "nope"})),
         )
         .await;
-    let missing = harness.response(json!("missing-model")).await;
     assert_eq!(missing["error"]["code"], json!(-32009));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

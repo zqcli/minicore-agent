@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "session-read-pages",
         [
             ModelScript::ToolCalls(vec![ToolCallScript {
@@ -13,8 +13,10 @@ async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
         ],
         &["read"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let tool_text = (0..400)
@@ -179,13 +181,13 @@ async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn unloaded_session_read_pages_short_turns_under_small_budget() {
-    let (agent, base, workspace) =
-        test_agent("session-read-short-pages", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("session-read-short-pages", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     for index in 0..100 {
@@ -264,18 +266,19 @@ async fn unloaded_session_read_pages_short_turns_under_small_budget() {
     assert!(pages > 1);
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_read_rejects_same_length_prefix_replacement() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "session-read-revision",
         [ModelScript::Text("answer")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let text = "prefix-".to_owned() + &"é🙂 escaped ".repeat(2_000);
@@ -291,14 +294,9 @@ async fn session_read_rejects_same_length_prefix_replacement() {
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
     let _ = harness.response(json!("wait")).await;
-    harness
-        .send(
-            json!("close"),
-            "session.close",
-            Some(json!({"session_id": session_id})),
-        )
+    let _ = harness
+        .call("session.close", Some(json!({"session_id": session_id})))
         .await;
-    let _ = harness.response(json!("close")).await;
 
     let first_id = json!("read-first");
     harness
@@ -328,9 +326,8 @@ async fn session_read_rejects_same_length_prefix_replacement() {
     history[prefix] = b'P';
     std::fs::write(&history_path, &history).unwrap();
 
-    harness
-        .send(
-            json!("read-second"),
+    let second = harness
+        .call(
             "session.read",
             Some(json!({
                 "session_id": session_id,
@@ -342,23 +339,23 @@ async fn session_read_rejects_same_length_prefix_replacement() {
             })),
         )
         .await;
-    let second = harness.response(json!("read-second")).await;
     assert_eq!(second["error"]["code"], json!(-32_005));
     assert_eq!(second["error"]["data"]["kind"], json!("invalid_state"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn loaded_session_read_does_not_expose_a_disk_tail() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "session-read-loaded-prefix",
         [ModelScript::Text("answer")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -369,10 +366,7 @@ async fn loaded_session_read_does_not_expose_a_disk_tail() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
 
     let history_path = base
         .join("data")
@@ -388,30 +382,28 @@ async fn loaded_session_read_does_not_expose_a_disk_tail() {
     with_tail.extend_from_slice(&original[..=newline]);
     std::fs::write(&history_path, with_tail).unwrap();
 
-    harness
-        .send(
-            json!("read"),
+    let read = harness
+        .call_ok(
             "session.read",
             Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
         )
         .await;
-    let read = harness.response(json!("read")).await;
     assert_eq!(read["result"]["session"]["loaded"], json!(true));
     assert_eq!(read["result"]["total"], json!(2));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "session-read-loaded-pagination",
         [ModelScript::Oversize, ModelScript::Text("new answer")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -434,14 +426,12 @@ async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
         json!("persisted")
     );
 
-    harness
-        .send(
-            json!("read-first"),
+    let first_page = harness
+        .call_ok(
             "session.read",
             Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
         )
         .await;
-    let first_page = harness.response(json!("read-first")).await;
     assert!(first_page["result"]["next_cursor"].is_object());
     let captured_end = first_page["result"]["captured_end"].as_u64().unwrap();
     let history_revision = first_page["result"]["history_revision"].clone();
@@ -504,18 +494,19 @@ async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
     assert!(!response_text.contains("new answer"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "session-read-integrity",
         [ModelScript::Text("first"), ModelScript::Text("second")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     for (index, text) in ["one", "two"].into_iter().enumerate() {
@@ -537,14 +528,9 @@ async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair(
             json!("persisted")
         );
     }
-    harness
-        .send(
-            json!("close"),
-            "session.close",
-            Some(json!({"session_id": session_id})),
-        )
+    let _ = harness
+        .call("session.close", Some(json!({"session_id": session_id})))
         .await;
-    let _ = harness.response(json!("close")).await;
 
     let history_path = base
         .join("data")
@@ -556,14 +542,12 @@ async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair(
     with_tail.extend_from_slice(b"{\"incomplete\"");
     std::fs::write(&history_path, &with_tail).unwrap();
 
-    harness
-        .send(
-            json!("tail"),
+    let tail = harness
+        .call_ok(
             "session.read",
             Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
         )
         .await;
-    let tail = harness.response(json!("tail")).await;
     assert_eq!(tail["result"]["trailing_incomplete"], json!(true));
     assert_eq!(tail["result"]["total"], json!(4));
     assert_eq!(std::fs::read(&history_path).unwrap(), with_tail);
@@ -577,14 +561,12 @@ async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair(
     let mut corrupt = with_tail;
     corrupt[second_line] = b'X';
     std::fs::write(&history_path, &corrupt).unwrap();
-    harness
-        .send(
-            json!("corrupt"),
+    let corrupt_response = harness
+        .call(
             "session.read",
             Some(json!({"session_id": session_id, "limit": 100, "max_bytes": 4_096})),
         )
         .await;
-    let corrupt_response = harness.response(json!("corrupt")).await;
     assert_eq!(corrupt_response["error"]["code"], json!(-32_011));
     assert_eq!(
         corrupt_response["error"]["data"]["kind"],
@@ -593,5 +575,4 @@ async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair(
     assert_eq!(std::fs::read(&history_path).unwrap(), corrupt);
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

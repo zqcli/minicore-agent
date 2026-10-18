@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn turn_result_reports_pending_and_stored_availability() {
     let model_started = Arc::new(Notify::new());
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "turn-result-lifecycle",
         [
             ModelScript::BlockWithSignal(Arc::clone(&model_started)),
@@ -11,8 +11,9 @@ async fn turn_result_reports_pending_and_stored_availability() {
         ],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -53,14 +54,9 @@ async fn turn_result_reports_pending_and_stored_availability() {
         harness.response(json!("cancel-blocked")).await["result"]["cancelled"],
         json!(true)
     );
-    harness
-        .send(
-            json!("wait-blocked"),
-            "turn.wait",
-            Some(turn_params(&blocked_turn)),
-        )
+    let _ = harness
+        .call("turn.wait", Some(turn_params(&blocked_turn)))
         .await;
-    let _ = harness.response(json!("wait-blocked")).await;
 
     harness
         .send(
@@ -81,18 +77,12 @@ async fn turn_result_reports_pending_and_stored_availability() {
         harness.response(json!("wait-stored")).await["result"]["persistence"],
         json!("persisted")
     );
-    harness
-        .send(
-            json!("close"),
-            "session.close",
-            Some(json!({"session_id": session_id})),
-        )
+    let _ = harness
+        .call("session.close", Some(json!({"session_id": session_id})))
         .await;
-    let _ = harness.response(json!("close")).await;
 
-    harness
-        .send(
-            json!("stored-result"),
+    let stored = harness
+        .call_ok(
             "turn.result",
             Some(json!({
                 "session_id": stored_turn["session_id"],
@@ -102,24 +92,23 @@ async fn turn_result_reports_pending_and_stored_availability() {
             })),
         )
         .await;
-    let stored = harness.response(json!("stored-result")).await;
     assert_eq!(stored["result"]["availability"], json!("stored"));
     assert_eq!(stored["result"]["persistence"], json!("persisted"));
     assert!(stored["result"]["items"].as_array().unwrap().len() >= 2);
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn turn_result_can_continue_from_live_to_stored_items() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "turn-result-live-stored-pages",
         [ModelScript::Oversize],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -130,14 +119,10 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
 
-    harness
-        .send(
-            json!("live-first"),
+    let first = harness
+        .call_ok(
             "turn.result",
             Some(json!({
                 "session_id": turn["session_id"],
@@ -147,7 +132,6 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
             })),
         )
         .await;
-    let first = harness.response(json!("live-first")).await;
     assert_eq!(first["result"]["availability"], json!("live"));
     assert!(first["result"]["next_cursor"].is_object());
 
@@ -161,14 +145,9 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
         entry.push_str(item["data"].as_str().unwrap());
     }
 
-    harness
-        .send(
-            json!("close"),
-            "session.close",
-            Some(json!({"session_id": session_id})),
-        )
+    let _ = harness
+        .call("session.close", Some(json!({"session_id": session_id})))
         .await;
-    let _ = harness.response(json!("close")).await;
 
     let mut pages = 1;
     while !cursor.is_null() {
@@ -206,18 +185,19 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
     assert_eq!(reconstructed.len(), 2);
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn turn_result_reads_failed_live_report_without_history() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "turn-result-failed-append",
         [ModelScript::Text("answer retained in memory")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let typed_session_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
@@ -231,10 +211,7 @@ async fn turn_result_reads_failed_live_report_without_history() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let waited = harness.response(json!("wait")).await;
+    let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["persistence"], json!("failed"));
 
     let history_path = base
@@ -243,9 +220,8 @@ async fn turn_result_reads_failed_live_report_without_history() {
         .join(session_id.as_str().unwrap())
         .join("history.jsonl");
     std::fs::remove_file(history_path).unwrap();
-    harness
-        .send(
-            json!("result"),
+    let result = harness
+        .call_ok(
             "turn.result",
             Some(json!({
                 "session_id": turn["session_id"],
@@ -255,14 +231,12 @@ async fn turn_result_reads_failed_live_report_without_history() {
             })),
         )
         .await;
-    let result = harness.response(json!("result")).await;
     assert_eq!(result["result"]["availability"], json!("live"));
     assert_eq!(result["result"]["persistence"], json!("failed"));
     assert_eq!(result["result"]["outcome"]["type"], json!("completed"));
     assert!(result.to_string().contains("answer retained in memory"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]

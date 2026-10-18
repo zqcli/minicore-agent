@@ -206,13 +206,15 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
 
 #[tokio::test]
 async fn session_context_reports_effective_input_budget_when_auto_enabled() {
-    let (agent, base, workspace) = test_agent_with_auto(
+    let fixture = RpcFixture::new(
         "context-budget",
         [ModelScript::Text("answer")],
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .auto_compaction();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -237,18 +239,18 @@ async fn session_context_reports_effective_input_budget_when_auto_enabled() {
     );
     assert!(context["result"]["last_prepare_failure"].is_null());
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_context_omits_budget_when_auto_disabled() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "context-disabled",
         [ModelScript::Text("answer")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -263,7 +265,6 @@ async fn session_context_omits_budget_when_auto_disabled() {
     assert!(context["result"]["budget"]["trigger_tokens"].is_null());
     assert!(context["result"]["budget"]["target_tokens"].is_null());
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// A locally oversized new user request still reaches the server and may
@@ -309,10 +310,7 @@ async fn oversized_current_input_server_acceptance(enabled: bool) {
         turn["loop_id"].is_string(),
         "ordinary submit must accept without admission summary"
     );
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let result = harness.response(json!("wait")).await;
+    let result = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(result["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(result["result"]["persistence"], json!("persisted"));
     let captured = server.finish().await;
@@ -322,24 +320,14 @@ async fn oversized_current_input_server_acceptance(enabled: bool) {
             .unwrap()
             .contains(&"x".repeat(20_000))
     );
-    harness
-        .send(
-            json!("context"),
-            "session.context",
-            Some(json!({"session_id":session_id})),
-        )
+    let context = harness
+        .call_ok("session.context", Some(json!({"session_id":session_id})))
         .await;
-    let context = harness.response(json!("context")).await;
     assert!(context["result"]["recovery"].is_null());
     // The reader still serves control methods and the completed persisted turn is idle.
-    harness
-        .send(
-            json!("state"),
-            "session.state",
-            Some(json!({"session_id": session_id})),
-        )
+    let state = harness
+        .call_ok("session.state", Some(json!({"session_id": session_id})))
         .await;
-    let state = harness.response(json!("state")).await;
     assert_eq!(state["result"]["status"], json!("idle"));
     harness.shutdown().await;
     remove_base(&base).await;
@@ -383,20 +371,15 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
         .unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
-    harness
-        .send(
-            json!("send"),
+    let response = harness
+        .call_ok(
             "turn.send",
             Some(json!({"session_id": session_id, "text": text})),
         )
         .await;
-    let response = harness.response(json!("send")).await;
     assert!(response["result"]["turn"]["loop_id"].is_string());
     let turn = response["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let wait = harness.response(json!("wait")).await;
+    let wait = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(wait["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(wait["result"]["persistence"], json!("persisted"));
     // The only call before completion is the ordinary model request. The
@@ -507,20 +490,15 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
             .get("error")
             .is_none()
     );
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let result = harness.response(json!("wait")).await;
+    let result = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(result["result"]["outcome"]["type"], "cancelled");
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    harness
-        .send(
-            json!("settled"),
+    let settled = harness
+        .call_ok(
             "session.context",
             Some(json!({"session_id":info.session_id})),
         )
         .await;
-    let settled = harness.response(json!("settled")).await;
     assert!(settled["result"]["automatic"]["current"].is_null());
     assert_eq!(
         settled["result"]["automatic"]["last"]["utility_usage"]["call_count"],

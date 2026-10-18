@@ -6,8 +6,10 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let (agent, base, workspace) =
-        test_agent("workspace-status-projection", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-status-projection", [], &[], ApprovalMode::Auto);
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let init = std::process::Command::new("git")
         .args(["init", "--quiet"])
         .arg(&workspace)
@@ -34,14 +36,9 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
         .await;
     assert!(harness.response(json!("before")).await["result"]["git_branch"].is_null());
 
-    harness
-        .send(
-            json!("status"),
-            "workspace.status",
-            Some(json!({"session_id": session_id})),
-        )
+    let status = harness
+        .call_ok("workspace.status", Some(json!({"session_id": session_id})))
         .await;
-    let status = harness.response(json!("status")).await;
     assert_eq!(status["result"]["complete"], json!(true));
     assert_eq!(status["result"]["repo_available"], json!(true));
     assert_eq!(status["result"]["branch"], json!("rpc-status"));
@@ -99,7 +96,6 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     assert!(harness.response(json!("cleared")).await["result"]["git_branch"].is_null());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[cfg(unix)]
@@ -108,8 +104,10 @@ async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let (agent, base, workspace) =
-        test_agent("workspace-status-capacity", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-status-capacity", [], &[], ApprovalMode::Auto);
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let root = std::fs::canonicalize(&workspace).unwrap();
     let started = base.join("status-started");
     let script = base.join("slow-git");
@@ -183,5 +181,4 @@ async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     assert_eq!(after["result"]["stopped_by"], json!("end"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

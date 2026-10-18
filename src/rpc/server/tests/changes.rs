@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn changes_list_separates_workspace_session_and_turn_scopes() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "changes-list-scopes",
         [ModelScript::ToolCalls(vec![ToolCallScript {
             name: "write",
@@ -10,20 +10,19 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
         }])],
         &["write"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     std::fs::write(workspace.join("value.txt"), b"user\n").unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("send"),
+    let sent = harness
+        .call_ok(
             "turn.send",
             Some(json!({"session_id": session, "text": "update file"})),
         )
         .await;
-    let sent = harness.response(json!("send")).await;
     let turn = sent["result"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
@@ -33,14 +32,12 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
         json!("completed")
     );
 
-    harness
-        .send(
-            json!("session"),
+    let session_changes = harness
+        .call_ok(
             "changes.list",
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let session_changes = harness.response(json!("session")).await;
     let session_records = session_changes["result"]["records"].as_array().unwrap();
     assert_eq!(session_records.len(), 1);
     assert_eq!(session_records[0]["origin"], json!("tool"));
@@ -52,9 +49,8 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
     assert_eq!(session_records[0]["details_available"], json!(true));
     assert_eq!(session_records[0]["tool_ref"]["session_id"], json!(session));
 
-    harness
-        .send(
-            json!("turn"),
+    let turn_changes = harness
+        .call_ok(
             "changes.list",
             Some(json!({
                 "session_id": session,
@@ -62,7 +58,6 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
             })),
         )
         .await;
-    let turn_changes = harness.response(json!("turn")).await;
     assert_eq!(
         turn_changes["result"]["records"].as_array().unwrap().len(),
         1
@@ -115,7 +110,6 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
     assert!(!workspace.exists());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// End-to-end public-RPC flow: a real native write records a change, the
@@ -124,7 +118,7 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
 /// is closed (cold), and pages a long line by UTF-8 fragments.
 #[tokio::test]
 async fn changes_diff_public_rpc_compares_native_before_and_after() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "changes-diff-flow",
         [
             ModelScript::ToolCalls(vec![ToolCallScript {
@@ -138,8 +132,9 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
         ],
         &["write"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     std::fs::write(workspace.join("value.txt"), b"user dirty\n").unwrap();
     std::fs::write(workspace.join("long.txt"), "x".repeat(40)).unwrap();
     let mut harness = RpcHarness::spawn(agent);
@@ -161,14 +156,12 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
         json!("completed")
     );
 
-    harness
-        .send(
-            json!("list"),
+    let listed = harness
+        .call_ok(
             "changes.list",
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let listed = harness.response(json!("list")).await;
     let records = listed["result"]["records"].as_array().unwrap();
     assert_eq!(records.len(), 2);
     let target = records
@@ -178,14 +171,12 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
     let change_ref = target["change_ref"].as_str().unwrap().to_owned();
 
     // Warm diff: before is the actual user-dirty buffer, not HEAD.
-    harness
-        .send(
-            json!("diff"),
+    let diff = harness
+        .call_ok(
             "changes.diff",
             Some(json!({"session_id": session, "change_ref": change_ref})),
         )
         .await;
-    let diff = harness.response(json!("diff")).await;
     assert_eq!(diff["result"]["base_version"]["kind"], json!("content"));
     assert_eq!(diff["result"]["target_version"]["kind"], json!("content"));
     assert_eq!(diff["result"]["comparison"], json!("tool_before_after"));
@@ -203,9 +194,8 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
     // A returned cursor continues the same comparison; a bumped revision is stale.
     let cursor = diff["result"]["next_cursor"].clone();
     if !cursor.is_null() {
-        harness
-            .send(
-                json!("cont"),
+        let continued = harness
+            .call_ok(
                 "changes.diff",
                 Some(json!({
                     "session_id": session,
@@ -214,7 +204,6 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
                 })),
             )
             .await;
-        let continued = harness.response(json!("cont")).await;
         assert_eq!(continued["result"]["stale"], json!(false));
     }
 
@@ -230,19 +219,16 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
         harness.response(json!("close")).await["result"],
         json!({"ok": true})
     );
-    harness
-        .send(
-            json!("cold"),
+    let cold = harness
+        .call_ok(
             "changes.diff",
             Some(json!({"session_id": session, "change_ref": change_ref})),
         )
         .await;
-    let cold = harness.response(json!("cold")).await;
     assert_eq!(cold["result"]["availability"], json!("available"));
     assert_eq!(cold["result"]["change_ref"], json!(change_ref));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// A long CRLF line with a missing final newline is paged by raw UTF-8
@@ -250,7 +236,7 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
 #[tokio::test]
 async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
     let long = format!("{}{}", "a".repeat(2_500), "é🙂世界".repeat(300));
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "changes-diff-paging",
         [ModelScript::ToolCalls(vec![ToolCallScript {
             name: "write",
@@ -258,8 +244,9 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
         }])],
         &["write"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     std::fs::write(workspace.join("long.txt"), &long).unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
@@ -278,14 +265,12 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
         harness.response(json!("wait")).await["result"]["outcome"]["type"],
         json!("completed")
     );
-    harness
-        .send(
-            json!("list"),
+    let listed = harness
+        .call_ok(
             "changes.list",
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let listed = harness.response(json!("list")).await;
     let change_ref = listed["result"]["records"][0]["change_ref"]
         .as_str()
         .unwrap()
@@ -307,10 +292,7 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
                 "cursor": cursor,
             })
         };
-        harness
-            .send(json!("diff"), "changes.diff", Some(params))
-            .await;
-        let diff = harness.response(json!("diff")).await;
+        let diff = harness.call_ok("changes.diff", Some(params)).await;
         for hunk in diff["result"]["hunks"].as_array().unwrap() {
             for line in hunk["lines"].as_array().unwrap() {
                 if line["kind"] == json!("removed") {
@@ -331,7 +313,6 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
     assert_eq!(removed, long);
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// Four `changes.diff` queries hold every query slot; a fifth is refused with
@@ -339,7 +320,7 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
 /// Session cancels the held comparisons.
 #[tokio::test]
 async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "changes-diff-capacity",
         [ModelScript::ToolCalls(vec![ToolCallScript {
             name: "write",
@@ -347,8 +328,9 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
         }])],
         &["write"],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     std::fs::write(workspace.join("value.txt"), b"user\n").unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
@@ -367,14 +349,12 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
         harness.response(json!("wait")).await["result"]["outcome"]["type"],
         json!("completed")
     );
-    harness
-        .send(
-            json!("list"),
+    let listed = harness
+        .call_ok(
             "changes.list",
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let listed = harness.response(json!("list")).await;
     let change_ref = listed["result"]["records"][0]["change_ref"]
         .as_str()
         .unwrap()
@@ -402,14 +382,12 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
             .expect("changes.diff query did not start");
     }
 
-    harness
-        .send(
-            json!("diff-over"),
+    let over = harness
+        .call(
             "changes.diff",
             Some(json!({"session_id": session, "change_ref": change_ref})),
         )
         .await;
-    let over = harness.response(json!("diff-over")).await;
     assert_eq!(over["error"]["code"], json!(-32019));
 
     harness
@@ -434,13 +412,13 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
     }
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
-    let (agent, base, workspace) =
-        test_agent("changes-list-capacity", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("changes-list-capacity", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
     let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
@@ -466,19 +444,13 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
 
     // The query pool is now full, so a real (valid) changes.list request is
     // rejected by capacity rather than by request validation.
-    harness
-        .send(
-            json!("cl-overflow"),
+    let overflow = harness
+        .call(
             "changes.list",
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let overflow = harness.response(json!("cl-overflow")).await;
-    assert_eq!(overflow["error"]["code"], json!(-32019));
-    assert_eq!(
-        overflow["error"]["data"]["kind"],
-        json!("resource_exhausted")
-    );
+    assert_rpc_error(&overflow, -32019, "resource_exhausted");
 
     // Control methods are not deferred and stay responsive while the pool holds
     // every slot.
@@ -505,7 +477,6 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
     }
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// Capacity is checked before any Session-owned worker is registered. With
@@ -519,8 +490,10 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let (agent, base, workspace) =
-        test_agent("changes-capacity-precedence", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("changes-capacity-precedence", [], &[], ApprovalMode::Auto);
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let root = std::fs::canonicalize(&workspace).unwrap();
     let started = base.join("capacity-git-started");
     let script = base.join("counting-git");
@@ -641,7 +614,6 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     }
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 /// The shared 32-slot deferred ceiling is filled by a real pending model turn
@@ -651,13 +623,14 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
 #[tokio::test]
 async fn changes_list_queries_share_the_total_waiter_ceiling() {
     let probe = ConcurrencyProbe::new();
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "changes-list-shared-ceiling",
         [ModelScript::Gate(Arc::clone(&probe))],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
     let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
@@ -705,12 +678,8 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
 
     // The shared ceiling is full; the next request is refused even though fewer
     // than MAX_DEFERRED_QUERIES query slots are held.
-    harness
-        .send(json!("over"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let over = harness.response(json!("over")).await;
-    assert_eq!(over["error"]["code"], json!(-32019));
-    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
+    let over = harness.call("turn.wait", Some(turn_params(&turn))).await;
+    assert_rpc_error(&over, -32019, "resource_exhausted");
 
     // Control methods stay responsive while both ceilings are pressed.
     harness
@@ -741,13 +710,13 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
     assert_eq!(held["error"]["code"], json!(-32002));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
-    let (agent, base, workspace) =
-        test_agent("changes-list-shutdown", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("changes-list-shutdown", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
     let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
@@ -773,6 +742,4 @@ async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
     let start = std::time::Instant::now();
     harness.shutdown().await;
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
-
-    remove_base(&base).await;
 }

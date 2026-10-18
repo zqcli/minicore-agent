@@ -62,9 +62,8 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
     let history_path = session_dir.join("history.jsonl");
     let history_before = std::fs::read(&history_path).unwrap();
 
-    harness
-        .send(
-            json!("compact"),
+    let compacted = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -72,7 +71,6 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
             })),
         )
         .await;
-    let compacted = harness.response(json!("compact")).await;
     assert_eq!(compacted["result"]["status"], json!("compacted"));
 
     harness
@@ -216,14 +214,14 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
 
 #[tokio::test]
 async fn manual_compaction_completion_clears_authoritative_busy_state() {
-    let (agent, base, workspace) =
-        test_agent("manual-completion-state", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("manual-completion-state", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("compact"),
+    let result = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -231,30 +229,23 @@ async fn manual_compaction_completion_clears_authoritative_busy_state() {
             })),
         )
         .await;
-    let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("noop"));
 
-    harness
-        .send(
-            json!("state"),
-            "session.state",
-            Some(json!({"session_id": session_id})),
-        )
+    let state = harness
+        .call_ok("session.state", Some(json!({"session_id": session_id})))
         .await;
-    let state = harness.response(json!("state")).await;
     assert!(
         state["result"]["compaction"].is_null(),
         "completed compaction must clear authoritative busy state: {state}"
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn session_context_reports_manual_busy_state_and_last_result() {
     let utility_started = Arc::new(Notify::new());
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "context-manual-busy",
         [
             ModelScript::Text("settled"),
@@ -263,7 +254,10 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
@@ -275,10 +269,7 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
@@ -363,12 +354,11 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_reports_independent_utility_usage() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "context-utility-usage",
         [
             ModelScript::TextWithUsage("settled", 41, 43),
@@ -377,7 +367,10 @@ async fn manual_compaction_reports_independent_utility_usage() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled = "settled history ".repeat(128);
@@ -419,14 +412,9 @@ async fn manual_compaction_reports_independent_utility_usage() {
         json!(11)
     );
 
-    harness
-        .send(
-            json!("context"),
-            "session.context",
-            Some(json!({"session_id": session_id})),
-        )
+    let context = harness
+        .call_ok("session.context", Some(json!({"session_id": session_id})))
         .await;
-    let context = harness.response(json!("context")).await;
     assert_eq!(
         context["result"]["last_result"]["utility_usage"]["call_count"],
         json!(1)
@@ -441,12 +429,11 @@ async fn manual_compaction_reports_independent_utility_usage() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn failed_manual_utility_stream_keeps_known_partial_usage() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "context-utility-partial",
         [
             ModelScript::TextWithUsage("settled", 41, 43),
@@ -455,7 +442,10 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled = "settled history ".repeat(128);
@@ -467,15 +457,11 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
-    harness
-        .send(
-            json!("compact"),
+    let result = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -483,7 +469,6 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
             })),
         )
         .await;
-    let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("failed"));
     assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
     assert_eq!(result["result"]["utility_usage"]["complete"], json!(false));
@@ -498,12 +483,11 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn missing_manual_utility_usage_remains_unknown() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "context-utility-unknown",
         [
             ModelScript::TextWithUsage("settled", 41, 43),
@@ -512,7 +496,10 @@ async fn missing_manual_utility_usage_remains_unknown() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled = "settled history ".repeat(128);
@@ -524,15 +511,11 @@ async fn missing_manual_utility_usage_remains_unknown() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
-    harness
-        .send(
-            json!("compact"),
+    let result = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -540,14 +523,12 @@ async fn missing_manual_utility_usage_remains_unknown() {
             })),
         )
         .await;
-    let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("compacted"));
     assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
     assert_eq!(result["result"]["utility_usage"]["complete"], json!(false));
     assert!(result["result"]["utility_usage"]["usage"].is_null());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
@@ -633,14 +614,9 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
                 std::fs::read(&summary_path).unwrap(),
                 summary_before_failure
             );
-            harness
-                .send(
-                    json!("single-context"),
-                    "session.context",
-                    Some(json!({"session_id": session_id})),
-                )
+            let context = harness
+                .call_ok("session.context", Some(json!({"session_id": session_id})))
                 .await;
-            let context = harness.response(json!("single-context")).await;
             assert_eq!(
                 context["result"]["coverage"]["covered_item_count"],
                 covered_before_failure
@@ -676,7 +652,7 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
 
 #[tokio::test]
 async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "context-utility-cancel",
         [
             ModelScript::TextWithUsage("settled", 2, 3),
@@ -685,7 +661,10 @@ async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled = "settled history ".repeat(128);
@@ -697,10 +676,7 @@ async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let gate = Arc::new(crate::test_support::Gate::new());
@@ -743,12 +719,13 @@ async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_empty_history_is_a_noop_without_a_model_call() {
-    let (agent, base, workspace) = test_agent("manual-noop", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("manual-noop", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
@@ -779,5 +756,4 @@ async fn manual_compaction_empty_history_is_a_noop_without_a_model_call() {
     assert_eq!(result["result"]["covered_item_count"], json!(0));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

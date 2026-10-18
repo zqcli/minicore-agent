@@ -2,21 +2,21 @@ use super::*;
 
 #[tokio::test]
 async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() {
-    let (agent, base, workspace) = test_agent("workspace-read", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-read", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     tokio::fs::write(workspace.join("note.txt"), b"hello\nworld\n")
         .await
         .unwrap();
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("ws-read"),
+    let read = harness
+        .call_ok(
             "workspace.read",
             Some(json!({"session_id": session_id, "path": "note.txt"})),
         )
         .await;
-    let read = harness.response(json!("ws-read")).await;
     let result = &read["result"];
     assert_eq!(result["path"], json!("note.txt"));
     assert_eq!(result["content"], json!("hello\nworld\n"));
@@ -30,9 +30,8 @@ async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() 
     assert_eq!(result["next_range"], json!(null));
     assert_eq!(result["file_bytes"], json!(12));
 
-    harness
-        .send(
-            json!("ws-range"),
+    let ranged = harness
+        .call_ok(
             "workspace.read",
             Some(json!({
                 "session_id": session_id,
@@ -42,7 +41,6 @@ async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() 
             })),
         )
         .await;
-    let ranged = harness.response(json!("ws-range")).await;
     assert_eq!(ranged["result"]["content"], json!("world\n"));
     assert_eq!(ranged["result"]["start_line"], json!(2));
 
@@ -61,9 +59,8 @@ async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() 
         harness.response(json!("ws-fresh")).await["result"]["status"],
         json!("ok")
     );
-    harness
-        .send(
-            json!("ws-stale"),
+    let stale = harness
+        .call_ok(
             "workspace.read",
             Some(json!({
                 "session_id": session_id,
@@ -72,25 +69,19 @@ async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() 
             })),
         )
         .await;
-    let stale = harness.response(json!("ws-stale")).await;
     assert_eq!(stale["result"]["status"], json!("changed"));
     assert_eq!(stale["result"]["content"], json!(""));
 
     // Only a loaded Session locates its Workspace.
     let unloaded = SessionId::new().unwrap();
     harness
-        .send(
-            json!("ws-unloaded"),
+        .call_err(
             "workspace.read",
             Some(json!({"session_id": unloaded, "path": "note.txt"})),
+            -32002,
+            "session_not_loaded",
         )
         .await;
-    let unloaded = harness.response(json!("ws-unloaded")).await;
-    assert_eq!(unloaded["error"]["code"], json!(-32002));
-    assert_eq!(
-        unloaded["error"]["data"]["kind"],
-        json!("session_not_loaded")
-    );
 
     harness
         .send(
@@ -115,30 +106,28 @@ async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() 
         json!(-32602)
     );
     harness
-        .send(
-            json!("ws-missing"),
+        .call_err(
             "workspace.read",
             Some(json!({"session_id": session_id, "path": "missing.txt"})),
+            -32010,
+            "workspace_error",
         )
         .await;
-    let missing = harness.response(json!("ws-missing")).await;
-    assert_eq!(missing["error"]["code"], json!(-32010));
-    assert_eq!(missing["error"]["data"]["kind"], json!("workspace_error"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
     let turn_started = Arc::new(Notify::new());
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "workspace-read-pending",
         [ModelScript::BlockWithSignal(Arc::clone(&turn_started))],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     tokio::fs::write(workspace.join("pending-a.txt"), b"a\n")
         .await
         .unwrap();
@@ -202,13 +191,13 @@ async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
     );
     assert!(harness.next_frame().await.is_none());
     harness.join().await.unwrap();
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() {
-    let (agent, base, workspace) =
-        test_agent("workspace-read-capacity", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-read-capacity", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     for index in 0..MAX_DEFERRED_QUERIES {
         tokio::fs::write(
             workspace.join(format!("cap-{index}.txt")),
@@ -240,15 +229,13 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
     }
 
     harness
-        .send(
-            json!("cap-over"),
+        .call_err(
             "workspace.read",
             Some(json!({"session_id": surviving, "path": "cap-fresh.txt"})),
+            -32019,
+            "resource_exhausted",
         )
         .await;
-    let over = harness.response(json!("cap-over")).await;
-    assert_eq!(over["error"]["code"], json!(-32019));
-    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
 
     // The reads really started before the Session is closed.
     for gate in &gates {
@@ -272,11 +259,7 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
     // Closing the owning Session cancels the four started queries.
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("cap-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32002));
-        assert_eq!(
-            response["error"]["data"]["kind"],
-            json!("session_not_loaded")
-        );
+        assert_rpc_error(&response, -32002, "session_not_loaded");
     }
 
     // The reader reaps the finished queries and admits a new one, and the
@@ -285,32 +268,29 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
         .send(json!("ping"), "agent.ping", Some(json!({})))
         .await;
     assert!(harness.response(json!("ping")).await["result"]["version"].is_string());
-    harness
-        .send(
-            json!("cap-closed"),
+    let closed = harness
+        .call(
             "workspace.read",
             Some(json!({"session_id": closing, "path": "cap-fresh.txt"})),
         )
         .await;
-    let closed = harness.response(json!("cap-closed")).await;
     assert_eq!(closed["error"]["code"], json!(-32002));
-    harness
-        .send(
-            json!("cap-reuse"),
+    let reuse = harness
+        .call_ok(
             "workspace.read",
             Some(json!({"session_id": surviving, "path": "cap-fresh.txt"})),
         )
         .await;
-    let reuse = harness.response(json!("cap-reuse")).await;
     assert_eq!(reuse["result"]["content"], json!("fresh\n"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn workspace_files_and_search_serve_entries_and_literal_matches() {
-    let (agent, base, workspace) = test_agent("workspace-scan", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-scan", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     tokio::fs::write(workspace.join("note.txt"), b"alpha\nneedle here\n")
         .await
         .unwrap();
@@ -323,14 +303,9 @@ async fn workspace_files_and_search_serve_entries_and_literal_matches() {
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("files"),
-            "workspace.files",
-            Some(json!({"session_id": session_id})),
-        )
+    let files = harness
+        .call_ok("workspace.files", Some(json!({"session_id": session_id})))
         .await;
-    let files = harness.response(json!("files")).await;
     let result = &files["result"];
     assert_eq!(result["directory"], json!(""));
     assert_eq!(result["consistency"], json!("live"));
@@ -361,9 +336,8 @@ async fn workspace_files_and_search_serve_entries_and_literal_matches() {
     assert_eq!(directory["size"], json!(null));
 
     // A recursive query filters entry paths and still descends.
-    harness
-        .send(
-            json!("files-recursive"),
+    let nested = harness
+        .call_ok(
             "workspace.files",
             Some(json!({
                 "session_id": session_id,
@@ -372,7 +346,6 @@ async fn workspace_files_and_search_serve_entries_and_literal_matches() {
             })),
         )
         .await;
-    let nested = harness.response(json!("files-recursive")).await;
     assert_eq!(
         nested["result"]["entries"][0]["path"],
         json!("sub/deep.txt")
@@ -381,14 +354,12 @@ async fn workspace_files_and_search_serve_entries_and_literal_matches() {
 
     // A literal, case-insensitive search reports line metadata, not contents
     // spliced into the text.
-    harness
-        .send(
-            json!("search"),
+    let search = harness
+        .call_ok(
             "workspace.search",
             Some(json!({"session_id": session_id, "query": "NEEDLE"})),
         )
         .await;
-    let search = harness.response(json!("search")).await;
     let result = &search["result"];
     assert_eq!(result["consistency"], json!("live"));
     assert_eq!(result["scan_complete"], json!(true));
@@ -434,34 +405,30 @@ async fn workspace_files_and_search_serve_entries_and_literal_matches() {
         json!(-32602)
     );
     harness
-        .send(
-            json!("files-missing"),
+        .call_err(
             "workspace.files",
             Some(json!({"session_id": session_id, "directory": "missing"})),
+            -32010,
+            "workspace_error",
         )
         .await;
-    let missing = harness.response(json!("files-missing")).await;
-    assert_eq!(missing["error"]["code"], json!(-32010));
-    assert_eq!(missing["error"]["data"]["kind"], json!("workspace_error"));
     let unloaded = SessionId::new().unwrap();
-    harness
-        .send(
-            json!("search-unloaded"),
+    let unloaded = harness
+        .call(
             "workspace.search",
             Some(json!({"session_id": unloaded, "query": "needle"})),
         )
         .await;
-    let unloaded = harness.response(json!("search-unloaded")).await;
     assert_eq!(unloaded["error"]["code"], json!(-32002));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
-    let (agent, base, workspace) =
-        test_agent("workspace-scan-pending", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-scan-pending", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     tokio::fs::write(workspace.join("a.txt"), b"pending hit\n")
         .await
         .unwrap();
@@ -504,13 +471,13 @@ async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
     // Shutdown cancels both scans, joins their blocking workers, and still
     // queues its own response last.
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() {
-    let (agent, base, workspace) =
-        test_agent("workspace-scan-capacity", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-scan-capacity", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     for index in 0..MAX_DEFERRED_QUERIES {
         tokio::fs::write(
             workspace.join(format!("cap-{index}.txt")),
@@ -542,15 +509,13 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     }
 
     harness
-        .send(
-            json!("scan-over"),
+        .call_err(
             "workspace.search",
             Some(json!({"session_id": surviving, "query": "fresh"})),
+            -32019,
+            "resource_exhausted",
         )
         .await;
-    let over = harness.response(json!("scan-over")).await;
-    assert_eq!(over["error"]["code"], json!(-32019));
-    assert_eq!(over["error"]["data"]["kind"], json!("resource_exhausted"));
 
     for hold in &holds {
         tokio::time::timeout(TIMEOUT, hold.wait_started())
@@ -573,11 +538,7 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     // Closing the owning Session cancels the four started scans.
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("scan-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32002));
-        assert_eq!(
-            response["error"]["data"]["kind"],
-            json!("session_not_loaded")
-        );
+        assert_rpc_error(&response, -32002, "session_not_loaded");
     }
 
     // The reader reaps the finished queries and admits a new one, and the
@@ -597,14 +558,12 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
         harness.response(json!("scan-closed")).await["error"]["code"],
         json!(-32002)
     );
-    harness
-        .send(
-            json!("scan-reuse"),
+    let reuse = harness
+        .call_ok(
             "workspace.search",
             Some(json!({"session_id": surviving, "query": "cap"})),
         )
         .await;
-    let reuse = harness.response(json!("scan-reuse")).await;
     let paths: Vec<&str> = reuse["result"]["matches"]
         .as_array()
         .unwrap()
@@ -616,24 +575,19 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     assert!(!paths.contains(&"cap-fresh.txt"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn workspace_status_answers_for_the_session_workspace() {
-    let (agent, base, workspace) =
-        test_agent("workspace-status", [], &[], ApprovalMode::Auto).await;
+    let fixture = RpcFixture::new("workspace-status", [], &[], ApprovalMode::Auto);
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("status"),
-            "workspace.status",
-            Some(json!({"session_id": session})),
-        )
+    let status = harness
+        .call_ok("workspace.status", Some(json!({"session_id": session})))
         .await;
-    let status = harness.response(json!("status")).await;
     // A temporary directory outside any repository is answered conservatively:
     // git refused to resolve a work tree, so the observation stays incomplete
     // instead of claiming a definite missing repository.
@@ -661,16 +615,13 @@ async fn workspace_status_answers_for_the_session_workspace() {
         json!(0)
     );
 
-    harness
-        .send(
-            json!("status-bad"),
+    let bad = harness
+        .call(
             "workspace.status",
             Some(json!({"session_id": session, "max_bytes": 16})),
         )
         .await;
-    let bad = harness.response(json!("status-bad")).await;
     assert_eq!(bad["error"]["code"], json!(-32602));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }

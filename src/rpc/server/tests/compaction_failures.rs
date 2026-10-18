@@ -2,13 +2,14 @@ use super::*;
 
 #[tokio::test]
 async fn manual_compaction_rejects_busy_and_blocked_sessions() {
-    let (agent, base, workspace) = test_agent(
+    let fixture = RpcFixture::new(
         "manual-admission",
         [ModelScript::Block],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -47,14 +48,14 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
 
     // A persistence failure blocks the Session, and compaction must preserve
     // the existing blocked admission semantics.
-    let (agent, base2, workspace2) = test_agent(
+    let blocked_fixture = RpcFixture::new(
         "manual-blocked",
         [ModelScript::Text("done")],
         &[],
         ApprovalMode::Auto,
-    )
-    .await;
-    let mut blocked = RpcHarness::spawn(agent);
+    );
+    let workspace2 = blocked_fixture.workspace.clone();
+    let mut blocked = RpcHarness::spawn(blocked_fixture.open().await);
     let blocked_id = create_and_open(&mut blocked, &workspace2).await;
     crate::store::APPEND_FAILURES.arm(blocked_id.as_str().unwrap().parse().unwrap(), true);
     blocked
@@ -84,13 +85,11 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
 
     harness.shutdown().await;
     blocked.shutdown().await;
-    remove_base(&base).await;
-    remove_base(&base2).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-cancel",
         [
             ModelScript::Text("settled"),
@@ -100,7 +99,10 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled_text = "settled history ".repeat(4_000);
@@ -112,10 +114,7 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
     harness
@@ -218,18 +217,20 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
     assert_eq!(result["result"]["failure_kind"], json!("cancelled"));
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-owned-handle",
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled_text = "settled history ".repeat(128);
@@ -301,12 +302,11 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
     );
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-write-failure",
         [
             ModelScript::TextWithUsage("settled", 2, 3),
@@ -317,7 +317,10 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled_text = "settled history ".repeat(128);
@@ -329,19 +332,15 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     let session_dir = base
         .join("data")
         .join("sessions")
         .join(session_id.as_str().unwrap());
     let history_path = session_dir.join("history.jsonl");
-    harness
-        .send(
-            json!("compact-initial"),
+    let initial = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -349,7 +348,6 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
             })),
         )
         .await;
-    let initial = harness.response(json!("compact-initial")).await;
     assert_eq!(
         initial["result"]["status"],
         json!("compacted"),
@@ -367,22 +365,16 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
         )
         .await;
     let next_turn = harness.response(json!("next-send")).await["result"]["turn"].clone();
-    harness
-        .send(
-            json!("next-wait"),
-            "turn.wait",
-            Some(turn_params(&next_turn)),
-        )
+    let _ = harness
+        .call("turn.wait", Some(turn_params(&next_turn)))
         .await;
-    let _ = harness.response(json!("next-wait")).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     let history_before = std::fs::read(&history_path).unwrap();
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
     crate::store::SUMMARY_WRITE_FAILURES.arm(typed_id, ());
 
-    harness
-        .send(
-            json!("compact"),
+    let result = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -390,7 +382,6 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
             })),
         )
         .await;
-    let result = harness.response(json!("compact")).await;
     assert_eq!(
         result["result"]["status"],
         json!("failed"),
@@ -407,18 +398,20 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
     assert_eq!(std::fs::read(&summary_path).unwrap(), summary_before);
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_rejects_model_failures_and_tool_events() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-model-failure",
         [ModelScript::Text("settled"), ModelScript::Fail],
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -448,9 +441,8 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
     assert_eq!(failure["result"]["status"], json!("failed"));
     assert_eq!(failure["result"]["failure_kind"], json!("model_failure"));
     harness.shutdown().await;
-    remove_base(&base).await;
 
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-tool-event",
         [
             ModelScript::Text("settled"),
@@ -462,7 +454,10 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -495,18 +490,20 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
         json!("tool_call_rejected")
     );
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_reports_unknown_write_without_publishing_state() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-unknown-write",
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled_text = "settled history ".repeat(128);
@@ -518,15 +515,11 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     crate::store::SUMMARY_UNKNOWN_WRITES.arm(session_id.as_str().unwrap().parse().unwrap(), ());
-    harness
-        .send(
-            json!("compact"),
+    let result = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -534,7 +527,6 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
             })),
         )
         .await;
-    let result = harness.response(json!("compact")).await;
     assert_eq!(
         result["result"]["status"],
         json!("unknown_write"),
@@ -553,18 +545,20 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
             .exists()
     );
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
 async fn manual_compaction_revalidates_history_before_commit() {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         "manual-revalidate",
         [ModelScript::Text("settled"), ModelScript::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let settled_text = "settled history ".repeat(128);
@@ -576,10 +570,7 @@ async fn manual_compaction_revalidates_history_before_commit() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let history_path = base
@@ -630,7 +621,6 @@ async fn manual_compaction_revalidates_history_before_commit() {
     assert!(!history_path.parent().unwrap().join("summary.json").exists());
 
     harness.shutdown().await;
-    remove_base(&base).await;
 }
 
 #[tokio::test]
@@ -659,10 +649,7 @@ async fn manual_compaction_deadline_covers_commit_wait() {
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
     let gate = Arc::new(crate::test_support::Gate::new());

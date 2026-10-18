@@ -427,73 +427,59 @@ fn test_models(model: Arc<FakeModel>) -> Models {
     Models::from_values(BTreeMap::from([("fake".to_owned(), model)]))
 }
 
-async fn test_agent(
-    label: &str,
-    scripts: impl IntoIterator<Item = ModelScript>,
-    tools: &[&str],
-    approval: ApprovalMode,
-) -> (Agent, PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-rpc-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let model = FakeModel::new(scripts);
-    let agent = Agent::open_with_models(
-        test_config(base.join("data"), tools, approval),
-        test_models(model),
-    )
-    .await
-    .unwrap();
-    (agent, base, workspace)
+struct RpcFixture {
+    base: crate::test_support::TempDir,
+    workspace: PathBuf,
+    config: AgentConfig,
+    scripts: Vec<ModelScript>,
+    context_window: u64,
 }
 
-async fn test_compaction_agent(
-    label: &str,
-    scripts: impl IntoIterator<Item = ModelScript>,
-    tools: &[&str],
-    approval: ApprovalMode,
-) -> (Agent, PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-rpc-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let model = FakeModel::for_compaction(scripts);
-    let agent = Agent::open_with_models(
-        test_config(base.join("data"), tools, approval),
-        test_models(model),
-    )
-    .await
-    .unwrap();
-    (agent, base, workspace)
-}
+impl RpcFixture {
+    fn new(
+        label: &str,
+        scripts: impl IntoIterator<Item = ModelScript>,
+        tools: &[&str],
+        approval: ApprovalMode,
+    ) -> Self {
+        let base = crate::test_support::TempDir::new(&format!("rpc-{label}"));
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = test_config(base.path().join("data"), tools, approval);
+        Self {
+            base,
+            workspace,
+            config,
+            scripts: scripts.into_iter().collect(),
+            context_window: 16_384,
+        }
+    }
 
-async fn test_agent_with_auto(
-    label: &str,
-    scripts: impl IntoIterator<Item = ModelScript>,
-    tools: &[&str],
-    approval: ApprovalMode,
-) -> (Agent, PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-rpc-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    let workspace = base.join("workspace");
-    tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let model = FakeModel::new(scripts);
-    let mut config = test_config(base.join("data"), tools, approval);
-    config.compaction = CompactionConfig {
-        enabled: true,
-        trigger_percent: 80,
-        target_percent: 50,
-    };
-    let agent = Agent::open_with_models(config, test_models(model))
+    fn compaction_model(mut self) -> Self {
+        self.context_window = 40_000;
+        self
+    }
+
+    fn auto_compaction(mut self) -> Self {
+        self.config.compaction = CompactionConfig {
+            enabled: true,
+            trigger_percent: 80,
+            target_percent: 50,
+        };
+        self
+    }
+
+    async fn open(&self) -> Agent {
+        Agent::open_with_models(
+            self.config.clone(),
+            test_models(FakeModel::with_context_window(
+                self.scripts.clone(),
+                self.context_window,
+            )),
+        )
         .await
-        .unwrap();
-    (agent, base, workspace)
+        .unwrap()
+    }
 }
 
 struct RpcHarness {
@@ -503,6 +489,7 @@ struct RpcHarness {
     pending: VecDeque<Value>,
     events: Vec<Value>,
     observed: Vec<Value>,
+    next_id: u64,
 }
 
 impl RpcHarness {
@@ -531,7 +518,34 @@ impl RpcHarness {
             pending: VecDeque::new(),
             events: Vec::new(),
             observed: Vec::new(),
+            next_id: 0,
         }
+    }
+
+    async fn call(&mut self, method: &str, params: Option<Value>) -> Value {
+        self.next_id += 1;
+        let id = json!(format!("rpc-call-{}", self.next_id));
+        self.send(id.clone(), method, params).await;
+        self.response(id).await
+    }
+
+    async fn call_ok(&mut self, method: &str, params: Option<Value>) -> Value {
+        let response = self.call(method, params).await;
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        assert!(response.get("result").is_some(), "{method}: {response}");
+        response
+    }
+
+    async fn call_err(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        code: i64,
+        kind: &str,
+    ) -> Value {
+        let response = self.call(method, params).await;
+        assert_rpc_error(&response, code, kind);
+        response
     }
 
     async fn send(&mut self, id: Value, method: &str, params: Option<Value>) {
@@ -620,6 +634,20 @@ impl RpcHarness {
     }
 }
 
+impl Drop for RpcHarness {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn assert_rpc_error(response: &Value, code: i64, kind: &str) {
+    assert_eq!(response["error"]["code"], code);
+    assert_eq!(response["error"]["data"]["kind"], kind);
+    assert!(response.get("result").is_none(), "{response}");
+}
+
 fn session_id(response: &Value) -> Value {
     response
         .pointer("/result/session/session_id")
@@ -674,14 +702,12 @@ async fn remove_base(path: &Path) {
 }
 
 async fn create_and_open(harness: &mut RpcHarness, workspace: &Path) -> Value {
-    harness
-        .send(
-            json!("create"),
+    let created = harness
+        .call_ok(
             "session.create",
             Some(json!({"workspace": workspace, "title": "rpc session"})),
         )
         .await;
-    let created = harness.response(json!("create")).await;
     assert_eq!(created["result"]["session"]["model"], json!("fake"));
     let session_id = session_id(&created);
     harness
@@ -760,13 +786,16 @@ async fn append_compaction_tail(harness: &mut RpcHarness, base: &Path, session_i
 }
 
 async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: &str) -> Value {
-    let (agent, base, workspace) = test_compaction_agent(
+    let fixture = RpcFixture::new(
         label,
         [ModelScript::Text("settled"), script],
         &[],
         ApprovalMode::Auto,
     )
-    .await;
+    .compaction_model();
+    let base = fixture.base.path().to_owned();
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     harness
@@ -777,14 +806,10 @@ async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: 
         )
         .await;
     let turn = harness.response(json!("send")).await["result"]["turn"].clone();
-    harness
-        .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
-        .await;
-    let _ = harness.response(json!("wait")).await;
+    let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
-    harness
-        .send(
-            json!("compact"),
+    let result = harness
+        .call_ok(
             "session.compact",
             Some(json!({
                 "session_id": session_id,
@@ -792,11 +817,9 @@ async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: 
             })),
         )
         .await;
-    let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("failed"));
     assert_eq!(result["result"]["failure_kind"], json!(expected));
     harness.shutdown().await;
-    remove_base(&base).await;
     result
 }
 
