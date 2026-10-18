@@ -1,8 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,7 +31,9 @@ use crate::tool_data::{
 use crate::tools::KNOWN_TOOL_NAMES;
 
 mod history;
+pub(crate) use history::HistoryLine;
 mod tool_records;
+use tool_records::AuxLedger;
 #[cfg(test)]
 use tool_records::change_blob_read_cost;
 
@@ -89,153 +89,69 @@ pub(crate) const AUX_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(test)]
-static APPEND_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
-#[cfg(test)]
-static RECORD_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
-#[cfg(test)]
-static SUMMARY_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
-#[cfg(test)]
-static AUX_WRITE_FAILURES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
-#[cfg(test)]
-static READ_CHANGE_BLOBS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-#[cfg(test)]
-static FAIL_REMOVE_TEMP_SESSIONS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
-#[cfg(test)]
-type AuxCommitGateEntry = (SessionId, Arc<AuxCommitGate>);
-#[cfg(test)]
-static AUX_COMMIT_GATES: OnceLock<Mutex<Vec<AuxCommitGateEntry>>> = OnceLock::new();
+pub(crate) static SESSION_LOAD_GATES: crate::test_support::Registry<
+    SessionId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 #[cfg(test)]
-pub(crate) struct AuxCommitGate {
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
-}
-
+pub(crate) static APPEND_FAILURES: crate::test_support::Registry<SessionId, bool> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-impl AuxCommitGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-}
-
+pub(crate) static RECORD_WRITE_FAILURES: crate::test_support::Registry<SessionId, ()> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-pub(crate) fn register_aux_commit_gate(session_id: SessionId, gate: Arc<AuxCommitGate>) {
-    let mutex = AUX_COMMIT_GATES.get_or_init(|| Mutex::new(Vec::new()));
-    mutex.lock().unwrap().push((session_id, gate));
-}
-
+pub(crate) static SUMMARY_WRITE_FAILURES: crate::test_support::Registry<SessionId, ()> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-async fn wait_aux_commit_gate(session_id: SessionId) {
-    let gate = {
-        let Some(mutex) = AUX_COMMIT_GATES.get() else {
-            return;
-        };
-        let mut entries = mutex.lock().unwrap();
-        let Some(pos) = entries.iter().position(|(s, _)| *s == session_id) else {
-            return;
-        };
-        entries.remove(pos).1
-    };
-    gate.entered.notify_one();
-    gate.release.notified().await;
-}
-
+pub(crate) static AUX_WRITE_FAILURES: crate::test_support::Registry<SessionId, ()> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-pub(crate) fn fail_next_remove_temp(session_id: SessionId) {
-    let mutex = FAIL_REMOVE_TEMP_SESSIONS.get_or_init(|| Mutex::new(Vec::new()));
-    mutex.lock().unwrap().push(session_id);
-}
-
+static READ_CHANGE_BLOBS: crate::test_support::Registry<PathBuf, PathBuf> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-fn should_fail_remove_temp(session_id: SessionId) -> bool {
-    let Some(mutex) = FAIL_REMOVE_TEMP_SESSIONS.get() else {
-        return false;
-    };
-    let mut failures = mutex.lock().unwrap();
-    if let Some(pos) = failures.iter().position(|&s| s == session_id) {
-        failures.remove(pos);
-        true
-    } else {
-        false
-    }
-}
+pub(crate) static FAIL_REMOVE_TEMP_SESSIONS: crate::test_support::Registry<SessionId, ()> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-type SummaryCommitGateEntry = (SessionId, Arc<SummaryCommitGate>);
+pub(crate) static AUX_COMMIT_GATES: crate::test_support::Registry<
+    SessionId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 #[cfg(test)]
-static SUMMARY_COMMIT_GATES: OnceLock<Mutex<Vec<SummaryCommitGateEntry>>> = OnceLock::new();
+pub(crate) static SUMMARY_COMMIT_GATES: crate::test_support::Registry<
+    SessionId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 #[cfg(test)]
-static SUMMARY_UNKNOWN_WRITES: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn take_read_change_blobs_under(prefix: &Path) -> Vec<PathBuf> {
-    let mut entries = READ_CHANGE_BLOBS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    let mut taken = Vec::new();
-    entries.retain(|path| {
-        if path.starts_with(prefix) {
-            taken.push(path.clone());
-            false
-        } else {
-            true
-        }
-    });
-    taken
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_aux_write(session_id: SessionId) {
-    let mutex = AUX_WRITE_FAILURES.get_or_init(|| Mutex::new(Vec::new()));
-    mutex.lock().unwrap().push(session_id);
-}
-
-#[cfg(test)]
-fn should_fail_aux_write(session_id: SessionId) -> bool {
-    let Some(mutex) = AUX_WRITE_FAILURES.get() else {
-        return false;
-    };
-    let mut failures = mutex.lock().unwrap();
-    if let Some(pos) = failures.iter().position(|item| *item == session_id) {
-        failures.remove(pos);
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct SummaryCommitGate {
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl SummaryCommitGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.entered.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
+pub(crate) static SUMMARY_UNKNOWN_WRITES: crate::test_support::Registry<SessionId, ()> =
+    crate::test_support::Registry::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SummaryCommit {
     Committed,
     Rejected,
     Unknown,
+}
+
+#[derive(Debug)]
+pub(crate) enum AppendError {
+    NotWritten(StoreError),
+    Unknown,
+}
+
+impl From<StoreError> for AppendError {
+    fn from(error: StoreError) -> Self {
+        Self::NotWritten(error)
+    }
+}
+
+impl AppendError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::NotWritten(error) => error.kind(),
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Persistent per-session product state owned by the Agent. Creating a session
@@ -300,10 +216,11 @@ pub(crate) fn normalize_title(title: &str) -> Result<Option<String>, ()> {
     }
 }
 
-/// A loaded session: its persistent record plus a sanitized in-memory history.
+/// Session data read from disk, including an unpublished history index.
 pub(crate) struct StoredSession {
     pub(crate) record: SessionRecord,
     pub(crate) history: std::sync::Arc<[HistoryItem]>,
+    pub(crate) history_index: Vec<HistoryLine>,
     /// `(loop_id, occurrence)` -> RFC3339 acceptance time, collected from the
     /// loop records so history views can show persisted user timestamps.
     pub(crate) user_times: std::collections::HashMap<(LoopId, usize), String>,
@@ -332,6 +249,7 @@ pub(crate) struct HistoryScanLimits {
     pub(crate) cancellation: CancellationToken,
 }
 
+#[derive(Default)]
 pub(crate) struct HistoryReadPage {
     pub(crate) captured_end: u64,
     pub(crate) revision: String,
@@ -483,10 +401,11 @@ pub(crate) fn delivery_state(delivery: minicore_runtime::model::DeliveryState) -
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct Store {
     root: PathBuf,
-    aux_lock: Arc<tokio::sync::Mutex<()>>,
+    history_indexes: Arc<Mutex<HashMap<SessionId, Vec<HistoryLine>>>>,
+    aux_lock: Arc<tokio::sync::Mutex<Option<AuxLedger>>>,
     diff_workers: Arc<Mutex<DiffWorkers>>,
     #[cfg(test)]
     aux_limits: Option<AuxLimits>,
@@ -597,7 +516,6 @@ struct ReadToolRecord {
 
 pub(crate) struct ToolChangeScan {
     pub(crate) records: Vec<(ToolRef, StoredFileChange)>,
-    pub(crate) complete: bool,
     pub(crate) skipped: bool,
     #[cfg(test)]
     pub(crate) entries: usize,
@@ -613,7 +531,6 @@ impl ToolChangeScan {
     pub(crate) fn unavailable() -> Self {
         Self {
             records: Vec::new(),
-            complete: false,
             skipped: true,
             #[cfg(test)]
             entries: 0,
@@ -699,30 +616,20 @@ impl Store {
         }
         // The root itself must be a real directory: never follow a `data_dir`
         // symlink indirectly through `root/sessions`.
-        match path_state(&root)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&root).await? {
             PathState::Directory => {}
             PathState::Missing => {
-                fs::create_dir_all(&root)
-                    .await
-                    .map_err(|_| StoreError::Unavailable)?;
+                fs::create_dir_all(&root).await.map_err(unavailable)?;
             }
             PathState::Symlink | PathState::RegularFile | PathState::Other => {
                 return Err(StoreError::InvalidRoot);
             }
         }
         let sessions = root.join(SESSIONS_DIR);
-        match path_state(&sessions)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&sessions).await? {
             PathState::Directory => {}
             PathState::Missing => {
-                fs::create_dir_all(&sessions)
-                    .await
-                    .map_err(|_| StoreError::Unavailable)?;
+                fs::create_dir_all(&sessions).await.map_err(unavailable)?;
             }
             PathState::Symlink | PathState::RegularFile | PathState::Other => {
                 return Err(StoreError::InvalidRoot);
@@ -730,7 +637,8 @@ impl Store {
         }
         Ok(Self {
             root,
-            aux_lock: Arc::new(tokio::sync::Mutex::new(())),
+            history_indexes: Arc::default(),
+            aux_lock: Arc::default(),
             diff_workers: Arc::new(Mutex::new(DiffWorkers::default())),
             #[cfg(test)]
             aux_limits: None,
@@ -741,13 +649,9 @@ impl Store {
         self.require_sessions_root().await?;
         let mut directory = fs::read_dir(self.sessions_directory())
             .await
-            .map_err(|_| StoreError::Unavailable)?;
+            .map_err(unavailable)?;
         let mut records = Vec::new();
-        while let Some(entry) = directory
-            .next_entry()
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        while let Some(entry) = directory.next_entry().await.map_err(unavailable)? {
             let state = match path_state(&entry.path()).await {
                 Ok(state) => state,
                 Err(_) => continue,
@@ -787,14 +691,9 @@ impl Store {
         }
         self.require_sessions_root().await?;
         let directory = self.session_directory(record.session_id);
-        match path_state(&directory)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&directory).await? {
             PathState::Missing => {
-                fs::create_dir(&directory)
-                    .await
-                    .map_err(|_| StoreError::Unavailable)?;
+                fs::create_dir(&directory).await.map_err(unavailable)?;
             }
             PathState::Directory => return Err(StoreError::SessionAlreadyExists),
             PathState::Symlink | PathState::RegularFile | PathState::Other => {
@@ -805,23 +704,24 @@ impl Store {
             self.write_record(record).await?;
             let directory = self.require_session_directory(record.session_id).await?;
             let history_path = directory.join(HISTORY_FILE);
-            match path_state(&history_path)
-                .await
-                .map_err(|_| StoreError::Unavailable)?
-            {
+            match path_state(&history_path).await? {
                 PathState::Missing => {
                     OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&history_path)
                         .await
-                        .map_err(|_| StoreError::Unavailable)?;
+                        .map_err(unavailable)?;
                 }
                 PathState::RegularFile => {}
                 PathState::Directory | PathState::Symlink | PathState::Other => {
                     return Err(StoreError::Corrupt);
                 }
             }
+            sync_directory(&directory).await.map_err(unavailable)?;
+            sync_directory(&self.sessions_directory())
+                .await
+                .map_err(unavailable)?;
             Ok(())
         }
         .await;
@@ -838,12 +738,15 @@ impl Store {
     ) -> Result<StoredSession, StoreError> {
         let directory = self.require_session_directory(session_id).await?;
         let record = Self::read_record(&directory.join(SESSION_RECORD_FILE), session_id).await?;
-        let (history, user_times) = self
-            .load_history(&directory.join(HISTORY_FILE), session_id)
-            .await?;
+        let (history, user_times, history_index) = self.load_history(session_id).await?;
+        #[cfg(test)]
+        if let Some(gate) = SESSION_LOAD_GATES.take(&session_id) {
+            gate.pass().await;
+        }
         Ok(StoredSession {
             record,
             history,
+            history_index,
             user_times,
         })
     }
@@ -857,10 +760,7 @@ impl Store {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let directory = self.require_session_directory(session_id).await?;
         let path = directory.join(SUMMARY_FILE);
-        match path_state(&path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&path).await? {
             PathState::Missing | PathState::Symlink | PathState::Directory | PathState::Other => {
                 return Ok(None);
             }
@@ -910,21 +810,10 @@ impl Store {
             return Ok(SummaryCommit::Rejected);
         }
         #[cfg(test)]
-        if let Some(gate) = take_summary_commit_gate(session_id) {
-            gate.entered.notify_one();
-            let Some(remaining) = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-            else {
-                return Ok(SummaryCommit::Rejected);
-            };
-            if tokio::time::timeout(remaining, gate.release.notified())
-                .await
-                .is_err()
-            {
-                return Ok(SummaryCommit::Rejected);
-            }
+        if !tests::pass_summary_gate(session_id, deadline).await {
+            return Ok(SummaryCommit::Rejected);
         }
+
         let Some(remaining) = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
@@ -962,11 +851,11 @@ impl Store {
             return Ok(SummaryCommit::Rejected);
         }
         #[cfg(test)]
-        if should_force_unknown_summary_write(session_id) {
+        if SUMMARY_UNKNOWN_WRITES.hit(&session_id) {
             return Ok(SummaryCommit::Unknown);
         }
         #[cfg(test)]
-        if should_fail_summary_write(session_id) {
+        if SUMMARY_WRITE_FAILURES.hit(&session_id) {
             return Err(StoreError::Unavailable);
         }
         let path = directory.join(SUMMARY_FILE);
@@ -977,36 +866,12 @@ impl Store {
         record.validate()?;
         let directory = self.require_session_directory(record.session_id).await?;
         #[cfg(test)]
-        if should_fail_record_write(record.session_id) {
+        if RECORD_WRITE_FAILURES.hit(&record.session_id) {
             return Err(StoreError::Unavailable);
         }
         let path = directory.join(SESSION_RECORD_FILE);
-        let bytes = serde_json::to_vec(record).map_err(|_| StoreError::Corrupt)?;
+        let bytes = serde_json::to_vec(record).map_err(corrupt)?;
         atomic_write(&path, &bytes).await
-    }
-
-    /// Starts one owned `changes.diff` CPU comparison for `session_id`.
-    /// Registration and the capacity check happen under the same lock as the
-    /// closing flag, so a Store that starts closing either observes this worker
-    /// or refuses it. Test-only: production callers pass an admission token
-    /// through `spawn_cancellable_diff_query` so a closing Session is observed.
-    #[cfg(test)]
-    pub(crate) fn spawn_diff_query(
-        &self,
-        session_id: SessionId,
-        before: Arc<[u8]>,
-        after: Arc<[u8]>,
-        context_lines: usize,
-        deadline: Instant,
-    ) -> Result<DiffQuery, StoreError> {
-        self.spawn_cancellable_diff_query(
-            session_id,
-            before,
-            after,
-            context_lines,
-            deadline,
-            &CancellationToken::new(),
-        )
     }
 
     /// Starts one owned `changes.diff` CPU comparison for `session_id`, deriving
@@ -1114,20 +979,26 @@ impl Store {
             .retain(|worker| !(worker.session_id == session_id && worker.is_finished()));
     }
 
-    /// Test-only evidence that diff worker handles are still registered (not
-    /// taken and dropped), used to prove a dropped or re-entered shutdown does
-    /// not detach an owned comparison.
-    #[cfg(test)]
-    pub(crate) fn registered_diff_workers(&self) -> usize {
-        self.diff_workers.lock().unwrap().workers.len()
+    pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
+        let mut ledger = self.aux_lock.lock().await;
+        let directory = self.require_session_directory(session_id).await?;
+        fs::remove_dir_all(directory).await.map_err(unavailable)?;
+        self.unload_history(session_id);
+        if let Some(ledger) = ledger.as_mut() {
+            ledger.remove_session(session_id);
+        }
+        Ok(())
     }
 
-    pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
-        let directory = self.require_session_directory(session_id).await?;
-        fs::remove_dir_all(directory)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        Ok(())
+    pub(crate) fn unload_history(&self, session_id: SessionId) {
+        self.history_indexes.lock().unwrap().remove(&session_id);
+    }
+
+    pub(crate) fn install_history_index(&self, session_id: SessionId, index: Vec<HistoryLine>) {
+        self.history_indexes
+            .lock()
+            .unwrap()
+            .insert(session_id, index);
     }
 
     pub(crate) async fn load_record(
@@ -1139,10 +1010,7 @@ impl Store {
     }
 
     async fn read_record(path: &Path, session_id: SessionId) -> Result<SessionRecord, StoreError> {
-        match path_state(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(path).await? {
             PathState::RegularFile => {}
             PathState::Missing => {
                 let directory = path.parent().unwrap_or(path);
@@ -1158,27 +1026,22 @@ impl Store {
             }
         }
         // Bound the record read absolutely before handing bytes to serde.
-        let metadata = fs::metadata(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        let metadata = fs::metadata(path).await.map_err(unavailable)?;
         if metadata.len() > MAX_SESSION_RECORD_BYTES as u64 {
             return Err(StoreError::Corrupt);
         }
-        let file = File::open(path)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
+        let file = File::open(path).await.map_err(unavailable)?;
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         file.take(MAX_SESSION_RECORD_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| StoreError::Unavailable)?;
+            .map_err(unavailable)?;
         if bytes.len() > MAX_SESSION_RECORD_BYTES {
             return Err(StoreError::Corrupt);
         }
-        let record: SessionRecord =
-            serde_json::from_slice(&bytes).map_err(|_| StoreError::Corrupt)?;
-        record.validate().map_err(|_| StoreError::Corrupt)?;
-        if record.session_id != session_id || record.session_id == SessionId::default() {
+        let record: SessionRecord = serde_json::from_slice(&bytes).map_err(corrupt)?;
+        record.validate().map_err(corrupt)?;
+        if record.session_id != session_id {
             return Err(StoreError::Corrupt);
         }
         Ok(record)
@@ -1193,10 +1056,7 @@ impl Store {
     }
 
     async fn require_root(&self) -> Result<(), StoreError> {
-        match path_state(&self.root)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&self.root).await? {
             PathState::Directory => Ok(()),
             PathState::Missing => Err(StoreError::Unavailable),
             PathState::Symlink | PathState::RegularFile | PathState::Other => {
@@ -1211,10 +1071,7 @@ impl Store {
     ) -> Result<PathBuf, StoreError> {
         self.require_sessions_root().await?;
         let directory = self.session_directory(session_id);
-        match path_state(&directory)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&directory).await? {
             PathState::Directory => {
                 reject_symlink_entries(&directory)
                     .await
@@ -1243,10 +1100,7 @@ impl Store {
 
     async fn require_sessions_root(&self) -> Result<(), StoreError> {
         self.require_root().await?;
-        match path_state(&self.sessions_directory())
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&self.sessions_directory()).await? {
             PathState::Directory => Ok(()),
             PathState::Missing => Err(StoreError::Unavailable),
             PathState::Symlink | PathState::RegularFile | PathState::Other => {
@@ -1279,12 +1133,7 @@ fn valid_sha256(value: &str) -> bool {
 async fn legacy_format_present(directory: &Path) -> Result<bool, StoreError> {
     for name in [LEGACY_MANIFEST_FILE, LEGACY_CONVERSATION_FILE] {
         let path = directory.join(name);
-        if matches!(
-            path_state(&path)
-                .await
-                .map_err(|_| StoreError::Unavailable)?,
-            PathState::RegularFile
-        ) {
+        if matches!(path_state(&path).await?, PathState::RegularFile) {
             return Ok(true);
         }
     }
@@ -1300,7 +1149,7 @@ enum PathState {
     Other,
 }
 
-async fn path_state(path: &Path) -> io::Result<PathState> {
+async fn path_state(path: &Path) -> Result<PathState, StoreError> {
     match fs::symlink_metadata(path).await {
         Ok(metadata) => {
             let file_type = metadata.file_type();
@@ -1315,7 +1164,7 @@ async fn path_state(path: &Path) -> io::Result<PathState> {
             })
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PathState::Missing),
-        Err(error) => Err(error),
+        Err(_) => Err(StoreError::Unavailable),
     }
 }
 
@@ -1341,6 +1190,21 @@ fn map_io_store_error(error: io::Error) -> StoreError {
     }
 }
 
+fn unavailable<E>(_: E) -> StoreError {
+    StoreError::Unavailable
+}
+fn corrupt<E>(_: E) -> StoreError {
+    StoreError::Corrupt
+}
+
+async fn real_dir_opt(path: &Path) -> Result<bool, StoreError> {
+    match path_state(path).await? {
+        PathState::Directory => Ok(true),
+        PathState::Missing => Ok(false),
+        _ => Err(StoreError::Corrupt),
+    }
+}
+
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     match atomic_write_status(path, bytes).await? {
         SummaryCommit::Committed => Ok(()),
@@ -1350,10 +1214,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 
 async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit, StoreError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    match path_state(parent)
-        .await
-        .map_err(|_| StoreError::Unavailable)?
-    {
+    match path_state(parent).await? {
         PathState::Directory => {}
         PathState::Symlink | PathState::RegularFile | PathState::Other => {
             return Err(StoreError::Corrupt);
@@ -1363,20 +1224,14 @@ async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit,
     reject_symlink_entries(parent)
         .await
         .map_err(map_io_store_error)?;
-    match path_state(path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?
-    {
+    match path_state(path).await? {
         PathState::Missing | PathState::RegularFile => {}
         PathState::Directory | PathState::Symlink | PathState::Other => {
             return Err(StoreError::Corrupt);
         }
     }
     let temp_path = unique_temp_path(path);
-    match path_state(&temp_path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?
-    {
+    match path_state(&temp_path).await? {
         PathState::Missing => {}
         PathState::RegularFile => return Err(StoreError::Unavailable),
         PathState::Directory | PathState::Symlink | PathState::Other => {
@@ -1388,7 +1243,7 @@ async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit,
         .create_new(true)
         .open(&temp_path)
         .await
-        .map_err(|_| StoreError::Unavailable)?;
+        .map_err(unavailable)?;
     if file.write_all(bytes).await.is_err()
         || file.flush().await.is_err()
         || file.sync_all().await.is_err()
@@ -1400,6 +1255,9 @@ async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit,
     drop(file);
     if fs::rename(&temp_path, path).await.is_err() {
         let _ = fs::remove_file(&temp_path).await;
+        return Ok(SummaryCommit::Unknown);
+    }
+    if sync_directory(parent).await.is_err() {
         return Ok(SummaryCommit::Unknown);
     }
     Ok(SummaryCommit::Committed)
@@ -1582,7 +1440,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 pub(crate) fn utc_timestamp() -> Result<String, StoreError> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| StoreError::Unavailable)?;
+        .map_err(unavailable)?;
     Ok(format_rfc3339_millis(
         duration.as_secs(),
         duration.subsec_millis(),
@@ -1622,127 +1480,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     };
     let year = if month <= 2 { year + 1 } else { year };
     (year, month as u32, day as u32)
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_append(session_id: SessionId) {
-    APPEND_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(session_id);
-}
-
-#[cfg(test)]
-fn should_fail_append(session_id: SessionId) -> bool {
-    let mut failures = APPEND_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    failures
-        .iter()
-        .position(|candidate| *candidate == session_id)
-        .map(|position| {
-            failures.remove(position);
-            true
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_record_write(session_id: SessionId) {
-    RECORD_WRITE_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(session_id);
-}
-
-#[cfg(test)]
-fn should_fail_record_write(session_id: SessionId) -> bool {
-    let mut failures = RECORD_WRITE_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    failures
-        .iter()
-        .position(|candidate| *candidate == session_id)
-        .map(|position| {
-            failures.remove(position);
-            true
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_summary_write(session_id: SessionId) {
-    SUMMARY_WRITE_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(session_id);
-}
-
-#[cfg(test)]
-fn should_fail_summary_write(session_id: SessionId) -> bool {
-    let mut failures = SUMMARY_WRITE_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    failures
-        .iter()
-        .position(|candidate| *candidate == session_id)
-        .map(|position| {
-            failures.remove(position);
-            true
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-pub(crate) fn gate_next_summary_commit(session_id: SessionId, gate: Arc<SummaryCommitGate>) {
-    SUMMARY_COMMIT_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, gate));
-}
-
-#[cfg(test)]
-fn take_summary_commit_gate(session_id: SessionId) -> Option<Arc<SummaryCommitGate>> {
-    let mut gates = SUMMARY_COMMIT_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|(candidate, _)| *candidate == session_id)
-        .map(|position| gates.remove(position).1)
-}
-
-#[cfg(test)]
-pub(crate) fn force_unknown_summary_write(session_id: SessionId) {
-    SUMMARY_UNKNOWN_WRITES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(session_id);
-}
-
-#[cfg(test)]
-fn should_force_unknown_summary_write(session_id: SessionId) -> bool {
-    let mut writes = SUMMARY_UNKNOWN_WRITES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    writes
-        .iter()
-        .position(|candidate| *candidate == session_id)
-        .map(|position| {
-            writes.remove(position);
-            true
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -7,17 +7,16 @@
 //! A missing before snapshot is a real addition; an unknown, expired, or
 //! corrupt snapshot is explicitly unavailable rather than an empty file.
 
-use std::cmp::min;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use similar::{Algorithm, ChangeTag, TextDiff};
+use similar::{Algorithm, ChangeTag, DiffOp, capture_diff, group_diff_ops};
 use tokio_util::sync::CancellationToken;
 
-use crate::budget::encoded_len;
+use crate::budget::{check_budget, encoded_len, encoded_result};
 use crate::changes::{
     ChangeCommitState, ChangeCoverage, ChangeKind, ChangeOrigin, ChangeRevision, FileChange,
     stored_tool_change_ref, tool_change_ref,
@@ -29,13 +28,11 @@ use crate::store::Store;
 use crate::text::floor_char_boundary;
 use crate::tool_data::{ToolData, ToolRef};
 
-/// Wall-clock budget for one diff query. The CPU comparison gets a smaller
-/// budget from this value.
+/// Wall-clock budget for one diff query.
 pub(crate) const CHANGE_DIFF_DEADLINE: Duration = Duration::from_secs(10);
-/// Upper bound on the comparison itself. `similar`'s deadline is approximate
-/// and has no expiry flag, so a result produced at or past it is reported as
-/// truncated rather than as the optimal diff.
-const CHANGE_DIFF_CPU_BUDGET: Duration = Duration::from_millis(500);
+/// Bounds Myers' quadratic worst case after trimming equal ends. Larger
+/// middles use a linear replacement plan without omitting any source lines.
+const MAX_MYERS_LINES: usize = 2_048;
 /// Combined line ceiling for both sides. Past it the comparison is not started.
 const MAX_DIFF_LINES: usize = 100_000;
 const DEFAULT_CONTEXT_LINES: usize = 3;
@@ -77,7 +74,7 @@ pub enum DiffLineKind {
 pub enum DiffAvailability {
     /// Every page of the comparison is present.
     Available,
-    /// Some pages, lines, or context were cut by a bound or the CPU budget.
+    /// Some pages, lines, or context were cut by a bound.
     Partial,
     /// At least one side is not text; no hunks are produced.
     Binary,
@@ -119,8 +116,6 @@ pub struct DiffHunk {
 pub struct DiffCursor {
     pub session_id: SessionId,
     pub change_ref: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_ref: Option<ToolRef>,
     pub ops_fingerprint: String,
     pub context_lines: usize,
     pub hunk_index: usize,
@@ -181,10 +176,6 @@ impl ChangesDiffRequest {
                 || cursor.change_ref != self.change_ref
                 || cursor.context_lines != context
                 || !valid_sha256(&cursor.ops_fingerprint)
-                || cursor
-                    .tool_ref
-                    .as_ref()
-                    .is_some_and(|tool_ref| tool_ref.session_id != self.session_id)
             {
                 return Err(AgentError::InvalidArguments);
             }
@@ -283,9 +274,8 @@ pub(crate) struct LinePlan {
     pub(crate) byte_len: usize,
 }
 
-/// Runs one bounded line comparison on a blocking thread. It checks its
-/// cancellation and deadline before doing any work, and reports truncation
-/// rather than claiming an optimal diff after `similar`'s approximate deadline.
+/// Builds a deterministic plan on a blocking thread. Query expiry cancels
+/// the result, never changes the alignment or returns a time-dependent prefix.
 pub(crate) fn plan_diff(
     before: &[u8],
     after: &[u8],
@@ -293,14 +283,9 @@ pub(crate) fn plan_diff(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<DiffOutcome, AgentError> {
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        return Err(AgentError::QueryLimit);
-    }
+    check_budget(cancellation, deadline)?;
     #[cfg(test)]
-    block_on_diff_gate(before, after, cancellation);
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        return Err(AgentError::QueryLimit);
-    }
+    tests::block_on_diff_gate(before, after, cancellation, deadline)?;
     let before_text = match std::str::from_utf8(before) {
         Ok(text) => text,
         Err(_) => return Ok(DiffOutcome::Binary),
@@ -328,26 +313,63 @@ pub(crate) fn plan_diff(
             truncated: true,
         }));
     }
-    let cpu_deadline = min(
-        Instant::now()
-            .checked_add(CHANGE_DIFF_CPU_BUDGET)
-            .unwrap_or(deadline),
-        deadline,
-    );
-    let mut config = TextDiff::configure();
-    config.algorithm(Algorithm::Myers).deadline(cpu_deadline);
-    let diff = config.diff_lines(before_text, after_text);
-    let groups = diff.grouped_ops(context_lines);
+    let before_tokens = before_lines
+        .iter()
+        .map(|&(start, len)| &before_text[start..start + len])
+        .collect::<Vec<_>>();
+    let after_tokens = after_lines
+        .iter()
+        .map(|&(start, len)| &after_text[start..start + len])
+        .collect::<Vec<_>>();
+    let prefix = before_tokens
+        .iter()
+        .zip(&after_tokens)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = before_tokens[prefix..]
+        .iter()
+        .rev()
+        .zip(after_tokens[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_end = before_count - suffix;
+    let new_end = after_count - suffix;
+    let replace = old_end - prefix + new_end - prefix > MAX_MYERS_LINES;
+    let mut ops = Vec::new();
+    if prefix > 0 {
+        ops.push(DiffOp::Equal {
+            old_index: 0,
+            new_index: 0,
+            len: prefix,
+        });
+    }
+    if replace {
+        ops.push(DiffOp::Replace {
+            old_index: prefix,
+            old_len: old_end - prefix,
+            new_index: prefix,
+            new_len: new_end - prefix,
+        });
+    } else {
+        ops.extend(capture_diff(
+            Algorithm::Myers,
+            &before_tokens,
+            prefix..old_end,
+            &after_tokens,
+            prefix..new_end,
+        ));
+    }
+    if suffix > 0 {
+        ops.push(DiffOp::Equal {
+            old_index: old_end,
+            new_index: new_end,
+            len: suffix,
+        });
+    }
+    let groups = group_diff_ops(ops, context_lines);
     let mut hunks = Vec::new();
-    let mut truncated = false;
     for group in groups {
-        if cancellation.is_cancelled() {
-            return Err(AgentError::QueryLimit);
-        }
-        if Instant::now() >= cpu_deadline {
-            truncated = true;
-            break;
-        }
+        check_budget(cancellation, deadline)?;
         // The grouped ops are contiguous, so the hunk's line spans are exactly
         // the union of their canonical old/new ranges.
         let mut old_start = usize::MAX;
@@ -363,18 +385,10 @@ pub(crate) fn plan_diff(
             old_end = old_end.max(old_range.end);
             new_start = new_start.min(new_range.start);
             new_end = new_end.max(new_range.end);
-            for change in diff.iter_changes(op) {
+            for change in op.iter_changes(&before_tokens, &after_tokens) {
                 scanned += 1;
-                // A single very large hunk must still observe cancellation and
-                // the CPU deadline, not only at the hunk boundary.
                 if scanned % 256 == 0 {
-                    if cancellation.is_cancelled() {
-                        return Err(AgentError::QueryLimit);
-                    }
-                    if Instant::now() >= cpu_deadline {
-                        truncated = true;
-                        break;
-                    }
+                    check_budget(cancellation, deadline)?;
                 }
                 let (kind, source, old_index, new_index) = match change.tag() {
                     ChangeTag::Equal => (
@@ -404,9 +418,7 @@ pub(crate) fn plan_diff(
                     LineSource::Before => old_index,
                     LineSource::After => new_index,
                 };
-                let Some((start, len)) = index.and_then(|index| table.get(index).copied()) else {
-                    continue;
-                };
+                let (start, len) = table[index.expect("diff change has a source index")];
                 lines.push(LinePlan {
                     kind,
                     old_index,
@@ -416,45 +428,31 @@ pub(crate) fn plan_diff(
                     byte_len: len,
                 });
             }
-            if truncated {
-                break;
-            }
         }
         if lines.is_empty() {
             continue;
         }
-        let old_start = if old_start == usize::MAX {
-            0
-        } else {
-            old_start
-        };
-        let new_start = if new_start == usize::MAX {
-            0
-        } else {
-            new_start
-        };
         hunks.push(HunkPlan {
             old_start,
-            old_count: old_end.saturating_sub(old_start),
+            old_count: old_end - old_start,
             new_start,
-            new_count: new_end.saturating_sub(new_start),
+            new_count: new_end - new_start,
             lines,
         });
     }
-    if Instant::now() >= cpu_deadline {
-        truncated = true;
-    }
+    check_budget(cancellation, deadline)?;
     Ok(DiffOutcome::Plan(DiffPlan {
-        fingerprint: plan_fingerprint(context_lines, &hunks),
+        fingerprint: plan_fingerprint(context_lines, replace, &hunks),
         hunks,
-        truncated,
+        truncated: false,
     }))
 }
 
-fn plan_fingerprint(context_lines: usize, hunks: &[HunkPlan]) -> String {
+fn plan_fingerprint(context_lines: usize, replace: bool, hunks: &[HunkPlan]) -> String {
     // Hash the plan field by field with a stable, explicit encoding instead of
     // building a second multi-megabyte canonical `Vec` and its JSON bytes.
     let mut hasher = Sha256::new();
+    hasher.update([u8::from(replace)]);
     hasher.update((context_lines as u64).to_le_bytes());
     hasher.update((hunks.len() as u64).to_le_bytes());
     for hunk in hunks {
@@ -552,31 +550,9 @@ pub(crate) async fn resolve_tool_change(
     warm: Option<&Arc<ToolData>>,
     session_id: SessionId,
     change_ref: &str,
-    cursor_tool_ref: Option<&ToolRef>,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Option<(ToolRef, FileChange)>, AgentError> {
-    // A cursor tool reference is only a lookup hint. It is verified against the
-    // session and the resolved change reference, so a forged or stale hint can
-    // never select a different change.
-    if let Some(tool_ref) = cursor_tool_ref {
-        if tool_ref.session_id != session_id {
-            return Err(AgentError::InvalidArguments);
-        }
-        if let Some(resolved) = resolve_one(
-            store,
-            warm,
-            session_id,
-            change_ref,
-            tool_ref,
-            deadline,
-            cancellation,
-        )
-        .await?
-        {
-            return Ok(Some(resolved));
-        }
-    }
     // Warm candidates are matched on metadata only, so unrelated before/after
     // buffers are not cloned to discover that they do not match.
     if let Some(data) = warm {
@@ -631,7 +607,7 @@ pub(crate) async fn resolve_tool_change(
     }
     // An incomplete scan cannot prove the reference is absent. Reporting
     // `ToolNotFound` here would be a false negative.
-    if !scan.complete || scan.skipped {
+    if scan.skipped {
         return Err(AgentError::Store);
     }
     Ok(None)
@@ -714,9 +690,7 @@ pub(crate) async fn changes_diff(
     deadline: Instant,
 ) -> Result<DiffResult, AgentError> {
     request.validate()?;
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        return Err(AgentError::QueryLimit);
-    }
+    check_budget(&cancellation, deadline)?;
     let max_bytes = request.max_bytes();
     if request.change_ref.starts_with("workspace:") {
         return encoded_result(workspace_unavailable(&request), max_bytes);
@@ -726,10 +700,6 @@ pub(crate) async fn changes_diff(
         warm.as_ref(),
         request.session_id,
         &request.change_ref,
-        request
-            .cursor
-            .as_ref()
-            .and_then(|cursor| cursor.tool_ref.as_ref()),
         deadline,
         &cancellation,
     )
@@ -737,9 +707,6 @@ pub(crate) async fn changes_diff(
     else {
         return Err(AgentError::ToolNotFound);
     };
-    if tool_change_ref(&tool_ref, &change) != request.change_ref {
-        return Err(AgentError::ToolNotFound);
-    }
     let base = DiffResult {
         change_ref: request.change_ref.clone(),
         path: change.path.clone(),
@@ -846,7 +813,7 @@ async fn compare_sources(
                 stale: request.cursor.is_some(),
                 availability: DiffAvailability::Binary,
                 complete: true,
-                ..clone_base(&base)
+                ..base
             },
             max_bytes,
         ),
@@ -868,7 +835,7 @@ async fn compare_sources(
                         DiffResult {
                             stale: true,
                             availability: DiffAvailability::Available,
-                            ..clone_base(&base)
+                            ..base
                         },
                         max_bytes,
                     );
@@ -907,7 +874,7 @@ async fn compare_sources(
                     complete: complete && !plan.truncated,
                     truncated: plan.truncated,
                     availability,
-                    ..clone_base(&base)
+                    ..base
                 },
                 max_bytes,
             )
@@ -938,29 +905,6 @@ pub(crate) fn workspace_unavailable(request: &ChangesDiffRequest) -> DiffResult 
     }
 }
 
-fn clone_base(base: &DiffResult) -> DiffResult {
-    DiffResult {
-        change_ref: base.change_ref.clone(),
-        path: base.path.clone(),
-        kind: base.kind.clone(),
-        origin: base.origin.clone(),
-        tool_ref: base.tool_ref.clone(),
-        comparison: base.comparison,
-        base_version: base.base_version.clone(),
-        target_version: base.target_version.clone(),
-        commit_state: base.commit_state,
-        coverage: base.coverage,
-        binary: false,
-        stale: false,
-        versions_refreshed: base.versions_refreshed,
-        availability: DiffAvailability::Unavailable,
-        hunks: Vec::new(),
-        complete: false,
-        truncated: false,
-        next_cursor: None,
-    }
-}
-
 fn side_bytes(revision: &ChangeRevision, bytes: Option<Vec<u8>>) -> Option<Arc<[u8]>> {
     match revision {
         ChangeRevision::Missing => Some(Arc::from(&[][..])),
@@ -976,7 +920,8 @@ fn side_bytes(revision: &ChangeRevision, bytes: Option<Vec<u8>>) -> Option<Arc<[
 /// previous records per candidate.
 struct PageMeter {
     base_empty: usize,
-    completed: Vec<usize>,
+    completed_bytes: usize,
+    completed_hunks: usize,
     current: Option<(usize, usize, usize)>,
     max_bytes: usize,
 }
@@ -987,8 +932,8 @@ impl PageMeter {
             let comma = if lines > 0 { 1 } else { 0 };
             (open, comp + comma + line_json_len, lines + 1)
         });
-        let mut sum: usize = self.completed.iter().sum();
-        let mut count = self.completed.len();
+        let mut sum = self.completed_bytes;
+        let mut count = self.completed_hunks;
         if let Some((open, comp, _)) = current {
             sum = sum
                 .saturating_add(open)
@@ -1017,7 +962,8 @@ impl PageMeter {
 
     fn finish_hunk(&mut self) {
         if let Some((open, comp, _)) = self.current.take() {
-            self.completed.push(open + 2 + comp);
+            self.completed_bytes += open + 2 + comp;
+            self.completed_hunks += 1;
         }
     }
 }
@@ -1033,11 +979,9 @@ fn build_page(
     start: (usize, usize, usize),
     max_bytes: usize,
 ) -> Result<(Vec<DiffHunk>, Option<DiffCursor>, bool), AgentError> {
-    let mut template = clone_base(base);
-    template.hunks = Vec::new();
+    let mut template = base.clone();
     template.next_cursor = Some(page_cursor(
         request,
-        base,
         plan,
         context_lines,
         plan.hunks.len(),
@@ -1051,7 +995,8 @@ fn build_page(
     let base_empty = encoded_len(&template);
     let mut meter = PageMeter {
         base_empty,
-        completed: Vec::new(),
+        completed_bytes: 0,
+        completed_hunks: 0,
         current: None,
         max_bytes,
     };
@@ -1089,7 +1034,7 @@ fn build_page(
             continue;
         }
         if meter.current.is_none() {
-            meter.open_hunk(hunk_open_len(hunk)?);
+            meter.open_hunk(hunk_open_len(hunk));
             page.push(DiffHunk {
                 old_start: hunk.old_start,
                 old_count: hunk.old_count,
@@ -1172,15 +1117,7 @@ fn build_page(
         } else {
             offset = offset.saturating_add(part);
             complete = false;
-            next_cursor = Some(page_cursor(
-                request,
-                base,
-                plan,
-                context_lines,
-                hi,
-                li,
-                offset,
-            ));
+            next_cursor = Some(page_cursor(request, plan, context_lines, hi, li, offset));
             break 'outer;
         }
     }
@@ -1190,23 +1127,7 @@ fn build_page(
     if complete {
         next_cursor = None;
     } else if next_cursor.is_none() {
-        next_cursor = Some(page_cursor(
-            request,
-            base,
-            plan,
-            context_lines,
-            hi,
-            li,
-            offset,
-        ));
-    }
-    // Final safety net: the measured page plus any continuation cursor must
-    // never exceed the budget, even for an unusually long ToolRef.
-    let mut check = clone_base(base);
-    check.hunks = page.clone();
-    check.next_cursor = next_cursor.clone();
-    if encoded_len(&check) > max_bytes {
-        return Err(AgentError::InvalidArguments);
+        next_cursor = Some(page_cursor(request, plan, context_lines, hi, li, offset));
     }
     Ok((page, next_cursor, complete))
 }
@@ -1217,10 +1138,8 @@ fn remove_empty_tail(page: &mut Vec<DiffHunk>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn page_cursor(
     request: &ChangesDiffRequest,
-    _base: &DiffResult,
     plan: &DiffPlan,
     context_lines: usize,
     hunk_index: usize,
@@ -1230,7 +1149,6 @@ fn page_cursor(
     DiffCursor {
         session_id: request.session_id,
         change_ref: request.change_ref.clone(),
-        tool_ref: None,
         ops_fingerprint: plan.fingerprint.clone(),
         context_lines,
         hunk_index,
@@ -1239,7 +1157,7 @@ fn page_cursor(
     }
 }
 
-fn hunk_open_len(hunk: &HunkPlan) -> Result<usize, AgentError> {
+fn hunk_open_len(hunk: &HunkPlan) -> usize {
     let empty = DiffHunk {
         old_start: hunk.old_start,
         old_count: hunk.old_count,
@@ -1248,94 +1166,14 @@ fn hunk_open_len(hunk: &HunkPlan) -> Result<usize, AgentError> {
         lines: Vec::new(),
     };
     let encoded = encoded_len(&empty);
-    Ok(encoded.saturating_sub(2))
-}
-
-fn encoded_result(result: DiffResult, max_bytes: usize) -> Result<DiffResult, AgentError> {
-    if encoded_len(&result) > max_bytes {
-        Err(AgentError::InvalidArguments)
-    } else {
-        Ok(result)
-    }
+    encoded - 2
 }
 
 #[cfg(test)]
-pub(crate) struct DiffGate {
-    pub(crate) entered: tokio::sync::Notify,
-    released: std::sync::Mutex<bool>,
-    release: std::sync::Condvar,
-}
+pub(crate) static DIFF_GATES: crate::test_support::Registry<
+    String,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 #[cfg(test)]
-impl DiffGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            entered: tokio::sync::Notify::new(),
-            released: std::sync::Mutex::new(false),
-            release: std::sync::Condvar::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.entered.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_all();
-    }
-}
-
-#[cfg(test)]
-type DiffGateEntry = (String, Arc<DiffGate>);
-#[cfg(test)]
-static DIFF_GATES: std::sync::OnceLock<std::sync::Mutex<Vec<DiffGateEntry>>> =
-    std::sync::OnceLock::new();
-
-/// Registers a gate for the comparison of these exact bytes, so a parallel test
-/// comparing different content cannot consume it.
-#[cfg(test)]
-pub(crate) fn gate_next_diff(before: &[u8], after: &[u8], gate: Arc<DiffGate>) {
-    let key = comparison_key(before, after);
-    DIFF_GATES
-        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((key, gate));
-}
-
-#[cfg(test)]
-fn comparison_key(before: &[u8], after: &[u8]) -> String {
-    let mut bytes = Vec::with_capacity(before.len() + after.len() + 16);
-    bytes.extend_from_slice(&(before.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(before);
-    bytes.extend_from_slice(&(after.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(after);
-    crate::store::hash_bytes(&bytes)
-}
-
-/// Blocks one CPU comparison until its gate is released or the comparison is
-/// cancelled. It polls with a short timeout so a cancelled owner still stops it.
-#[cfg(test)]
-fn block_on_diff_gate(before: &[u8], after: &[u8], cancellation: &CancellationToken) {
-    let key = comparison_key(before, after);
-    let Some(gate) = DIFF_GATES.get().and_then(|mutex| {
-        let mut gates = mutex.lock().unwrap();
-        let position = gates.iter().position(|(candidate, _)| candidate == &key)?;
-        Some(gates.remove(position).1)
-    }) else {
-        return;
-    };
-    gate.entered.notify_one();
-    let mut released = gate.released.lock().unwrap();
-    while !*released && !cancellation.is_cancelled() {
-        let (guard, _) = gate
-            .release
-            .wait_timeout(released, Duration::from_millis(5))
-            .unwrap();
-        released = guard;
-    }
-}
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod tests;

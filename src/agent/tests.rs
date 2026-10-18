@@ -39,7 +39,6 @@ use crate::sessions::{
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
-    fail_next_append, fail_next_record_write,
 };
 use crate::tool_data::ToolData;
 use crate::tools::command::CommandOwners;
@@ -1927,7 +1926,7 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
     )
     .await;
     let blocked_info = create_session(&mut blocked_agent, &blocked_workspace).await;
-    fail_next_append(blocked_info.session_id);
+    crate::store::APPEND_FAILURES.arm(blocked_info.session_id, true);
     let blocked_turn = send_text(&mut blocked_agent, blocked_info.session_id, "block").await;
     let result = wait_text(&blocked_agent, blocked_turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
@@ -1973,7 +1972,7 @@ async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
         .load_record(info.session_id)
         .await
         .unwrap();
-    fail_next_record_write(info.session_id);
+    crate::store::RECORD_WRITE_FAILURES.arm(info.session_id, ());
 
     let result = agent
         .rename_session(RenameSession {
@@ -3706,7 +3705,7 @@ async fn post_turn_eligibility_excludes_failed_cancelled_disabled_and_unpersiste
         };
         let info = create_session(&mut agent, &workspace).await;
         if mode == "append_failed" {
-            fail_next_append(info.session_id);
+            crate::store::APPEND_FAILURES.arm(info.session_id, true);
         }
         let turn = send_text(&mut agent, info.session_id, "answer").await;
         if mode == "cancelled" {
@@ -4064,6 +4063,66 @@ async fn next_send_cleans_up_finished_turn_without_explicit_wait() {
 }
 
 #[tokio::test]
+async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
+    let (data_dir, _guard) = fixture_dir(&format!("append-rollback-{}", next_id()));
+    let (workspace, _guard) = workspace_file("append-rollback-ws", "a.txt", b"hello");
+    let model = FakeModel::new(
+        "main",
+        [ModelScript::Text("not saved"), ModelScript::Text("saved")],
+    );
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    crate::store::APPEND_FAILURES.arm(info.session_id, false);
+    let first = send_text(&mut agent, info.session_id, "rolled back").await;
+    let result = wait_text(&agent, first).await;
+    assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
+    assert_eq!(
+        agent
+            .history(GetHistory {
+                session_id: info.session_id,
+                offset: 0,
+                limit: 100
+            })
+            .unwrap()
+            .total,
+        0
+    );
+    assert!(
+        agent
+            .session_state(info.session_id)
+            .unwrap()
+            .block_reason
+            .is_none()
+    );
+    let second = send_text(&mut agent, info.session_id, "keep this").await;
+    let result = wait_text(&agent, second).await;
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+    let expected = result.report.appended.len();
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(
+        agent
+            .history(GetHistory {
+                session_id: info.session_id,
+                offset: 0,
+                limit: 100
+            })
+            .unwrap()
+            .total,
+        expected
+    );
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn append_failure_blocks_session_and_returns_failed_persistence() {
     let (data_dir, _guard) = fixture_dir(&format!("blocked-{}", next_id()));
     let (workspace, _guard) = workspace_file("blocked-ws", "a.txt", b"hello");
@@ -4075,7 +4134,7 @@ async fn append_failure_blocks_session_and_returns_failed_persistence() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    fail_next_append(info.session_id);
+    crate::store::APPEND_FAILURES.arm(info.session_id, true);
 
     let turn = send_text(&mut agent, info.session_id, "will fail").await;
     let result = wait_text(&agent, turn).await;
@@ -4123,7 +4182,7 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    fail_next_append(info.session_id);
+    crate::store::APPEND_FAILURES.arm(info.session_id, true);
 
     let turn = send_text(&mut agent, info.session_id, "first turn").await;
 
@@ -4203,7 +4262,7 @@ async fn close_and_reopen_recovers_from_blocked_session() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    fail_next_append(info.session_id);
+    crate::store::APPEND_FAILURES.arm(info.session_id, true);
     let turn = send_text(&mut agent, info.session_id, "fail").await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
@@ -4234,7 +4293,7 @@ async fn metadata_write_failure_does_not_fail_the_turn() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    fail_next_record_write(info.session_id);
+    crate::store::RECORD_WRITE_FAILURES.arm(info.session_id, ());
 
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let result = wait_text(&agent, turn).await;
@@ -4680,7 +4739,7 @@ async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
     // only supported mode) reaches the record write; the injected failure must
     // therefore surface as a Store error rather than an early settings
     // rejection.
-    fail_next_record_write(info.session_id);
+    crate::store::RECORD_WRITE_FAILURES.arm(info.session_id, ());
     let failed = agent
         .update_session(UpdateSession {
             session_id: info.session_id,
@@ -5568,7 +5627,7 @@ async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    fail_next_append(info.session_id);
+    crate::store::APPEND_FAILURES.arm(info.session_id, true);
     let turn = send_text(&mut agent, info.session_id, "block").await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
@@ -6372,6 +6431,59 @@ async fn immediate_send_after_completion_does_not_report_busy() {
 }
 
 #[tokio::test]
+async fn cancelled_open_does_not_publish_a_history_index() {
+    let (data_dir, _guard) = fixture_dir(&format!("cancel-open-{}", next_id()));
+    let (workspace, _guard) = workspace_file("cancel-open-ws", "a.txt", b"hello");
+    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "saved").await;
+    wait_text(&agent, turn).await;
+    agent.close_session(info.session_id).await.unwrap();
+
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::store::SESSION_LOAD_GATES.arm(info.session_id, Arc::clone(&gate));
+    let mut opening = Box::pin(agent.open_session(info.session_id));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut opening => panic!("open completed before the gate: {result:?}"),
+            _ = gate.wait_started() => {}
+        }
+    })
+    .await
+    .unwrap();
+    drop(opening);
+    assert!(matches!(
+        agent.session_state(info.session_id),
+        Err(AgentError::SessionNotLoaded)
+    ));
+
+    let history = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("history.jsonl");
+    let mut bytes = std::fs::read(&history).unwrap();
+    bytes.insert(0, b' ');
+    std::fs::write(&history, &bytes).unwrap();
+    let page = agent
+        .read_session(ReadSession {
+            view: crate::read::ReadView::Canonical,
+            ..display_read(info.session_id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.history_revision, crate::store::hash_bytes(&bytes));
+    assert_eq!(page.captured_end, bytes.len() as u64);
+    agent.open_session(info.session_id).await.unwrap();
+    agent.close_session(info.session_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
     let (data_dir, _guard) = fixture_dir(&format!("ws-identity-{}", next_id()));
     let (workspace, _guard) = workspace_file("ws-identity-ws", "a.txt", b"hello");
@@ -6383,6 +6495,8 @@ async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
+    let turn = send_text(&mut agent, info.session_id, "persist before close").await;
+    wait_text(&agent, turn).await;
     agent.close_session(info.session_id).await.unwrap();
 
     // Deleting the workspace makes reopen fail cleanly instead of running
@@ -6392,6 +6506,24 @@ async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
         agent.open_session(info.session_id).await,
         Err(AgentError::Workspace)
     ));
+
+    // Failed open must release its index; an unloaded read observes disk afresh.
+    let history = data_dir
+        .join("sessions")
+        .join(info.session_id.to_string())
+        .join("history.jsonl");
+    let mut bytes = std::fs::read(&history).unwrap();
+    bytes.insert(0, b' ');
+    std::fs::write(&history, &bytes).unwrap();
+    let page = agent
+        .read_session(ReadSession {
+            view: crate::read::ReadView::Canonical,
+            ..display_read(info.session_id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.history_revision, crate::store::hash_bytes(&bytes));
+    assert_eq!(page.captured_end, bytes.len() as u64);
 }
 
 #[cfg(unix)]
@@ -7846,9 +7978,9 @@ async fn emergency_settlement_failure_is_observable_and_preserves_old_projection
         .await;
         let info = create_session(&mut agent, &workspace).await;
         if unknown {
-            crate::store::force_unknown_summary_write(info.session_id);
+            crate::store::SUMMARY_UNKNOWN_WRITES.arm(info.session_id, ());
         } else {
-            crate::store::fail_next_summary_write(info.session_id);
+            crate::store::SUMMARY_WRITE_FAILURES.arm(info.session_id, ());
         }
         let turn = send_text(&mut agent, info.session_id, "read a").await;
         let result = wait_text(&agent, turn).await;
@@ -10312,7 +10444,7 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    fail_next_append(info.session_id);
+    crate::store::APPEND_FAILURES.arm(info.session_id, true);
 
     let workflow = AssertUnwindSafe(async {
         let turn = send_text(&mut agent, info.session_id, "run tools").await;
@@ -10380,7 +10512,17 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
             })
             .expect("the Bash ToolRef is present")
             .clone();
-        let bash = read_tool(&agent, bash_ref.clone()).await;
+        let bash = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let record = read_tool(&agent, bash_ref.clone()).await;
+                if record.execution.recording != ToolRecordingState::MemoryOnly {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("auxiliary persistence did not finish");
         assert_eq!(bash.execution.state, ToolExecutionState::Succeeded);
         assert_eq!(bash.execution.recording, ToolRecordingState::Saved);
         let command = bash.execution.command.as_ref().expect("a command record");
@@ -10701,7 +10843,7 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
     let info = create_session(&mut agent, &workspace).await;
 
     // Inject auxiliary write failure on this session
-    crate::store::fail_next_aux_write(info.session_id);
+    crate::store::AUX_WRITE_FAILURES.arm(info.session_id, ());
 
     let turn = send_text(&mut agent, info.session_id, "run with aux failure").await;
     let result = wait_text(&agent, turn).await;
@@ -10798,6 +10940,12 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
 
     let turn = send_text(&mut agent, info.session_id, "run with aux success").await;
     let result = wait_text(&agent, turn).await;
+    agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .cleanup_finished()
+        .await
+        .unwrap();
 
     assert_eq!(
         result.report.outcome,
@@ -10878,28 +11026,39 @@ async fn session_close_while_aux_write_held_still_joins_owned_worker() {
     .await;
     let info = create_session(&mut agent, &workspace).await;
 
-    let gate = Arc::new(crate::store::AuxCommitGate::new());
-    crate::store::register_aux_commit_gate(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::store::AUX_COMMIT_GATES.arm(info.session_id, Arc::clone(&gate));
 
-    let _turn = send_text(&mut agent, info.session_id, "run with aux notify").await;
+    let turn = send_text(&mut agent, info.session_id, "run with aux notify").await;
 
     // 1. Prove that execution has reached the aux write phase under lock
-    gate.entered.notified().await;
+    gate.wait_started().await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait_text(&agent, turn))
+        .await
+        .expect("turn completion must not wait for auxiliary persistence");
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
 
     // 2. Poll close session while aux write is held: must remain pending on owned worker join
+    let store = agent.store_handle();
     let close_task = tokio::spawn(async move { agent.close_session(info.session_id).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         !close_task.is_finished(),
         "close must be waiting for active loop worker"
     );
+    assert!(store.has_history_index(info.session_id));
 
     // 3. Release gate to let aux write complete
-    gate.release.notify_one();
+    gate.release();
 
     // 4. Worker joins cleanly and close completes
     let close_res = close_task.await.unwrap();
     assert!(close_res.is_ok());
+    assert!(!store.has_history_index(info.session_id));
 }
 
 #[tokio::test]
@@ -11008,6 +11167,12 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     let result = wait_text(&agent, turn).await;
+    agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .cleanup_finished()
+        .await
+        .unwrap();
     assert_eq!(
         result.persistence,
         crate::sessions::TurnPersistence::Persisted
@@ -11277,7 +11442,7 @@ async fn cold_read_missing_aux_or_unknown_tool_maps_to_tool_not_found() {
 #[cfg(unix)]
 #[tokio::test]
 async fn warm_record_served_immediately_without_disk_or_gate() {
-    use crate::read::{ToolReadGate, gate_next_tool_read};
+    use crate::read::TOOL_READ_GATES;
     use crate::tool_data::{ToolDataStream, ToolExecutionState};
     use base64::Engine;
 
@@ -11302,6 +11467,12 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
+    agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .cleanup_finished()
+        .await
+        .unwrap();
 
     let tool_refs = agent
         .loaded_session(info.session_id)
@@ -11311,8 +11482,8 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     let tool_ref = tool_refs[0].clone();
 
     // 1. Install a gate on the cold path for this tool_ref.
-    let gate = Arc::new(ToolReadGate::new());
-    gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    TOOL_READ_GATES.arm(tool_ref.clone(), Arc::clone(&gate));
 
     // 2. Corrupt disk record to ensure disk read would fail if attempted
     let hash = crate::store::tool_ref_hash(&tool_ref);
@@ -11384,6 +11555,12 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
+    agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .cleanup_finished()
+        .await
+        .unwrap();
 
     let session = agent.loaded_session(info.session_id).unwrap();
     let tool_refs = session
@@ -11477,6 +11654,12 @@ async fn both_sources_unavailable_preserves_known_offsets() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
+    agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .cleanup_finished()
+        .await
+        .unwrap();
 
     let session = agent.loaded_session(info.session_id).unwrap();
     let tool_refs = session
@@ -11766,7 +11949,7 @@ async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_doe
         .await;
         let info = create_session(&mut agent, &workspace).await;
         if fail {
-            fail_next_append(info.session_id);
+            crate::store::APPEND_FAILURES.arm(info.session_id, true);
         }
         let turn = send_text(&mut agent, info.session_id, "opaque-only response").await;
         let result = wait_text(&agent, turn).await;
@@ -12967,7 +13150,7 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
         .join(id.to_string())
         .join("history.jsonl");
     let original = std::fs::read(&history).unwrap();
-    fail_next_append(id);
+    crate::store::APPEND_FAILURES.arm(id, false);
     let turn = send_text(&mut agent, id, "must not promote unpersisted input").await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
@@ -12987,7 +13170,7 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
             .join("summary.json")
             .exists()
     );
-    assert!(agent.session_state(id).unwrap().block_reason.is_some());
+    assert!(agent.session_state(id).unwrap().block_reason.is_none());
 }
 
 #[tokio::test]
@@ -13005,9 +13188,9 @@ async fn settled_projection_write_failures_qualify_threshold_result_without_eras
             .join("history.jsonl");
         let prefix = std::fs::read(&history).unwrap();
         if unknown {
-            crate::store::force_unknown_summary_write(id);
+            crate::store::SUMMARY_UNKNOWN_WRITES.arm(id, ());
         } else {
-            crate::store::fail_next_summary_write(id);
+            crate::store::SUMMARY_WRITE_FAILURES.arm(id, ());
         }
         let turn = send_text(&mut agent, id, "user survives settlement failure").await;
         let result = wait_text(&agent, turn).await;
@@ -13054,8 +13237,8 @@ async fn settled_projection_close_race_rejects_snapshot_without_losing_persisted
     )
     .await;
     let session = agent.loaded_session(id).unwrap().clone();
-    let gate = Arc::new(crate::store::SummaryCommitGate::new());
-    crate::store::gate_next_summary_commit(id, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::store::SUMMARY_COMMIT_GATES.arm(id, Arc::clone(&gate));
     let _turn = send_text(&mut agent, id, "persist this user despite close race").await;
     gate.wait_started().await;
     {

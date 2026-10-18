@@ -25,16 +25,6 @@ thread_local! {
     static TOOL_RESULT_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(test)]
-fn reset_tool_result_scan_count() {
-    TOOL_RESULT_SCAN_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-fn tool_result_scan_count() -> usize {
-    TOOL_RESULT_SCAN_COUNT.with(Cell::get)
-}
-
 /// Public/prose normalization strips opaque provider replay and legacy opaque
 /// reasoning. Durable normalization uses the same canonical cleanup while
 /// retaining validated replay in the existing history pipeline.

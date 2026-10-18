@@ -12,10 +12,13 @@ async fn shutdown_broadcasts_to_all_sessions_before_waiting_for_any_worker() {
         read_profile(),
     )
     .await;
+    let store = agent.store_handle();
+    let mut ids = Vec::new();
     let mut cancellations = Vec::new();
     let mut gates = Vec::new();
     for _ in 0..2 {
         let info = create_session(&mut agent, workspace.path()).await;
+        ids.push(info.session_id);
         let gate = Arc::new(Gate::new());
         PAUSE_BEFORE_JOIN.arm(info.session_id, gate.clone());
         send_text(&mut agent, info.session_id, "hold completion").await;
@@ -42,6 +45,8 @@ async fn shutdown_broadcasts_to_all_sessions_before_waiting_for_any_worker() {
             .await
             .is_err()
     );
+    assert!(ids.iter().all(|id| store.has_history_index(*id)));
     gates[0].release();
     assert!(shutdown.await.unwrap().is_ok());
+    assert!(ids.iter().all(|id| !store.has_history_index(*id)));
 }

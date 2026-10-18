@@ -421,6 +421,73 @@ async fn failed_preparations_release_reservations_without_installing_candidates(
 }
 
 #[tokio::test]
+async fn deferred_open_publishes_its_index_only_when_installed() {
+    for mode in ["abort", "discard", "install"] {
+        let (mut agent, _base, workspace) = reload_agent().await;
+        let session = create(&mut agent, &workspace).await;
+        let id = session.session_id;
+        let store = agent.store_handle();
+        assert!(store.has_history_index(id));
+        let turn = agent
+            .send(crate::SendMessage {
+                session_id: id,
+                text: "saved history".into(),
+            })
+            .await
+            .unwrap();
+        agent.wait_turn(turn).await.unwrap();
+        agent.close_session(id).await.unwrap();
+        assert!(!store.has_history_index(id));
+        let (mut server, mut output) = server(agent);
+        let gate = Arc::new(Gate::new());
+        if mode == "abort" {
+            crate::store::SESSION_LOAD_GATES.arm(id, gate.clone());
+        }
+        assert!(matches!(
+            server.dispatch(request("session.open", json!({"session_id":id}))),
+            Dispatch::Deferred
+        ));
+        if mode == "abort" {
+            tokio::time::timeout(TIMEOUT, gate.wait_started())
+                .await
+                .unwrap();
+            assert!(!store.has_history_index(id));
+            server.operations.abort_all();
+            assert!(
+                matches!(server.operations.join_next().await.unwrap(), Err(error) if error.is_cancelled())
+            );
+        } else {
+            let prepared = tokio::time::timeout(TIMEOUT, server.operations.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!store.has_history_index(id));
+            assert!(server.agent().loaded_session(id).is_none());
+            if mode == "install" {
+                server.complete_operation(prepared).await.unwrap();
+                let response = serde_json::to_value(output.recv().await.unwrap()).unwrap();
+                assert_eq!(response["result"]["session"]["loaded"], true);
+                assert!(store.has_history_index(id));
+                assert!(matches!(
+                    server.dispatch(request("session.close", json!({"session_id":id}))),
+                    Dispatch::Deferred
+                ));
+                assert_eq!(
+                    complete(&mut server, &mut output).await["result"],
+                    json!({"ok":true})
+                );
+            } else {
+                drop(prepared);
+            }
+        }
+        assert!(!store.has_history_index(id));
+        server.agent.take().unwrap().shutdown().await.unwrap();
+        assert!(!store.has_history_index(id));
+    }
+}
+
+#[tokio::test]
 async fn shutdown_drains_pending_open_create_and_reload_before_its_response() {
     for method in ["session.open", "session.create", "agent.reload"] {
         let (mut agent, base, workspace) = reload_agent().await;
@@ -431,6 +498,9 @@ async fn shutdown_drains_pending_open_create_and_reload_before_its_response() {
             .query_cancellation();
         let target = create(&mut agent, &workspace).await;
         agent.close_session(target.session_id).await.unwrap();
+        let store = agent.store_handle();
+        assert!(store.has_history_index(witness.session_id));
+        assert!(!store.has_history_index(target.session_id));
         write_config(base.path(), 1);
         let params = match method {
             "session.open" => json!({"session_id":target.session_id}),
@@ -439,7 +509,11 @@ async fn shutdown_drains_pending_open_create_and_reload_before_its_response() {
         };
         let mut harness = RpcHarness::spawn(agent);
         let gate = Arc::new(Gate::new());
-        OPERATION_GATES.arm(base.path().join("data"), gate.clone());
+        if method == "session.open" {
+            crate::store::SESSION_LOAD_GATES.arm(target.session_id, gate.clone());
+        } else {
+            OPERATION_GATES.arm(base.path().join("data"), gate.clone());
+        }
         harness.send(json!("held"), method, Some(params)).await;
         tokio::time::timeout(TIMEOUT, gate.wait_started())
             .await
@@ -450,14 +524,10 @@ async fn shutdown_drains_pending_open_create_and_reload_before_its_response() {
         tokio::time::timeout(TIMEOUT, closed.cancelled())
             .await
             .unwrap();
+        assert!(!store.has_history_index(target.session_id));
         gate.release();
-        assert!(
-            harness
-                .response(json!("held"))
-                .await
-                .get("result")
-                .is_some()
-        );
+        let held = harness.response(json!("held")).await;
+        assert!(held.get("result").is_some());
         assert_eq!(
             harness.response(json!("shutdown")).await["result"],
             json!({"ok":true})
@@ -471,6 +541,11 @@ async fn shutdown_drains_pending_open_create_and_reload_before_its_response() {
             .collect();
         assert_eq!(ids, vec![&json!("held"), &json!("shutdown")]);
         assert_eq!(harness.observed.last().unwrap()["id"], "shutdown");
+        assert!(!store.has_history_index(witness.session_id));
+        assert!(!store.has_history_index(target.session_id));
+        if let Some(id) = held.pointer("/result/session/session_id") {
+            assert!(!store.has_history_index(id.as_str().unwrap().parse().unwrap()));
+        }
     }
 }
 

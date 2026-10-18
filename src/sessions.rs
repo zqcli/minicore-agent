@@ -225,6 +225,7 @@ impl Sessions {
 
     pub(crate) fn remove(&mut self, session_id: SessionId) -> Option<Session> {
         let session = self.loaded.remove(&session_id)?;
+        session.shared.store.unload_history(session_id);
         // Workspace queries are owned by the loaded Session; closing it stops
         // them instead of reading a Workspace whose Session is gone.
         session.cancel_queries();
@@ -245,7 +246,9 @@ impl Sessions {
             ids.iter().map(|id| self.loaded[id].clone().join_shutdown()),
         )
         .await;
-        self.loaded.clear();
+        for id in ids {
+            self.remove(id);
+        }
         results.into_iter().collect()
     }
 }
@@ -564,6 +567,7 @@ impl Session {
             record,
             history,
             user_times,
+            history_index: _,
         } = stored;
         let crate::agent::SessionSetup {
             parts,
@@ -1586,6 +1590,11 @@ async fn run_active_loop(
             .await
         {
             Ok(()) => {
+                let history = Arc::clone(&session.shared.inner.lock().unwrap().history);
+                let mut merged = Vec::with_capacity(history.len() + sanitized.len());
+                merged.extend(history.iter().cloned());
+                merged.extend(sanitized.iter().cloned());
+                let merged = merged.into();
                 {
                     let mut inner = session.shared.inner.lock().unwrap();
                     // Persisted user timestamps align by (loop_id, occurrence).
@@ -1604,10 +1613,7 @@ async fn run_active_loop(
                             occurrence += 1;
                         }
                     }
-                    let mut merged = Vec::with_capacity(inner.history.len() + sanitized.len());
-                    merged.extend(inner.history.iter().cloned());
-                    merged.extend(sanitized.iter().cloned());
-                    inner.history = merged.into();
+                    inner.history = merged;
                     inner.blocked = None;
                 }
                 session.presentation().clear_user_times();
@@ -1621,9 +1627,10 @@ async fn run_active_loop(
                     error_kind = error.kind(),
                     "history.jsonl append failed"
                 );
-                let mut inner = session.shared.inner.lock().unwrap();
-                inner.blocked = Some(SessionBlockReason::Persistence);
-                drop(inner);
+                if matches!(error, crate::store::AppendError::Unknown) {
+                    session.shared.inner.lock().unwrap().blocked =
+                        Some(SessionBlockReason::Persistence);
+                }
                 TurnPersistence::Failed
             }
         }
@@ -1660,12 +1667,6 @@ async fn run_active_loop(
         persistence,
     });
 
-    // Best-effort auxiliary tool persistence: save native tool facts and
-    // streams to the store's auxiliary directory before publishing turn completion.
-    // Failure is logged as a warning; it does not change TurnResult persistence
-    // or ToolOutcome, does not retry the loop, and does not touch history.jsonl.
-    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
-
     // Own the join slot before reserving. Reservation excludes the next
     // submit and close captures its cancellation owner under the same lock.
     // There is no await between completion publication and handle installation.
@@ -1697,6 +1698,9 @@ async fn run_active_loop(
         }
     }
     drop(join_slot);
+
+    // Remain in the owned task so close/shutdown still join auxiliary writes.
+    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
 
     session.shared.events.try_send(AgentEvent::TurnFinished {
         turn,

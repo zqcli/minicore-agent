@@ -38,17 +38,13 @@ use minicore_runtime::model::{
 };
 
 use crate::agent::Agent;
-use crate::changes::{ChangeListGate, gate_next_change_list};
+use crate::changes::CHANGE_LIST_GATES;
 use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
-use crate::read::{ToolReadGate, gate_next_tool_read};
+use crate::read::TOOL_READ_GATES;
 use crate::sessions::PAUSE_AFTER_COMPACTION_RESULT;
-use crate::store::{
-    SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
-    force_unknown_summary_write, gate_next_summary_commit,
-};
 use crate::workspace::query::READ_GATES;
 use crate::workspace::scan::{ScanHold, hold_next_scan};
 
@@ -1088,7 +1084,7 @@ async fn session_rename_write_failure_does_not_change_loaded_state() {
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
-    fail_next_record_write(typed_id);
+    crate::store::RECORD_WRITE_FAILURES.arm(typed_id, ());
 
     harness
         .send(
@@ -1189,7 +1185,7 @@ async fn session_rename_is_allowed_for_a_blocked_session() {
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
-    fail_next_append(typed_id);
+    crate::store::APPEND_FAILURES.arm(typed_id, true);
 
     harness
         .send(
@@ -2156,9 +2152,9 @@ async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
     let _ = harness.response(json!("wait")).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
-    let gate = Arc::new(SummaryCommitGate::new());
+    let gate = Arc::new(crate::test_support::Gate::new());
     let typed_session_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
-    gate_next_summary_commit(typed_session_id, Arc::clone(&gate));
+    crate::store::SUMMARY_COMMIT_GATES.arm(typed_session_id, Arc::clone(&gate));
     harness
         .send(
             json!("compact"),
@@ -2495,7 +2491,7 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
     .await;
     let mut blocked = RpcHarness::spawn(agent);
     let blocked_id = create_and_open(&mut blocked, &workspace2).await;
-    fail_next_append(blocked_id.as_str().unwrap().parse().unwrap());
+    crate::store::APPEND_FAILURES.arm(blocked_id.as_str().unwrap().parse().unwrap(), true);
     blocked
         .send(
             json!("send"),
@@ -2817,7 +2813,7 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
     append_compaction_tail(&mut harness, &base, &session_id).await;
     let history_before = std::fs::read(&history_path).unwrap();
     let typed_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
-    fail_next_summary_write(typed_id);
+    crate::store::SUMMARY_WRITE_FAILURES.arm(typed_id, ());
 
     harness
         .send(
@@ -2962,7 +2958,7 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
         .await;
     let _ = harness.response(json!("wait")).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
-    force_unknown_summary_write(session_id.as_str().unwrap().parse().unwrap());
+    crate::store::SUMMARY_UNKNOWN_WRITES.arm(session_id.as_str().unwrap().parse().unwrap(), ());
     harness
         .send(
             json!("compact"),
@@ -3032,8 +3028,8 @@ async fn manual_compaction_revalidates_history_before_commit() {
         .position(|byte| *byte == b'\n')
         .expect("settled history has one complete line");
     let first_line = history_before[..=newline].to_vec();
-    let gate = Arc::new(SummaryCommitGate::new());
-    gate_next_summary_commit(
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::store::SUMMARY_COMMIT_GATES.arm(
         session_id.as_str().unwrap().parse().unwrap(),
         Arc::clone(&gate),
     );
@@ -3104,8 +3100,8 @@ async fn manual_compaction_deadline_covers_commit_wait() {
     let _ = harness.response(json!("wait")).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
-    let gate = Arc::new(SummaryCommitGate::new());
-    gate_next_summary_commit(
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::store::SUMMARY_COMMIT_GATES.arm(
         session_id.as_str().unwrap().parse().unwrap(),
         Arc::clone(&gate),
     );
@@ -3350,7 +3346,7 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
     .await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
-    fail_next_append(session_id.as_str().unwrap().parse().unwrap());
+    crate::store::APPEND_FAILURES.arm(session_id.as_str().unwrap().parse().unwrap(), true);
 
     harness
         .send(
@@ -3405,7 +3401,7 @@ async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
     .await;
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
-    fail_next_append(session_id.as_str().unwrap().parse().unwrap());
+    crate::store::APPEND_FAILURES.arm(session_id.as_str().unwrap().parse().unwrap(), true);
 
     // 1. send first turn
     harness
@@ -4756,7 +4752,7 @@ async fn turn_result_reads_failed_live_report_without_history() {
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
     let typed_session_id: SessionId = session_id.as_str().unwrap().parse().unwrap();
-    fail_next_append(typed_session_id);
+    crate::store::APPEND_FAILURES.arm(typed_session_id, true);
 
     harness
         .send(
@@ -5239,7 +5235,7 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
             crate::compaction::auto::minimal_messages(&system, &[candidate.as_str()])
                 .and_then(|messages| {
                     crate::compaction::auto::estimate_tokens_with_budget(
-                        &crate::models::DefaultProviderBudget,
+                        &crate::models::tests::DefaultProviderBudget,
                         messages,
                         &[],
                         ReasoningPreference::Auto,
@@ -6434,8 +6430,11 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
 
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
-        let gate = Arc::new(crate::diff::DiffGate::new());
-        crate::diff::gate_next_diff(b"user\n", b"agent\n", Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        crate::diff::DIFF_GATES.arm(
+            crate::diff::tests::comparison_key(b"user\n", b"agent\n"),
+            Arc::clone(&gate),
+        );
         gates.push(gate);
         harness
             .send(
@@ -6496,8 +6495,8 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
 
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
-        let gate = Arc::new(ChangeListGate::new());
-        gate_next_change_list(session_val, Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        CHANGE_LIST_GATES.arm(session_val, Arc::clone(&gate));
         gates.push(gate);
         harness
             .send(
@@ -6591,8 +6590,8 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     // Hold every query slot with gated (already admitted) tool-change queries.
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
-        let gate = Arc::new(ChangeListGate::new());
-        gate_next_change_list(session_val, Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        CHANGE_LIST_GATES.arm(session_val, Arc::clone(&gate));
         gates.push(gate);
         harness
             .send(
@@ -6728,8 +6727,8 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
     .expect("gated model request did not start");
 
     // One held changes.list query + one parked turn.wait per remaining slot.
-    let held_gate = Arc::new(ChangeListGate::new());
-    gate_next_change_list(session_val, Arc::clone(&held_gate));
+    let held_gate = Arc::new(crate::test_support::Gate::new());
+    CHANGE_LIST_GATES.arm(session_val, Arc::clone(&held_gate));
     harness
         .send(
             json!("cl-held"),
@@ -6801,8 +6800,8 @@ async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
     let session = create_and_open(&mut harness, &workspace).await;
     let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
 
-    let gate = Arc::new(ChangeListGate::new());
-    gate_next_change_list(session_val, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    CHANGE_LIST_GATES.arm(session_val, Arc::clone(&gate));
     harness
         .send(
             json!("cl-pending"),
@@ -6927,8 +6926,8 @@ async fn tool_read_deferred_query_capacity_ceiling_and_ping_availability() {
             request_index: index as u32,
             tool_call_id: minicore_runtime::ToolCallId::new(format!("gate-call-{index}")).unwrap(),
         };
-        let gate = Arc::new(ToolReadGate::new());
-        gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        TOOL_READ_GATES.arm(tool_ref.clone(), Arc::clone(&gate));
         gates.push(gate);
         refs.push(tool_ref.clone());
 
@@ -7025,8 +7024,8 @@ async fn tool_read_deferred_query_shutdown_cancels_within_deadline() {
         request_index: 0,
         tool_call_id: minicore_runtime::ToolCallId::new("gate-shutdown-call").unwrap(),
     };
-    let gate = Arc::new(ToolReadGate::new());
-    gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    TOOL_READ_GATES.arm(tool_ref.clone(), Arc::clone(&gate));
 
     harness
         .send(
@@ -7074,8 +7073,8 @@ async fn tool_output_deferred_query_shutdown_cancellation_cleans_up() {
         request_index: 0,
         tool_call_id: minicore_runtime::ToolCallId::new("gate-output-call").unwrap(),
     };
-    let gate = Arc::new(ToolReadGate::new());
-    gate_next_tool_read(tool_ref.clone(), Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    TOOL_READ_GATES.arm(tool_ref.clone(), Arc::clone(&gate));
 
     harness
         .send(

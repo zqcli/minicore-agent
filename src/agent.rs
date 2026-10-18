@@ -789,6 +789,7 @@ impl Agent {
                 crate::store::StoredSession {
                     record,
                     history: Vec::new().into(),
+                    history_index: Vec::new(),
                     user_times: Default::default(),
                 },
                 workspace,
@@ -1200,7 +1201,7 @@ impl Agent {
 
     pub(crate) fn install_session(
         &mut self,
-        stored: crate::store::StoredSession,
+        mut stored: crate::store::StoredSession,
         workspace: Arc<Workspace>,
         setup: SessionSetup,
     ) -> SessionInfo {
@@ -1214,6 +1215,7 @@ impl Agent {
             .models
             .physical_context_window(&record.model)
             .expect("validated model");
+        let history_index = std::mem::take(&mut stored.history_index);
         let session = crate::sessions::Session::new(
             stored,
             workspace,
@@ -1231,6 +1233,7 @@ impl Agent {
             physical_window,
         );
         let info = session.info(true);
+        self.store.install_history_index(session_id, history_index);
         self.sessions.insert(session_id, session);
         self.event_sink.try_send(AgentEvent::SessionOpened {
             session: info.clone(),
