@@ -5315,8 +5315,12 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
     let (_directory, store, id) = fixture("indexed-large-history").await;
     store.create_session(&record(id)).await.unwrap();
     store.install_history_index(id, Vec::new());
-    let text = "x".repeat(64 * 1024);
-    let mut entry = loop_record_with_users(&[text.as_str(); 64]);
+    // Scan limits are parameters: 17 records exceed a 16-line cold scan limit
+    // just as production histories exceed the 64 MiB / 100,000-line defaults.
+    const USERS: usize = 4;
+    const COLD_LINES: usize = 16;
+    let text = "x".repeat(4 * 1024);
+    let mut entry = loop_record_with_users(&[text.as_str(); USERS]);
     for _ in 0..17 {
         entry.loop_id = LoopId::new().unwrap();
         for item in &mut entry.items {
@@ -5329,25 +5333,24 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
     let page = store
         .read_history_page(
             id,
-            16 * 64,
+            16 * USERS,
             1,
-            Some(17 * 64),
+            Some(17 * USERS),
             None,
             None,
-            Some(16 * 64),
-            &history_limits(8 * 1024 * 1024, 1),
+            Some(16 * USERS),
+            &history_limits(64 * 1024, 1),
         )
         .await
         .unwrap();
-    assert!(page.captured_end > 64 * 1024 * 1024);
     assert_eq!(page.scanned_lines, 1);
-    assert_eq!(page.total_items, 17 * 64);
+    assert_eq!(page.total_items, 17 * USERS);
     assert_eq!(page.items, entry.items[..1]);
     assert_eq!(page.covered_usage.loop_count, 16);
     index_history(&store, id).await;
     assert_eq!(
         store
-            .read_loop_record(id, entry.loop_id, &history_limits(8 * 1024 * 1024, 1))
+            .read_loop_record(id, entry.loop_id, &history_limits(64 * 1024, 1))
             .await
             .unwrap()
             .unwrap()
@@ -5360,13 +5363,13 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
         store
             .read_history_page(
                 id,
-                16 * 64,
+                16 * USERS,
                 1,
                 None,
                 None,
                 None,
                 None,
-                &history_limits(64 * 1024 * 1024, 100_000)
+                &history_limits(64 * 1024 * 1024, COLD_LINES)
             )
             .await,
         Err(StoreError::QueryLimit)
@@ -5374,13 +5377,13 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
     let cold = store
         .read_history_page(
             id,
-            16 * 64,
+            16 * USERS,
             1,
             None,
             Some(page.captured_end),
             Some(&page.revision),
-            Some(16 * 64),
-            &history_limits(128 * 1024 * 1024, 100_000),
+            Some(16 * USERS),
+            &history_limits(64 * 1024 * 1024, 100_000),
         )
         .await
         .unwrap();
