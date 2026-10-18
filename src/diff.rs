@@ -632,7 +632,7 @@ pub(crate) async fn resolve_tool_change(
     }
     // An incomplete scan cannot prove the reference is absent. Reporting
     // `ToolNotFound` here would be a false negative.
-    if !scan.complete || scan.skipped {
+    if scan.skipped {
         return Err(AgentError::Store);
     }
     Ok(None)

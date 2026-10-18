@@ -2,71 +2,15 @@
 use super::*;
 
 #[cfg(test)]
-static AUX_BLOB_WRITE_FAILURES: OnceLock<Mutex<Vec<(SessionId, usize)>>> = OnceLock::new();
+pub(crate) static AUX_BLOB_WRITE_FAILURES: crate::test_support::Registry<SessionId, usize> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-type AuxTempCreationGateEntry = (SessionId, Arc<AuxCommitGate>);
-#[cfg(test)]
-static AUX_TEMP_CREATION_GATES: OnceLock<Mutex<Vec<AuxTempCreationGateEntry>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn fail_aux_blob_write_after(session_id: SessionId, successful_writes: usize) {
-    AUX_BLOB_WRITE_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, successful_writes));
-}
-
-#[cfg(test)]
-fn should_fail_aux_blob_write(session_id: SessionId) -> bool {
-    let Some(mutex) = AUX_BLOB_WRITE_FAILURES.get() else {
-        return false;
-    };
-    let mut failures = mutex.lock().unwrap();
-    let Some(pos) = failures.iter().position(|(item, _)| *item == session_id) else {
-        return false;
-    };
-    if failures[pos].1 == 0 {
-        failures.remove(pos);
-        true
-    } else {
-        failures[pos].1 -= 1;
-        false
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn register_aux_temp_creation_gate(session_id: SessionId, gate: Arc<AuxCommitGate>) {
-    AUX_TEMP_CREATION_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, gate));
-}
-
-#[cfg(test)]
-async fn wait_aux_temp_creation_gate(session_id: SessionId) {
-    let Some(mutex) = AUX_TEMP_CREATION_GATES.get() else {
-        return;
-    };
-    let gate = {
-        let mut entries = mutex.lock().unwrap();
-        let Some(pos) = entries.iter().position(|(item, _)| *item == session_id) else {
-            return;
-        };
-        entries.remove(pos).1
-    };
-    gate.entered.notify_one();
-    gate.release.notified().await;
-}
+pub(crate) static AUX_TEMP_CREATION_GATES: crate::test_support::Registry<
+    SessionId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 impl Store {
-    #[cfg(test)]
-    pub(crate) fn with_aux_limits(mut self, limits: AuxLimits) -> Self {
-        self.aux_limits = Some(limits);
-        self
-    }
-
     fn aux_limits(&self) -> AuxLimits {
         #[cfg(test)]
         if let Some(limits) = self.aux_limits {
@@ -75,71 +19,19 @@ impl Store {
         DEFAULT_AUX_LIMITS
     }
 
-    /// Atomically persists one completed tool call's metadata and retained
-    /// raw stream windows to the auxiliary directory.
-    #[cfg(test)]
-    pub(crate) async fn commit_tool_record(
+    pub(super) async fn commit_tool_record_locked(
         &self,
         snapshot: &ToolPersistenceSnapshot,
         deadline: Instant,
+        ledger: &mut Option<AuxLedger>,
     ) -> Result<(), StoreError> {
-        #[cfg(test)]
-        if should_fail_aux_write(snapshot.tool_ref.session_id) {
-            return Err(StoreError::Unavailable);
-        }
-        let _guard = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await {
-            Ok(guard) => guard,
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-        self.commit_tool_record_locked(snapshot, deadline).await
-    }
-
-    async fn commit_tool_record_locked(
-        &self,
-        snapshot: &ToolPersistenceSnapshot,
-        deadline: Instant,
-    ) -> Result<(), StoreError> {
-        if Instant::now() >= deadline {
-            return Err(StoreError::Unavailable);
-        }
+        check_aux_deadline(deadline)?;
         validate_stored_tool_record(&snapshot.record, &snapshot.tool_ref)?;
 
-        let input_len = snapshot.input_bytes.as_ref().map_or(0, |b| b.len());
-        let result_len = snapshot.result_bytes.as_ref().map_or(0, |b| b.len());
-        let stdout_len = snapshot.stdout_bytes.as_ref().map_or(0, |b| b.len());
-        let stderr_len = snapshot.stderr_bytes.as_ref().map_or(0, |b| b.len());
-        let before_len = snapshot
-            .file_change_before
-            .as_ref()
-            .map_or(0, |bytes| bytes.len());
-        let after_len = snapshot
-            .file_change_after
-            .as_ref()
-            .map_or(0, |bytes| bytes.len());
-
-        let streams = [
-            (
-                snapshot.input_bytes.as_deref(),
-                snapshot.record.input.file_bytes,
-                snapshot.record.input.file_sha256.as_deref(),
-            ),
-            (
-                snapshot.result_bytes.as_deref(),
-                snapshot.record.result.file_bytes,
-                snapshot.record.result.file_sha256.as_deref(),
-            ),
-            (
-                snapshot.stdout_bytes.as_deref(),
-                snapshot.record.stdout.file_bytes,
-                snapshot.record.stdout.file_sha256.as_deref(),
-            ),
-            (
-                snapshot.stderr_bytes.as_deref(),
-                snapshot.record.stderr.file_bytes,
-                snapshot.record.stderr.file_sha256.as_deref(),
-            ),
-        ];
-        for (bytes, expected_len, expected_sha) in streams {
+        let blobs = snapshot_blobs(snapshot);
+        for ((_, bytes), (_, expected_len, expected_sha)) in
+            blobs.into_iter().zip(stored_blobs(&snapshot.record))
+        {
             let actual_len = bytes.map_or(0, |bytes| bytes.len());
             if actual_len != expected_len {
                 return Err(StoreError::Corrupt);
@@ -156,12 +48,11 @@ impl Store {
             snapshot.file_change_before.as_deref(),
             snapshot.file_change_after.as_deref(),
         )?;
-        let raw_bytes = input_len
-            .saturating_add(result_len)
-            .saturating_add(stdout_len)
-            .saturating_add(stderr_len)
-            .saturating_add(before_len)
-            .saturating_add(after_len);
+        let raw_bytes: usize = blobs
+            .iter()
+            .filter_map(|(_, bytes)| *bytes)
+            .map(<[u8]>::len)
+            .sum();
         if raw_bytes > 3 * 1024 * 1024 {
             return Err(StoreError::RecordTooLarge);
         }
@@ -169,31 +60,15 @@ impl Store {
         let session_dir = self
             .require_session_directory(snapshot.tool_ref.session_id)
             .await?;
-        let session_meta = fs::symlink_metadata(&session_dir)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if session_meta.file_type().is_symlink() || !session_meta.is_dir() {
-            return Err(StoreError::Corrupt);
-        }
-
         let tools_dir = session_dir.join(AUX_TOOLS_DIR);
-        match path_state(&tools_dir)
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-        {
+        match path_state(&tools_dir).await? {
             PathState::Directory | PathState::Missing => {}
             _ => return Err(StoreError::Corrupt),
         }
 
         let hash = tool_ref_hash(&snapshot.tool_ref);
         let target_dir = tools_dir.join(&hash);
-        if target_dir.exists() {
-            let target_meta = fs::symlink_metadata(&target_dir)
-                .await
-                .map_err(|_| StoreError::Unavailable)?;
-            if target_meta.file_type().is_symlink() || !target_meta.is_dir() {
-                return Err(StoreError::Corrupt);
-            }
+        if real_dir_opt(&target_dir).await? {
             match self
                 .read_tool_record_details(&snapshot.tool_ref, deadline)
                 .await
@@ -203,9 +78,9 @@ impl Store {
                         return Err(StoreError::Corrupt);
                     }
                     let existing_record_bytes =
-                        serde_json::to_vec(&existing.metadata).map_err(|_| StoreError::Corrupt)?;
+                        serde_json::to_vec(&existing.metadata).map_err(corrupt)?;
                     let incoming_record_bytes =
-                        serde_json::to_vec(&snapshot.record).map_err(|_| StoreError::Corrupt)?;
+                        serde_json::to_vec(&snapshot.record).map_err(corrupt)?;
                     if existing_record_bytes != incoming_record_bytes {
                         return Err(StoreError::Corrupt);
                     }
@@ -215,27 +90,25 @@ impl Store {
             }
         }
 
-        let record_bytes = serde_json::to_vec(&snapshot.record).map_err(|_| StoreError::Corrupt)?;
+        let record_bytes = serde_json::to_vec(&snapshot.record).map_err(corrupt)?;
         if record_bytes.len() > MAX_TOOL_METADATA_BYTES {
             return Err(StoreError::RecordTooLarge);
         }
 
-        let item_bytes = (record_bytes.len()
-            + input_len
-            + result_len
-            + stdout_len
-            + stderr_len
-            + before_len
-            + after_len) as u64;
+        let item_bytes = (record_bytes.len() + raw_bytes) as u64;
         let reserve = item_bytes.saturating_mul(2);
 
         let limits = self.aux_limits();
-        self.enforce_aux_budget_locked(snapshot.tool_ref.session_id, reserve, limits, deadline)
-            .await?;
+        self.enforce_aux_budget_locked(
+            snapshot.tool_ref.session_id,
+            reserve,
+            limits,
+            deadline,
+            ledger,
+        )
+        .await?;
 
-        if Instant::now() >= deadline {
-            return Err(StoreError::Unavailable);
-        }
+        check_aux_deadline(deadline)?;
         match fs::create_dir(&tools_dir).await {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -257,56 +130,49 @@ impl Store {
 
         let write_res = async {
             #[cfg(test)]
-            wait_aux_temp_creation_gate(snapshot.tool_ref.session_id).await;
+            if let Some(gate) = AUX_TEMP_CREATION_GATES.take(&snapshot.tool_ref.session_id) {
+                gate.pass().await;
+            }
 
-            let blobs = [
-                (TOOL_INPUT_FILE, snapshot.input_bytes.as_deref()),
-                (TOOL_RESULT_FILE, snapshot.result_bytes.as_deref()),
-                (TOOL_STDOUT_FILE, snapshot.stdout_bytes.as_deref()),
-                (TOOL_STDERR_FILE, snapshot.stderr_bytes.as_deref()),
-                (TOOL_BEFORE_FILE, snapshot.file_change_before.as_deref()),
-                (TOOL_AFTER_FILE, snapshot.file_change_after.as_deref()),
-            ];
             for (name, bytes) in blobs {
                 if let Some(bytes) = bytes {
-                    if Instant::now() >= deadline {
-                        return Err(StoreError::Unavailable);
-                    }
+                    check_aux_deadline(deadline)?;
                     #[cfg(test)]
-                    if should_fail_aux_blob_write(snapshot.tool_ref.session_id) {
+                    if tests::fail_blob_write(snapshot.tool_ref.session_id) {
                         return Err(StoreError::Unavailable);
                     }
                     write_sync_file(&temp_dir.join(name), bytes).await?;
                 }
             }
-            if Instant::now() >= deadline {
-                return Err(StoreError::Unavailable);
-            }
+            check_aux_deadline(deadline)?;
             write_sync_file(&temp_dir.join(TOOL_RECORD_FILE), &record_bytes).await?;
-            if Instant::now() >= deadline {
-                return Err(StoreError::Unavailable);
-            }
-            sync_directory(&temp_dir)
-                .await
-                .map_err(|_| StoreError::Unavailable)?;
+            check_aux_deadline(deadline)?;
+            sync_directory(&temp_dir).await.map_err(unavailable)?;
             Ok::<(), StoreError>(())
         }
         .await;
 
         if write_res.is_err() {
-            let _ = remove_aux_directory(&temp_dir).await;
+            discard_aux_temp(&temp_dir, ledger).await;
             return Err(StoreError::Unavailable);
         }
 
         if Instant::now() >= deadline {
-            let _ = remove_aux_directory(&temp_dir).await;
+            discard_aux_temp(&temp_dir, ledger).await;
             return Err(StoreError::Unavailable);
         }
 
         if fs::rename(&temp_dir, &target_dir).await.is_err() {
-            let _ = remove_aux_directory(&temp_dir).await;
+            discard_aux_temp(&temp_dir, ledger).await;
             return Err(StoreError::Unavailable);
         }
+
+        ledger.as_mut().unwrap().insert(AuxDirectoryEntry {
+            session_id: snapshot.tool_ref.session_id,
+            path: target_dir,
+            mtime: std::time::SystemTime::now(),
+            bytes: item_bytes,
+        });
 
         if sync_directory(&tools_dir).await.is_err() {
             return Err(StoreError::Unavailable);
@@ -328,7 +194,7 @@ impl Store {
 
         #[cfg(test)]
         if let Some(first) = tool_refs.first() {
-            if should_fail_aux_write(first.session_id) {
+            if AUX_WRITE_FAILURES.hit(&first.session_id) {
                 return tool_refs
                     .iter()
                     .cloned()
@@ -337,7 +203,8 @@ impl Store {
             }
         }
 
-        let _guard = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await {
+        let mut ledger = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await
+        {
             Ok(guard) => guard,
             Err(_) => {
                 return tool_refs
@@ -350,7 +217,9 @@ impl Store {
 
         #[cfg(test)]
         if let Some(first) = tool_refs.first() {
-            wait_aux_commit_gate(first.session_id).await;
+            if let Some(gate) = AUX_COMMIT_GATES.take(&first.session_id) {
+                gate.pass().await;
+            }
         }
 
         let mut results = Vec::with_capacity(tool_refs.len().min(DEFAULT_SESSION_AUX_RECORDS));
@@ -366,12 +235,14 @@ impl Store {
             let snapshot = match tool_data.snapshot_for_persistence(tool_ref) {
                 Some(snap) => snap,
                 None => {
-                    results.push((tool_ref.clone(), Err(StoreError::Corrupt)));
+                    results.push((tool_ref.clone(), Err(StoreError::Unavailable)));
                     continue;
                 }
             };
 
-            let res = self.commit_tool_record_locked(&snapshot, deadline).await;
+            let res = self
+                .commit_tool_record_locked(&snapshot, deadline, &mut ledger)
+                .await;
             if matches!(res, Err(StoreError::QueryLimit)) || Instant::now() >= deadline {
                 expired = true;
             }
@@ -379,19 +250,6 @@ impl Store {
         }
 
         results
-    }
-
-    /// Reads one stored tool record and its retained raw blobs from the auxiliary
-    /// directory, returning an in-memory `ToolRecord` projection. Returns `Ok(None)`
-    /// when the record or auxiliary directory does not exist.
-    #[cfg(test)]
-    pub(crate) async fn read_tool_record(
-        &self,
-        tool_ref: &ToolRef,
-    ) -> Result<Option<ToolRecord>, StoreError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        self.read_tool_record_with_deadline(tool_ref, deadline)
-            .await
     }
 
     pub(crate) async fn read_tool_record_with_deadline(
@@ -426,7 +284,7 @@ impl Store {
         check_aux_scan(cancellation, deadline)?;
         let tools_dir = session_dir.join(AUX_TOOLS_DIR);
         let mut budget = ChangeScanBudget::default();
-        let mut complete = true;
+
         let mut skipped = false;
         let mut records = Vec::new();
         match path_state(&tools_dir).await {
@@ -435,7 +293,7 @@ impl Store {
                 let mut entries = match fs::read_dir(&tools_dir).await {
                     Ok(entries) => entries,
                     Err(_) => {
-                        return Ok(make_tool_change_scan(records, false, true, &budget));
+                        return Ok(make_tool_change_scan(records, true, &budget));
                     }
                 };
                 let limits = self.aux_limits();
@@ -444,7 +302,6 @@ impl Store {
                     // Reserve the entry ceiling before the next directory I/O, so
                     // the hard limit is never exceeded by one speculative read.
                     if !budget.entry_available(limits.max_scan_entries) {
-                        complete = false;
                         skipped = true;
                         break;
                     }
@@ -458,7 +315,7 @@ impl Store {
                             Ok(Ok(Some(entry))) => entry,
                             Ok(Ok(None)) => break,
                             Ok(Err(_)) => {
-                                complete = false;
+
                                 skipped = true;
                                 break;
                             }
@@ -471,13 +328,11 @@ impl Store {
                     let metadata = match fs::symlink_metadata(&path).await {
                         Ok(metadata) => metadata,
                         Err(_) => {
-                            complete = false;
                             skipped = true;
                             continue;
                         }
                     };
                     let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                        complete = false;
                         skipped = true;
                         continue;
                     };
@@ -488,7 +343,6 @@ impl Store {
                         || metadata.file_type().is_symlink()
                         || !metadata.is_dir()
                     {
-                        complete = false;
                         skipped = true;
                         continue;
                     }
@@ -504,12 +358,10 @@ impl Store {
                         .await?
                     {
                         ChangeMetadataRead::BudgetExhausted => {
-                            complete = false;
                             skipped = true;
                             break;
                         }
                         ChangeMetadataRead::Record(None) => {
-                            complete = false;
                             skipped = true;
                         }
                         ChangeMetadataRead::Record(Some(stored)) => {
@@ -525,7 +377,7 @@ impl Store {
                             records.push((stored.tool_ref, change));
                             if records.len() > limits.session_records {
                                 records.pop();
-                                complete = false;
+
                                 skipped = true;
                                 break;
                             }
@@ -534,11 +386,10 @@ impl Store {
                 }
             }
             Ok(_) | Err(_) => {
-                complete = false;
                 skipped = true;
             }
         }
-        Ok(make_tool_change_scan(records, complete, skipped, &budget))
+        Ok(make_tool_change_scan(records, skipped, &budget))
     }
 
     async fn read_change_metadata_at(
@@ -755,44 +606,34 @@ impl Store {
         if tool_ref.session_id != session_id {
             return Err(StoreError::InvalidArguments);
         }
-        if cancellation.is_cancelled() || Instant::now() >= deadline {
-            return Err(StoreError::QueryLimit);
-        }
+        check_aux_scan(cancellation, deadline)?;
+        self.require_sessions_root().await?;
         let session_dir = self.session_directory(session_id);
-        let session_meta = match fs::symlink_metadata(&session_dir).await {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-        if session_meta.file_type().is_symlink() || !session_meta.is_dir() {
-            return Err(StoreError::Corrupt);
+        if !real_dir_opt(&session_dir).await? {
+            return Ok(None);
         }
-        let target_dir = session_dir
-            .join(AUX_TOOLS_DIR)
-            .join(tool_ref_hash(tool_ref));
+        let tools_dir = session_dir.join(AUX_TOOLS_DIR);
+        if !real_dir_opt(&tools_dir).await? {
+            return Ok(None);
+        }
+        let target_dir = tools_dir.join(tool_ref_hash(tool_ref));
+        if !real_dir_opt(&target_dir).await? {
+            return Ok(None);
+        }
         let record_path = target_dir.join(TOOL_RECORD_FILE);
-        let file = match safe_open_read(&record_path).await {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-        let mut bytes = Vec::new();
-        let mut reader = file.take((MAX_TOOL_METADATA_BYTES + 1) as u64);
-        let read = tokio::select! {
+        let loaded = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(StoreError::QueryLimit),
-            result = tokio::time::timeout_at(deadline.into(), reader.read_to_end(&mut bytes)) => {
+            result = tokio::time::timeout_at(deadline.into(), load_tool_metadata(&record_path)) => {
                 result.map_err(|_| StoreError::QueryLimit)?
             }
         };
-        if read.is_err() || bytes.len() > MAX_TOOL_METADATA_BYTES {
-            return Ok(None);
-        }
-        let stored: StoredToolRecord = match serde_json::from_slice(&bytes) {
-            Ok(stored) => stored,
-            Err(_) => return Ok(None),
+        let stored = match loaded {
+            Ok(Some(stored)) => stored,
+            Ok(None) | Err(StoreError::Corrupt) => return Ok(None),
+            Err(error) => return Err(error),
         };
-        if stored.tool_ref != *tool_ref || validate_stored_tool_record(&stored, tool_ref).is_err() {
+        if validate_stored_tool_record(&stored, tool_ref).is_err() {
             return Ok(None);
         }
         let Some(change) = stored.file_change else {
@@ -817,112 +658,32 @@ impl Store {
         &self,
         tool_ref: &ToolRef,
     ) -> Result<Option<ReadToolRecord>, StoreError> {
-        let root_meta = fs::symlink_metadata(&self.root)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
-            return Err(StoreError::Corrupt);
-        }
-
-        let sessions_dir = self.sessions_directory();
-        let sessions_meta = fs::symlink_metadata(&sessions_dir)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if sessions_meta.file_type().is_symlink() || !sessions_meta.is_dir() {
-            return Err(StoreError::Corrupt);
-        }
+        self.require_sessions_root().await?;
 
         let session_dir = self.session_directory(tool_ref.session_id);
-        let session_meta = match fs::symlink_metadata(&session_dir).await {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(StoreError::SessionNotFound);
-            }
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-        if session_meta.file_type().is_symlink() || !session_meta.is_dir() {
-            return Err(StoreError::Corrupt);
+        if !real_dir_opt(&session_dir).await? {
+            return Err(StoreError::SessionNotFound);
         }
-
         let tools_dir = session_dir.join(AUX_TOOLS_DIR);
-        let tools_meta = match fs::symlink_metadata(&tools_dir).await {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-        if tools_meta.file_type().is_symlink() || !tools_meta.is_dir() {
-            return Err(StoreError::Corrupt);
+        if !real_dir_opt(&tools_dir).await? {
+            return Ok(None);
+        }
+        let target_dir = tools_dir.join(tool_ref_hash(tool_ref));
+        if !real_dir_opt(&target_dir).await? {
+            return Ok(None);
         }
 
-        let hash = tool_ref_hash(tool_ref);
-        let target_dir = tools_dir.join(&hash);
-        let target_meta = match fs::symlink_metadata(&target_dir).await {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-        if target_meta.file_type().is_symlink() || !target_meta.is_dir() {
-            return Err(StoreError::Corrupt);
-        }
-
-        let record_path = target_dir.join(TOOL_RECORD_FILE);
-        let file = match safe_open_read(&record_path).await {
-            Ok(f) => f,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(StoreError::Unavailable),
-        };
-
-        let mut bytes = Vec::new();
-        if file
-            .take((MAX_TOOL_METADATA_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .is_err()
-        {
-            return Err(StoreError::Unavailable);
-        }
-        if bytes.len() > MAX_TOOL_METADATA_BYTES {
-            return Err(StoreError::Corrupt);
-        }
-
-        let stored: StoredToolRecord = match serde_json::from_slice(&bytes) {
-            Ok(stored) => stored,
-            Err(_) => return Err(StoreError::Corrupt),
+        let Some(stored) = load_tool_metadata(&target_dir.join(TOOL_RECORD_FILE)).await? else {
+            return Ok(None);
         };
 
         validate_stored_tool_record(&stored, tool_ref)?;
 
-        let (input_bytes, input_corrupt) = read_blob(
-            &target_dir.join(TOOL_INPUT_FILE),
-            stored.input.file_bytes,
-            stored.input.file_sha256.as_deref(),
-            MAX_TOOL_INPUT_PERSIST_BYTES,
-        )
-        .await;
-
-        let (result_bytes, result_corrupt) = read_blob(
-            &target_dir.join(TOOL_RESULT_FILE),
-            stored.result.file_bytes,
-            stored.result.file_sha256.as_deref(),
-            MAX_TOOL_RESULT_PERSIST_BYTES,
-        )
-        .await;
-
-        let (stdout_bytes, stdout_corrupt) = read_blob(
-            &target_dir.join(TOOL_STDOUT_FILE),
-            stored.stdout.file_bytes,
-            stored.stdout.file_sha256.as_deref(),
-            crate::tool_data::MAX_TOOL_STREAM_BYTES,
-        )
-        .await;
-
-        let (stderr_bytes, stderr_corrupt) = read_blob(
-            &target_dir.join(TOOL_STDERR_FILE),
-            stored.stderr.file_bytes,
-            stored.stderr.file_sha256.as_deref(),
-            crate::tool_data::MAX_TOOL_STREAM_BYTES,
-        )
-        .await;
+        let mut blobs = std::array::from_fn::<_, 4, _>(|_| (None, false));
+        for (slot, (name, bytes, sha)) in blobs.iter_mut().zip(stored_blobs(&stored)) {
+            *slot = read_blob(&target_dir.join(name), bytes, sha).await;
+        }
+        let [input, result, stdout, stderr] = blobs;
 
         let (file_change_before, file_change_before_corrupt) = match &stored.file_change {
             Some(change) => {
@@ -939,10 +700,10 @@ impl Store {
 
         let record = ToolRecord::from_stored(
             stored.clone(),
-            (input_bytes, input_corrupt),
-            (result_bytes, result_corrupt),
-            (stdout_bytes, stdout_corrupt),
-            (stderr_bytes, stderr_corrupt),
+            input,
+            result,
+            stdout,
+            stderr,
             (file_change_before, file_change_before_corrupt),
             (file_change_after, file_change_after_corrupt),
         );
@@ -953,217 +714,116 @@ impl Store {
         }))
     }
 
+    async fn scan_aux_ledger(&self, deadline: Instant) -> Result<AuxLedger, StoreError> {
+        self.require_sessions_root().await?;
+        let mut sessions = fs::read_dir(self.sessions_directory())
+            .await
+            .map_err(unavailable)?;
+        let mut ledger = AuxLedger::default();
+        // The read-query entry ceiling must not prevent budget eviction at startup.
+        while let Some(entry) = next_aux_entry(&mut sessions, deadline).await? {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).await.map_err(unavailable)?;
+            let session_id = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<SessionId>().ok());
+            let Some(session_id) = session_id.filter(|_| meta.is_dir()) else {
+                ledger.note_foreign(None, meta.len());
+                tracing::warn!(entry = ?path, "skipping foreign auxiliary budget entry");
+                continue;
+            };
+            let tools = path.join(AUX_TOOLS_DIR);
+            match real_dir_opt(&tools).await {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_) => {
+                    let bytes = fs::symlink_metadata(&tools)
+                        .await
+                        .map_or(0, |meta| meta.len());
+                    ledger.note_foreign(Some(session_id), bytes);
+                    tracing::warn!(entry = ?tools, "skipping unreadable auxiliary directory");
+                    continue;
+                }
+            }
+            let mut entries = fs::read_dir(&tools).await.map_err(unavailable)?;
+            while let Some(entry) = next_aux_entry(&mut entries, deadline).await? {
+                let path = entry.path();
+                let meta = fs::symlink_metadata(&path).await.map_err(unavailable)?;
+                let name = entry.file_name();
+                let name = name.to_str().unwrap_or("");
+                let (bytes, valid_files) = if meta.is_dir() {
+                    scan_aux_files(&path, deadline).await?
+                } else {
+                    (meta.len(), false)
+                };
+                if valid_files && is_valid_temp_name(name) {
+                    #[cfg(test)]
+                    if FAIL_REMOVE_TEMP_SESSIONS.hit(&session_id) {
+                        return Err(StoreError::Unavailable);
+                    }
+                    if remove_aux_directory(&path).await.is_ok() {
+                        continue;
+                    }
+                } else if valid_files && valid_sha256(name) {
+                    if let Ok(Some(record)) = load_tool_metadata(&path.join(TOOL_RECORD_FILE)).await
+                    {
+                        if record.tool_ref.session_id == session_id
+                            && tool_ref_hash(&record.tool_ref) == name
+                            && validate_stored_tool_record(&record, &record.tool_ref).is_ok()
+                        {
+                            ledger.insert(AuxDirectoryEntry {
+                                session_id,
+                                path,
+                                bytes,
+                                mtime: meta.modified().map_err(unavailable)?,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                ledger.note_foreign(Some(session_id), bytes);
+                tracing::warn!(entry = ?path, "skipping foreign or corrupt auxiliary record");
+            }
+        }
+        Ok(ledger)
+    }
+
     async fn enforce_aux_budget_locked(
         &self,
         target_session: SessionId,
         reserve: u64,
         limits: AuxLimits,
         deadline: Instant,
+        ledger: &mut Option<AuxLedger>,
     ) -> Result<(), StoreError> {
-        let sessions_dir = self.sessions_directory();
-        let sessions_meta = fs::symlink_metadata(&sessions_dir)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if sessions_meta.file_type().is_symlink() || !sessions_meta.is_dir() {
-            return Err(StoreError::Corrupt);
+        if ledger.is_none() {
+            *ledger = Some(self.scan_aux_ledger(deadline).await?);
         }
-
-        let mut session_entries = fs::read_dir(&sessions_dir)
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-
-        let mut total_scanned = 0usize;
-        let mut global_bytes = 0u64;
-        let mut global_records = 0usize;
-        let mut session_bytes = 0u64;
-        let mut session_records = 0usize;
-        let mut all_entries = Vec::new();
-        let mut target_entries = Vec::new();
-
-        while let Some(ses_entry) = {
-            if Instant::now() >= deadline {
-                return Err(StoreError::QueryLimit);
+        let ledger = ledger.as_mut().unwrap();
+        loop {
+            let (bytes, records) = ledger
+                .sessions
+                .get(&target_session)
+                .copied()
+                .unwrap_or_default();
+            let session_full = bytes.saturating_add(reserve) > limits.session_bytes
+                || records + 1 > limits.session_records;
+            let global_full = ledger.global_bytes.saturating_add(reserve) > limits.global_bytes
+                || ledger.entries.len() + 1 > limits.global_records;
+            if !session_full && !global_full {
+                return Ok(());
             }
-            session_entries
-                .next_entry()
-                .await
-                .map_err(|_| StoreError::Unavailable)?
-        } {
-            total_scanned = total_scanned.saturating_add(1);
-            if total_scanned > limits.max_scan_entries || Instant::now() >= deadline {
-                return Err(StoreError::QueryLimit);
-            }
-            let ses_path = ses_entry.path();
-            let ses_meta = fs::symlink_metadata(&ses_path)
-                .await
-                .map_err(|_| StoreError::Unavailable)?;
-            if ses_meta.file_type().is_symlink() {
-                return Err(StoreError::Corrupt);
-            }
-            if !ses_meta.is_dir() {
-                global_bytes = global_bytes.saturating_add(ses_meta.len());
-                continue;
-            }
-            let file_name = ses_entry.file_name();
-            let Some(name_str) = file_name.to_str() else {
-                return Err(StoreError::Corrupt);
-            };
-            let Ok(current_ses_id) = name_str.parse::<SessionId>() else {
-                return Err(StoreError::Corrupt);
-            };
-            let tools_dir = ses_path.join(AUX_TOOLS_DIR);
-            let tools_meta = match fs::symlink_metadata(&tools_dir).await {
-                Ok(m) => m,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => return Err(StoreError::Unavailable),
-            };
-            if tools_meta.file_type().is_symlink() || !tools_meta.is_dir() {
-                return Err(StoreError::Corrupt);
-            }
-
-            let mut tool_dir_entries = fs::read_dir(&tools_dir)
-                .await
-                .map_err(|_| StoreError::Unavailable)?;
-
-            while let Some(tool_entry) = {
-                if Instant::now() >= deadline {
-                    return Err(StoreError::QueryLimit);
-                }
-                tool_dir_entries
-                    .next_entry()
-                    .await
-                    .map_err(|_| StoreError::Unavailable)?
-            } {
-                total_scanned = total_scanned.saturating_add(1);
-                if total_scanned > limits.max_scan_entries || Instant::now() >= deadline {
-                    return Err(StoreError::QueryLimit);
-                }
-                let tool_path = tool_entry.path();
-                let tool_meta = fs::symlink_metadata(&tool_path)
-                    .await
-                    .map_err(|_| StoreError::Unavailable)?;
-                if tool_meta.file_type().is_symlink() {
-                    return Err(StoreError::Corrupt);
-                }
-                let tool_name = tool_entry.file_name();
-                let Some(name_str) = tool_name.to_str() else {
-                    return Err(StoreError::Corrupt);
-                };
-
-                if is_valid_temp_name(name_str) {
-                    if !tool_meta.is_dir() {
-                        return Err(StoreError::Corrupt);
-                    }
-                    match verify_and_scan_temp_dir(
-                        &tool_path,
-                        &mut total_scanned,
-                        limits.max_scan_entries,
-                        deadline,
-                    )
-                    .await?
-                    {
-                        Some(temp_bytes) => {
-                            global_bytes = global_bytes.saturating_add(temp_bytes);
-                            if current_ses_id == target_session {
-                                session_bytes = session_bytes.saturating_add(temp_bytes);
-                            }
-
-                            #[cfg(test)]
-                            let fail_remove = should_fail_remove_temp(current_ses_id);
-                            #[cfg(not(test))]
-                            let fail_remove = false;
-
-                            if fail_remove || remove_aux_directory(&tool_path).await.is_err() {
-                                return Err(StoreError::Unavailable);
-                            }
-
-                            global_bytes = global_bytes.saturating_sub(temp_bytes);
-                            if current_ses_id == target_session {
-                                session_bytes = session_bytes.saturating_sub(temp_bytes);
-                            }
-                            continue;
-                        }
-                        None => {
-                            return Err(StoreError::Corrupt);
-                        }
-                    }
-                }
-
-                if !valid_sha256(name_str) || !tool_meta.is_dir() {
-                    return Err(StoreError::Corrupt);
-                }
-
-                let (dir_bytes, _mtime, verified_entry) = scan_and_verify_tool_dir(
-                    &tool_path,
-                    current_ses_id,
-                    name_str,
-                    &mut total_scanned,
-                    limits.max_scan_entries,
-                    deadline,
-                )
-                .await?;
-
-                global_bytes = global_bytes.saturating_add(dir_bytes);
-                global_records = global_records.saturating_add(1);
-                if current_ses_id == target_session {
-                    session_bytes = session_bytes.saturating_add(dir_bytes);
-                    session_records = session_records.saturating_add(1);
-                    target_entries.push(verified_entry.clone());
-                }
-                all_entries.push(verified_entry);
-            }
+            check_aux_deadline(deadline)?;
+            let victim = ledger
+                .entries
+                .iter()
+                .find(|(_, entry)| !session_full || entry.session_id == target_session)
+                .map(|(key, entry)| (key.clone(), entry.path.clone()))
+                .ok_or(StoreError::Unavailable)?;
+            remove_aux_directory(&victim.1).await?;
+            ledger.remove(&victim.0);
         }
-
-        // Evict session-level oldest records if exceeding session bounds
-        target_entries.sort_by_key(|e| e.mtime);
-        while (session_bytes.saturating_add(reserve) > limits.session_bytes
-            || session_records.saturating_add(1) > limits.session_records)
-            && !target_entries.is_empty()
-        {
-            if Instant::now() >= deadline {
-                return Err(StoreError::QueryLimit);
-            }
-            let victim = target_entries.remove(0);
-            remove_aux_directory(&victim.path).await?;
-            session_bytes = session_bytes.saturating_sub(victim.bytes);
-            session_records = session_records.saturating_sub(1);
-            global_bytes = global_bytes.saturating_sub(victim.bytes);
-            global_records = global_records.saturating_sub(1);
-            if let Some(pos) = all_entries.iter().position(|e| e.path == victim.path) {
-                all_entries.remove(pos);
-            }
-        }
-        if session_bytes.saturating_add(reserve) > limits.session_bytes
-            || session_records.saturating_add(1) > limits.session_records
-        {
-            return Err(StoreError::Unavailable);
-        }
-
-        // Evict global oldest records if exceeding global bounds
-        all_entries.sort_by_key(|e| e.mtime);
-        while (global_bytes.saturating_add(reserve) > limits.global_bytes
-            || global_records.saturating_add(1) > limits.global_records)
-            && !all_entries.is_empty()
-        {
-            if Instant::now() >= deadline {
-                return Err(StoreError::QueryLimit);
-            }
-            let victim = all_entries.remove(0);
-            remove_aux_directory(&victim.path).await?;
-            global_bytes = global_bytes.saturating_sub(victim.bytes);
-            global_records = global_records.saturating_sub(1);
-            if victim.session_id == target_session {
-                session_bytes = session_bytes.saturating_sub(victim.bytes);
-                session_records = session_records.saturating_sub(1);
-            }
-        }
-        if global_bytes.saturating_add(reserve) > limits.global_bytes
-            || global_records.saturating_add(1) > limits.global_records
-        {
-            return Err(StoreError::Unavailable);
-        }
-
-        Ok(())
     }
 }
 
@@ -1206,23 +866,22 @@ pub(super) fn change_blob_read_cost(revision: &ChangeRevision) -> usize {
 
 fn make_tool_change_scan(
     mut records: Vec<(ToolRef, StoredFileChange)>,
-    complete: bool,
     skipped: bool,
     budget: &ChangeScanBudget,
 ) -> ToolChangeScan {
     records.sort_by_cached_key(|entry| tool_ref_hash(&entry.0));
-    let fingerprint = serde_json::to_vec(&(
-        &records,
-        complete,
-        skipped,
-        budget.entries,
-        budget.metadata_bytes,
-    ))
-    .map(|bytes| hash_bytes(&bytes))
-    .unwrap_or_else(|_| hash_bytes(b"change-scan-serialization-failed"));
+    let fingerprint = hash_bytes(
+        &serde_json::to_vec(&(
+            &records,
+            !skipped,
+            skipped,
+            budget.entries,
+            budget.metadata_bytes,
+        ))
+        .expect("serializing tool change metadata cannot fail"),
+    );
     ToolChangeScan {
         records,
-        complete,
         skipped,
         #[cfg(test)]
         entries: budget.entries,
@@ -1240,14 +899,105 @@ struct AuxDirectoryEntry {
     bytes: u64,
 }
 
-async fn remove_aux_directory(path: &Path) -> Result<(), StoreError> {
-    let parent = path.parent().ok_or(StoreError::Corrupt)?;
-    if parent.file_name() != Some(std::ffi::OsStr::new(AUX_TOOLS_DIR)) {
+type AuxKey = (std::time::SystemTime, PathBuf);
+
+#[derive(Default)]
+pub(super) struct AuxLedger {
+    entries: std::collections::BTreeMap<AuxKey, AuxDirectoryEntry>,
+    sessions: HashMap<SessionId, (u64, usize)>,
+    global_bytes: u64,
+}
+
+impl AuxLedger {
+    fn insert(&mut self, entry: AuxDirectoryEntry) {
+        let totals = self.sessions.entry(entry.session_id).or_default();
+        totals.0 += entry.bytes;
+        totals.1 += 1;
+        self.global_bytes += entry.bytes;
+        self.entries
+            .insert((entry.mtime, entry.path.clone()), entry);
+    }
+
+    fn note_foreign(&mut self, session_id: Option<SessionId>, bytes: u64) {
+        self.global_bytes += bytes;
+        if let Some(session_id) = session_id {
+            self.sessions.entry(session_id).or_default().0 += bytes;
+        }
+    }
+
+    fn remove(&mut self, key: &AuxKey) {
+        let entry = self.entries.remove(key).unwrap();
+        self.global_bytes -= entry.bytes;
+        let totals = self.sessions.get_mut(&entry.session_id).unwrap();
+        totals.0 -= entry.bytes;
+        totals.1 -= 1;
+    }
+
+    pub(super) fn remove_session(&mut self, session_id: SessionId) {
+        if let Some((bytes, _)) = self.sessions.remove(&session_id) {
+            self.global_bytes -= bytes;
+        }
+        self.entries
+            .retain(|_, entry| entry.session_id != session_id);
+    }
+}
+
+fn check_aux_deadline(deadline: Instant) -> Result<(), StoreError> {
+    if Instant::now() >= deadline {
+        Err(StoreError::Unavailable)
+    } else {
+        Ok(())
+    }
+}
+
+async fn next_aux_entry(
+    entries: &mut fs::ReadDir,
+    deadline: Instant,
+) -> Result<Option<fs::DirEntry>, StoreError> {
+    check_aux_deadline(deadline)?;
+    entries.next_entry().await.map_err(unavailable)
+}
+
+async fn scan_aux_files(path: &Path, deadline: Instant) -> Result<(u64, bool), StoreError> {
+    let mut entries = fs::read_dir(path).await.map_err(unavailable)?;
+    let mut bytes = 0;
+    let mut valid = true;
+    while let Some(entry) = next_aux_entry(&mut entries, deadline).await? {
+        let meta = fs::symlink_metadata(entry.path())
+            .await
+            .map_err(unavailable)?;
+        bytes += meta.len();
+        valid &= meta.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| ALLOWED_AUX_FILES.contains(&name));
+    }
+    Ok((bytes, valid))
+}
+
+async fn load_tool_metadata(path: &Path) -> Result<Option<StoredToolRecord>, StoreError> {
+    let file = match safe_open_read(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StoreError::Unavailable),
+    };
+    let mut bytes = Vec::new();
+    file.take((MAX_TOOL_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(unavailable)?;
+    if bytes.len() > MAX_TOOL_METADATA_BYTES {
         return Err(StoreError::Corrupt);
     }
-    fs::remove_dir_all(path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
+    serde_json::from_slice(&bytes).map(Some).map_err(corrupt)
+}
+
+async fn remove_aux_directory(path: &Path) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .expect("auxiliary directory has a tools parent");
+    fs::remove_dir_all(path).await.map_err(unavailable)?;
     match fs::remove_dir(parent).await {
         Ok(()) => Ok(()),
         Err(error)
@@ -1262,13 +1012,20 @@ async fn remove_aux_directory(path: &Path) -> Result<(), StoreError> {
     }
 }
 
+async fn discard_aux_temp(path: &Path, ledger: &mut Option<AuxLedger>) {
+    if remove_aux_directory(path).await.is_err() {
+        // A surviving partial directory has unknown size; rebuild before reserving again.
+        *ledger = None;
+    }
+}
+
 async fn write_sync_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .await
-        .map_err(|_| StoreError::Unavailable)?;
+        .map_err(unavailable)?;
     if file.write_all(bytes).await.is_err()
         || file.flush().await.is_err()
         || file.sync_all().await.is_err()
@@ -1327,110 +1084,72 @@ fn validate_stored_tool_record(
         }
     }
 
-    if !stored.input.seen {
-        if stored.input.total_bytes != 0
-            || stored.input.file_bytes != 0
-            || stored.input.file_sha256.is_some()
-        {
-            return Err(StoreError::Corrupt);
+    for (seen, total_bytes, file_bytes, file_sha256, expired, cap) in [
+        (
+            stored.input.seen,
+            stored.input.total_bytes,
+            stored.input.file_bytes,
+            &stored.input.file_sha256,
+            stored.input.expired,
+            MAX_TOOL_INPUT_PERSIST_BYTES,
+        ),
+        (
+            stored.result.seen,
+            stored.result.total_bytes,
+            stored.result.file_bytes,
+            &stored.result.file_sha256,
+            stored.result.expired,
+            MAX_TOOL_RESULT_PERSIST_BYTES,
+        ),
+    ] {
+        if !seen {
+            if total_bytes != 0 || file_bytes != 0 || file_sha256.is_some() {
+                return Err(StoreError::Corrupt);
+            }
+        } else {
+            if file_bytes > total_bytes {
+                return Err(StoreError::Corrupt);
+            }
+            if expired && (file_bytes != 0 || file_sha256.is_some()) {
+                return Err(StoreError::Corrupt);
+            }
         }
-    } else {
-        if stored.input.file_bytes > stored.input.total_bytes {
-            return Err(StoreError::Corrupt);
+        if file_bytes > cap {
+            return Err(StoreError::RecordTooLarge);
         }
-        if stored.input.expired
-            && (stored.input.file_bytes != 0 || stored.input.file_sha256.is_some())
-        {
-            return Err(StoreError::Corrupt);
-        }
-    }
-    if stored.input.file_bytes > MAX_TOOL_INPUT_PERSIST_BYTES {
-        return Err(StoreError::RecordTooLarge);
     }
 
-    if !stored.result.seen {
-        if stored.result.total_bytes != 0
-            || stored.result.file_bytes != 0
-            || stored.result.file_sha256.is_some()
-        {
+    for stream in [&stored.stdout, &stored.stderr] {
+        if stream.start_offset > stream.observed_end {
             return Err(StoreError::Corrupt);
         }
-    } else {
-        if stored.result.file_bytes > stored.result.total_bytes {
-            return Err(StoreError::Corrupt);
+        if !stream.seen {
+            if stream.start_offset != 0
+                || stream.observed_end != 0
+                || stream.file_bytes != 0
+                || stream.file_sha256.is_some()
+            {
+                return Err(StoreError::Corrupt);
+            }
+        } else if stream.expired {
+            if stream.start_offset != stream.observed_end
+                || stream.file_bytes != 0
+                || stream.file_sha256.is_some()
+            {
+                return Err(StoreError::Corrupt);
+            }
+        } else {
+            let diff = stream
+                .observed_end
+                .checked_sub(stream.start_offset)
+                .ok_or(StoreError::Corrupt)?;
+            if diff != stream.file_bytes as u64 {
+                return Err(StoreError::Corrupt);
+            }
         }
-        if stored.result.expired
-            && (stored.result.file_bytes != 0 || stored.result.file_sha256.is_some())
-        {
-            return Err(StoreError::Corrupt);
+        if stream.file_bytes > crate::tool_data::MAX_TOOL_STREAM_BYTES {
+            return Err(StoreError::RecordTooLarge);
         }
-    }
-    if stored.result.file_bytes > MAX_TOOL_RESULT_PERSIST_BYTES {
-        return Err(StoreError::RecordTooLarge);
-    }
-
-    if stored.stdout.start_offset > stored.stdout.observed_end {
-        return Err(StoreError::Corrupt);
-    }
-    if !stored.stdout.seen {
-        if stored.stdout.start_offset != 0
-            || stored.stdout.observed_end != 0
-            || stored.stdout.file_bytes != 0
-            || stored.stdout.file_sha256.is_some()
-        {
-            return Err(StoreError::Corrupt);
-        }
-    } else if stored.stdout.expired {
-        if stored.stdout.start_offset != stored.stdout.observed_end
-            || stored.stdout.file_bytes != 0
-            || stored.stdout.file_sha256.is_some()
-        {
-            return Err(StoreError::Corrupt);
-        }
-    } else {
-        let diff = stored
-            .stdout
-            .observed_end
-            .checked_sub(stored.stdout.start_offset)
-            .ok_or(StoreError::Corrupt)?;
-        if diff != stored.stdout.file_bytes as u64 {
-            return Err(StoreError::Corrupt);
-        }
-    }
-    if stored.stdout.file_bytes > crate::tool_data::MAX_TOOL_STREAM_BYTES {
-        return Err(StoreError::RecordTooLarge);
-    }
-
-    if stored.stderr.start_offset > stored.stderr.observed_end {
-        return Err(StoreError::Corrupt);
-    }
-    if !stored.stderr.seen {
-        if stored.stderr.start_offset != 0
-            || stored.stderr.observed_end != 0
-            || stored.stderr.file_bytes != 0
-            || stored.stderr.file_sha256.is_some()
-        {
-            return Err(StoreError::Corrupt);
-        }
-    } else if stored.stderr.expired {
-        if stored.stderr.start_offset != stored.stderr.observed_end
-            || stored.stderr.file_bytes != 0
-            || stored.stderr.file_sha256.is_some()
-        {
-            return Err(StoreError::Corrupt);
-        }
-    } else {
-        let diff = stored
-            .stderr
-            .observed_end
-            .checked_sub(stored.stderr.start_offset)
-            .ok_or(StoreError::Corrupt)?;
-        if diff != stored.stderr.file_bytes as u64 {
-            return Err(StoreError::Corrupt);
-        }
-    }
-    if stored.stderr.file_bytes > crate::tool_data::MAX_TOOL_STREAM_BYTES {
-        return Err(StoreError::RecordTooLarge);
     }
 
     let change_bytes = stored.file_change.as_ref().map_or(0, |change| {
@@ -1456,28 +1175,14 @@ fn validate_stored_tool_record(
         return Err(StoreError::RecordTooLarge);
     }
 
-    let check_sha256 = |bytes: usize, hash: Option<&str>| -> bool {
-        if bytes == 0 {
-            hash.is_none()
+    for (_, bytes, hash) in stored_blobs(stored) {
+        if if bytes == 0 {
+            hash.is_some()
         } else {
-            hash.is_some_and(valid_sha256)
+            !hash.is_some_and(valid_sha256)
+        } {
+            return Err(StoreError::Corrupt);
         }
-    };
-    if !check_sha256(stored.input.file_bytes, stored.input.file_sha256.as_deref())
-        || !check_sha256(
-            stored.result.file_bytes,
-            stored.result.file_sha256.as_deref(),
-        )
-        || !check_sha256(
-            stored.stdout.file_bytes,
-            stored.stdout.file_sha256.as_deref(),
-        )
-        || !check_sha256(
-            stored.stderr.file_bytes,
-            stored.stderr.file_sha256.as_deref(),
-        )
-    {
-        return Err(StoreError::Corrupt);
     }
 
     if let Some(cmd) = &stored.command {
@@ -1501,7 +1206,7 @@ fn validate_stored_tool_record(
 }
 
 fn validate_stored_file_change(change: &StoredFileChange) -> Result<(), StoreError> {
-    crate::workspace::validate_relative_path(&change.path).map_err(|_| StoreError::Corrupt)?;
+    crate::workspace::validate_relative_path(&change.path).map_err(corrupt)?;
     match &change.before {
         ChangeRevision::Missing => {
             if !change.before_captured {
@@ -1562,7 +1267,6 @@ fn validate_file_change_snapshot(
             Err(StoreError::Corrupt)
         };
     };
-    validate_stored_file_change(stored)?;
     if let Some(bytes) = before_bytes {
         let ChangeRevision::Content {
             sha256,
@@ -1571,11 +1275,7 @@ fn validate_file_change_snapshot(
         else {
             return Err(StoreError::Corrupt);
         };
-        if !stored.before_captured
-            || bytes.len() != *size
-            || bytes.len() > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES
-            || hash_bytes(bytes) != *sha256
-        {
+        if bytes.len() != *size || hash_bytes(bytes) != *sha256 {
             return Err(StoreError::Corrupt);
         }
     }
@@ -1587,11 +1287,7 @@ fn validate_file_change_snapshot(
         else {
             return Err(StoreError::Corrupt);
         };
-        if !stored.after_captured
-            || bytes.len() != *size
-            || bytes.len() > crate::changes::MAX_CHANGE_SNAPSHOT_BYTES
-            || hash_bytes(bytes) != *sha256
-        {
+        if bytes.len() != *size || hash_bytes(bytes) != *sha256 {
             return Err(StoreError::Corrupt);
         }
     }
@@ -1602,17 +1298,11 @@ async fn read_blob(
     path: &Path,
     expected_bytes: usize,
     expected_sha256: Option<&str>,
-    max_cap: usize,
 ) -> (Option<Vec<u8>>, bool) {
     if expected_bytes == 0 {
         return (None, false);
     }
-    if expected_bytes > max_cap {
-        return (None, true);
-    }
-    let Some(expected_hash) = expected_sha256 else {
-        return (None, true);
-    };
+    let expected_hash = expected_sha256.expect("validated nonempty blob has a digest");
     let Ok(file) = safe_open_read(path).await else {
         return (None, true);
     };
@@ -1643,11 +1333,7 @@ async fn read_change_blob(path: &Path, revision: &ChangeRevision) -> (Option<Vec
         return (None, true);
     }
     #[cfg(test)]
-    READ_CHANGE_BLOBS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(path.to_path_buf());
+    tests::note_change_blob(path);
     let Ok(file) = safe_open_read(path).await else {
         return (None, true);
     };
@@ -1666,141 +1352,39 @@ async fn read_change_blob(path: &Path, revision: &ChangeRevision) -> (Option<Vec
     (Some(value), false)
 }
 
-async fn verify_and_scan_temp_dir(
-    path: &Path,
-    total_scanned: &mut usize,
-    max_scan_entries: usize,
-    deadline: Instant,
-) -> Result<Option<u64>, StoreError> {
-    let mut read_dir = fs::read_dir(path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
-    let mut temp_bytes = 0u64;
-    while let Some(entry) = {
-        if Instant::now() >= deadline {
-            return Err(StoreError::QueryLimit);
-        }
-        read_dir
-            .next_entry()
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-    } {
-        *total_scanned = total_scanned.saturating_add(1);
-        if *total_scanned > max_scan_entries || Instant::now() >= deadline {
-            return Err(StoreError::QueryLimit);
-        }
-        let meta = fs::symlink_metadata(entry.path())
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Ok(None);
-        }
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
-            return Ok(None);
-        };
-        if !ALLOWED_AUX_FILES.contains(&name_str) {
-            return Ok(None);
-        }
-        temp_bytes = temp_bytes.saturating_add(meta.len());
-    }
-    Ok(Some(temp_bytes))
+fn snapshot_blobs(snapshot: &ToolPersistenceSnapshot) -> [(&str, Option<&[u8]>); 6] {
+    [
+        (TOOL_INPUT_FILE, snapshot.input_bytes.as_deref()),
+        (TOOL_RESULT_FILE, snapshot.result_bytes.as_deref()),
+        (TOOL_STDOUT_FILE, snapshot.stdout_bytes.as_deref()),
+        (TOOL_STDERR_FILE, snapshot.stderr_bytes.as_deref()),
+        (TOOL_BEFORE_FILE, snapshot.file_change_before.as_deref()),
+        (TOOL_AFTER_FILE, snapshot.file_change_after.as_deref()),
+    ]
 }
 
-async fn scan_and_verify_tool_dir(
-    path: &Path,
-    session_id: SessionId,
-    expected_hash: &str,
-    total_scanned: &mut usize,
-    max_scan_entries: usize,
-    deadline: Instant,
-) -> Result<(u64, std::time::SystemTime, AuxDirectoryEntry), StoreError> {
-    let dir_meta = fs::symlink_metadata(path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
-    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
-        return Err(StoreError::Corrupt);
-    }
-    let mtime = dir_meta
-        .modified()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-    let mut read_dir = fs::read_dir(path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
-    let mut dir_bytes = 0u64;
-    let mut has_record = false;
-
-    while let Some(entry) = {
-        if Instant::now() >= deadline {
-            return Err(StoreError::QueryLimit);
-        }
-        read_dir
-            .next_entry()
-            .await
-            .map_err(|_| StoreError::Unavailable)?
-    } {
-        *total_scanned = total_scanned.saturating_add(1);
-        if *total_scanned > max_scan_entries || Instant::now() >= deadline {
-            return Err(StoreError::QueryLimit);
-        }
-        let file_meta = fs::symlink_metadata(entry.path())
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        if file_meta.file_type().is_symlink() || !file_meta.is_file() {
-            return Err(StoreError::Corrupt);
-        }
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
-            return Err(StoreError::Corrupt);
-        };
-        if !ALLOWED_AUX_FILES.contains(&name_str) {
-            return Err(StoreError::Corrupt);
-        }
-        if name_str == TOOL_RECORD_FILE {
-            has_record = true;
-        }
-        dir_bytes = dir_bytes.saturating_add(file_meta.len());
-    }
-
-    if !has_record {
-        return Err(StoreError::Corrupt);
-    }
-
-    let record_path = path.join(TOOL_RECORD_FILE);
-    let file = safe_open_read(&record_path)
-        .await
-        .map_err(|_| StoreError::Unavailable)?;
-    let mut bytes = Vec::new();
-    if file
-        .take((MAX_TOOL_METADATA_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .is_err()
-    {
-        return Err(StoreError::Unavailable);
-    }
-    if bytes.len() > MAX_TOOL_METADATA_BYTES {
-        return Err(StoreError::Corrupt);
-    }
-    let stored: StoredToolRecord =
-        serde_json::from_slice(&bytes).map_err(|_| StoreError::Corrupt)?;
-    if stored.version != TOOL_RECORD_FORMAT_VERSION
-        || stored.tool_ref.session_id != session_id
-        || tool_ref_hash(&stored.tool_ref) != expected_hash
-    {
-        return Err(StoreError::Corrupt);
-    }
-    validate_stored_tool_record(&stored, &stored.tool_ref)?;
-
-    Ok((
-        dir_bytes,
-        mtime,
-        AuxDirectoryEntry {
-            session_id,
-            path: path.to_path_buf(),
-            mtime,
-            bytes: dir_bytes,
-        },
-    ))
+// The four core blobs use the same order as snapshot_blobs; change snapshots follow them.
+fn stored_blobs(stored: &StoredToolRecord) -> [(&str, usize, Option<&str>); 4] {
+    [
+        (
+            TOOL_INPUT_FILE,
+            stored.input.file_bytes,
+            stored.input.file_sha256.as_deref(),
+        ),
+        (
+            TOOL_RESULT_FILE,
+            stored.result.file_bytes,
+            stored.result.file_sha256.as_deref(),
+        ),
+        (
+            TOOL_STDOUT_FILE,
+            stored.stdout.file_bytes,
+            stored.stdout.file_sha256.as_deref(),
+        ),
+        (
+            TOOL_STDERR_FILE,
+            stored.stderr.file_bytes,
+            stored.stderr.file_sha256.as_deref(),
+        ),
+    ]
 }

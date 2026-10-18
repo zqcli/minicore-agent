@@ -801,6 +801,17 @@ impl Agent {
             tracing::debug!(session_id = %session_id, "session already loaded");
             return Ok(session.info(true));
         }
+        let result = self.open_unloaded_session(session_id).await;
+        if result.is_err() {
+            self.store.unload_history(session_id);
+        }
+        result
+    }
+
+    async fn open_unloaded_session(
+        &mut self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<SessionInfo, AgentError> {
         let record = self
             .store
             .load_record(session_id)

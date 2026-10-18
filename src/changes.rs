@@ -731,7 +731,7 @@ pub(crate) async fn list_tool_changes(
 
     let mut records = warm_records;
     let mut warnings = Vec::new();
-    let mut complete = scan.complete;
+    let mut complete = !scan.skipped;
     if scan.skipped {
         push_warning(&mut warnings, ChangeListWarning::RecordsSkipped);
     }

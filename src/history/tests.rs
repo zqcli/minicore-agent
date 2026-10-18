@@ -346,3 +346,11 @@ fn history_view_debug_redacts_user_and_tool_content() {
     assert!(debug.contains("text_bytes"));
     assert!(debug.contains("content_len"));
 }
+
+fn reset_tool_result_scan_count() {
+    TOOL_RESULT_SCAN_COUNT.with(|count| count.set(0));
+}
+
+fn tool_result_scan_count() -> usize {
+    TOOL_RESULT_SCAN_COUNT.with(Cell::get)
+}

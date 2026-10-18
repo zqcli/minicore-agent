@@ -16,20 +16,60 @@ use crate::error::AgentError;
 use crate::tool_data::{ToolData, ToolDataAvailability, ToolDataStream, ToolOutputRequest};
 
 use super::*;
-use crate::store::tool_records::{fail_aux_blob_write_after, register_aux_temp_creation_gate};
+use crate::store::tool_records::{AUX_BLOB_WRITE_FAILURES, AUX_TEMP_CREATION_GATES};
 
-async fn fixture(label: &str) -> (PathBuf, Store, SessionId) {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-agent-store-{label}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&base).await;
-    let store = Store::open(base.clone()).await.unwrap();
-    let session_id = SessionId::new().unwrap();
-    (base, store, session_id)
+pub(super) async fn fail_append(
+    mut file: File,
+    path: &Path,
+    bytes: &[u8],
+    previous_len: u64,
+    rollback_fails: bool,
+) -> Result<(), AppendError> {
+    file.write_all(&bytes[..bytes.len() / 2]).await.unwrap();
+    file.flush().await.unwrap();
+    if rollback_fails {
+        file = File::open(path).await.unwrap();
+    }
+    Err(super::history::rollback_append(&file, previous_len).await)
 }
 
-fn record(_store: &Store, session_id: SessionId) -> SessionRecord {
+pub(super) async fn pass_summary_gate(session_id: SessionId, deadline: Instant) -> bool {
+    match SUMMARY_COMMIT_GATES.take(&session_id) {
+        Some(gate) => tokio::time::timeout_at(deadline.into(), gate.pass())
+            .await
+            .is_ok(),
+        None => true,
+    }
+}
+
+pub(super) fn fail_blob_write(session_id: SessionId) -> bool {
+    match AUX_BLOB_WRITE_FAILURES.take(&session_id) {
+        Some(0) => true,
+        Some(remaining) => {
+            AUX_BLOB_WRITE_FAILURES.arm(session_id, remaining - 1);
+            false
+        }
+        None => false,
+    }
+}
+
+pub(super) fn note_change_blob(path: &Path) {
+    let root = path.ancestors().nth(5).unwrap().to_path_buf();
+    READ_CHANGE_BLOBS.arm(root, path.to_path_buf());
+}
+
+fn take_read_change_blobs_under(prefix: &Path) -> Vec<PathBuf> {
+    let root = prefix.to_path_buf();
+    std::iter::from_fn(|| READ_CHANGE_BLOBS.take(&root)).collect()
+}
+
+async fn fixture(label: &str) -> (crate::test_support::TempDir, Store, SessionId) {
+    let directory = crate::test_support::TempDir::new(label);
+    let store = Store::open(directory.path().to_path_buf()).await.unwrap();
+    (directory, store, SessionId::new().unwrap())
+}
+
+fn record(session_id: SessionId) -> SessionRecord {
     let now = utc_timestamp().unwrap();
     SessionRecord {
         format_version: SESSION_FORMAT_VERSION,
@@ -48,8 +88,7 @@ fn record(_store: &Store, session_id: SessionId) -> SessionRecord {
     }
 }
 
-fn loop_record(session_id: SessionId, text: &str) -> StoredLoopRecord {
-    let _ = session_id;
+fn loop_record(text: &str) -> StoredLoopRecord {
     let loop_id = LoopId::new().unwrap();
     StoredLoopRecord {
         loop_id,
@@ -216,15 +255,13 @@ async fn append_raw_history_json_line(store: &Store, session_id: SessionId, json
 
 #[tokio::test]
 async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
-    let (base, store, session_id) = fixture("wide-tool-rounds").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (directory, store, session_id) = fixture("wide-tool-rounds").await;
+    let base = directory.path();
+    store.create_session(&record(session_id)).await.unwrap();
     let counts = [0_u64, 32, 65_535, 65_536, 70_000];
     let mut loop_ids = Vec::new();
     for count in counts {
-        let mut entry = loop_record(session_id, "count fixture");
+        let mut entry = loop_record("count fixture");
         entry.tool_rounds = count;
         loop_ids.push(entry.loop_id);
         // Old records have the same JSON integer representation, without
@@ -235,7 +272,7 @@ async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
         append_raw_history_json_line(&store, session_id, &value.to_string()).await;
     }
     drop(store);
-    let reopened = Store::open(base.clone()).await.unwrap();
+    let reopened = Store::open(base.to_path_buf()).await.unwrap();
     assert_eq!(
         reopened
             .load_session(session_id)
@@ -262,7 +299,7 @@ async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
         assert_eq!(entry.tool_rounds, count);
     }
     let page = reopened
-        .read_history_page(session_id, 0, 100, None, None, None, None, None, &limits)
+        .read_history_page(session_id, 0, 100, None, None, None, None, &limits)
         .await
         .unwrap();
     assert_eq!(
@@ -272,16 +309,16 @@ async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
             .collect::<Vec<_>>(),
         counts
     );
-    fs::remove_dir_all(base).await.unwrap();
 }
 
 #[tokio::test]
 async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible() {
-    let (base, store, session_id) = fixture("user-times").await;
-    let session = record(&store, session_id);
+    let (directory, store, session_id) = fixture("user-times").await;
+    let base = directory.path();
+    let session = record(session_id);
     store.create_session(&session).await.unwrap();
 
-    let mut valid = loop_record(session_id, "same");
+    let mut valid = loop_record("same");
     let loop_id = valid.loop_id;
     valid.user_times = Some(vec![Some("2026-09-05T14:05:06.007Z".to_owned())]);
     store.append_loop(session_id, &valid).await.unwrap();
@@ -292,7 +329,7 @@ async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible
     );
 
     // A missing optional field remains the old JSONL compatibility path.
-    let old = loop_record(session_id, "old");
+    let old = loop_record("old");
     store.append_loop(session_id, &old).await.unwrap();
     let history_path = base
         .join(SESSIONS_DIR)
@@ -306,14 +343,14 @@ async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible
         old_jsonl_before_load
     );
 
-    let mut invalid_timestamp = loop_record(session_id, "invalid");
+    let mut invalid_timestamp = loop_record("invalid");
     invalid_timestamp.user_times = Some(vec![Some("not-a-timestamp".to_owned())]);
     store
         .append_loop(session_id, &invalid_timestamp)
         .await
         .unwrap();
 
-    let mut too_many = loop_record(session_id, "too many");
+    let mut too_many = loop_record("too many");
     too_many.user_times = Some(vec![
         Some("2026-09-05T14:05:06.007Z".to_owned()),
         Some("extra".to_owned()),
@@ -328,16 +365,12 @@ async fn user_time_metadata_is_bounded_validated_and_old_records_stay_compatible
             .contains_key(&(invalid_timestamp.loop_id, 0))
     );
     assert!(!loaded.user_times.contains_key(&(too_many.loop_id, 0)));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn user_time_metadata_does_not_displace_core_at_line_limit() {
-    let (base, store, session_id) = fixture("user-times-line-limit").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("user-times-line-limit").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let mut loop_record: StoredLoopRecord =
         serde_json::from_slice(&loop_line_with_size(MAX_LOOP_RECORD_BYTES - 32)).unwrap();
     let user_count = loop_record
@@ -355,16 +388,12 @@ async fn user_time_metadata_does_not_displace_core_at_line_limit() {
     let loaded = store.load_session(session_id).await.unwrap();
     assert_eq!(loaded.history.len(), user_count);
     assert!(loaded.user_times.is_empty());
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn same_text_users_keep_occurrence_when_one_time_is_invalid() {
-    let (base, store, session_id) = fixture("user-time-occurrence").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("user-time-occurrence").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let mut loop_record = loop_record_with_users(&["same", "same"]);
     let loop_id = loop_record.loop_id;
     let valid_time = "2026-09-05T14:05:06.007Z";
@@ -390,22 +419,18 @@ async fn same_text_users_keep_occurrence_when_one_time_is_invalid() {
         loaded.user_times.get(&(loop_id, 1)).map(String::as_str),
         Some(valid_time)
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn malformed_user_time_json_does_not_block_history_read_or_append() {
-    let (base, store, session_id) = fixture("malformed-user-times").await;
+    let (_directory, store, session_id) = fixture("malformed-user-times").await;
+    store.create_session(&record(session_id)).await.unwrap();
     store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    store
-        .append_loop(session_id, &loop_record(session_id, "before"))
+        .append_loop(session_id, &loop_record("before"))
         .await
         .unwrap();
 
-    let malformed_shape = serde_json::to_value(loop_record(session_id, "object")).unwrap();
+    let malformed_shape = serde_json::to_value(loop_record("object")).unwrap();
     let malformed_shape = {
         let mut value = malformed_shape;
         value["user_times"] = json!({"unexpected": "shape"});
@@ -413,7 +438,7 @@ async fn malformed_user_time_json_does_not_block_history_read_or_append() {
     };
     append_raw_history_line(&store, session_id, malformed_shape).await;
 
-    let malformed_entry = serde_json::to_value(loop_record(session_id, "entry")).unwrap();
+    let malformed_entry = serde_json::to_value(loop_record("entry")).unwrap();
     let malformed_entry = {
         let mut value = malformed_entry;
         value["user_times"] = json!([{"unexpected": "entry"}]);
@@ -434,107 +459,52 @@ async fn malformed_user_time_json_does_not_block_history_read_or_append() {
     assert!(loaded.user_times.is_empty());
 
     store
-        .append_loop(session_id, &loop_record(session_id, "after"))
+        .append_loop(session_id, &loop_record("after"))
         .await
         .unwrap();
     assert_eq!(
         store.load_session(session_id).await.unwrap().history.len(),
         4
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
-async fn core_history_corruption_is_still_rejected() {
-    let (base, store, session_id) = fixture("core-history-corrupt").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let mut value = serde_json::to_value(loop_record(session_id, "core")).unwrap();
-    value["items"] = json!("not-an-items-array");
-    value["user_times"] = json!({"unexpected": "shape"});
-    append_raw_history_line(&store, session_id, value).await;
-
-    assert!(matches!(
-        store.load_session(session_id).await,
-        Err(StoreError::Corrupt)
-    ));
-    let _ = fs::remove_dir_all(base).await;
-}
-
-#[tokio::test]
-async fn duplicate_core_json_fields_are_rejected() {
-    let (base, store, session_id) = fixture("duplicate-core-field").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let raw = serde_json::to_string(&loop_record(session_id, "duplicate core")).unwrap();
-    let duplicate_items = raw.replacen("\"items\":", "\"items\":[],\"items\":", 1);
-    append_raw_history_json_line(&store, session_id, &duplicate_items).await;
-
-    assert!(matches!(
-        store.load_session(session_id).await,
-        Err(StoreError::Corrupt)
-    ));
-    let _ = fs::remove_dir_all(base).await;
-}
-
-#[tokio::test]
-async fn duplicate_user_time_json_fields_are_rejected() {
-    let (base, store, session_id) = fixture("duplicate-user-times-field").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let mut loop_record = loop_record(session_id, "duplicate user times");
-    loop_record.user_times = Some(vec![Some("2026-09-05T14:05:06.007Z".to_owned())]);
-    let raw = serde_json::to_string(&loop_record).unwrap();
-    let duplicate_user_times =
-        raw.replacen("\"user_times\":", "\"user_times\":null,\"user_times\":", 1);
-    append_raw_history_json_line(&store, session_id, &duplicate_user_times).await;
-
-    assert!(matches!(
-        store.load_session(session_id).await,
-        Err(StoreError::Corrupt)
-    ));
-    let _ = fs::remove_dir_all(base).await;
-}
-
-#[tokio::test]
-async fn unknown_and_wrong_type_core_json_fields_are_rejected() {
-    let unknown_field = {
-        let mut raw =
-            serde_json::to_string(&loop_record(SessionId::new().unwrap(), "unknown")).unwrap();
-        raw.insert_str(raw.len() - 1, ",\"unknown_core\":true");
-        raw
-    };
-    let wrong_type = {
-        let mut raw =
-            serde_json::to_string(&loop_record(SessionId::new().unwrap(), "wrong")).unwrap();
-        let field = "\"items\":";
-        let value_start = raw.find(field).unwrap() + field.len();
-        let value_end = raw[value_start..].find("],\"usage\"").unwrap() + value_start + 1;
-        raw.replace_range(value_start..value_end, "\"not-an-items-array\"");
-        raw
-    };
-
+async fn malformed_history_json_is_rejected() {
+    let mut entry = loop_record("core");
+    entry.user_times = Some(vec![Some("2026-09-05T14:05:06.007Z".to_owned())]);
+    let raw = serde_json::to_string(&entry).unwrap();
+    let mut unknown = serde_json::to_value(&entry).unwrap();
+    unknown["unknown_core"] = json!(true);
+    let mut wrong_type = serde_json::to_value(&entry).unwrap();
+    wrong_type["items"] = json!("not-an-items-array");
+    let mut wrong_core_and_metadata = wrong_type.clone();
+    wrong_core_and_metadata["user_times"] = json!({"unexpected": "shape"});
     for (label, raw) in [
-        ("unknown-core-field", unknown_field),
-        ("wrong-type-core-field", wrong_type),
+        ("unknown-core-field", unknown.to_string()),
+        ("wrong-type-core-field", wrong_type.to_string()),
+        (
+            "core-and-metadata-corrupt",
+            wrong_core_and_metadata.to_string(),
+        ),
+        (
+            "duplicate-core-field",
+            raw.replacen("\"items\":", "\"items\":[],\"items\":", 1),
+        ),
+        (
+            "duplicate-user-times",
+            raw.replacen("\"user_times\":", "\"user_times\":null,\"user_times\":", 1),
+        ),
     ] {
-        let (base, store, session_id) = fixture(label).await;
-        store
-            .create_session(&record(&store, session_id))
-            .await
-            .unwrap();
+        let (_directory, store, session_id) = fixture(label).await;
+        store.create_session(&record(session_id)).await.unwrap();
         append_raw_history_json_line(&store, session_id, &raw).await;
-        assert!(matches!(
-            store.load_session(session_id).await,
-            Err(StoreError::Corrupt)
-        ));
-        let _ = fs::remove_dir_all(base).await;
+        assert!(
+            matches!(
+                store.load_session(session_id).await,
+                Err(StoreError::Corrupt)
+            ),
+            "{label}"
+        );
     }
 }
 
@@ -592,8 +562,8 @@ fn loop_line_with_size(target: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn create_round_trip_and_delete() {
-    let (base, store, session_id) = fixture("create").await;
-    let record = record(&store, session_id);
+    let (_directory, store, session_id) = fixture("create").await;
+    let record = record(session_id);
     store.create_session(&record).await.unwrap();
 
     let directory = store.session_directory(session_id);
@@ -622,13 +592,12 @@ async fn create_round_trip_and_delete() {
         store.load_record(session_id).await,
         Err(StoreError::SessionNotFound)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn extended_reasoning_values_round_trip_in_record_and_history() {
-    let (base, store, session_id) = fixture("extended-reasoning").await;
-    let mut session_record = record(&store, session_id);
+    let (_directory, store, session_id) = fixture("extended-reasoning").await;
+    let mut session_record = record(session_id);
     store.create_session(&session_record).await.unwrap();
 
     let values = [
@@ -702,22 +671,18 @@ async fn extended_reasoning_values_round_trip_in_record_and_history() {
         assert!(view_serialized.contains(&format!("\"reasoning_level\":\"{wire}\"")));
     }
     assert_eq!(loaded.record.reasoning, ReasoningPreference::Ultra);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn append_and_load_flatten_history_in_order() {
-    let (base, store, session_id) = fixture("append").await;
+    let (_directory, store, session_id) = fixture("append").await;
+    store.create_session(&record(session_id)).await.unwrap();
     store
-        .create_session(&record(&store, session_id))
+        .append_loop(session_id, &loop_record("first"))
         .await
         .unwrap();
     store
-        .append_loop(session_id, &loop_record(session_id, "first"))
-        .await
-        .unwrap();
-    store
-        .append_loop(session_id, &loop_record(session_id, "second"))
+        .append_loop(session_id, &loop_record("second"))
         .await
         .unwrap();
 
@@ -731,18 +696,14 @@ async fn append_and_load_flatten_history_in_order() {
         })
         .collect::<Vec<_>>();
     assert_eq!(texts, vec!["first".to_owned(), "second".to_owned()]);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn final_partial_line_is_ignored_and_truncated() {
-    let (base, store, session_id) = fixture("partial").await;
+    let (_directory, store, session_id) = fixture("partial").await;
+    store.create_session(&record(session_id)).await.unwrap();
     store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    store
-        .append_loop(session_id, &loop_record(session_id, "first"))
+        .append_loop(session_id, &loop_record("first"))
         .await
         .unwrap();
     let history_path = store.session_directory(session_id).join(HISTORY_FILE);
@@ -759,21 +720,17 @@ async fn final_partial_line_is_ignored_and_truncated() {
 
     // After the repair, a new append is still legal.
     store
-        .append_loop(session_id, &loop_record(session_id, "second"))
+        .append_loop(session_id, &loop_record("second"))
         .await
         .unwrap();
     let loaded = store.load_session(session_id).await.unwrap();
     assert_eq!(loaded.history.len(), 2);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn first_partial_line_only_is_truncated_to_empty_then_append_works() {
-    let (base, store, session_id) = fixture("only-partial").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("only-partial").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let history_path = store.session_directory(session_id).join(HISTORY_FILE);
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
@@ -789,21 +746,18 @@ async fn first_partial_line_only_is_truncated_to_empty_then_append_works() {
     assert_eq!(fs::metadata(&history_path).await.unwrap().len(), 0);
 
     store
-        .append_loop(session_id, &loop_record(session_id, "first"))
+        .append_loop(session_id, &loop_record("first"))
         .await
         .unwrap();
     let loaded = store.load_session(session_id).await.unwrap();
     assert_eq!(loaded.history.len(), 1);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn oversized_final_partial_line_is_repaired_and_appendable() {
-    let (base, store, session_id) = fixture("oversized-partial").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (directory, store, session_id) = fixture("oversized-partial").await;
+    let base = directory.path();
+    store.create_session(&record(session_id)).await.unwrap();
     let history_path = store.session_directory(session_id).join(HISTORY_FILE);
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
@@ -821,22 +775,18 @@ async fn oversized_final_partial_line_is_repaired_and_appendable() {
     assert_eq!(fs::metadata(&history_path).await.unwrap().len(), 0);
 
     store
-        .append_loop(session_id, &loop_record(session_id, "after repair"))
+        .append_loop(session_id, &loop_record("after repair"))
         .await
         .unwrap();
-    let reopened = Store::open(base.clone()).await.unwrap();
+    let reopened = Store::open(base.to_path_buf()).await.unwrap();
     let loaded = reopened.load_session(session_id).await.unwrap();
     assert_eq!(loaded.history.len(), 1);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn legal_complete_line_at_limit_is_accepted_but_just_over_limit_is_corrupt() {
-    let (base, store, session_id) = fixture("line-boundary").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("line-boundary").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let history_path = store.session_directory(session_id).join(HISTORY_FILE);
 
     let at_limit = loop_line_with_size(MAX_LOOP_RECORD_BYTES);
@@ -859,16 +809,12 @@ async fn legal_complete_line_at_limit_is_accepted_but_just_over_limit_is_corrupt
         store.load_session(session_id).await,
         Err(StoreError::Corrupt)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn missing_history_file_is_corrupt_but_list_still_reads() {
-    let (base, store, session_id) = fixture("missing-history").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("missing-history").await;
+    store.create_session(&record(session_id)).await.unwrap();
     fs::remove_file(store.session_directory(session_id).join(HISTORY_FILE))
         .await
         .unwrap();
@@ -881,16 +827,12 @@ async fn missing_history_file_is_corrupt_but_list_still_reads() {
     let records = store.list_sessions().await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].session_id, session_id);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn oversized_session_record_is_corrupt() {
-    let (base, store, session_id) = fixture("oversized-record").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("oversized-record").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let record_path = store
         .session_directory(session_id)
         .join(SESSION_RECORD_FILE);
@@ -909,7 +851,6 @@ async fn oversized_session_record_is_corrupt() {
         store.load_session(session_id).await,
         Err(StoreError::Corrupt)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[cfg(unix)]
@@ -917,18 +858,14 @@ async fn oversized_session_record_is_corrupt() {
 async fn store_root_symlink_is_rejected() {
     use std::os::unix::fs::symlink;
 
-    let label = format!("root-symlink-{}", std::process::id());
-    let root_area = std::env::temp_dir().join(label);
-    let _ = fs::remove_dir_all(&root_area).await;
-    let base = root_area.join("data");
-    let real = root_area.join("real");
+    let directory = crate::test_support::TempDir::new("root-symlink");
+    let base = directory.path().join("data");
+    let real = directory.path().join("real");
     fs::create_dir_all(&real).await.unwrap();
     symlink(&real, &base).unwrap();
 
     let result = Store::open(base.clone()).await;
     assert!(matches!(result, Err(StoreError::InvalidRoot)));
-    let _ = fs::remove_file(&base).await;
-    let _ = fs::remove_dir_all(&root_area).await;
 }
 
 #[cfg(unix)]
@@ -936,8 +873,9 @@ async fn store_root_symlink_is_rejected() {
 async fn post_open_sessions_symlink_rejects_all_session_operations() {
     use std::os::unix::fs::symlink;
 
-    let (base, store, session_id) = fixture("sessions-root-symlink").await;
-    let original = record(&store, session_id);
+    let (directory, store, session_id) = fixture("sessions-root-symlink").await;
+    let base = directory.path();
+    let original = record(session_id);
     store.create_session(&original).await.unwrap();
 
     let sessions = store.sessions_directory();
@@ -985,9 +923,9 @@ async fn post_open_sessions_symlink_rejects_all_session_operations() {
     ));
     assert!(matches!(
         store
-            .append_loop(session_id, &loop_record(session_id, "must not append"))
+            .append_loop(session_id, &loop_record("must not append"))
             .await,
-        Err(StoreError::Corrupt)
+        Err(AppendError::NotWritten(StoreError::Corrupt))
     ));
     assert!(matches!(
         store.delete_session(session_id).await,
@@ -995,7 +933,7 @@ async fn post_open_sessions_symlink_rejects_all_session_operations() {
     ));
 
     let new_session_id = SessionId::new().unwrap();
-    let new_record = record(&store, new_session_id);
+    let new_record = record(new_session_id);
     assert!(matches!(
         store.create_session(&new_record).await,
         Err(StoreError::Corrupt)
@@ -1021,18 +959,14 @@ async fn post_open_sessions_symlink_rejects_all_session_operations() {
             .unwrap()
     );
     let _ = fs::remove_file(&sessions).await;
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn middle_corrupt_line_is_corrupt() {
-    let (base, store, session_id) = fixture("corrupt").await;
+    let (_directory, store, session_id) = fixture("corrupt").await;
+    store.create_session(&record(session_id)).await.unwrap();
     store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    store
-        .append_loop(session_id, &loop_record(session_id, "first"))
+        .append_loop(session_id, &loop_record("first"))
         .await
         .unwrap();
     let history_path = store.session_directory(session_id).join(HISTORY_FILE);
@@ -1048,16 +982,12 @@ async fn middle_corrupt_line_is_corrupt() {
         store.load_session(session_id).await,
         Err(StoreError::Corrupt)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn oversized_line_is_corrupt() {
-    let (base, store, session_id) = fixture("oversized").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("oversized").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let history_path = store.session_directory(session_id).join(HISTORY_FILE);
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
@@ -1074,16 +1004,12 @@ async fn oversized_line_is_corrupt() {
         store.load_session(session_id).await,
         Err(StoreError::Corrupt)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn record_too_large_append_is_rejected() {
-    let (base, store, session_id) = fixture("record-too-large").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("record-too-large").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let loop_id = LoopId::new().unwrap();
     let oversized_item = HistoryItem::Assistant(AssistantHistory {
         provider_replay: None,
@@ -1108,16 +1034,15 @@ async fn record_too_large_append_is_rejected() {
     };
     assert!(matches!(
         store.append_loop(session_id, &big).await,
-        Err(StoreError::RecordTooLarge)
+        Err(AppendError::NotWritten(StoreError::RecordTooLarge))
     ));
     let loaded = store.load_session(session_id).await.unwrap();
     assert!(loaded.history.is_empty());
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn old_format_is_skipped_in_list_and_rejected_on_open() {
-    let (base, store, session_id) = fixture("old-format").await;
+    let (_directory, store, session_id) = fixture("old-format").await;
     let directory = store.session_directory(session_id);
     fs::create_dir_all(&directory).await.unwrap();
     fs::write(directory.join(LEGACY_MANIFEST_FILE), b"{}")
@@ -1139,7 +1064,6 @@ async fn old_format_is_skipped_in_list_and_rejected_on_open() {
             .unwrap()
             .is_file()
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[cfg(unix)]
@@ -1147,7 +1071,8 @@ async fn old_format_is_skipped_in_list_and_rejected_on_open() {
 async fn symlink_session_files_are_rejected() {
     use std::os::unix::fs::symlink;
 
-    let (base, store, session_id) = fixture("symlink").await;
+    let (directory, store, session_id) = fixture("symlink").await;
+    let base = directory.path();
     let outside = base.join("outside.json");
     fs::write(&outside, b"{}").await.unwrap();
     let directory = store.session_directory(session_id);
@@ -1158,16 +1083,12 @@ async fn symlink_session_files_are_rejected() {
         store.load_session(session_id).await,
         Err(StoreError::Corrupt)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn unrelated_files_do_not_break_list() {
-    let (base, store, session_id) = fixture("tolerance").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("tolerance").await;
+    store.create_session(&record(session_id)).await.unwrap();
     fs::write(store.sessions_directory().join("not-a-session"), b"x")
         .await
         .unwrap();
@@ -1178,18 +1099,14 @@ async fn unrelated_files_do_not_break_list() {
     let records = store.list_sessions().await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].session_id, session_id);
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn delete_only_removes_the_target_session_directory() {
-    let (base, store, session_id) = fixture("delete-only").await;
+    let (_directory, store, session_id) = fixture("delete-only").await;
     let other = SessionId::new().unwrap();
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    store.create_session(&record(&store, other)).await.unwrap();
+    store.create_session(&record(session_id)).await.unwrap();
+    store.create_session(&record(other)).await.unwrap();
 
     store.delete_session(session_id).await.unwrap();
     assert!(store.load_session(other).await.is_ok());
@@ -1197,16 +1114,12 @@ async fn delete_only_removes_the_target_session_directory() {
         store.load_session(session_id).await,
         Err(StoreError::SessionNotFound)
     ));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn loaded_history_is_sanitized_of_opaque_reasoning() {
-    let (base, store, session_id) = fixture("sanitize").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("sanitize").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let loop_id = LoopId::new().unwrap();
     let tool = ToolCall::new(
         ToolCallId::new("call-1").unwrap(),
@@ -1266,18 +1179,14 @@ async fn loaded_history_is_sanitized_of_opaque_reasoning() {
             .iter()
             .any(|part| part.as_tool_call().is_some())
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn historical_subagent_history_items_remain_generic_and_readable() {
-    let (base, store, session_id) = fixture("legacy-history").await;
-    let mut session = record(&store, session_id);
+    let (_directory, store, session_id) = fixture("legacy-history").await;
+    let mut session = record(session_id);
     session.tools = vec!["read".to_owned(), "subagent".to_owned()];
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    store.create_session(&record(session_id)).await.unwrap();
     store.write_record(&session).await.unwrap();
 
     let loop_id = LoopId::new().unwrap();
@@ -1331,13 +1240,12 @@ async fn historical_subagent_history_items_remain_generic_and_readable() {
     let serialized = serde_json::to_string(loaded.history.as_ref()).unwrap();
     assert!(serialized.contains("subagent"));
     assert!(serialized.contains("historical child result"));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn session_record_validation_accepts_valid_multiline_prompt_and_known_tools() {
-    let (base, store, session_id) = fixture("valid-record").await;
-    let mut record = record(&store, session_id);
+    let (_directory, _store, session_id) = fixture("valid-record").await;
+    let mut record = record(session_id);
     record.system_prompt = concat!(
         "You are a helpful assistant.\n",
         "\tPlease follow instructions:\n",
@@ -1348,13 +1256,12 @@ async fn session_record_validation_accepts_valid_multiline_prompt_and_known_tool
     record.tools = vec!["read".to_owned(), "write".to_owned(), "bash".to_owned()];
     record.model = "provider/model-v1:beta".to_owned();
     assert!(record.validate().is_ok());
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn session_record_validation_rejects_empty_and_control_chars_in_system_prompt() {
-    let (base, store, session_id) = fixture("invalid-prompt").await;
-    let mut record = record(&store, session_id);
+    let (_directory, _store, session_id) = fixture("invalid-prompt").await;
+    let mut record = record(session_id);
 
     record.system_prompt = String::new();
     assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
@@ -1373,13 +1280,12 @@ async fn session_record_validation_rejects_empty_and_control_chars_in_system_pro
 
     record.system_prompt = "hello\n\tworld".to_owned();
     assert!(record.validate().is_ok());
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn session_record_validation_rejects_unknown_and_duplicate_tools() {
-    let (base, store, session_id) = fixture("invalid-tools").await;
-    let mut record = record(&store, session_id);
+    let (_directory, store, session_id) = fixture("invalid-tools").await;
+    let mut record = record(session_id);
 
     record.tools = vec!["read".to_owned(), "unknown_tool".to_owned()];
     assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
@@ -1407,23 +1313,14 @@ async fn session_record_validation_rejects_unknown_and_duplicate_tools() {
     assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
     record.tools = vec!["subagent".to_owned(), "subagent".to_owned()];
     assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn legacy_auxiliary_tool_records_remain_readable() {
-    let (base, store, session_id) = fixture("legacy-auxiliary-tool").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("legacy-auxiliary-tool").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("legacy-subagent").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "legacy-subagent");
     let data = ToolData::new();
     data.note_requested(&tool_ref, "subagent");
     data.note_result(&tool_ref, "historical result");
@@ -1453,13 +1350,12 @@ async fn legacy_auxiliary_tool_records_remain_readable() {
         )
         .unwrap();
     assert_eq!(output.data, "historical result");
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn session_record_validation_rejects_invalid_model_ids() {
-    let (base, store, session_id) = fixture("invalid-model").await;
-    let mut record = record(&store, session_id);
+    let (_directory, _store, session_id) = fixture("invalid-model").await;
+    let mut record = record(session_id);
 
     record.model = String::new();
     assert!(matches!(record.validate(), Err(StoreError::InvalidRecord)));
@@ -1481,21 +1377,20 @@ async fn session_record_validation_rejects_invalid_model_ids() {
 
     record.model = "vendor/model-name:v1.0".to_owned();
     assert!(record.validate().is_ok());
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn invalid_session_record_skipped_by_list_and_rejected_by_open() {
-    let (base, store, valid_id) = fixture("corrupt-record-list-open").await;
+    let (_directory, store, valid_id) = fixture("corrupt-record-list-open").await;
 
-    let valid_record = record(&store, valid_id);
+    let valid_record = record(valid_id);
     store.create_session(&valid_record).await.unwrap();
 
     let invalid_id = SessionId::new().unwrap();
     let invalid_dir = store.session_directory(invalid_id);
     fs::create_dir_all(&invalid_dir).await.unwrap();
 
-    let mut invalid_record = record(&store, invalid_id);
+    let mut invalid_record = record(invalid_id);
     invalid_record.system_prompt = String::new();
     let invalid_bytes = serde_json::to_vec(&invalid_record).unwrap();
     fs::write(invalid_dir.join(SESSION_RECORD_FILE), invalid_bytes)
@@ -1513,17 +1408,15 @@ async fn invalid_session_record_skipped_by_list_and_rejected_by_open() {
     assert!(matches!(open_result, Err(StoreError::Corrupt)));
 
     assert!(store.load_session(valid_id).await.is_ok());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
-    let (base, store, session_id) = fixture("readonly-scan-limits").await;
-    let record = record(&store, session_id);
+    let (_directory, store, session_id) = fixture("readonly-scan-limits").await;
+    let record = record(session_id);
     store.create_session(&record).await.unwrap();
     store
-        .append_loop(session_id, &loop_record(session_id, "scan me"))
+        .append_loop(session_id, &loop_record("scan me"))
         .await
         .unwrap();
 
@@ -1537,7 +1430,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, None, &limits,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, &limits,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1550,7 +1443,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, None, &expired,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, &expired,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1563,7 +1456,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, None, &capped,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, &capped,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1576,27 +1469,17 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
             Err(StoreError::QueryLimit)
         ));
     }
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn rejected_aux_budget_does_not_create_an_auxiliary_directory() {
-    let (base, store, session_id) = fixture("aux-rejected-directory").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-rejected-directory").await;
+    store.create_session(&record(session_id)).await.unwrap();
     let store = store.with_aux_limits(AuxLimits {
         global_bytes: 0,
         ..DEFAULT_AUX_LIMITS
     });
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("rejected").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "rejected");
     let data = crate::tool_data::ToolData::new();
     data.note_requested(&tool_ref, "read");
     data.note_result(&tool_ref, "ok");
@@ -1620,23 +1503,14 @@ async fn rejected_aux_budget_does_not_create_an_auxiliary_directory() {
             .unwrap()
             .is_empty()
     );
-    fs::remove_dir_all(base).await.unwrap();
 }
 
 #[tokio::test]
 async fn binary_and_utf8_empty_eof_auxiliary_tool_persistence() {
-    let (base, store, session_id) = fixture("aux-binary-utf8").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-binary-utf8").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("bash-call-1").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "bash-call-1");
 
     let input_bytes = b"echo hello\n".to_vec();
     let result_bytes = b"hello\n".to_vec();
@@ -1765,17 +1639,12 @@ async fn binary_and_utf8_empty_eof_auxiliary_tool_persistence() {
     assert!(stderr_page.eof);
     assert_eq!(stderr_page.observed_end, 0);
     assert!(stderr_page.data.is_empty());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn auxiliary_blob_states_preserve_snapshot_files_and_metadata() {
-    let (base, store, session_id) = fixture("aux-blob-states").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-blob-states").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
     let cases: [(&str, [Option<Vec<u8>>; 6]); 3] = [
         ("missing", [None, None, None, None, None, None]),
@@ -1804,12 +1673,7 @@ async fn auxiliary_blob_states_preserve_snapshot_files_and_metadata() {
     ];
 
     for (state, blobs) in cases {
-        let tool_ref = ToolRef {
-            session_id,
-            loop_id: LoopId::new().unwrap(),
-            request_index: 0,
-            tool_call_id: ToolCallId::new(format!("blob-{state}")).unwrap(),
-        };
+        let tool_ref = make_tool_ref(session_id, format!("blob-{state}"));
         let snapshot = auxiliary_snapshot(tool_ref.clone(), blobs);
         store
             .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
@@ -1853,17 +1717,12 @@ async fn auxiliary_blob_states_preserve_snapshot_files_and_metadata() {
             "{state} metadata"
         );
     }
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn empty_process_stream_blobs_remain_corrupt() {
-    let (base, store, session_id) = fixture("aux-empty-stream-corrupt").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-empty-stream-corrupt").await;
+    store.create_session(&record(session_id)).await.unwrap();
     for (index, name) in ["input", "result", "stdout", "stderr"].iter().enumerate() {
         let tool_ref = ToolRef {
             session_id,
@@ -1887,22 +1746,13 @@ async fn empty_process_stream_blobs_remain_corrupt() {
             .join(AUX_TOOLS_DIR)
             .exists()
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn file_change_auxiliary_round_trip_and_missing_blob_degrade_details() {
-    let (base, store, session_id) = fixture("file-change-round-trip").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("write-file-change").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("file-change-round-trip").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "write-file-change");
     let data = ToolData::new();
     data.note_requested(&tool_ref, "write");
     data.note_file_change(
@@ -2019,16 +1869,13 @@ async fn file_change_auxiliary_round_trip_and_missing_blob_degrade_details() {
             .await
             .unwrap()
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs() {
-    let (base, store, session_id) = fixture("change-cold-pages").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (directory, store, session_id) = fixture("change-cold-pages").await;
+    let base = directory.path();
+    store.create_session(&record(session_id)).await.unwrap();
 
     // 12 persisted native records; only the page's records are ever verified.
     let mut refs = Vec::new();
@@ -2091,7 +1938,6 @@ async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs()
         .await
         .unwrap();
     assert_eq!(scan.records.len(), 12);
-    assert!(scan.complete);
     assert!(!scan.skipped);
     assert!(scan.metadata_bytes > 0);
     assert!(scan.entries >= 12);
@@ -2145,7 +1991,7 @@ async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs()
             .unwrap()
             .to_owned()
     };
-    let _ = take_read_change_blobs_under(&base);
+    let _ = take_read_change_blobs_under(base);
     let mut cursor = None;
     let mut seen = std::collections::BTreeSet::new();
     let mut pages = 0;
@@ -2165,7 +2011,7 @@ async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs()
         .unwrap();
         assert!(!page.records.is_empty());
         let expected_dirs = page_dirs(&page);
-        let attempts = take_read_change_blobs_under(&base);
+        let attempts = take_read_change_blobs_under(base);
         assert!(
             !attempts.is_empty(),
             "page {pages} did not attempt any blob verification"
@@ -2235,24 +2081,14 @@ async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs()
         turn_page.records[0].tool_ref.as_ref().unwrap().loop_id,
         refs[0].loop_id
     );
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn corrupt_change_metadata_is_skipped_without_corrupting_the_store() {
-    let (base, store, session_id) = fixture("change-metadata-corrupt").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("change-metadata-corrupt").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let good_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("good").unwrap(),
-    };
+    let good_ref = make_tool_ref(session_id, "good");
     let data = ToolData::new();
     data.note_requested(&good_ref, "write");
     data.note_file_change(
@@ -2345,17 +2181,12 @@ async fn corrupt_change_metadata_is_skipped_without_corrupting_the_store() {
             .iter()
             .any(|record| record.path == "good.txt")
     );
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn change_scan_entry_and_metadata_budgets_reserve_before_io() {
-    let (base, store, session_id) = fixture("change-scan-budget").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("change-scan-budget").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
     let mut refs = Vec::new();
     for index in 0..3u32 {
@@ -2412,7 +2243,6 @@ async fn change_scan_entry_and_metadata_budgets_reserve_before_io() {
         )
         .await
         .unwrap();
-    assert!(!scan.complete);
     assert!(scan.skipped);
     assert!(
         scan.entries <= 1,
@@ -2456,7 +2286,6 @@ async fn change_scan_entry_and_metadata_budgets_reserve_before_io() {
         )
         .await
         .unwrap();
-    assert!(!oversized_scan.complete);
     assert!(oversized_scan.skipped);
     assert_eq!(
         oversized_scan.records.len(),
@@ -2500,23 +2329,13 @@ async fn change_scan_entry_and_metadata_budgets_reserve_before_io() {
             .unwrap()
     );
     assert!(blob_budget.exhausted, "the lookahead crosses the budget");
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
-    let (base, store, session_id) = fixture("diff-warm-cold").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-warm").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("diff-warm-cold").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "diff-warm");
     let data = ToolData::new();
     data.note_requested(&tool_ref, "write");
     data.note_file_change(
@@ -2631,24 +2450,14 @@ async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
     )
     .await;
     assert!(matches!(miss, Err(AgentError::ToolNotFound)));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn cold_changes_diff_caller_cancel_keeps_store_owned_worker() {
-    let (base, store, session_id) = fixture("diff-cold-caller-cancel").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("diff-cold-caller-cancel").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-cold-cancel").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "diff-cold-cancel");
     let before = b"before\n".to_vec();
     let after = b"after\n".to_vec();
     let snapshot = auxiliary_snapshot(
@@ -2713,23 +2522,13 @@ async fn cold_changes_diff_caller_cancel_keeps_store_owned_worker() {
     assert_eq!(store.registered_diff_workers(), 1);
     store.shutdown_diff_workers().await;
     assert_eq!(store.registered_diff_workers(), 0);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_missing_before_is_an_addition_and_empty_content_is_not_binary() {
-    let (base, store, session_id) = fixture("diff-missing-before").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-added").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("diff-missing-before").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "diff-added");
     let data = ToolData::new();
     data.note_requested(&tool_ref, "write");
     data.note_file_change(
@@ -2791,23 +2590,13 @@ async fn diff_missing_before_is_an_addition_and_empty_content_is_not_binary() {
             .flat_map(|hunk| &hunk.lines)
             .any(|line| line.kind == crate::diff::DiffLineKind::Added)
     );
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_corrupt_or_missing_snapshots_report_unavailable_not_empty() {
-    let (base, store, session_id) = fixture("diff-corrupt").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-corrupt").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("diff-corrupt").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "diff-corrupt");
     let data = ToolData::new();
     data.note_requested(&tool_ref, "write");
     data.note_file_change(
@@ -2868,23 +2657,13 @@ async fn diff_corrupt_or_missing_snapshots_report_unavailable_not_empty() {
     );
     assert!(result.hunks.is_empty());
     assert!(!result.binary);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_warm_half_merges_with_its_disk_counterpart_only() {
-    let (base, store, session_id) = fixture("diff-half-merge").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-half").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("diff-half-merge").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "diff-half");
     let before = b"user dirty\n".to_vec();
     let after = b"agent clean\n".to_vec();
     let data = ToolData::new();
@@ -2957,23 +2736,13 @@ async fn diff_warm_half_merges_with_its_disk_counterpart_only() {
     assert_eq!(merged.1.before_bytes.as_deref(), Some(before.as_slice()));
     assert_eq!(merged.1.after_bytes.as_deref(), Some(after.as_slice()));
     assert!(merged.1.details_available());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_metadata_conflict_keeps_the_valid_warm_side() {
-    let (base, store, session_id) = fixture("diff-meta-conflict").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-conflict").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("diff-meta-conflict").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "diff-conflict");
     let disk_before = b"disk before\n".to_vec();
     let disk_after = b"disk after\n".to_vec();
     let data = ToolData::new();
@@ -3051,23 +2820,13 @@ async fn diff_metadata_conflict_keeps_the_valid_warm_side() {
     );
     assert!(resolved.1.after_bytes.is_none());
     assert!(!resolved.1.details_available());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_cursor_hint_must_match_the_resolved_reference() {
-    let (base, store, session_id) = fixture("diff-hint").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-hint").unwrap(),
-    };
+    let (_directory, store, session_id) = fixture("diff-hint").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "diff-hint");
     let data = ToolData::new();
     data.note_requested(&tool_ref, "write");
     data.note_file_change(
@@ -3143,17 +2902,12 @@ async fn diff_cursor_hint_must_match_the_resolved_reference() {
         .await,
         Err(AgentError::InvalidArguments)
     ));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_worker_capacity_is_bounded_and_shutdown_joins() {
-    let (base, store, session_id) = fixture("diff-workers").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("diff-workers").await;
+    store.create_session(&record(session_id)).await.unwrap();
     // Hold every worker slot with a distinct, gated comparison so capacity
     // cannot drain before the overflow attempt.
     let mut held = Vec::new();
@@ -3211,13 +2965,11 @@ async fn diff_worker_capacity_is_bounded_and_shutdown_joins() {
         ),
         Err(StoreError::QueryLimit)
     ));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_cancelled_admission_refuses_to_spawn_a_worker() {
-    let (base, store, session_id) = fixture("diff-admission-cancelled").await;
+    let (_directory, store, session_id) = fixture("diff-admission-cancelled").await;
     let admission = CancellationToken::new();
     admission.cancel();
     // A closing Session's token is observed under the registry lock, so no
@@ -3260,13 +3012,11 @@ async fn diff_cancelled_admission_refuses_to_spawn_a_worker() {
     assert!(matches!(query.wait().await, Err(AgentError::QueryLimit)));
     store.shutdown_diff_workers().await;
     assert_eq!(store.registered_diff_workers(), 0);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_shutdown_drop_and_concurrent_join_really_stop_the_worker() {
-    let (base, store, session_id) = fixture("diff-shutdown-reentrant").await;
+    let (_directory, store, session_id) = fixture("diff-shutdown-reentrant").await;
     let before: Arc<[u8]> = Arc::from(b"one\n".to_vec());
     let after: Arc<[u8]> = Arc::from(b"ONE\n".to_vec());
     let gate = Arc::new(crate::diff::DiffGate::new());
@@ -3291,12 +3041,11 @@ async fn diff_shutdown_drop_and_concurrent_join_really_stop_the_worker() {
         .await
         .expect("shutdown did not join the cancelled worker");
     assert_eq!(store.registered_diff_workers(), 0);
-    let _ = fs::remove_dir_all(base).await;
 
     // A shutdown future dropped before it joins must not detach the handle.
     // The same owner is still registered and a later (or concurrent)
     // shutdown joins the same worker instead of returning early.
-    let (base, store, session_id) = fixture("diff-shutdown-dropped").await;
+    let (_directory, store, session_id) = fixture("diff-shutdown-dropped").await;
     let before: Arc<[u8]> = Arc::from(b"two\n".to_vec());
     let after: Arc<[u8]> = Arc::from(b"TWO\n".to_vec());
     let gate = Arc::new(crate::diff::DiffGate::new());
@@ -3323,13 +3072,11 @@ async fn diff_shutdown_drop_and_concurrent_join_really_stop_the_worker() {
         tokio::join!(store.shutdown_diff_workers(), store.shutdown_diff_workers());
     let _ = (first, second);
     assert_eq!(store.registered_diff_workers(), 0);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn diff_session_shutdown_joins_only_that_session() {
-    let (base, store, first) = fixture("diff-session-join-a").await;
+    let (_directory, store, first) = fixture("diff-session-join-a").await;
     let second = SessionId::new().unwrap();
     let before_a: Arc<[u8]> = Arc::from(b"alpha\n".to_vec());
     let after_a: Arc<[u8]> = Arc::from(b"ALPHA\n".to_vec());
@@ -3376,24 +3123,14 @@ async fn diff_session_shutdown_joins_only_that_session() {
     drop(query_b);
     store.shutdown_diff_workers().await;
     assert_eq!(store.registered_diff_workers(), 0);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn valid_temp_directory_does_not_mark_tool_change_scan_incomplete() {
-    let (base, store, session_id) = fixture("temp-scan-complete").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("temp-scan-complete").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-temp-1").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-temp-1");
     let valid_hash = tool_ref_hash(&tool_ref);
     let temp_dir = store
         .session_directory(session_id)
@@ -3410,86 +3147,18 @@ async fn valid_temp_directory_does_not_mark_tool_change_scan_incomplete() {
         )
         .await
         .unwrap();
-    assert!(scan.complete);
     assert!(!scan.skipped);
     assert!(scan.records.is_empty());
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn complete_identity_and_path_traversal_protection() {
-    let (base, store, session_id) = fixture("aux-identity-path").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-identity-path").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-1").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-1");
 
-    let snapshot = ToolPersistenceSnapshot {
-        tool_ref: tool_ref.clone(),
-        record: StoredToolRecord {
-            version: TOOL_RECORD_FORMAT_VERSION,
-            tool_ref: tool_ref.clone(),
-            name: "bash".to_owned(),
-            subject: ToolSubject::Other,
-            subject_truncated: false,
-            state: ToolExecutionState::Succeeded,
-            phase: None,
-            started_at: None,
-            finished_at: None,
-            outcome: Some(ToolResultOutcome::Success),
-            input: StoredInputSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            result: StoredResultSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stdout: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stderr: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            command: None,
-            file_change: None,
-        },
-        input_bytes: None,
-        result_bytes: None,
-        stdout_bytes: None,
-        stderr_bytes: None,
-        file_change_before: None,
-        file_change_after: None,
-    };
+    let snapshot = empty_snapshot(tool_ref.clone());
 
     store
         .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
@@ -3508,12 +3177,7 @@ async fn complete_identity_and_path_traversal_protection() {
     assert!(expected_dir.is_dir());
 
     // Mismatched ToolRef query on different loop or call returns None
-    let other_tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-1").unwrap(),
-    };
+    let other_tool_ref = make_tool_ref(session_id, "call-1");
     assert!(
         store
             .read_tool_record(&other_tool_ref)
@@ -3521,24 +3185,14 @@ async fn complete_identity_and_path_traversal_protection() {
             .unwrap()
             .is_none()
     );
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn atomic_publishing_idempotent_overwrite_and_cleanup_on_failure() {
-    let (base, store, session_id) = fixture("aux-atomic-idempotent").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-atomic-idempotent").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-idempotent").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-idempotent");
 
     let snapshot = ToolPersistenceSnapshot {
         tool_ref: tool_ref.clone(),
@@ -3613,7 +3267,7 @@ async fn atomic_publishing_idempotent_overwrite_and_cleanup_on_failure() {
         .unwrap();
 
     // Injected failure cleans up temporary directory without corrupting target
-    fail_next_aux_write(session_id);
+    crate::store::AUX_WRITE_FAILURES.arm(session_id, ());
     assert!(matches!(
         store
             .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
@@ -3623,24 +3277,14 @@ async fn atomic_publishing_idempotent_overwrite_and_cleanup_on_failure() {
 
     // Read still succeeds
     assert!(store.read_tool_record(&tool_ref).await.unwrap().is_some());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn auxiliary_mid_write_failure_removes_partial_commit() {
-    let (base, store, session_id) = fixture("aux-mid-write-cleanup").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-mid-write-cleanup").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("mid-write-cleanup").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "mid-write-cleanup");
     let snapshot = auxiliary_snapshot(
         tool_ref.clone(),
         [
@@ -3652,7 +3296,7 @@ async fn auxiliary_mid_write_failure_removes_partial_commit() {
             Some(b"after".to_vec()),
         ],
     );
-    fail_aux_blob_write_after(session_id, 1);
+    AUX_BLOB_WRITE_FAILURES.arm(session_id, 1);
     assert!(matches!(
         store
             .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
@@ -3668,23 +3312,14 @@ async fn auxiliary_mid_write_failure_removes_partial_commit() {
         !tools_dir.join(tool_ref_hash(&tool_ref)).exists(),
         "partial temp commit must not publish a target"
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn auxiliary_deadline_after_temp_creation_removes_partial_commit() {
-    let (base, store, session_id) = fixture("aux-deadline-cleanup").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-deadline-cleanup").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("deadline-cleanup").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "deadline-cleanup");
     let snapshot = auxiliary_snapshot(
         tool_ref.clone(),
         [
@@ -3696,17 +3331,17 @@ async fn auxiliary_deadline_after_temp_creation_removes_partial_commit() {
             None,
         ],
     );
-    let gate = Arc::new(AuxCommitGate::new());
-    register_aux_temp_creation_gate(session_id, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    AUX_TEMP_CREATION_GATES.arm(session_id, Arc::clone(&gate));
     let deadline = Instant::now() + Duration::from_millis(500);
     let store_for_task = store.clone();
     let task =
         tokio::spawn(async move { store_for_task.commit_tool_record(&snapshot, deadline).await });
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_started())
         .await
         .expect("auxiliary commit did not create its temp directory");
     tokio::time::sleep_until(deadline.into()).await;
-    gate.release.notify_one();
+    gate.release();
 
     assert!(matches!(task.await.unwrap(), Err(StoreError::Unavailable)));
     let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
@@ -3718,23 +3353,14 @@ async fn auxiliary_deadline_after_temp_creation_removes_partial_commit() {
         !tools_dir.join(tool_ref_hash(&tool_ref)).exists(),
         "expired temp commit must not publish a target"
     );
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn metadata_and_blob_corruption_handling() {
-    let (base, store, session_id) = fixture("aux-corrupt").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-corrupt").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-corrupt").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-corrupt");
 
     let stdout_bytes = b"authoritative stdout tail".to_vec();
     let snapshot = ToolPersistenceSnapshot {
@@ -3870,17 +3496,12 @@ async fn metadata_and_blob_corruption_handling() {
         store.read_tool_record(&tool_ref).await,
         Err(StoreError::UnsupportedFormat)
     ));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn auxiliary_budget_gc_and_scan_limits() {
-    let (base, store, session_id) = fixture("aux-gc-limits").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-gc-limits").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
     // Set small limits: session max 2 records / 50 KiB; global max 3 records / 80 KiB
     let store = store.with_aux_limits(AuxLimits {
@@ -4018,45 +3639,25 @@ async fn auxiliary_budget_gc_and_scan_limits() {
             .unwrap()
             .is_some()
     );
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn legacy_session_without_tools_directory() {
-    let (base, store, session_id) = fixture("aux-legacy").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-legacy").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-old").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-old");
 
     // No tools directory exists yet; read returns Ok(None), not StoreError::Corrupt
     assert!(store.read_tool_record(&tool_ref).await.unwrap().is_none());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
-async fn scan_limit_hit_in_inner_files_returns_query_limit() {
-    let (base, store, session_id) = fixture("aux-inner-limit").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+async fn aux_ledger_is_not_limited_by_read_query_entry_ceiling() {
+    let (_directory, store, session_id) = fixture("aux-inner-limit").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-scan-inner").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-scan-inner");
 
     let stdout_bytes = b"testing inner scan limit".to_vec();
     let snapshot = ToolPersistenceSnapshot {
@@ -4125,8 +3726,7 @@ async fn scan_limit_hit_in_inner_files_returns_query_limit() {
         .await
         .unwrap();
 
-    // Second commit with max_scan_entries: 1 -> scanning sessions/tools/inner_files
-    // will exceed scan limit inside directory scan!
+    // The read-query entry limit does not disable ledger-based persistence.
     let store_restricted = store.with_aux_limits(AuxLimits {
         session_bytes: 16 * 1024 * 1024,
         session_records: 1024,
@@ -4135,12 +3735,7 @@ async fn scan_limit_hit_in_inner_files_returns_query_limit() {
         max_scan_entries: 1,
     });
 
-    let tool_ref2 = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-scan-inner-2").unwrap(),
-    };
+    let tool_ref2 = make_tool_ref(session_id, "call-scan-inner-2");
     let mut snap2 = snapshot.clone();
     snap2.tool_ref = tool_ref2.clone();
     snap2.record.tool_ref = tool_ref2;
@@ -4148,21 +3743,17 @@ async fn scan_limit_hit_in_inner_files_returns_query_limit() {
     let res = store_restricted
         .commit_tool_record(&snap2, Instant::now() + Duration::from_secs(5))
         .await;
-    assert!(matches!(res, Err(StoreError::QueryLimit)));
-
-    let _ = fs::remove_dir_all(base).await;
+    assert!(res.is_ok());
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn symlink_session_id_dir_is_rejected_and_not_scanned() {
+async fn foreign_symlink_session_is_skipped_and_not_scanned() {
     use std::os::unix::fs::symlink;
 
-    let (base, store, session_id) = fixture("aux-symlink-ses").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (directory, store, session_id) = fixture("aux-symlink-ses").await;
+    let base = directory.path();
+    store.create_session(&record(session_id)).await.unwrap();
 
     // Create an outside directory
     let outside = base.join("outside_dir");
@@ -4173,95 +3764,22 @@ async fn symlink_session_id_dir_is_rejected_and_not_scanned() {
     let symlink_path = store.sessions_directory().join(fake_ses_id.to_string());
     symlink(&outside, &symlink_path).unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-sym-ses").unwrap(),
-    };
-    let snapshot = ToolPersistenceSnapshot {
-        tool_ref: tool_ref.clone(),
-        record: StoredToolRecord {
-            version: TOOL_RECORD_FORMAT_VERSION,
-            tool_ref: tool_ref.clone(),
-            name: "bash".to_owned(),
-            subject: ToolSubject::Other,
-            subject_truncated: false,
-            state: ToolExecutionState::Succeeded,
-            phase: None,
-            started_at: None,
-            finished_at: None,
-            outcome: Some(ToolResultOutcome::Success),
-            input: StoredInputSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            result: StoredResultSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stdout: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stderr: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            command: None,
-            file_change: None,
-        },
-        input_bytes: None,
-        result_bytes: None,
-        stdout_bytes: None,
-        stderr_bytes: None,
-        file_change_before: None,
-        file_change_after: None,
-    };
+    let tool_ref = make_tool_ref(session_id, "call-sym-ses");
+    let snapshot = empty_snapshot(tool_ref.clone());
 
     // Budget enforcement scanning encounters the symlink session entry and must fail closed
     let res = store
         .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
         .await;
-    assert!(matches!(res, Err(StoreError::Corrupt)));
-
-    let _ = fs::remove_dir_all(base).await;
+    assert!(res.is_ok());
 }
 
 #[tokio::test]
 async fn temp_dir_removal_failure_rejects_aux_commit() {
-    let (base, store, session_id) = fixture("aux-temp-fail").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-temp-fail").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-temp-fail").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-temp-fail");
 
     let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
     fs::create_dir_all(&tools_dir).await.unwrap();
@@ -4272,90 +3790,22 @@ async fn temp_dir_removal_failure_rejects_aux_commit() {
         .await
         .unwrap();
 
-    fail_next_remove_temp(session_id);
+    crate::store::FAIL_REMOVE_TEMP_SESSIONS.arm(session_id, ());
 
-    let snapshot = ToolPersistenceSnapshot {
-        tool_ref: tool_ref.clone(),
-        record: StoredToolRecord {
-            version: TOOL_RECORD_FORMAT_VERSION,
-            tool_ref: tool_ref.clone(),
-            name: "bash".to_owned(),
-            subject: ToolSubject::Other,
-            subject_truncated: false,
-            state: ToolExecutionState::Succeeded,
-            phase: None,
-            started_at: None,
-            finished_at: None,
-            outcome: Some(ToolResultOutcome::Success),
-            input: StoredInputSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            result: StoredResultSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stdout: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stderr: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            command: None,
-            file_change: None,
-        },
-        input_bytes: None,
-        result_bytes: None,
-        stdout_bytes: None,
-        stderr_bytes: None,
-        file_change_before: None,
-        file_change_after: None,
-    };
+    let snapshot = empty_snapshot(tool_ref.clone());
 
     let res = store
         .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
         .await;
     assert!(matches!(res, Err(StoreError::Unavailable)));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
-async fn private_temp_directory_with_unknown_files_is_not_deleted_and_rejects_commit() {
-    let (base, store, session_id) = fixture("aux-private-temp").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+async fn private_temp_directory_is_preserved_without_disabling_commits() {
+    let (_directory, store, session_id) = fixture("aux-private-temp").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-private-temp").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-private-temp");
 
     let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
     fs::create_dir_all(&tools_dir).await.unwrap();
@@ -4371,93 +3821,25 @@ async fn private_temp_directory_with_unknown_files_is_not_deleted_and_rejects_co
         .await
         .unwrap();
 
-    let snapshot = ToolPersistenceSnapshot {
-        tool_ref: tool_ref.clone(),
-        record: StoredToolRecord {
-            version: TOOL_RECORD_FORMAT_VERSION,
-            tool_ref: tool_ref.clone(),
-            name: "bash".to_owned(),
-            subject: ToolSubject::Other,
-            subject_truncated: false,
-            state: ToolExecutionState::Succeeded,
-            phase: None,
-            started_at: None,
-            finished_at: None,
-            outcome: Some(ToolResultOutcome::Success),
-            input: StoredInputSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            result: StoredResultSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stdout: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stderr: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            command: None,
-            file_change: None,
-        },
-        input_bytes: None,
-        result_bytes: None,
-        stdout_bytes: None,
-        stderr_bytes: None,
-        file_change_before: None,
-        file_change_after: None,
-    };
+    let snapshot = empty_snapshot(tool_ref.clone());
 
     // Budget enforcement fails closed because of unknown directory
     let res = store
         .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
         .await;
-    assert!(matches!(res, Err(StoreError::Corrupt)));
+    assert!(res.is_ok());
 
     // Critical safety verification: user file and nested directory are NEVER deleted!
     assert!(user_file.exists(), "user file must not be deleted");
     assert!(nested_dir.exists(), "nested directory must not be deleted");
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn legitimate_crashed_temp_directory_is_converged_and_evicted() {
-    let (base, store, session_id) = fixture("aux-crashed-temp").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-crashed-temp").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-crashed-temp").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-crashed-temp");
 
     let tools_dir = store.session_directory(session_id).join(AUX_TOOLS_DIR);
     fs::create_dir_all(&tools_dir).await.unwrap();
@@ -4473,65 +3855,7 @@ async fn legitimate_crashed_temp_directory_is_converged_and_evicted() {
         .await
         .unwrap();
 
-    let snapshot = ToolPersistenceSnapshot {
-        tool_ref: tool_ref.clone(),
-        record: StoredToolRecord {
-            version: TOOL_RECORD_FORMAT_VERSION,
-            tool_ref: tool_ref.clone(),
-            name: "bash".to_owned(),
-            subject: ToolSubject::Other,
-            subject_truncated: false,
-            state: ToolExecutionState::Succeeded,
-            phase: None,
-            started_at: None,
-            finished_at: None,
-            outcome: Some(ToolResultOutcome::Success),
-            input: StoredInputSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            result: StoredResultSummary {
-                total_bytes: 0,
-                seen: false,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stdout: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            stderr: StoredStreamWindow {
-                start_offset: 0,
-                observed_end: 0,
-                seen: false,
-                complete: true,
-                truncated: false,
-                expired: false,
-                file_bytes: 0,
-                file_sha256: None,
-            },
-            command: None,
-            file_change: None,
-        },
-        input_bytes: None,
-        result_bytes: None,
-        stdout_bytes: None,
-        stderr_bytes: None,
-        file_change_before: None,
-        file_change_after: None,
-    };
+    let snapshot = empty_snapshot(tool_ref.clone());
 
     // Commit succeeds and cleans up the orphaned legitimate temp directory
     let res = store
@@ -4542,24 +3866,14 @@ async fn legitimate_crashed_temp_directory_is_converged_and_evicted() {
         !crashed_temp_dir.exists(),
         "orphaned temp dir converged and removed"
     );
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn oversized_metadata_file_bytes_rejected_without_alloc() {
-    let (base, store, session_id) = fixture("aux-oversized-meta").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-oversized-meta").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-oversized").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-oversized");
 
     let hash = tool_ref_hash(&tool_ref);
     let target_dir = store
@@ -4630,24 +3944,14 @@ async fn oversized_metadata_file_bytes_rejected_without_alloc() {
     // Must reject without allocating 100 MiB
     let res = store.read_tool_record(&tool_ref).await;
     assert!(matches!(res, Err(StoreError::RecordTooLarge)));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn invalid_metadata_ranges_and_hashes_rejected() {
-    let (base, store, session_id) = fixture("aux-bad-ranges").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-bad-ranges").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-bad-range").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-bad-range");
 
     let hash = tool_ref_hash(&tool_ref);
     let target_dir = store
@@ -4749,8 +4053,6 @@ async fn invalid_metadata_ranges_and_hashes_rejected() {
         store.read_tool_record(&tool_ref).await,
         Err(StoreError::Corrupt)
     ));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[cfg(unix)]
@@ -4758,18 +4060,11 @@ async fn invalid_metadata_ranges_and_hashes_rejected() {
 async fn single_blob_symlink_only_marks_stream_unavailable() {
     use std::os::unix::fs::symlink;
 
-    let (base, store, session_id) = fixture("aux-blob-symlink").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (directory, store, session_id) = fixture("aux-blob-symlink").await;
+    let base = directory.path();
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-blob-symlink").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-blob-symlink");
 
     let stdout_bytes = b"safe output".to_vec();
     let snapshot = ToolPersistenceSnapshot {
@@ -4867,24 +4162,14 @@ async fn single_blob_symlink_only_marks_stream_unavailable() {
         )
         .unwrap();
     assert_eq!(page.availability, ToolDataAvailability::Unavailable);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn idempotent_commit_with_corrupt_existing_fails() {
-    let (base, store, session_id) = fixture("aux-idempotent-corrupt").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-idempotent-corrupt").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-idempotent-corrupt").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-idempotent-corrupt");
 
     let stdout_bytes = b"valid content".to_vec();
     let snapshot = ToolPersistenceSnapshot {
@@ -4966,20 +4251,15 @@ async fn idempotent_commit_with_corrupt_existing_fails() {
         .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(5))
         .await;
     assert!(matches!(res, Err(StoreError::Corrupt)));
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn concurrent_sessions_global_quota() {
-    let (base, store, session_id1) = fixture("aux-concurrent-quota").await;
+    let (_directory, store, session_id1) = fixture("aux-concurrent-quota").await;
     let session_id2 = SessionId::new().unwrap();
 
-    store
-        .create_session(&record(&store, session_id1))
-        .await
-        .unwrap();
-    let mut rec2 = record(&store, session_id2);
+    store.create_session(&record(session_id1)).await.unwrap();
+    let mut rec2 = record(session_id2);
     rec2.session_id = session_id2;
     store.create_session(&rec2).await.unwrap();
 
@@ -5130,24 +4410,14 @@ async fn concurrent_sessions_global_quota() {
     .count();
 
     assert_eq!(remaining_records, 2);
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn command_record_stdout_evicted_by_pressure_snapshot_commit_and_cold_project_consistency() {
-    let (base, store, session_id) = fixture("aux-cmd-evict").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
+    let (_directory, store, session_id) = fixture("aux-cmd-evict").await;
+    store.create_session(&record(session_id)).await.unwrap();
 
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("call-evict-cmd").unwrap(),
-    };
+    let tool_ref = make_tool_ref(session_id, "call-evict-cmd");
 
     let tool_data = crate::tool_data::ToolData::new();
     tool_data.note_requested(&tool_ref, "bash");
@@ -5262,21 +4532,20 @@ async fn command_record_stdout_evicted_by_pressure_snapshot_commit_and_cold_proj
         .unwrap();
     assert_eq!(stderr_page.availability, ToolDataAvailability::Available);
     assert!(!stderr_page.data.is_empty());
-
-    let _ = fs::remove_dir_all(base).await;
 }
 
 #[tokio::test]
 async fn compaction_dual_anchor_uses_exact_loop_boundaries_inside_shared_buffers() {
-    let (base, store, id) = fixture("compact-dual-buffer").await;
-    store.create_session(&record(&store, id)).await.unwrap();
+    let (directory, store, id) = fixture("compact-dual-buffer").await;
+    let base = directory.path();
+    store.create_session(&record(id)).await.unwrap();
     // Both an early newline sharing its buffer with later records, and a
     // multi-buffer record followed by more records exercise exact hashing.
     let records = [
-        loop_record(id, "first"),
+        loop_record("first"),
         loop_record_with_users(&["second", "third"]),
-        loop_record(id, &"z".repeat(20_000)),
-        loop_record(id, "last"),
+        loop_record(&"z".repeat(20_000)),
+        loop_record("last"),
     ];
     let mut history = Vec::new();
     let mut boundaries = Vec::new();
@@ -5327,15 +4596,15 @@ async fn compaction_dual_anchor_uses_exact_loop_boundaries_inside_shared_buffers
         );
     }
     assert_eq!(fs::read(&raw_path).await.unwrap(), raw);
-    fs::remove_dir_all(base).await.unwrap();
 }
 
 #[tokio::test]
 async fn compaction_dual_anchor_rejects_same_length_prefix_tail_and_incomplete_changes() {
-    let (base, store, id) = fixture("compact-dual-tamper").await;
-    store.create_session(&record(&store, id)).await.unwrap();
-    let first = loop_record(id, "PREFIX_MARKER");
-    let tail = loop_record(id, "TAIL_MARKER");
+    let (directory, store, id) = fixture("compact-dual-tamper").await;
+    let base = directory.path();
+    store.create_session(&record(id)).await.unwrap();
+    let first = loop_record("PREFIX_MARKER");
+    let tail = loop_record("TAIL_MARKER");
     store.append_loop(id, &first).await.unwrap();
     store.append_loop(id, &tail).await.unwrap();
     let history = [first.items.clone(), tail.items.clone()].concat();
@@ -5400,15 +4669,15 @@ async fn compaction_dual_anchor_rejects_same_length_prefix_tail_and_incomplete_c
             .unwrap()
             .is_none()
     );
-    fs::remove_dir_all(base).await.unwrap();
 }
 
 #[tokio::test]
 async fn compaction_commit_full_anchor_binds_retained_record_metadata() {
-    let (base, store, id) = fixture("compact-full-metadata").await;
-    store.create_session(&record(&store, id)).await.unwrap();
-    let first = loop_record(id, "old");
-    let tail = loop_record(id, "recent");
+    let (directory, store, id) = fixture("compact-full-metadata").await;
+    let base = directory.path();
+    store.create_session(&record(id)).await.unwrap();
+    let first = loop_record("old");
+    let tail = loop_record("recent");
     store.append_loop(id, &first).await.unwrap();
     store.append_loop(id, &tail).await.unwrap();
     let history = [first.items.clone(), tail.items.clone()].concat();
@@ -5461,5 +4730,309 @@ async fn compaction_commit_full_anchor_binds_retained_record_metadata() {
         fs::read(directory.join("summary.json")).await.unwrap(),
         b"old snapshot"
     );
-    fs::remove_dir_all(base).await.unwrap();
+}
+
+impl Store {
+    pub(crate) fn spawn_diff_query(
+        &self,
+        session_id: SessionId,
+        before: Arc<[u8]>,
+        after: Arc<[u8]>,
+        context_lines: usize,
+        deadline: Instant,
+    ) -> Result<DiffQuery, StoreError> {
+        self.spawn_cancellable_diff_query(
+            session_id,
+            before,
+            after,
+            context_lines,
+            deadline,
+            &CancellationToken::new(),
+        )
+    }
+    pub(crate) fn registered_diff_workers(&self) -> usize {
+        self.diff_workers.lock().unwrap().workers.len()
+    }
+    pub(crate) fn with_aux_limits(mut self, limits: AuxLimits) -> Self {
+        self.aux_limits = Some(limits);
+        self
+    }
+    pub(crate) async fn commit_tool_record(
+        &self,
+        snapshot: &ToolPersistenceSnapshot,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        if AUX_WRITE_FAILURES.hit(&snapshot.tool_ref.session_id) {
+            return Err(StoreError::Unavailable);
+        }
+        let mut ledger = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await
+        {
+            Ok(guard) => guard,
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        self.commit_tool_record_locked(snapshot, deadline, &mut ledger)
+            .await
+    }
+    pub(crate) async fn read_tool_record(
+        &self,
+        tool_ref: &ToolRef,
+    ) -> Result<Option<ToolRecord>, StoreError> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        self.read_tool_record_with_deadline(tool_ref, deadline)
+            .await
+    }
+}
+
+fn make_tool_ref(session_id: SessionId, name: impl AsRef<str>) -> ToolRef {
+    ToolRef {
+        session_id,
+        loop_id: LoopId::new().unwrap(),
+        request_index: 0,
+        tool_call_id: ToolCallId::new(name).unwrap(),
+    }
+}
+
+fn empty_snapshot(tool_ref: ToolRef) -> ToolPersistenceSnapshot {
+    let mut snapshot = auxiliary_snapshot(tool_ref, [None, None, None, None, None, None]);
+    snapshot.record.name = "bash".to_owned();
+    snapshot.record.started_at = None;
+    snapshot.record.finished_at = None;
+    snapshot
+}
+
+fn history_limits(max_bytes: u64, max_lines: usize) -> HistoryScanLimits {
+    HistoryScanLimits {
+        max_bytes,
+        max_lines,
+        deadline: Instant::now() + Duration::from_secs(30),
+        cancellation: CancellationToken::new(),
+    }
+}
+
+#[tokio::test]
+async fn indexed_history_seeks_past_the_cold_scan_limit() {
+    let (_directory, store, id) = fixture("indexed-large-history").await;
+    store.create_session(&record(id)).await.unwrap();
+    let text = "x".repeat(64 * 1024);
+    let mut entry = loop_record_with_users(&[text.as_str(); 64]);
+    for _ in 0..17 {
+        entry.loop_id = LoopId::new().unwrap();
+        for item in &mut entry.items {
+            if let HistoryItem::User(user) = item {
+                user.loop_id = entry.loop_id;
+            }
+        }
+        store.append_loop(id, &entry).await.unwrap();
+    }
+    let page = store
+        .read_history_page(
+            id,
+            16 * 64,
+            1,
+            Some(17 * 64),
+            None,
+            None,
+            Some(16 * 64),
+            &history_limits(8 * 1024 * 1024, 1),
+        )
+        .await
+        .unwrap();
+    assert!(page.captured_end > 64 * 1024 * 1024);
+    assert_eq!(page.scanned_lines, 1);
+    assert_eq!(page.total_items, 17 * 64);
+    assert_eq!(page.items, entry.items[..1]);
+    assert_eq!(page.covered_usage.loop_count, 16);
+    store.load_session(id).await.unwrap();
+    assert_eq!(
+        store
+            .read_loop_record(id, entry.loop_id, &history_limits(8 * 1024 * 1024, 1))
+            .await
+            .unwrap()
+            .unwrap()
+            .loop_id,
+        entry.loop_id
+    );
+
+    store.unload_history(id);
+    assert!(matches!(
+        store
+            .read_history_page(
+                id,
+                16 * 64,
+                1,
+                None,
+                None,
+                None,
+                None,
+                &history_limits(64 * 1024 * 1024, 100_000)
+            )
+            .await,
+        Err(StoreError::QueryLimit)
+    ));
+    let cold = store
+        .read_history_page(
+            id,
+            16 * 64,
+            1,
+            None,
+            Some(page.captured_end),
+            Some(&page.revision),
+            Some(16 * 64),
+            &history_limits(128 * 1024 * 1024, 100_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cold.revision, page.revision);
+    assert_eq!(cold.items, page.items);
+    assert_eq!(cold.covered_usage, page.covered_usage);
+}
+
+#[tokio::test]
+async fn indexed_history_cursors_survive_append_and_unload() {
+    let (_directory, store, id) = fixture("indexed-cursors").await;
+    store.create_session(&record(id)).await.unwrap();
+    store
+        .append_loop(id, &loop_record_with_users(&["one", "two"]))
+        .await
+        .unwrap();
+    store.load_session(id).await.unwrap();
+    let limits = history_limits(32 * 1024 * 1024, 100);
+    let first = store
+        .read_history_page(id, 0, 1, Some(2), None, None, None, &limits)
+        .await
+        .unwrap();
+    store
+        .clone()
+        .append_loop(id, &loop_record("three"))
+        .await
+        .unwrap();
+    let next = store
+        .read_history_page(
+            id,
+            1,
+            1,
+            Some(3),
+            Some(first.captured_end),
+            Some(&first.revision),
+            None,
+            &limits,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.total_items, 2);
+    assert_eq!(next.items.len(), 1);
+    let snapshot = store
+        .read_history_page(id, 0, 3, Some(2), None, None, None, &limits)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.revision, first.revision);
+    store.unload_history(id);
+    let cold = store
+        .read_history_page(
+            id,
+            1,
+            1,
+            None,
+            Some(first.captured_end),
+            Some(&first.revision),
+            None,
+            &limits,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cold.items, next.items);
+    store.load_session(id).await.unwrap();
+    let current = store
+        .read_history_page(id, 2, 1, Some(3), None, None, None, &limits)
+        .await
+        .unwrap();
+    assert_eq!(current.total_items, 3);
+    assert_ne!(current.revision, first.revision);
+    store.delete_session(id).await.unwrap();
+    assert!(!store.history_indexes.lock().unwrap().contains_key(&id));
+}
+
+#[tokio::test]
+async fn partial_append_rolls_back_or_reports_unknown_and_load_repairs() {
+    for rollback_fails in [false, true] {
+        let (_directory, store, id) = fixture("append-rollback").await;
+        store.create_session(&record(id)).await.unwrap();
+        let first = loop_record("kept");
+        store.append_loop(id, &first).await.unwrap();
+        store.load_session(id).await.unwrap();
+        let path = store.session_directory(id).join(HISTORY_FILE);
+        let original = fs::read(&path).await.unwrap();
+        APPEND_FAILURES.arm(id, rollback_fails);
+        let error = store
+            .append_loop(id, &loop_record("partial"))
+            .await
+            .unwrap_err();
+        if rollback_fails {
+            assert!(matches!(error, AppendError::Unknown));
+            assert!(fs::metadata(&path).await.unwrap().len() > original.len() as u64);
+            assert_eq!(
+                store.load_session(id).await.unwrap().history.as_ref(),
+                first.items
+            );
+        } else {
+            assert!(matches!(
+                error,
+                AppendError::NotWritten(StoreError::Unavailable)
+            ));
+        }
+        assert_eq!(fs::read(&path).await.unwrap(), original);
+        store.append_loop(id, &loop_record("next")).await.unwrap();
+        assert_eq!(store.load_session(id).await.unwrap().history.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn foreign_aux_entries_do_not_disable_persistence_and_known_bytes_count() {
+    let (directory, store, id) = fixture("foreign-aux").await;
+    store.create_session(&record(id)).await.unwrap();
+    let foreign = SessionId::new().unwrap();
+    store.create_session(&record(foreign)).await.unwrap();
+    let tools = store.session_directory(foreign).join(AUX_TOOLS_DIR);
+    let corrupt_dir = tools.join("a".repeat(64));
+    fs::create_dir_all(&corrupt_dir).await.unwrap();
+    fs::write(corrupt_dir.join(TOOL_RECORD_FILE), b"bad json")
+        .await
+        .unwrap();
+    fs::write(tools.join(".DS_Store"), vec![0; 4096])
+        .await
+        .unwrap();
+    let store = Store::open(directory.path().to_path_buf()).await.unwrap();
+    let first = empty_snapshot(make_tool_ref(id, "first"));
+    let restricted = store.clone().with_aux_limits(AuxLimits {
+        global_bytes: 4096,
+        ..DEFAULT_AUX_LIMITS
+    });
+    assert!(matches!(
+        restricted
+            .commit_tool_record(&first, Instant::now() + Duration::from_secs(10))
+            .await,
+        Err(StoreError::Unavailable)
+    ));
+    store
+        .commit_tool_record(&first, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    // Deleting a foreign session removes its accounted bytes too.
+    store.clone().delete_session(foreign).await.unwrap();
+    // Subsequent commits use the shared ledger, not a new filesystem walk.
+    fs::write(store.sessions_directory().join(".DS_Store"), vec![0; 8192])
+        .await
+        .unwrap();
+    let second = empty_snapshot(make_tool_ref(id, "second"));
+    restricted
+        .commit_tool_record(&second, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_tool_record(&first.tool_ref)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

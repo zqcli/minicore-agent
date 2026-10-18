@@ -556,10 +556,13 @@ Cost and subscription fields remain `null` without a reliable provider source.
 `session.read` is a read-only query. It does not load a closed Session, open its
 Workspace, validate the configured Model, initialize Tools or PromptProvider,
 start a loop, repair `history.jsonl`, or update `session.json`. An already loaded
-Session is read from one committed in-memory snapshot and is bounded by that
-snapshot's item count. The query therefore continues to work for a closed
-Session whose Workspace was deleted or whose Model/Profile is no longer
-configured.
+Session uses its committed snapshot's item count and an in-memory index of
+complete JSONL lines. The index supplies prefix offsets and SHA-256 revisions;
+only the lines needed for the page are read and parsed. It is initialized on
+creation/load, extended on append, and discarded on unload or a failed open. Loaded canonical/display reads and
+stored `turn.result` lookups do not rescan the full file. The query also works
+for a closed Session whose Workspace was deleted or whose Model/Profile is no
+longer configured.
 
 ```json
 {
@@ -598,13 +601,21 @@ only summaries for turns represented by at least one item chunk in this
 response; a small byte budget therefore does not inherit summaries for items
 that were not emitted. `history_revision` is a SHA-256 of the
 captured complete prefix ending at `captured_end`. Continuation requests must
-send both values; a same-length replacement or a non-boundary prefix returns
-`invalid_state`. A final incomplete JSONL tail is reported as
-`trailing_incomplete` and is never repaired. If the read-only scan reaches its
-work/deadline/cancellation bound before establishing the requested prefix, it
-returns retryable `query_limit` rather than claiming a complete total; retrying
-with a smaller `limit` can reduce retained source work. The item chunks remain
-the continuation mechanism when one item itself is larger than the page.
+send both values; a changed revision or a non-boundary prefix returns
+`invalid_state`. Revision bytes are identical across load/unload. The loaded
+index is authoritative; external modifications while a Session is loaded are
+not supported. Cold scans detect even same-length replacements. A final
+incomplete JSONL tail is reported by cold reads as `trailing_incomplete` and is
+never repaired by a query.
+
+Unloaded Session scans are limited to 64 MiB, 100,000 complete lines, and a
+10-second deadline, with cancellation support. Exceeding a scan bound returns
+`query_limit`, not a partial total. Reducing `limit` may reduce retained source
+work but cannot overcome the cold prefix-scan ceiling; load the Session to use
+indexed reads for larger histories. Loaded queries retain per-query byte, line,
+deadline, and cancellation bounds on the selected lines, not the full prefix.
+The item chunks remain the continuation mechanism when one item itself is
+larger than the page.
 
 #### Display projection
 
@@ -837,11 +848,16 @@ response arrives:
 
 `outcome.type` is `completed`, `cancelled` (with `reason`), or `failed` (with
 `kind` and optionally `model_error`). `persistence` is `persisted` or `failed`.
-`persistence: persisted` means the Agent's append operation completed
-successfully in the running process. The Store is not a transactional ledger and
-does not provide an end-to-end crash-durability proof. A failed JSONL append
-returns the completed loop report with `persistence: failed` and blocks the
-Session from further turns.
+`persistence: persisted` means the Agent's history append and `sync_data`
+completed. Metadata/summary replacements sync the parent directory after rename;
+creating a Session and repairing a partial history tail are also synced. These
+writes are not a transaction across all Session files. A failed JSONL append
+returns the completed loop report with `persistence: failed` and leaves committed
+in-memory history unchanged. If the record was rejected before writing, or a
+failed write was rolled back to the previous length and synced, the Session
+remains usable. Only a failed rollback leaves an uncertain append outcome and
+blocks further turns (`block_reason: "persistence"`); close/reopen is required.
+An uncertain failed turn may be present on disk after reopening.
 
 ### `turn.result`
 
@@ -1050,13 +1066,22 @@ never reports a fabricated exit code. A requested `cancel` is recorded as
 process.
 
 `execution.recording` reports the auxiliary write result: `memory_only`,
-`saved`, or `failed`. Saving follows main History persistence and precedes Turn
-completion. A failed auxiliary save does not change the real tool outcome or
-main Turn persistence, and retained memory remains readable. `saved` is not a
+`saved`, or `failed`. Saving runs after authoritative Turn completion is
+published, inside the owned Session task; close/shutdown still join it.
+`turn.wait` and `turn.result` do not wait for this best-effort save, so a completed
+Turn may temporarily report `memory_only`. A failed auxiliary save does not
+change the real tool outcome or main Turn persistence, and retained memory
+remains readable. `saved` is not a
 promise of indefinite retention: the Store applies per-tool (3 MiB), per-Session
 (16 MiB/1024 records), and Store-wide (256 MiB/8192 records) auxiliary budgets.
-These budgets coordinate one Store and its clones; independent writers sharing
-a data directory are not supported. Public queries prefer loaded memory and use
+A shared in-memory ledger is initialized by one directory scan, then updated
+on commit, oldest-first eviction, and Session deletion. A failed temporary-file
+cleanup invalidates it so the next reservation accounts for any surviving bytes.
+Foreign or corrupt
+entries are warned about and skipped without following symlinks; known bytes
+still count against the budgets. These budgets coordinate one Store and its
+clones; independent writers or external data-directory changes during the
+Store's lifetime are not supported. Public queries prefer loaded memory and use
 durable auxiliary storage for unloaded Sessions or evicted bytes.
 
 `availability` is per stream: `pending` while the call is still running and
