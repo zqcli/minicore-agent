@@ -50,9 +50,9 @@ pass `--locked`. Do not run a broad `cargo update`.
   `str::floor_char_boundary`. Use `crate::text::{floor_char_boundary, truncate}`
   instead.
 - `unsafe` is forbidden (`unsafe_code = "forbid"`).
-- Dependencies are pinned with `=`. Add one only with a clear need. A version
-  bump changes `Cargo.toml` and the `minicore-agent` entry in `Cargo.lock`, and
-  nothing else.
+- Keep existing exact (`=`) dependency pins, and add a dependency only with a
+  clear need. A version bump changes `Cargo.toml` and the `minicore-agent` entry
+  in `Cargo.lock`, and nothing else.
 - Keep code lean. Validate inputs once at the boundary that owns them, do not
   re-check invariants the types or earlier validation already guarantee, and add
   no speculative abstractions or configuration.

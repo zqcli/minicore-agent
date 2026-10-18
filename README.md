@@ -181,8 +181,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 CI checks formatting, Clippy, and rustdoc on stable Rust, runs the tests on
 Ubuntu, macOS, and Windows, and runs the tests again with Rust 1.85.0. Unit tests live in `<module>/tests.rs` files.
 Integration tests are the `it` target plus `rpc_soak` (see
-[tests/README.md](tests/README.md)). Tests use loopback providers only; never
-use real credentials. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution
+[tests/README.md](tests/README.md)). Routine tests use loopback providers; the
+live provider tests are `#[ignore]` and opt-in. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution
 rules and [AGENTS.md](AGENTS.md) for coding-agent guidance.
 
 ## Documentation
