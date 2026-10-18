@@ -2,12 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn manual_compaction_rejects_busy_and_blocked_sessions() {
-    let fixture = RpcFixture::new(
-        "manual-admission",
-        [ModelScript::Block],
-        &[],
-        ApprovalMode::Auto,
-    );
+    let mut fixture = RpcFixture::new("manual-admission", [Step::Pending], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -48,9 +43,9 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
 
     // A persistence failure blocks the Session, and compaction must preserve
     // the existing blocked admission semantics.
-    let blocked_fixture = RpcFixture::new(
+    let mut blocked_fixture = RpcFixture::new(
         "manual-blocked",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &[],
         ApprovalMode::Auto,
     );
@@ -89,13 +84,9 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
 
 #[tokio::test]
 async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-cancel",
-        [
-            ModelScript::Text("settled"),
-            ModelScript::Block,
-            ModelScript::Text("summary"),
-        ],
+        [Step::Text("settled"), Step::Pending, Step::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
@@ -221,9 +212,9 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
 
 #[tokio::test]
 async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-owned-handle",
-        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+        [Step::Text("settled"), Step::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
@@ -306,13 +297,13 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
 
 #[tokio::test]
 async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-write-failure",
         [
-            ModelScript::TextWithUsage("settled", 2, 3),
-            ModelScript::TextWithUsage("initial summary", 5, 7),
-            ModelScript::TextWithUsage("new turn answer", 11, 13),
-            ModelScript::TextWithUsage("new summary", 17, 19),
+            Step::TextWithUsage("settled", 2, 3),
+            Step::TextWithUsage("initial summary", 5, 7),
+            Step::TextWithUsage("new turn answer", 11, 13),
+            Step::TextWithUsage("new summary", 17, 19),
         ],
         &[],
         ApprovalMode::Auto,
@@ -402,9 +393,9 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
 
 #[tokio::test]
 async fn manual_compaction_rejects_model_failures_and_tool_events() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-model-failure",
-        [ModelScript::Text("settled"), ModelScript::Fail],
+        [Step::Text("settled"), Step::Fail(fake_model_error())],
         &[],
         ApprovalMode::Auto,
     )
@@ -442,11 +433,11 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
     assert_eq!(failure["result"]["failure_kind"], json!("model_failure"));
     harness.shutdown().await;
 
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-tool-event",
         [
-            ModelScript::Text("settled"),
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            Step::Text("settled"),
+            tool_calls(vec![ToolCallScript {
                 name: "read",
                 arguments: json!({}),
             }]),
@@ -494,9 +485,9 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
 
 #[tokio::test]
 async fn manual_compaction_reports_unknown_write_without_publishing_state() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-unknown-write",
-        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+        [Step::Text("settled"), Step::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
@@ -549,9 +540,9 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
 
 #[tokio::test]
 async fn manual_compaction_revalidates_history_before_commit() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "manual-revalidate",
-        [ModelScript::Text("settled"), ModelScript::Text("summary")],
+        [Step::Text("settled"), Step::Text("summary")],
         &[],
         ApprovalMode::Auto,
     )
@@ -633,8 +624,7 @@ async fn manual_compaction_deadline_covers_commit_wait() {
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
     config.loop_options.model_timeout_seconds = Some(1);
-    let model =
-        FakeModel::for_compaction([ModelScript::Text("settled"), ModelScript::Text("summary")]);
+    let model = fake_model(40_000, [Step::Text("settled"), Step::Text("summary")]);
     let agent = Agent::open_with_models(config, test_models(model))
         .await
         .unwrap();
@@ -683,25 +673,28 @@ async fn manual_compaction_deadline_covers_commit_wait() {
 async fn manual_compaction_rejects_incomplete_late_empty_and_oversize_output() {
     assert_manual_failure_case(
         "manual-no-finish",
-        ModelScript::NoFinish,
+        finished(&["incomplete"], None),
         "invalid_model_response",
     )
     .await;
     assert_manual_failure_case(
         "manual-wrong-finish",
-        ModelScript::WrongFinish,
+        finished(&["wrong finish"], Some(ModelFinishReason::Length)),
         "invalid_model_response",
     )
     .await;
     assert_manual_failure_case(
         "manual-late-content",
-        ModelScript::LateContent,
+        late_content(),
         "invalid_model_response",
     )
     .await;
     let duplicate = assert_manual_failure_case(
         "manual-duplicate-usage",
-        ModelScript::DuplicateUsage("duplicate usage"),
+        usage_events(
+            "duplicate usage",
+            &[Usage::new(7, 11, 0), Usage::new(13, 17, 0)],
+        ),
         "invalid_model_response",
     )
     .await;
@@ -711,6 +704,15 @@ async fn manual_compaction_rejects_incomplete_late_empty_and_oversize_output() {
         json!(false)
     );
     assert!(duplicate["result"]["utility_usage"]["usage"].is_null());
-    assert_manual_failure_case("manual-whitespace", ModelScript::Whitespace, "no_progress").await;
-    assert_manual_failure_case("manual-oversize", ModelScript::Oversize, "too_large").await;
+    assert_manual_failure_case(
+        "manual-whitespace",
+        finished(
+            &[" 
+	"],
+            Some(ModelFinishReason::Stop),
+        ),
+        "no_progress",
+    )
+    .await;
+    assert_manual_failure_case("manual-oversize", oversize(), "too_large").await;
 }

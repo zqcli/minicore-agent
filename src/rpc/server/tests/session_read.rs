@@ -2,14 +2,14 @@ use super::*;
 
 #[tokio::test]
 async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "session-read-pages",
         [
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            tool_calls(vec![ToolCallScript {
                 name: "read",
                 arguments: json!({"path": "huge.txt", "limit": 400}),
             }]),
-            ModelScript::Oversize,
+            oversize(),
         ],
         &["read"],
         ApprovalMode::Auto,
@@ -185,7 +185,7 @@ async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
 
 #[tokio::test]
 async fn unloaded_session_read_pages_short_turns_under_small_budget() {
-    let fixture = RpcFixture::new("session-read-short-pages", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("session-read-short-pages", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -270,9 +270,9 @@ async fn unloaded_session_read_pages_short_turns_under_small_budget() {
 
 #[tokio::test]
 async fn session_read_rejects_same_length_prefix_replacement() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "session-read-revision",
-        [ModelScript::Text("answer")],
+        [Step::Text("answer")],
         &[],
         ApprovalMode::Auto,
     );
@@ -347,9 +347,9 @@ async fn session_read_rejects_same_length_prefix_replacement() {
 
 #[tokio::test]
 async fn loaded_session_read_does_not_expose_a_disk_tail() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "session-read-loaded-prefix",
-        [ModelScript::Text("answer")],
+        [Step::Text("answer")],
         &[],
         ApprovalMode::Auto,
     );
@@ -396,9 +396,9 @@ async fn loaded_session_read_does_not_expose_a_disk_tail() {
 
 #[tokio::test]
 async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "session-read-loaded-pagination",
-        [ModelScript::Oversize, ModelScript::Text("new answer")],
+        [oversize(), Step::Text("new answer")],
         &[],
         ApprovalMode::Auto,
     );
@@ -498,9 +498,9 @@ async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
 
 #[tokio::test]
 async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "session-read-integrity",
-        [ModelScript::Text("first"), ModelScript::Text("second")],
+        [Step::Text("first"), Step::Text("second")],
         &[],
         ApprovalMode::Auto,
     );

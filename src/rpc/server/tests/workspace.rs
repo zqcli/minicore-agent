@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() {
-    let fixture = RpcFixture::new("workspace-read", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-read", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     tokio::fs::write(workspace.join("note.txt"), b"hello\nworld\n")
@@ -120,9 +120,9 @@ async fn workspace_read_query_serves_raw_content_and_rejects_invalid_requests() 
 #[tokio::test]
 async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
     let turn_started = Arc::new(Notify::new());
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "workspace-read-pending",
-        [ModelScript::BlockWithSignal(Arc::clone(&turn_started))],
+        [block_with_signal(Arc::clone(&turn_started))],
         &[],
         ApprovalMode::Auto,
     );
@@ -195,7 +195,7 @@ async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
 
 #[tokio::test]
 async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() {
-    let fixture = RpcFixture::new("workspace-read-capacity", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-read-capacity", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     for index in 0..MAX_DEFERRED_QUERIES {
@@ -288,7 +288,7 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
 
 #[tokio::test]
 async fn workspace_files_and_search_serve_entries_and_literal_matches() {
-    let fixture = RpcFixture::new("workspace-scan", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-scan", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     tokio::fs::write(workspace.join("note.txt"), b"alpha\nneedle here\n")
@@ -426,7 +426,7 @@ async fn workspace_files_and_search_serve_entries_and_literal_matches() {
 
 #[tokio::test]
 async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
-    let fixture = RpcFixture::new("workspace-scan-pending", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-scan-pending", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     tokio::fs::write(workspace.join("a.txt"), b"pending hit\n")
@@ -475,7 +475,7 @@ async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
 
 #[tokio::test]
 async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() {
-    let fixture = RpcFixture::new("workspace-scan-capacity", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-scan-capacity", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     for index in 0..MAX_DEFERRED_QUERIES {
@@ -579,7 +579,7 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
 
 #[tokio::test]
 async fn workspace_status_answers_for_the_session_workspace() {
-    let fixture = RpcFixture::new("workspace-status", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-status", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);

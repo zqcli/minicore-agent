@@ -6,12 +6,9 @@ use super::*;
 #[tokio::test]
 async fn fragmented_frame_survives_deferred_waiter_interleaving() {
     let probe = ConcurrencyProbe::new();
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "half-frame-interleave",
-        [
-            ModelScript::Gate(Arc::clone(&probe)),
-            ModelScript::Text("done"),
-        ],
+        [gated(Arc::clone(&probe)), Step::Text("done")],
         &["read"],
         ApprovalMode::Auto,
     );
@@ -135,9 +132,9 @@ async fn read_frame_limit_covers_cumulative_length_after_cancellation() {
 #[tokio::test]
 async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
     let probe = ConcurrencyProbe::new();
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "waiter-limit",
-        [ModelScript::Gate(Arc::clone(&probe))],
+        [gated(Arc::clone(&probe))],
         &[],
         ApprovalMode::Auto,
     );

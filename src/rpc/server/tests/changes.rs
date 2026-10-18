@@ -2,9 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn changes_list_separates_workspace_session_and_turn_scopes() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "changes-list-scopes",
-        [ModelScript::ToolCalls(vec![ToolCallScript {
+        [tool_calls(vec![ToolCallScript {
             name: "write",
             arguments: json!({"path": "value.txt", "content": "agent\n"}),
         }])],
@@ -118,14 +118,14 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
 /// is closed (cold), and pages a long line by UTF-8 fragments.
 #[tokio::test]
 async fn changes_diff_public_rpc_compares_native_before_and_after() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "changes-diff-flow",
         [
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            tool_calls(vec![ToolCallScript {
                 name: "write",
                 arguments: json!({"path": "value.txt", "content": "agent\n"}),
             }]),
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            tool_calls(vec![ToolCallScript {
                 name: "write",
                 arguments: json!({"path": "long.txt", "content": "short"}),
             }]),
@@ -236,9 +236,9 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
 #[tokio::test]
 async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
     let long = format!("{}{}", "a".repeat(2_500), "é🙂世界".repeat(300));
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "changes-diff-paging",
-        [ModelScript::ToolCalls(vec![ToolCallScript {
+        [tool_calls(vec![ToolCallScript {
             name: "write",
             arguments: json!({"path": "long.txt", "content": "changed"}),
         }])],
@@ -320,9 +320,9 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
 /// Session cancels the held comparisons.
 #[tokio::test]
 async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "changes-diff-capacity",
-        [ModelScript::ToolCalls(vec![ToolCallScript {
+        [tool_calls(vec![ToolCallScript {
             name: "write",
             arguments: json!({"path": "value.txt", "content": "agent\n"}),
         }])],
@@ -416,7 +416,7 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
 
 #[tokio::test]
 async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
-    let fixture = RpcFixture::new("changes-list-capacity", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("changes-list-capacity", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -490,7 +490,7 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let fixture = RpcFixture::new("changes-capacity-precedence", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("changes-capacity-precedence", [], &[], ApprovalMode::Auto);
     let base = fixture.base.path().to_owned();
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
@@ -623,9 +623,9 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
 #[tokio::test]
 async fn changes_list_queries_share_the_total_waiter_ceiling() {
     let probe = ConcurrencyProbe::new();
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "changes-list-shared-ceiling",
-        [ModelScript::Gate(Arc::clone(&probe))],
+        [gated(Arc::clone(&probe))],
         &[],
         ApprovalMode::Auto,
     );
@@ -714,7 +714,7 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
 
 #[tokio::test]
 async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
-    let fixture = RpcFixture::new("changes-list-shutdown", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("changes-list-shutdown", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);

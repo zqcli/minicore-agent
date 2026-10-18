@@ -102,7 +102,7 @@ async fn reload_agent() -> (Agent, TempDir, PathBuf) {
     write_config(base.path(), 0);
     let agent = Agent::open_file_with_models(
         base.path().join("agent.toml"),
-        test_models(FakeModel::new([])),
+        test_models(fake_model(16_384, [])),
     )
     .await
     .unwrap();
@@ -127,8 +127,7 @@ async fn compaction_cancel_before_preparation_prevents_the_summary_call() {
     let base = TempDir::new("core-review-compaction");
     let workspace = base.path().join("workspace");
     tokio::fs::create_dir(&workspace).await.unwrap();
-    let model =
-        FakeModel::for_compaction([ModelScript::Text("settled"), ModelScript::Text("summary")]);
+    let model = fake_model(40_000, [Step::Text("settled"), Step::Text("summary")]);
     let agent = Agent::open_with_models(
         test_config(base.path().join("data"), &[], ApprovalMode::Auto),
         test_models(model.clone()),
@@ -208,7 +207,7 @@ async fn compaction_cancel_before_preparation_prevents_the_summary_call() {
 
 #[tokio::test]
 async fn dropping_unpolled_compaction_preparation_releases_admission() {
-    let fixture = RpcFixture::new("dropped-compaction", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("dropped-compaction", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let mut agent = fixture.open().await;
     let session = create(&mut agent, &workspace).await;
@@ -560,7 +559,7 @@ async fn all_query_paths_prefer_caller_cancellation_over_session_closure() {
     fn erase<T: Send + 'static>(future: QueryFuture<T>) -> QueryFuture<()> {
         future.map(|result| result.map(|_| ())).boxed()
     }
-    let fixture = RpcFixture::new("query-precedence", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("query-precedence", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let mut agent = fixture.open().await;
     for (cancel_caller, cancel_session) in [(true, false), (false, true), (true, true)] {

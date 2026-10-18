@@ -3,11 +3,11 @@ use super::*;
 #[tokio::test]
 async fn turn_result_reports_pending_and_stored_availability() {
     let model_started = Arc::new(Notify::new());
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "turn-result-lifecycle",
         [
-            ModelScript::BlockWithSignal(Arc::clone(&model_started)),
-            ModelScript::Text("stored answer"),
+            block_with_signal(Arc::clone(&model_started)),
+            Step::Text("stored answer"),
         ],
         &[],
         ApprovalMode::Auto,
@@ -101,9 +101,9 @@ async fn turn_result_reports_pending_and_stored_availability() {
 
 #[tokio::test]
 async fn turn_result_can_continue_from_live_to_stored_items() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "turn-result-live-stored-pages",
-        [ModelScript::Oversize],
+        [oversize()],
         &[],
         ApprovalMode::Auto,
     );
@@ -189,9 +189,9 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
 
 #[tokio::test]
 async fn turn_result_reads_failed_live_report_without_history() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "turn-result-failed-append",
-        [ModelScript::Text("answer retained in memory")],
+        [Step::Text("answer retained in memory")],
         &[],
         ApprovalMode::Auto,
     );

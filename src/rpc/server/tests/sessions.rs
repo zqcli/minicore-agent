@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
-    let fixture = RpcFixture::new("extended-reasoning", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("extended-reasoning", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -90,9 +90,9 @@ async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
 
 #[tokio::test]
 async fn session_rename_is_a_separate_rpc_and_persists_title_without_config_revision() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "rename-basic",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &[],
         ApprovalMode::Auto,
     );
@@ -137,7 +137,7 @@ async fn session_rename_is_a_separate_rpc_and_persists_title_without_config_revi
 
 #[tokio::test]
 async fn session_rename_supports_unloaded_sessions_and_clears_title() {
-    let fixture = RpcFixture::new("rename-unloaded", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("rename-unloaded", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -182,7 +182,7 @@ async fn session_rename_supports_unloaded_sessions_and_clears_title() {
 
 #[tokio::test]
 async fn session_rename_rejects_invalid_titles_and_unknown_fields() {
-    let fixture = RpcFixture::new("rename-invalid", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("rename-invalid", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -229,7 +229,7 @@ async fn session_rename_rejects_invalid_titles_and_unknown_fields() {
 
 #[tokio::test]
 async fn session_rename_write_failure_does_not_change_loaded_state() {
-    let fixture = RpcFixture::new("rename-write-failure", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("rename-write-failure", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -258,12 +258,7 @@ async fn session_rename_write_failure_does_not_change_loaded_state() {
 
 #[tokio::test]
 async fn session_rename_is_allowed_while_a_loop_is_busy() {
-    let fixture = RpcFixture::new(
-        "rename-busy-rpc",
-        [ModelScript::Block],
-        &[],
-        ApprovalMode::Auto,
-    );
+    let mut fixture = RpcFixture::new("rename-busy-rpc", [Step::Pending], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -320,9 +315,9 @@ async fn session_rename_is_allowed_while_a_loop_is_busy() {
 
 #[tokio::test]
 async fn session_rename_is_allowed_for_a_blocked_session() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "rename-blocked-rpc",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &[],
         ApprovalMode::Auto,
     );
@@ -372,9 +367,9 @@ async fn session_rename_is_allowed_for_a_blocked_session() {
 
 #[tokio::test]
 async fn create_open_history_and_send_wait_deferred() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "flow",
-        [ModelScript::Text("complete")],
+        [Step::Text("complete")],
         &["read"],
         ApprovalMode::Auto,
     );
@@ -462,9 +457,9 @@ async fn create_open_history_and_send_wait_deferred() {
 
 #[tokio::test]
 async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "wait-concurrent",
-        [ModelScript::Block],
+        [Step::Pending],
         &["read"],
         ApprovalMode::Auto,
     );
@@ -519,9 +514,9 @@ async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
 
 #[tokio::test]
 async fn session_update_requires_an_unknown_field_free_shape_and_model_change() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "update",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &["read"],
         ApprovalMode::Auto,
     );

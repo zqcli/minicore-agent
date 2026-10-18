@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn capability_discovery_returns_ordered_lists() {
-    let fixture = RpcFixture::new("capability", [], &["read"], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("capability", [], &["read"], ApprovalMode::Auto);
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let ping = harness.call_ok("agent.ping", Some(json!({}))).await;
@@ -50,7 +50,7 @@ async fn capability_discovery_returns_ordered_lists() {
 
 #[tokio::test]
 async fn agent_reload_requires_empty_params_and_a_file_source() {
-    let fixture = RpcFixture::new("reload-rpc", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("reload-rpc", [], &[], ApprovalMode::Auto);
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
 
@@ -86,7 +86,7 @@ async fn agent_reload_requires_empty_params_and_a_file_source() {
 /// the unknown-method fallback through `dispatch_inner`.
 #[tokio::test]
 async fn dispatch_inner_propagates_the_full_error_object() {
-    let fixture = RpcFixture::new("dispatch-error", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("dispatch-error", [], &[], ApprovalMode::Auto);
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
 

@@ -2,14 +2,14 @@ use super::*;
 
 #[tokio::test]
 async fn tool_read_and_output_query_recorded_facts_by_full_identity() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "tool-data-rpc",
         [
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            tool_calls(vec![ToolCallScript {
                 name: "read",
                 arguments: json!({"path": "a.txt", "limit": 4}),
             }]),
-            ModelScript::Text("done"),
+            Step::Text("done"),
         ],
         &["read"],
         ApprovalMode::Auto,
@@ -123,14 +123,14 @@ async fn tool_read_and_output_query_recorded_facts_by_full_identity() {
 
 #[tokio::test]
 async fn tool_read_exposes_approval_time_invocation_without_running() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "tool-data-approval",
         [
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            tool_calls(vec![ToolCallScript {
                 name: "write",
                 arguments: json!({"path": "out.txt", "content": "approved"}),
             }]),
-            ModelScript::Text("done"),
+            Step::Text("done"),
         ],
         &["write"],
         ApprovalMode::Ask,
@@ -230,7 +230,7 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
 
 #[tokio::test]
 async fn tool_read_deferred_query_capacity_ceiling_and_ping_availability() {
-    let fixture = RpcFixture::new("tool-read-capacity", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("tool-read-capacity", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -327,7 +327,7 @@ async fn tool_read_deferred_query_capacity_ceiling_and_ping_availability() {
 
 #[tokio::test]
 async fn tool_read_deferred_query_shutdown_cancels_within_deadline() {
-    let fixture = RpcFixture::new("tool-read-shutdown", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("tool-read-shutdown", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -375,7 +375,7 @@ async fn tool_read_deferred_query_shutdown_cancels_within_deadline() {
 
 #[tokio::test]
 async fn tool_output_deferred_query_shutdown_cancellation_cleans_up() {
-    let fixture = RpcFixture::new("tool-output-shutdown", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("tool-output-shutdown", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);

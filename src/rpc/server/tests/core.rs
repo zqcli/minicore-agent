@@ -9,7 +9,7 @@ async fn lifecycle_disk_work_is_deferred_and_reserves_the_session() {
         "session.delete",
         "session.compact",
     ] {
-        let fixture = RpcFixture::new("deferred-lifecycle", [], &[], ApprovalMode::Auto);
+        let mut fixture = RpcFixture::new("deferred-lifecycle", [], &[], ApprovalMode::Auto);
         let base = fixture.base.path().to_owned();
         let workspace = fixture.workspace.clone();
         let agent = fixture.open().await;
@@ -69,7 +69,7 @@ async fn lifecycle_disk_work_is_deferred_and_reserves_the_session() {
 #[tokio::test]
 async fn create_reserves_its_id_before_the_record_can_be_discovered() {
     use super::super::{Dispatch, RpcId, RpcRequest};
-    let fixture = RpcFixture::new("create-reservation", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("create-reservation", [], &[], ApprovalMode::Auto);
     let base = fixture.base.path().to_owned();
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
@@ -123,9 +123,9 @@ async fn create_reserves_its_id_before_the_record_can_be_discovered() {
 
 #[tokio::test]
 async fn slow_close_allows_other_turn_cancellation_and_shutdown_waits_for_it() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "close-responsive",
-        [ModelScript::Block, ModelScript::Block],
+        [Step::Pending, Step::Pending],
         &[],
         ApprovalMode::Auto,
     );
@@ -191,9 +191,9 @@ async fn slow_close_allows_other_turn_cancellation_and_shutdown_waits_for_it() {
 
 #[tokio::test]
 async fn answers_after_completion_report_turn_not_found() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "ended-answer",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &[],
         ApprovalMode::Auto,
     );
@@ -239,7 +239,7 @@ async fn answers_after_completion_report_turn_not_found() {
 
 #[tokio::test]
 async fn oversized_frame_reports_parse_error_then_stops() {
-    let fixture = RpcFixture::new("oversized-service", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("oversized-service", [], &[], ApprovalMode::Auto);
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
     let mut frame = vec![b' '; MAX_RPC_LINE_BYTES + 1];
@@ -262,7 +262,7 @@ async fn oversized_frame_reports_parse_error_then_stops() {
 
 #[tokio::test]
 async fn shutdown_signal_is_observed_while_a_close_is_pending() {
-    let fixture = RpcFixture::new("signal-during-close", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("signal-during-close", [], &[], ApprovalMode::Auto);
     let base = fixture.base.path().to_owned();
     let workspace = fixture.workspace.clone();
     let mut agent = fixture.open().await;

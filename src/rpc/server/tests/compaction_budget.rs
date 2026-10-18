@@ -8,10 +8,7 @@ async fn manual_compaction_rejects_fixed_schema_budget_before_model_call() {
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let model = FakeModel::with_context_window(
-        [ModelScript::Text("settled"), ModelScript::Text("unused")],
-        256,
-    );
+    let model = fake_model(256, [Step::Text("settled"), Step::Text("unused")]);
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &["read"], ApprovalMode::Auto),
         test_models(Arc::clone(&model)),
@@ -62,13 +59,13 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let model = FakeModel::for_compaction([
-        ModelScript::Text("settled"),
-        ModelScript::Observe {
-            calls: Arc::clone(&observations),
-            text: "summary",
-        },
-    ]);
+    let model = fake_model(
+        40_000,
+        [
+            Step::Text("settled"),
+            observe(Arc::clone(&observations), "summary"),
+        ],
+    );
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &[], ApprovalMode::Auto),
         test_models(Arc::clone(&model)),
@@ -130,12 +127,9 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let mut scripts = vec![ModelScript::Text("settled")];
-    scripts.extend((0..32).map(|_| ModelScript::Observe {
-        calls: Arc::clone(&observations),
-        text: "partial summary",
-    }));
-    let model = FakeModel::for_compaction(scripts);
+    let mut scripts = vec![Step::Text("settled")];
+    scripts.extend((0..32).map(|_| observe(Arc::clone(&observations), "partial summary")));
+    let model = fake_model(40_000, scripts);
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &[], ApprovalMode::Auto),
         test_models(model),
@@ -206,9 +200,9 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
 
 #[tokio::test]
 async fn session_context_reports_effective_input_budget_when_auto_enabled() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-budget",
-        [ModelScript::Text("answer")],
+        [Step::Text("answer")],
         &[],
         ApprovalMode::Auto,
     )
@@ -243,9 +237,9 @@ async fn session_context_reports_effective_input_budget_when_auto_enabled() {
 
 #[tokio::test]
 async fn session_context_omits_budget_when_auto_disabled() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-disabled",
-        [ModelScript::Text("answer")],
+        [Step::Text("answer")],
         &[],
         ApprovalMode::Auto,
     );
@@ -341,7 +335,7 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
     ));
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
-    let model = FakeModel::with_context_window([ModelScript::Text("answer")], 1_000);
+    let model = fake_model(1_000, [Step::Text("answer")]);
     let mut config = test_config(base.join("data"), &[], ApprovalMode::Auto);
     config.compaction = CompactionConfig {
         enabled: true,
@@ -398,13 +392,16 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
         .await
         .unwrap();
     let config = test_config(base.join("data"), &["read"], ApprovalMode::Auto);
-    let seed_model = FakeModel::new([
-        ModelScript::ToolCalls(vec![ToolCallScript {
-            name: "read",
-            arguments: json!({"path":"old.txt"}),
-        }]),
-        ModelScript::Text("seed done"),
-    ]);
+    let seed_model = fake_model(
+        16_384,
+        [
+            tool_calls(vec![ToolCallScript {
+                name: "read",
+                arguments: json!({"path":"old.txt"}),
+            }]),
+            Step::Text("seed done"),
+        ],
+    );
     let mut seed = Agent::open_with_models(config.clone(), test_models(seed_model))
         .await
         .unwrap();
@@ -432,8 +429,7 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
     seed.close_session(info.session_id).await.unwrap();
     drop(seed);
     let entered = Arc::new(Notify::new());
-    let model =
-        FakeModel::with_context_window([ModelScript::BlockWithSignal(Arc::clone(&entered))], 8_000);
+    let model = fake_model(8_000, [block_with_signal(Arc::clone(&entered))]);
     let mut config = config;
     config.compaction = CompactionConfig {
         enabled: true,

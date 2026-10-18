@@ -11,15 +11,12 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
 
     let observations = Arc::new(Mutex::new(Vec::new()));
     let mut scripts = vec![
-        ModelScript::Text("settled answer one"),
-        ModelScript::Text("settled answer two"),
-        ModelScript::Text("settled answer three"),
+        Step::Text("settled answer one"),
+        Step::Text("settled answer two"),
+        Step::Text("settled answer three"),
     ];
-    scripts.extend((0..64).map(|_| ModelScript::Observe {
-        calls: Arc::clone(&observations),
-        text: "manual compact summary",
-    }));
-    let model = FakeModel::for_compaction(scripts);
+    scripts.extend((0..64).map(|_| observe(Arc::clone(&observations), "manual compact summary")));
+    let model = fake_model(40_000, scripts);
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &["read"], ApprovalMode::Auto),
         test_models(model),
@@ -214,7 +211,7 @@ async fn manual_compaction_generates_no_tools_summary_and_reopens_atomic_snapsho
 
 #[tokio::test]
 async fn manual_compaction_completion_clears_authoritative_busy_state() {
-    let fixture = RpcFixture::new("manual-completion-state", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("manual-completion-state", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);
@@ -245,11 +242,11 @@ async fn manual_compaction_completion_clears_authoritative_busy_state() {
 #[tokio::test]
 async fn session_context_reports_manual_busy_state_and_last_result() {
     let utility_started = Arc::new(Notify::new());
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-manual-busy",
         [
-            ModelScript::Text("settled"),
-            ModelScript::BlockWithSignal(Arc::clone(&utility_started)),
+            Step::Text("settled"),
+            block_with_signal(Arc::clone(&utility_started)),
         ],
         &[],
         ApprovalMode::Auto,
@@ -358,11 +355,11 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
 
 #[tokio::test]
 async fn manual_compaction_reports_independent_utility_usage() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-utility-usage",
         [
-            ModelScript::TextWithUsage("settled", 41, 43),
-            ModelScript::TextWithUsage("summary", 7, 11),
+            Step::TextWithUsage("settled", 41, 43),
+            Step::TextWithUsage("summary", 7, 11),
         ],
         &[],
         ApprovalMode::Auto,
@@ -433,11 +430,11 @@ async fn manual_compaction_reports_independent_utility_usage() {
 
 #[tokio::test]
 async fn failed_manual_utility_stream_keeps_known_partial_usage() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-utility-partial",
         [
-            ModelScript::TextWithUsage("settled", 41, 43),
-            ModelScript::UsageThenFail(7, 11),
+            Step::TextWithUsage("settled", 41, 43),
+            usage_then_fail(7, 11),
         ],
         &[],
         ApprovalMode::Auto,
@@ -487,11 +484,11 @@ async fn failed_manual_utility_stream_keeps_known_partial_usage() {
 
 #[tokio::test]
 async fn missing_manual_utility_usage_remains_unknown() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-utility-unknown",
         [
-            ModelScript::TextWithUsage("settled", 41, 43),
-            ModelScript::NoUsage("summary"),
+            Step::TextWithUsage("settled", 41, 43),
+            finished(&["summary"], Some(ModelFinishReason::Stop)),
         ],
         &[],
         ApprovalMode::Auto,
@@ -540,19 +537,16 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
     let workspace = base.join("workspace");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
     let observations = Arc::new(Mutex::new(Vec::new()));
-    let model = FakeModel::for_compaction([
-        ModelScript::Text("first answer"),
-        ModelScript::Observe {
-            calls: Arc::clone(&observations),
-            text: "FIRST_SUMMARY",
-        },
-        ModelScript::Text("second answer"),
-        ModelScript::Observe {
-            calls: Arc::clone(&observations),
-            text: "UPDATED_SUMMARY",
-        },
-        ModelScript::Text("oversize settled answer"),
-    ]);
+    let model = fake_model(
+        40_000,
+        [
+            Step::Text("first answer"),
+            observe(Arc::clone(&observations), "FIRST_SUMMARY"),
+            Step::Text("second answer"),
+            observe(Arc::clone(&observations), "UPDATED_SUMMARY"),
+            Step::Text("oversize settled answer"),
+        ],
+    );
     let agent = Agent::open_with_models(
         test_config(base.join("data"), &[], ApprovalMode::Auto),
         test_models(Arc::clone(&model)),
@@ -652,11 +646,11 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
 
 #[tokio::test]
 async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "context-utility-cancel",
         [
-            ModelScript::TextWithUsage("settled", 2, 3),
-            ModelScript::TextWithUsage("summary", 7, 11),
+            Step::TextWithUsage("settled", 2, 3),
+            Step::TextWithUsage("summary", 7, 11),
         ],
         &[],
         ApprovalMode::Auto,
@@ -723,7 +717,7 @@ async fn manual_compaction_cancel_after_utility_call_keeps_usage_accounting() {
 
 #[tokio::test]
 async fn manual_compaction_empty_history_is_a_noop_without_a_model_call() {
-    let fixture = RpcFixture::new("manual-noop", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("manual-noop", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
     let mut harness = RpcHarness::spawn(agent);

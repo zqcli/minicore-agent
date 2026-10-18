@@ -6,7 +6,7 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let fixture = RpcFixture::new("workspace-status-projection", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-status-projection", [], &[], ApprovalMode::Auto);
     let base = fixture.base.path().to_owned();
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
@@ -104,7 +104,7 @@ async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let fixture = RpcFixture::new("workspace-status-capacity", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-status-capacity", [], &[], ApprovalMode::Auto);
     let base = fixture.base.path().to_owned();
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;

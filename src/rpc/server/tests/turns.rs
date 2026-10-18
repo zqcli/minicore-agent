@@ -2,9 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn history_view_is_safe_and_pages() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "safe-view",
-        [ModelScript::ToolCalls(vec![ToolCallScript {
+        [tool_calls(vec![ToolCallScript {
             name: "read",
             arguments: json!({"path": "secret.txt"}),
         }])],
@@ -62,9 +62,9 @@ async fn history_view_is_safe_and_pages() {
 
 #[tokio::test]
 async fn persistence_failure_returns_failed_and_blocked_state() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "persist-fail",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &["read"],
         ApprovalMode::Auto,
     );
@@ -105,9 +105,9 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
 
 #[tokio::test]
 async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "blocked-discard",
-        [ModelScript::Text("hello")],
+        [Step::Text("hello")],
         &["read"],
         ApprovalMode::Auto,
     );
@@ -170,14 +170,14 @@ async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
 
 #[tokio::test]
 async fn interaction_answer_resolves_an_approval() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "approval",
         [
-            ModelScript::ToolCalls(vec![ToolCallScript {
+            tool_calls(vec![ToolCallScript {
                 name: "write",
                 arguments: json!({"path": "out.txt", "content": "approved"}),
             }]),
-            ModelScript::Text("wrote it"),
+            Step::Text("wrote it"),
         ],
         &["write"],
         ApprovalMode::Ask,
@@ -222,9 +222,9 @@ async fn interaction_answer_resolves_an_approval() {
 
 #[tokio::test]
 async fn shutdown_cancels_and_awaits_an_active_loop() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "shutdown-active",
-        [ModelScript::Block],
+        [Step::Pending],
         &["read"],
         ApprovalMode::Auto,
     );
@@ -245,9 +245,9 @@ async fn shutdown_cancels_and_awaits_an_active_loop() {
 
 #[tokio::test]
 async fn error_mapping_covers_blocked_and_stale_turn() {
-    let fixture = RpcFixture::new(
+    let mut fixture = RpcFixture::new(
         "errors",
-        [ModelScript::Text("done")],
+        [Step::Text("done")],
         &["read"],
         ApprovalMode::Auto,
     );

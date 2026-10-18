@@ -20,7 +20,7 @@ pub(super) async fn pause_operation(key: PathBuf) {
     }
 }
 
-use crate::test_support::Gate;
+use crate::test_support::{Gate, ScriptedModel, Step};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::pending;
 use std::io;
@@ -45,9 +45,8 @@ use crate::ids::SessionId;
 use minicore_runtime::ToolCallId;
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
-    Model, ModelCallContext, ModelDescriptor, ModelError, ModelErrorKind, ModelEvent,
-    ModelFinishReason, ModelMessage, ModelRef, ModelRequest, ModelStartFuture, ModelStream,
-    ReasoningPreference, Usage,
+    Model, ModelCallContext, ModelError, ModelErrorKind, ModelEvent, ModelFinishReason,
+    ModelMessage, ModelRequest, ModelStream, ReasoningPreference, Usage,
 };
 
 use crate::agent::Agent;
@@ -67,31 +66,6 @@ use super::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Clone)]
-enum ModelScript {
-    Text(&'static str),
-    TextWithUsage(&'static str, u64, u64),
-    DuplicateUsage(&'static str),
-    NoUsage(&'static str),
-    Observe {
-        calls: Arc<Mutex<Vec<ObservedCall>>>,
-        text: &'static str,
-    },
-    Fail,
-    /// Emits usage, then fails. The observed usage must be retained as a
-    /// known partial total rather than reported as unknown.
-    UsageThenFail(u64, u64),
-    Gate(Arc<ConcurrencyProbe>),
-    ToolCalls(Vec<ToolCallScript>),
-    NoFinish,
-    WrongFinish,
-    LateContent,
-    Whitespace,
-    BlockWithSignal(Arc<Notify>),
-    Oversize,
-    Block,
-}
 
 struct ObservedCall {
     request: ModelRequest,
@@ -150,19 +124,6 @@ struct ToolCallScript {
     arguments: Value,
 }
 
-fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
-    BTreeSet::from([
-        ReasoningPreference::Auto,
-        ReasoningPreference::Disabled,
-        ReasoningPreference::Low,
-        ReasoningPreference::Medium,
-        ReasoningPreference::High,
-        ReasoningPreference::XHigh,
-        ReasoningPreference::Max,
-        ReasoningPreference::Ultra,
-    ])
-}
-
 fn configured_model(model: &str, base_url: &str, api_key_env: &str) -> ModelConfig {
     ModelConfig::OpenAiResponses {
         model: model.to_owned(),
@@ -171,223 +132,139 @@ fn configured_model(model: &str, base_url: &str, api_key_env: &str) -> ModelConf
         physical_context_window: 32_000,
         output_budget_tokens: 2_000,
         safety_margin_tokens: 1_000,
-        supported_reasoning: fake_supported_reasoning(),
+        supported_reasoning: crate::test_support::model::supported_reasoning(),
         supports_tools: true,
         request_timeout_seconds: Some(30),
     }
 }
 
-struct FakeModel {
-    descriptor: ModelDescriptor,
-    scripts: Mutex<VecDeque<ModelScript>>,
-    calls: AtomicUsize,
+fn fake_model(context_window: u64, scripts: impl IntoIterator<Item = Step>) -> Arc<ScriptedModel> {
+    ScriptedModel::with_window("fake", context_window, scripts)
 }
 
-impl FakeModel {
-    fn new(scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
-        Self::with_context_and_capabilities(scripts, 16_384, fake_supported_reasoning(), true)
-    }
-
-    fn for_compaction(scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
-        Self::with_context_window(scripts, 40_000)
-    }
-
-    fn with_context_window(
-        scripts: impl IntoIterator<Item = ModelScript>,
-        context_window: u64,
-    ) -> Arc<Self> {
-        Self::with_context_and_capabilities(
-            scripts,
-            context_window,
-            fake_supported_reasoning(),
-            true,
-        )
-    }
-
-    fn with_context_and_capabilities(
-        scripts: impl IntoIterator<Item = ModelScript>,
-        context_window: u64,
-        supported_reasoning: BTreeSet<ReasoningPreference>,
-        supports_tools: bool,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            descriptor: ModelDescriptor::new(
-                "fake".parse::<ModelRef>().unwrap(),
-                context_window,
-                supported_reasoning,
-                supports_tools,
-            )
-            .unwrap(),
-            scripts: Mutex::new(scripts.into_iter().collect()),
-            calls: AtomicUsize::new(0),
-        })
-    }
+fn text_stream(text: &str) -> ModelStream {
+    Box::pin(stream::iter(
+        [
+            ModelEvent::text_delta(text).unwrap(),
+            ModelEvent::Usage {
+                usage: Usage::new(1, 1, 0),
+            },
+            ModelEvent::Finish {
+                reason: ModelFinishReason::Stop,
+            },
+        ]
+        .map(Ok),
+    ))
 }
 
-impl Model for FakeModel {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn start(&self, request: ModelRequest, context: ModelCallContext) -> ModelStartFuture<'_> {
-        let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-        let script = self
-            .scripts
+/// Records the request and call context, then answers with `text`.
+fn observe(calls: Arc<Mutex<Vec<ObservedCall>>>, text: &'static str) -> Step {
+    Step::Custom(Box::new(move |request, context| {
+        calls
             .lock()
             .unwrap()
-            .pop_front()
-            .unwrap_or(ModelScript::Text("default"));
-        Box::pin(async move {
-            match script {
-                ModelScript::Text(text) => Ok(model_events(vec![
-                    ModelEvent::text_delta(text).unwrap(),
-                    ModelEvent::Usage {
-                        usage: Usage::new(1, 1, 0),
-                    },
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ])),
-                ModelScript::TextWithUsage(text, input, output) => Ok(model_events(vec![
-                    ModelEvent::text_delta(text).unwrap(),
-                    ModelEvent::Usage {
-                        usage: Usage::new(input, output, 0),
-                    },
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ])),
-                ModelScript::DuplicateUsage(text) => Ok(model_events(vec![
-                    ModelEvent::text_delta(text).unwrap(),
-                    ModelEvent::Usage {
-                        usage: Usage::new(7, 11, 0),
-                    },
-                    ModelEvent::Usage {
-                        usage: Usage::new(13, 17, 0),
-                    },
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ])),
-                ModelScript::NoUsage(text) => Ok(model_events(vec![
-                    ModelEvent::text_delta(text).unwrap(),
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ])),
-                ModelScript::Observe { calls, text } => {
-                    calls
-                        .lock()
-                        .unwrap()
-                        .push(ObservedCall { request, context });
-                    Ok(model_events(vec![
-                        ModelEvent::text_delta(text).unwrap(),
-                        ModelEvent::Usage {
-                            usage: Usage::new(1, 1, 0),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        },
-                    ]))
-                }
-                ModelScript::Fail => Err(fake_model_error()),
-                ModelScript::UsageThenFail(input, output) => Ok(Box::pin(stream::iter(vec![
-                    Ok(ModelEvent::Usage {
-                        usage: Usage::new(input, output, 0),
-                    }),
-                    Err(fake_model_error()),
-                ])) as ModelStream),
-                ModelScript::Gate(probe) => {
-                    probe.started.fetch_add(1, Ordering::SeqCst);
-                    let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
-                    probe.observe_active(active);
-                    probe.release.cancelled().await;
-                    probe.active.fetch_sub(1, Ordering::SeqCst);
-                    Ok(model_events(vec![
-                        ModelEvent::text_delta("gated answer").unwrap(),
-                        ModelEvent::Usage {
-                            usage: Usage::new(1, 1, 0),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        },
-                    ]))
-                }
-                ModelScript::ToolCalls(calls) => {
-                    let mut events = Vec::new();
-                    for (index, call) in calls.into_iter().enumerate() {
-                        let tool_call_id =
-                            ToolCallId::new(format!("{}-rpc-{call_index}-{index}", call.name))
-                                .unwrap();
-                        events.push(ModelEvent::ToolCallStart {
-                            tool_call_id: tool_call_id.clone(),
-                            tool_name: call.name.parse().unwrap(),
-                        });
-                        events.push(
-                            ModelEvent::tool_call_arguments_delta(
-                                tool_call_id.clone(),
-                                serde_json::to_string(&call.arguments).unwrap(),
-                            )
-                            .unwrap(),
-                        );
-                        events.push(ModelEvent::ToolCallEnd { tool_call_id });
-                    }
-                    events.push(ModelEvent::Usage {
-                        usage: Usage::new(1, 1, 0),
-                    });
-                    events.push(ModelEvent::Finish {
-                        reason: ModelFinishReason::ToolCalls,
-                    });
-                    Ok(model_events(events))
-                }
-                ModelScript::NoFinish => Ok(model_events(vec![
-                    ModelEvent::text_delta("incomplete").unwrap(),
-                ])),
-                ModelScript::WrongFinish => Ok(model_events(vec![
-                    ModelEvent::text_delta("wrong finish").unwrap(),
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Length,
-                    },
-                ])),
-                ModelScript::LateContent => Ok(model_events(vec![
-                    ModelEvent::text_delta("late").unwrap(),
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                    ModelEvent::text_delta("after finish").unwrap(),
-                ])),
-                ModelScript::Whitespace => Ok(model_events(vec![
-                    ModelEvent::text_delta(" \n\t").unwrap(),
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ])),
-                ModelScript::Oversize => {
-                    let chunk = "x".repeat(64 * 1024);
-                    Ok(model_events(vec![
-                        ModelEvent::text_delta(chunk.clone()).unwrap(),
-                        ModelEvent::text_delta(chunk).unwrap(),
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        },
-                    ]))
-                }
-                ModelScript::Block => {
-                    let _: Result<ModelStream, ModelError> = pending().await;
-                    unreachable!()
-                }
-                ModelScript::BlockWithSignal(started) => {
-                    started.notify_one();
-                    let _: Result<ModelStream, ModelError> = pending().await;
-                    unreachable!()
-                }
-            }
-        })
-    }
+            .push(ObservedCall { request, context });
+        Box::pin(async move { Ok(text_stream(text)) })
+    }))
 }
 
-fn model_events(events: Vec<ModelEvent>) -> ModelStream {
-    Box::pin(stream::iter(events.into_iter().map(Ok)))
+fn gated(probe: Arc<ConcurrencyProbe>) -> Step {
+    Step::Custom(Box::new(move |_, _| {
+        Box::pin(async move {
+            probe.started.fetch_add(1, Ordering::SeqCst);
+            let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+            probe.observe_active(active);
+            probe.release.cancelled().await;
+            probe.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(text_stream("gated answer"))
+        })
+    }))
+}
+
+fn block_with_signal(started: Arc<Notify>) -> Step {
+    Step::Custom(Box::new(move |_, _| {
+        started.notify_one();
+        Box::pin(pending())
+    }))
+}
+
+fn tool_calls(calls: Vec<ToolCallScript>) -> Step {
+    static NEXT_CALL: AtomicUsize = AtomicUsize::new(0);
+    let request = NEXT_CALL.fetch_add(1, Ordering::Relaxed);
+    let mut events = Vec::new();
+    for (index, call) in calls.into_iter().enumerate() {
+        let tool_call_id = ToolCallId::new(format!("{}-rpc-{request}-{index}", call.name)).unwrap();
+        events.push(ModelEvent::ToolCallStart {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: call.name.parse().unwrap(),
+        });
+        events.push(
+            ModelEvent::tool_call_arguments_delta(
+                tool_call_id.clone(),
+                serde_json::to_string(&call.arguments).unwrap(),
+            )
+            .unwrap(),
+        );
+        events.push(ModelEvent::ToolCallEnd { tool_call_id });
+    }
+    events.push(ModelEvent::Usage {
+        usage: Usage::new(1, 1, 0),
+    });
+    events.push(ModelEvent::Finish {
+        reason: ModelFinishReason::ToolCalls,
+    });
+    Step::Events(events)
+}
+
+/// Emits usage, then fails. The observed usage must be retained as a known
+/// partial total rather than reported as unknown.
+fn usage_then_fail(input: u64, output: u64) -> Step {
+    Step::PreviewEvents(
+        vec![
+            Ok(ModelEvent::Usage {
+                usage: Usage::new(input, output, 0),
+            }),
+            Err(fake_model_error()),
+        ],
+        None,
+    )
+}
+
+fn finished(deltas: &[&str], reason: Option<ModelFinishReason>) -> Step {
+    let mut events: Vec<_> = deltas
+        .iter()
+        .map(|delta| ModelEvent::text_delta(*delta).unwrap())
+        .collect();
+    events.extend(reason.map(|reason| ModelEvent::Finish { reason }));
+    Step::Events(events)
+}
+
+fn oversize() -> Step {
+    let chunk = "x".repeat(64 * 1024);
+    finished(&[&chunk, &chunk], Some(ModelFinishReason::Stop))
+}
+
+fn late_content() -> Step {
+    Step::Events(vec![
+        ModelEvent::text_delta("late").unwrap(),
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Stop,
+        },
+        ModelEvent::text_delta("after finish").unwrap(),
+    ])
+}
+
+fn usage_events(text: &str, usages: &[Usage]) -> Step {
+    let mut events = vec![ModelEvent::text_delta(text).unwrap()];
+    events.extend(
+        usages
+            .iter()
+            .map(|usage| ModelEvent::Usage { usage: *usage }),
+    );
+    events.push(ModelEvent::Finish {
+        reason: ModelFinishReason::Stop,
+    });
+    Step::Events(events)
 }
 
 fn test_config(data_dir: PathBuf, tools: &[&str], approval: ApprovalMode) -> AgentConfig {
@@ -422,7 +299,7 @@ fn test_config(data_dir: PathBuf, tools: &[&str], approval: ApprovalMode) -> Age
     }
 }
 
-fn test_models(model: Arc<FakeModel>) -> Models {
+fn test_models(model: Arc<ScriptedModel>) -> Models {
     let model: Arc<dyn Model> = model;
     Models::from_values(BTreeMap::from([("fake".to_owned(), model)]))
 }
@@ -431,14 +308,14 @@ struct RpcFixture {
     base: crate::test_support::TempDir,
     workspace: PathBuf,
     config: AgentConfig,
-    scripts: Vec<ModelScript>,
+    scripts: Vec<Step>,
     context_window: u64,
 }
 
 impl RpcFixture {
     fn new(
         label: &str,
-        scripts: impl IntoIterator<Item = ModelScript>,
+        scripts: impl IntoIterator<Item = Step>,
         tools: &[&str],
         approval: ApprovalMode,
     ) -> Self {
@@ -469,12 +346,12 @@ impl RpcFixture {
         self
     }
 
-    async fn open(&self) -> Agent {
+    async fn open(&mut self) -> Agent {
         Agent::open_with_models(
             self.config.clone(),
-            test_models(FakeModel::with_context_window(
-                self.scripts.clone(),
+            test_models(fake_model(
                 self.context_window,
+                std::mem::take(&mut self.scripts),
             )),
         )
         .await
@@ -785,10 +662,10 @@ async fn append_compaction_tail(harness: &mut RpcHarness, base: &Path, session_i
     assert!(harness.response(json!("fixture-open")).await["error"].is_null());
 }
 
-async fn assert_manual_failure_case(label: &str, script: ModelScript, expected: &str) -> Value {
-    let fixture = RpcFixture::new(
+async fn assert_manual_failure_case(label: &str, script: Step, expected: &str) -> Value {
+    let mut fixture = RpcFixture::new(
         label,
-        [ModelScript::Text("settled"), script],
+        [Step::Text("settled"), script],
         &[],
         ApprovalMode::Auto,
     )
