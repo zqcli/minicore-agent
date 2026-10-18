@@ -151,9 +151,18 @@ impl FixedPrompt {
         let fixed = Self {
             system,
             hard_input_bytes,
+            // Summaries cap reasoning cost at Low where the model offers it;
+            // otherwise the session's own preference is the supported choice.
             reasoning: match input.reasoning {
                 ReasoningPreference::Disabled => ReasoningPreference::Disabled,
-                _ => ReasoningPreference::Low,
+                _ if input
+                    .model
+                    .descriptor()
+                    .supports_reasoning(ReasoningPreference::Low) =>
+                {
+                    ReasoningPreference::Low
+                }
+                preference => preference,
             },
         };
         // Project instructions and schemas remain part of the normal request's

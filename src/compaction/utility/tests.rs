@@ -773,22 +773,36 @@ fn recent_tail_scales_down_with_the_effective_window() {
 }
 
 #[tokio::test]
-async fn large_previous_snapshot_is_bounded_and_utility_reasoning_is_low() {
-    let model = summary_model("concise summary");
-    let mut input = input(&model, vec![]);
-    input.reasoning = ReasoningPreference::High;
-    input.previous_summary = Some(BoundedText::new("old ".repeat(60_000)).unwrap());
-    let source = projected(&input);
-    assert!(source.len() < 70_000);
-    assert!(source.contains("more characters truncated]"));
-    assert!(
-        generate_summary(&input, &CancellationToken::new())
-            .await
-            .is_ok()
-    );
-    assert_eq!(
-        model.requests.lock().unwrap()[0].reasoning(),
-        ReasoningPreference::Low
-    );
-    assert_eq!(input.previous_summary.unwrap().byte_len(), 240_000);
+async fn large_previous_snapshot_is_bounded_and_utility_reasoning_is_capped_where_supported() {
+    use ReasoningPreference::{Auto, High, Low};
+    for (supported, session, expected) in [
+        ([Auto, Low, High].into(), High, Low),
+        ([Auto].into(), Auto, Auto),
+    ] {
+        let model = ScriptedModel::with_reasoning(
+            "fixture",
+            100_000,
+            supported,
+            [Step::Events(vec![
+                ModelEvent::text_delta("concise summary").unwrap(),
+                usage_event(),
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            ])],
+        );
+        let mut input = input(&model, vec![]);
+        input.reasoning = session;
+        input.previous_summary = Some(BoundedText::new("old ".repeat(60_000)).unwrap());
+        let source = projected(&input);
+        assert!(source.len() < 70_000);
+        assert!(source.contains("more characters truncated]"));
+        assert!(
+            generate_summary(&input, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
+        assert_eq!(model.requests.lock().unwrap()[0].reasoning(), expected);
+        assert_eq!(input.previous_summary.unwrap().byte_len(), 240_000);
+    }
 }
