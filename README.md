@@ -74,10 +74,13 @@ A Session runs at most one active Runtime loop. Its persisted `session.json`,
 ```
 
 The complete history is authoritative. `persistence: persisted` means the
-Agent's append completed in the running process; the Store is not a transactional
-ledger and this is not an end-to-end crash-durability guarantee. A failed Agent
-append returns the Runtime result with `persistence: failed` and blocks further
-turns. On reopen, only a trailing incomplete JSONL line may be truncated; a
+Agent's history append and data sync completed. Session and summary replacements
+also sync their parent directory after rename. This is not a transaction across
+history, metadata, summaries, and auxiliary tool records. A failed append returns
+the Runtime result with `persistence: failed` without changing in-memory history.
+A rejection before writing or a successfully synced rollback permits another
+turn; only an uncertain append outcome blocks further turns until close/reopen.
+On reopen, only a trailing incomplete JSONL line may be truncated and synced; a
 complete malformed record is corruption, not recoverable crash state. Live
 events are best-effort; use `turn.wait`, `turn.result`, and history queries for
 authority. Existing v0.2 Session data is not migrated.

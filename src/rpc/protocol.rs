@@ -1,23 +1,18 @@
-use std::path::PathBuf;
-
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use minicore_runtime::interaction::InteractionAnswer;
-use minicore_runtime::model::ReasoningPreference;
 use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer};
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{InteractionId, LoopId};
 
-use crate::agent::{
-    CompactSession, CreateSession, RenameSession, SessionInfo, SteerMessage, TurnRef, UpdateSession,
-};
+use crate::agent::{SessionInfo, SteerMessage, TurnRef};
 use crate::event::AgentEvent;
 use crate::history::GetHistory;
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
-use crate::read::{ReadCursor, ReadSession, TurnResultRequest};
+use crate::read::{ReadCursor, TurnResultRequest};
 use crate::tool_data::{ToolDataStream, ToolOutputRequest, ToolReadRequest, ToolRef};
 
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
@@ -47,6 +42,7 @@ pub(crate) const RESOURCE_EXHAUSTED: i32 = -32_019;
 pub(crate) const QUERY_LIMIT: i32 = -32_020;
 pub(crate) const TOOL_NOT_FOUND: i32 = -32_021;
 pub(crate) const CONTEXT_UNCOMPRESSIBLE: i32 = -32_022;
+pub(crate) const CONFIG_ERROR: i32 = -32_023;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -140,52 +136,10 @@ where
 #[serde(deny_unknown_fields)]
 pub(crate) struct EmptyParams {}
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionCreateParams {
-    pub(crate) workspace: PathBuf,
-    #[serde(default)]
-    pub(crate) profile: String,
-    #[serde(default)]
-    pub(crate) model: Option<String>,
-    #[serde(default)]
-    pub(crate) reasoning: Option<ReasoningPreference>,
-    #[serde(default)]
-    pub(crate) title: Option<String>,
-}
-
-impl From<SessionCreateParams> for CreateSession {
-    fn from(value: SessionCreateParams) -> Self {
-        Self {
-            workspace: value.workspace,
-            profile: value.profile,
-            model: value.model,
-            reasoning: value.reasoning,
-            title: value.title,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionParams {
     pub(crate) session_id: crate::ids::SessionId,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionCompactParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    pub(crate) operation_id: String,
-}
-
-impl From<SessionCompactParams> for CompactSession {
-    fn from(value: SessionCompactParams) -> Self {
-        Self {
-            session_id: value.session_id,
-            operation_id: value.operation_id,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -210,41 +164,6 @@ impl From<SessionHistoryParams> for GetHistory {
 
 fn default_history_limit() -> usize {
     100
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionReadParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    #[serde(default)]
-    pub(crate) cursor: Option<ReadCursor>,
-    #[serde(default = "default_history_limit")]
-    pub(crate) limit: usize,
-    #[serde(default)]
-    pub(crate) max_bytes: Option<usize>,
-    #[serde(default)]
-    pub(crate) captured_end: Option<u64>,
-    #[serde(default)]
-    pub(crate) history_revision: Option<String>,
-    #[serde(default)]
-    pub(crate) view: crate::read::ReadView,
-    #[serde(default)]
-    pub(crate) projection_revision: Option<String>,
-}
-
-impl From<SessionReadParams> for ReadSession {
-    fn from(value: SessionReadParams) -> Self {
-        Self {
-            session_id: value.session_id,
-            cursor: value.cursor,
-            limit: value.limit,
-            max_bytes: value.max_bytes,
-            captured_end: value.captured_end,
-            history_revision: value.history_revision,
-            view: value.view,
-            projection_revision: value.projection_revision,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -330,55 +249,6 @@ impl From<ToolOutputParams> for ToolOutputRequest {
             max_bytes: value.max_bytes,
         }
     }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionUpdateParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    #[serde(default)]
-    pub(crate) model: Option<String>,
-    #[serde(default)]
-    pub(crate) reasoning: Option<ReasoningPreference>,
-}
-
-impl SessionUpdateParams {
-    pub(crate) fn has_field(&self) -> bool {
-        self.model.is_some() || self.reasoning.is_some()
-    }
-}
-
-impl From<SessionUpdateParams> for UpdateSession {
-    fn from(value: SessionUpdateParams) -> Self {
-        Self {
-            session_id: value.session_id,
-            model: value.model,
-            reasoning: value.reasoning,
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SessionRenameParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    pub(crate) title: String,
-}
-
-impl From<SessionRenameParams> for RenameSession {
-    fn from(value: SessionRenameParams) -> Self {
-        Self {
-            session_id: value.session_id,
-            title: value.title,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TurnSendParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    pub(crate) text: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

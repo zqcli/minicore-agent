@@ -261,7 +261,7 @@ fn loop_options_applies_overrides_to_runtime_defaults() {
     config.loop_options.max_pending_steers = Some(8);
     config.loop_options.model_retry_attempts = Some(3);
     config.loop_options.model_retry_base_delay_millis = Some(250);
-    let options = config.loop_options(7).unwrap();
+    let options = config.loop_options().unwrap();
     assert_eq!(options.max_tool_rounds, 0);
     assert_eq!(options.event_capacity, 16);
     assert_eq!(options.max_pending_steers, 8);
@@ -275,19 +275,26 @@ fn automatic_options_give_prompt_preparation_a_model_timeout_floor() {
     config.compaction.enabled = true;
     config.loop_options.prompt_timeout_seconds = Some(5);
     config.loop_options.model_timeout_seconds = Some(17);
-    let options = config.loop_options_for_automatic(7).unwrap();
-    assert_eq!(options.prompt_timeout, Duration::from_secs(17));
-    assert_eq!(options.model_timeout, Duration::from_secs(17));
-    let options = config.loop_options_for_model(7, "main").unwrap();
+    let options = config.loop_options_for_model("main").unwrap();
     assert_eq!(options.prompt_timeout, Duration::from_secs(30));
+    assert_eq!(options.model_timeout, Duration::from_secs(17));
+    config.loop_options.model_timeout_seconds = Some(45);
+    assert_eq!(
+        config
+            .loop_options_for_model("main")
+            .unwrap()
+            .prompt_timeout,
+        Duration::from_secs(45)
+    );
+    config.loop_options.model_timeout_seconds = Some(17);
 
     config.loop_options.prompt_timeout_seconds = Some(30);
-    let options = config.loop_options_for_automatic(7).unwrap();
+    let options = config.loop_options_for_model("main").unwrap();
     assert_eq!(options.prompt_timeout, Duration::from_secs(30));
 
     config.compaction.enabled = false;
     config.loop_options.prompt_timeout_seconds = Some(5);
-    let options = config.loop_options_for_automatic(7).unwrap();
+    let options = config.loop_options_for_model("main").unwrap();
     assert_eq!(options.prompt_timeout, Duration::from_secs(5));
 }
 

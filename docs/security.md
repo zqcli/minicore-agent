@@ -53,6 +53,13 @@ Tool arguments, and Bash commands/paths/content. Agent errors and redacted
 `Debug` values expose stable classifications and bounded metadata, not secret
 payloads.
 
+A non-loopback `http://` model `base_url` sends the bearer token and request/response
+content in plaintext. It remains allowed for trusted LAN gateways, but the Agent
+logs one warning per such model when constructing the catalog at startup or reload.
+The warning identifies only the configured model ID, never the key, host, or URL
+path. Prefer HTTPS outside a trusted local network; loopback HTTP does not receive
+this warning. Redirects remain disabled.
+
 The RPC and history views are different from logs: user text, Tool results, and
 some bounded raw Tool streams are intentionally queryable data and may contain
 secrets supplied by a user or model. Opaque provider reasoning is removed from
