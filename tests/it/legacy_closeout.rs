@@ -11,10 +11,8 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-#[path = "support/openai_mock.rs"]
-mod openai_mock;
-#[path = "support/rpc_process.rs"]
-mod rpc_process;
+use crate::support::openai_mock;
+use crate::support::rpc_process;
 use openai_mock::{MockResponse, MockServer};
 use rpc_process::RpcProcess;
 

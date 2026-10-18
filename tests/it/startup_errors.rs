@@ -207,7 +207,7 @@ fn custom_tls_bundle_with_chinese_path_boots_ping_and_shutdown() {
     let bundle_path = cert_dir.join("公司根证书.pem");
     std::fs::write(
         &bundle_path,
-        include_bytes!("fixtures/amazon-root-ca-3.pem"),
+        include_bytes!("../fixtures/amazon-root-ca-3.pem"),
     )
     .unwrap();
     assert_fixed_config_boots(Some(&bundle_path));

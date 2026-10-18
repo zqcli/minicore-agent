@@ -3,12 +3,10 @@ use std::path::{Path, PathBuf};
 use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
-#[path = "support/openai_mock.rs"]
-mod openai_mock;
+use crate::support::openai_mock;
 use openai_mock::{MockResponse, MockServer};
 
-#[path = "support/rpc_process.rs"]
-mod rpc_process;
+use crate::support::rpc_process;
 use rpc_process::RpcProcess;
 
 fn write_config(temp_dir: &Path, base_url: &str, key_env: &str, tools: &[&str]) -> PathBuf {

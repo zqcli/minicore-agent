@@ -3,11 +3,9 @@ use std::path::{Path, PathBuf};
 use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
-#[path = "support/openai_mock.rs"]
-mod openai_mock;
+use crate::support::openai_mock;
+use crate::support::rpc_process;
 use openai_mock::{ChunkGate, MockResponse, MockServer};
-#[path = "support/rpc_process.rs"]
-mod rpc_process;
 use rpc_process::RpcProcess;
 
 const KEY_ENV: &str = "MINICORE_TUI_FLOW_KEY";

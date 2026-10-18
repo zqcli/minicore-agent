@@ -1,14 +1,14 @@
+pub mod support;
+
 use std::path::{Path, PathBuf};
 
 use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
-#[path = "support/openai_mock.rs"]
-mod openai_mock;
 use openai_mock::{MockResponse, MockServer};
-#[path = "support/rpc_process.rs"]
-mod rpc_process;
 use rpc_process::RpcProcess;
+use support::openai_mock;
+use support::rpc_process;
 
 const KEY_ENV: &str = "MINICORE_RPC_SOAK_KEY";
 const KEY: &str = "RPC-SOAK-API-KEY-SECRET";

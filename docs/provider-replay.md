@@ -88,7 +88,7 @@ The removed tests targeted implicit loop-local continuation eviction, cancelled
 loop purging, request-index sequencing, and a 4 MiB cache. Their relevant output
 order/argument, terminal mismatch, failure, isolation, and byte-limit assertions
 are replaced by attachment-based tests in `src/models/openai/tests/replay_tests.rs`,
-`tests/openai_rpc_process.rs`, and the emergency Agent tests. There is no such
+`tests/it/openai_rpc_process.rs`, and the emergency Agent tests. There is no such
 cache or eviction lifecycle in this version.
 
 No real-provider, paid-model, cache-hit-rate, native cross-platform, or remote CI
