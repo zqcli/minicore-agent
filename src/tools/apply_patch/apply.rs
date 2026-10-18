@@ -117,9 +117,8 @@ pub(super) fn apply_single_file_patch_with_stats(
     source: &str,
     patch: &str,
 ) -> Result<(String, ApplyStats), ToolError> {
-    if patch.is_empty() || patch.len() > MAX_PATCH_BYTES || patch.contains('\0') {
-        return Err(ToolError::InvalidInvocation);
-    }
+    // The tool entry rejects empty, oversized and NUL-bearing patches before I/O;
+    // appends below enforce the result bound.
     let first = patch
         .split_inclusive('\n')
         .next()

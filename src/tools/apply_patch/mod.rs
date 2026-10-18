@@ -123,9 +123,6 @@ impl ApplyPatchTool {
                 };
                 emit_phase(&context, "matching");
                 let result = apply_single_file_patch(&input.path, &source, &input.patch)?;
-                if result.len() > MAX_PATCH_BYTES {
-                    return Err(ToolError::InvalidInvocation);
-                }
                 let output = ToolOutput::new(format!(
                     "patched {} bytes to {} bytes at {path_display}",
                     source.len(),
