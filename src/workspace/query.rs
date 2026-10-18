@@ -7,14 +7,14 @@
 //! newer content. Nothing here writes history, starts a model call, or mutates
 //! the file.
 
+use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
@@ -29,9 +29,6 @@ const DEFAULT_MAX_LINES: u32 = DEFAULT_READ_LIMIT as u32;
 const MAX_MAX_LINES: u32 = MAX_READ_LINES as u32;
 /// A result budget smaller than this cannot hold any useful envelope plus
 /// content. `workspace.files` and `workspace.search` share the same range.
-pub(crate) const MIN_RESULT_BYTES: usize = 1024;
-pub(crate) const DEFAULT_RESULT_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// A request path longer than this is rejected before any query slot or
 /// serialization work. The generic workspace path checks stay uncapped.
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
@@ -93,12 +90,7 @@ impl WorkspaceReadRequest {
         {
             return Err(AgentError::InvalidArguments);
         }
-        if self
-            .max_bytes
-            .is_some_and(|max_bytes| !(MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&max_bytes))
-        {
-            return Err(AgentError::InvalidArguments);
-        }
+        validate_result_bytes(self.max_bytes)?;
         if self
             .if_revision
             .as_deref()
@@ -256,53 +248,23 @@ pub(crate) async fn read_until(
         .await?;
     }
 
-    let mut file = with_query_budget(
-        workspace.open_regular_file(&path),
+    let capture = with_query_budget(
+        workspace.capture_file(&path, MAX_READ_BYTES),
         &session_cancellation,
         &shutdown_cancellation,
         deadline,
     )
-    .await?
-    .map_err(map_workspace_error)?;
-    let before = with_query_budget(
-        file.metadata(),
-        &session_cancellation,
-        &shutdown_cancellation,
-        deadline,
-    )
-    .await?
-    .map_err(|_| AgentError::Workspace)?;
-    let capacity = usize::try_from(before.len().min(MAX_READ_BYTES as u64)).unwrap_or(0) + 1;
-    let mut bytes = Vec::with_capacity(capacity);
-    let limit = MAX_READ_BYTES as u64 + 1;
-    with_query_budget(
-        async { (&mut file).take(limit).read_to_end(&mut bytes).await },
-        &session_cancellation,
-        &shutdown_cancellation,
-        deadline,
-    )
-    .await?
-    .map_err(|_| AgentError::Workspace)?;
-    let after = with_query_budget(
-        file.metadata(),
-        &session_cancellation,
-        &shutdown_cancellation,
-        deadline,
-    )
-    .await?
-    .map_err(|_| AgentError::Workspace)?;
-
-    // A file larger than the whole-file bound has no preview and no revision.
-    // The bounded read cannot exceed the bound plus one byte.
-    let oversized = bytes.len() > MAX_READ_BYTES;
-    // A response is only trustworthy when the bytes form one consistent whole
-    // file: same size before and after, and no modification in between. The
-    // full modification time is compared so a same-millisecond rewrite is not
-    // hidden; this is still a live observation, never a filesystem snapshot.
-    let consistent = !oversized
-        && u64::try_from(bytes.len()).ok() == Some(after.len())
-        && after.len() == before.len()
-        && modified_time(&before) == modified_time(&after);
+    .await?;
+    let (bytes, stamp, stable, oversized) = match capture {
+        crate::workspace::FileCapture::Complete(snapshot) => {
+            (snapshot.bytes, snapshot.stamp, snapshot.stable, false)
+        }
+        crate::workspace::FileCapture::TooLarge(stamp) => (Vec::new(), stamp, false, true),
+        crate::workspace::FileCapture::Missing => return Err(AgentError::Workspace),
+        crate::workspace::FileCapture::Error(error) => return Err(map_workspace_error(error)),
+    };
+    // A stable stamp alone cannot prove a full read (e.g. a procfs file).
+    let consistent = stable && bytes.len() as u64 == stamp.len();
     let revision = consistent.then(|| revision_of(&bytes));
 
     let mut result = WorkspaceReadResult {
@@ -316,8 +278,8 @@ pub(crate) async fn read_until(
         next_range: None,
         encoding: WorkspaceReadEncoding::Unknown,
         status: WorkspaceReadStatus::Ok,
-        file_bytes: after.len(),
-        file_modified_unix_ms: modified_unix_ms(&after),
+        file_bytes: stamp.len(),
+        file_modified_unix_ms: stamp.modified_unix_ms(),
     };
 
     if oversized {
@@ -563,18 +525,6 @@ fn select_page(
         line_truncated,
         next,
     })
-}
-
-fn modified_time(metadata: &std::fs::Metadata) -> Option<SystemTime> {
-    metadata.modified().ok()
-}
-
-fn modified_unix_ms(metadata: &std::fs::Metadata) -> Option<u64> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn map_workspace_error(error: crate::workspace::WorkspaceError) -> AgentError {

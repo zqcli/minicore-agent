@@ -27,8 +27,6 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,9 +40,8 @@ use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::workspace::Workspace;
-use crate::workspace::query::{
-    DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, MAX_RESULT_BYTES, MIN_RESULT_BYTES,
-};
+use crate::workspace::query::MAX_PATH_BYTES;
+use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
 use crate::workspace::scan::{READ_CHUNK_BYTES, WorkspaceScanConsistency, now_unix_ms};
 
 mod diff;
@@ -95,12 +92,7 @@ impl WorkspaceStatusRequest {
     pub fn validate(&self) -> Result<(), AgentError> {
         // Cheap and filesystem-free, so an invalid budget is rejected before a
         // query slot is reserved.
-        if self
-            .max_bytes
-            .is_some_and(|max_bytes| !(MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&max_bytes))
-        {
-            return Err(AgentError::InvalidArguments);
-        }
+        validate_result_bytes(self.max_bytes)?;
         Ok(())
     }
 }
@@ -357,27 +349,6 @@ impl Observation {
     }
 }
 
-/// Observes the Workspace's Git status through fixed, shell-free git arguments.
-#[cfg(test)]
-pub(crate) async fn status(
-    workspace: &Workspace,
-    request: &WorkspaceStatusRequest,
-    session_cancellation: &CancellationToken,
-    shutdown_cancellation: &CancellationToken,
-    child_cancellation: &CancellationToken,
-) -> Result<WorkspaceStatusResult, AgentError> {
-    let deadline = status_deadline_at(workspace.root());
-    status_with_deadline(
-        workspace,
-        request,
-        session_cancellation,
-        shutdown_cancellation,
-        child_cancellation,
-        deadline,
-    )
-    .await
-}
-
 pub(crate) async fn status_with_deadline(
     workspace: &Workspace,
     request: &WorkspaceStatusRequest,
@@ -392,6 +363,16 @@ pub(crate) async fn status_with_deadline(
     let env = status_env(&root);
     let observed_at_unix_ms = now_unix_ms();
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_RESULT_BYTES);
+    let unavailable = |warnings, complete| {
+        assemble(
+            false,
+            Observation::default(),
+            warnings,
+            complete,
+            max_bytes,
+            observed_at_unix_ms,
+        )
+    };
     let run = GitRun {
         program: program.as_os_str(),
         root: &root,
@@ -409,66 +390,19 @@ pub(crate) async fn status_with_deadline(
     // The work tree root bounds every path this query may report and is also
     // the directory git runs from, so porcelain paths are unambiguous.
     let probe = run_git(&run, &os_args(&["rev-parse", "--show-toplevel"])).await?;
-    if probe.spawn_failed {
-        // Git is not installed or not executable: an explicit unavailable
-        // state, never a clean workspace.
-        push_warning(&mut warnings, WorkspaceStatusWarning::GitUnavailable);
-        return assemble(
-            false,
-            Observation::default(),
-            warnings,
-            false,
-            max_bytes,
-            observed_at_unix_ms,
-        );
-    }
-    if probe.timed_out {
-        push_warning(&mut warnings, WorkspaceStatusWarning::Deadline);
-        return assemble(
-            false,
-            Observation::default(),
-            warnings,
-            false,
-            max_bytes,
-            observed_at_unix_ms,
-        );
-    }
-    if probe.truncated || probe.io_failed {
-        // The repository state was not observed, so it is reported as unknown
-        // instead of as a definite answer.
-        push_warning(
-            &mut warnings,
-            if probe.truncated {
-                WorkspaceStatusWarning::OutputTruncated
-            } else {
-                WorkspaceStatusWarning::StatusFailed
-            },
-        );
-        return assemble(
-            false,
-            Observation::default(),
-            warnings,
-            false,
-            max_bytes,
-            observed_at_unix_ms,
-        );
+    if let Some(warning) = failure_warning(&probe) {
+        push_warning(&mut warnings, warning);
+        return unavailable(warnings, false);
     }
     let toplevel = if probe.succeeded() {
-        repository_root(&probe.stdout)
+        repository_root(&probe.stdout).await
     } else {
         None
     };
     if probe.succeeded() && toplevel.is_none() {
         // Git answered, but the answer is not a usable work tree root.
         push_warning(&mut warnings, WorkspaceStatusWarning::StatusFailed);
-        return assemble(
-            false,
-            Observation::default(),
-            warnings,
-            false,
-            max_bytes,
-            observed_at_unix_ms,
-        );
+        return unavailable(warnings, false);
     }
     let Some(toplevel) = toplevel else {
         // Without a work tree root, only a definite answer from git may be
@@ -476,14 +410,8 @@ pub(crate) async fn status_with_deadline(
         // dubious ownership check, a corrupt configuration, or a permission
         // problem stays an unknown failure.
         let classify = run_git(&run, &os_args(&["rev-parse", "--is-bare-repository"])).await?;
-        if classify.spawn_failed {
-            push_warning(&mut warnings, WorkspaceStatusWarning::GitUnavailable);
-        } else if classify.timed_out {
-            push_warning(&mut warnings, WorkspaceStatusWarning::Deadline);
-        } else if classify.truncated {
-            push_warning(&mut warnings, WorkspaceStatusWarning::OutputTruncated);
-        } else if classify.io_failed {
-            push_warning(&mut warnings, WorkspaceStatusWarning::StatusFailed);
+        if let Some(warning) = failure_warning(&classify) {
+            push_warning(&mut warnings, warning);
         } else if classify.succeeded()
             && matches!(
                 String::from_utf8_lossy(&classify.stdout).trim(),
@@ -493,37 +421,16 @@ pub(crate) async fn status_with_deadline(
             // `true` is a bare repository, `false` means the workspace is
             // inside a git directory but not in a work tree. Both are definite
             // answers with no status to report.
-            return assemble(
-                false,
-                Observation::default(),
-                warnings,
-                true,
-                max_bytes,
-                observed_at_unix_ms,
-            );
+            return unavailable(warnings, true);
         } else {
             push_warning(&mut warnings, WorkspaceStatusWarning::StatusFailed);
         }
-        return assemble(
-            false,
-            Observation::default(),
-            warnings,
-            false,
-            max_bytes,
-            observed_at_unix_ms,
-        );
+        return unavailable(warnings, false);
     };
     let Some(pathspec) = workspace_pathspec(workspace.root(), &toplevel) else {
         // The work tree root cannot be related to the workspace, so no
         // porcelain path could be attributed safely.
-        return assemble(
-            false,
-            Observation::default(),
-            vec![WorkspaceStatusWarning::StatusFailed],
-            false,
-            max_bytes,
-            observed_at_unix_ms,
-        );
+        return unavailable(vec![WorkspaceStatusWarning::StatusFailed], false);
     };
     if pathspec != OsStr::new(".") {
         push_warning(&mut warnings, WorkspaceStatusWarning::NestedRepository);
@@ -595,6 +502,20 @@ pub(crate) async fn status_with_deadline(
         max_bytes,
         observed_at_unix_ms,
     )
+}
+
+fn failure_warning(output: &GitOutput) -> Option<WorkspaceStatusWarning> {
+    if output.spawn_failed {
+        Some(WorkspaceStatusWarning::GitUnavailable)
+    } else if output.timed_out {
+        Some(WorkspaceStatusWarning::Deadline)
+    } else if output.truncated {
+        Some(WorkspaceStatusWarning::OutputTruncated)
+    } else if output.io_failed {
+        Some(WorkspaceStatusWarning::StatusFailed)
+    } else {
+        None
+    }
 }
 
 fn push_warning(warnings: &mut Vec<WorkspaceStatusWarning>, warning: WorkspaceStatusWarning) {
@@ -999,7 +920,7 @@ fn workspace_pathspec(workspace_root: &Path, toplevel: &Path) -> Option<OsString
     Some(spec)
 }
 
-fn repository_root(stdout: &[u8]) -> Option<PathBuf> {
+async fn repository_root(stdout: &[u8]) -> Option<PathBuf> {
     let text = std::str::from_utf8(stdout).ok()?;
     let path = text.strip_suffix('\n').unwrap_or(text);
     if path.is_empty() || path.contains('\n') {
@@ -1009,8 +930,12 @@ fn repository_root(stdout: &[u8]) -> Option<PathBuf> {
     // and compared with the canonical workspace root (for example `/tmp`
     // against `/private/tmp`). An answer that fails that check is not a root
     // every porcelain path can be attributed to.
-    let canonical = std::fs::canonicalize(path).ok()?;
-    canonical.is_dir().then_some(canonical)
+    let canonical = tokio::fs::canonicalize(path).await.ok()?;
+    tokio::fs::metadata(&canonical)
+        .await
+        .ok()?
+        .is_dir()
+        .then_some(canonical)
 }
 
 fn os_args(args: &[&str]) -> Vec<OsString> {
@@ -1039,20 +964,22 @@ async fn run_git(run: &GitRun<'_>, args: &[OsString]) -> Result<GitOutput, Agent
         // Fixed configuration, so neither a user's global configuration nor a
         // repository setting can start a file system monitor, recurse into
         // submodules, colour the output, or change how renames are detected.
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-c")
-        .arg("submodule.recurse=false")
-        .arg("-c")
-        .arg("color.ui=false")
-        .arg("-c")
-        .arg("core.quotePath=false")
-        .arg("-c")
-        .arg("diff.renames=true")
-        .arg("-c")
-        .arg("status.renames=true")
-        .arg("-c")
-        .arg("status.relativePaths=false")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "diff.renames=true",
+            "-c",
+            "status.renames=true",
+            "-c",
+            "status.relativePaths=false",
+        ])
         .args(args);
     // Every inherited `GIT_*` name is dropped before the child starts, so no
     // `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, or
@@ -1153,26 +1080,24 @@ async fn run_git(run: &GitRun<'_>, args: &[OsString]) -> Result<GitOutput, Agent
     let mut timed_out = false;
     let waited = tokio::select! {
         biased;
-        _ = run.session_cancellation.cancelled() => Stop::Cancelled,
-        _ = run.shutdown_cancellation.cancelled() => Stop::Cancelled,
-        _ = run.child_cancellation.cancelled() => Stop::Cancelled,
+        _ = run.session_cancellation.cancelled() => Some(Stop::Cancelled),
+        _ = run.shutdown_cancellation.cancelled() => Some(Stop::Cancelled),
+        _ = run.child_cancellation.cancelled() => Some(Stop::Cancelled),
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(run.deadline)) => {
             timed_out = true;
-            Stop::Expired
+            Some(Stop::Expired)
         }
-        _ = stdout_bound.notified() => Stop::Bounded,
-        _ = stderr_bound.notified() => Stop::Bounded,
-        _ = futures_util::future::join(capture, drain) => Stop::PipesClosed,
+        _ = stdout_bound.notified() => Some(Stop::Bounded),
+        _ = stderr_bound.notified() => Some(Stop::Bounded),
+        _ = futures_util::future::join(capture, drain) => None,
     };
     let mut truncated =
         flags.stdout_capped.load(Ordering::Acquire) || flags.stderr_capped.load(Ordering::Acquire);
     let mut io_failed = flags.io_failed.load(Ordering::Acquire);
     let mut exit_code = None;
-    match waited {
-        Stop::PipesClosed => {
-            // The pipes are closed, but the child still owns its exit status:
-            // wait for it under the same budget instead of waiting without one.
-            let status = tokio::select! {
+    let waited = match waited {
+        Some(stop) => stop,
+        None => tokio::select! {
                 biased;
                 _ = run.session_cancellation.cancelled() => Stop::Cancelled,
                 _ = run.shutdown_cancellation.cancelled() => Stop::Cancelled,
@@ -1182,39 +1107,14 @@ async fn run_git(run: &GitRun<'_>, args: &[OsString]) -> Result<GitOutput, Agent
                 }
                 status = child.wait() => {
                     match status {
-                        Ok(status) => {
-                            exit_code = status.code();
-                            Stop::Reaped
-                        }
-                        Err(_) => {
-                            io_failed = true;
-                            Stop::Reaped
-                        }
+                        Ok(status) => exit_code = status.code(),
+                        Err(_) => io_failed = true,
                     }
+                    Stop::Reaped
                 }
-            };
-            match status {
-                Stop::Reaped => {}
-                Stop::Cancelled => {
-                    if !stop_child(&mut child, run).await {
-                        // The child was asked to stop and was not reaped: the
-                        // query fails instead of reporting a cancellation it
-                        // cannot back.
-                        return Err(AgentError::Internal);
-                    }
-                    return Err(AgentError::QueryLimit);
-                }
-                Stop::Expired => {
-                    timed_out = true;
-                    if !stop_child(&mut child, run).await {
-                        io_failed = true;
-                    }
-                }
-                Stop::PipesClosed | Stop::Bounded => {
-                    unreachable!("the wait branch only stops by the budget")
-                }
-            }
-        }
+        },
+    };
+    match waited {
         Stop::Cancelled => {
             if !stop_child(&mut child, run).await {
                 return Err(AgentError::Internal);
@@ -1249,8 +1149,6 @@ async fn run_git(run: &GitRun<'_>, args: &[OsString]) -> Result<GitOutput, Agent
 /// Why one git invocation's race ended.
 #[derive(Clone, Copy)]
 enum Stop {
-    /// Both pipes reached end of file; the child may still be running.
-    PipesClosed,
     /// The query was cancelled.
     Cancelled,
     /// The deadline passed.
@@ -1261,18 +1159,15 @@ enum Stop {
     Reaped,
 }
 
-/// Stops the owned child and reaps it. The owner waits until the operating
-/// system reports the child, so a stuck system can delay the query past its
-/// deadline; that delay is documented and is never replaced by a latency-based
-/// guess at termination. Returns false when the kill and the wait could not
-/// both be confirmed, which the caller reports as a failed observation.
+/// Stops the child and waits for a bounded reap grace. A timeout is an
+/// unconfirmed termination, never evidence that the child exited.
 async fn stop_child(child: &mut tokio::process::Child, run: &GitRun<'_>) -> bool {
     let _ = run;
     // A Unix test may hold this point to observe the owner while its child is
     // still unreaped; the hold never appears outside Unix tests.
     #[cfg(all(test, unix))]
-    if let Some(gate) = status_reap_gate(run.root) {
-        gate.hold().await;
+    if let Some(gate) = STATUS_REAP_GATES.take(&run.root.to_path_buf()) {
+        gate.pass().await;
     }
     let killed = child.start_kill();
     if killed.is_err() {
@@ -1284,7 +1179,13 @@ async fn stop_child(child: &mut tokio::process::Child, run: &GitRun<'_>) -> bool
             Err(_) => return false,
         }
     }
-    child.wait().await.is_ok()
+    match tokio::time::timeout(super::WORKSPACE_CANCEL_GRACE, child.wait()).await {
+        Ok(result) => result.is_ok(),
+        Err(_) => {
+            tracing::warn!("detaching workspace status child: reap exceeded cancellation grace");
+            false
+        }
+    }
 }
 
 /// A platform null file, so git's user configuration is explicitly empty.
@@ -1300,73 +1201,26 @@ fn null_device() -> &'static OsStr {
 }
 
 #[cfg(test)]
-static STATUS_CAPS: OnceLock<Mutex<Vec<(PathBuf, StatusCaps)>>> = OnceLock::new();
+pub(crate) static STATUS_CAPS: crate::test_support::Registry<PathBuf, StatusCaps> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-static STATUS_DEADLINES: OnceLock<Mutex<Vec<(PathBuf, Duration)>>> = OnceLock::new();
+pub(crate) static STATUS_DEADLINES: crate::test_support::Registry<PathBuf, Duration> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-static STATUS_PROGRAMS: OnceLock<Mutex<Vec<(PathBuf, OsString)>>> = OnceLock::new();
+pub(crate) static STATUS_PROGRAMS: crate::test_support::Registry<PathBuf, OsString> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-type StatusEnvs = Mutex<Vec<(PathBuf, Vec<(OsString, OsString)>)>>;
+pub(crate) static STATUS_ENVS: crate::test_support::Registry<PathBuf, Vec<(OsString, OsString)>> =
+    crate::test_support::Registry::new();
 #[cfg(all(test, unix))]
-type StatusReapGates = Mutex<Vec<(PathBuf, Arc<StatusReapGate>)>>;
-#[cfg(test)]
-static STATUS_ENVS: OnceLock<StatusEnvs> = OnceLock::new();
-#[cfg(all(test, unix))]
-static STATUS_REAP_GATES: OnceLock<StatusReapGates> = OnceLock::new();
-
-/// A test seam that parks one owned worker at the moment it would stop its
-/// child, so a test can observe the owner while the process is still unreaped
-/// and then release it without sleeping. It never exists outside Unix tests.
-#[cfg(all(test, unix))]
-pub(crate) struct StatusReapGate {
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(all(test, unix))]
-impl StatusReapGate {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        })
-    }
-
-    /// Signals that a worker reached this point and waits for the release.
-    async fn hold(&self) {
-        self.entered.notify_one();
-        self.release.notified().await;
-    }
-
-    /// Waits until a worker reached this point.
-    pub(crate) async fn entered(&self) {
-        self.entered.notified().await;
-    }
-
-    /// Lets the parked worker stop and reap its child.
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
-#[cfg(all(test, unix))]
-fn status_reap_gate(root: &Path) -> Option<Arc<StatusReapGate>> {
-    lookup(&STATUS_REAP_GATES, root, Arc::clone)
-}
-
-/// Parks one owned worker at the moment it would stop its child.
-#[cfg(all(test, unix))]
-pub(crate) fn set_status_reap_gate(root: PathBuf, gate: Arc<StatusReapGate>) {
-    STATUS_REAP_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((root, gate));
-}
+pub(crate) static STATUS_REAP_GATES: crate::test_support::Registry<
+    PathBuf,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 fn status_caps(root: &Path) -> StatusCaps {
     #[cfg(test)]
-    if let Some(caps) = lookup(&STATUS_CAPS, root, |caps| *caps) {
+    if let Some(caps) = STATUS_CAPS.get(&root.to_path_buf()) {
         return caps;
     }
     let _ = root;
@@ -1381,7 +1235,7 @@ pub(crate) fn status_deadline_at(root: &Path) -> Instant {
 
 fn status_deadline(root: &Path) -> Duration {
     #[cfg(test)]
-    if let Some(deadline) = lookup(&STATUS_DEADLINES, root, |deadline| *deadline) {
+    if let Some(deadline) = STATUS_DEADLINES.get(&root.to_path_buf()) {
         return deadline;
     }
     let _ = root;
@@ -1390,7 +1244,7 @@ fn status_deadline(root: &Path) -> Duration {
 
 fn status_program(root: &Path) -> OsString {
     #[cfg(test)]
-    if let Some(program) = lookup(&STATUS_PROGRAMS, root, |program| program.clone()) {
+    if let Some(program) = STATUS_PROGRAMS.get(&root.to_path_buf()) {
         return program;
     }
     let _ = root;
@@ -1402,11 +1256,9 @@ fn status_program(root: &Path) -> OsString {
 /// or `GIT_TRACE*` value can redirect or instrument the query. Values are
 /// filtered by name and never recorded.
 fn status_env(root: &Path) -> Vec<(OsString, OsString)> {
-    #[cfg(test)]
-    let inherited: Vec<(OsString, OsString)> =
-        lookup(&STATUS_ENVS, root, Clone::clone).unwrap_or_else(|| std::env::vars_os().collect());
-    #[cfg(not(test))]
     let inherited: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    #[cfg(test)]
+    let inherited = STATUS_ENVS.get(&root.to_path_buf()).unwrap_or(inherited);
     let _ = root;
     // The comparison is ASCII case-insensitive on every platform: Windows
     // environment names are case-insensitive, so `git_dir` must be dropped
@@ -1424,69 +1276,4 @@ fn status_env(root: &Path) -> Vec<(OsString, OsString)> {
 }
 
 #[cfg(test)]
-fn lookup<T: Clone>(
-    entries: &OnceLock<Mutex<Vec<(PathBuf, T)>>>,
-    root: &Path,
-    take: impl Fn(&T) -> T,
-) -> Option<T> {
-    entries.get().and_then(|entries| {
-        entries
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(path, _)| path.as_path() == root)
-            .map(|(_, value)| take(value))
-    })
-}
-
-/// Lowers the query caps for one workspace, so a test can reach the output and
-/// record ceilings without producing a megabyte of output.
-#[cfg(test)]
-pub(crate) fn set_status_caps(root: PathBuf, stdout_bytes: usize, records: u64) {
-    STATUS_CAPS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((
-            root,
-            StatusCaps {
-                stdout_bytes,
-                records,
-            },
-        ));
-}
-
-/// Shortens the query deadline for one workspace, so a timeout can be observed
-/// without waiting for real time to pass.
-#[cfg(test)]
-pub(crate) fn set_status_deadline(root: PathBuf, deadline: Duration) {
-    STATUS_DEADLINES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((root, deadline));
-}
-
-/// Replaces the git executable for one workspace.
-#[cfg(test)]
-pub(crate) fn set_status_program(root: PathBuf, program: PathBuf) {
-    STATUS_PROGRAMS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((root, program.into_os_string()));
-}
-
-/// Replaces the inherited environment for one workspace, so a test can prove
-/// that a `GIT_*` variable from the parent never reaches the git child.
-#[cfg(test)]
-pub(crate) fn set_status_env(root: PathBuf, env: Vec<(OsString, OsString)>) {
-    STATUS_ENVS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((root, env));
-}
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod tests;

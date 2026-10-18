@@ -1,8 +1,10 @@
 use super::*;
+use crate::workspace::scan::MIN_RESULT_BYTES;
 use std::process::{Command as StdCommand, Output};
 use std::sync::Arc;
 
 struct Fixture {
+    _dir: crate::test_support::TempDir,
     base: PathBuf,
     root: PathBuf,
     workspace: Arc<Workspace>,
@@ -10,14 +12,13 @@ struct Fixture {
 
 /// A workspace directory that is not inside any repository.
 async fn plain_fixture(label: &str) -> Fixture {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-workspace-status-{label}-{}",
-        SessionId::new().unwrap()
-    ));
+    let dir = crate::test_support::TempDir::new(label);
+    let base = dir.path().to_path_buf();
     let root = base.join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root.clone()).await.unwrap());
     Fixture {
+        _dir: dir,
         base,
         root,
         workspace,
@@ -84,10 +85,6 @@ async fn request(
     .await
 }
 
-fn cleanup(fixture: &Fixture) {
-    let _ = std::fs::remove_dir_all(&fixture.base);
-}
-
 #[cfg(unix)]
 fn executable(path: &Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -129,7 +126,6 @@ async fn a_clean_repository_is_observed_completely() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert_eq!(result.consistency, WorkspaceScanConsistency::Live);
     assert!(result.observed_at_unix_ms > 0);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -178,7 +174,6 @@ async fn staged_unstaged_and_untracked_entries_are_counted() {
     assert_eq!(untracked.kind, WorkspaceStatusEntryKind::Untracked);
     assert_eq!(untracked.index_status, None);
     assert_eq!(untracked.worktree_status, None);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -191,7 +186,6 @@ async fn an_unborn_head_reports_a_branch_without_an_oid() {
     assert!(result.branch.is_some());
     assert!(!result.detached);
     assert!(result.complete);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -208,7 +202,6 @@ async fn a_detached_head_reports_detached_without_a_branch() {
     assert_eq!(result.branch, None);
     assert!(result.head_oid.is_some());
     assert!(result.complete);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -238,7 +231,6 @@ async fn a_conflict_is_reported_as_unmerged() {
         .find(|entry| entry.kind == WorkspaceStatusEntryKind::Unmerged)
         .expect("unmerged entry");
     assert_eq!(entry.path, "shared.txt");
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -264,7 +256,6 @@ async fn a_rename_keeps_both_paths() {
     assert_eq!(entry.path, "after.txt");
     assert_eq!(entry.original_path.as_deref(), Some("before.txt"));
     assert_eq!(entry.index_status.as_deref(), Some("R"));
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -282,7 +273,6 @@ async fn a_non_repository_is_reported_conservatively() {
     assert!(result.entries.is_empty());
     assert!(!result.complete);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::StatusFailed]);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -297,15 +287,14 @@ async fn a_bare_repository_is_a_complete_answer_without_a_work_tree() {
     assert!(result.entries.is_empty());
     assert!(result.complete);
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
 async fn a_missing_git_executable_is_reported_as_unavailable() {
     let fixture = plain_fixture("missing-git").await;
-    set_status_program(
+    STATUS_PROGRAMS.arm(
         fixture.workspace.root().to_path_buf(),
-        fixture.base.join("missing-git"),
+        fixture.base.join("missing-git").into_os_string(),
     );
 
     let result = observe(&fixture.workspace).await;
@@ -315,7 +304,6 @@ async fn a_missing_git_executable_is_reported_as_unavailable() {
         result.warnings,
         vec![WorkspaceStatusWarning::GitUnavailable]
     );
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -496,7 +484,6 @@ async fn a_staged_gitlink_is_counted_without_entering_the_submodule() {
         "a submodule file system monitor ran"
     );
     assert!(!hook_marker.exists(), "a submodule hook ran");
-    cleanup(&fixture);
 }
 
 /// A rename whose previous name lies outside the workspace keeps the entry
@@ -559,7 +546,6 @@ async fn odd_paths_survive_the_nul_parser() {
     expected.push("line\nbreak.txt");
     expected.sort_unstable();
     assert_eq!(paths, expected);
-    cleanup(&fixture);
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -580,7 +566,6 @@ async fn a_non_utf8_path_is_skipped_and_marked_incomplete() {
     assert!(!result.complete);
     assert!(result.entries.is_empty());
     assert_eq!(result.untracked, 0);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -593,10 +578,12 @@ async fn the_stdout_ceiling_stops_the_query() {
             b"x",
         );
     }
-    set_status_caps(
+    STATUS_CAPS.arm(
         fixture.workspace.root().to_path_buf(),
-        512,
-        MAX_STATUS_RECORDS,
+        StatusCaps {
+            stdout_bytes: 512,
+            records: MAX_STATUS_RECORDS,
+        },
     );
 
     let result = observe(&fixture.workspace).await;
@@ -606,7 +593,6 @@ async fn the_stdout_ceiling_stops_the_query() {
         result.warnings,
         vec![WorkspaceStatusWarning::OutputTruncated]
     );
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -615,10 +601,12 @@ async fn the_record_ceiling_stops_the_query() {
     for index in 0..3 {
         write_file(&fixture.root, &format!("file-{index}.txt"), b"x");
     }
-    set_status_caps(
+    STATUS_CAPS.arm(
         fixture.workspace.root().to_path_buf(),
-        MAX_STATUS_STDOUT_BYTES,
-        1,
+        StatusCaps {
+            stdout_bytes: MAX_STATUS_STDOUT_BYTES,
+            records: 1,
+        },
     );
 
     let result = observe(&fixture.workspace).await;
@@ -628,7 +616,6 @@ async fn the_record_ceiling_stops_the_query() {
         result.warnings,
         vec![WorkspaceStatusWarning::OutputTruncated]
     );
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -653,20 +640,18 @@ async fn the_encoded_budget_truncates_entries_without_losing_the_summary() {
         vec![WorkspaceStatusWarning::OutputTruncated]
     );
     assert!(encoded_len(&result) <= MIN_RESULT_BYTES);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
 async fn an_expired_deadline_reports_an_unavailable_observation() {
     let fixture = repo_fixture("deadline").await;
-    set_status_deadline(fixture.workspace.root().to_path_buf(), Duration::ZERO);
+    STATUS_DEADLINES.arm(fixture.workspace.root().to_path_buf(), Duration::ZERO);
 
     let result = observe(&fixture.workspace).await;
     assert!(!result.repo_available);
     assert!(!result.complete);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::Deadline]);
     assert!(result.entries.is_empty());
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -681,7 +666,10 @@ async fn a_cancelled_query_stops_and_reaps_the_owned_child() {
         &script,
         &format!("#!/bin/sh\n: > '{}'\nsleep 3\n", started.display()),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
 
     let session = CancellationToken::new();
     let request = WorkspaceStatusRequest {
@@ -723,7 +711,6 @@ async fn a_cancelled_query_stops_and_reaps_the_owned_child() {
         cancelled_at.elapsed() < Duration::from_secs(2),
         "a cancelled query did not stop its git child"
     );
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -744,7 +731,10 @@ async fn a_stderr_flood_stops_the_owned_child() {
             survived.display()
         ),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
 
     let queried_at = Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(5), observe(&fixture.workspace))
@@ -762,7 +752,6 @@ async fn a_stderr_flood_stops_the_owned_child() {
         "a flooding child was allowed to run to completion"
     );
     assert!(queried_at.elapsed() < Duration::from_secs(5));
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -796,14 +785,13 @@ async fn inherited_git_environment_variables_never_reach_git() {
         fixture.base.join("fsmonitor").into_os_string(),
     ));
     env.push(("GIT_TRACE".into(), trace.clone().into_os_string()));
-    set_status_env(fixture.workspace.root().to_path_buf(), env);
+    STATUS_ENVS.arm(fixture.workspace.root().to_path_buf(), env);
 
     let result = observe(&fixture.workspace).await;
     assert!(result.repo_available);
     assert_eq!(result.untracked, 1);
     assert!(result.complete);
     assert!(!trace.exists(), "a GIT_* variable reached the git child");
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -838,7 +826,6 @@ async fn a_configured_fsmonitor_never_runs() {
         std::fs::metadata(&index).unwrap().modified().unwrap(),
         before_modified
     );
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -859,7 +846,6 @@ async fn status_leaves_the_workspace_files_unchanged() {
         std::fs::metadata(&file).unwrap().modified().unwrap(),
         before_modified
     );
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -878,8 +864,11 @@ async fn a_child_that_closes_its_pipes_is_still_reaped_by_the_deadline() {
             started.display()
         ),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
-    set_status_deadline(
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
+    STATUS_DEADLINES.arm(
         fixture.workspace.root().to_path_buf(),
         Duration::from_millis(300),
     );
@@ -891,7 +880,6 @@ async fn a_child_that_closes_its_pipes_is_still_reaped_by_the_deadline() {
     assert!(!result.repo_available);
     assert!(!result.complete);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::Deadline]);
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -914,11 +902,16 @@ async fn a_chunk_that_crosses_the_stdout_ceiling_keeps_its_prefix() {
             payload_path.display()
         ),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
-    set_status_caps(
+    STATUS_PROGRAMS.arm(
         fixture.workspace.root().to_path_buf(),
-        1024,
-        MAX_STATUS_RECORDS,
+        script.into_os_string(),
+    );
+    STATUS_CAPS.arm(
+        fixture.workspace.root().to_path_buf(),
+        StatusCaps {
+            stdout_bytes: 1024,
+            records: MAX_STATUS_RECORDS,
+        },
     );
 
     let result = observe(&fixture.workspace).await;
@@ -932,7 +925,6 @@ async fn a_chunk_that_crosses_the_stdout_ceiling_keeps_its_prefix() {
         result.untracked > 0,
         "the prefix of the chunk that crossed the ceiling was discarded"
     );
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -951,13 +943,15 @@ async fn a_signal_death_is_a_failed_observation() {
             fixture.root.display()
         ),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
 
     let result = observe(&fixture.workspace).await;
     assert!(result.repo_available);
     assert!(!result.complete);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::StatusFailed]);
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -974,13 +968,15 @@ async fn an_unusable_repository_root_is_a_failed_observation() {
             fixture.base.join("nowhere").display()
         ),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
 
     let result = observe(&fixture.workspace).await;
     assert!(!result.repo_available);
     assert!(!result.complete);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::StatusFailed]);
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -993,7 +989,10 @@ async fn a_cancelled_budget_never_starts_a_process() {
         &script,
         &format!("#!/bin/sh\n: > '{}'\n", started.display()),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
     let session = CancellationToken::new();
     session.cancel();
     let request = WorkspaceStatusRequest {
@@ -1015,7 +1014,6 @@ async fn a_cancelled_budget_never_starts_a_process() {
         Err(AgentError::QueryLimit)
     ));
     assert!(!started.exists(), "a cancelled query started a git process");
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -1028,15 +1026,17 @@ async fn an_expired_budget_never_starts_a_process() {
         &script,
         &format!("#!/bin/sh\n: > '{}'\n", started.display()),
     );
-    set_status_program(fixture.workspace.root().to_path_buf(), script);
-    set_status_deadline(fixture.workspace.root().to_path_buf(), Duration::ZERO);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        script.into_os_string(),
+    );
+    STATUS_DEADLINES.arm(fixture.workspace.root().to_path_buf(), Duration::ZERO);
 
     let result = observe(&fixture.workspace).await;
     assert!(!started.exists(), "an expired query started a git process");
     assert!(!result.repo_available);
     assert!(!result.complete);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::Deadline]);
-    cleanup(&fixture);
 }
 
 #[tokio::test]
@@ -1074,7 +1074,6 @@ async fn a_stream_git_could_not_have_produced_is_not_a_complete_answer() {
     assert_eq!(found.malformed, 4);
     assert_eq!(found.head_oid, None);
     assert!(found.branch_headers_complete());
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -1138,7 +1137,7 @@ async fn global_and_system_configuration_is_never_read() {
         "GIT_CONFIG_VALUE_0".into(),
         monitor.clone().into_os_string(),
     ));
-    set_status_env(fixture.workspace.root().to_path_buf(), env);
+    STATUS_ENVS.arm(fixture.workspace.root().to_path_buf(), env);
 
     let result = observe(&fixture.workspace).await;
     assert!(result.repo_available);
@@ -1148,7 +1147,6 @@ async fn global_and_system_configuration_is_never_read() {
         !marker.exists(),
         "a global configuration started an external monitor"
     );
-    cleanup(&fixture);
 }
 
 /// A branch name long enough that reserving its room would exceed a minimal
@@ -1198,7 +1196,6 @@ async fn every_cut_point_stays_within_the_encoded_budget() {
             );
         }
     }
-    cleanup(&fixture);
 }
 
 #[cfg(unix)]
@@ -1221,5 +1218,24 @@ async fn json_escapes_are_counted_against_the_budget() {
         );
         assert_eq!(result.untracked, 8);
     }
-    cleanup(&fixture);
+}
+
+/// Observes the Workspace's Git status through fixed, shell-free git arguments.
+pub(crate) async fn status(
+    workspace: &Workspace,
+    request: &WorkspaceStatusRequest,
+    session_cancellation: &CancellationToken,
+    shutdown_cancellation: &CancellationToken,
+    child_cancellation: &CancellationToken,
+) -> Result<WorkspaceStatusResult, AgentError> {
+    let deadline = status_deadline_at(workspace.root());
+    status_with_deadline(
+        workspace,
+        request,
+        session_cancellation,
+        shutdown_cancellation,
+        child_cancellation,
+        deadline,
+    )
+    .await
 }

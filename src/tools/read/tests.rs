@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::tools::{ToolIoGate, block_next_io};
+use crate::tools::IO_GATES;
 
 async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, ReadTool) {
     let base = std::env::temp_dir().join(format!(
@@ -179,15 +179,10 @@ async fn byte_cap_lookahead_validates_utf8_crlf_and_true_eof() {
         .await
         .unwrap();
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "invalid-continuation"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "invalid-continuation"}))
+            .await
+            .unwrap(),
+        "Cannot read binary or non-UTF-8 content as text."
     );
 
     let mut crlf = vec![b'a'; MAX_READ_BYTES - 1];
@@ -203,31 +198,37 @@ async fn byte_cap_lookahead_validates_utf8_crlf_and_true_eof() {
         .await
         .unwrap();
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "eof-incomplete"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "eof-incomplete"}))
+            .await
+            .unwrap(),
+        "Cannot read binary or non-UTF-8 content as text."
     );
 
     tokio::fs::write(root.join("bare-cr"), b"before\rafter")
         .await
         .unwrap();
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "bare-cr"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "bare-cr"})).await.unwrap(),
+        "1: before\\rafter"
     );
+    cleanup(&base).await;
+}
+
+#[tokio::test]
+async fn read_streams_to_lines_beyond_the_window_and_escapes_controls() {
+    let (base, _, tool) = fixture("late-lines").await;
+    let text = format!(
+        "{}late\x0c\x1b\rend\n",
+        "padding\n".repeat(MAX_READ_BYTES / 8 + 1)
+    );
+    tokio::fs::write(base.join("root/large"), text)
+        .await
+        .unwrap();
+    let offset = MAX_READ_BYTES / 8 + 2;
+    let output = execute(&tool, json!({"path": "large", "offset": offset}))
+        .await
+        .unwrap();
+    assert_eq!(output, format!("{offset}: late\\u{{c}}\\u{{1b}}\\rend"));
     cleanup(&base).await;
 }
 
@@ -262,7 +263,7 @@ fn decoder_excludes_lookahead_and_strips_split_crlf() {
 }
 
 #[tokio::test]
-async fn binary_nul_and_invalid_utf8_fail_without_output_bytes() {
+async fn binary_content_is_explained_and_controls_are_escaped() {
     let (base, _, tool) = fixture("binary").await;
     let root = base.join("root");
     tokio::fs::write(root.join("nul"), b"text\0more")
@@ -276,37 +277,18 @@ async fn binary_nul_and_invalid_utf8_fail_without_output_bytes() {
         .unwrap();
 
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "nul"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "nul"})).await.unwrap(),
+        "Cannot read binary or non-UTF-8 content as text."
     );
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "escape-control"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "escape-control"}))
+            .await
+            .unwrap(),
+        "1: text\\u{1b}more"
     );
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "invalid"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "invalid"})).await.unwrap(),
+        "Cannot read binary or non-UTF-8 content as text."
     );
     cleanup(&base).await;
 }
@@ -433,8 +415,8 @@ async fn cancellation_and_deadline_interrupt_waiting_read_operations() {
     let tool = Arc::new(tool);
 
     let cancellation = CancellationToken::new();
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "file"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm((TOOL_NAME, "file".to_owned()), Arc::clone(&gate));
     let cancelled_tool = Arc::clone(&tool);
     let cancelled_context = context(
         cancellation.clone(),
@@ -445,12 +427,12 @@ async fn cancellation_and_deadline_interrupt_waiting_read_operations() {
             .execute(invocation(json!({"path": "file"})), cancelled_context)
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     cancellation.cancel();
     assert_eq!(cancelled.await.unwrap(), Err(ToolError::Cancelled));
 
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "file"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm((TOOL_NAME, "file".to_owned()), Arc::clone(&gate));
     let deadline_tool = Arc::clone(&tool);
     let deadline = tokio::spawn(async move {
         deadline_tool
@@ -463,7 +445,7 @@ async fn cancellation_and_deadline_interrupt_waiting_read_operations() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     assert_eq!(deadline.await.unwrap(), Err(ToolError::TimedOut));
 
     let cancellation = CancellationToken::new();

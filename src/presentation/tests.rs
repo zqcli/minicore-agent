@@ -639,7 +639,7 @@ async fn presentation_tool_variants_share_binding_and_finish() {
         crate::event::AgentEventSink::new(observer_sender),
     );
     let owners = CommandOwners::new();
-    let plain = crate::tools::build_tools(
+    let plain = crate::tools::tests::build_tools(
         &["read".to_owned()],
         Arc::clone(&workspace),
         CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),

@@ -11,10 +11,9 @@ use serde_json::json;
 use crate::Workspace;
 use crate::tool_data::{ToolData, ToolRef};
 
+use super::file_change::{FileBefore, commit_text, file_before_from_capture};
 use super::{
-    FileBefore, MAX_WRITE_BYTES, emit_phase, escape_control_characters, expected_file_state,
-    file_before_from_capture, map_workspace_error, precheck_control, record_file_change,
-    run_controlled, wait_for_test_io,
+    MAX_WRITE_BYTES, emit_phase, escape_control_characters, map_workspace_error, run_controlled,
 };
 
 const TOOL_NAME: &str = "write";
@@ -78,12 +77,7 @@ impl WriteTool {
         tool_data: Option<Arc<ToolData>>,
     ) -> ToolFuture<'_> {
         Box::pin(async move {
-            precheck_control(&context)?;
-            if invocation.tool_name() != self.spec.name() {
-                return Err(ToolError::InvalidInvocation);
-            }
-            let input: WriteInput = serde_json::from_value(invocation.arguments().clone())
-                .map_err(|_| ToolError::InvalidInvocation)?;
+            let input: WriteInput = super::decode_input(&self.spec, &invocation, &context)?;
             if input.content.len() > MAX_WRITE_BYTES {
                 return Err(ToolError::InvalidInvocation);
             }
@@ -95,27 +89,25 @@ impl WriteTool {
             let output = ToolOutput::new(format!("wrote {bytes} bytes to {path_display}"))
                 .map_err(|_| ToolError::Internal)?;
             run_controlled(&context, async {
-                wait_for_test_io(TOOL_NAME, &input.path).await;
+                #[cfg(test)]
+                if let Some(gate) = super::IO_GATES.take(&(TOOL_NAME, input.path.clone())) {
+                    gate.pass().await;
+                }
                 emit_phase(&context, "writing");
                 let before = if tool_ref.is_some() && tool_data.is_some() {
                     capture_before_best_effort(&self.workspace, &input.path, context.deadline).await
                 } else {
                     FileBefore::Unknown
                 };
-                let expected = expected_file_state(&before);
-                let observation = self
-                    .workspace
-                    .write_atomic_observed(&input.path, input.content.as_bytes(), expected)
-                    .await;
-                record_file_change(
-                    tool_data.as_deref(),
+                commit_text(
+                    &self.workspace,
                     tool_ref.as_ref(),
+                    tool_data.as_deref(),
                     &input.path,
                     before,
                     input.content.as_bytes(),
-                    &observation,
-                );
-                observation.outcome.map_err(map_workspace_error)
+                )
+                .await
             })
             .await?;
             Ok(ToolExecutionOutcome::Completed(output))

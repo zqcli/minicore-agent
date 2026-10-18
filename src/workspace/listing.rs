@@ -15,9 +15,8 @@ use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::workspace::Workspace;
-use crate::workspace::query::{
-    DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, MAX_RESULT_BYTES, MIN_RESULT_BYTES,
-};
+use crate::workspace::query::MAX_PATH_BYTES;
+use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
 use crate::workspace::scan::{
     SCOPE_HEX_LEN, Visit, WalkOptions, WorkspaceFileKind, WorkspaceScanConsistency,
     WorkspaceScanStop, display_path, now_unix_ms, run_scan, scope_digest, valid_scope, walk_scope,
@@ -76,17 +75,16 @@ impl WorkspaceFilesRequest {
         {
             return Err(AgentError::InvalidArguments);
         }
-        if self
-            .max_bytes
-            .is_some_and(|max_bytes| !(MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&max_bytes))
-        {
-            return Err(AgentError::InvalidArguments);
-        }
+        validate_result_bytes(self.max_bytes)?;
         if let Some(cursor) = &self.cursor {
             // The scope is computed from this request alone, so a cursor from a
             // different session, directory, recursion mode, or path filter is
             // rejected before any query slot is reserved.
-            if !valid_scope(&cursor.scope) || cursor.scope != self.scope(&directory) {
+            if !valid_scope(&cursor.scope)
+                || cursor.scope != self.scope(&directory)
+                || cursor.path.len() > MAX_PATH_BYTES
+                || crate::workspace::normalize_relative(&cursor.path, true).is_err()
+            {
                 return Err(AgentError::InvalidArguments);
             }
         }
@@ -137,14 +135,12 @@ impl fmt::Debug for WorkspaceFilesRequest {
     }
 }
 
-/// Where a later page continues. `entry` is the ordinal of the first raw
-/// traversal entry (rule-excluded entries included) the request must examine
-/// again; `scope` binds the cursor to the
-/// session and traversal parameters that produced it.
+/// Last processed relative path in sorted depth-first order. `scope` binds it
+/// to the session and traversal parameters; entries behind it are not replayed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceListCursor {
-    pub entry: u64,
+    pub path: String,
     pub scope: String,
 }
 
@@ -182,8 +178,7 @@ pub struct WorkspaceFilesResult {
     /// unrepresentable path, or an entry the budget could not hold. Entries
     /// filtered out by `query` and roots excluded by the rules do not clear it.
     pub scan_complete: bool,
-    /// What ended the scan. `end`, `depth`, `rules`, and `entries` never
-    /// continue, so an incomplete scan without a cursor is always explicit.
+    /// What ended the scan. `end`, `depth`, `rules`, and `deadline` do not continue.
     pub stopped_by: WorkspaceScanStop,
     /// Visited entries that were not returned: entries filtered out by
     /// `query`, entries whose path is not valid UTF-8, entries that could not
@@ -219,7 +214,7 @@ struct FilesPlan {
     limit: usize,
     max_bytes: usize,
     scope: String,
-    start_entry: u64,
+    start_path: Option<String>,
 }
 
 /// Lists one bounded page of workspace entries.
@@ -235,17 +230,14 @@ pub(crate) async fn files(
             .map_err(|_| AgentError::InvalidArguments)?,
     );
     let scope = request.scope(&directory);
-    let start_entry = match &request.cursor {
-        Some(cursor) => cursor.entry,
-        None => 0,
-    };
+    let start_path = request.cursor.as_ref().map(|cursor| cursor.path.clone());
     let plan = FilesPlan {
         directory,
         recursive: request.recursive(),
         query: request.query.clone().filter(|query| !query.is_empty()),
         limit: usize::try_from(request.limit()).unwrap_or(usize::MAX),
         max_bytes: request.max_bytes(),
-        start_entry,
+        start_path,
         scope,
     };
     run_scan(
@@ -284,8 +276,9 @@ fn scan_files(
             recursive: plan.recursive,
             want_size: true,
             directory_only: true,
+            resume_file: false,
         },
-        plan.start_entry,
+        plan.start_path.as_deref(),
         budget,
         |entry, budget| {
             if !budget.byte_available(u64::try_from(entry.relative.len()).unwrap_or(u64::MAX)) {
@@ -303,7 +296,7 @@ fn scan_files(
                 size: entry.size,
             };
             let encoded = encoded_len(&record);
-            if used + encoded + 1 > content_budget {
+            if used + encoded + 1 + encoded_len(&entry.relative) > content_budget {
                 if result.entries.is_empty() {
                     // The budget cannot hold this entry even alone, so the page
                     // skips and counts it instead of stalling, and the response
@@ -330,10 +323,17 @@ fn scan_files(
     let dropped = dropped + outcome.unrepresentable + outcome.unreadable;
     result.skipped_count += outcome.unrepresentable + outcome.unreadable + outcome.excluded;
     result.stopped_by = outcome.reason;
-    result.next_cursor = outcome.next.map(|entry| WorkspaceListCursor {
-        entry,
-        scope: plan.scope.clone(),
-    });
+    // The envelope reserves an empty cursor path; charge the actual key too.
+    // A key that cannot fit cannot be advertised as a usable continuation.
+    result.next_cursor = outcome
+        .next
+        .filter(|path| {
+            path.len() <= MAX_PATH_BYTES && encoded_len(path) - 2 <= content_budget - used
+        })
+        .map(|path| WorkspaceListCursor {
+            path,
+            scope: plan.scope.clone(),
+        });
     result.truncated = outcome.reason != WorkspaceScanStop::End || dropped > 0;
     result.scan_complete = outcome.reason == WorkspaceScanStop::End && dropped == 0;
     Ok(result)
@@ -346,7 +346,7 @@ fn envelope_bytes(directory: &str, max_bytes: usize) -> Result<usize, AgentError
         directory: directory.to_owned(),
         entries: Vec::new(),
         next_cursor: Some(WorkspaceListCursor {
-            entry: u64::MAX,
+            path: String::new(),
             scope: "f".repeat(SCOPE_HEX_LEN),
         }),
         truncated: true,
@@ -357,11 +357,7 @@ fn envelope_bytes(directory: &str, max_bytes: usize) -> Result<usize, AgentError
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    let size = encoded_len(&probe);
-    if size >= max_bytes {
-        return Err(AgentError::InvalidArguments);
-    }
-    Ok(size)
+    crate::workspace::scan::envelope_size(&probe, max_bytes)
 }
 
 #[cfg(test)]

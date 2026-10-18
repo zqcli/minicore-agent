@@ -11,22 +11,25 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
+use crate::Workspace;
 use crate::tool_data::{CommandStatus, ToolRef};
-use crate::{Workspace, WorkspaceError};
 
 use super::command::{Capture, CommandBinding, CommandOutcome, CommandOwners, CommandRequest};
-use super::{DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT, precheck_control};
+use super::{DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT};
 
-/// Bounded model-facing prefix of one stream, kept separately from the
+/// Bounded model-facing head and tail of one stream, kept separately from the
 /// streaming window in `tool_data`.
 struct StreamCapture {
     bytes: Vec<u8>,
     truncated: bool,
+    omitted: u64,
 }
 
 const TOOL_NAME: &str = "bash";
-const STREAM_CAPTURE_LIMIT: usize = MAX_COMMAND_OUTPUT / 2;
+const STREAM_CAPTURE_LIMIT: usize = FORMATTED_OUTPUT_LIMIT;
 const TRUNCATED: &str = "[truncated]";
+const TRUNCATION_OVERHEAD: usize =
+    "\n[... ".len() + 20 + " bytes omitted ...]\n\n".len() + TRUNCATED.len();
 const FORMATTED_OUTPUT_LIMIT: usize = if MAX_COMMAND_OUTPUT < MAX_TEXT_BYTES {
     MAX_COMMAND_OUTPUT
 } else {
@@ -53,11 +56,6 @@ impl CommandEnvironment {
 
     pub(crate) fn extended(&self, names: impl IntoIterator<Item = OsString>) -> Self {
         Self::new(self.removed.iter().cloned().chain(names))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn names(&self) -> &[OsString] {
-        &self.removed
     }
 
     pub(crate) fn apply(&self, command: &mut Command) {
@@ -92,11 +90,6 @@ struct BashInput {
 }
 
 impl BashTool {
-    #[cfg(test)]
-    pub(super) fn new(workspace: Arc<Workspace>, environment: CommandEnvironment) -> Self {
-        Self::with_binding(workspace, environment, None)
-    }
-
     pub(crate) fn with_binding(
         workspace: Arc<Workspace>,
         environment: CommandEnvironment,
@@ -142,18 +135,6 @@ impl BashTool {
             spec,
         }
     }
-
-    /// Waits for every command this tool owns. A standalone tool has no
-    /// Session-level join, so its tests use this.
-    #[cfg(all(test, unix))]
-    pub(super) async fn join_owned_commands(&self) {
-        self.owners.join_all().await;
-    }
-
-    #[cfg(all(test, unix))]
-    pub(super) fn active_owned_commands(&self) -> usize {
-        self.owners.active()
-    }
 }
 
 impl Tool for BashTool {
@@ -180,12 +161,7 @@ impl BashTool {
         tool_ref: Option<ToolRef>,
     ) -> ToolFuture<'_> {
         Box::pin(async move {
-            precheck_control(&context)?;
-            if invocation.tool_name() != self.spec.name() {
-                return Err(ToolError::InvalidInvocation);
-            }
-            let input: BashInput = serde_json::from_value(invocation.arguments().clone())
-                .map_err(|_| ToolError::InvalidInvocation)?;
+            let input: BashInput = super::decode_input(&self.spec, &invocation, &context)?;
             if input.command.is_empty()
                 || input.command.contains('\0')
                 || !(1..=MAX_COMMAND_TIMEOUT).contains(&input.timeout_seconds)
@@ -205,7 +181,7 @@ impl BashTool {
                 deadline,
                 cancellation: context.cancellation.clone(),
                 environment: self.environment.clone(),
-                prefix_limit: STREAM_CAPTURE_LIMIT,
+                capture_limit: STREAM_CAPTURE_LIMIT,
                 streams: self.binding.as_ref().map(|binding| binding.sink()),
                 capture,
             };
@@ -258,10 +234,12 @@ fn outcome_to_result(outcome: &CommandOutcome) -> Result<ToolExecutionOutcome, T
     let stdout = StreamCapture {
         bytes: outcome.stdout.clone(),
         truncated: outcome.stdout_truncated || incomplete,
+        omitted: outcome.stdout_omitted,
     };
     let stderr = StreamCapture {
         bytes: outcome.stderr.clone(),
         truncated: outcome.stderr_truncated || incomplete,
+        omitted: outcome.stderr_omitted,
     };
     let output = format_output(outcome.result.exit_code, &stdout, &stderr);
     let output = ToolOutput::new(output).map_err(|_| ToolError::Internal)?;
@@ -282,7 +260,7 @@ async fn resolve_cwd(
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             Err(ToolError::TimedOut)
         }
-        result = &mut resolve => result.map_err(map_cwd_error),
+        result = &mut resolve => result.map_err(super::map_source_error),
     }
 }
 
@@ -295,8 +273,14 @@ fn format_output(exit_code: Option<i32>, stdout: &StreamCapture, stderr: &Stream
         .saturating_add(stderr_label.len())
         .saturating_add(1);
     let available = FORMATTED_OUTPUT_LIMIT.saturating_sub(fixed);
-    let stdout_budget = available / 2;
-    let stderr_budget = available.saturating_sub(stdout_budget);
+    let stdout_size = stream_size(stdout);
+    let stderr_size = stream_size(stderr);
+    let stdout_budget = if stdout_size <= available / 2 {
+        stdout_size
+    } else {
+        available - stderr_size.min(available / 2)
+    };
+    let stderr_budget = available - stdout_budget;
     let stdout = format_stream(stdout, stdout_budget);
     let stderr = format_stream(stderr, stderr_budget);
     let mut output = String::with_capacity(
@@ -314,32 +298,71 @@ fn format_output(exit_code: Option<i32>, stdout: &StreamCapture, stderr: &Stream
     output
 }
 
+fn decoded_characters(bytes: &[u8]) -> impl Iterator<Item = (char, usize)> + '_ {
+    bytes.utf8_chunks().flat_map(|chunk| {
+        chunk
+            .valid()
+            .chars()
+            .map(|character| (character, character.len_utf8()))
+            .chain((!chunk.invalid().is_empty()).then_some(('\u{fffd}', chunk.invalid().len())))
+    })
+}
+
+fn stream_size(capture: &StreamCapture) -> usize {
+    decoded_characters(&capture.bytes)
+        .map(|(character, _)| sanitized_character_len(character))
+        .sum::<usize>()
+        + if capture.truncated {
+            TRUNCATION_OVERHEAD
+        } else {
+            0
+        }
+}
+
 fn format_stream(capture: &StreamCapture, budget: usize) -> String {
-    let value = String::from_utf8_lossy(&capture.bytes);
-    let sanitized_len = value.chars().fold(0usize, |length, character| {
-        length.saturating_add(sanitized_character_len(character))
-    });
+    let sanitized_len: usize = decoded_characters(&capture.bytes)
+        .map(|(character, _)| sanitized_character_len(character))
+        .sum();
     let truncated = capture.truncated || sanitized_len > budget;
-    let marker_extra = TRUNCATED.len().saturating_add(1);
-    let content_budget = if truncated {
-        budget.saturating_sub(marker_extra)
-    } else {
-        budget
-    };
-    let mut output = String::with_capacity(budget.min(sanitized_len.saturating_add(marker_extra)));
-    for character in value.chars() {
-        let length = sanitized_character_len(character);
-        if output.len().saturating_add(length) > content_budget {
+    let mut output = String::with_capacity(budget.min(sanitized_len + TRUNCATION_OVERHEAD));
+    if !truncated {
+        for (character, _) in decoded_characters(&capture.bytes) {
+            push_sanitized_character(&mut output, character);
+        }
+        return output;
+    }
+    // Reserve enough for the widest byte count, delimiters and the cut marker.
+    let content_budget = budget.saturating_sub(TRUNCATION_OVERHEAD);
+    let mut head_bytes = 0;
+    for (character, bytes) in decoded_characters(&capture.bytes) {
+        if output.len() + sanitized_character_len(character) > content_budget / 2 {
             break;
         }
         push_sanitized_character(&mut output, character);
+        head_bytes += bytes;
     }
-    if truncated {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
+    let tail_budget = content_budget - output.len();
+    let mut remaining = sanitized_len - output.len();
+    let mut offset = 0;
+    let mut tail_bytes = 0;
+    let mut tail = String::new();
+    for (character, bytes) in decoded_characters(&capture.bytes) {
+        offset += bytes;
+        if offset <= head_bytes {
+            continue;
         }
-        output.push_str(TRUNCATED);
+        if remaining > tail_budget {
+            remaining -= sanitized_character_len(character);
+        } else {
+            push_sanitized_character(&mut tail, character);
+            tail_bytes += bytes;
+        }
     }
+    let omitted = capture.omitted + (capture.bytes.len() - head_bytes - tail_bytes) as u64;
+    output.push_str(&format!("\n[... {omitted} bytes omitted ...]\n"));
+    output.push_str(&tail);
+    output.push('\n');
+    output.push_str(TRUNCATED);
     debug_assert!(output.len() <= budget);
     output
 }
@@ -360,19 +383,6 @@ fn push_sanitized_character(output: &mut String, character: char) {
         output.push(character);
     } else {
         output.extend(character.escape_default());
-    }
-}
-
-fn map_cwd_error(error: WorkspaceError) -> ToolError {
-    match error {
-        WorkspaceError::InvalidPath | WorkspaceError::Escape => ToolError::InvalidInvocation,
-        WorkspaceError::NotFound
-        | WorkspaceError::NotFile
-        | WorkspaceError::NotDirectory
-        | WorkspaceError::Unavailable
-        | WorkspaceError::UnknownOutcome
-        | WorkspaceError::TooLarge
-        | WorkspaceError::Binary => ToolError::Failed,
     }
 }
 

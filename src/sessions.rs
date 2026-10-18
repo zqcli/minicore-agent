@@ -492,11 +492,34 @@ impl StatusWorkers {
 pub(crate) struct StatusQuery<T = crate::WorkspaceStatusResult> {
     receiver: tokio::sync::oneshot::Receiver<Result<T, AgentError>>,
     child_cancel: CancellationToken,
+    shutdown: CancellationToken,
 }
 
 impl<T> StatusQuery<T> {
     pub(crate) async fn wait(mut self) -> Result<T, AgentError> {
-        match (&mut self.receiver).await {
+        let received = tokio::select! {
+            result = &mut self.receiver => Some(result),
+            _ = self.child_cancel.cancelled() => None,
+            _ = self.shutdown.cancelled() => None,
+        };
+        let received = match received {
+            Some(result) => result,
+            None => match tokio::time::timeout(
+                crate::workspace::WORKSPACE_CANCEL_GRACE,
+                &mut self.receiver,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        "cancelled workspace status waiter detached from stalled worker"
+                    );
+                    return Err(AgentError::QueryLimit);
+                }
+            },
+        };
+        match received {
             Ok(result) => result,
             // The worker ended without publishing a result, so nothing was
             // observed; the failure stays inside the query boundary.
@@ -857,7 +880,8 @@ impl Session {
         deadline: Instant,
     ) -> Result<StatusQuery, AgentError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let child_cancel = CancellationToken::new();
+        let child_cancel = self.shared.close.child_token();
+        let query_shutdown = shutdown_cancellation.clone();
         let session_cancellation = self.shared.close.clone();
         let worker_child_cancel = child_cancel.clone();
         let mut workers = self.shared.status_workers.lock().unwrap();
@@ -886,6 +910,7 @@ impl Session {
         Ok(StatusQuery {
             receiver,
             child_cancel,
+            shutdown: query_shutdown,
         })
     }
 
@@ -899,7 +924,8 @@ impl Session {
         request.validate()?;
         let workspace = self.workspace();
         let session_cancel = self.shared.close.clone();
-        let child_cancel = CancellationToken::new();
+        let child_cancel = self.shared.close.child_token();
+        let query_shutdown = cancellation.clone();
         let worker_cancel = child_cancel.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut workers = self.shared.status_workers.lock().unwrap();
@@ -925,18 +951,25 @@ impl Session {
         Ok(StatusQuery {
             receiver,
             child_cancel,
+            shutdown: query_shutdown,
         })
     }
 
-    /// Refuses new status workers and waits until each has reaped its child.
+    /// Refuses new status workers and gives cancelled workers a bounded reap grace.
     async fn join_status_workers(&self) {
         let workers = {
             let mut workers = self.shared.status_workers.lock().unwrap();
             workers.closing = true;
             std::mem::take(&mut workers.workers)
         };
-        for handle in workers {
-            let _ = handle.await;
+        let deadline = tokio::time::Instant::now() + crate::workspace::WORKSPACE_CANCEL_GRACE;
+        for mut handle in workers {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("detaching cancelled workspace status worker after reap grace");
+            }
         }
     }
 

@@ -9,12 +9,12 @@ use minicore_runtime::tools::{
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::Workspace;
 use crate::tool_data::{ToolData, ToolRef};
-use crate::{Workspace, WorkspaceError};
 
+use super::file_change::{commit_text, read_source_before};
 use super::{
-    FileBefore, MAX_PATCH_BYTES, emit_phase, escape_control_characters, expected_file_state,
-    map_workspace_error, precheck_control, record_file_change, run_controlled, wait_for_test_io,
+    MAX_PATCH_BYTES, emit_phase, escape_control_characters, map_workspace_error, run_controlled,
 };
 
 const TOOL_NAME: &str = "apply_patch";
@@ -91,12 +91,7 @@ impl ApplyPatchTool {
         tool_data: Option<Arc<ToolData>>,
     ) -> ToolFuture<'_> {
         Box::pin(async move {
-            precheck_control(&context)?;
-            if invocation.tool_name() != self.spec.name() {
-                return Err(ToolError::InvalidInvocation);
-            }
-            let input: ApplyPatchInput = serde_json::from_value(invocation.arguments().clone())
-                .map_err(|_| ToolError::InvalidInvocation)?;
+            let input: ApplyPatchInput = super::decode_input(&self.spec, &invocation, &context)?;
             if input.patch.is_empty()
                 || input.patch.len() > MAX_PATCH_BYTES
                 || input.patch.contains('\0')
@@ -109,28 +104,21 @@ impl ApplyPatchTool {
             let path_display = escape_control_characters(&input.path);
 
             run_controlled(&context, async {
-                wait_for_test_io(TOOL_NAME, &input.path).await;
+                #[cfg(test)]
+                if let Some(gate) = super::IO_GATES.take(&(TOOL_NAME, input.path.clone())) {
+                    gate.pass().await;
+                }
                 emit_phase(&context, "reading");
-                let (source, before) = if tool_ref.is_some() && tool_data.is_some() {
-                    let (source, stamp, stable) = self
-                        .workspace
-                        .read_text_snapshot(&input.path, MAX_PATCH_BYTES)
-                        .await
-                        .map_err(map_source_error)?;
-                    let before = FileBefore::Content {
-                        bytes: source.as_bytes().to_vec(),
-                        stamp,
-                        stable,
-                    };
-                    (source, before)
-                } else {
-                    (
-                        self.workspace
-                            .read_text(&input.path, MAX_PATCH_BYTES)
-                            .await
-                            .map_err(map_source_error)?,
-                        FileBefore::Unknown,
-                    )
+                let (source, before) = match read_source_before(
+                    &self.workspace,
+                    &input.path,
+                    MAX_PATCH_BYTES,
+                    tool_ref.is_some() && tool_data.is_some(),
+                )
+                .await
+                {
+                    Ok(source) => source,
+                    Err(error) => return super::file_change::source_failure(error),
                 };
                 emit_phase(&context, "matching");
                 let result = apply_single_file_patch(&input.path, &source, &input.patch)?;
@@ -144,20 +132,15 @@ impl ApplyPatchTool {
                 ))
                 .map_err(|_| ToolError::Internal)?;
                 emit_phase(&context, "committing");
-                let expected = expected_file_state(&before);
-                let observation = self
-                    .workspace
-                    .write_atomic_observed(&input.path, result.as_bytes(), expected)
-                    .await;
-                record_file_change(
-                    tool_data.as_deref(),
+                commit_text(
+                    &self.workspace,
                     tool_ref.as_ref(),
+                    tool_data.as_deref(),
                     &input.path,
                     before,
                     result.as_bytes(),
-                    &observation,
-                );
-                observation.outcome.map_err(map_workspace_error)?;
+                )
+                .await?;
                 Ok(ToolExecutionOutcome::Completed(output))
             })
             .await
@@ -247,15 +230,6 @@ struct ApplyStats {
     codex_match_visits: usize,
 }
 
-#[cfg(test)]
-impl ApplyStats {
-    fn total_steps(&self) -> usize {
-        self.source_line_visits
-            .saturating_add(self.patch_content_visits)
-            .saturating_add(self.codex_match_visits)
-    }
-}
-
 struct ResultBuilder {
     value: String,
     line_count: usize,
@@ -289,10 +263,7 @@ impl ResultBuilder {
         }
         self.value.push_str(text);
         self.value.push_str(ending.as_str());
-        self.line_count = self
-            .line_count
-            .checked_add(1)
-            .ok_or(ToolError::InvalidInvocation)?;
+        self.line_count = add(self.line_count, 1)?;
         self.previous_had_no_newline = ending == LineEnding::None;
         Ok(())
     }
@@ -371,9 +342,7 @@ fn apply_unified_patch_with_stats(
             new: new_range,
             contents,
         });
-        hunk_count = hunk_count
-            .checked_add(1)
-            .ok_or(ToolError::InvalidInvocation)?;
+        hunk_count = add(hunk_count, 1)?;
 
         match parser.next() {
             Some(line) if strip_transport_ending(line).starts_with("@@ ") => {
@@ -529,30 +498,20 @@ fn parse_and_resolve_codex_patch<'a>(
             return Err(ToolError::InvalidInvocation);
         }
         if let CodexLocator::Range { new, .. } = &hunk.locator {
-            let skipped = start
-                .checked_sub(source_cursor)
-                .ok_or(ToolError::InvalidInvocation)?;
-            let expected_new = output_cursor
-                .checked_add(skipped)
-                .ok_or(ToolError::InvalidInvocation)?;
+            let skipped = sub(start, source_cursor)?;
+            let expected_new = add(output_cursor, skipped)?;
             if new.index != expected_new {
                 return Err(ToolError::InvalidInvocation);
             }
         }
-        let skipped = start
-            .checked_sub(source_cursor)
-            .ok_or(ToolError::InvalidInvocation)?;
-        output_cursor = output_cursor
-            .checked_add(skipped)
-            .ok_or(ToolError::InvalidInvocation)?;
+        let skipped = sub(start, source_cursor)?;
+        output_cursor = add(output_cursor, skipped)?;
         source_cursor = start;
         if header_only {
             continue;
         }
 
-        let old_end = start
-            .checked_add(old_count)
-            .ok_or(ToolError::InvalidInvocation)?;
+        let old_end = add(start, old_count)?;
         let mut contents = hunk.contents;
         mark_codex_source_endings(&mut contents, source, start, preferred_ending)?;
         if index + 1 == total_hunks
@@ -568,9 +527,7 @@ fn parse_and_resolve_codex_patch<'a>(
         let new = make_hunk_range(output_cursor, new_count)?;
         resolved.push(ResolvedHunk { old, new, contents });
         source_cursor = old_end;
-        output_cursor = output_cursor
-            .checked_add(new_count)
-            .ok_or(ToolError::InvalidInvocation)?;
+        output_cursor = add(output_cursor, new_count)?;
         previous_start = Some(start);
     }
 
@@ -629,19 +586,7 @@ fn parse_codex_patch<'a>(
             let raw = parser.next().ok_or(ToolError::InvalidInvocation)?;
             let line = strip_transport_ending(raw);
             let mut content = parse_patch_content(line)?;
-            if parser
-                .peek()
-                .is_some_and(|next| strip_transport_ending(next) == NO_NEWLINE_AT_END)
-            {
-                parser.next();
-                mark_no_newline(&mut content)?;
-                if parser
-                    .peek()
-                    .is_some_and(|next| strip_transport_ending(next) == NO_NEWLINE_AT_END)
-                {
-                    return Err(ToolError::InvalidInvocation);
-                }
-            }
+            consume_no_newline(&mut parser, &mut content)?;
             contents.push(content);
         }
         if contents.is_empty()
@@ -679,26 +624,9 @@ fn codex_content_counts(contents: &[PatchContent<'_>]) -> Result<(usize, usize),
     let mut old_count = 0usize;
     let mut new_count = 0usize;
     for content in contents {
-        match content.kind {
-            PatchLineKind::Context => {
-                old_count = old_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-                new_count = new_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-            }
-            PatchLineKind::Remove => {
-                old_count = old_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-            }
-            PatchLineKind::Add => {
-                new_count = new_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-            }
-        }
+        let (old, new) = content.kind.delta();
+        old_count = add(old_count, old)?;
+        new_count = add(new_count, new)?;
     }
     Ok((old_count, new_count))
 }
@@ -718,10 +646,7 @@ fn locate_codex_hunk(
             if old.count != old_count || new.count != new_count {
                 return Err(ToolError::InvalidInvocation);
             }
-            let end = old
-                .index
-                .checked_add(old.count)
-                .ok_or(ToolError::InvalidInvocation)?;
+            let end = add(old.index, old.count)?;
             if end > source.len() || (end_of_file && end != source.len()) {
                 return Err(ToolError::Failed);
             }
@@ -953,9 +878,7 @@ fn mark_codex_result_no_newline(contents: &mut [PatchContent<'_>], new_count: us
 }
 
 fn make_hunk_range(index: usize, count: usize) -> Result<HunkRange, ToolError> {
-    let end = index
-        .checked_add(count)
-        .ok_or(ToolError::InvalidInvocation)?;
+    let end = add(index, count)?;
     Ok(HunkRange { index, count, end })
 }
 
@@ -970,46 +893,17 @@ fn parse_hunk_contents<'a>(
     while old_count < expected_old || new_count < expected_new {
         let raw = parser.next().ok_or(ToolError::InvalidInvocation)?;
         let line = strip_transport_ending(raw);
-        if line == "\\ No newline at end of file" {
+        if line == NO_NEWLINE_AT_END {
             return Err(ToolError::InvalidInvocation);
         }
         let mut content = parse_patch_content(line)?;
-        match content.kind {
-            PatchLineKind::Context => {
-                old_count = old_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-                new_count = new_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-            }
-            PatchLineKind::Remove => {
-                old_count = old_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-            }
-            PatchLineKind::Add => {
-                new_count = new_count
-                    .checked_add(1)
-                    .ok_or(ToolError::InvalidInvocation)?;
-            }
-        }
+        let (old, new) = content.kind.delta();
+        old_count = add(old_count, old)?;
+        new_count = add(new_count, new)?;
         if old_count > expected_old || new_count > expected_new {
             return Err(ToolError::InvalidInvocation);
         }
-        if parser
-            .peek()
-            .is_some_and(|line| strip_transport_ending(line) == "\\ No newline at end of file")
-        {
-            parser.next();
-            mark_no_newline(&mut content)?;
-            if parser
-                .peek()
-                .is_some_and(|line| strip_transport_ending(line) == "\\ No newline at end of file")
-            {
-                return Err(ToolError::InvalidInvocation);
-            }
-        }
+        consume_no_newline(parser, &mut content)?;
         contents.push(content);
     }
     if contents.is_empty() {
@@ -1206,17 +1100,9 @@ fn parse_hunk_range(range: &str, prefix: char) -> Result<HunkRange, ToolError> {
     if start == 0 && count != 0 {
         return Err(ToolError::InvalidInvocation);
     }
-    let index = if count == 0 {
-        start
-    } else {
-        start.checked_sub(1).ok_or(ToolError::InvalidInvocation)?
-    };
-    let end = index
-        .checked_add(count)
-        .ok_or(ToolError::InvalidInvocation)?;
-    start
-        .checked_add(count)
-        .ok_or(ToolError::InvalidInvocation)?;
+    let index = if count == 0 { start } else { sub(start, 1)? };
+    let end = add(index, count)?;
+    add(start, count)?;
     Ok(HunkRange { index, count, end })
 }
 
@@ -1342,17 +1228,39 @@ fn strip_transport_ending(line: &str) -> &str {
     line.strip_suffix('\r').unwrap_or(line)
 }
 
-fn map_source_error(error: WorkspaceError) -> ToolError {
-    match error {
-        WorkspaceError::InvalidPath | WorkspaceError::Escape => ToolError::InvalidInvocation,
-        WorkspaceError::NotFound
-        | WorkspaceError::NotFile
-        | WorkspaceError::NotDirectory
-        | WorkspaceError::Unavailable
-        | WorkspaceError::UnknownOutcome
-        | WorkspaceError::TooLarge
-        | WorkspaceError::Binary => ToolError::Failed,
+fn add(left: usize, right: usize) -> Result<usize, ToolError> {
+    left.checked_add(right).ok_or(ToolError::InvalidInvocation)
+}
+fn sub(left: usize, right: usize) -> Result<usize, ToolError> {
+    left.checked_sub(right).ok_or(ToolError::InvalidInvocation)
+}
+impl PatchLineKind {
+    fn delta(self) -> (usize, usize) {
+        match self {
+            Self::Context => (1, 1),
+            Self::Remove => (1, 0),
+            Self::Add => (0, 1),
+        }
     }
+}
+fn consume_no_newline(
+    parser: &mut PatchLines<'_>,
+    content: &mut PatchContent<'_>,
+) -> Result<(), ToolError> {
+    if parser
+        .peek()
+        .is_some_and(|line| strip_transport_ending(line) == NO_NEWLINE_AT_END)
+    {
+        parser.next();
+        mark_no_newline(content)?;
+        if parser
+            .peek()
+            .is_some_and(|line| strip_transport_ending(line) == NO_NEWLINE_AT_END)
+        {
+            return Err(ToolError::InvalidInvocation);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

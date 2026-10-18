@@ -20,11 +20,6 @@ pub(crate) struct RequestKey {
     pub(crate) request_index: u32,
 }
 
-#[derive(Default)]
-struct ObserverInner {
-    request_key: Option<RequestKey>,
-}
-
 /// The sole narrow execution observer. It records authoritative tool facts and
 /// publishes best-effort events, but never owns a Session, Agent, or command
 /// registry. Command ownership remains explicitly Session-owned.
@@ -32,10 +27,24 @@ pub(crate) struct ToolObserver {
     session_id: SessionId,
     tool_data: Arc<ToolData>,
     events: AgentEventSink,
-    inner: Mutex<ObserverInner>,
+    inner: Mutex<Option<RequestKey>>,
 }
 
 impl ToolObserver {
+    fn turn(&self, loop_id: LoopId) -> TurnRef {
+        TurnRef {
+            session_id: self.session_id,
+            loop_id,
+        }
+    }
+    fn meta(&self, loop_id: LoopId) -> EventMeta {
+        EventMeta {
+            session_id: self.session_id,
+            loop_id: Some(loop_id),
+            dropped_before: 0,
+        }
+    }
+
     pub(crate) fn new(
         session_id: SessionId,
         tool_data: Arc<ToolData>,
@@ -45,7 +54,7 @@ impl ToolObserver {
             session_id,
             tool_data,
             events,
-            inner: Mutex::new(ObserverInner::default()),
+            inner: Mutex::new(None),
         })
     }
 
@@ -66,15 +75,15 @@ impl ToolObserver {
     }
 
     pub(crate) fn note_request_start(&self, key: RequestKey) {
-        self.inner.lock().unwrap().request_key = Some(key);
+        *self.inner.lock().unwrap() = Some(key);
     }
 
     pub(crate) fn request_key(&self) -> Option<RequestKey> {
-        self.inner.lock().unwrap().request_key
+        *self.inner.lock().unwrap()
     }
 
     pub(crate) fn reset_before_loop_start(&self) {
-        self.inner.lock().unwrap().request_key = None;
+        *self.inner.lock().unwrap() = None;
     }
 
     pub(crate) fn publish_tool_invocation(
@@ -95,16 +104,9 @@ impl ToolObserver {
         };
         let loop_id = data.tool_ref.loop_id;
         let _ = self.events.try_send(AgentEvent::ToolExecution {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
+            turn: self.turn(loop_id),
             data,
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
+            meta: self.meta(loop_id),
         });
     }
 
@@ -119,11 +121,7 @@ impl ToolObserver {
             let _ = self.events.try_send(AgentEvent::ToolExecution {
                 turn,
                 data,
-                meta: EventMeta {
-                    session_id: self.session_id,
-                    loop_id: Some(loop_id),
-                    dropped_before: 0,
-                },
+                meta: self.meta(loop_id),
             });
         }
     }
@@ -131,16 +129,9 @@ impl ToolObserver {
     pub(crate) fn emit_tool_invocation(&self, data: ToolInvocationData) {
         let loop_id = data.tool_ref.loop_id;
         let _ = self.events.try_send(AgentEvent::ToolInvocation {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
+            turn: self.turn(loop_id),
             data,
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
+            meta: self.meta(loop_id),
         });
     }
 
@@ -152,20 +143,13 @@ impl ToolObserver {
     ) {
         let loop_id = tool_ref.loop_id;
         let _ = self.events.try_send(AgentEvent::ToolProcess {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
+            turn: self.turn(loop_id),
             data: ToolProcessData {
                 tool_ref: tool_ref.clone(),
                 chunk,
                 command,
             },
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
+            meta: self.meta(loop_id),
         });
     }
 }

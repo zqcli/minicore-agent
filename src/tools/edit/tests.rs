@@ -11,10 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::tool_data::{ToolData, ToolRef};
-use crate::tools::{ToolIoGate, block_next_io};
-use crate::workspace::{
-    BeforeRenameGate, block_before_rename, fail_next_before_rename, fail_next_directory_sync,
-};
+use crate::tools::IO_GATES;
+use crate::workspace::{BEFORE_RENAME_FAILURES, BEFORE_RENAME_GATES, DIRECTORY_SYNC_FAILURES};
 
 async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, EditTool) {
     let base = std::env::temp_dir().join(format!(
@@ -169,8 +167,8 @@ async fn bound_edit_records_a_conflict_when_the_target_changes_before_commit() {
         .await
         .unwrap();
     let target = workspace.resolve_for_write("value.txt").await.unwrap();
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
     let data = Arc::new(ToolData::new());
     let tool_ref = bound_ref();
     data.note_requested(&tool_ref, TOOL_NAME);
@@ -210,6 +208,26 @@ async fn bound_edit_records_a_conflict_when_the_target_changes_before_commit() {
 }
 
 #[tokio::test]
+async fn lf_edit_from_read_preserves_crlf_source() {
+    let (base, _, tool) = fixture("crlf").await;
+    let path = base.join("root/value.txt");
+    tokio::fs::write(&path, "one\r\ntwo\r\nthree\r\n")
+        .await
+        .unwrap();
+    execute(
+        &tool,
+        json!({"path": "value.txt", "old_text": "one\ntwo\n", "new_text": "new\nlines\n"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::fs::read(&path).await.unwrap(),
+        b"new\r\nlines\r\nthree\r\n"
+    );
+    cleanup(&base).await;
+}
+
+#[tokio::test]
 async fn no_match_and_ambiguous_fail_without_writing_then_replace_all_is_non_overlapping() {
     let (base, _, tool) = fixture("matches").await;
     let root = base.join("root");
@@ -221,15 +239,8 @@ async fn no_match_and_ambiguous_fail_without_writing_then_replace_all_is_non_ove
         json!({"path": "value.txt", "old_text": "old", "new_text": "new"}),
     ] {
         assert_eq!(
-            tool.execute(
-                invocation(arguments),
-                context(
-                    CancellationToken::new(),
-                    Instant::now() + Duration::from_secs(5)
-                )
-            )
-            .await,
-            Err(ToolError::Failed)
+            execute(&tool, arguments).await.unwrap(),
+            "Edit requires exactly one match (or replace_all for multiple matches). Read the file and check old_text."
         );
         assert_eq!(
             tokio::fs::read_to_string(&target).await.unwrap(),
@@ -324,7 +335,20 @@ async fn input_source_and_result_limits_are_enforced_before_allocation_or_write(
         .await
         .unwrap();
     tokio::fs::create_dir(root.join("directory")).await.unwrap();
-    for path in ["too-large", "binary", "nul", "directory", "missing"] {
+    for path in ["binary", "nul"] {
+        let before = tokio::fs::read(root.join(path)).await.unwrap();
+        assert_eq!(
+            execute(
+                &tool,
+                json!({"path": path, "old_text": "text", "new_text": "new"})
+            )
+            .await
+            .unwrap(),
+            "Cannot edit binary or non-UTF-8 content as text."
+        );
+        assert_eq!(tokio::fs::read(root.join(path)).await.unwrap(), before);
+    }
+    for path in ["too-large", "directory", "missing"] {
         assert_eq!(
             tool.execute(
                 invocation(json!({"path": path, "old_text": "a", "new_text": "b"})),
@@ -436,8 +460,8 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
     let tool = Arc::new(tool);
 
     let cancellation = CancellationToken::new();
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "cancelled"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm((TOOL_NAME, "cancelled".to_owned()), Arc::clone(&gate));
     let cancelled_tool = Arc::clone(&tool);
     let cancelled_context = context(
         cancellation.clone(),
@@ -451,7 +475,7 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     cancellation.cancel();
     assert_eq!(cancelled.await.unwrap(), Err(ToolError::Cancelled));
     assert_eq!(
@@ -461,8 +485,8 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
         "old"
     );
 
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "timed-out"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm((TOOL_NAME, "timed-out".to_owned()), Arc::clone(&gate));
     let deadline_tool = Arc::clone(&tool);
     let deadline = tokio::spawn(async move {
         deadline_tool
@@ -475,7 +499,7 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     assert_eq!(deadline.await.unwrap(), Err(ToolError::TimedOut));
     assert_eq!(
         tokio::fs::read_to_string(root.join("timed-out"))
@@ -494,7 +518,7 @@ async fn atomic_failures_and_unknown_outcomes_never_report_success() {
     tokio::fs::write(&target, "old").await.unwrap();
     let resolved = workspace.resolve_for_write("value").await.unwrap();
 
-    fail_next_before_rename(resolved.clone());
+    BEFORE_RENAME_FAILURES.arm(resolved.clone(), ());
     assert_eq!(
         tool.execute(
             invocation(json!({"path": "value", "old_text": "old", "new_text": "before-rename"})),
@@ -508,7 +532,7 @@ async fn atomic_failures_and_unknown_outcomes_never_report_success() {
     );
     assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "old");
 
-    fail_next_directory_sync(resolved.parent().unwrap().to_path_buf());
+    DIRECTORY_SYNC_FAILURES.arm(resolved.parent().unwrap().to_path_buf(), ());
     assert_eq!(
         tool.execute(
             invocation(json!({"path": "value", "old_text": "old", "new_text": "complete-new"})),

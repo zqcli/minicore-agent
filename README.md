@@ -141,7 +141,12 @@ framing, ordering, limits, and error mapping are maintained in
 This is a local backend, not a security sandbox. Bash runs with the Agent
 process's host authority. Workspace path checks prevent ordinary traversal and
 symlink mistakes, but do not defend against a same-user process racing the
-filesystem. Use OS/container isolation for untrusted commands or models.
+filesystem. Unix commands use `/bin/bash -c` (or `/bin/sh -c` if Bash is absent),
+not a login shell, preserving the Agent's inherited environment apart from
+credential filtering and the Agent marker. Use OS/container isolation for
+untrusted commands or models, and an init process to reap container orphans.
+Atomic file replacement preserves existing permission bits, but not ownership
+or extended attributes.
 
 RPC stdout is reserved for protocol frames and events; diagnostics go to
 stderr. API key values, prompts, provider bodies, Tool arguments, and Bash

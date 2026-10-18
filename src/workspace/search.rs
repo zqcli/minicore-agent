@@ -24,9 +24,8 @@ use crate::ids::SessionId;
 use crate::text::floor_char_boundary;
 use crate::tools::MAX_READ_BYTES;
 use crate::workspace::Workspace;
-use crate::workspace::query::{
-    DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, MAX_RESULT_BYTES, MIN_RESULT_BYTES,
-};
+use crate::workspace::query::MAX_PATH_BYTES;
+use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
 use crate::workspace::scan::{
     MAX_SEARCH_PATHS, READ_CHUNK_BYTES, SCOPE_HEX_LEN, ScanBudget, Visit, WalkOptions,
     WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop, normalized_roots, now_unix_ms,
@@ -82,12 +81,7 @@ impl WorkspaceSearchRequest {
         {
             return Err(AgentError::InvalidArguments);
         }
-        if self
-            .max_bytes
-            .is_some_and(|max_bytes| !(MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&max_bytes))
-        {
-            return Err(AgentError::InvalidArguments);
-        }
+        validate_result_bytes(self.max_bytes)?;
         if let Some(cursor) = &self.cursor {
             // The scope is computed from this request alone, so a cursor from a
             // different session, query, case mode, or root list is rejected
@@ -96,6 +90,8 @@ impl WorkspaceSearchRequest {
                 || cursor.scope != self.scope(&roots)
                 || usize::try_from(cursor.path_index).unwrap_or(usize::MAX) >= roots.len()
                 || cursor.line_byte_offset > MAX_READ_BYTES as u32
+                || cursor.path.len() > MAX_PATH_BYTES
+                || crate::workspace::normalize_relative(&cursor.path, true).is_err()
             {
                 return Err(AgentError::InvalidArguments);
             }
@@ -146,15 +142,13 @@ impl fmt::Debug for WorkspaceSearchRequest {
     }
 }
 
-/// Where a later page continues: the index into the request's `paths`, the raw
-/// traversal entry ordinal inside it (rule-excluded entries included), and the
-/// position inside that entry when the page stopped in the middle of a file. `line`/`line_byte_offset` are
-/// ignored when `line` is zero, which continues from the entry start.
+/// Continuation root and relative path. A nonzero `line` resumes only that
+/// file at `line_byte_offset`; zero continues after `path`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSearchCursor {
     pub path_index: u32,
-    pub entry: u64,
+    pub path: String,
     pub line: u32,
     pub line_byte_offset: u32,
     pub scope: String,
@@ -211,8 +205,8 @@ pub struct WorkspaceSearchResult {
     /// excluded by the rules are counted in `skipped_files` without clearing
     /// it: the scope was enumerated, but not every file was searched.
     pub scan_complete: bool,
-    /// What ended the scan. `page` and `bytes` continue from the cursor; `end`,
-    /// `depth`, `entries`, and `rules` never do.
+    /// What ended the scan. `page`, `entries`, and `bytes` can continue;
+    /// `end`, `depth`, `rules`, and `deadline` do not.
     pub stopped_by: WorkspaceScanStop,
     /// Visited files that were not searched: unsupported by design (over the
     /// whole-file bound, binary, not valid UTF-8, special, or outside the
@@ -308,7 +302,7 @@ struct SearchPlan {
     max_bytes: usize,
     scope: String,
     start_path: usize,
-    start_entry: u64,
+    start_entry: Option<String>,
     resume: Option<(u32, u32)>,
 }
 
@@ -327,7 +321,6 @@ struct SearchPage<'a> {
 
 /// A record under construction for one line, and its exact encoded size.
 struct PendingLine {
-    ranges: Vec<(usize, usize)>,
     record: WorkspaceSearchMatch,
     encoded: usize,
 }
@@ -368,14 +361,14 @@ pub(crate) async fn search(
     let (start_path, start_entry, resume) = match &request.cursor {
         Some(cursor) => (
             usize::try_from(cursor.path_index).unwrap_or(usize::MAX),
-            cursor.entry,
+            Some(cursor.path.clone()),
             if cursor.line == 0 {
                 None
             } else {
                 Some((cursor.line, cursor.line_byte_offset))
             },
         ),
-        None => (0, 0, None),
+        None => (0, None, None),
     };
     let plan = SearchPlan {
         roots,
@@ -402,6 +395,26 @@ fn scan_search(
     plan: &SearchPlan,
     budget: &mut ScanBudget,
 ) -> Result<WorkspaceSearchResult, AgentError> {
+    // Lexically disjoint roots can alias through intermediate symlinks. Reject
+    // that overlap too, before emitting the same resolved path twice.
+    if plan.roots.len() > 1 {
+        let mut resolved = Vec::new();
+        for root in &plan.roots {
+            budget.check()?;
+            if budget.time_expired() {
+                break;
+            }
+            let path = workspace
+                .resolve_inside_sync(root, true)
+                .map_err(|_| AgentError::Workspace)?;
+            if resolved.iter().any(|other: &std::path::PathBuf| {
+                path.starts_with(other) || other.starts_with(&path)
+            }) {
+                return Err(AgentError::InvalidArguments);
+            }
+            resolved.push(path);
+        }
+    }
     let envelope = envelope_bytes(plan.max_bytes)?;
     let matcher = Matcher::new(&plan.query, plan.case_sensitive)?;
     let mut page = SearchPage {
@@ -424,11 +437,11 @@ fn scan_search(
             continue;
         }
         let entry_start = if path_index == plan.start_path {
-            plan.start_entry
+            plan.start_entry.as_deref()
         } else {
-            0
+            None
         };
-        let mut resume = if path_index == plan.start_path {
+        let resume = if path_index == plan.start_path {
             plan.resume
         } else {
             None
@@ -440,6 +453,7 @@ fn scan_search(
                 recursive: true,
                 want_size: false,
                 directory_only: false,
+                resume_file: resume.is_some(),
             },
             entry_start,
             budget,
@@ -450,7 +464,8 @@ fn scan_search(
                 if page.remaining == 0 {
                     return Ok(Visit::StopBefore(WorkspaceScanStop::Page));
                 }
-                match scan_file(workspace, &entry.relative, resume.take(), &mut page, budget)? {
+                let file_resume = resume.filter(|_| entry_start == Some(entry.relative.as_str()));
+                match scan_file(workspace, &entry.relative, file_resume, &mut page, budget)? {
                     FileScan::Done => Ok(Visit::Next),
                     FileScan::StopInside { line, offset } => Ok(Visit::StopInside {
                         reason: WorkspaceScanStop::Page,
@@ -464,24 +479,41 @@ fn scan_search(
         unrepresentable += outcome.unrepresentable;
         unreadable += outcome.unreadable;
         excluded += outcome.excluded;
-        match outcome.next {
-            Some(entry) => {
+        // Finishing an earlier root can exhaust the page before this root's
+        // first entry. Advancing the root index is itself a continuation.
+        let next_path = outcome.next.or_else(|| {
+            (path_index > plan.start_path
+                && matches!(
+                    outcome.reason,
+                    WorkspaceScanStop::Entries | WorkspaceScanStop::Bytes
+                ))
+            .then(String::new)
+        });
+        match next_path {
+            Some(path) => {
                 reason = outcome.reason;
+                if path.len() > MAX_PATH_BYTES
+                    || encoded_len(&path) - 2 > page.content_budget - page.used
+                {
+                    break;
+                }
                 next = Some(WorkspaceSearchCursor {
                     path_index: u32::try_from(path_index).unwrap_or(u32::MAX),
-                    entry,
+                    path,
                     line: outcome.resume.map(|(line, _)| line).unwrap_or(0),
                     line_byte_offset: outcome.resume.map(|(_, offset)| offset).unwrap_or(0),
                     scope: plan.scope.clone(),
                 });
                 break;
             }
-            None => {
-                if outcome.reason != WorkspaceScanStop::End {
-                    reason = outcome.reason;
+            None => match outcome.reason {
+                WorkspaceScanStop::End => {}
+                WorkspaceScanStop::Rules | WorkspaceScanStop::Depth => reason = outcome.reason,
+                stopped => {
+                    reason = stopped;
                     break;
                 }
-            }
+            },
         }
     }
     let dropped = page.dropped + unrepresentable + unreadable;
@@ -554,9 +586,9 @@ fn scan_file(
         // and end the scan with a deadline instead of a cursor.
         #[cfg(test)]
         if !page.matches.is_empty()
-            && crate::workspace::scan::scan_expiry_after_result(workspace.root())
+            && crate::workspace::scan::SCAN_RESULT_EXPIRIES.hit(&workspace.root().to_path_buf())
         {
-            budget.expire_now();
+            budget.expired = true;
         }
         line_number = line_number.saturating_add(1);
     }
@@ -579,56 +611,55 @@ fn visit_line(
     from: usize,
     budget: &mut ScanBudget,
 ) -> Result<Option<(u32, u32)>, AgentError> {
-    let matcher = page.matcher;
-    let mut pending: Option<PendingLine> = None;
-    let mut stop: Option<(u32, u32)> = None;
-    scan_ranges(matcher, line, from, |start, end| {
-        // Long lines and pages that build many records still stop when the
-        // query is cancelled or the deadline passes.
+    let mut ranges = Vec::new();
+    let mut overflow = None;
+    scan_ranges(page.matcher, line, from, |start, end| {
         budget.check()?;
         if budget.time_expired() {
-            // Keep the matches already committed for this line and let the walk
-            // report the deadline; a timeout never hands out a page cursor.
             return Ok(RangeFlow::Stop);
         }
-        let accepted = pending
-            .as_ref()
-            .map(|pending| pending.ranges.len())
-            .unwrap_or(0);
-        if u64::try_from(accepted).unwrap_or(u64::MAX) >= page.remaining {
-            // The page may not return another match: stop before this one so
-            // the next page re-finds it.
-            stop = Some((line_number, u32::try_from(start).unwrap_or(u32::MAX)));
+        if ranges.len() as u64 >= page.remaining {
+            overflow = Some(start);
             return Ok(RangeFlow::Stop);
         }
-        let mut ranges = pending
-            .as_ref()
-            .map(|pending| pending.ranges.clone())
-            .unwrap_or_default();
         ranges.push((start, end));
-        match build_record(page, path, line_number, line, &ranges)? {
-            Some(record) => {
-                pending = Some(record);
-                Ok(RangeFlow::Next)
+        Ok(RangeFlow::Next)
+    })?;
+    let mut first = 0;
+    while first < ranges.len() {
+        let Some(mut record) =
+            build_record(page, path, line_number, line, &ranges[first..first + 1])?
+        else {
+            if !page.matches.is_empty() {
+                return Ok(Some((line_number, ranges[first].0 as u32)));
             }
-            None if page.matches.is_empty() && pending.is_none() => {
-                // Nothing has been returned for this page yet, so skipping and
-                // counting the match keeps the page moving and marks the result
-                // incomplete instead of stalling or pretending to be complete.
-                page.dropped += 1;
-                page.file_dropped = true;
-                Ok(RangeFlow::Next)
-            }
-            None => {
-                stop = Some((line_number, u32::try_from(start).unwrap_or(u32::MAX)));
-                Ok(RangeFlow::Stop)
+            page.dropped += 1;
+            page.file_dropped = true;
+            first += 1;
+            continue;
+        };
+        // Fit the largest prefix. Encoded range lists and their enclosing line
+        // slice only grow, so logarithmic probes replace per-match copies.
+        let mut accepted = first + 1;
+        let mut upper = ranges.len();
+        while accepted < upper {
+            let mid = accepted + (upper - accepted).div_ceil(2);
+            match build_record(page, path, line_number, line, &ranges[first..mid])? {
+                Some(candidate) => {
+                    accepted = mid;
+                    record = candidate;
+                }
+                None => upper = mid - 1,
             }
         }
-    })?;
-    if let Some(pending) = pending {
-        commit(page, pending);
+        commit(page, record);
+        return Ok(ranges
+            .get(accepted)
+            .map(|range| range.0)
+            .or(overflow)
+            .map(|offset| (line_number, offset as u32)));
     }
-    Ok(stop)
+    Ok(overflow.map(|offset| (line_number, offset as u32)))
 }
 
 /// Builds the record for one line and the given absolute ranges, preferring the
@@ -689,14 +720,10 @@ fn build_candidate(
         line_truncated: start > 0 || end < line.len(),
     };
     let encoded = encoded_len(&record);
-    if page.used + encoded + 1 > page.content_budget {
+    if page.used + encoded + 1 + encoded_len(&path) > page.content_budget {
         return Ok(None);
     }
-    Ok(Some(PendingLine {
-        ranges: ranges.to_vec(),
-        record,
-        encoded,
-    }))
+    Ok(Some(PendingLine { record, encoded }))
 }
 
 /// Adds a built record to the page and charges its matches.
@@ -723,6 +750,12 @@ fn read_searchable_file(
             return Ok(match error {
                 // A special file or a path outside the boundary is a known
                 // unsupported object, not a failed read.
+                crate::workspace::WorkspaceError::NotFound
+                    if std::fs::symlink_metadata(workspace.root().join(relative))
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+                {
+                    ReadFile::Unsupported
+                }
                 crate::workspace::WorkspaceError::NotFile
                 | crate::workspace::WorkspaceError::NotDirectory
                 | crate::workspace::WorkspaceError::Escape
@@ -764,7 +797,15 @@ fn read_searchable_file(
         if bytes.len() + read > MAX_READ_BYTES {
             return Ok(ReadFile::Unsupported);
         }
+        if chunk[..read].contains(&0) {
+            return Ok(ReadFile::Unsupported);
+        }
         bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() == read
+            && std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_some())
+        {
+            return Ok(ReadFile::Unsupported);
+        }
     }
     if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
         return Ok(ReadFile::Unsupported);
@@ -781,7 +822,7 @@ fn envelope_bytes(max_bytes: usize) -> Result<usize, AgentError> {
         matches: Vec::new(),
         next_cursor: Some(WorkspaceSearchCursor {
             path_index: u32::MAX,
-            entry: u64::MAX,
+            path: String::new(),
             line: u32::MAX,
             line_byte_offset: u32::MAX,
             scope: "f".repeat(SCOPE_HEX_LEN),
@@ -794,11 +835,7 @@ fn envelope_bytes(max_bytes: usize) -> Result<usize, AgentError> {
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    let size = encoded_len(&probe);
-    if size >= max_bytes {
-        return Err(AgentError::InvalidArguments);
-    }
-    Ok(size)
+    crate::workspace::scan::envelope_size(&probe, max_bytes)
 }
 
 #[cfg(test)]

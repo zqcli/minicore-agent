@@ -20,11 +20,12 @@ fn write(workspace: &Workspace, path: &str, bytes: &[u8]) {
 
 fn scan_budget(workspace: &Workspace) -> ScanBudget {
     ScanBudget {
-        limits: scan_limits(workspace.root()),
+        limits: workspace.scan_limits,
         entries: 0,
         bytes: 0,
         rule_files: 0,
         rule_bytes: 0,
+        rules_exhausted: false,
         stop: CancellationToken::new(),
         session_cancellation: CancellationToken::new(),
         shutdown_cancellation: CancellationToken::new(),
@@ -33,7 +34,7 @@ fn scan_budget(workspace: &Workspace) -> ScanBudget {
     }
 }
 
-fn walk(workspace: &Workspace, start_entry: u64) -> (WalkOutcome, Vec<String>) {
+fn walk(workspace: &Workspace, start_entry: Option<&str>) -> (WalkOutcome, Vec<String>) {
     let mut budget = scan_budget(workspace);
     let mut seen = Vec::new();
     let outcome = walk_scope(
@@ -43,6 +44,7 @@ fn walk(workspace: &Workspace, start_entry: u64) -> (WalkOutcome, Vec<String>) {
             recursive: true,
             want_size: false,
             directory_only: false,
+            resume_file: false,
         },
         start_entry,
         &mut budget,
@@ -72,13 +74,14 @@ async fn a_deadline_keeps_the_partial_walk_and_drops_the_continuation() {
             recursive: true,
             want_size: false,
             directory_only: false,
+            resume_file: false,
         },
-        0,
+        None,
         &mut budget,
         |entry, budget| {
             seen.push(entry.relative.clone());
             // The deadline passes right after the first visited entry.
-            budget.expire_now();
+            budget.expired = true;
             Ok(Visit::Next)
         },
     )
@@ -94,7 +97,7 @@ async fn a_deadline_keeps_the_partial_walk_and_drops_the_continuation() {
 async fn a_cancelled_session_fails_the_scan_and_exits_the_worker() {
     let (workspace, _base) = fixture("deadline-cancel").await;
     let hold = Arc::new(ScanHold::new());
-    hold_next_scan(workspace.root().to_path_buf(), Arc::clone(&hold));
+    SCAN_HOLDS.arm(workspace.root().to_path_buf(), Arc::clone(&hold));
     let session = CancellationToken::new();
     let pending = tokio::spawn({
         let workspace = Arc::clone(&workspace);
@@ -124,10 +127,45 @@ async fn a_cancelled_session_fails_the_scan_and_exits_the_worker() {
 }
 
 #[tokio::test]
+async fn cancellation_does_not_wait_forever_for_a_stalled_filesystem_worker() {
+    let (workspace, base) = fixture("stalled-worker").await;
+    let gate = Arc::new(crate::test_support::Gate::new());
+    let cancellation = CancellationToken::new();
+    let (exited, exit) = tokio::sync::oneshot::channel();
+    let pending = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        let cancellation = cancellation.clone();
+        async move {
+            run_scan(
+                workspace,
+                cancellation,
+                CancellationToken::new(),
+                move |_, _| {
+                    gate.pass_blocking();
+                    let _ = exited.send(());
+                    Ok(())
+                },
+            )
+            .await
+        }
+    });
+    gate.wait_started().await;
+    cancellation.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), pending).await;
+    gate.release();
+    exit.await.unwrap();
+    assert!(matches!(
+        result.unwrap().unwrap(),
+        Err(AgentError::QueryLimit)
+    ));
+    tokio::fs::remove_dir_all(base).await.unwrap();
+}
+
+#[tokio::test]
 async fn dropping_the_awaiter_cancels_the_worker() {
     let (workspace, _base) = fixture("drop-guard").await;
     let hold = Arc::new(ScanHold::new());
-    hold_next_scan(workspace.root().to_path_buf(), Arc::clone(&hold));
+    SCAN_HOLDS.arm(workspace.root().to_path_buf(), Arc::clone(&hold));
     let pending = tokio::spawn({
         let workspace = Arc::clone(&workspace);
         async move {
@@ -172,7 +210,7 @@ async fn nested_rules_inherit_and_git_metadata_is_never_walked() {
     write(&workspace, "sub/keep.txt", b"x");
     write(&workspace, "sub/keep.log", b"x");
 
-    let (outcome, mut seen) = walk(&workspace, 0);
+    let (outcome, mut seen) = walk(&workspace, None);
     assert_eq!(outcome.reason, WorkspaceScanStop::End);
     seen.sort();
     assert_eq!(
@@ -206,7 +244,7 @@ async fn rule_categories_precede_depth_and_rules_never_leak() {
     write(&workspace, "blocked/inside.txt", b"x");
     write(&workspace, "sub/kept.txt", b"x");
 
-    let (outcome, mut seen) = walk(&workspace, 0);
+    let (outcome, mut seen) = walk(&workspace, None);
     assert_eq!(outcome.reason, WorkspaceScanStop::End);
     seen.sort();
     assert_eq!(
@@ -232,8 +270,9 @@ async fn rule_categories_precede_depth_and_rules_never_leak() {
             recursive: true,
             want_size: false,
             directory_only: false,
+            resume_file: false,
         },
-        0,
+        None,
         &mut budget,
         |entry, _| {
             nested.push(entry.relative.clone());
@@ -268,8 +307,9 @@ async fn a_subdirectory_root_inherits_ancestor_rules() {
             recursive: true,
             want_size: false,
             directory_only: false,
+            resume_file: false,
         },
-        0,
+        None,
         &mut budget,
         |entry, _| {
             seen.push(entry.relative.clone());
@@ -299,8 +339,9 @@ async fn an_explicit_root_is_never_filtered_by_its_own_rules() {
             recursive: true,
             want_size: false,
             directory_only: false,
+            resume_file: false,
         },
-        0,
+        None,
         &mut budget,
         |entry, _| {
             seen.push(entry.relative.clone());
@@ -317,56 +358,50 @@ async fn an_explicit_root_is_never_filtered_by_its_own_rules() {
 }
 
 #[tokio::test]
-async fn positioning_is_charged_to_the_entry_ceiling() {
-    let (workspace, base) = fixture("positioning").await;
+async fn resuming_does_not_spend_the_entry_budget_on_previous_pages() {
+    let (mut workspace, base) = fixture("positioning").await;
     for index in 0..10 {
         write(&workspace, &format!("file-{index}.txt"), b"x");
     }
-    set_scan_limits(
-        workspace.root().to_path_buf(),
-        ScanLimits {
-            entries: 4,
-            bytes: 1 << 20,
-            depth: 8,
-            rule_files: 8,
-            rule_bytes: 1 << 20,
-        },
-    );
-    let (outcome, seen) = walk(&workspace, 0);
+    Arc::make_mut(&mut workspace).scan_limits = ScanLimits {
+        entries: 4,
+        bytes: 1 << 20,
+        depth: 8,
+        rule_files: 8,
+        rule_bytes: 1 << 20,
+    };
+    let (outcome, seen) = walk(&workspace, None);
     assert_eq!(outcome.reason, WorkspaceScanStop::Entries);
-    assert_eq!(outcome.next, None);
+    assert_eq!(outcome.next.as_deref(), Some("file-3.txt"));
     assert_eq!(seen.len(), 4);
 
-    let (outcome, seen) = walk(&workspace, 9);
-    assert_eq!(outcome.reason, WorkspaceScanStop::Entries);
+    let (outcome, seen) = walk(&workspace, Some("file-8.txt"));
+    assert_eq!(outcome.reason, WorkspaceScanStop::End);
     assert_eq!(outcome.next, None);
-    assert!(seen.is_empty());
+    assert_eq!(seen, ["file-9.txt"]);
     let _ = tokio::fs::remove_dir_all(&base).await;
 }
 
 #[tokio::test]
 async fn an_exhausted_rule_budget_stops_with_the_rules_reason() {
-    let (workspace, base) = fixture("rules-budget").await;
+    let (mut workspace, base) = fixture("rules-budget").await;
     let mut rules = String::new();
     for index in 0..40 {
         rules.push_str(&format!("ignored-{index}.txt\n"));
     }
     write(&workspace, ".gitignore", rules.as_bytes());
     write(&workspace, "kept.txt", b"x");
-    set_scan_limits(
-        workspace.root().to_path_buf(),
-        ScanLimits {
-            entries: 1_000,
-            bytes: 1 << 20,
-            depth: 8,
-            rule_files: 1,
-            rule_bytes: 8,
-        },
-    );
-    let (outcome, seen) = walk(&workspace, 0);
+    Arc::make_mut(&mut workspace).scan_limits = ScanLimits {
+        entries: 1_000,
+        bytes: 1 << 20,
+        depth: 8,
+        rule_files: 1,
+        rule_bytes: 8,
+    };
+    let (outcome, seen) = walk(&workspace, None);
     assert_eq!(outcome.reason, WorkspaceScanStop::Rules);
     assert_eq!(outcome.next, None);
-    assert!(seen.is_empty());
+    assert_eq!(seen, [".gitignore", "kept.txt"]);
     let _ = tokio::fs::remove_dir_all(&base).await;
 }
 
@@ -378,7 +413,7 @@ async fn non_repository_defaults_apply_and_local_rules_win() {
     write(&workspace, "src/main.rs", b"x");
     write(&workspace, ".gitignore", b"!target/\n");
 
-    let (outcome, mut seen) = walk(&workspace, 0);
+    let (outcome, mut seen) = walk(&workspace, None);
     assert_eq!(outcome.reason, WorkspaceScanStop::End);
     seen.sort();
     assert_eq!(
@@ -392,4 +427,48 @@ async fn non_repository_defaults_apply_and_local_rules_win() {
         ]
     );
     let _ = tokio::fs::remove_dir_all(&base).await;
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub(crate) struct ScanHold {
+    gate: crate::test_support::Gate,
+    exited: AtomicBool,
+}
+impl ScanHold {
+    pub(crate) fn new() -> Self {
+        Self {
+            gate: crate::test_support::Gate::new(),
+            exited: AtomicBool::new(false),
+        }
+    }
+    pub(crate) async fn wait_started(&self) {
+        self.gate.wait_started().await;
+    }
+    pub(crate) fn release(&self) {
+        self.gate.release();
+    }
+    pub(crate) fn exited(&self) -> bool {
+        self.exited.load(Ordering::SeqCst)
+    }
+}
+pub(super) struct ScanExit(Arc<ScanHold>);
+impl Drop for ScanExit {
+    fn drop(&mut self) {
+        self.0.exited.store(true, Ordering::SeqCst);
+    }
+}
+pub(super) fn hold_worker(root: &Path, budget: &ScanBudget) -> Option<ScanExit> {
+    let hold = SCAN_HOLDS.take(&root.to_path_buf())?;
+    let exit = ScanExit(hold);
+    tokio::runtime::Handle::current().block_on(async {
+        tokio::select! {
+            _ = exit.0.gate.pass() => {},
+            _ = budget.stop.cancelled() => {},
+            _ = budget.session_cancellation.cancelled() => {},
+            _ = budget.shutdown_cancellation.cancelled() => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(budget.deadline)) => {},
+        }
+    });
+    Some(exit)
 }

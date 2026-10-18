@@ -14,8 +14,50 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+
+#[test]
+fn omission_counts_raw_bytes_even_when_invalid_utf8_expands() {
+    let capture = StreamCapture {
+        bytes: vec![0xff; 100],
+        truncated: false,
+        omitted: 0,
+    };
+    let output = format_stream(&capture, TRUNCATION_OVERHEAD + 12);
+    assert!(output.contains("96 bytes omitted"));
+    assert_eq!(output.matches('\u{fffd}').count(), 4);
+}
+
+#[test]
+fn model_output_shares_the_budget_and_keeps_head_and_tail() {
+    let empty = StreamCapture {
+        bytes: Vec::new(),
+        truncated: false,
+        omitted: 0,
+    };
+    let small = StreamCapture {
+        bytes: vec![b'x'; FORMATTED_OUTPUT_LIMIT * 3 / 4],
+        truncated: false,
+        omitted: 0,
+    };
+    let output = format_output(Some(0), &small, &empty);
+    assert!(!output.contains(TRUNCATED));
+    assert_eq!(
+        output.bytes().filter(|byte| *byte == b'x').count(),
+        small.bytes.len() + 1
+    );
+    let large = StreamCapture {
+        bytes: format!("HEAD{}TAIL", "x".repeat(FORMATTED_OUTPUT_LIMIT * 2)).into_bytes(),
+        truncated: false,
+        omitted: 0,
+    };
+    let output = format_output(Some(0), &large, &empty);
+    assert!(output.contains("HEAD"));
+    assert!(output.contains("TAIL"));
+    assert!(output.contains("bytes omitted"));
+    assert!(output.len() <= FORMATTED_OUTPUT_LIMIT);
+}
 #[cfg(unix)]
-use crate::tools::command::TerminationFailure;
+use crate::tools::command::tests::TerminationFailure;
 
 const TEST_MODEL_KEY: &str = "MINICORE_TEST_MODEL_KEY";
 const TEST_MODEL_SECRET: &str = "MINICORE-TEST-MODEL-SECRET";
@@ -818,7 +860,7 @@ async fn assert_termination_failure_is_honest(label: &str, failure: TerminationF
     });
     let pid = read_pid(&pid_file).await;
     let mut guard = UnixProcessGuard::new(pid);
-    crate::tools::command::inject_termination_failure(pid, failure);
+    crate::tools::command::TERMINATION_FAILURES.arm((Some(pid), failure), ());
     let started = Instant::now();
     cancellation.cancel();
     let result = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
@@ -1135,4 +1177,25 @@ fn kill_process(pid: u32) {
         .arg(pid.to_string())
         .arg("/F")
         .status();
+}
+
+impl CommandEnvironment {
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> &[OsString] {
+        &self.removed
+    }
+}
+impl BashTool {
+    #[cfg(test)]
+    pub(super) fn new(workspace: Arc<Workspace>, environment: CommandEnvironment) -> Self {
+        Self::with_binding(workspace, environment, None)
+    }
+    #[cfg(all(test, unix))]
+    pub(super) async fn join_owned_commands(&self) {
+        self.owners.join_all().await;
+    }
+    #[cfg(all(test, unix))]
+    pub(super) fn active_owned_commands(&self) -> usize {
+        self.owners.active()
+    }
 }

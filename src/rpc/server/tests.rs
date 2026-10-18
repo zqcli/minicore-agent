@@ -41,7 +41,7 @@ use crate::store::{
 };
 use crate::test_support::Gate;
 use crate::workspace::query::READ_GATES;
-use crate::workspace::scan::{ScanHold, hold_next_scan};
+use crate::workspace::scan::{SCAN_HOLDS, tests::ScanHold};
 
 use super::{
     Frame, MAX_DEFERRED_QUERIES, MAX_DEFERRED_WAITERS, MAX_RPC_LINE_BYTES, RpcServer, read_frame,
@@ -5705,7 +5705,7 @@ async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
     let session_id = create_and_open(&mut harness, &workspace).await;
 
     let files_hold = Arc::new(ScanHold::new());
-    hold_next_scan(root.clone(), Arc::clone(&files_hold));
+    SCAN_HOLDS.arm(root.clone(), Arc::clone(&files_hold));
     harness
         .send(
             json!("files"),
@@ -5718,7 +5718,7 @@ async fn pending_workspace_scans_do_not_block_ping_or_shutdown() {
         .expect("gated files scan did not start");
 
     let search_hold = Arc::new(ScanHold::new());
-    hold_next_scan(root, Arc::clone(&search_hold));
+    SCAN_HOLDS.arm(root, Arc::clone(&search_hold));
     harness
         .send(
             json!("search"),
@@ -5765,7 +5765,7 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     let mut holds = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
         let hold = Arc::new(ScanHold::new());
-        hold_next_scan(root.clone(), Arc::clone(&hold));
+        SCAN_HOLDS.arm(root.clone(), Arc::clone(&hold));
         holds.push(hold);
         harness
             .send(
@@ -5854,7 +5854,7 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
 #[cfg(unix)]
 #[tokio::test]
 async fn workspace_status_projects_the_shared_presentation_branch_and_clears_failures() {
-    use crate::workspace::status::set_status_program;
+    use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
     let (agent, base, workspace) =
@@ -5922,7 +5922,10 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    STATUS_PROGRAMS.arm(
+        std::fs::canonicalize(&workspace).unwrap(),
+        script.into_os_string(),
+    );
     std::fs::write(&marker, b"fail\n").unwrap();
 
     harness
@@ -6519,7 +6522,7 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
 #[cfg(unix)]
 #[tokio::test]
 async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
-    use crate::workspace::status::set_status_program;
+    use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
     let (agent, base, workspace) =
@@ -6535,7 +6538,7 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(root, script);
+    STATUS_PROGRAMS.arm(root, script.into_os_string());
 
     let mut harness = RpcHarness::spawn(agent);
     let session = create_and_open(&mut harness, &workspace).await;
@@ -6783,7 +6786,7 @@ async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
 #[cfg(unix)]
 #[tokio::test]
 async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
-    use crate::workspace::status::set_status_program;
+    use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
     let (agent, base, workspace) =
@@ -6799,7 +6802,7 @@ async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(root, script);
+    STATUS_PROGRAMS.arm(root, script.into_os_string());
 
     let mut harness = RpcHarness::spawn(agent);
     let closing = create_and_open(&mut harness, &workspace).await;

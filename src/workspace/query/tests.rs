@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{Gate, TempDir};
+use crate::workspace::scan::{MAX_RESULT_BYTES, MIN_RESULT_BYTES};
 
 struct Fixture {
     root: std::path::PathBuf,
@@ -466,7 +467,7 @@ async fn special_files_and_a_post_check_swap_do_not_block() {
 
     write(&fixture, "swap.txt", b"data\n").await;
     let target = std::fs::canonicalize(fixture.root.join("swap.txt")).unwrap();
-    crate::workspace::swap_next_open_with_fifo(target);
+    crate::workspace::SWAP_OPEN_TO_FIFO.arm(target, ());
     let swapped = tokio::time::timeout(
         Duration::from_secs(2),
         query(&fixture, read_request("swap.txt")),

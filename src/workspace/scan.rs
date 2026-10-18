@@ -5,22 +5,16 @@
 //! walk: rules come from `ignore::gitignore` matchers built from bounded reads
 //! of `.ignore`, `.gitignore`, and `.git/info/exclude`, never from a
 //! hand-written pattern parser and never from the global git configuration.
-//! Nothing here trusts the tree to bound its own work: every raw directory
-//! entry, every positioning step, every unreadable path, and every rule byte is
-//! charged against the request budget, checked against the deadline and
-//! cancellation as it happens, and reported through an explicit stop reason
-//! instead of a guessed total. One traversal runs on a single blocking worker
-//! per query, which is always joined before the query returns.
+//! Each page visits names after its path cursor; ancestor directories are
+//! reopened only to descend to that position. Budgets count this page's visits,
+//! content and rule bytes. Cancellation gives the blocking worker a bounded
+//! join grace, so a stalled filesystem cannot hold session shutdown forever.
 
 use std::ffi::OsStr;
 use std::fs::{self as std_fs};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-#[cfg(test)]
-use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::Match as IgnoreMatch;
@@ -43,8 +37,7 @@ pub(crate) const MAX_SEARCH_PATHS: usize = 32;
 /// Cursor scope fingerprints are truncated SHA-256 hex prefixes.
 pub(crate) const SCOPE_HEX_LEN: usize = 16;
 
-/// Raw entries one request may consume, including entries consumed while
-/// positioning at a cursor.
+/// Entries one page may visit after its cursor.
 const MAX_SCAN_ENTRIES: u64 = 100_000;
 /// Path or content bytes one request may examine for results.
 const MAX_SCAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -57,6 +50,30 @@ const MAX_RULE_FILE_BYTES: u64 = 256 * 1024;
 /// Bytes requested from one blocking read, so cancellation and the deadline are
 /// observed inside a large read instead of only around it.
 pub(crate) const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+pub(crate) const MIN_RESULT_BYTES: usize = 1024;
+pub(crate) const DEFAULT_RESULT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_RESULT_BYTES: usize = 256 * 1024;
+
+pub(crate) fn validate_result_bytes(max_bytes: Option<usize>) -> Result<(), AgentError> {
+    if max_bytes.is_some_and(|bytes| !(MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&bytes)) {
+        Err(AgentError::InvalidArguments)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn envelope_size<T: Serialize>(
+    probe: &T,
+    max_bytes: usize,
+) -> Result<usize, AgentError> {
+    let size = crate::budget::encoded_len(probe);
+    if size >= max_bytes {
+        Err(AgentError::InvalidArguments)
+    } else {
+        Ok(size)
+    }
+}
 
 const IGNORE_FILES: [&str; 2] = [".ignore", ".gitignore"];
 const GIT_EXCLUDE: &str = ".git/info/exclude";
@@ -83,14 +100,10 @@ const DEFAULT_EXCLUDED_DIRECTORIES: &[&str] = &[
 
 /// The stop that ended a bounded scan.
 ///
-/// `end` reached the end of the requested scope, and `page`, `entries`, `bytes`,
-/// `depth`, `rules`, and `deadline` are bounds that cut it short. `page` and
-/// `bytes` continue from the reported cursor; `entries` stops without a
-/// continuation because a resumed request would spend its whole budget reaching
-/// the same ceiling; `depth` and `rules` have nothing further to report;
-/// `deadline` keeps the partial result, returns no cursor, and asks for a
-/// narrower request or a later retry. Cancellation is never a stop: it fails the
-/// query instead.
+/// `page`, `entries` and `bytes` can continue from the path cursor. `depth`
+/// and `rules` describe incomplete traversal; rule exhaustion skips further
+/// rule files without stopping the walk. `deadline` keeps partial results but
+/// has no cursor. Cancellation fails the query instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceScanStop {
@@ -152,13 +165,14 @@ pub(crate) struct ScanBudget {
     bytes: u64,
     rule_files: u64,
     rule_bytes: u64,
+    rules_exhausted: bool,
     stop: CancellationToken,
     session_cancellation: CancellationToken,
     shutdown_cancellation: CancellationToken,
     deadline: Instant,
     /// Set once a check observes the deadline, so the scan reports
     /// `WorkspaceScanStop::Deadline` and keeps its partial result.
-    expired: bool,
+    pub(super) expired: bool,
 }
 
 impl ScanBudget {
@@ -172,13 +186,6 @@ impl ScanBudget {
     /// True when the query deadline passed.
     pub(crate) fn time_expired(&self) -> bool {
         self.expired || Instant::now() >= self.deadline
-    }
-
-    /// True when the query was cancelled or its deadline passed. Only the test
-    /// hold consults it; production stops go through `check` and `time_expired`.
-    #[cfg(test)]
-    pub(crate) fn stopped(&self) -> bool {
-        self.cancelled() || self.time_expired()
     }
 
     /// Fails the query only when it was cancelled, which must not produce a
@@ -195,19 +202,11 @@ impl ScanBudget {
         Ok(())
     }
 
-    /// Marks this budget as timed out so the rest of the scan behaves as if the
-    /// deadline had passed. Tests place the timeout at a chosen point with it.
-    #[cfg(test)]
-    pub(crate) fn expire_now(&mut self) {
-        self.expired = true;
-    }
-
     pub(crate) fn limits(&self) -> ScanLimits {
         self.limits
     }
 
-    /// Claims one raw entry, including entries consumed while positioning at a
-    /// cursor. False once the entry ceiling is reached.
+    /// Claims a new entry on this page; cursor ancestors are not charged.
     pub(crate) fn claim_entry(&mut self) -> bool {
         if self.entries >= self.limits.entries {
             return false;
@@ -278,15 +277,14 @@ pub(crate) struct WalkOptions {
     pub(crate) want_size: bool,
     /// Reject a requested root that is not a directory.
     pub(crate) directory_only: bool,
+    pub(crate) resume_file: bool,
 }
 
 /// Result of one traversal of one requested root.
 pub(crate) struct WalkOutcome {
     pub(crate) reason: WorkspaceScanStop,
-    /// Continuation ordinal, or `None` when the scan cannot continue: the stop
-    /// allows no continuation, or the entry budget ran out before the requested
-    /// position was reached.
-    pub(crate) next: Option<u64>,
+    /// Last processed path, or the partially searched file when `resume` is set.
+    pub(crate) next: Option<String>,
     /// Within-entry resume position when the scan stopped inside an entry.
     pub(crate) resume: Option<(u32, u32)>,
     /// Entries whose path is not valid UTF-8.
@@ -315,20 +313,15 @@ struct DirRules {
 
 /// Walks one requested root with the shared rules.
 ///
-/// The traversal is a depth-first pre-order over the rule-filtered tree in the
-/// filesystem's directory order. `start_entry` positions a resumed request by
-/// ordinal; that positioning is charged against the entry ceiling exactly like
-/// examined entries, and when it cannot finish the scan stops without a
-/// continuation instead of returning a cursor that would not advance. `.git`
-/// metadata is never returned or expanded, `.ignore`, `.gitignore`, and
-/// `.git/info/exclude` inside the Workspace are applied, and the global git
-/// configuration is never read. Symlinked directories are never followed or
-/// expanded, including when one is the requested root.
+/// Depth-first pre-order with sorted directory names. A resume descends along
+/// `start_path` and skips earlier siblings without visiting them. `.git` is
+/// never expanded, global ignore rules are never read, and symlinked directories
+/// are never followed. Intermediate aliases use their resolved relative path.
 pub(crate) fn walk_scope<F>(
     workspace: &Workspace,
     directory: &str,
     options: WalkOptions,
-    start_entry: u64,
+    start_path: Option<&str>,
     budget: &mut ScanBudget,
     visit: F,
 ) -> Result<WalkOutcome, AgentError>
@@ -359,6 +352,10 @@ where
     if root_is_directory && requested_symlink {
         return Err(AgentError::Workspace);
     }
+    let relative = resolved
+        .strip_prefix(workspace.root())
+        .map_err(|_| AgentError::Workspace)?
+        .to_path_buf();
     let display = display_path(&relative);
     let is_repo = std_fs::symlink_metadata(workspace.root().join(".git")).is_ok();
     let limits = budget.limits();
@@ -369,8 +366,8 @@ where
         limits,
         options,
         is_repo,
-        local: 0,
-        start_entry,
+        start_path: start_path.map(PathBuf::from),
+        last: start_path.unwrap_or("").to_owned(),
         reason: WorkspaceScanStop::End,
         next: None,
         resume: None,
@@ -408,13 +405,10 @@ struct Walker<'a, F> {
     limits: ScanLimits,
     options: WalkOptions,
     is_repo: bool,
-    /// Ordinal of the next raw entry in this walk, starting at zero. The cursor
-    /// is scoped to one requested root, so this is not the query-wide entry
-    /// count that `ScanBudget` keeps.
-    local: u64,
-    start_entry: u64,
+    start_path: Option<PathBuf>,
+    last: String,
     reason: WorkspaceScanStop,
-    next: Option<u64>,
+    next: Option<String>,
     resume: Option<(u32, u32)>,
     unrepresentable: u64,
     unreadable: u64,
@@ -436,7 +430,9 @@ where
             self.next = None;
             self.resume = None;
         }
-        let reason = if self.reason == WorkspaceScanStop::End && self.depth_capped {
+        let reason = if self.reason == WorkspaceScanStop::End && self.budget.rules_exhausted {
+            WorkspaceScanStop::Rules
+        } else if self.reason == WorkspaceScanStop::End && self.depth_capped {
             WorkspaceScanStop::Depth
         } else {
             self.reason
@@ -465,7 +461,7 @@ where
         Ok(())
     }
 
-    fn stop(&mut self, reason: WorkspaceScanStop, next: Option<u64>) {
+    fn stop(&mut self, reason: WorkspaceScanStop, next: Option<String>) {
         // A timeout outranks whichever bound noticed it and never continues: the
         // caller is asked to refine the request instead of resuming it.
         if self.budget.time_expired() {
@@ -476,7 +472,10 @@ where
         }
         if self.reason == WorkspaceScanStop::End {
             self.reason = reason;
-            self.next = next;
+            self.next = next.filter(|path| {
+                self.resume.is_some()
+                    || (!path.is_empty() && self.start_path.as_deref() != Some(Path::new(path)))
+            });
         }
     }
 
@@ -516,9 +515,7 @@ where
         Ok(())
     }
 
-    /// Loads this directory's own rule files, returning whether a rule set was
-    /// pushed. It stops the traversal instead of applying partial rules when
-    /// the rule budget is exhausted.
+    /// Loads complete rule files within the remaining budget.
     fn load_directory_rules(&mut self, dir: &Path, relative: &Path) -> Result<bool, AgentError> {
         let dot_ignore = self.load_rules_file(&dir.join(IGNORE_FILES[0]), dir)?;
         if self.stopped() {
@@ -558,12 +555,19 @@ where
         base: &Path,
     ) -> Result<Option<Gitignore>, AgentError> {
         self.check()?;
-        if self.stopped() {
+        if self.stopped() || self.budget.rules_exhausted {
             return Ok(None);
         }
         let metadata = match std_fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
             Err(_) => {
                 self.unreadable += 1;
                 return Ok(None);
@@ -592,7 +596,8 @@ where
             return Ok(None);
         }
         if !self.budget.claim_rule_file() {
-            self.stop(WorkspaceScanStop::Rules, None);
+            self.budget.rules_exhausted = true;
+            self.unreadable += 1;
             return Ok(None);
         }
         let Some(text) = self.read_bounded(&path)? else {
@@ -643,9 +648,10 @@ where
             let charged = u64::try_from(read).unwrap_or(u64::MAX);
             let read_cap = usize::try_from(MAX_RULE_FILE_BYTES).unwrap_or(usize::MAX);
             if !self.budget.charge_rule_bytes(charged) || bytes.len() + read > read_cap {
-                // Applying part of a rule file would silently change what the
-                // scan sees, so the traversal stops and says so instead.
-                self.stop(WorkspaceScanStop::Rules, None);
+                // Never apply a partial rule file; continue the walk without
+                // loading further rules and report incomplete coverage.
+                self.budget.rules_exhausted = true;
+                self.unreadable += 1;
                 return Ok(None);
             }
             bytes.extend_from_slice(&chunk[..read]);
@@ -765,7 +771,7 @@ where
         if self.stopped() {
             return Ok(());
         }
-        let mut entries = match std_fs::read_dir(dir) {
+        let entries = match std_fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(_) => {
                 self.unreadable += 1;
@@ -775,58 +781,56 @@ where
                 return Ok(());
             }
         };
-        while !self.stopped() {
+        // Keep only this page's earliest names plus lookahead and the cursor
+        // ancestor. A huge directory must not require an unbounded allocation.
+        let capacity = self.limits.entries.saturating_sub(self.budget.entries) as usize + 2;
+        let mut sorted = std::collections::BTreeMap::new();
+        for entry in entries {
+            self.check()?;
+            if self.stopped() {
+                return Ok(());
+            }
+            match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    let child = relative.join(&name);
+                    if self
+                        .start_path
+                        .as_ref()
+                        .is_some_and(|start| child < *start && !start.starts_with(&child))
+                    {
+                        continue;
+                    }
+                    sorted.insert(name, entry);
+                    if sorted.len() > capacity {
+                        sorted.pop_last();
+                    }
+                }
+                Err(_) => self.unreadable += 1,
+            }
+        }
+        for entry in sorted.into_values() {
             self.check()?;
             if self.stopped() {
                 break;
             }
-            let Some(item) = entries.next() else {
-                break;
-            };
-            if !self.budget.claim_entry() {
-                self.stop(WorkspaceScanStop::Entries, None);
-                break;
-            }
-            let ordinal = self.local;
-            self.local += 1;
-            // A resumed request replays every raw entry before its cursor,
-            // including ignored ones, without asking the visitor and without
-            // emitting results, but it still descends into directories so the
-            // ordinals inside a subtree line up with the first page.
-            let positioning = ordinal < self.start_entry;
-            let entry = match item {
-                Ok(entry) => entry,
-                Err(_) => {
-                    self.unreadable += 1;
-                    continue;
-                }
-            };
-            let next = self.examine(relative, display, depth, &entry, positioning)?;
-            if positioning {
+            let child = relative.join(entry.file_name());
+            let positioning = self.start_path.as_ref().is_some_and(|start| {
+                child < *start || (child == *start && !self.options.resume_file)
+            });
+            if positioning
+                && !self
+                    .start_path
+                    .as_ref()
+                    .is_some_and(|start| start.starts_with(&child))
+            {
                 continue;
             }
-            if let Some(visit) = next {
-                match visit {
-                    Visit::Next => {}
-                    Visit::Stop(reason) => {
-                        self.stop(reason, Some(ordinal + 1));
-                        break;
-                    }
-                    Visit::StopBefore(reason) => {
-                        self.stop(reason, Some(ordinal));
-                        break;
-                    }
-                    Visit::StopInside {
-                        reason,
-                        line,
-                        offset,
-                    } => {
-                        self.resume = Some((line, offset));
-                        self.stop(reason, Some(ordinal));
-                        break;
-                    }
-                }
+            if !positioning && !self.budget.claim_entry() {
+                self.stop(WorkspaceScanStop::Entries, Some(self.last.clone()));
+                break;
             }
+            self.examine(relative, display, depth, &entry, positioning)?;
         }
         Ok(())
     }
@@ -840,7 +844,7 @@ where
         depth: usize,
         entry: &std_fs::DirEntry,
         positioning: bool,
-    ) -> Result<Option<Visit>, AgentError> {
+    ) -> Result<(), AgentError> {
         let name = entry.file_name();
         let absolute = entry.path();
         let mut child_relative = relative.to_path_buf();
@@ -851,33 +855,31 @@ where
                 Ok(metadata) => metadata.file_type(),
                 Err(_) => {
                     self.unreadable += 1;
-                    return Ok(None);
+                    if !positioning && name.to_str().is_some() {
+                        self.last = display_path(&child_relative);
+                    }
+                    return Ok(());
                 }
             },
         };
         let is_dir = file_type.is_dir();
         if self.excluded(&child_relative, &name, is_dir) {
-            return Ok(None);
+            if !positioning && name.to_str().is_some() {
+                self.last = display_path(&child_relative);
+            }
+            return Ok(());
         }
         let Some(part) = name.to_str() else {
             self.unrepresentable += 1;
-            return Ok(None);
+            return Ok(());
         };
         let mut child_display = display.to_owned();
         if !child_display.is_empty() {
             child_display.push('/');
         }
         child_display.push_str(part);
-        let kind = if is_dir {
-            WorkspaceFileKind::Directory
-        } else if file_type.is_file() {
-            WorkspaceFileKind::File
-        } else if file_type.is_symlink() {
-            WorkspaceFileKind::Symlink
-        } else {
-            WorkspaceFileKind::Other
-        };
-        let size = if self.options.want_size && kind == WorkspaceFileKind::File {
+        let kind = entry_kind(file_type);
+        let size = if !positioning && self.options.want_size && kind == WorkspaceFileKind::File {
             std_fs::symlink_metadata(&absolute)
                 .ok()
                 .filter(|metadata| metadata.is_file())
@@ -891,15 +893,11 @@ where
             kind,
             size,
         };
-        let stop = if positioning {
-            None
-        } else {
-            match (self.visit)(&view, self.budget)? {
-                Visit::Next => None,
-                stopped => Some(stopped),
-            }
-        };
-        if is_dir && self.options.recursive && stop.is_none() {
+        if !positioning {
+            let visit = (self.visit)(&view, self.budget)?;
+            self.apply_visit(visit, &child_display);
+        }
+        if is_dir && self.options.recursive && !self.stopped() {
             if child_depth >= self.limits.depth {
                 self.depth_capped = true;
             } else {
@@ -912,18 +910,34 @@ where
                 )?;
             }
         }
-        Ok(stop)
+        Ok(())
+    }
+
+    fn apply_visit(&mut self, visit: Visit, path: &str) {
+        match visit {
+            Visit::Next => self.last = path.to_owned(),
+            Visit::Stop(reason) => self.stop(reason, Some(path.to_owned())),
+            Visit::StopBefore(reason) => self.stop(reason, Some(self.last.clone())),
+            Visit::StopInside {
+                reason,
+                line,
+                offset,
+            } => {
+                self.resume = Some((line, offset));
+                self.stop(reason, Some(path.to_owned()));
+            }
+        }
     }
 
     /// Visits a requested root that is a single file.
     fn visit_root_file(&mut self, absolute: &Path, relative: &Path) -> Result<(), AgentError> {
-        if !self.budget.claim_entry() {
-            self.stop(WorkspaceScanStop::Entries, None);
+        if self.start_path.as_ref().is_some_and(|start| {
+            relative < start.as_path() || (relative == start && !self.options.resume_file)
+        }) {
             return Ok(());
         }
-        let ordinal = self.local;
-        self.local += 1;
-        if ordinal < self.start_entry {
+        if !self.budget.claim_entry() {
+            self.stop(WorkspaceScanStop::Entries, None);
             return Ok(());
         }
         if self.excluded_root(relative, false) {
@@ -937,13 +951,7 @@ where
                 return Ok(());
             }
         };
-        let kind = if metadata.is_file() {
-            WorkspaceFileKind::File
-        } else if metadata.file_type().is_symlink() {
-            WorkspaceFileKind::Symlink
-        } else {
-            WorkspaceFileKind::Other
-        };
+        let kind = entry_kind(metadata.file_type());
         let view = WalkEntry {
             relative: display_path(relative),
             kind,
@@ -953,31 +961,29 @@ where
                 None
             },
         };
-        match (self.visit)(&view, self.budget)? {
-            Visit::Next => {}
-            Visit::Stop(reason) => self.stop(reason, Some(ordinal + 1)),
-            Visit::StopBefore(reason) => self.stop(reason, Some(ordinal)),
-            Visit::StopInside {
-                reason,
-                line,
-                offset,
-            } => {
-                self.resume = Some((line, offset));
-                self.stop(reason, Some(ordinal));
-            }
-        }
+        let visit = (self.visit)(&view, self.budget)?;
+        self.apply_visit(visit, &view.relative);
         Ok(())
+    }
+}
+
+fn entry_kind(file_type: std_fs::FileType) -> WorkspaceFileKind {
+    if file_type.is_dir() {
+        WorkspaceFileKind::Directory
+    } else if file_type.is_file() {
+        WorkspaceFileKind::File
+    } else if file_type.is_symlink() {
+        WorkspaceFileKind::Symlink
+    } else {
+        WorkspaceFileKind::Other
     }
 }
 
 /// Runs one scan on a retained blocking worker.
 ///
-/// The worker observes cancellation and the deadline at every examined entry
-/// and read chunk, so it exits on its own. When the awaiter observes
-/// cancellation or the deadline first it stops the worker and joins it before
-/// returning. A drop guard also stops the worker when the awaiting future is
-/// dropped by its caller, so a dropped query never leaves a worker walking a
-/// large tree.
+/// Cancellation is checked between filesystem operations. A cancelled awaiter
+/// gives the worker a short grace, then detaches with a warning if an operation
+/// is still stuck. Dropping the awaiter also signals cancellation.
 pub(crate) async fn run_scan<T, F>(
     workspace: Arc<Workspace>,
     session_cancellation: CancellationToken,
@@ -989,7 +995,7 @@ where
     F: FnOnce(&Workspace, &mut ScanBudget) -> Result<T, AgentError> + Send + 'static,
 {
     let deadline = Instant::now()
-        .checked_add(scan_deadline(workspace.root()))
+        .checked_add(workspace.scan_deadline)
         .unwrap_or_else(Instant::now);
     let stop = CancellationToken::new();
     let _guard = ScanGuard { stop: stop.clone() };
@@ -1000,11 +1006,12 @@ where
         let worker_shutdown = shutdown_cancellation.clone();
         tokio::task::spawn_blocking(move || {
             let mut budget = ScanBudget {
-                limits: scan_limits(workspace.root()),
+                limits: workspace.scan_limits,
                 entries: 0,
                 bytes: 0,
                 rule_files: 0,
                 rule_bytes: 0,
+                rules_exhausted: false,
                 stop: worker_stop,
                 session_cancellation: worker_session,
                 shutdown_cancellation: worker_shutdown,
@@ -1012,15 +1019,7 @@ where
                 expired: false,
             };
             #[cfg(test)]
-            let held = take_scan_hold(workspace.root());
-            // Installed before the gate, so the exit signal is dropped even when
-            // the worker returns before reaching the scan closure.
-            #[cfg(test)]
-            let _exit = ScanExit::install(held.as_ref());
-            #[cfg(test)]
-            if let Some(hold) = held.as_ref() {
-                hold.block(&budget);
-            }
+            let _exit = tests::hold_worker(workspace.root(), &budget);
             budget.check()?;
             scan(&workspace, &mut budget)
         })
@@ -1038,7 +1037,14 @@ where
         Some(result) => result,
         None => {
             stop.cancel();
-            let _ = handle.await;
+            if tokio::time::timeout(super::WORKSPACE_CANCEL_GRACE, &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "detaching cancelled workspace scan: worker did not stop within grace"
+                );
+            }
             return Err(AgentError::QueryLimit);
         }
     };
@@ -1059,8 +1065,6 @@ impl Drop for ScanGuard {
     }
 }
 
-/// Exact encoded size of one record, used to keep every page inside its
-/// `max_bytes` budget.
 /// Truncated SHA-256 fingerprint that binds a cursor to its session, method,
 /// and traversal parameters. It is a mismatch detector, not a secret.
 pub(crate) fn scope_digest(parts: &[&str]) -> String {
@@ -1089,7 +1093,6 @@ pub(crate) fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Largest character-boundary prefix of `text` that is at most `index` bytes.
 /// Joins a native relative path into the `/`-separated form used by results.
 pub(crate) fn display_path(relative: &Path) -> String {
     let mut display = String::new();
@@ -1150,200 +1153,11 @@ pub(crate) fn normalized_roots(paths: Option<&[String]>) -> Result<Vec<String>, 
 }
 
 #[cfg(test)]
-static SCAN_LIMITS_OVERRIDES: OnceLock<Mutex<Vec<(PathBuf, ScanLimits)>>> = OnceLock::new();
+pub(crate) static SCAN_HOLDS: crate::test_support::Registry<PathBuf, Arc<tests::ScanHold>> =
+    crate::test_support::Registry::new();
+#[cfg(test)]
+pub(crate) static SCAN_RESULT_EXPIRIES: crate::test_support::Registry<PathBuf> =
+    crate::test_support::Registry::new();
 
 #[cfg(test)]
-pub(crate) fn set_scan_limits(root: PathBuf, limits: ScanLimits) {
-    let overrides = SCAN_LIMITS_OVERRIDES.get_or_init(|| Mutex::new(Vec::new()));
-    let mut overrides = overrides.lock().unwrap();
-    match overrides.iter_mut().find(|(path, _)| *path == root) {
-        Some(entry) => entry.1 = limits,
-        None => overrides.push((root, limits)),
-    }
-}
-
-#[cfg(test)]
-fn scan_limits(root: &Path) -> ScanLimits {
-    if let Some(overrides) = SCAN_LIMITS_OVERRIDES.get() {
-        if let Some((_, limits)) = overrides
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(path, _)| path.as_path() == root)
-        {
-            return *limits;
-        }
-    }
-    ScanLimits::standard()
-}
-
-#[cfg(not(test))]
-fn scan_limits(_root: &Path) -> ScanLimits {
-    ScanLimits::standard()
-}
-
-#[cfg(test)]
-pub(crate) struct ScanHold {
-    started: AtomicBool,
-    exited: AtomicBool,
-    released: Mutex<bool>,
-    release: Condvar,
-}
-
-#[cfg(test)]
-impl ScanHold {
-    pub(crate) fn new() -> Self {
-        Self {
-            started: AtomicBool::new(false),
-            exited: AtomicBool::new(false),
-            released: Mutex::new(false),
-            release: Condvar::new(),
-        }
-    }
-
-    fn mark_exited(&self) {
-        self.exited.store(true, AtomicOrdering::SeqCst);
-    }
-
-    /// Whether the blocking worker left its scope, whether it ran the scan, was
-    /// cancelled, or panicked.
-    pub(crate) fn exited(&self) -> bool {
-        self.exited.load(AtomicOrdering::SeqCst)
-    }
-
-    /// Blocks the worker until the test releases it, exiting early when the
-    /// query is cancelled or the deadline passes.
-    pub(crate) fn block(&self, budget: &ScanBudget) {
-        self.started.store(true, AtomicOrdering::SeqCst);
-        let mut released = self.released.lock().unwrap();
-        while !*released && !budget.stopped() {
-            let (next, timeout) = self
-                .release
-                .wait_timeout(released, Duration::from_millis(20))
-                .unwrap();
-            released = next;
-            if timeout.timed_out() && budget.stopped() {
-                break;
-            }
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        while !self.started.load(AtomicOrdering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    pub(crate) fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_all();
-    }
-}
-
-/// Marks the gated worker as gone when its scope ends, for every early return,
-/// successful finish, and panic.
-#[cfg(test)]
-struct ScanExit(Arc<ScanHold>);
-
-#[cfg(test)]
-impl ScanExit {
-    fn install(hold: Option<&Arc<ScanHold>>) -> Option<Self> {
-        hold.map(|hold| Self(Arc::clone(hold)))
-    }
-}
-
-#[cfg(test)]
-impl Drop for ScanExit {
-    fn drop(&mut self) {
-        self.0.mark_exited();
-    }
-}
-
-#[cfg(test)]
-type ScanHolds = Mutex<Vec<(PathBuf, Arc<ScanHold>)>>;
-
-#[cfg(test)]
-type ScanDeadlines = Mutex<Vec<(PathBuf, Duration)>>;
-
-#[cfg(test)]
-static SCAN_DEADLINE_OVERRIDES: OnceLock<ScanDeadlines> = OnceLock::new();
-
-/// Makes every scan of `root` use `deadline` as its wall-clock budget.
-#[cfg(test)]
-pub(crate) fn set_scan_deadline(root: PathBuf, deadline: Duration) {
-    let overrides = SCAN_DEADLINE_OVERRIDES.get_or_init(|| Mutex::new(Vec::new()));
-    let mut overrides = overrides.lock().unwrap();
-    match overrides.iter_mut().find(|(path, _)| *path == root) {
-        Some(entry) => entry.1 = deadline,
-        None => overrides.push((root, deadline)),
-    }
-}
-
-#[cfg(test)]
-fn scan_deadline(root: &Path) -> Duration {
-    if let Some(overrides) = SCAN_DEADLINE_OVERRIDES.get() {
-        if let Some((_, deadline)) = overrides
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(path, _)| path.as_path() == root)
-        {
-            return *deadline;
-        }
-    }
-    WORKSPACE_SCAN_DEADLINE
-}
-
-#[cfg(not(test))]
-fn scan_deadline(_root: &Path) -> Duration {
-    WORKSPACE_SCAN_DEADLINE
-}
-
-#[cfg(test)]
-static SCAN_RESULT_EXPIRIES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-
-/// Makes the next scan of `root` observe the deadline as soon as it has
-/// committed its first result, so tests can place a timeout mid-scan without
-/// waiting for real time to pass.
-#[cfg(test)]
-pub(crate) fn expire_scan_after_result(root: PathBuf) {
-    SCAN_RESULT_EXPIRIES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(root);
-}
-
-#[cfg(test)]
-pub(crate) fn scan_expiry_after_result(root: &Path) -> bool {
-    SCAN_RESULT_EXPIRIES.get().is_some_and(|roots| {
-        roots
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|path| path.as_path() == root)
-    })
-}
-
-#[cfg(test)]
-static SCAN_HOLDS: OnceLock<ScanHolds> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn hold_next_scan(root: PathBuf, hold: Arc<ScanHold>) {
-    SCAN_HOLDS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((root, hold));
-}
-
-#[cfg(test)]
-fn take_scan_hold(root: &Path) -> Option<Arc<ScanHold>> {
-    let holds = SCAN_HOLDS.get()?;
-    let mut holds = holds.lock().unwrap();
-    let index = holds.iter().position(|(path, _)| path.as_path() == root)?;
-    Some(holds.remove(index).1)
-}
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::tool_data::{ToolData, ToolRef};
-use crate::tools::{ToolIoGate, block_next_io};
-use crate::workspace::{fail_next_before_rename, fail_next_directory_sync};
+use crate::tools::IO_GATES;
+use crate::workspace::{BEFORE_RENAME_FAILURES, DIRECTORY_SYNC_FAILURES};
 
 async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, ApplyPatchTool) {
     let base = std::env::temp_dir().join(format!(
@@ -859,7 +859,20 @@ async fn patch_source_and_result_limits_are_enforced_without_writing() {
         .unwrap();
     tokio::fs::create_dir(root.join("directory")).await.unwrap();
     let patch = "@@ -1 +1 @@\n-a\n+b\n";
-    for path in ["too-large", "binary", "nul", "directory", "missing"] {
+    for path in ["binary", "nul"] {
+        let before = tokio::fs::read(root.join(path)).await.unwrap();
+        assert_eq!(
+            execute(
+                &tool,
+                json!({"path": path, "patch": "@@ -1 +1 @@\n-text\n+new\n"})
+            )
+            .await
+            .unwrap(),
+            "Cannot edit binary or non-UTF-8 content as text."
+        );
+        assert_eq!(tokio::fs::read(root.join(path)).await.unwrap(), before);
+    }
+    for path in ["too-large", "directory", "missing"] {
         assert_eq!(
             tool.execute(
                 invocation(json!({"path": path, "patch": patch})),
@@ -988,8 +1001,8 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
     let patch = "@@ -1 +1 @@\n-old\n+new\n";
 
     let cancellation = CancellationToken::new();
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "cancelled"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm((TOOL_NAME, "cancelled".to_owned()), Arc::clone(&gate));
     let cancelled_tool = Arc::clone(&tool);
     let cancelled_context = context(
         cancellation.clone(),
@@ -1003,7 +1016,7 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     cancellation.cancel();
     assert_eq!(cancelled.await.unwrap(), Err(ToolError::Cancelled));
     assert_eq!(
@@ -1013,8 +1026,8 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
         "old\n"
     );
 
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "timed-out"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm((TOOL_NAME, "timed-out".to_owned()), Arc::clone(&gate));
     let deadline_tool = Arc::clone(&tool);
     let deadline = tokio::spawn(async move {
         deadline_tool
@@ -1027,7 +1040,7 @@ async fn cancellation_and_deadline_before_commit_do_not_modify_the_source() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     assert_eq!(deadline.await.unwrap(), Err(ToolError::TimedOut));
     assert_eq!(
         tokio::fs::read_to_string(root.join("timed-out"))
@@ -1047,7 +1060,7 @@ async fn atomic_failures_and_unknown_outcomes_never_report_success() {
     let resolved = workspace.resolve_for_write("value").await.unwrap();
     let patch = "@@ -1 +1 @@\n-old\n+new\n";
 
-    fail_next_before_rename(resolved.clone());
+    BEFORE_RENAME_FAILURES.arm(resolved.clone(), ());
     assert_eq!(
         tool.execute(
             invocation(json!({"path": "value", "patch": patch})),
@@ -1061,7 +1074,7 @@ async fn atomic_failures_and_unknown_outcomes_never_report_success() {
     );
     assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "old\n");
 
-    fail_next_directory_sync(resolved.parent().unwrap().to_path_buf());
+    DIRECTORY_SYNC_FAILURES.arm(resolved.parent().unwrap().to_path_buf(), ());
     assert_eq!(
         tool.execute(
             invocation(json!({"path": "value", "patch": patch})),
@@ -1075,4 +1088,13 @@ async fn atomic_failures_and_unknown_outcomes_never_report_success() {
     );
     assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "new\n");
     cleanup(&base).await;
+}
+
+#[cfg(test)]
+impl ApplyStats {
+    fn total_steps(&self) -> usize {
+        self.source_line_visits
+            .saturating_add(self.patch_content_visits)
+            .saturating_add(self.codex_match_visits)
+    }
 }

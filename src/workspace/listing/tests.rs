@@ -1,22 +1,89 @@
 use super::*;
-use crate::workspace::scan::{
-    ScanHold, ScanLimits, hold_next_scan, set_scan_deadline, set_scan_limits,
-};
+use crate::workspace::scan::tests::ScanHold;
+use crate::workspace::scan::{MAX_RESULT_BYTES, MIN_RESULT_BYTES};
+use crate::workspace::scan::{SCAN_HOLDS, ScanLimits};
+
+#[tokio::test]
+async fn ignored_only_pages_advance_without_replaying_the_same_entries() {
+    let mut fixture = fixture("ignored-pages").await;
+    write(&fixture, ".gitignore", b"*.skip\n").await;
+    for name in ["a.skip", "b.skip", "c.skip", "d.skip", "keep"] {
+        write(&fixture, name, b"").await;
+    }
+    Arc::make_mut(&mut fixture.workspace).scan_limits.entries = 2;
+    let mut req = request(&fixture);
+    req.query = Some("keep".into());
+    let (found, reason, complete) = collect_all(&fixture, req).await;
+    assert_eq!(found, ["keep"]);
+    assert_eq!(reason, WorkspaceScanStop::End);
+    assert!(complete);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unrepresentable_cursor_does_not_exceed_the_result_budget() {
+    let mut fixture = fixture("large-cursor").await;
+    let name = "\u{1b}".repeat(100);
+    write(&fixture, &format!("{name}/{name}/file"), b"").await;
+    Arc::make_mut(&mut fixture.workspace).scan_limits.entries = 2;
+    let mut req = request(&fixture);
+    req.query = Some("absent".into());
+    req.recursive = Some(true);
+    req.max_bytes = Some(MIN_RESULT_BYTES);
+    let result = list(&fixture, req).await;
+    assert!(serde_json::to_vec(&result).unwrap().len() <= MIN_RESULT_BYTES);
+    assert!(result.next_cursor.is_none());
+    assert!(!result.scan_complete);
+    assert_eq!(result.stopped_by, WorkspaceScanStop::Entries);
+}
+
+#[tokio::test]
+async fn worktree_metadata_is_absent_and_pages_are_stable_under_insertions() {
+    let fixture = fixture("path-cursor").await;
+    write(&fixture, ".git", b"gitdir: /outside/metadata").await;
+    write(&fixture, "b/nested", b"").await;
+    write(&fixture, "d", b"").await;
+    let mut req = request(&fixture);
+    req.recursive = Some(true);
+    req.limit = Some(1);
+    let first = list(&fixture, req.clone()).await;
+    assert_eq!(paths(&first), ["b"]);
+    assert_eq!(first.skipped_count, 0);
+    req.cursor = first.next_cursor;
+    write(&fixture, "a", b"").await;
+    write(&fixture, "c", b"").await;
+    let (rest, reason, complete) = collect_all(&fixture, req).await;
+    assert_eq!(rest, ["b/nested", "c", "d"]);
+    assert_eq!(reason, WorkspaceScanStop::End);
+    assert!(complete);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn intermediate_alias_uses_resolved_ignore_path() {
+    let fixture = fixture("resolved-ignore").await;
+    write(&fixture, "real/sub/file", b"").await;
+    std::os::unix::fs::symlink("real", fixture.workspace.root().join("alias")).unwrap();
+    let mut req = request(&fixture);
+    req.directory = Some("alias/sub".into());
+    assert_eq!(paths(&list(&fixture, req.clone()).await), ["real/sub/file"]);
+    write(&fixture, ".gitignore", b"real/\n").await;
+    assert!(list(&fixture, req).await.entries.is_empty());
+}
 
 struct Fixture {
+    _dir: crate::test_support::TempDir,
     session: SessionId,
     workspace: Arc<Workspace>,
 }
 
 async fn fixture(label: &str) -> Fixture {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-workspace-files-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    let root = base.join("root");
+    let dir = crate::test_support::TempDir::new(label);
+    let root = dir.path().join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root).await.unwrap());
     Fixture {
+        _dir: dir,
         session: SessionId::new().unwrap(),
         workspace,
     }
@@ -264,12 +331,9 @@ async fn symlinks_are_listed_but_never_followed_or_escaped() {
 
 #[tokio::test]
 async fn an_expired_budget_returns_no_entries_and_no_cursor() {
-    let fixture = fixture("deadline-empty").await;
+    let mut fixture = fixture("deadline-empty").await;
     write(&fixture, "one.txt", b"x").await;
-    set_scan_deadline(
-        fixture.workspace.root().to_path_buf(),
-        std::time::Duration::ZERO,
-    );
+    Arc::make_mut(&mut fixture.workspace).scan_deadline = std::time::Duration::ZERO;
 
     let result = list(&fixture, request(&fixture)).await;
     assert!(result.entries.is_empty());
@@ -377,20 +441,17 @@ async fn one_entry_pages_replay_directories_and_ignored_entries() {
 
 #[tokio::test]
 async fn entry_and_depth_ceilings_are_reported_not_hidden() {
-    let ceilings = fixture("ceilings").await;
+    let mut ceilings = fixture("ceilings").await;
     for index in 0..8 {
         write(&ceilings, &format!("file-{index}.txt"), b"x").await;
     }
-    set_scan_limits(
-        ceilings.workspace.root().to_path_buf(),
-        ScanLimits {
-            entries: 3,
-            bytes: 1 << 20,
-            depth: 64,
-            rule_files: 8,
-            rule_bytes: 1 << 20,
-        },
-    );
+    Arc::make_mut(&mut ceilings.workspace).scan_limits = ScanLimits {
+        entries: 3,
+        bytes: 1 << 20,
+        depth: 64,
+        rule_files: 8,
+        rule_bytes: 1 << 20,
+    };
     let mut recursive = request(&ceilings);
     recursive.recursive = Some(true);
     let first = list(&ceilings, recursive.clone()).await;
@@ -398,25 +459,20 @@ async fn entry_and_depth_ceilings_are_reported_not_hidden() {
     assert_eq!(first.entries.len(), 3);
     assert!(first.truncated);
     assert!(!first.scan_complete);
-    // A resumed request would spend its whole budget reaching the same
-    // ceiling, so the stop is explicit and has no continuation.
-    assert!(first.next_cursor.is_none());
+    assert!(first.next_cursor.is_some());
     let (collected, _, complete) = collect_all(&ceilings, recursive).await;
-    assert_eq!(collected.len(), 3);
-    assert!(!complete);
+    assert_eq!(collected.len(), 8);
+    assert!(complete);
 
-    let deep = fixture("depth").await;
+    let mut deep = fixture("depth").await;
     write(&deep, "a/b/c/d/e.txt", b"deep").await;
-    set_scan_limits(
-        deep.workspace.root().to_path_buf(),
-        ScanLimits {
-            entries: 1000,
-            bytes: 1 << 20,
-            depth: 2,
-            rule_files: 8,
-            rule_bytes: 1 << 20,
-        },
-    );
+    Arc::make_mut(&mut deep.workspace).scan_limits = ScanLimits {
+        entries: 1000,
+        bytes: 1 << 20,
+        depth: 2,
+        rule_files: 8,
+        rule_bytes: 1 << 20,
+    };
     let mut recursive = request(&deep);
     recursive.recursive = Some(true);
     let result = list(&deep, recursive).await;
@@ -505,7 +561,7 @@ async fn result_budget_and_validation_are_enforced() {
     ));
     let mut cursor = request(&fixture);
     cursor.cursor = Some(WorkspaceListCursor {
-        entry: 0,
+        path: String::new(),
         scope: "not-a-scope".to_owned(),
     });
     assert!(matches!(
@@ -578,7 +634,7 @@ async fn a_held_scan_finishes_after_release() {
     let fixture = fixture("hold").await;
     write(&fixture, "a.txt", b"a").await;
     let hold = Arc::new(ScanHold::new());
-    hold_next_scan(fixture.workspace.root().to_path_buf(), Arc::clone(&hold));
+    SCAN_HOLDS.arm(fixture.workspace.root().to_path_buf(), Arc::clone(&hold));
     let pending = tokio::spawn({
         let workspace = Arc::clone(&fixture.workspace);
         let request = request(&fixture);

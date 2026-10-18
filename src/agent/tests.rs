@@ -1640,7 +1640,7 @@ async fn i1_create_open_and_turns_leave_branch_unknown_until_explicit_status() {
 #[cfg(unix)]
 #[tokio::test]
 async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
-    use crate::workspace::status::set_status_program;
+    use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
     use tokio_util::sync::CancellationToken;
 
@@ -1707,7 +1707,10 @@ async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    STATUS_PROGRAMS.arm(
+        std::fs::canonicalize(&workspace).unwrap(),
+        script.into_os_string(),
+    );
     std::fs::write(&marker, b"fail\n").unwrap();
 
     let failed = agent
@@ -8978,8 +8981,71 @@ async fn openai_session_emergency_projection_survives_driver_retry_followups_and
 /// after its child was stopped and reaped.
 #[cfg(unix)]
 #[tokio::test]
+async fn session_close_detaches_a_stalled_status_worker_after_grace() {
+    use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
+    use std::os::unix::fs::PermissionsExt;
+    let (data_dir, _data_guard) = fixture_dir(&format!("status-stalled-{}", next_id()));
+    let (workspace, _workspace_guard) = workspace_file("status-stalled-ws", "note", b"text");
+    let model = FakeModel::new("main", []);
+    let mut agent = open_agent(
+        &data_dir,
+        BTreeMap::from([("main".to_owned(), model)]),
+        read_profile(),
+    )
+    .await;
+    let session_id = create_session(&mut agent, &workspace).await.session_id;
+    let pid_path = data_dir.join("pid");
+    let script = data_dir.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = std::fs::canonicalize(&workspace).unwrap();
+    STATUS_PROGRAMS.arm(root.clone(), script.into_os_string());
+    let gate = Arc::new(crate::test_support::Gate::new());
+    STATUS_REAP_GATES.arm(root, Arc::clone(&gate));
+    let session = agent.loaded_session(session_id).unwrap();
+    let query = session
+        .spawn_status_query(
+            session.workspace(),
+            crate::WorkspaceStatusRequest {
+                session_id,
+                max_bytes: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+    let pid = wait_for_started_child(&pid_path, 0).await;
+    let close = agent.close_session(session_id);
+    tokio::pin!(close);
+    assert!(futures_util::poll!(&mut close).is_pending());
+    gate.wait_started().await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut close).await;
+    let query_result = tokio::time::timeout(std::time::Duration::from_secs(2), query.wait()).await;
+    gate.release();
+    for _ in 0..200 {
+        if !process_is_listed(pid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(matches!(
+        query_result.expect("status waiter exceeded grace"),
+        Err(AgentError::QueryLimit)
+    ));
+    result.expect("status join exceeded grace").unwrap();
+    assert!(!process_is_listed(pid));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() {
-    use crate::workspace::status::{StatusReapGate, set_status_program, set_status_reap_gate};
+    use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
 
     let (data_dir, _data_guard) = fixture_dir(&format!("status-owner-{}", next_id()));
@@ -9020,7 +9086,10 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    STATUS_PROGRAMS.arm(
+        std::fs::canonicalize(&workspace).unwrap(),
+        script.into_os_string(),
+    );
 
     let session = agent.loaded_session(session_id).unwrap();
     let spawn = |session: &crate::sessions::Session| {
@@ -9061,8 +9130,8 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
     // alive: while the owner still waits for its child, the close cannot return,
     // and it returns only after that child was actually reaped. The reap gate
     // parks the owner so both facts are observed without sleeping.
-    let gate = StatusReapGate::new();
-    set_status_reap_gate(
+    let gate = Arc::new(crate::test_support::Gate::new());
+    STATUS_REAP_GATES.arm(
         std::fs::canonicalize(&workspace).unwrap(),
         Arc::clone(&gate),
     );
@@ -9077,7 +9146,7 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
     let mut close = std::pin::pin!(close);
     // The first poll cancels the Session's queries, including this worker.
     assert!(futures_util::poll!(&mut close).is_pending());
-    gate.entered().await;
+    gate.wait_started().await;
     assert!(
         process_is_listed(second_pid),
         "the child was reaped before its owner was released"
@@ -9099,7 +9168,7 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
 #[cfg(unix)]
 #[tokio::test]
 async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
-    use crate::workspace::status::{StatusReapGate, set_status_program, set_status_reap_gate};
+    use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
 
     let (data_dir, _data_guard) = fixture_dir(&format!("status-prepare-{}", next_id()));
@@ -9129,7 +9198,10 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    STATUS_PROGRAMS.arm(
+        std::fs::canonicalize(&workspace).unwrap(),
+        script.into_os_string(),
+    );
 
     let session = agent.loaded_session(session_id).unwrap();
     // Registration is synchronous: the worker exists before the future is ever
@@ -9152,8 +9224,8 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
 
     // The gate parks the worker at its child reap point, so the close is proven
     // to wait for that worker rather than skipping it.
-    let gate = StatusReapGate::new();
-    set_status_reap_gate(
+    let gate = Arc::new(crate::test_support::Gate::new());
+    STATUS_REAP_GATES.arm(
         std::fs::canonicalize(&workspace).unwrap(),
         Arc::clone(&gate),
     );
@@ -9161,7 +9233,7 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     let close = agent.close_session(session_id);
     let mut close = std::pin::pin!(close);
     assert!(futures_util::poll!(&mut close).is_pending());
-    gate.entered().await;
+    gate.wait_started().await;
     assert!(
         process_is_listed(pid),
         "the child was reaped before its owner was released"
@@ -9184,7 +9256,7 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
 #[cfg(unix)]
 #[tokio::test]
 async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close() {
-    use crate::workspace::status::{StatusReapGate, set_status_program, set_status_reap_gate};
+    use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
 
     let (data_dir, _data_guard) = fixture_dir(&format!("diff-prepare-{}", next_id()));
@@ -9241,7 +9313,10 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    STATUS_PROGRAMS.arm(
+        std::fs::canonicalize(&workspace).unwrap(),
+        script.into_os_string(),
+    );
 
     let session = agent.loaded_session(session_id).unwrap();
     let prepared = crate::queries::prepare_changes_diff(
@@ -9266,8 +9341,8 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
     );
     assert_eq!(session.active_status_workers(), 1);
 
-    let gate = StatusReapGate::new();
-    set_status_reap_gate(
+    let gate = Arc::new(crate::test_support::Gate::new());
+    STATUS_REAP_GATES.arm(
         std::fs::canonicalize(&workspace).unwrap(),
         Arc::clone(&gate),
     );
@@ -9275,7 +9350,7 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
     let close = agent.close_session(session_id);
     let mut close = std::pin::pin!(close);
     assert!(futures_util::poll!(&mut close).is_pending());
-    gate.entered().await;
+    gate.wait_started().await;
     gate.release();
     close.await.unwrap();
     assert_eq!(session.active_status_workers(), 0);
@@ -9789,7 +9864,7 @@ async fn s1_hallucinated_subagent_is_an_unavailable_tool_not_a_dispatch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
-    use crate::workspace::status::set_status_program;
+    use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
     let (data_dir, _data_guard) = fixture_dir(&format!("i1-stub-{}", next_id()));
@@ -9808,7 +9883,10 @@ async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
     let mut permissions = std::fs::metadata(&script).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
-    set_status_program(std::fs::canonicalize(&workspace).unwrap(), script);
+    STATUS_PROGRAMS.arm(
+        std::fs::canonicalize(&workspace).unwrap(),
+        script.into_os_string(),
+    );
 
     let model = FakeModel::new(
         "main",

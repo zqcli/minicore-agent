@@ -1,25 +1,71 @@
 use super::*;
-use crate::workspace::scan::{
-    ScanLimits, expire_scan_after_result, set_scan_deadline, set_scan_limits,
-};
+use crate::workspace::scan::MIN_RESULT_BYTES;
+use crate::workspace::scan::{SCAN_RESULT_EXPIRIES, ScanLimits};
 
 /// One collected match: path, line number, and absolute line byte ranges.
 type MatchedLine = (String, u32, Vec<(u64, u64)>);
 
+#[tokio::test]
+async fn partial_file_cursor_never_applies_to_a_different_file() {
+    let fixture = fixture("cursor-file").await;
+    write(&fixture, "b", b"hit\nhit\n");
+    write(&fixture, "d", b"hit\n");
+    let mut req = request(&fixture, "hit");
+    req.max_matches = Some(1);
+    let first = run(&fixture, req.clone()).await;
+    assert_eq!(first.matches[0].path, "b");
+    req.cursor = first.next_cursor;
+    assert!(req.cursor.as_ref().unwrap().line > 0);
+    std::fs::remove_file(fixture.workspace.root().join("b")).unwrap();
+    write(&fixture, "a", b"hit\n");
+    let second = run(&fixture, req).await;
+    assert_eq!(second.matches[0].path, "d");
+    assert_eq!(second.matches[0].line_number, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resolved_root_aliases_cannot_duplicate_matches() {
+    let fixture = fixture("root-aliases").await;
+    write(&fixture, "real/sub/file", b"needle\n");
+    std::os::unix::fs::symlink("real", fixture.workspace.root().join("alias")).unwrap();
+    let mut req = request(&fixture, "needle");
+    req.paths = Some(vec!["alias/sub".into(), "real/sub".into()]);
+    assert!(matches!(
+        search(
+            Arc::clone(&fixture.workspace),
+            req,
+            CancellationToken::new(),
+            CancellationToken::new()
+        )
+        .await,
+        Err(AgentError::InvalidArguments)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_links_are_unsupported_not_failed_reads() {
+    let fixture = fixture("dangling").await;
+    std::os::unix::fs::symlink("missing", fixture.workspace.root().join("link")).unwrap();
+    let result = run(&fixture, request(&fixture, "hit")).await;
+    assert_eq!(result.skipped_files, 1);
+    assert!(result.scan_complete);
+}
+
 struct Fixture {
+    _dir: crate::test_support::TempDir,
     session: SessionId,
     workspace: Arc<Workspace>,
 }
 
 async fn fixture(label: &str) -> Fixture {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-workspace-search-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    let root = base.join("root");
+    let dir = crate::test_support::TempDir::new(label);
+    let root = dir.path().join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root).await.unwrap());
     Fixture {
+        _dir: dir,
         session: SessionId::new().unwrap(),
         workspace,
     }
@@ -66,6 +112,42 @@ fn absolute_ranges(record: &WorkspaceSearchMatch) -> Vec<(u64, u64)> {
             )
         })
         .collect()
+}
+
+#[tokio::test]
+async fn rule_exhaustion_does_not_skip_later_search_roots() {
+    let mut fixture = fixture("rules-multiple-roots").await;
+    write(&fixture, ".ignore", b"");
+    write(&fixture, "a/.ignore", b"ignored\n");
+    write(&fixture, "a/file", b"needle\n");
+    write(&fixture, "b/file", b"needle\n");
+    Arc::make_mut(&mut fixture.workspace).scan_limits.rule_files = 1;
+    let mut req = request(&fixture, "needle");
+    req.paths = Some(vec!["a".into(), "b".into()]);
+    let result = run(&fixture, req).await;
+    assert_eq!(
+        result
+            .matches
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a/file", "b/file"]
+    );
+    assert_eq!(result.stopped_by, WorkspaceScanStop::Rules);
+    assert!(!result.scan_complete);
+    assert!(result.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn binary_probe_does_not_charge_the_unread_remainder() {
+    let mut fixture = fixture("binary-probe").await;
+    write(&fixture, "a.bin", vec![0; 300_000]);
+    write(&fixture, "z.txt", b"needle\n");
+    Arc::make_mut(&mut fixture.workspace).scan_limits.bytes = 70_000;
+    let result = run(&fixture, request(&fixture, "needle")).await;
+    assert!(result.scan_complete);
+    assert_eq!(result.skipped_files, 1);
+    assert_eq!(result.matches[0].path, "z.txt");
 }
 
 #[tokio::test]
@@ -345,7 +427,7 @@ async fn a_deadline_after_a_match_keeps_it_without_a_cursor() {
     write(&fixture, "two.txt", b"hit again\n");
     // The timeout lands as soon as the first match has been committed: the
     // second file is never searched.
-    expire_scan_after_result(fixture.workspace.root().to_path_buf());
+    SCAN_RESULT_EXPIRIES.arm(fixture.workspace.root().to_path_buf(), ());
 
     let result = run(&fixture, request(&fixture, "hit")).await;
     assert_eq!(result.matches.len(), 1);
@@ -358,12 +440,9 @@ async fn a_deadline_after_a_match_keeps_it_without_a_cursor() {
 
 #[tokio::test]
 async fn an_expired_budget_returns_an_empty_partial_instead_of_an_end() {
-    let fixture = fixture("deadline-empty").await;
+    let mut fixture = fixture("deadline-empty").await;
     write(&fixture, "one.txt", b"hit\n");
-    set_scan_deadline(
-        fixture.workspace.root().to_path_buf(),
-        std::time::Duration::ZERO,
-    );
+    Arc::make_mut(&mut fixture.workspace).scan_deadline = std::time::Duration::ZERO;
 
     let result = run(&fixture, request(&fixture, "hit")).await;
     assert!(result.matches.is_empty());
@@ -520,20 +599,45 @@ async fn explicit_roots_cannot_bypass_the_rules() {
 }
 
 #[tokio::test]
+async fn an_exhausted_page_continues_at_the_next_explicit_root() {
+    for entry_limit in [true, false] {
+        let mut fixture = fixture("root-boundary").await;
+        write(&fixture, "a", b"hit\n");
+        write(&fixture, "b", b"hit\n");
+        if entry_limit {
+            Arc::make_mut(&mut fixture.workspace).scan_limits.entries = 1;
+        } else {
+            Arc::make_mut(&mut fixture.workspace).scan_limits.bytes = 4;
+        }
+        let mut req = request(&fixture, "hit");
+        req.paths = Some(vec!["a".into(), "b".into()]);
+        let first = run(&fixture, req.clone()).await;
+        assert_eq!(first.matches.len(), 1);
+        assert_eq!(first.matches[0].path, "a");
+        let cursor = first.next_cursor.unwrap();
+        assert_eq!(cursor.path_index, 1);
+        assert_eq!(cursor.path, "");
+        req.cursor = Some(cursor);
+        let second = run(&fixture, req).await;
+        assert_eq!(second.matches.len(), 1);
+        assert_eq!(second.matches[0].path, "b");
+        assert!(second.scan_complete);
+    }
+}
+
+#[tokio::test]
 async fn scan_ceiling_reports_zero_matches_and_continues() {
-    let fixture = fixture("ceiling").await;
-    write(&fixture, "a.txt", b"hit one\n");
-    write(&fixture, "b.txt", b"hit two\n");
-    set_scan_limits(
-        fixture.workspace.root().to_path_buf(),
-        ScanLimits {
-            entries: 100,
-            bytes: 6,
-            depth: 64,
-            rule_files: 8,
-            rule_bytes: 1 << 20,
-        },
-    );
+    let mut fixture = fixture("ceiling").await;
+    write(&fixture, "a.txt", b"no\n");
+    write(&fixture, "b.txt", b"hit one\n");
+    write(&fixture, "c.txt", b"hit two\n");
+    Arc::make_mut(&mut fixture.workspace).scan_limits = ScanLimits {
+        entries: 100,
+        bytes: 10,
+        depth: 64,
+        rule_files: 8,
+        rule_bytes: 1 << 20,
+    };
     let mut request = request(&fixture, "hit");
     let first = run(&fixture, request.clone()).await;
     assert!(first.matches.is_empty());
@@ -541,17 +645,15 @@ async fn scan_ceiling_reports_zero_matches_and_continues() {
     assert!(first.truncated);
     assert_eq!(first.stopped_by, WorkspaceScanStop::Bytes);
     let cursor = first.next_cursor.clone().expect("the scan continues");
+    assert_eq!(cursor.path, "a.txt");
 
-    set_scan_limits(
-        fixture.workspace.root().to_path_buf(),
-        ScanLimits {
-            entries: 100,
-            bytes: 1 << 20,
-            depth: 64,
-            rule_files: 8,
-            rule_bytes: 1 << 20,
-        },
-    );
+    Arc::make_mut(&mut fixture.workspace).scan_limits = ScanLimits {
+        entries: 100,
+        bytes: 1 << 20,
+        depth: 64,
+        rule_files: 8,
+        rule_bytes: 1 << 20,
+    };
     request.cursor = Some(cursor);
     let second = run(&fixture, request).await;
     assert_eq!(second.matches.len(), 2);

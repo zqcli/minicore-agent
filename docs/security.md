@@ -10,7 +10,16 @@ The `bash` Tool can run commands with the operating-system authority of the
 Agent process, including access to files, network resources, and inherited
 permissions. `approval = "ask"` and `read_only` control Tool policy, not OS
 capabilities. Use a container, VM, restricted account, or another OS boundary
-when the model or command is not trusted.
+when the model or command is not trusted. On Unix the Tool runs `/bin/bash -c`
+when available, otherwise `/bin/sh -c`, never a login shell. It inherits the
+Agent environment, except configured credential variables are removed and
+`MINICORE_AGENT=1` is set. Profiles are not re-sourced by a login shell. Windows
+continues to use PowerShell with `-NoProfile`.
+
+Unix cancellation sends SIGTERM to the process group, allows a 500 ms grace,
+then sends SIGKILL and reaps it. Model-visible output keeps head and tail with an
+omitted-bytes marker; stdout and stderr share one output budget. Use an init
+process (for example container `--init`) to reap orphaned descendants in containers.
 
 The stdio RPC transport has no network authentication layer. Keep the process
 and its pipes local to the intended client. Presentation responses/events are a
@@ -24,7 +33,10 @@ those frames to a less-trusted service without applying an additional policy.
 Absolute paths, parent traversal, NUL, invalid file types, and escape symlinks
 are rejected; symlinks that resolve inside the root may be read under the
 cooperative model. Atomic writes recheck parents and targets and report an
-explicit unknown outcome if a post-rename directory sync fails.
+explicit unknown outcome if a post-rename directory sync fails. Replacing an
+existing file preserves its permission bits, including private and executable
+modes; ownership and extended attributes are not preserved. These checks apply
+to `write`, `edit`, and `apply_patch`.
 
 These checks are not a defense against an adversarial process running as the
 same user. Such a process can race path components or replace files between

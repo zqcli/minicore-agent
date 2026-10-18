@@ -5,11 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use thiserror::Error;
@@ -23,60 +19,32 @@ pub(crate) mod search;
 pub(crate) mod status;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) const WORKSPACE_CANCEL_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 #[cfg(test)]
-static BEFORE_RENAME_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+pub(crate) static BEFORE_RENAME_FAILURES: crate::test_support::Registry<PathBuf> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-static DIRECTORY_SYNC_FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+pub(crate) static DIRECTORY_SYNC_FAILURES: crate::test_support::Registry<PathBuf> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-static TEMP_ID_OVERRIDES: OnceLock<Mutex<Vec<(PathBuf, u64)>>> = OnceLock::new();
+static TEMP_ID_OVERRIDES: crate::test_support::Registry<PathBuf, u64> =
+    crate::test_support::Registry::new();
 #[cfg(test)]
-static BEFORE_RENAME_GATES: OnceLock<Mutex<Vec<Arc<BeforeRenameGate>>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct BeforeRenameGate {
-    target: PathBuf,
-    started: AtomicBool,
-    released: Mutex<bool>,
-    release: Condvar,
-}
-
-#[cfg(test)]
-impl BeforeRenameGate {
-    pub(crate) fn new(target: PathBuf) -> Self {
-        Self {
-            target,
-            started: AtomicBool::new(false),
-            released: Mutex::new(false),
-            release: Condvar::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        while !self.started.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    pub(crate) fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_all();
-    }
-
-    fn block(&self) {
-        self.started.store(true, Ordering::Release);
-        let released = self.released.lock().unwrap();
-        drop(
-            self.release
-                .wait_while(released, |released| !*released)
-                .unwrap(),
-        );
-    }
-}
+pub(crate) static BEFORE_RENAME_GATES: crate::test_support::Registry<
+    PathBuf,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+#[cfg(all(test, unix))]
+pub(crate) static SWAP_OPEN_TO_FIFO: crate::test_support::Registry<PathBuf> =
+    crate::test_support::Registry::new();
 
 #[derive(Clone)]
 pub struct Workspace {
     root: Arc<PathBuf>,
+    scan_limits: scan::ScanLimits,
+    scan_deadline: std::time::Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -186,6 +154,8 @@ impl Workspace {
         }
         Ok(Self {
             root: Arc::new(root),
+            scan_limits: scan::ScanLimits::standard(),
+            scan_deadline: scan::WORKSPACE_SCAN_DEADLINE,
         })
     }
 
@@ -197,9 +167,7 @@ impl Workspace {
         let relative = normalize_relative(path, false)?;
         let resolved = self.canonicalize_inside(&self.root.join(relative)).await?;
         let metadata = fs::metadata(&resolved).await.map_err(map_io_error)?;
-        if !metadata.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        ensure_regular(&metadata)?;
         Ok(resolved)
     }
 
@@ -217,15 +185,11 @@ impl Workspace {
         if metadata.file_type().is_symlink() {
             return Err(WorkspaceError::Escape);
         }
-        if !metadata.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        ensure_regular(&metadata)?;
         #[cfg(all(test, unix))]
-        swap_open_target_with_fifo(&resolved);
+        tests::swap_open_target_with_fifo(&resolved);
         let file = open_read_only(&resolved).await?;
-        if !file.metadata().await.map_err(map_io_error)?.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        ensure_regular(&file.metadata().await.map_err(map_io_error)?)?;
         Ok(file)
     }
 
@@ -239,9 +203,7 @@ impl Workspace {
     ) -> Result<PathBuf, WorkspaceError> {
         let relative = normalize_relative(path, allow_empty)?;
         let resolved = std_fs::canonicalize(self.root.join(relative)).map_err(map_io_error)?;
-        if !resolved.starts_with(self.root.as_path()) {
-            return Err(WorkspaceError::Escape);
-        }
+        ensure_inside(&self.root, &resolved)?;
         Ok(resolved)
     }
 
@@ -250,9 +212,7 @@ impl Workspace {
     pub(crate) fn resolve_existing_sync(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
         let resolved = self.resolve_inside_sync(path, false)?;
         let metadata = std_fs::metadata(&resolved).map_err(map_io_error)?;
-        if !metadata.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        ensure_regular(&metadata)?;
         Ok(resolved)
     }
 
@@ -265,13 +225,9 @@ impl Workspace {
         if metadata.file_type().is_symlink() {
             return Err(WorkspaceError::Escape);
         }
-        if !metadata.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        ensure_regular(&metadata)?;
         let file = open_read_only_sync(&resolved)?;
-        if !file.metadata().map_err(map_io_error)?.is_file() {
-            return Err(WorkspaceError::NotFile);
-        }
+        ensure_regular(&file.metadata().map_err(map_io_error)?)?;
         Ok(file)
     }
 
@@ -302,19 +258,6 @@ impl Workspace {
         validate_relative_path(path)
     }
 
-    pub(crate) async fn read_bytes(
-        &self,
-        path: &str,
-        max_bytes: usize,
-    ) -> Result<Vec<u8>, WorkspaceError> {
-        let mut prefix = self.read_prefix(path, max_bytes).await?;
-        if prefix.has_more {
-            return Err(WorkspaceError::TooLarge);
-        }
-        prefix.bytes.truncate(prefix.visible_len);
-        Ok(prefix.bytes)
-    }
-
     pub(crate) async fn read_prefix(
         &self,
         path: &str,
@@ -336,40 +279,17 @@ impl Workspace {
         })
     }
 
-    pub(crate) async fn read_text(
-        &self,
-        path: &str,
-        max_bytes: usize,
-    ) -> Result<String, WorkspaceError> {
-        let bytes = self.read_bytes(path, max_bytes).await?;
-        if bytes.contains(&0) {
-            return Err(WorkspaceError::Binary);
-        }
-        String::from_utf8(bytes).map_err(|_| WorkspaceError::Binary)
-    }
-
-    /// Reads one bounded regular file once and returns the bytes together with
-    /// the metadata observed around that read. A changed stamp is evidence of
-    /// a live concurrent writer, not a reason to reject the normal operation.
-    pub(crate) async fn read_file_snapshot(
-        &self,
-        path: &str,
-        max_bytes: usize,
-    ) -> Result<FileSnapshot, WorkspaceError> {
-        match self.capture_file(path, max_bytes).await {
-            FileCapture::Complete(snapshot) => Ok(snapshot),
-            FileCapture::Missing => Err(WorkspaceError::NotFound),
-            FileCapture::TooLarge(_) => Err(WorkspaceError::TooLarge),
-            FileCapture::Error(error) => Err(error),
-        }
-    }
-
     pub(crate) async fn read_text_snapshot(
         &self,
         path: &str,
         max_bytes: usize,
     ) -> Result<(String, FileStamp, bool), WorkspaceError> {
-        let snapshot = self.read_file_snapshot(path, max_bytes).await?;
+        let snapshot = match self.capture_file(path, max_bytes).await {
+            FileCapture::Complete(snapshot) => snapshot,
+            FileCapture::Missing => return Err(WorkspaceError::NotFound),
+            FileCapture::TooLarge(_) => return Err(WorkspaceError::TooLarge),
+            FileCapture::Error(error) => return Err(error),
+        };
         if snapshot.bytes.contains(&0) {
             return Err(WorkspaceError::Binary);
         }
@@ -415,18 +335,6 @@ impl Workspace {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn write_atomic(
-        &self,
-        path: &str,
-        bytes: &[u8],
-    ) -> Result<(), WorkspaceError> {
-        self.write_atomic_observed(path, bytes, None).await.outcome
-    }
-
-    /// The same mutation as `write_atomic`, with bounded facts from the
-    /// synchronous commit path. The returned observation is consumed by the
-    /// native file tools before their controlled future yields again.
     pub(crate) async fn write_atomic_observed(
         &self,
         path: &str,
@@ -450,9 +358,7 @@ impl Workspace {
 
     async fn canonicalize_inside(&self, path: &Path) -> Result<PathBuf, WorkspaceError> {
         let resolved = fs::canonicalize(path).await.map_err(map_io_error)?;
-        if !resolved.starts_with(self.root.as_path()) {
-            return Err(WorkspaceError::Escape);
-        }
+        ensure_inside(&self.root, &resolved)?;
         Ok(resolved)
     }
 
@@ -522,16 +428,7 @@ pub(crate) fn normalize_relative(path: &str, allow_empty: bool) -> Result<PathBu
 }
 
 async fn validate_write_target(target: &Path) -> Result<(), WorkspaceError> {
-    match fs::symlink_metadata(target).await {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(WorkspaceError::InvalidPath),
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(WorkspaceError::NotFile),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
-            Err(WorkspaceError::NotDirectory)
-        }
-        Err(_) => Err(WorkspaceError::Unavailable),
-    }
+    classify_write_target(fs::symlink_metadata(target).await).map(|_| ())
 }
 
 fn commit_write(
@@ -546,28 +443,7 @@ fn commit_write(
         Err(error) => return failed_observation(error),
     };
     let target = parent.join(file_name);
-    if let Err(error) = validate_write_target_sync(&target) {
-        return failed_observation(error);
-    }
-    let before = file_state_sync(&target);
-    let initial_expected_matches = expected_matches_state(expected, &before);
-    let (outcome, renamed, after, gate_expected_matches, gate_unknown) =
-        atomic_write(&target, bytes, expected);
-    let expected_matches = if gate_unknown {
-        None
-    } else if gate_expected_matches.is_some() {
-        gate_expected_matches
-    } else {
-        initial_expected_matches
-    };
-    AtomicWriteObservation {
-        outcome,
-        before,
-        after,
-        renamed,
-        expected_matches,
-        expected_unknown: gate_unknown,
-    }
+    atomic_write(&target, bytes, expected)
 }
 
 fn ensure_parent_directory(root: &Path, parent: &Path) -> Result<PathBuf, WorkspaceError> {
@@ -616,18 +492,18 @@ fn ensure_parent_directory(root: &Path, parent: &Path) -> Result<PathBuf, Worksp
 
 fn canonicalize_inside_sync(root: &Path, path: &Path) -> Result<PathBuf, WorkspaceError> {
     let resolved = std_fs::canonicalize(path).map_err(map_io_error)?;
-    if !resolved.starts_with(root) {
-        return Err(WorkspaceError::Escape);
-    }
+    ensure_inside(root, &resolved)?;
     Ok(resolved)
 }
 
-fn validate_write_target_sync(target: &Path) -> Result<(), WorkspaceError> {
-    match std_fs::symlink_metadata(target) {
+fn classify_write_target(
+    metadata: io::Result<std_fs::Metadata>,
+) -> Result<Option<std_fs::Metadata>, WorkspaceError> {
+    match metadata {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(WorkspaceError::InvalidPath),
-        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
         Ok(_) => Err(WorkspaceError::NotFile),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
             Err(WorkspaceError::NotDirectory)
         }
@@ -651,87 +527,71 @@ fn atomic_write(
     target: &Path,
     bytes: &[u8],
     expected: Option<ExpectedFileState>,
-) -> (
-    Result<(), WorkspaceError>,
-    bool,
-    FileState,
-    Option<bool>,
-    bool,
-) {
-    let Some(parent) = target.parent() else {
-        return (
-            Err(WorkspaceError::InvalidPath),
-            false,
-            FileState::Unknown,
-            None,
-            false,
-        );
+) -> AtomicWriteObservation {
+    let metadata = match classify_write_target(std_fs::symlink_metadata(target)) {
+        Ok(metadata) => metadata,
+        Err(error) => return failed_observation(error),
+    };
+    let before = metadata.as_ref().map_or(FileState::Missing, |metadata| {
+        FileState::Present(FileStamp::from_metadata(metadata))
+    });
+    let mut observation = AtomicWriteObservation {
+        before,
+        expected_matches: expected_matches_state(expected, &before),
+        ..failed_observation(WorkspaceError::Unavailable)
     };
     let (temp_path, mut file) = match create_unique_temp(target) {
         Ok(value) => value,
-        Err(error) => return (Err(error), false, FileState::Unknown, None, false),
+        Err(error) => {
+            observation.outcome = Err(error);
+            return observation;
+        }
     };
-    if file.write_all(bytes).is_err() || file.flush().is_err() || file.sync_all().is_err() {
+    observation.outcome = (|| {
+        // Copy permissions before writing so private files never have a more
+        // permissive temporary copy. Ownership and extended attributes are not copied.
+        if let Some(metadata) = &metadata {
+            file.set_permissions(metadata.permissions())
+                .map_err(|_| WorkspaceError::Unavailable)?;
+        }
+        file.write_all(bytes)
+            .map_err(|_| WorkspaceError::Unavailable)?;
+        file.flush().map_err(|_| WorkspaceError::Unavailable)?;
+        // Writing may clear set-ID bits, so restore the complete mode before syncing.
+        if let Some(metadata) = &metadata {
+            file.set_permissions(metadata.permissions())
+                .map_err(|_| WorkspaceError::Unavailable)?;
+        }
+        file.sync_all().map_err(|_| WorkspaceError::Unavailable)?;
         drop(file);
-        let _ = std_fs::remove_file(&temp_path);
-        return (
-            Err(WorkspaceError::Unavailable),
-            false,
-            FileState::Unknown,
-            None,
-            false,
-        );
+        #[cfg(test)]
+        if let Some(gate) = BEFORE_RENAME_GATES.take(&target.to_path_buf()) {
+            gate.pass_blocking();
+        }
+        let matches = expected_matches_state(expected, &file_state_sync(target));
+        observation.expected_unknown = expected.is_some() && matches.is_none();
+        if observation.expected_unknown || matches.is_some() {
+            observation.expected_matches = matches;
+        }
+        #[cfg(test)]
+        if BEFORE_RENAME_FAILURES.hit(&target.to_path_buf()) {
+            return Err(WorkspaceError::Unavailable);
+        }
+        classify_write_target(std_fs::symlink_metadata(target))?;
+        std_fs::rename(&temp_path, target).map_err(|_| WorkspaceError::Unavailable)?;
+        observation.renamed = true;
+        observation.after = file_state_sync(target);
+        sync_directory(
+            target
+                .parent()
+                .expect("write targets have a resolved parent"),
+        )
+        .map_err(|_| WorkspaceError::UnknownOutcome)
+    })();
+    if !observation.renamed {
+        let _ = std_fs::remove_file(temp_path);
     }
-    drop(file);
-    #[cfg(test)]
-    if let Some(gate) = take_before_rename_gate(target) {
-        gate.block();
-    }
-    let after_gate = file_state_sync(target);
-    let gate_expected_matches = expected_matches_state(expected, &after_gate);
-    let gate_unknown = expected.is_some() && gate_expected_matches.is_none();
-    #[cfg(test)]
-    if should_fail_before_rename(target) {
-        let _ = std_fs::remove_file(&temp_path);
-        return (
-            Err(WorkspaceError::Unavailable),
-            false,
-            FileState::Unknown,
-            gate_expected_matches,
-            gate_unknown,
-        );
-    }
-    if let Err(error) = validate_write_target_sync(target) {
-        let _ = std_fs::remove_file(&temp_path);
-        return (
-            Err(error),
-            false,
-            FileState::Unknown,
-            gate_expected_matches,
-            gate_unknown,
-        );
-    }
-    if std_fs::rename(&temp_path, target).is_err() {
-        let _ = std_fs::remove_file(&temp_path);
-        return (
-            Err(WorkspaceError::Unavailable),
-            false,
-            FileState::Unknown,
-            gate_expected_matches,
-            gate_unknown,
-        );
-    }
-    let after = file_state_sync(target);
-    if sync_directory(parent).is_err() {
-        return (
-            Err(WorkspaceError::UnknownOutcome),
-            true,
-            after,
-            gate_expected_matches,
-            gate_unknown,
-        );
-    }
-    (Ok(()), true, after, gate_expected_matches, gate_unknown)
+    observation
 }
 
 fn failed_observation(error: WorkspaceError) -> AtomicWriteObservation {
@@ -805,24 +665,15 @@ fn temp_basename(id: u64) -> String {
 
 fn next_temp_id(_target: &Path) -> u64 {
     #[cfg(test)]
-    {
-        let mut overrides = TEMP_ID_OVERRIDES
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .unwrap();
-        if let Some(position) = overrides
-            .iter()
-            .position(|(candidate, _)| candidate == _target)
-        {
-            return overrides.remove(position).1;
-        }
+    if let Some(id) = TEMP_ID_OVERRIDES.take(&_target.to_path_buf()) {
+        return id;
     }
     NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(test)]
-    if should_fail_directory_sync(path) {
+    if DIRECTORY_SYNC_FAILURES.hit(&path.to_path_buf()) {
         return Err(io::Error::other(
             "injected workspace directory sync failure",
         ));
@@ -866,20 +717,39 @@ pub(crate) fn validate_relative_path(path: &str) -> Result<(), WorkspaceError> {
 /// file cannot block the caller, and `O_NOFOLLOW` so a symlink swapped in after
 /// the path checks fails the open instead of escaping the workspace.
 async fn open_read_only(path: &Path) -> Result<File, WorkspaceError> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    options.open(path).await.map_err(map_open_error)
+    tokio::fs::OpenOptions::from(read_options())
+        .open(path)
+        .await
+        .map_err(map_open_error)
 }
 
 /// Synchronous twin of `open_read_only` for blocking scan workers.
 pub(crate) fn open_read_only_sync(path: &Path) -> Result<StdFile, WorkspaceError> {
-    let mut options = std_fs::OpenOptions::new();
+    read_options().open(path).map_err(map_open_error)
+}
+
+fn read_options() -> StdOpenOptions {
+    let mut options = StdOpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    options.open(path).map_err(map_open_error)
+    options
+}
+
+fn ensure_inside(root: &Path, path: &Path) -> Result<(), WorkspaceError> {
+    if path.starts_with(root) {
+        Ok(())
+    } else {
+        Err(WorkspaceError::Escape)
+    }
+}
+
+fn ensure_regular(metadata: &std_fs::Metadata) -> Result<(), WorkspaceError> {
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(WorkspaceError::NotFile)
+    }
 }
 
 fn map_open_error(error: io::Error) -> WorkspaceError {
@@ -893,108 +763,5 @@ fn map_open_error(error: io::Error) -> WorkspaceError {
     map_read_error(error, WorkspaceError::NotFile)
 }
 
-#[cfg(all(test, unix))]
-static SWAP_OPEN_TO_FIFO: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-
-/// Test seam: the next regular-file open of `target` replaces the file with a
-/// FIFO after the metadata check, so the non-blocking open itself is exercised.
-#[cfg(all(test, unix))]
-pub(crate) fn swap_next_open_with_fifo(target: PathBuf) {
-    SWAP_OPEN_TO_FIFO
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(target);
-}
-
-#[cfg(all(test, unix))]
-fn swap_open_target_with_fifo(target: &Path) {
-    let mut pending = SWAP_OPEN_TO_FIFO
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    let Some(position) = pending.iter().position(|candidate| candidate == target) else {
-        return;
-    };
-    pending.remove(position);
-    drop(pending);
-    let _ = std_fs::remove_file(target);
-    let _ = std::process::Command::new("mkfifo").arg(target).status();
-}
-
 #[cfg(test)]
-pub(crate) fn fail_next_before_rename(target: PathBuf) {
-    BEFORE_RENAME_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(target);
-}
-
-#[cfg(test)]
-fn should_fail_before_rename(target: &Path) -> bool {
-    let mut failures = BEFORE_RENAME_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    failures
-        .iter()
-        .position(|candidate| candidate == target)
-        .map(|position| failures.remove(position))
-        .is_some()
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_directory_sync(path: PathBuf) {
-    DIRECTORY_SYNC_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(path);
-}
-
-#[cfg(test)]
-fn should_fail_directory_sync(path: &Path) -> bool {
-    let mut failures = DIRECTORY_SYNC_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    failures
-        .iter()
-        .position(|candidate| candidate == path)
-        .map(|position| failures.remove(position))
-        .is_some()
-}
-
-#[cfg(test)]
-fn override_temp_ids(target: PathBuf, ids: impl IntoIterator<Item = u64>) {
-    TEMP_ID_OVERRIDES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .extend(ids.into_iter().map(|id| (target.clone(), id)));
-}
-
-#[cfg(test)]
-pub(crate) fn block_before_rename(gate: Arc<BeforeRenameGate>) {
-    BEFORE_RENAME_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push(gate);
-}
-
-#[cfg(test)]
-fn take_before_rename_gate(target: &Path) -> Option<Arc<BeforeRenameGate>> {
-    let mut gates = BEFORE_RENAME_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|gate| gate.target == target)
-        .map(|position| gates.remove(position))
-}
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod tests;

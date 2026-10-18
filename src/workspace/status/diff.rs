@@ -14,7 +14,11 @@ pub(crate) async fn diff_sources(
 ) -> Result<DiffSources, AgentError> {
     let (head, entry) =
         crate::changes::parse_workspace_ref(&request.change_ref, request.session_id)?;
-    let mut base = workspace_unavailable(request);
+    let mut sources = DiffSources {
+        base: workspace_unavailable(request),
+        bytes: None,
+    };
+    let base = &mut sources.base;
     base.path = entry.path.clone();
     base.kind = match entry.kind {
         WorkspaceStatusEntryKind::Untracked => ChangeKind::Added,
@@ -23,10 +27,10 @@ pub(crate) async fn diff_sources(
         WorkspaceStatusEntryKind::Ordinary => ChangeKind::Modified,
     };
     if entry.kind == WorkspaceStatusEntryKind::Unmerged {
-        return Ok(DiffSources { base, bytes: None });
+        return Ok(sources);
     }
     if entry.kind == WorkspaceStatusEntryKind::Renamed && entry.original_path.is_none() {
-        return Ok(DiffSources { base, bytes: None });
+        return Ok(sources);
     }
     let program = status_program(workspace.root());
     let env = status_env(workspace.root());
@@ -42,13 +46,13 @@ pub(crate) async fn diff_sources(
     };
     let probe = run_git(&run, &os_args(&["rev-parse", "--show-toplevel"])).await?;
     if !usable(&probe) {
-        return Ok(DiffSources { base, bytes: None });
+        return Ok(sources);
     }
-    let Some(toplevel) = repository_root(&probe.stdout) else {
-        return Ok(DiffSources { base, bytes: None });
+    let Some(toplevel) = repository_root(&probe.stdout).await else {
+        return Ok(sources);
     };
     let Ok(prefix) = workspace.root().strip_prefix(&toplevel) else {
-        return Ok(DiffSources { base, bytes: None });
+        return Ok(sources);
     };
     let path = prefix.join(&entry.path);
     run.root = &toplevel;
@@ -65,25 +69,22 @@ pub(crate) async fn diff_sources(
         },
     );
     let worktree = base.comparison != DiffComparison::HeadToIndex;
-    let index = index_blob(&run, &path).await?;
-    let (before, after) = if worktree {
-        let old = if base.comparison == DiffComparison::HeadToWorktree {
-            let old_path = prefix.join(entry.original_path.as_ref().unwrap_or(&entry.path));
-            if head.is_empty() {
-                Blob::Missing
-            } else {
-                head_blob(&run, &head, &old_path).await?
-            }
-        } else {
-            index
-        };
-        let (before, version) = load_side(&run, old).await?;
-        base.base_version = version;
+    let old = if base.comparison == DiffComparison::IndexToWorktree {
+        index_blob(&run, &path).await?
+    } else if head.is_empty() {
+        Blob::Missing
+    } else {
+        let old_path = prefix.join(entry.original_path.as_ref().unwrap_or(&entry.path));
+        head_blob(&run, &head, &old_path).await?
+    };
+    let (before, version) = load_side(&run, old).await?;
+    base.base_version = version;
+    let after = if worktree {
         if matches!(entry.kind, WorkspaceStatusEntryKind::Untracked)
             && before.as_ref().is_some_and(|v| !v.is_empty())
         {
             base.stale = true;
-            return Ok(DiffSources { base, bytes: None });
+            return Ok(sources);
         }
         let capture = tokio::select! {
             biased;
@@ -100,7 +101,7 @@ pub(crate) async fn diff_sources(
                 }
             } => capture,
         };
-        let after = match capture {
+        match capture {
             FileCapture::Missing => {
                 base.target_version = ChangeRevision::Missing;
                 Some(Vec::new())
@@ -110,20 +111,12 @@ pub(crate) async fn diff_sources(
                 Some(snapshot.bytes)
             }
             _ => None,
-        };
-        (before, after)
+        }
     } else {
-        let old_path = prefix.join(entry.original_path.as_ref().unwrap_or(&entry.path));
-        let old = if head.is_empty() {
-            Blob::Missing
-        } else {
-            head_blob(&run, &head, &old_path).await?
-        };
-        let (before, before_version) = load_side(&run, old).await?;
+        let index = index_blob(&run, &path).await?;
         let (after, after_version) = load_side(&run, index).await?;
-        base.base_version = before_version;
         base.target_version = after_version;
-        (before, after)
+        after
     };
     let bytes = before
         .zip(after)
@@ -140,7 +133,8 @@ pub(crate) async fn diff_sources(
             };
         }
     }
-    Ok(DiffSources { base, bytes })
+    sources.bytes = bytes;
+    Ok(sources)
 }
 
 fn usable(output: &GitOutput) -> bool {

@@ -11,10 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::tool_data::{ToolData, ToolRef};
-use crate::tools::{ToolIoGate, block_next_io};
-use crate::workspace::{
-    BeforeRenameGate, block_before_rename, fail_next_before_rename, fail_next_directory_sync,
-};
+use crate::tools::IO_GATES;
+use crate::workspace::{BEFORE_RENAME_FAILURES, BEFORE_RENAME_GATES, DIRECTORY_SYNC_FAILURES};
 
 async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, WriteTool) {
     let base = std::env::temp_dir().join(format!(
@@ -247,7 +245,7 @@ async fn bound_write_preserves_not_committed_and_post_rename_unknown_states() {
 
     let first = bound_ref();
     data.note_requested(&first, TOOL_NAME);
-    fail_next_before_rename(target.clone());
+    BEFORE_RENAME_FAILURES.arm(target.clone(), ());
     assert_eq!(
         tool.execute_bound(
             invocation(json!({"path": "value.txt", "content": "not committed"})),
@@ -273,7 +271,7 @@ async fn bound_write_preserves_not_committed_and_post_rename_unknown_states() {
 
     let second = bound_ref();
     data.note_requested(&second, TOOL_NAME);
-    fail_next_directory_sync(target.parent().unwrap().to_path_buf());
+    DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
     assert_eq!(
         tool.execute_bound(
             invocation(json!({"path": "value.txt", "content": "unknown"})),
@@ -430,7 +428,7 @@ async fn workspace_atomic_failures_and_unknown_outcomes_are_failed_tools() {
     let root = base.join("root");
     tokio::fs::write(root.join("value"), b"old").await.unwrap();
     let target = workspace.resolve_for_write("value").await.unwrap();
-    fail_next_before_rename(target.clone());
+    BEFORE_RENAME_FAILURES.arm(target.clone(), ());
     assert_eq!(
         tool.execute(
             invocation(json!({"path": "value", "content": "before-rename"})),
@@ -444,7 +442,7 @@ async fn workspace_atomic_failures_and_unknown_outcomes_are_failed_tools() {
     );
     assert_eq!(tokio::fs::read(&target).await.unwrap(), b"old");
 
-    fail_next_directory_sync(target.parent().unwrap().to_path_buf());
+    DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
     assert_eq!(
         tool.execute(
             invocation(json!({"path": "value", "content": "complete-new"})),
@@ -467,8 +465,11 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
     let tool = Arc::new(tool);
 
     let cancellation = CancellationToken::new();
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "cancelled-parent/cancelled"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm(
+        (TOOL_NAME, "cancelled-parent/cancelled".to_owned()),
+        Arc::clone(&gate),
+    );
     let cancelled_tool = Arc::clone(&tool);
     let cancelled_context = context(
         cancellation.clone(),
@@ -482,7 +483,7 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     cancellation.cancel();
     assert_eq!(cancelled.await.unwrap(), Err(ToolError::Cancelled));
     assert!(
@@ -491,8 +492,11 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
             .is_err()
     );
 
-    let gate = Arc::new(ToolIoGate::new(TOOL_NAME, "deadline-parent/timed-out"));
-    block_next_io(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    IO_GATES.arm(
+        (TOOL_NAME, "deadline-parent/timed-out".to_owned()),
+        Arc::clone(&gate),
+    );
     let deadline_tool = Arc::clone(&tool);
     let deadline = tokio::spawn(async move {
         deadline_tool
@@ -505,7 +509,7 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
             )
             .await
     });
-    gate.started.acquire().await.unwrap().forget();
+    gate.wait_started().await;
     assert_eq!(deadline.await.unwrap(), Err(ToolError::TimedOut));
     assert!(
         tokio::fs::symlink_metadata(root.join("deadline-parent"))
@@ -530,8 +534,8 @@ async fn cancellation_during_commit_returns_the_real_commit_result() {
     let root = base.join("root");
     tokio::fs::write(root.join("value"), b"old").await.unwrap();
     let target = workspace.resolve_for_write("value").await.unwrap();
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
@@ -574,9 +578,9 @@ async fn deadline_during_commit_returns_post_rename_unknown_outcome() {
     let root = base.join("root");
     tokio::fs::write(root.join("value"), b"old").await.unwrap();
     let target = workspace.resolve_for_write("value").await.unwrap();
-    fail_next_directory_sync(target.parent().unwrap().to_path_buf());
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
     let deadline = Instant::now() + Duration::from_millis(1000);
     let task = tokio::spawn(async move {
         tool.execute(
@@ -617,9 +621,9 @@ async fn bound_write_deadline_keeps_the_mutation_and_records_it() {
     let root = base.join("root");
     tokio::fs::write(root.join("value"), b"old").await.unwrap();
     let target = workspace.resolve_for_write("value").await.unwrap();
-    fail_next_directory_sync(target.parent().unwrap().to_path_buf());
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    DIRECTORY_SYNC_FAILURES.arm(target.parent().unwrap().to_path_buf(), ());
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
     let data = Arc::new(ToolData::new());
     let tool_ref = bound_ref();
     data.note_requested(&tool_ref, TOOL_NAME);

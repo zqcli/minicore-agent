@@ -79,6 +79,24 @@ impl CommandStreamSink for RecordingSink {
     }
 }
 
+#[tokio::test]
+async fn model_capture_keeps_both_ends_and_counts_omitted_raw_bytes() {
+    let state = Arc::new(Mutex::new(StreamState::default()));
+    let mut reader = b"abcdefghijklmnopqrstuvwxyz".as_slice();
+    drain_stream(
+        &mut reader,
+        None,
+        None,
+        ToolDataStream::Stdout,
+        Arc::clone(&state),
+        16,
+    )
+    .await;
+    assert!(state.lock().unwrap().complete);
+    assert!(state.lock().unwrap().truncated);
+    assert_eq!(take_capture(&state), (b"abcdefghstuvwxyz".to_vec(), 10));
+}
+
 fn session() -> SessionId {
     let mut bytes = [0_u8; 16];
     bytes[15] = 7;
@@ -138,7 +156,7 @@ fn request(
         deadline: Instant::now() + Duration::from_millis(deadline_ms),
         cancellation: CancellationToken::new(),
         environment: CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),
-        prefix_limit: 4096,
+        capture_limit: 4096,
         streams: sink,
         capture: Capture::Inherited,
     }
@@ -263,6 +281,46 @@ async fn a_chunk_is_stored_before_it_is_observed_and_while_the_command_runs() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancellation_allows_term_handlers_to_finish() {
+    let dir = crate::test_support::TempDir::new("term-handler");
+    let owners = CommandOwners::new();
+    let request = request(
+        dir.path(),
+        "term-handler",
+        "trap 'printf cleaned > cleaned; exit 0' TERM; echo $$ > child.pid; while :; do sleep 1; done",
+        30_000,
+        None,
+    );
+    let cancel = request.cancellation.clone();
+    let mut worker = owners.start(request).unwrap();
+    read_pid(&dir.path().join("child.pid")).await;
+    cancel.cancel();
+    worker.completion().await;
+    owners.join_all().await;
+    assert_eq!(
+        tokio::fs::read(dir.path().join("cleaned")).await.unwrap(),
+        b"cleaned"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_is_not_a_login_shell() {
+    let command = shell_command("printf ready");
+    assert_eq!(
+        command.as_std().get_args().collect::<Vec<_>>(),
+        ["-c", "printf ready"]
+    );
+    let expected = if Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    assert_eq!(command.as_std().get_program(), expected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cancelling_records_cancelling_then_a_confirmed_group_end() {
     let owners = CommandOwners::new();
     let dir = fixture("cancel-owner");
@@ -323,7 +381,7 @@ async fn an_injected_reap_failure_never_claims_confirmed_termination() {
     let cancellation = request.cancellation.clone();
     let mut worker = owners.start(request).unwrap();
     let pid = read_pid(&dir.join("child.pid")).await;
-    inject_termination_failure(pid, TerminationFailure::Wait);
+    TERMINATION_FAILURES.arm((Some(pid), TerminationFailure::Wait), ());
     cancellation.cancel();
     let outcome = worker.completion().await;
     assert_eq!(outcome.result.status, CommandStatus::Cancelled);
@@ -959,4 +1017,47 @@ async fn unfinished_held_worker_occupies_registry_capacity() {
     let _ = release.send(());
     owners.join_all().await;
     assert_eq!(owners.active(), 0);
+}
+
+impl CommandOwners {
+    #[cfg(test)]
+    pub(crate) fn active(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .workers
+            .iter()
+            .filter(|worker| !worker.is_finished())
+            .count()
+    }
+    #[cfg(test)]
+    pub(crate) fn add_held_worker(
+        &self,
+        loop_id: LoopId,
+    ) -> (CancellationToken, tokio::sync::oneshot::Sender<()>) {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let tool_ref = crate::tool_data::ToolRef {
+            session_id: "ses_00000000000000000000000000000001".parse().unwrap(),
+            loop_id,
+            request_index: 0,
+            tool_call_id: ToolCallId::new(format!("held-{loop_id}")).unwrap(),
+        };
+        let handle = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+        let mut inner = self.inner.lock().unwrap();
+        inner.workers.push(Arc::new(OwnedWorker::new(
+            OwnerKey::Tool(tool_ref),
+            cancel.clone(),
+            handle,
+        )));
+        (cancel, release_tx)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TerminationFailure {
+    StartKill,
+    Wait,
 }

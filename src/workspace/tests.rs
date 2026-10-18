@@ -4,6 +4,27 @@ use super::*;
 
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(unix)]
+#[tokio::test]
+async fn atomic_replacement_preserves_private_and_executable_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let (base, workspace) = fixture("permissions").await;
+    let path = workspace.root().join("file");
+    for mode in [0o600, 0o755, 0o4755] {
+        fs::write(&path, b"before").await.unwrap();
+        fs::set_permissions(&path, std_fs::Permissions::from_mode(mode))
+            .await
+            .unwrap();
+        workspace.write_atomic("file", b"after").await.unwrap();
+        assert_eq!(
+            fs::metadata(&path).await.unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+        assert_eq!(fs::read(&path).await.unwrap(), b"after");
+    }
+    cleanup(&base).await;
+}
+
 async fn fixture(label: &str) -> (PathBuf, Workspace) {
     let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
     let base = std::env::temp_dir().join(format!(
@@ -40,7 +61,11 @@ async fn open_canonicalizes_root_and_resolves_relative_files_and_directories() {
             .unwrap()
     );
     assert_eq!(
-        workspace.read_text("nested/file.txt", 32).await.unwrap(),
+        workspace
+            .read_text_snapshot("nested/file.txt", 32)
+            .await
+            .unwrap()
+            .0,
         "hello"
     );
     assert_eq!(
@@ -147,9 +172,11 @@ async fn write_resolution_and_atomic_write_create_nested_parents() {
         .unwrap();
     assert_eq!(
         workspace
-            .read_bytes("nested/deep/new.txt", 32)
+            .read_text_snapshot("nested/deep/new.txt", 32)
             .await
-            .unwrap(),
+            .unwrap()
+            .0
+            .as_bytes(),
         b"created"
     );
     cleanup(&base).await;
@@ -166,7 +193,7 @@ async fn bounded_reads_reject_large_and_binary_text() {
     fs::write(root.join("binary"), [0xff, 0xfe]).await.unwrap();
 
     assert_eq!(
-        workspace.read_bytes("large.txt", 4).await,
+        workspace.read_text_snapshot("large.txt", 4).await,
         Err(WorkspaceError::TooLarge)
     );
     let prefix = workspace.read_prefix("lookahead.txt", 4).await.unwrap();
@@ -174,7 +201,7 @@ async fn bounded_reads_reject_large_and_binary_text() {
     assert!(prefix.has_more);
     assert_eq!(prefix.bytes, b"12345678");
     assert_eq!(
-        workspace.read_text("binary", 8).await,
+        workspace.read_text_snapshot("binary", 8).await,
         Err(WorkspaceError::Binary)
     );
     cleanup(&base).await;
@@ -193,11 +220,15 @@ async fn text_reads_reject_nul_but_allow_unicode_newlines_and_tabs() {
         .unwrap();
 
     assert_eq!(
-        workspace.read_text("nul.txt", 32).await,
+        workspace.read_text_snapshot("nul.txt", 32).await,
         Err(WorkspaceError::Binary)
     );
     assert_eq!(
-        workspace.read_text("unicode.txt", 64).await.unwrap(),
+        workspace
+            .read_text_snapshot("unicode.txt", 64)
+            .await
+            .unwrap()
+            .0,
         unicode
     );
     cleanup(&base).await;
@@ -218,7 +249,11 @@ async fn symlinks_inside_root_and_workspace_root_are_supported() {
     symlink(&root, &root_link).unwrap();
 
     assert_eq!(
-        workspace.read_text("file-link", 32).await.unwrap(),
+        workspace
+            .read_text_snapshot("file-link", 32)
+            .await
+            .unwrap()
+            .0,
         "inside"
     );
     assert_eq!(
@@ -303,7 +338,7 @@ async fn atomic_overwrite_has_no_partial_result_before_rename() {
     let root = base.join("root");
     fs::write(root.join("value.txt"), b"old").await.unwrap();
     let target = workspace.resolve_for_write("value.txt").await.unwrap();
-    fail_next_before_rename(target);
+    BEFORE_RENAME_FAILURES.arm(target, ());
 
     assert_eq!(
         workspace.write_atomic("value.txt", b"new").await,
@@ -330,7 +365,7 @@ async fn directory_sync_failure_after_rename_is_unknown_with_complete_target() {
     let (base, workspace) = fixture("atomic-unknown").await;
     let root = base.join("root");
     fs::write(root.join("value.txt"), b"old").await.unwrap();
-    fail_next_directory_sync(workspace.root.as_ref().clone());
+    DIRECTORY_SYNC_FAILURES.arm(workspace.root.as_ref().clone(), ());
 
     assert_eq!(
         workspace.write_atomic("value.txt", b"complete-new").await,
@@ -353,7 +388,10 @@ async fn atomic_write_supports_long_valid_target_basename() {
     let name = "a".repeat(245);
 
     workspace.write_atomic(&name, b"long-name").await.unwrap();
-    assert_eq!(workspace.read_bytes(&name, 32).await.unwrap(), b"long-name");
+    assert_eq!(
+        workspace.read_text_snapshot(&name, 32).await.unwrap().0,
+        "long-name"
+    );
     cleanup(&base).await;
 }
 
@@ -363,9 +401,11 @@ async fn temporary_path_skips_exact_target_alias_across_counter_wrap() {
     let root = base.join("root");
     let target_name = temp_basename(u64::MAX);
     let target = workspace.resolve_for_write(&target_name).await.unwrap();
-    override_temp_ids(target.clone(), [u64::MAX, 0]);
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    for id in [u64::MAX, 0] {
+        TEMP_ID_OVERRIDES.arm(target.clone(), id);
+    }
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
 
     let writer = workspace.clone();
     let path = target_name.clone();
@@ -389,9 +429,11 @@ async fn temporary_path_skips_ascii_case_insensitive_target_alias() {
     let root = base.join("root");
     let target_name = temp_basename(41).to_ascii_uppercase();
     let target = workspace.resolve_for_write(&target_name).await.unwrap();
-    override_temp_ids(target.clone(), [41, 42]);
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    for id in [41, 42] {
+        TEMP_ID_OVERRIDES.arm(target.clone(), id);
+    }
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
 
     let writer = workspace.clone();
     let path = target_name.clone();
@@ -423,9 +465,11 @@ async fn temporary_path_skips_real_symlink_after_target_alias() {
     fs::write(&outside, b"outside").await.unwrap();
     let symlink_candidate = root.join(temp_basename(52));
     symlink(&outside, &symlink_candidate).unwrap();
-    override_temp_ids(target.clone(), [51, 52, 53]);
-    let gate = Arc::new(BeforeRenameGate::new(target.clone()));
-    block_before_rename(Arc::clone(&gate));
+    for id in [51, 52, 53] {
+        TEMP_ID_OVERRIDES.arm(target.clone(), id);
+    }
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
 
     let writer = workspace.clone();
     let path = target_name.clone();
@@ -477,4 +521,28 @@ async fn unique_temp_name_does_not_follow_fixed_symlink() {
             .is_symlink()
     );
     cleanup(&base).await;
+}
+
+impl Workspace {
+    pub(crate) async fn write_atomic(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), WorkspaceError> {
+        self.write_atomic_observed(path, bytes, None).await.outcome
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn swap_open_target_with_fifo(target: &Path) {
+    if SWAP_OPEN_TO_FIFO.hit(&target.to_path_buf()) {
+        std_fs::remove_file(target).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(target)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 }

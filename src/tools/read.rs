@@ -9,6 +9,7 @@ use minicore_runtime::tools::{
 use minicore_runtime::value::MAX_TEXT_BYTES;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::text::floor_char_boundary;
 use crate::workspace::ReadPrefix;
@@ -16,7 +17,7 @@ use crate::{Workspace, WorkspaceError};
 
 use super::{
     DEFAULT_READ_LIMIT, DEFAULT_READ_OFFSET, MAX_DIRECTORY_ENTRIES, MAX_READ_BYTES, MAX_READ_LINES,
-    emit_phase, map_workspace_error, precheck_control, run_controlled, wait_for_test_io,
+    emit_phase, map_workspace_error, run_controlled,
 };
 
 const TOOL_NAME: &str = "read";
@@ -80,17 +81,15 @@ impl Tool for ReadTool {
 
     fn execute(&self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'_> {
         Box::pin(async move {
-            precheck_control(&context)?;
-            if invocation.tool_name() != self.spec.name() {
-                return Err(ToolError::InvalidInvocation);
-            }
-            let input: ReadInput = serde_json::from_value(invocation.arguments().clone())
-                .map_err(|_| ToolError::InvalidInvocation)?;
+            let input: ReadInput = super::decode_input(&self.spec, &invocation, &context)?;
             if input.offset == 0 || !(1..=MAX_READ_LINES).contains(&input.limit) {
                 return Err(ToolError::InvalidInvocation);
             }
             let output = run_controlled(&context, async {
-                wait_for_test_io(TOOL_NAME, &input.path).await;
+                #[cfg(test)]
+                if let Some(gate) = super::IO_GATES.take(&(TOOL_NAME, input.path.clone())) {
+                    gate.pass().await;
+                }
                 emit_phase(&context, "reading");
                 read_path(&self.workspace, &input).await
             })
@@ -121,7 +120,7 @@ async fn list_directory(directory: PathBuf) -> Result<String, ToolError> {
             .file_name()
             .into_string()
             .map_err(|_| ToolError::Failed)?;
-        let mut name = safe_entry_name(&name);
+        let mut name = super::escape_control_characters(&name);
         let file_type = entry.file_type().await.map_err(|_| ToolError::Failed)?;
         if file_type.is_dir() {
             name.push('/');
@@ -151,31 +150,46 @@ async fn list_directory(directory: PathBuf) -> Result<String, ToolError> {
     Ok(output)
 }
 
-fn safe_entry_name(name: &str) -> String {
-    let mut output = String::with_capacity(name.len());
-    for character in name.chars() {
-        if character.is_control() {
-            output.extend(character.escape_default());
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
-
 async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, ToolError> {
-    let prefix = workspace
-        .read_prefix(&input.path, MAX_READ_BYTES)
+    let file = workspace
+        .open_regular_file(&input.path)
         .await
         .map_err(map_workspace_error)?;
-    let byte_truncated = prefix.has_more;
-    let text = decode_text_prefix(prefix)?;
-    if text
-        .chars()
-        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
-    {
-        return Err(ToolError::Failed);
+    let mut reader = BufReader::new(file);
+    let mut skipped = 0;
+    while skipped < input.offset - 1 {
+        let chunk = reader.fill_buf().await.map_err(|_| ToolError::Failed)?;
+        if chunk.is_empty() {
+            return Ok(format!("[no lines at or after offset {}]", input.offset));
+        }
+        let mut consumed = chunk.len();
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte == b'\n' {
+                skipped += 1;
+                if skipped == input.offset - 1 {
+                    consumed = index + 1;
+                    break;
+                }
+            }
+        }
+        reader.consume(consumed);
     }
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_READ_BYTES + 4) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| ToolError::Failed)?;
+    let prefix = ReadPrefix {
+        visible_len: bytes.len().min(MAX_READ_BYTES),
+        has_more: bytes.len() > MAX_READ_BYTES,
+        bytes,
+    };
+    let byte_truncated = prefix.has_more;
+    let text = match decode_text_prefix(prefix) {
+        Ok(text) if !text.contains('\0') => text,
+        _ => return Ok("Cannot read binary or non-UTF-8 content as text.".to_owned()),
+    };
     if text.is_empty() {
         let mut output = "[empty file]".to_owned();
         if byte_truncated {
@@ -184,7 +198,7 @@ async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, T
         return Ok(output);
     }
 
-    let mut lines = text.lines().enumerate().skip(input.offset - 1);
+    let mut lines = text.split_terminator('\n').enumerate();
     let mut output = String::new();
     let mut selected = 0usize;
     let mut output_truncated = false;
@@ -193,7 +207,14 @@ async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, T
             break;
         };
         selected += 1;
-        let rendered = format!("{}: {line}", index + 1);
+        let mut rendered = format!("{}: ", index + input.offset);
+        for character in line.chars() {
+            if character.is_control() && character != '\t' {
+                rendered.extend(character.escape_default());
+            } else {
+                rendered.push(character);
+            }
+        }
         if !push_bounded_line(&mut output, &rendered) {
             output_truncated = true;
             break;
@@ -234,15 +255,10 @@ fn decode_text_prefix(prefix: ReadPrefix) -> Result<String, ToolError> {
         Err(_) => return Err(ToolError::Failed),
     };
 
-    for index in 0..visible_end {
-        if prefix.bytes[index] == b'\r' && prefix.bytes.get(index + 1) != Some(&b'\n') {
-            return Err(ToolError::Failed);
-        }
-    }
     let mut text = std::str::from_utf8(&prefix.bytes[..visible_end])
         .map_err(|_| ToolError::Failed)?
         .replace("\r\n", "\n");
-    if text.ends_with('\r') {
+    if text.ends_with('\r') && prefix.bytes.get(visible_end) == Some(&b'\n') {
         text.pop();
     }
     Ok(text)

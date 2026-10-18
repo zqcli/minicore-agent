@@ -1,24 +1,23 @@
+use super::tests::status;
 use super::*;
 use crate::changes::{ChangeRevision, workspace_records};
 use crate::diff::{ChangesDiffRequest, DiffComparison, workspace_diff};
 
 struct Fixture {
+    _dir: crate::test_support::TempDir,
     base: PathBuf,
     workspace: Workspace,
     session: SessionId,
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.base);
-    }
-}
 impl Fixture {
     async fn new() -> Self {
         let session = SessionId::new().unwrap();
-        let base = std::env::temp_dir().join(format!("minicore-review-{session}"));
+        let dir = crate::test_support::TempDir::new("workspace-diff");
+        let base = dir.path().to_path_buf();
         std::fs::create_dir_all(base.join("repo")).unwrap();
         let workspace = Workspace::open(base.join("repo")).await.unwrap();
         let fixture = Self {
+            _dir: dir,
             base,
             workspace,
             session,
@@ -257,7 +256,10 @@ async fn workspace_diff_cancellation_reaps_the_git_child() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    set_status_program(fixture.workspace.root().to_path_buf(), program);
+    STATUS_PROGRAMS.arm(
+        fixture.workspace.root().to_path_buf(),
+        program.into_os_string(),
+    );
     let cancellation = CancellationToken::new();
     let worker_cancel = cancellation.clone();
     let workspace = Workspace::open(fixture.workspace.root().to_path_buf())

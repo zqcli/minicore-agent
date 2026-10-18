@@ -23,8 +23,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::process::Stdio;
-#[cfg(all(test, unix))]
-use std::sync::OnceLock;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -265,9 +263,9 @@ pub(crate) struct CommandRequest {
     pub(crate) deadline: Instant,
     pub(crate) cancellation: CancellationToken,
     pub(crate) environment: CommandEnvironment,
-    /// Retained prefix per stream for the model-facing result. This is a
+    /// Retained head and tail per stream for the model-facing result. This is a
     /// separate, smaller budget than the streaming window.
-    pub(crate) prefix_limit: usize,
+    pub(crate) capture_limit: usize,
     pub(crate) streams: Option<Arc<dyn CommandStreamSink>>,
     /// Platform capture for this command; Windows command owners pass their
     /// named-pipe capture, everything else uses inherited pipes.
@@ -275,13 +273,15 @@ pub(crate) struct CommandRequest {
 }
 
 /// What one finished command leaves behind: the structured record plus the
-/// bounded model-facing prefix of each stream.
+/// bounded model-facing head and tail of each stream.
 pub(crate) struct CommandOutcome {
     pub(crate) result: CommandResult,
-    /// Retained model-facing prefix of each stream, kept separately from the
+    /// Retained model-facing head and tail of each stream, kept separately from the
     /// streaming window.
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_omitted: u64,
+    pub(crate) stderr_omitted: u64,
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_truncated: bool,
 }
@@ -308,6 +308,8 @@ impl CommandWorker {
                     result: terminal_record(CommandStatus::Failed, None, None, false, None, None),
                     stdout: Vec::new(),
                     stderr: Vec::new(),
+                    stdout_omitted: 0,
+                    stderr_omitted: 0,
                     stdout_truncated: false,
                     stderr_truncated: false,
                 });
@@ -445,14 +447,21 @@ impl CommandOwners {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        self.stop_and_join(workers).await;
+    }
+
+    async fn stop_and_join(&self, workers: Vec<Arc<OwnedWorker>>) {
         for worker in &workers {
             worker.cancel.cancel();
         }
         for worker in &workers {
             worker.join().await;
         }
-        let mut inner = self.inner.lock().unwrap();
-        inner.workers.retain(|worker| !worker.is_finished());
+        self.inner
+            .lock()
+            .unwrap()
+            .workers
+            .retain(|worker| !worker.is_finished());
     }
 
     /// Refuses new owners, requests every owner to stop, and waits for every
@@ -463,59 +472,18 @@ impl CommandOwners {
             inner.closing = true;
             inner.workers.clone()
         };
-        for worker in &workers {
-            worker.cancel.cancel();
-        }
-        for worker in &workers {
-            worker.join().await;
-        }
-        let mut inner = self.inner.lock().unwrap();
-        inner.workers.retain(|worker| !worker.is_finished());
-    }
-
-    /// Test-only evidence that no owner is still running.
-    #[cfg(test)]
-    pub(crate) fn active(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .workers
-            .iter()
-            .filter(|worker| !worker.is_finished())
-            .count()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn add_held_worker(
-        &self,
-        loop_id: LoopId,
-    ) -> (CancellationToken, tokio::sync::oneshot::Sender<()>) {
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let cancel = CancellationToken::new();
-        let tool_ref = crate::tool_data::ToolRef {
-            session_id: "ses_00000000000000000000000000000001".parse().unwrap(),
-            loop_id,
-            request_index: 0,
-            tool_call_id: ToolCallId::new(format!("held-{loop_id}")).unwrap(),
-        };
-        let handle = tokio::spawn(async move {
-            let _ = release_rx.await;
-        });
-        let mut inner = self.inner.lock().unwrap();
-        inner.workers.push(Arc::new(OwnedWorker::new(
-            OwnerKey::Tool(tool_ref),
-            cancel.clone(),
-            handle,
-        )));
-        (cancel, release_tx)
+        self.stop_and_join(workers).await;
     }
 }
 
-/// Per-stream accumulator for the model-facing prefix. It is deliberately
+/// Per-stream accumulator for the model-facing head and tail. It is deliberately
 /// small: the streaming window lives in the sink and both budgets are counted
 /// separately.
 #[derive(Default)]
 struct StreamState {
     prefix: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    bytes: u64,
     truncated: bool,
     complete: bool,
     /// The owner stopped observing before a real end of output.
@@ -561,7 +529,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
     let mut drains: Pin<Box<dyn Future<Output = ()> + Send + '_>> = {
         let tool_ref = request.tool_ref.clone();
         let sink = request.streams.clone();
-        let limit = request.prefix_limit;
+        let limit = request.capture_limit;
         let stdout_state = Arc::clone(&stdout_state);
         let stderr_state = Arc::clone(&stderr_state);
         Box::pin(async move {
@@ -627,7 +595,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
     let mut pipes_cut = false;
     if cancel_requested || deadline_expired {
         announce_stop(&request, cancel_requested);
-        stop_scope(&mut child, leader);
+        stop_scope(&mut child, leader).await;
         stopped_scope = true;
     } else if leader_status.is_none() {
         // The pipes closed first, but the leader still owns its exit: wait for
@@ -650,7 +618,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
                     cancel_requested = true;
                 }
                 announce_stop(&request, cancel_requested);
-                stop_scope(&mut child, leader);
+                stop_scope(&mut child, leader).await;
                 stopped_scope = true;
             }
         }
@@ -665,14 +633,14 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
         let remaining = remaining_until(request.deadline);
         let deadline_cut = remaining <= LEADER_DRAIN_GRACE;
         let grace = LEADER_DRAIN_GRACE.min(remaining);
-        if !drain_within(&mut drains, grace, cancel, &mut drains_done).await {
+        if !drain_within(&mut drains, grace, Some(cancel), &mut drains_done).await {
             if deadline_cut || Instant::now() >= request.deadline {
                 deadline_expired = true;
             } else if request.cancellation.is_cancelled() || cancel.is_cancelled() {
                 cancel_requested = true;
                 announce_stop(&request, true);
             }
-            stop_scope(&mut child, leader);
+            stop_scope(&mut child, leader).await;
             stopped_scope = true;
             pipes_cut = true;
         }
@@ -684,16 +652,16 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
         // final drain is still attempted: the stop token is normally already
         // cancelled here, and giving up on the buffers immediately would lose
         // bytes a stopped process already wrote.
-        pipes_cut |= !drain_final(&mut drains, STOPPED_DRAIN_GRACE, &mut drains_done).await;
+        pipes_cut |= !drain_within(&mut drains, STOPPED_DRAIN_GRACE, None, &mut drains_done).await;
     }
     // A leader can exit and leave group/job members behind even when they hold
     // no pipe (for example `sleep 60 >/dev/null &`). Those members must be gone
     // before the owner finishes; only a process that actively left the scope is
     // outside the promise.
     if leader_status.is_some() && !stopped_scope && !scope_gone(leader).await {
-        stop_scope(&mut child, leader);
+        stop_scope(&mut child, leader).await;
         stopped_scope = true;
-        pipes_cut |= !drain_final(&mut drains, STOPPED_DRAIN_GRACE, &mut drains_done).await;
+        pipes_cut |= !drain_within(&mut drains, STOPPED_DRAIN_GRACE, None, &mut drains_done).await;
     }
 
     // The one full reap; its future is never dropped mid-flight.
@@ -750,7 +718,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
     finish(&request, result, &stdout_state, &stderr_state)
 }
 
-/// Stores the terminal record, then takes the model-facing prefixes. The
+/// Stores the terminal record, then takes the model-facing captures. The
 /// stored record is written before this returns, so a later query and the tool
 /// result describe the same command.
 fn finish(
@@ -768,10 +736,14 @@ fn finish(
         let state = stderr.lock().unwrap();
         state.truncated || state.cut
     };
+    let (stdout, stdout_omitted) = take_capture(stdout);
+    let (stderr, stderr_omitted) = take_capture(stderr);
     CommandOutcome {
         result,
-        stdout: take_prefix(stdout),
-        stderr: take_prefix(stderr),
+        stdout,
+        stderr,
+        stdout_omitted,
+        stderr_omitted,
         stdout_truncated,
         stderr_truncated,
     }
@@ -782,60 +754,22 @@ fn remaining_until(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-/// Records the requested stop before the terminal record is available. Only a
-/// cancellation is recorded: a deadline is not a cancellation request, and its
-/// terminal `timed_out` record follows within the same owner.
-fn announce_start(request: &CommandRequest) {
-    let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) else {
-        return;
-    };
-    let (stdout_range, stderr_range) = stream_ranges(request);
-    let (stdout_base, stdout_end) = stdout_range.unwrap_or((0, 0));
-    let (stderr_base, stderr_end) = stderr_range.unwrap_or((0, 0));
-    sink.note_command(
-        tool_ref,
-        &CommandResult {
-            status: CommandStatus::Running,
-            exit_code: None,
-            signal: None,
-            termination_confirmed: false,
-            stdout_base_offset: stdout_base,
-            stdout_observed_end: stdout_end,
-            stderr_base_offset: stderr_base,
-            stderr_observed_end: stderr_end,
-            output_complete: false,
-            output_truncated: false,
-        },
-    );
+fn live_record(request: &CommandRequest, status: CommandStatus) -> CommandResult {
+    let (stdout, stderr) = stream_ranges(request);
+    terminal_record(status, None, None, false, stdout, stderr)
 }
 
-/// Records the requested stop before the terminal record is available.
+fn announce_start(request: &CommandRequest) {
+    record(request, &live_record(request, CommandStatus::Running));
+}
+
 fn announce_stop(request: &CommandRequest, cancel_requested: bool) {
-    if !cancel_requested {
-        return;
+    if cancel_requested {
+        if let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) {
+            sink.mark_cancelling(tool_ref);
+            sink.note_command(tool_ref, &live_record(request, CommandStatus::Cancelling));
+        }
     }
-    let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) else {
-        return;
-    };
-    sink.mark_cancelling(tool_ref);
-    let (stdout_range, stderr_range) = stream_ranges(request);
-    let (stdout_base, stdout_end) = stdout_range.unwrap_or((0, 0));
-    let (stderr_base, stderr_end) = stderr_range.unwrap_or((0, 0));
-    sink.note_command(
-        tool_ref,
-        &CommandResult {
-            status: CommandStatus::Cancelling,
-            exit_code: None,
-            signal: None,
-            termination_confirmed: false,
-            stdout_base_offset: stdout_base,
-            stdout_observed_end: stdout_end,
-            stderr_base_offset: stderr_base,
-            stderr_observed_end: stderr_end,
-            output_complete: false,
-            output_truncated: false,
-        },
-    );
 }
 
 /// Spawns the shell command inside the controlled scope. A Windows job object
@@ -860,8 +794,13 @@ fn spawn_child(
 
 #[cfg(unix)]
 fn shell_command(command: &str) -> tokio::process::Command {
-    let mut process = tokio::process::Command::new("/bin/sh");
-    process.arg("-lc").arg(command);
+    let shell = if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    let mut process = tokio::process::Command::new(shell);
+    process.arg("-c").arg(command);
     process
 }
 
@@ -910,12 +849,21 @@ async fn drain_stream<R>(
             sink.push_chunk(tool_ref, stream, chunk);
         }
         let mut state = state.lock().unwrap();
-        let remaining = limit.saturating_sub(state.prefix.len());
-        let keep = remaining.min(chunk.len());
+        state.bytes += read as u64;
+        let head_limit = limit / 2;
+        let keep = (head_limit - state.prefix.len()).min(chunk.len());
         state.prefix.extend_from_slice(&chunk[..keep]);
-        if keep < chunk.len() {
-            state.truncated = true;
+        let tail_limit = limit - head_limit;
+        let tail = &chunk[keep..];
+        if tail.len() >= tail_limit {
+            state.tail.clear();
+            state.tail.extend(&tail[tail.len() - tail_limit..]);
+        } else {
+            let discard = (state.tail.len() + tail.len()).saturating_sub(tail_limit);
+            state.tail.drain(..discard);
+            state.tail.extend(tail);
         }
+        state.truncated = state.bytes > limit as u64;
     }
     if ended {
         state.lock().unwrap().complete = true;
@@ -928,7 +876,7 @@ async fn drain_stream<R>(
 async fn drain_within(
     drains: &mut Pin<Box<dyn Future<Output = ()> + Send + '_>>,
     grace: Duration,
-    cancel: &CancellationToken,
+    cancel: Option<&CancellationToken>,
     done: &mut bool,
 ) -> bool {
     if *done {
@@ -936,31 +884,7 @@ async fn drain_within(
     }
     let completed = tokio::select! {
         biased;
-        _ = cancel.cancelled() => false,
-        _ = tokio::time::sleep(grace) => false,
-        _ = &mut *drains => true,
-    };
-    if completed {
-        *done = true;
-    }
-    completed
-}
-
-/// The final drain after the controlled scope was stopped. It does not observe
-/// a cancel token: the owner's stop token is normally already cancelled at this
-/// point, and abandoning the buffers immediately would lose the bytes a killed
-/// process already wrote. It stays bounded, so a pipe held by a process that
-/// escaped the scope still cannot hang the owner.
-async fn drain_final(
-    drains: &mut Pin<Box<dyn Future<Output = ()> + Send + '_>>,
-    grace: Duration,
-    done: &mut bool,
-) -> bool {
-    if *done {
-        return true;
-    }
-    let completed = tokio::select! {
-        biased;
+        _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => false,
         _ = tokio::time::sleep(grace) => false,
         _ = &mut *drains => true,
     };
@@ -981,7 +905,7 @@ async fn wrapper_wait(
 ) -> io::Result<ExitStatus> {
     let result = Box::into_pin(child.wait()).await;
     #[cfg(all(test, unix))]
-    if take_termination_failure(_leader, TerminationFailure::Wait) {
+    if TERMINATION_FAILURES.hit(&(_leader, tests::TerminationFailure::Wait)) {
         let _ = &result;
         return Err(io::Error::other("injected wait failure"));
     }
@@ -992,51 +916,17 @@ async fn wrapper_wait(
 /// discarded, so the caller can fall back instead of skipping cleanup.
 fn start_kill(child: &mut Box<dyn TokioChildWrapper>, _leader: Option<u32>) -> io::Result<()> {
     #[cfg(all(test, unix))]
-    if take_termination_failure(_leader, TerminationFailure::StartKill) {
+    if TERMINATION_FAILURES.hit(&(_leader, tests::TerminationFailure::StartKill)) {
         return Err(io::Error::other("injected start_kill failure"));
     }
     child.start_kill()
 }
 
-/// Test-only injection of a stop/reap failure, keyed by leader pid. The owner
-/// then reports an explicit failure instead of claiming termination.
 #[cfg(all(test, unix))]
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum TerminationFailure {
-    StartKill,
-    Wait,
-}
-
-#[cfg(all(test, unix))]
-static TERMINATION_FAILURES: OnceLock<Mutex<Vec<(u32, TerminationFailure)>>> = OnceLock::new();
-
-#[cfg(all(test, unix))]
-pub(crate) fn inject_termination_failure(pid: u32, failure: TerminationFailure) {
-    TERMINATION_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((pid, failure));
-}
-
-#[cfg(all(test, unix))]
-fn take_termination_failure(pid: Option<u32>, failure: TerminationFailure) -> bool {
-    let Some(pid) = pid else {
-        return false;
-    };
-    let mut failures = TERMINATION_FAILURES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    let Some(position) = failures
-        .iter()
-        .position(|candidate| *candidate == (pid, failure))
-    else {
-        return false;
-    };
-    failures.remove(position);
-    true
-}
+pub(crate) static TERMINATION_FAILURES: crate::test_support::Registry<(
+    Option<u32>,
+    tests::TerminationFailure,
+)> = crate::test_support::Registry::new();
 
 /// Stops the controlled scope: the leader first, then the whole group/job so no
 /// descendant survives the owner. Every step is attempted even when an earlier
@@ -1044,7 +934,13 @@ fn take_termination_failure(pid: Option<u32>, failure: TerminationFailure) -> bo
 /// directly, so a stop error never skips real cleanup. The returned facts are
 /// unknown-capable: a caller must not report a confirmed termination from a
 /// request that may not have reached the OS.
-fn stop_scope(child: &mut Box<dyn TokioChildWrapper>, leader: Option<u32>) {
+async fn stop_scope(child: &mut Box<dyn TokioChildWrapper>, leader: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = leader {
+        if signal_group(pid, nix::sys::signal::Signal::SIGTERM).is_ok() {
+            tokio::time::sleep(STOPPED_DRAIN_GRACE).await;
+        }
+    }
     let leader_stopped = start_kill(child, leader).is_ok();
     #[cfg(unix)]
     if let Some(pid) = leader {
@@ -1093,7 +989,7 @@ async fn fail_owned(
     stdout: &StreamHandle,
     stderr: &StreamHandle,
 ) -> CommandResult {
-    stop_scope(child, leader);
+    stop_scope(child, leader).await;
     let _ = wrapper_wait(child, leader).await;
     // A command whose own handling failed has no honest end of output: the
     // streams are final but cut, so a page never reports them as pending. The
@@ -1128,9 +1024,12 @@ fn with_output_flags(
     result
 }
 
-fn take_prefix(state: &StreamHandle) -> Vec<u8> {
+fn take_capture(state: &StreamHandle) -> (Vec<u8>, u64) {
     let mut state = state.lock().unwrap();
-    std::mem::take(&mut state.prefix)
+    let mut bytes = std::mem::take(&mut state.prefix);
+    bytes.extend(state.tail.drain(..));
+    let omitted = state.bytes - bytes.len() as u64;
+    (bytes, omitted)
 }
 
 /// True only when both streams reached a real end of output.
@@ -1266,4 +1165,4 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

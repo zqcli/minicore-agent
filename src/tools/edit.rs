@@ -7,12 +7,12 @@ use minicore_runtime::tools::{
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::Workspace;
 use crate::tool_data::{ToolData, ToolRef};
-use crate::{Workspace, WorkspaceError};
 
+use super::file_change::{commit_text, read_source_before};
 use super::{
-    FileBefore, MAX_PATCH_BYTES, emit_phase, escape_control_characters, expected_file_state,
-    map_workspace_error, precheck_control, record_file_change, run_controlled, wait_for_test_io,
+    MAX_PATCH_BYTES, emit_phase, escape_control_characters, map_workspace_error, run_controlled,
 };
 
 const TOOL_NAME: &str = "edit";
@@ -88,12 +88,7 @@ impl EditTool {
         tool_data: Option<Arc<ToolData>>,
     ) -> ToolFuture<'_> {
         Box::pin(async move {
-            precheck_control(&context)?;
-            if invocation.tool_name() != self.spec.name() {
-                return Err(ToolError::InvalidInvocation);
-            }
-            let input: EditInput = serde_json::from_value(invocation.arguments().clone())
-                .map_err(|_| ToolError::InvalidInvocation)?;
+            let input: EditInput = super::decode_input(&self.spec, &invocation, &context)?;
             if input.old_text.is_empty()
                 || input.old_text.len() > MAX_PATCH_BYTES
                 || input.new_text.len() > MAX_PATCH_BYTES
@@ -108,50 +103,33 @@ impl EditTool {
             let path_display = escape_control_characters(&input.path);
 
             run_controlled(&context, async {
-                wait_for_test_io(TOOL_NAME, &input.path).await;
+                #[cfg(test)]
+                if let Some(gate) = super::IO_GATES.take(&(TOOL_NAME, input.path.clone())) { gate.pass().await; }
                 emit_phase(&context, "reading");
-                let (source, before) = if tool_ref.is_some() && tool_data.is_some() {
-                    let (source, stamp, stable) = self
-                        .workspace
-                        .read_text_snapshot(&input.path, MAX_PATCH_BYTES)
-                        .await
-                        .map_err(map_source_error)?;
-                    let before = FileBefore::Content {
-                        bytes: source.as_bytes().to_vec(),
-                        stamp,
-                        stable,
-                    };
-                    (source, before)
-                } else {
-                    (
-                        self.workspace
-                            .read_text(&input.path, MAX_PATCH_BYTES)
-                            .await
-                            .map_err(map_source_error)?,
-                        FileBefore::Unknown,
-                    )
+                let (source, before) = match read_source_before(
+                    &self.workspace, &input.path, MAX_PATCH_BYTES,
+                    tool_ref.is_some() && tool_data.is_some(),
+                ).await {
+                    Ok(source) => source,
+                    Err(error) => return super::file_change::source_failure(error),
                 };
                 emit_phase(&context, "matching");
-                let (result, replacements) = edit_text(&source, &input)?;
+                let (result, replacements) = match edit_text(&source, &input) {
+                    Ok(result) => result,
+                    Err(ToolError::Failed) => {
+                        let output = ToolOutput::new("Edit requires exactly one match (or replace_all for multiple matches). Read the file and check old_text.")
+                            .map_err(|_| ToolError::Internal)?;
+                        return Ok(ToolExecutionOutcome::Completed(output));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let output = ToolOutput::new(format!(
                     "replaced {replacements} occurrence(s) in {path_display}"
                 ))
                 .map_err(|_| ToolError::Internal)?;
                 emit_phase(&context, "committing");
-                let expected = expected_file_state(&before);
-                let observation = self
-                    .workspace
-                    .write_atomic_observed(&input.path, result.as_bytes(), expected)
-                    .await;
-                record_file_change(
-                    tool_data.as_deref(),
-                    tool_ref.as_ref(),
-                    &input.path,
-                    before,
-                    result.as_bytes(),
-                    &observation,
-                );
-                observation.outcome.map_err(map_workspace_error)?;
+                commit_text(&self.workspace, tool_ref.as_ref(), tool_data.as_deref(),
+                    &input.path, before, result.as_bytes()).await?;
                 Ok(ToolExecutionOutcome::Completed(output))
             })
             .await
@@ -160,6 +138,21 @@ impl EditTool {
 }
 
 fn edit_text(source: &str, input: &EditInput) -> Result<(String, usize), ToolError> {
+    let translated;
+    let input = if source.contains("\r\n")
+        && input.old_text.contains('\n')
+        && !input.old_text.contains("\r\n")
+    {
+        translated = EditInput {
+            path: input.path.clone(),
+            old_text: input.old_text.replace('\n', "\r\n"),
+            new_text: input.new_text.replace("\r\n", "\n").replace('\n', "\r\n"),
+            replace_all: input.replace_all,
+        };
+        &translated
+    } else {
+        input
+    };
     let replacements = source.match_indices(&input.old_text).count();
     if replacements == 0 || (!input.replace_all && replacements > 1) {
         return Err(ToolError::Failed);
@@ -188,23 +181,7 @@ fn edit_text(source: &str, input: &EditInput) -> Result<(String, usize), ToolErr
     } else {
         source.replacen(&input.old_text, &input.new_text, 1)
     };
-    if result.len() != result_len {
-        return Err(ToolError::Internal);
-    }
     Ok((result, replacements))
-}
-
-fn map_source_error(error: WorkspaceError) -> ToolError {
-    match error {
-        WorkspaceError::InvalidPath | WorkspaceError::Escape => ToolError::InvalidInvocation,
-        WorkspaceError::NotFound
-        | WorkspaceError::NotFile
-        | WorkspaceError::NotDirectory
-        | WorkspaceError::Unavailable
-        | WorkspaceError::UnknownOutcome
-        | WorkspaceError::TooLarge
-        | WorkspaceError::Binary => ToolError::Failed,
-    }
 }
 
 #[cfg(test)]
