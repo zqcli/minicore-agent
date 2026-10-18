@@ -5,7 +5,7 @@
 Compatibility (RPC protocol stays 1; history, snapshot and auxiliary formats,
 history revision strings and event wire shapes are unchanged):
 
-- Pin Runtime 0.7.0 at `86fba7893a09a6cdab76c52da07f5fc93c307a90`. Runtime owns
+- Pin Runtime 0.7.0 at `b93aea38fea32b4ee416e4bbf5e66254157e1463`. Runtime owns
   model-text normalization (CRLF/CR become LF, other controls except LF/TAB one
   space, never expanding bytes); the adapter no longer rejects control text.
   Future Runtime statuses, cancellation reasons and outcomes map to `unknown`.

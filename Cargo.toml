@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Public API is pinned to the reviewed Runtime 0.7.0 revision.
-minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "86fba7893a09a6cdab76c52da07f5fc93c307a90", version = "0.7.0" }
+minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "b93aea38fea32b4ee416e4bbf5e66254157e1463", version = "0.7.0" }
 # Owned process groups/jobs for the Bash command worker. `tracing` is left off
 # on purpose: a wrapped command must never be logged with its script text.
 process-wrap = { version = "=8.2.0", default-features = false, features = [

@@ -23,7 +23,7 @@ verification evidence.
 
 These guides describe the current source package **0.7.0**, Rust 2024/MSRV 1.85,
 Runtime `0.7.0` at revision
-`86fba7893a09a6cdab76c52da07f5fc93c307a90`, and RPC protocol version `1`.
+`b93aea38fea32b4ee416e4bbf5e66254157e1463`, and RPC protocol version `1`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 
