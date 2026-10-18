@@ -743,6 +743,13 @@ an old Profile, `session.json`, or `history.jsonl` on its own. The current Agent
 has no executable delegated child-session Tool; `subagent` remains unsupported
 in current Profiles.
 
+`apply_patch` changes one existing workspace file using unified diff or a Codex
+`*** Update File` envelope. Unified diffs may have `diff --git` and `index` lines
+before their `---`/`+++` headers. Trailing empty lines are accepted after the patch;
+an empty line inside a hunk is empty context, as if its leading space were present.
+Paths, hunk ranges, source text, and newline markers must still match exactly:
+there is no fuzzy matching, multi-file patching, rename, or binary patch support.
+
 ## History
 
 ### `session.history`

@@ -311,7 +311,20 @@ fn apply_unified_patch_with_stats(
 ) -> Result<(String, ApplyStats), ToolError> {
     let source_lines = split_source_lines(source);
     let mut parser = PatchLines::new(patch);
-    let first = parser.next().ok_or(ToolError::InvalidInvocation)?;
+    let mut first = parser.next().ok_or(ToolError::InvalidInvocation)?;
+    if first.starts_with("diff --git ") || first.starts_with("index ") {
+        if first.starts_with("diff --git ") {
+            first = parser.next().ok_or(ToolError::InvalidInvocation)?;
+        }
+        if first.starts_with("index ") {
+            first = parser.next().ok_or(ToolError::InvalidInvocation)?;
+        }
+        // Git metadata is informational; the ---/+++ paths still authorize
+        // the single file this patch may change.
+        if !first.starts_with("--- ") {
+            return Err(ToolError::InvalidInvocation);
+        }
+    }
     let mut next_hunk = if strip_transport_ending(first).starts_with("--- ") {
         let original = parse_header_path(first, "--- ")?;
         let modified =
@@ -324,7 +337,6 @@ fn apply_unified_patch_with_stats(
     };
 
     let mut resolved = Vec::new();
-    let mut hunk_count = 0usize;
     let mut previous_old_end = 0usize;
     let mut previous_new_end = 0usize;
 
@@ -342,19 +354,17 @@ fn apply_unified_patch_with_stats(
             new: new_range,
             contents,
         });
-        hunk_count = add(hunk_count, 1)?;
-
         match parser.next() {
             Some(line) if strip_transport_ending(line).starts_with("@@ ") => {
                 next_hunk = line;
             }
+            Some(line) if strip_transport_ending(line).is_empty() => {
+                parser.finish()?;
+                break;
+            }
             Some(_) => return Err(ToolError::InvalidInvocation),
             None => break,
         }
-    }
-
-    if hunk_count == 0 {
-        return Err(ToolError::InvalidInvocation);
     }
     apply_resolved_hunks(source, &source_lines, &resolved, parser.steps, 0)
 }
@@ -437,6 +447,15 @@ impl<'a> PatchLines<'a> {
             self.peeked = self.lines.next();
         }
         self.peeked
+    }
+
+    fn finish(&mut self) -> Result<(), ToolError> {
+        while let Some(line) = self.next() {
+            if !strip_transport_ending(line).is_empty() {
+                return Err(ToolError::InvalidInvocation);
+            }
+        }
+        Ok(())
     }
 
     fn next(&mut self) -> Option<&'a str> {
@@ -557,10 +576,10 @@ fn parse_codex_patch<'a>(
             if hunks
                 .last()
                 .is_none_or(|hunk: &CodexHunk<'_>| hunk.contents.is_empty())
-                || parser.next().is_some()
             {
                 return Err(ToolError::InvalidInvocation);
             }
+            parser.finish()?;
             return Ok((hunks, parser.steps));
         }
         if !line.starts_with("@@") {
@@ -1033,7 +1052,9 @@ fn matching_source_line<'a>(
 }
 
 fn parse_patch_content(line: &str) -> Result<PatchContent<'_>, ToolError> {
-    let (kind, text) = if let Some(text) = line.strip_prefix(' ') {
+    let (kind, text) = if line.is_empty() {
+        (PatchLineKind::Context, "")
+    } else if let Some(text) = line.strip_prefix(' ') {
         (PatchLineKind::Context, text)
     } else if let Some(text) = line.strip_prefix('-') {
         (PatchLineKind::Remove, text)
