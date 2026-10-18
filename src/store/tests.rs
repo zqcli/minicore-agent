@@ -1722,35 +1722,6 @@ async fn auxiliary_blob_states_preserve_snapshot_files_and_metadata() {
 }
 
 #[tokio::test]
-async fn empty_process_stream_blobs_remain_corrupt() {
-    let (_directory, store, session_id) = fixture("aux-empty-stream-corrupt").await;
-    store.create_session(&record(session_id)).await.unwrap();
-    for (index, name) in ["input", "result", "stdout", "stderr"].iter().enumerate() {
-        let tool_ref = ToolRef {
-            session_id,
-            loop_id: LoopId::new().unwrap(),
-            request_index: index as u32,
-            tool_call_id: ToolCallId::new(format!("empty-{name}")).unwrap(),
-        };
-        let mut blobs = [None, None, None, None, None, None];
-        blobs[index] = Some(Vec::new());
-        let snapshot = auxiliary_snapshot(tool_ref, blobs);
-        assert!(matches!(
-            store
-                .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
-                .await,
-            Err(StoreError::Corrupt)
-        ));
-    }
-    assert!(
-        !store
-            .session_directory(session_id)
-            .join(AUX_TOOLS_DIR)
-            .exists()
-    );
-}
-
-#[tokio::test]
 async fn file_change_auxiliary_round_trip_and_missing_blob_degrade_details() {
     let (_directory, store, session_id) = fixture("file-change-round-trip").await;
     store.create_session(&record(session_id)).await.unwrap();

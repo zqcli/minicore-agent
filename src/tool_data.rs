@@ -339,7 +339,7 @@ impl fmt::Debug for CommandResult {
 /// really read, whether or not it is still retained.
 #[derive(Clone, Default)]
 pub(crate) struct StreamWindow {
-    bytes: Vec<u8>,
+    bytes: VecDeque<u8>,
     start_offset: u64,
     observed_end: u64,
     seen: bool,
@@ -363,7 +363,7 @@ struct StreamPush {
 impl StreamWindow {
     fn from_stored(stored: StoredStreamWindow, bytes: Option<Vec<u8>>, corrupt: bool) -> Self {
         Self {
-            bytes: bytes.unwrap_or_default(),
+            bytes: bytes.unwrap_or_default().into(),
             start_offset: stored.start_offset,
             observed_end: stored.observed_end,
             seen: stored.seen,
@@ -392,8 +392,8 @@ impl StreamWindow {
         }
     }
 
-    fn snapshot(&self) -> (StoredStreamWindow, Option<Vec<u8>>) {
-        let (bytes, file_bytes, file_sha256) = snapshot_blob(&self.bytes, self.expired);
+    fn snapshot(self) -> (StoredStreamWindow, Option<Vec<u8>>) {
+        let (bytes, file_bytes, file_sha256) = snapshot_blob(self.bytes.into(), self.expired);
         (
             StoredStreamWindow {
                 start_offset: self.start_offset,
@@ -439,7 +439,7 @@ impl StreamWindow {
                 let additional = target - old_len;
                 self.bytes.reserve_exact(additional);
             }
-            self.bytes.extend_from_slice(chunk);
+            self.bytes.extend(chunk);
         } else {
             let excess = total - MAX_TOOL_STREAM_BYTES;
             self.start_offset = self.start_offset.saturating_add(excess as u64);
@@ -457,7 +457,7 @@ impl StreamWindow {
                 let additional = MAX_TOOL_STREAM_BYTES - self.bytes.len();
                 self.bytes.reserve_exact(additional);
             }
-            self.bytes.extend_from_slice(chunk_slice);
+            self.bytes.extend(chunk_slice);
         }
         StreamPush {
             base_offset,
@@ -483,16 +483,21 @@ impl StreamWindow {
 
     /// The retained bytes from one raw offset, when that offset is still
     /// inside the window.
-    fn page(&self, offset: u64) -> Option<&[u8]> {
-        if self.expired || offset < self.start_offset {
+    fn page(&self, offset: u64) -> Option<(&[u8], &[u8])> {
+        if offset < self.start_offset {
             return None;
         }
         let index = usize::try_from(offset - self.start_offset).ok()?;
-        self.bytes.get(index..)
+        let (first, second) = self.bytes.as_slices();
+        if index < first.len() {
+            Some((&first[index..], second))
+        } else {
+            Some((second.get(index - first.len()..)?, &[]))
+        }
     }
 
     fn evict(&mut self) {
-        self.bytes = Vec::new();
+        self.bytes = VecDeque::new();
         self.start_offset = self.observed_end;
         self.expired = true;
         self.truncated = true;
@@ -2172,15 +2177,15 @@ impl ToolData {
         &self,
         tool_ref: &ToolRef,
     ) -> Option<ToolPersistenceSnapshot> {
-        let inner = self.lock();
-        let record = inner.records.get(tool_ref)?;
-
+        let record = self.get_record(tool_ref)?;
         if !record.is_terminal() {
             return None;
         }
-
+        #[cfg(test)]
+        tests::wait_snapshot_gate(tool_ref);
+        let command = record.command.clone().map(|cmd| record.live_command(cmd));
         let (input_bytes, input_file_bytes, input_file_sha256) =
-            snapshot_blob(record.input.as_bytes(), record.input_expired);
+            snapshot_blob(record.input.into_bytes(), record.input_expired);
         let input_summary = StoredInputSummary {
             total_bytes: record.input_total,
             seen: record.input_seen,
@@ -2191,7 +2196,7 @@ impl ToolData {
         };
 
         let (result_bytes, result_file_bytes, result_file_sha256) =
-            snapshot_blob(record.result.as_bytes(), record.result_expired);
+            snapshot_blob(record.result.into_bytes(), record.result_expired);
         let result_summary = StoredResultSummary {
             total_bytes: record.result_total,
             seen: record.result_seen,
@@ -2204,27 +2209,27 @@ impl ToolData {
         let (stdout_summary, stdout_bytes) = record.stdout.snapshot();
         let (stderr_summary, stderr_bytes) = record.stderr.snapshot();
 
-        let command = record.command.clone().map(|cmd| record.live_command(cmd));
-        let file_change = record.file_change.as_ref().map(FileChange::stored);
-        let file_change_before = record
+        let (file_change, file_change_before, file_change_after) = record
             .file_change
-            .as_ref()
-            .and_then(|change| change.before_bytes.clone());
-        let file_change_after = record
-            .file_change
-            .as_ref()
-            .and_then(|change| change.after_bytes.clone());
+            .map(|change| {
+                (
+                    Some(change.stored()),
+                    change.before_bytes,
+                    change.after_bytes,
+                )
+            })
+            .unwrap_or_default();
 
         let stored_record = StoredToolRecord {
             version: TOOL_RECORD_FORMAT_VERSION,
             tool_ref: tool_ref.clone(),
-            name: record.name.clone(),
-            subject: record.subject.clone(),
+            name: record.name,
+            subject: record.subject,
             subject_truncated: record.subject_truncated,
             state: record.state,
             phase: record.phase,
-            started_at: record.started_at.clone(),
-            finished_at: record.finished_at.clone(),
+            started_at: record.started_at,
+            finished_at: record.finished_at,
             outcome: record.outcome,
             input: input_summary,
             result: result_summary,
@@ -2247,15 +2252,19 @@ impl ToolData {
     }
 }
 
-fn snapshot_blob(bytes: &[u8], expired: bool) -> (Option<Vec<u8>>, usize, Option<String>) {
+#[cfg(test)]
+static SNAPSHOT_GATES: crate::test_support::Registry<
+    ToolRef,
+    std::sync::Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
+fn snapshot_blob(bytes: Vec<u8>, expired: bool) -> (Option<Vec<u8>>, usize, Option<String>) {
     if expired || bytes.is_empty() {
         (None, 0, None)
     } else {
-        (
-            Some(bytes.to_vec()),
-            bytes.len(),
-            Some(crate::store::hash_bytes(bytes)),
-        )
+        let len = bytes.len();
+        let hash = crate::store::hash_bytes(&bytes);
+        (Some(bytes), len, Some(hash))
     }
 }
 
@@ -2318,7 +2327,7 @@ fn output_process(
     if !window.seen && request.offset != 0 {
         return Err(AgentError::InvalidArguments);
     }
-    let Some(bytes) = window.page(request.offset) else {
+    let Some((first, second)) = window.page(request.offset) else {
         // The requested bytes were dropped from the retained window: report the
         // loss and where the window starts now so the next page can read the tail.
         let has_retained = !window.bytes.is_empty();
@@ -2338,7 +2347,7 @@ fn output_process(
             max_bytes,
         );
     };
-    if bytes.is_empty() {
+    if first.is_empty() && second.is_empty() {
         // Nothing is retained at or after this offset; the frame reports the
         // real end without inventing content.
         return encoded_result(
@@ -2361,17 +2370,25 @@ fn output_process(
         return Err(AgentError::InvalidArguments);
     }
     let available = max_bytes.saturating_sub(template_len).saturating_add(2);
-    let take = raw_bytes_for_base64(available).min(bytes.len());
+    let take = raw_bytes_for_base64(available).min(first.len() + second.len());
     if take == 0 {
         return Err(AgentError::InvalidArguments);
     }
+    let bytes = if take <= first.len() {
+        std::borrow::Cow::Borrowed(&first[..take])
+    } else {
+        let mut bytes = Vec::with_capacity(take);
+        bytes.extend_from_slice(first);
+        bytes.extend_from_slice(&second[..take - first.len()]);
+        std::borrow::Cow::Owned(bytes)
+    };
     let next = request.offset.saturating_add(take as u64);
     encoded_result(
         ToolOutputPage {
             base_offset: request.offset,
             next_offset: next,
             eof: stream_final && next >= window.observed_end,
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes[..take]),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
             ..base
         },
         max_bytes,
