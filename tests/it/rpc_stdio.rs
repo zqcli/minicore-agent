@@ -4,6 +4,7 @@ use crate::support::fixture::Fixture;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use minicore_agent::SessionId;
 use serde_json::{Value, json};
@@ -359,6 +360,38 @@ fn eof_shuts_down_without_an_extra_frame() {
     let mut trailing = String::new();
     assert_eq!(process.output.read_line(&mut trailing).unwrap(), 0);
     assert!(process.child.wait().unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn signals_and_rpc_shutdown_exit_with_stdin_still_open() {
+    for mode in ["INT", "TERM", "rpc"] {
+        let mut process = spawn_server();
+        process.send_json(json!({"jsonrpc": "2.0", "id": 1, "method": "agent.ping"}));
+        assert_ping(process.response(), json!(1));
+        // Give stdin's next blocking read time to park before stopping.
+        std::thread::sleep(Duration::from_millis(30));
+        if mode == "rpc" {
+            process.send_json(json!({"jsonrpc": "2.0", "id": 2, "method": "agent.shutdown"}));
+            assert_eq!(process.response()["result"]["ok"], json!(true));
+        } else {
+            let pid = process.child.id().to_string();
+            let status = Command::new("kill")
+                .args([format!("-{mode}"), pid])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = process.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{mode} waited for stdin EOF");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.success(), "{mode}: {status}");
+    }
 }
 
 #[test]

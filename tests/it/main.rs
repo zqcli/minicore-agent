@@ -1,7 +1,6 @@
-// Resolve the shared module tree from tests/support without path attributes.
-pub mod support {
-    include!("../support/mod.rs");
-}
+// tests/support is shared with the separate rpc_soak target.
+#[path = "../support/mod.rs"]
+pub mod support;
 
 mod legacy_closeout;
 mod openai_rpc_process;
