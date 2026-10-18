@@ -14,7 +14,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::auto::{AutoContext, compressible_ranges, fold_history_with_ranges};
+use super::auto::{AutoContext, fold_history_with_ranges};
 use super::utility::{self, CompactionInput, SourcePart, UtilityError};
 use super::{
     AutomaticCompactionObservation, AutomaticCompactionView, CompactionState,
@@ -108,10 +108,6 @@ impl CompactionState {
     }
 
     fn install_consolidated(&self, value: ConsolidatedSummary) -> bool {
-        if value.covered.len() > 4096 || value.content.byte_len() > super::MAX_SUMMARY_CONTENT_BYTES
-        {
-            return false;
-        }
         let mut state = self.threshold.lock().unwrap();
         if state
             .consolidated
@@ -280,10 +276,13 @@ pub(crate) struct ProjectionResult {
     pub(crate) compacted: bool,
 }
 
-#[cfg(test)]
 impl ProjectionResult {
-    fn into_compacted(self) -> Option<Self> {
-        self.compacted.then_some(self)
+    fn unchanged(request: ModelRequest) -> Self {
+        Self {
+            request,
+            usage: None,
+            compacted: false,
+        }
     }
 }
 
@@ -306,21 +305,15 @@ pub(crate) async fn consolidate(
 ) -> Result<ProjectionResult, ProjectionFailure> {
     let auto = input.auto;
     let state = &auto.state;
-    let items = input.base.iter().chain(input.appended).collect::<Vec<_>>();
-    let ranges = compressible_ranges(input.base.len(), &items, input.loop_id)?;
-    let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
-    let old = state.consolidated(input.loop_id, input.summary, &valid);
-    let folded = state.emergency_groups(input.loop_id, &valid);
-    let (fixed, history) =
-        super::auto_compose(input.system, input.summary, input.base, input.appended)?;
-    let messages = fold_history_with_ranges(
-        &fixed,
-        &history,
-        items.len(),
-        &ranges,
-        &folded,
-        old.as_ref(),
+    let projection = super::auto::Projection::new(
+        state,
+        input.system,
+        input.summary,
+        input.base,
+        input.appended,
+        input.loop_id,
     )?;
+    let messages = projection.messages()?;
     let make = |messages| {
         ModelRequest::new(
             messages,
@@ -342,11 +335,7 @@ pub(crate) async fn consolidate(
     let before = before_bytes.div_ceil(4) as u64;
     let budget = auto.policy.budget(auto.model.descriptor().context_window);
     if !recovery && input.request_index == 0 && input.base.is_empty() && input.summary.is_none() {
-        return Ok(ProjectionResult {
-            request: before_request,
-            usage: None,
-            compacted: false,
-        });
+        return Ok(ProjectionResult::unchanged(before_request));
     }
     let trigger_before = if input.request_index == 0 && !recovery {
         // The first Runtime boundary contains only new User/Steer items.
@@ -371,48 +360,35 @@ pub(crate) async fn consolidate(
         state.threshold_estimate(
             auto.model.descriptor(),
             &before_request,
-            &items,
+            &projection.items,
             before,
             &*auto.budget,
         )
     };
-    if !recovery && trigger_before < budget.trigger_tokens {
-        return Ok(ProjectionResult {
-            request: before_request,
-            usage: None,
-            compacted: false,
-        });
+    let history_end = if input.request_index == 0 {
+        input.base.len()
+    } else {
+        projection.items.len()
+    };
+    let (history_items, history_bytes) = projection.history_size(history_end);
+    let history_triggered =
+        auto.policy
+            .history_triggered(history_items, history_bytes, &auto.limits);
+    if !recovery && trigger_before < budget.trigger_tokens && !history_triggered {
+        return Ok(ProjectionResult::unchanged(before_request));
     }
 
-    // The newest result must first reach the assistant verbatim. Earlier,
-    // already consumed complete exchanges can enter the historical summary.
-    let newest = (!recovery && input.request_index > 0)
-        .then(|| {
-            ranges
-                .iter()
-                .rev()
-                .find(|(key, _)| {
-                    key.start >= input.base.len()
-                        && matches!(items[key.start], HistoryItem::Assistant(_))
-                })
-                .map(|(key, _)| key.clone())
-        })
-        .flatten();
-    let mut covered = old
-        .as_ref()
-        .map(|old| old.covered.clone())
-        .unwrap_or_default();
-    for (key, _) in &ranges {
-        if Some(key) != newest.as_ref() {
-            covered.insert(key.clone());
-        }
-    }
+    let covered = projection.coverage(input.base.len(), !recovery && input.request_index > 0);
+    let super::auto::Projection {
+        items,
+        ranges,
+        folded,
+        consolidated: old,
+        fixed,
+        history,
+    } = projection;
     if covered.is_empty() && input.summary.is_none() && old.is_none() {
-        return Ok(ProjectionResult {
-            request: before_request,
-            usage: None,
-            compacted: false,
-        });
+        return Ok(ProjectionResult::unchanged(before_request));
     }
     if covered.len() > 4096 {
         return Err(UtilityError::TooLarge.into());
@@ -441,11 +417,7 @@ pub(crate) async fn consolidate(
             .is_some_and(|(owner, index)| owner == input.loop_id && input.request_index <= index)
             || threshold.source == Some(source)
         {
-            return Ok(ProjectionResult {
-                request: before_request,
-                usage: None,
-                compacted: false,
-            });
+            return Ok(ProjectionResult::unchanged(before_request));
         }
         drop(threshold);
         let mut floor = Vec::new();
@@ -464,29 +436,21 @@ pub(crate) async fn consolidate(
                 floor.push(message.clone());
             }
         }
-        if !floor.is_empty()
+        if !history_triggered
+            && !floor.is_empty()
             && auto
                 .budget
                 .estimate_request_tokens(&make(floor)?, None, None)
                 .map_err(|_| UtilityError::Serialization)?
                 >= budget.trigger_tokens
         {
-            return Ok(ProjectionResult {
-                request: before_request,
-                usage: None,
-                compacted: false,
-            });
+            return Ok(ProjectionResult::unchanged(before_request));
         }
         let mut threshold = state.threshold.lock().unwrap();
         threshold.attempted = Some((input.loop_id, input.request_index));
         threshold.source = Some(source);
     }
-    if input.cancellation.is_cancelled() {
-        return Err(UtilityError::Cancelled.into());
-    }
-    if Instant::now() >= input.deadline {
-        return Err(UtilityError::Timeout.into());
-    }
+    utility::check_active(input.cancellation, input.deadline)?;
     let live_usage = Arc::new(std::sync::Mutex::new(None));
     let mut observation = ObservationGuard::new(
         state,
@@ -522,7 +486,6 @@ pub(crate) async fn consolidate(
         project_instructions: input.system.clone(),
         tool_schemas: input.tools.to_vec(),
         hard_tokens: budget.hard_tokens,
-        safe_before_estimate: false,
         operation_deadline: input.deadline,
         live_usage: Some(live_usage),
     };
@@ -552,7 +515,6 @@ pub(crate) async fn consolidate(
         let request = make(fold_history_with_ranges(
             &fixed,
             &history,
-            items.len(),
             &ranges,
             &folded,
             Some(&consolidated),
@@ -568,17 +530,12 @@ pub(crate) async fn consolidate(
                     || input
                         .rejected_body_bytes
                         .is_none_or(|original| after_bytes >= original)))
-            || request.messages().len() > auto.max_prompt_messages
+            || request.messages().len() > auto.limits.max_prompt_messages
             || !super::recovery::validate_clean_tool_exchanges(request.messages())
         {
             return Err(UtilityError::NoProgress);
         }
-        if input.cancellation.is_cancelled() {
-            return Err(UtilityError::Cancelled);
-        }
-        if Instant::now() >= input.deadline {
-            return Err(UtilityError::Timeout);
-        }
+        utility::check_active(input.cancellation, input.deadline)?;
         if !state.install_consolidated(consolidated) {
             return Err(UtilityError::TooLarge);
         }

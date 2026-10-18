@@ -164,31 +164,21 @@ impl fmt::Debug for AssistantDisplayPart {
 
 /// Source of the displayed context usage. Reported usage is the last API
 /// request's footprint, not an estimate of an in-flight or future request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextKind {
+    #[default]
     Unknown,
     Estimated,
     Reported,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct ContextUsageView {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
     pub percent: Option<f64>,
     pub kind: ContextKind,
-}
-
-impl Default for ContextUsageView {
-    fn default() -> Self {
-        Self {
-            tokens: None,
-            window: None,
-            percent: None,
-            kind: ContextKind::Unknown,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -224,14 +214,7 @@ pub struct SteerProgressView {
     pub applied_count: u64,
 }
 
-struct LastLoop {
-    loop_id: LoopId,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-}
-
 struct LiveTool {
-    key: Option<RequestKey>,
     tool_name: String,
     display: ToolDisplay,
 }
@@ -252,7 +235,7 @@ struct PresentationInner {
     tool_results: HashMap<(RequestKey, ToolCallId), ToolResultInfo>,
     request_usage: RequestUsageCache,
     live_times: VecDeque<Option<String>>,
-    last_loop: Option<LastLoop>,
+    last_loop: Option<LastLoopView>,
     branch: Option<String>,
     model_label: Option<String>,
     context: ContextUsageView,
@@ -289,18 +272,15 @@ impl PresentationInner {
             return None;
         }
         self.applied_steer = Some((applied_count, key));
+        let turn = TurnRef {
+            session_id,
+            loop_id: key.loop_id,
+        };
         Some(AgentEvent::SteerProgress {
-            turn: TurnRef {
-                session_id,
-                loop_id: key.loop_id,
-            },
+            turn,
             request_index: key.request_index,
             applied_count,
-            meta: EventMeta {
-                session_id,
-                loop_id: Some(key.loop_id),
-                dropped_before: 0,
-            },
+            meta: EventMeta::for_turn(turn),
         })
     }
 }
@@ -347,11 +327,6 @@ impl Presentation {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn session_id(&self) -> SessionId {
-        self.session_id
-    }
-
     pub(crate) fn set_branch(&self, branch: Option<String>) {
         self.lock().branch = branch;
     }
@@ -364,15 +339,11 @@ impl Presentation {
     pub(crate) fn note_request_start(&self, key: RequestKey) {
         let event = {
             let mut inner = self.lock();
-            if let Some((prepared_key, count)) = inner.prepared_steers.take() {
-                if prepared_key == key {
-                    inner.commit_steer_applied(self.session_id, key, count)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            inner
+                .prepared_steers
+                .take()
+                .filter(|(prepared_key, _)| *prepared_key == key)
+                .and_then(|(_, count)| inner.commit_steer_applied(self.session_id, key, count))
         };
         if let Some(event) = event {
             let _ = self.events.try_send(event);
@@ -421,23 +392,18 @@ impl Presentation {
                 inner.context = reported_context(usage, physical_window);
                 inner.context_settings = (settings.config_generation, settings.summary_generation);
             }
-            Some(AgentEvent::RequestUsage {
-                turn: TurnRef {
-                    session_id: self.session_id,
-                    loop_id: key.loop_id,
-                },
+            let turn = TurnRef {
+                session_id: self.session_id,
+                loop_id: key.loop_id,
+            };
+            AgentEvent::RequestUsage {
+                turn,
                 request_index: key.request_index,
                 usage,
-                meta: EventMeta {
-                    session_id: self.session_id,
-                    loop_id: Some(key.loop_id),
-                    dropped_before: 0,
-                },
-            })
+                meta: EventMeta::for_turn(turn),
+            }
         };
-        if let Some(event) = event {
-            let _ = self.events.try_send(event);
-        }
+        let _ = self.events.try_send(event);
     }
 
     /// Clears observation state owned by the previous loop before the Runtime
@@ -458,7 +424,7 @@ impl Presentation {
     /// deliberately metadata-only: the first real model request may already
     /// have installed its observation identity.
     pub(crate) fn bind_started_loop(&self, loop_id: LoopId, started_at: Option<String>) {
-        self.lock().last_loop = Some(LastLoop {
+        self.lock().last_loop = Some(LastLoopView {
             loop_id,
             started_at,
             finished_at: None,
@@ -527,10 +493,6 @@ impl Presentation {
     }
 
     pub(crate) fn record_prompt_time(&self, accepted_at: Option<String>) {
-        self.record_user_time(accepted_at);
-    }
-
-    fn record_user_time(&self, accepted_at: Option<String>) {
         self.lock().live_times.push_back(accepted_at);
     }
 
@@ -557,7 +519,6 @@ impl Presentation {
         inner.live_tools.insert(
             (key, invocation.tool_call_id().clone()),
             LiveTool {
-                key,
                 tool_name: invocation.tool_name().as_str().to_owned(),
                 display,
             },
@@ -565,8 +526,8 @@ impl Presentation {
     }
 
     /// Finalizes a completed tool in place: adds displayable result rows to
-    /// the pending display, caches a bounded result copy for the current
-    /// loop, and emits the best-effort `tool_presentation` event with the
+    /// the pending display, retains the result until `ToolFinished`, and
+    /// emits the best-effort `tool_presentation` event with the
     /// fixed identity captured at execute start.
     pub(crate) fn finish_tool(
         &self,
@@ -574,20 +535,11 @@ impl Presentation {
         tool_call_id: &ToolCallId,
         result_text: Option<(String, bool)>,
     ) {
-        let (loop_id, request_index, tool_name, display) = {
+        let (tool_name, display) = {
             let mut inner = self.lock();
             let Some(live) = inner.live_tools.remove(&(key, tool_call_id.clone())) else {
                 return;
             };
-            if let (Some(key), Some((content, truncated))) = (key, &result_text) {
-                inner.tool_results.insert(
-                    (key, tool_call_id.clone()),
-                    ToolResultInfo {
-                        content: content.clone(),
-                        truncated: *truncated,
-                    },
-                );
-            }
             let mut display = live.display;
             if let Some((_, truncated)) = &result_text {
                 display.truncated |= *truncated;
@@ -596,45 +548,43 @@ impl Presentation {
                 &mut display,
                 result_text.as_ref().map(|(text, _)| text.as_str()),
             );
-            (
-                live.key.map(|key| key.loop_id),
-                live.key.map(|key| key.request_index),
-                live.tool_name,
-                display,
-            )
+            if let (Some(key), Some((content, truncated))) = (key, result_text) {
+                inner.tool_results.insert(
+                    (key, tool_call_id.clone()),
+                    ToolResultInfo { content, truncated },
+                );
+            }
+            (live.tool_name, display)
         };
-        let Some(loop_id) = loop_id else {
+        let Some(key) = key else {
             return;
         };
+        let turn = TurnRef {
+            session_id: self.session_id,
+            loop_id: key.loop_id,
+        };
         let _ = self.events.try_send(AgentEvent::ToolPresentation {
-            turn: TurnRef {
-                session_id: self.session_id,
-                loop_id,
-            },
-            request_index: request_index.unwrap_or(0),
+            turn,
+            request_index: key.request_index,
             tool_call_id: tool_call_id.clone(),
             tool_name,
             display,
-            meta: EventMeta {
-                session_id: self.session_id,
-                loop_id: Some(loop_id),
-                dropped_before: 0,
-            },
+            meta: EventMeta::for_turn(turn),
         });
     }
 
-    /// Best-effort bounded result copy for the current loop, used to attach
+    /// Takes the pending result once, used to attach
     /// `content` to the runtime `ToolFinished` event so the TUI can render
     /// expanded results from the same source the wrapper saw.
-    pub(crate) fn tool_result(
+    pub(crate) fn take_tool_result(
         &self,
         key: RequestKey,
         tool_call_id: &ToolCallId,
     ) -> Option<(String, bool)> {
         self.lock()
             .tool_results
-            .get(&(key, tool_call_id.clone()))
-            .map(|info| (info.content.clone(), info.truncated))
+            .remove(&(key, tool_call_id.clone()))
+            .map(|info| (info.content, info.truncated))
     }
 
     pub(crate) fn snapshot(&self) -> PresentationView {
@@ -654,11 +604,7 @@ impl Presentation {
             context,
             cost_usd: None,
             using_subscription: None,
-            last_loop: inner.last_loop.as_ref().map(|last_loop| LastLoopView {
-                loop_id: last_loop.loop_id,
-                started_at: last_loop.started_at.clone(),
-                finished_at: last_loop.finished_at.clone(),
-            }),
+            last_loop: inner.last_loop.clone(),
             steer_progress: inner
                 .applied_steer
                 .as_ref()
@@ -839,7 +785,7 @@ pub(crate) struct PresentationTool {
 }
 
 #[derive(Clone)]
-enum ToolImpl {
+pub(crate) enum ToolImpl {
     Plain(Arc<dyn Tool>),
     Bash(Arc<crate::tools::OwnedBashTool>),
     Write(Arc<NativeWriteTool>),
@@ -848,7 +794,7 @@ enum ToolImpl {
 }
 
 impl PresentationTool {
-    fn new(
+    pub(crate) fn new(
         inner: ToolImpl,
         presentation: Arc<Presentation>,
         observer: Arc<ToolObserver>,
@@ -858,48 +804,6 @@ impl PresentationTool {
             presentation,
             observer,
         })
-    }
-
-    pub(crate) fn new_with_observer(
-        inner: Arc<dyn Tool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    ) -> Arc<Self> {
-        Self::new(ToolImpl::Plain(inner), presentation, observer)
-    }
-
-    /// Explicit construction for the owned-command tool: only this variant
-    /// receives the captured `ToolRef` at the real execute boundary.
-    pub(crate) fn new_bash_with_observer(
-        inner: Arc<crate::tools::OwnedBashTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    ) -> Arc<Self> {
-        Self::new(ToolImpl::Bash(inner), presentation, observer)
-    }
-
-    pub(crate) fn new_write_with_observer(
-        inner: Arc<NativeWriteTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    ) -> Arc<Self> {
-        Self::new(ToolImpl::Write(inner), presentation, observer)
-    }
-
-    pub(crate) fn new_edit_with_observer(
-        inner: Arc<NativeEditTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    ) -> Arc<Self> {
-        Self::new(ToolImpl::Edit(inner), presentation, observer)
-    }
-
-    pub(crate) fn new_apply_patch_with_observer(
-        inner: Arc<NativeApplyPatchTool>,
-        presentation: Arc<Presentation>,
-        observer: Arc<ToolObserver>,
-    ) -> Arc<Self> {
-        Self::new(ToolImpl::ApplyPatch(inner), presentation, observer)
     }
 
     fn tool(&self) -> &dyn Tool {
@@ -946,11 +850,17 @@ impl Tool for PresentationTool {
             observer.publish_tool_invocation(tool_ref, &invocation);
         }
 
-        let request_key = key;
         let tool_call_id = invocation.tool_call_id().clone();
         let inner = self.inner.clone();
         let tool_data = observer.tool_data();
         Box::pin(async move {
+            macro_rules! execute_native {
+                ($tool:expr) => {
+                    $tool
+                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
+                        .await
+                };
+            }
             let result = match inner {
                 ToolImpl::Plain(inner) => inner.execute(invocation, context).await,
                 ToolImpl::Bash(inner) => {
@@ -958,26 +868,14 @@ impl Tool for PresentationTool {
                         .execute_bound(invocation, context, tool_ref.clone())
                         .await
                 }
-                ToolImpl::Write(inner) => {
-                    inner
-                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await
-                }
-                ToolImpl::Edit(inner) => {
-                    inner
-                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await
-                }
-                ToolImpl::ApplyPatch(inner) => {
-                    inner
-                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await
-                }
+                ToolImpl::Write(inner) => execute_native!(inner),
+                ToolImpl::Edit(inner) => execute_native!(inner),
+                ToolImpl::ApplyPatch(inner) => execute_native!(inner),
             };
             finish_presentation_tool(
                 &presentation,
                 &observer,
-                request_key,
+                key,
                 &tool_call_id,
                 tool_ref.as_ref(),
                 &result,
@@ -1216,8 +1114,13 @@ fn path_arg(args: &serde_json::Value, home: &str) -> Option<String> {
 }
 
 fn read_range(args: &serde_json::Value) -> String {
-    let offset_value = args.get("offset").and_then(serde_json::Value::as_u64);
-    let limit_value = args.get("limit").and_then(serde_json::Value::as_u64);
+    format_read_range(
+        args.get("offset").and_then(serde_json::Value::as_u64),
+        args.get("limit").and_then(serde_json::Value::as_u64),
+    )
+}
+
+fn format_read_range(offset_value: Option<u64>, limit_value: Option<u64>) -> String {
     if offset_value.is_none() && limit_value.is_none() {
         return String::new();
     }

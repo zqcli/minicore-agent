@@ -92,7 +92,6 @@ fn incremental_string_escape_and_surrogate_decode_never_emits_half_scalar() {
     assert!(parser.complete());
     assert_eq!(parser.path.as_deref(), Some("src/中.txt"));
     assert_eq!(parser.content.as_deref(), Some("e\u{301}\n👩🏽‍💻\t\\\""));
-    assert_eq!(parser.scanned, source.chars().count());
     let mut parser = PreviewParser::new("write");
     let mut bytes = 0;
     parser.feed(r#"{"content":"x\uD83D"#, &mut bytes);
@@ -131,7 +130,6 @@ fn only_top_level_whitelist_is_captured_and_unknown_fields_are_not_retained() {
     assert_eq!(parser.retained, display_capacity(&parser));
     assert_eq!(parser.path.as_ref().unwrap().len(), 2);
     assert!(parser.key.capacity() <= 32);
-    assert_eq!(parser.scanned, huge.len());
 }
 
 #[test]
@@ -290,7 +288,6 @@ fn one_byte_deltas_are_linear_and_throttled_before_clone_and_queue() {
     for ch in source.chars() {
         observer.observe(&delta("c", &ch.to_string()), now);
     }
-    assert_eq!(observer.calls[0].parser.scanned, source.len());
     // Start + one first-path exception, not a snapshot/parse of each prefix.
     assert_eq!(receiver.len(), 2);
     observer.observe(&end("c"), now);
@@ -318,6 +315,45 @@ fn throttle_is_stream_wide_and_unknown_fields_do_not_repeat_snapshots() {
     observer.observe(&delta("a", "irrelevant"), now + UPDATE_INTERVAL * 4);
     assert_eq!(receiver.len(), count);
     drain(&mut receiver);
+}
+
+#[test]
+fn large_preview_throttles_wire_volume_without_delaying_final_snapshot() {
+    let (mut observer, mut receiver) = fixture(128);
+    let now = Instant::now();
+    observer.observe(&start("c", "write"), now);
+    observer.observe(&delta("c", r#"{"path":"large","content":""#), now);
+    for _ in 0..8 {
+        observer.observe(&delta("c", &"x".repeat(8 * 1024)), now);
+    }
+    drain(&mut receiver);
+    for tick in 1..=30 {
+        observer.observe(&delta("c", "x"), now + UPDATE_INTERVAL * tick);
+    }
+    let updates = drain(&mut receiver);
+    assert!(!updates.is_empty());
+    assert!(updates.len() <= 2);
+    assert!(
+        updates
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum::<usize>()
+            < 150 * 1024
+    );
+    observer.observe(&delta("c", "\"}"), now + UPDATE_INTERVAL * 30);
+    observer.observe(&end("c"), now + UPDATE_INTERVAL * 30);
+    let final_events = drain(&mut receiver);
+    assert_eq!(final_events.len(), 1);
+    assert_eq!(
+        state(&final_events[0]),
+        ToolArgumentsPreviewState::Generated
+    );
+    if let AgentEvent::ToolArgumentsPreview { display, .. } = &final_events[0] {
+        assert_eq!(
+            display.expanded_input.as_ref().unwrap().len(),
+            64 * 1024 + 30
+        );
+    }
 }
 
 #[test]

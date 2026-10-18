@@ -15,8 +15,7 @@ use std::time::Instant;
 use minicore_runtime::tools::{Tool, ToolError, ToolSet};
 use thiserror::Error;
 
-use crate::presentation::{Presentation, PresentationTool};
-
+use crate::presentation::{Presentation, PresentationTool, ToolImpl};
 use crate::tools::command::CommandOwners;
 use crate::tools::observe::ToolObserver;
 use crate::{Workspace, WorkspaceError};
@@ -79,59 +78,36 @@ fn build_tools_with(
         if !seen.insert(name.as_str()) {
             return Err(BuildToolsError::InvalidConfiguration);
         }
-        let display = presentation.map(|(presentation, observer, _)| (presentation, observer));
         let tool = match name.as_str() {
-            "apply_patch" => present(
-                ApplyPatchTool::new(Arc::clone(&workspace)),
-                display,
-                PresentationTool::new_apply_patch_with_observer,
-            ),
-            "bash" => present(
-                BashTool::with_binding(
-                    Arc::clone(&workspace),
-                    command_environment.clone(),
-                    presentation
-                        .map(|(_, observer, owners)| observer.command_binding(Arc::clone(owners))),
-                ),
-                display,
-                PresentationTool::new_bash_with_observer,
-            ),
-            "edit" => present(
-                EditTool::new(Arc::clone(&workspace)),
-                display,
-                PresentationTool::new_edit_with_observer,
-            ),
-            "read" => present(
-                ReadTool::new(Arc::clone(&workspace)),
-                display,
-                |tool, presentation, observer| {
-                    PresentationTool::new_with_observer(tool, presentation, observer)
-                },
-            ),
-            "write" => present(
-                WriteTool::new(Arc::clone(&workspace)),
-                display,
-                PresentationTool::new_write_with_observer,
-            ),
+            "apply_patch" => {
+                ToolImpl::ApplyPatch(Arc::new(ApplyPatchTool::new(Arc::clone(&workspace))))
+            }
+            "bash" => ToolImpl::Bash(Arc::new(BashTool::with_binding(
+                Arc::clone(&workspace),
+                command_environment.clone(),
+                presentation
+                    .map(|(_, observer, owners)| observer.command_binding(Arc::clone(owners))),
+            ))),
+            "edit" => ToolImpl::Edit(Arc::new(EditTool::new(Arc::clone(&workspace)))),
+            "read" => ToolImpl::Plain(Arc::new(ReadTool::new(Arc::clone(&workspace)))),
+            "write" => ToolImpl::Write(Arc::new(WriteTool::new(Arc::clone(&workspace)))),
             _ => return Err(BuildToolsError::InvalidConfiguration),
+        };
+        let tool: Arc<dyn Tool> = match presentation {
+            Some((presentation, observer, _)) => {
+                PresentationTool::new(tool, Arc::clone(presentation), Arc::clone(observer))
+            }
+            None => match tool {
+                ToolImpl::Plain(tool) => tool,
+                ToolImpl::Bash(tool) => tool,
+                ToolImpl::Write(tool) => tool,
+                ToolImpl::Edit(tool) => tool,
+                ToolImpl::ApplyPatch(tool) => tool,
+            },
         };
         builder.register_arc(tool);
     }
     builder.build().map_err(|_| BuildToolsError::Internal)
-}
-
-fn present<T: Tool + 'static>(
-    tool: T,
-    presentation: Option<(&Arc<Presentation>, &Arc<ToolObserver>)>,
-    wrap: impl FnOnce(Arc<T>, Arc<Presentation>, Arc<ToolObserver>) -> Arc<PresentationTool>,
-) -> Arc<dyn Tool> {
-    let tool = Arc::new(tool);
-    match presentation {
-        Some((presentation, observer)) => {
-            wrap(tool, Arc::clone(presentation), Arc::clone(observer))
-        }
-        None => tool,
-    }
 }
 
 pub(super) fn escape_control_characters(value: &str) -> String {

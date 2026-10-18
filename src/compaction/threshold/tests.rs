@@ -84,14 +84,16 @@ impl Model for Stub {
 }
 fn context(model: &Arc<Stub>) -> AutoContext {
     AutoContext {
-        model: Arc::clone(model) as Arc<dyn Model>,
-        budget: Arc::new(crate::models::tests::DefaultProviderBudget),
-        policy: super::super::CompactionPolicy {
-            enabled: true,
-            trigger_percent: 95,
-            target_percent: 50,
+        binding: crate::compaction::auto::AutoContextBinding {
+            model: Arc::clone(model) as Arc<dyn Model>,
+            budget: Arc::new(crate::models::tests::DefaultProviderBudget),
+            policy: super::super::CompactionPolicy {
+                enabled: true,
+                trigger_percent: 95,
+                target_percent: 50,
+            },
+            limits: minicore_runtime::LoopLimits::default(),
         },
-        max_prompt_messages: 4096,
         state: CompactionState::new(),
     }
 }
@@ -334,7 +336,7 @@ async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
 async fn summary_only_projection_can_refresh_after_reopen_or_smaller_model() {
     let model = Stub::new(12_000, "Refreshed old summary", None);
     let mut auto = context(&model);
-    auto.policy.trigger_percent = 60;
+    auto.binding.policy.trigger_percent = 60;
     let system = BoundedText::new("s").unwrap();
     let summary = BoundedText::new("old summary ".repeat(2_600)).unwrap();
     let current = LoopId::new().unwrap();
@@ -443,7 +445,7 @@ async fn dropped_preparation_clears_current_before_any_following_event() {
 async fn no_progress_preserves_projection_and_accounts_single_call() {
     let model = Stub::new(15_000, &"g".repeat(55_000), None);
     let mut auto = context(&model);
-    auto.policy.trigger_percent = 50;
+    auto.binding.policy.trigger_percent = 50;
     let system = BoundedText::new("s").unwrap();
     let current = LoopId::new().unwrap();
     let old = LoopId::new().unwrap();
@@ -653,4 +655,132 @@ fn settlement_qualifier_is_idempotent_and_preserves_failed_attempt_identity() {
     let mut expected = original;
     expected.outcome = "no_progress_settlement_failed".into();
     assert_eq!(auto.state.automatic_view().last, Some(expected));
+}
+
+impl ProjectionResult {
+    fn into_compacted(self) -> Option<Self> {
+        self.compacted.then_some(self)
+    }
+}
+
+#[tokio::test]
+async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
+    for index in [0, 1] {
+        for by_bytes in [false, true] {
+            let model = Stub::new(1_000_000, "historical summary", None);
+            let mut auto = context(&model);
+            auto.binding.policy.trigger_percent = 50;
+            let current = LoopId::new().unwrap();
+            let base = vec![text(LoopId::new().unwrap(), 0, &"old".repeat(1_000))];
+            let appended = vec![user(current, "preserve current input", false)];
+            let settled = if index == 0 { &[][..] } else { &appended[..] };
+            let limits = &mut auto.binding.limits;
+            if by_bytes {
+                limits.max_history_bytes = 2
+                    * (crate::sessions::estimate_history_bytes(&base)
+                        + crate::sessions::estimate_history_bytes(settled))
+                    + 1;
+            } else {
+                limits.max_history_items = 2 * (base.len() + settled.len()) + 1;
+            }
+            let system = BoundedText::new("system").unwrap();
+            let cancel = CancellationToken::new();
+            let below = consolidate(
+                input(
+                    &auto, &system, None, &base, &appended, current, index, &cancel,
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(!below.compacted);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            if by_bytes {
+                auto.binding.limits.max_history_bytes -= 1;
+            } else {
+                auto.binding.limits.max_history_items -= 1;
+            }
+            let at = consolidate(
+                input(
+                    &auto, &system, None, &base, &appended, current, index, &cancel,
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(at.compacted);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+            assert!(at.request.messages().iter().any(|message| matches!(message, ModelMessage::User(text) if text == "preserve current input")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn admission_pressure_returns_only_when_effective_history_grows() {
+    for by_bytes in [false, true] {
+        for emergency in [false, true] {
+            let model = Stub::new(1_000_000, "historical summary", None);
+            let mut auto = context(&model);
+            auto.binding.policy.trigger_percent = 50;
+            let old = LoopId::new().unwrap();
+            let current = LoopId::new().unwrap();
+            let base = (0..10)
+                .flat_map(|index| exchange(old, index, 2_000))
+                .collect::<Vec<_>>();
+            let base_bytes = crate::sessions::estimate_history_bytes(&base);
+            if by_bytes {
+                auto.binding.limits.max_history_bytes = 2 * base_bytes;
+            } else {
+                auto.binding.limits.max_history_items = 2 * base.len();
+            }
+            let system = BoundedText::new("system").unwrap();
+            let cancel = CancellationToken::new();
+            let mut appended = vec![user(current, "current input", false)];
+            let initial_calls = if emergency {
+                let items = base.iter().collect::<Vec<_>>();
+                let groups = super::super::auto::compressible_ranges(base.len(), &items, current)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(key, _)| (key, BoundedText::new("group summary").unwrap()))
+                    .collect();
+                assert!(auto.state.install_emergency_groups(current, groups));
+                0
+            } else {
+                let result = consolidate(
+                    input(&auto, &system, None, &base, &appended, current, 0, &cancel),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert!(result.compacted);
+                1
+            };
+            // Consolidation removes the old groups; emergency summaries each retain one item.
+            let growth_rounds = if emergency { 5 } else { 10 };
+            for round in 1..=growth_rounds {
+                let returns = round == growth_rounds;
+                appended.extend(exchange(
+                    current,
+                    round - 1,
+                    if returns && by_bytes { base_bytes } else { 100 },
+                ));
+                let result = consolidate(
+                    input(
+                        &auto, &system, None, &base, &appended, current, round, &cancel,
+                    ),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.compacted, returns,
+                    "bytes={by_bytes}, emergency={emergency}, round={round}"
+                );
+                assert_eq!(
+                    model.calls.load(Ordering::SeqCst),
+                    initial_calls + usize::from(returns)
+                );
+            }
+        }
+    }
 }

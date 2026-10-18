@@ -179,9 +179,9 @@ impl PreviewObserver {
                         .path
                         .as_ref()
                         .is_some_and(|path| !path.is_empty());
-                let due = self
-                    .last_update
-                    .is_none_or(|last| now.saturating_duration_since(last) >= UPDATE_INTERVAL);
+                let due = self.last_update.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= call.parser.update_interval()
+                });
                 if first_path || (due && call.parser.changes != call.emitted_change) {
                     call.first_path_sent |= first_path;
                     self.emit(index, ToolArgumentsPreviewState::Generating, now);
@@ -218,14 +218,15 @@ impl PreviewObserver {
                     || (call.ended && !call.parser.complete()),
             )
         };
+        let turn = TurnRef {
+            session_id: self.presentation.session_id,
+            loop_id: self.key.loop_id,
+        };
         let _ = self
             .presentation
             .events
             .try_send(AgentEvent::ToolArgumentsPreview {
-                turn: TurnRef {
-                    session_id: self.presentation.session_id,
-                    loop_id: self.key.loop_id,
-                },
+                turn,
                 request_index: self.key.request_index,
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -234,11 +235,7 @@ impl PreviewObserver {
                 state,
                 partial,
                 display,
-                meta: EventMeta {
-                    session_id: self.presentation.session_id,
-                    loop_id: Some(self.key.loop_id),
-                    dropped_before: 0,
-                },
+                meta: EventMeta::for_turn(turn),
             });
         self.last_update = Some(now);
     }
@@ -337,6 +334,56 @@ enum Escape {
     LowU(u16),
     LowUnicode(u16, u8, u16),
 }
+
+impl Escape {
+    fn decode(self, ch: char) -> Option<(Self, Option<char>)> {
+        let decoded = match self {
+            Self::None => match ch {
+                '\\' => return Some((Self::Slash, None)),
+                c if c < '\u{20}' => return None,
+                c => c,
+            },
+            Self::Slash => match ch {
+                'u' => return Some((Self::Unicode(0, 0), None)),
+                '"' | '\\' | '/' => ch,
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                _ => return None,
+            },
+            Self::LowSlash(high) if ch == '\\' => return Some((Self::LowU(high), None)),
+            Self::LowU(high) if ch == 'u' => return Some((Self::LowUnicode(high, 0, 0), None)),
+            Self::Unicode(digits, value) | Self::LowUnicode(_, digits, value) => {
+                let high = match self {
+                    Self::LowUnicode(high, _, _) => Some(high),
+                    _ => None,
+                };
+                let value = (value << 4) | ch.to_digit(16)? as u16;
+                if digits < 3 {
+                    return Some((
+                        match high {
+                            Some(high) => Self::LowUnicode(high, digits + 1, value),
+                            None => Self::Unicode(digits + 1, value),
+                        },
+                        None,
+                    ));
+                }
+                match (high, value) {
+                    (Some(high), 0xdc00..=0xdfff) => char::from_u32(
+                        0x10000 + ((u32::from(high) - 0xd800) << 10) + u32::from(value) - 0xdc00,
+                    )?,
+                    (Some(_), _) | (None, 0xdc00..=0xdfff) => return None,
+                    (None, 0xd800..=0xdbff) => return Some((Self::LowSlash(value), None)),
+                    (None, _) => char::from_u32(u32::from(value))?,
+                }
+            }
+            _ => return None,
+        };
+        Some((Self::None, Some(decoded)))
+    }
+}
 #[derive(Clone, Copy)]
 enum NumberState {
     Minus,
@@ -398,8 +445,6 @@ struct PreviewParser {
     body_cut: bool,
     invalid: bool,
     changes: u64,
-    #[cfg(test)]
-    scanned: usize,
 }
 
 impl PreviewParser {
@@ -424,8 +469,6 @@ impl PreviewParser {
             body_cut: false,
             invalid: false,
             changes: 0,
-            #[cfg(test)]
-            scanned: 0,
         }
     }
 
@@ -458,10 +501,6 @@ impl PreviewParser {
             if self.invalid {
                 break;
             }
-            #[cfg(test)]
-            {
-                self.scanned += 1;
-            }
             if let Some(token) = self.token.take() {
                 if self.token_char(token, ch, stream_bytes) {
                     continue;
@@ -478,104 +517,20 @@ impl PreviewParser {
     fn token_char(&mut self, token: Token, ch: char, bytes: &mut usize) -> bool {
         match token {
             Token::String { capture, escape } => {
-                let mut decoded = None;
-                let next = match escape {
-                    Escape::None => match ch {
-                        '"' => {
-                            if matches!(capture, Capture::Key) {
-                                self.finish_key(bytes);
-                            } else if matches!(
-                                self.stack.last(),
-                                Some(Frame::Object(ObjectState::KeyOrEnd | ObjectState::Key))
-                            ) {
-                                *self.stack.last_mut().unwrap() = Frame::Object(ObjectState::Colon);
-                            }
-                            return true;
-                        }
-                        '\\' => Escape::Slash,
-                        c if c < '\u{20}' => {
-                            self.fail(bytes);
-                            return true;
-                        }
-                        c => {
-                            decoded = Some(c);
-                            Escape::None
-                        }
-                    },
-                    Escape::Slash => match ch {
-                        '"' | '\\' | '/' => {
-                            decoded = Some(ch);
-                            Escape::None
-                        }
-                        'b' => {
-                            decoded = Some('\u{8}');
-                            Escape::None
-                        }
-                        'f' => {
-                            decoded = Some('\u{c}');
-                            Escape::None
-                        }
-                        'n' => {
-                            decoded = Some('\n');
-                            Escape::None
-                        }
-                        'r' => {
-                            decoded = Some('\r');
-                            Escape::None
-                        }
-                        't' => {
-                            decoded = Some('\t');
-                            Escape::None
-                        }
-                        'u' => Escape::Unicode(0, 0),
-                        _ => {
-                            self.fail(bytes);
-                            return true;
-                        }
-                    },
-                    Escape::Unicode(digits, value) => {
-                        let Some(hex) = ch.to_digit(16) else {
-                            self.fail(bytes);
-                            return true;
-                        };
-                        let value = (value << 4) | hex as u16;
-                        if digits < 3 {
-                            Escape::Unicode(digits + 1, value)
-                        } else if (0xd800..=0xdbff).contains(&value) {
-                            Escape::LowSlash(value)
-                        } else if (0xdc00..=0xdfff).contains(&value) {
-                            self.fail(bytes);
-                            return true;
-                        } else {
-                            decoded = char::from_u32(u32::from(value));
-                            Escape::None
-                        }
+                if matches!(escape, Escape::None) && ch == '"' {
+                    if matches!(capture, Capture::Key) {
+                        self.finish_key(bytes);
+                    } else if matches!(
+                        self.stack.last(),
+                        Some(Frame::Object(ObjectState::KeyOrEnd | ObjectState::Key))
+                    ) {
+                        *self.stack.last_mut().unwrap() = Frame::Object(ObjectState::Colon);
                     }
-                    Escape::LowSlash(high) if ch == '\\' => Escape::LowU(high),
-                    Escape::LowU(high) if ch == 'u' => Escape::LowUnicode(high, 0, 0),
-                    Escape::LowUnicode(high, digits, value) => {
-                        let Some(hex) = ch.to_digit(16) else {
-                            self.fail(bytes);
-                            return true;
-                        };
-                        let value = (value << 4) | hex as u16;
-                        if digits < 3 {
-                            Escape::LowUnicode(high, digits + 1, value)
-                        } else if (0xdc00..=0xdfff).contains(&value) {
-                            decoded = char::from_u32(
-                                0x10000 + ((u32::from(high) - 0xd800) << 10) + u32::from(value)
-                                    - 0xdc00,
-                            );
-                            Escape::None
-                        } else {
-                            self.fail(bytes);
-                            return true;
-                        }
-                    }
-                    _ => {
-                        self.fail(bytes);
-                        return true;
-                    }
+                    return true;
+                }
+                let Some((next, decoded)) = escape.decode(ch) else {
+                    self.fail(bytes);
+                    return true;
                 };
                 if let Some(ch) = decoded {
                     self.capture(capture, ch, bytes);
@@ -889,21 +844,13 @@ impl PreviewParser {
                             },
                         })
                     }
-                    't' => {
+                    't' | 'f' | 'n' => {
                         self.token = Some(Token::Literal {
-                            expected: "true",
-                            index: 1,
-                        })
-                    }
-                    'f' => {
-                        self.token = Some(Token::Literal {
-                            expected: "false",
-                            index: 1,
-                        })
-                    }
-                    'n' => {
-                        self.token = Some(Token::Literal {
-                            expected: "null",
+                            expected: match ch {
+                                't' => "true",
+                                'f' => "false",
+                                _ => "null",
+                            },
                             index: 1,
                         })
                     }
@@ -921,18 +868,16 @@ impl PreviewParser {
         }
     }
 
+    fn update_interval(&self) -> Duration {
+        // Full snapshots target at most 128 KiB/s, retaining 30 Hz for small cards.
+        let bytes = self.path.as_ref().map_or(0, String::len)
+            + self.content.as_ref().map_or(0, String::len);
+        UPDATE_INTERVAL.max(Duration::from_secs_f64(bytes as f64 / (128.0 * 1024.0)))
+    }
+
     fn display(&self) -> ToolDisplay {
         let mut detail = self.path.clone().unwrap_or_else(|| "...".to_owned());
-        if self.offset.is_some() || self.limit.is_some() {
-            let offset = self.offset.unwrap_or(1);
-            detail.push_str(&format!(":{offset}"));
-            if let Some(limit) = self.limit {
-                detail.push_str(&format!(
-                    "-{}",
-                    offset.saturating_add(limit).saturating_sub(1)
-                ));
-            }
-        }
+        detail.push_str(&super::format_read_range(self.offset, self.limit));
         let (detail, detail_cut) = single_line(&detail, MAX_DETAIL_BYTES);
         let rows = self.content.as_deref().map(count_lines);
         ToolDisplay {

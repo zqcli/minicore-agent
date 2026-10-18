@@ -188,17 +188,15 @@ async fn expired_prompt_deadline_is_rejected_before_workspace_read() {
 
 #[tokio::test]
 async fn cancellation_after_read_future_is_pending_returns_cancelled() {
-    let workspace = Arc::new(
-        Workspace::open(std::env::temp_dir().to_path_buf())
-            .await
-            .unwrap(),
-    );
-    let gate = Arc::new(PromptReadGate::new());
-    let provider = ProjectPromptProvider::new_with_read_gate(
+    let temp = crate::test_support::TempDir::new("prompt-gate");
+    let workspace = Arc::new(Workspace::open(temp.path().to_path_buf()).await.unwrap());
+    let gate = Arc::new(crate::test_support::Gate::new());
+    READ_GATE.arm(workspace.root().to_owned(), Arc::clone(&gate));
+    let provider = ProjectPromptProvider::with_auto(
         workspace,
         "system".to_owned(),
         CompactionState::new(),
-        Arc::clone(&gate),
+        None,
     )
     .unwrap();
     let model = ModelDescriptor::new(
@@ -220,7 +218,7 @@ async fn cancellation_after_read_future_is_pending_returns_cancelled() {
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
     });
     tokio::select! {
-        _ = gate.wait_until_pending() => {}
+        _ = gate.wait_started() => {}
         result = &mut future => panic!("read completed before it was cancelled: {result:?}"),
     }
     cancellation.cancel();
@@ -229,17 +227,15 @@ async fn cancellation_after_read_future_is_pending_returns_cancelled() {
 
 #[tokio::test]
 async fn deadline_after_read_future_is_pending_returns_cancelled() {
-    let workspace = Arc::new(
-        Workspace::open(std::env::temp_dir().to_path_buf())
-            .await
-            .unwrap(),
-    );
-    let gate = Arc::new(PromptReadGate::new());
-    let provider = ProjectPromptProvider::new_with_read_gate(
+    let temp = crate::test_support::TempDir::new("prompt-gate");
+    let workspace = Arc::new(Workspace::open(temp.path().to_path_buf()).await.unwrap());
+    let gate = Arc::new(crate::test_support::Gate::new());
+    READ_GATE.arm(workspace.root().to_owned(), Arc::clone(&gate));
+    let provider = ProjectPromptProvider::with_auto(
         workspace,
         "system".to_owned(),
         CompactionState::new(),
-        Arc::clone(&gate),
+        None,
     )
     .unwrap();
     let model = ModelDescriptor::new(
@@ -261,11 +257,18 @@ async fn deadline_after_read_future_is_pending_returns_cancelled() {
         deadline,
     });
     tokio::select! {
-        _ = gate.wait_until_pending() => {}
+        _ = gate.wait_started() => {}
         result = &mut future => panic!("read completed before its deadline: {result:?}"),
     }
     tokio::time::sleep_until(deadline).await;
     // Runtime exposes both provider cancellation and an expired prompt
     // deadline as PromptError::Cancelled.
     assert!(matches!(future.await, Err(PromptError::Cancelled)));
+}
+
+pub(super) async fn read_agents(workspace: &Workspace) -> Result<ReadPrefix, WorkspaceError> {
+    if let Some(gate) = READ_GATE.take(&workspace.root().to_owned()) {
+        gate.pass().await;
+    }
+    workspace.read_prefix(AGENTS_PATH, MAX_AGENTS_BYTES).await
 }

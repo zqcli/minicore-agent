@@ -1962,7 +1962,10 @@ Write cards can show the first 10 logical lines while collapsed; this is an
 input preview, not Bash output or process timing.
 
 Changed snapshots are cloned and emitted at most 30 times per second across
-the stream, driven only by incoming deltas. Call start, first visible path,
+the stream, driven only by incoming deltas. The interval grows with retained
+preview size: the larger of approximately 33 ms and display bytes / 128 KiB per
+second (before JSON framing/escaping). Large cards therefore emit less often
+instead of repeatedly sending their full body at 30 Hz. Call start, first visible path,
 call end, and discard are bounded immediate exceptions. No extra timer or task
 is created. The existing bounded event queue may drop any snapshot, including
 the first or last. Later snapshots are independently usable; no client-side

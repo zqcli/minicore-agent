@@ -15,6 +15,12 @@ pub(crate) const MAX_AGENTS_BYTES: usize = 64 * 1024;
 const PROJECT_ENVELOPE: &str = "[minicore-project-instructions source=AGENTS.md]";
 const TRUNCATED: &str = "[truncated]";
 
+#[cfg(test)]
+static READ_GATE: crate::test_support::Registry<
+    std::path::PathBuf,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
 /// Request-level prompt provider that merges the session system prompt with a
 /// freshly read workspace `AGENTS.md`, applies the session-local or
 /// execution-bound derived snapshot projection, and delegates the remaining
@@ -28,11 +34,9 @@ const TRUNCATED: &str = "[truncated]";
 pub(crate) struct ProjectPromptProvider {
     workspace: Arc<Workspace>,
     system_prompt: BoundedText,
-    compaction: Option<Arc<CompactionState>>,
+    compaction: Arc<CompactionState>,
     bound_summary: Option<BoundedText>,
     auto: Option<AutoContext>,
-    #[cfg(test)]
-    read_gate: Option<Arc<PromptReadGate>>,
 }
 
 impl ProjectPromptProvider {
@@ -47,11 +51,9 @@ impl ProjectPromptProvider {
         Ok(Self {
             workspace,
             system_prompt,
-            compaction: Some(compaction),
+            compaction,
             bound_summary: None,
             auto,
-            #[cfg(test)]
-            read_gate: None,
         })
     }
 
@@ -62,29 +64,10 @@ impl ProjectPromptProvider {
         auto: Option<AutoContext>,
         compaction: Arc<CompactionState>,
     ) -> Result<Self, AgentPromptError> {
-        let system_prompt =
-            BoundedText::new(system_prompt).map_err(|_| AgentPromptError::InvalidSystemPrompt)?;
         Ok(Self {
-            workspace,
-            system_prompt,
-            compaction: Some(compaction),
             bound_summary: Some(summary),
-            auto,
-            #[cfg(test)]
-            read_gate: None,
+            ..Self::with_auto(workspace, system_prompt, compaction, auto)?
         })
-    }
-
-    #[cfg(test)]
-    fn new_with_read_gate(
-        workspace: Arc<Workspace>,
-        system_prompt: String,
-        compaction: Arc<CompactionState>,
-        read_gate: Arc<PromptReadGate>,
-    ) -> Result<Self, AgentPromptError> {
-        let mut provider = Self::with_auto(workspace, system_prompt, compaction, None)?;
-        provider.read_gate = Some(read_gate);
-        Ok(provider)
     }
 }
 
@@ -96,11 +79,18 @@ pub(crate) enum AgentPromptError {
 
 impl PromptProvider for ProjectPromptProvider {
     fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
+        Box::pin(self.prepare_inner(request))
+    }
+}
+
+impl ProjectPromptProvider {
+    async fn prepare_inner(
+        &self,
+        request: PromptRequest<'_>,
+    ) -> Result<minicore_runtime::prompt::PreparedPrompt, PromptError> {
         if request.cancellation.is_cancelled() || request.deadline <= tokio::time::Instant::now() {
-            return Box::pin(async { Err(PromptError::Cancelled) });
+            return Err(PromptError::Cancelled);
         }
-        let workspace = Arc::clone(&self.workspace);
-        let system_base = self.system_prompt.clone();
         let cancellation = request.cancellation.clone();
         let deadline = request.deadline;
         let loop_id = request.loop_id;
@@ -109,237 +99,175 @@ impl PromptProvider for ProjectPromptProvider {
         let model = request.model;
         let reasoning = request.reasoning;
         let tools = request.tools;
-        let compaction = self.compaction.as_ref().map(Arc::clone);
-        let bound_summary = self.bound_summary.clone();
-        let auto = self.auto.clone();
-        #[cfg(test)]
-        let read_gate = self.read_gate.clone();
-        Box::pin(async move {
-            #[cfg(test)]
-            let read = read_agents_with_gate(workspace, read_gate);
-            #[cfg(not(test))]
-            let read = workspace.read_prefix(AGENTS_PATH, MAX_AGENTS_BYTES);
-            tokio::pin!(read);
-            let prefix = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(PromptError::Cancelled),
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(PromptError::Cancelled);
-                }
-                result = &mut read => result,
-            };
-            let agents = match prefix {
-                Ok(prefix) => match decode_agents(&prefix) {
-                    Ok(content) => Some(content),
-                    Err(_) => return Err(PromptError::InvalidHistory),
-                },
-                Err(WorkspaceError::NotFound) => None,
-                Err(_) => return Err(PromptError::InvalidHistory),
-            };
-            let system = build_system_prompt(&system_base, agents)
-                .map_err(|_| PromptError::InvalidHistory)?;
-            let compaction_for_clear = compaction.clone();
-            let (projected_base, summary) = if let Some(summary) = bound_summary {
-                (history.base(), Some(summary))
-            } else if let Some(compaction) = compaction {
-                match compaction.project(history.base()) {
-                    Some(projection) => (projection.suffix, Some(projection.summary)),
-                    None => (history.base(), None),
-                }
-            } else {
-                (history.base(), None)
-            };
-            let Some(auto) = auto.filter(|auto| auto.policy.enabled) else {
-                // Keep the disabled path on Runtime's original provider so
-                // automatic compaction does not change established history
-                // projection semantics.
-                let provider = DefaultPromptProvider::new(Some(system));
-                let projected_history = HistoryView::new(projected_base, history.appended());
-                let mut prepared = provider
-                    .prepare(PromptRequest {
-                        loop_id,
-                        request_index,
-                        history: projected_history,
-                        model,
-                        reasoning,
-                        tools,
-                        cancellation,
-                        deadline,
-                    })
-                    .await?;
-                if let Some(summary) = summary {
-                    let summary_message =
-                        summary_data_message(&summary).map_err(|_| PromptError::InvalidHistory)?;
-                    let insert_at = prepared
-                        .messages
-                        .iter()
-                        .position(|message| matches!(message, ModelMessage::System(_)))
-                        .map_or(0, |index| index + 1);
-                    prepared.messages.insert(insert_at, summary_message);
-                }
-                if let Some(compaction) = compaction_for_clear {
-                    compaction.clear_prepare_failure();
-                }
-                return Ok(prepared);
-            };
-            let messages = match crate::compaction::threshold::consolidate(
-                crate::compaction::threshold::ProjectionInput {
-                    auto: &auto,
-                    system: &system,
-                    summary: summary.as_ref(),
-                    base: projected_base,
-                    appended: history.appended(),
-                    tools,
-                    reasoning,
-                    limits: minicore_runtime::model::ModelLimits::default(),
+
+        let system = self.read_system_prompt(&cancellation, deadline).await?;
+        let (projected_base, summary) = if let Some(summary) = &self.bound_summary {
+            (history.base(), Some(summary.clone()))
+        } else {
+            self.compaction
+                .project(history.base())
+                .map(|projection| (projection.suffix, Some(projection.summary)))
+                .unwrap_or((history.base(), None))
+        };
+        let Some(auto) = self.auto.as_ref().filter(|auto| auto.policy.enabled) else {
+            // Keep the disabled path on Runtime's original provider so
+            // automatic compaction does not change established history
+            // projection semantics.
+            let provider = DefaultPromptProvider::new(Some(system));
+            let projected_history = HistoryView::new(projected_base, history.appended());
+            let mut prepared = provider
+                .prepare(PromptRequest {
                     loop_id,
                     request_index,
-                    deadline: deadline.into_std(),
-                    cancellation: &cancellation,
-                    rejected_body_bytes: None,
-                },
-                false,
-            )
-            .await
+                    history: projected_history,
+                    model,
+                    reasoning,
+                    tools,
+                    cancellation,
+                    deadline,
+                })
+                .await?;
+            if let Some(summary) = summary {
+                let summary_message =
+                    summary_data_message(&summary).map_err(|_| PromptError::InvalidHistory)?;
+                let insert_at = prepared
+                    .messages
+                    .iter()
+                    .position(|message| matches!(message, ModelMessage::System(_)))
+                    .map_or(0, |index| index + 1);
+                prepared.messages.insert(insert_at, summary_message);
+            }
+            self.compaction.clear_prepare_failure();
+            return Ok(prepared);
+        };
+        let messages = match crate::compaction::threshold::consolidate(
+            crate::compaction::threshold::ProjectionInput {
+                auto,
+                system: &system,
+                summary: summary.as_ref(),
+                base: projected_base,
+                appended: history.appended(),
+                tools,
+                reasoning,
+                limits: minicore_runtime::model::ModelLimits::default(),
+                loop_id,
+                request_index,
+                deadline: deadline.into_std(),
+                cancellation: &cancellation,
+                rejected_body_bytes: None,
+            },
+            false,
+        )
+        .await
+        {
+            Ok(result) => {
+                auto.state.clear_prepare_failure();
+                result.request.messages().to_vec()
+            }
+            Err(error)
+                if matches!(
+                    error.error,
+                    crate::compaction::UtilityError::Cancelled
+                        | crate::compaction::UtilityError::Timeout
+                ) =>
             {
-                Ok(result) => {
-                    if result.compacted {
-                        auto.state.clear_prepare_failure();
-                    }
-                    result.request.messages().to_vec()
-                }
-                Err(error)
-                    if matches!(
-                        error.error,
-                        crate::compaction::UtilityError::Cancelled
-                            | crate::compaction::UtilityError::Timeout
-                    ) =>
-                {
-                    return Err(PromptError::Cancelled);
-                }
-                Err(error) => {
-                    auto.state.note_prepare_failure(error.error.kind());
-                    // History items are projected exactly as the runtime
-                    // `DefaultPromptProvider` would, then kept separate from the
-                    // system/durable-summary prefix so groups can be folded.
-                    let (fixed, history_messages) = crate::compaction::auto_compose(
-                        &system,
-                        summary.as_ref(),
-                        projected_base,
-                        history.appended(),
-                    )
-                    .map_err(|_| PromptError::InvalidHistory)?;
-                    let items = projected_base
-                        .iter()
-                        .chain(history.appended())
-                        .collect::<Vec<_>>();
-                    let ranges = crate::compaction::auto::compressible_ranges(
-                        projected_base.len(),
-                        &items,
-                        loop_id,
-                    )
-                    .map_err(|_| PromptError::InvalidHistory)?;
-                    let valid_keys = ranges.iter().map(|(key, _)| key.clone()).collect();
-                    let folded = auto.state.emergency_groups(loop_id, &valid_keys);
-                    let consolidated =
-                        auto.state
-                            .consolidated(loop_id, summary.as_ref(), &valid_keys);
-                    crate::compaction::auto::fold_history_with_ranges(
-                        &fixed,
-                        &history_messages,
-                        items.len(),
-                        &ranges,
-                        &folded,
-                        consolidated.as_ref(),
-                    )
-                    .map_err(|_| PromptError::InvalidHistory)?
-                }
-            };
-            {
-                // Bound the retained recovery source before cloning any
-                // history item; an over-cap source is never copied.
-                let source_safe = crate::compaction::recovery_source_is_safe(
+                return Err(PromptError::Cancelled);
+            }
+            Err(error) => {
+                auto.state.note_prepare_failure(error.error.kind());
+                crate::compaction::auto::Projection::new(
+                    &auto.state,
                     &system,
                     summary.as_ref(),
                     projected_base,
                     history.appended(),
+                    loop_id,
+                )
+                .and_then(|projection| projection.messages())
+                .map_err(|_| PromptError::InvalidHistory)?
+            }
+        };
+        {
+            // Bound the retained recovery source before cloning any
+            // history item; an over-cap source is never copied.
+            let source_safe = crate::compaction::recovery_source_is_safe(
+                &system,
+                summary.as_ref(),
+                projected_base,
+                history.appended(),
+                tools,
+            );
+            let settings = auto.state.request_settings();
+            let ticket = if source_safe {
+                crate::compaction::compute_content_hash(&crate::compaction::TicketFraming {
+                    loop_id,
+                    request_index,
+                    messages: &messages,
                     tools,
-                );
-                let settings = auto.state.request_settings();
-                let ticket = if source_safe {
-                    crate::compaction::compute_content_hash(
+                    model_descriptor: model,
+                    reasoning,
+                    config_generation: settings.config_generation,
+                    summary_generation: settings.summary_generation,
+                })
+                .ok()
+                .map(|content_hash| {
+                    crate::compaction::ActiveRecoveryTicket {
                         loop_id,
                         request_index,
-                        &messages,
-                        tools,
-                        model,
+                        content_hash,
+                        ticket_hash: None,
+                        original_body_bytes: 0,
+                        system: system.clone(),
+                        summary: summary.clone(),
+                        base: projected_base.to_vec(),
+                        appended: history.appended().to_vec(),
+                        tools: tools.to_vec(),
+                        limits: minicore_runtime::model::ModelLimits::default(),
                         reasoning,
-                        settings.config_generation,
-                        settings.summary_generation,
-                    )
-                    .ok()
-                    .map(|content_hash| {
-                        crate::compaction::ActiveRecoveryTicket {
-                            loop_id,
-                            request_index,
-                            content_hash,
-                            ticket_hash: None,
-                            original_body_bytes: 0,
-                            original_tokens: 0,
-                            system: system.clone(),
-                            summary: summary.clone(),
-                            base: projected_base.to_vec(),
-                            appended: history.appended().to_vec(),
-                            tools: tools.to_vec(),
-                            limits: minicore_runtime::model::ModelLimits::default(),
-                            reasoning,
-                            // The utility binding is the one this provider
-                            // is preparing the request with. It is never
-                            // replaced by a later global settings read.
-                            auto_binding: Some(auto.binding()),
-                        }
-                    })
-                } else {
-                    None
-                };
-                auto.state
-                    .register_recovery_ticket(loop_id, request_index, ticket);
-                Ok(minicore_runtime::prompt::PreparedPrompt { messages })
-            }
-        })
-    }
-}
-
-#[cfg(test)]
-struct PromptReadGate {
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl PromptReadGate {
-    fn new() -> Self {
-        Self {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+                        // The utility binding is the one this provider
+                        // is preparing the request with. It is never
+                        // replaced by a later global settings read.
+                        auto_binding: Some(auto.binding()),
+                    }
+                })
+            } else {
+                None
+            };
+            auto.state
+                .register_recovery_ticket(loop_id, request_index, ticket);
+            Ok(minicore_runtime::prompt::PreparedPrompt { messages })
         }
     }
 
-    async fn wait_until_pending(&self) {
-        self.entered.notified().await;
+    async fn read_system_prompt(
+        &self,
+        cancellation: &tokio_util::sync::CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<BoundedText, PromptError> {
+        let workspace = &self.workspace;
+        #[cfg(test)]
+        let read = tests::read_agents(workspace);
+        #[cfg(not(test))]
+        let read = workspace.read_prefix(AGENTS_PATH, MAX_AGENTS_BYTES);
+        tokio::pin!(read);
+        let prefix = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(PromptError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(PromptError::Cancelled);
+            }
+            result = &mut read => result,
+        };
+        let agents = match prefix {
+            Ok(prefix) => match decode_agents(&prefix) {
+                Ok(content) => Some(content),
+                Err(_) => return Err(PromptError::InvalidHistory),
+            },
+            Err(WorkspaceError::NotFound) => None,
+            Err(_) => return Err(PromptError::InvalidHistory),
+        };
+        build_system_prompt(&self.system_prompt, agents).map_err(|_| PromptError::InvalidHistory)
     }
-}
-
-#[cfg(test)]
-async fn read_agents_with_gate(
-    workspace: Arc<Workspace>,
-    gate: Option<Arc<PromptReadGate>>,
-) -> Result<ReadPrefix, WorkspaceError> {
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
-    workspace.read_prefix(AGENTS_PATH, MAX_AGENTS_BYTES).await
 }
 
 /// Reads and validates the workspace `AGENTS.md` root file content. An

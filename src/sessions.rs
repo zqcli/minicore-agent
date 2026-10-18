@@ -509,6 +509,7 @@ struct CompactionReservation {
     /// never gated by this estimate.
     automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
     trigger_tokens: Option<u64>,
+    history_triggered: bool,
     deadline: Instant,
 }
 
@@ -2002,13 +2003,18 @@ fn map_loop_event(
             // the lookup remains best-effort because the event and presentation
             // channels have independent delivery/drop semantics. Terminal
             // structured facts are recorded once by `tool_execution_event`.
-            let presentation_result = session.presentation().tool_result(
-                crate::tools::observe::RequestKey {
-                    loop_id,
-                    request_index,
-                },
-                &call_id,
-            );
+            let (content, content_truncated) = session
+                .presentation()
+                .take_tool_result(
+                    crate::tools::observe::RequestKey {
+                        loop_id,
+                        request_index,
+                    },
+                    &call_id,
+                )
+                .map_or((None, false), |(content, truncated)| {
+                    (Some(content), truncated)
+                });
             Some(AgentEvent::ToolFinished {
                 turn,
                 request_index,
@@ -2016,10 +2022,8 @@ fn map_loop_event(
                 result: ToolResultView {
                     outcome,
                     content_bytes: output_bytes,
-                    content: presentation_result
-                        .as_ref()
-                        .map(|(content, _)| content.clone()),
-                    content_truncated: presentation_result.is_some_and(|(_, truncated)| truncated),
+                    content,
+                    content_truncated,
                 },
                 meta,
             })

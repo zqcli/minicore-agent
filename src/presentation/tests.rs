@@ -522,7 +522,7 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
         crate::compaction::CompactionState::new(),
     );
     let observer = ToolObserver::new(
-        presentation.session_id(),
+        presentation.session_id,
         Arc::new(ToolData::new()),
         AgentEventSink::new(tokio::sync::mpsc::channel(8).0),
     );
@@ -550,7 +550,7 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
     presentation.note_request_start(first_key);
     presentation.begin_tool(Some(first_key), &invocation, display.clone());
     let first_ref = ToolRef {
-        session_id: presentation.session_id(),
+        session_id: presentation.session_id,
         loop_id: first_key.loop_id,
         request_index: 0,
         tool_call_id: call_id.clone(),
@@ -567,7 +567,7 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
     presentation.note_request_start(second_key);
     presentation.begin_tool(Some(second_key), &invocation, display);
     let second_ref = ToolRef {
-        session_id: presentation.session_id(),
+        session_id: presentation.session_id,
         loop_id: second_key.loop_id,
         request_index: 0,
         tool_call_id: call_id.clone(),
@@ -614,14 +614,21 @@ fn finishing_a_call_removes_its_live_entry() {
             truncated: false,
         },
     );
-    presentation.finish_tool(Some(key), &call_id, None);
+    presentation.finish_tool(Some(key), &call_id, Some(("tool output".into(), true)));
     assert!(presentation.lock().live_tools.is_empty());
+    assert_eq!(
+        presentation.take_tool_result(key, &call_id),
+        Some(("tool output".into(), true))
+    );
+    assert_eq!(presentation.take_tool_result(key, &call_id), None);
+    assert!(presentation.lock().tool_results.is_empty());
 }
 
 #[tokio::test]
 async fn presentation_tool_variants_share_binding_and_finish() {
     let session_id = SessionId::new().unwrap();
-    let base = std::env::temp_dir().join(format!("minicore-agent-presentation-tool-{session_id}"));
+    let temp = crate::test_support::TempDir::new("presentation-tool");
+    let base = temp.path();
     let root = base.join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(crate::Workspace::open(root).await.unwrap());
@@ -658,40 +665,40 @@ async fn presentation_tool_variants_share_binding_and_finish() {
     let tools = [
         (
             "read",
-            PresentationTool::new_with_observer(
-                plain,
+            PresentationTool::new(
+                crate::presentation::ToolImpl::Plain(plain),
                 Arc::clone(&presentation),
                 Arc::clone(&observer),
             ),
         ),
         (
             "bash",
-            PresentationTool::new_bash_with_observer(
-                bash,
+            PresentationTool::new(
+                crate::presentation::ToolImpl::Bash(bash),
                 Arc::clone(&presentation),
                 Arc::clone(&observer),
             ),
         ),
         (
             "write",
-            PresentationTool::new_write_with_observer(
-                write,
+            PresentationTool::new(
+                crate::presentation::ToolImpl::Write(write),
                 Arc::clone(&presentation),
                 Arc::clone(&observer),
             ),
         ),
         (
             "edit",
-            PresentationTool::new_edit_with_observer(
-                edit,
+            PresentationTool::new(
+                crate::presentation::ToolImpl::Edit(edit),
                 Arc::clone(&presentation),
                 Arc::clone(&observer),
             ),
         ),
         (
             "apply_patch",
-            PresentationTool::new_apply_patch_with_observer(
-                apply_patch,
+            PresentationTool::new(
+                crate::presentation::ToolImpl::ApplyPatch(apply_patch),
                 Arc::clone(&presentation),
                 Arc::clone(&observer),
             ),
@@ -779,7 +786,6 @@ async fn presentation_tool_variants_share_binding_and_finish() {
 
     assert!(observer_events.try_recv().is_err());
     assert!(presentation_events.try_recv().is_err());
-    let _ = tokio::fs::remove_dir_all(base).await;
 }
 
 #[test]
