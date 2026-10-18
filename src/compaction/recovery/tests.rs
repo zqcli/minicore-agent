@@ -2,6 +2,8 @@ use super::*;
 use crate::compaction::CompactionPolicy;
 use crate::compaction::{auto::compressible_ranges, auto_compose};
 use crate::models::tests::DefaultProviderBudget;
+use crate::test_support::model::context_overflow;
+use crate::test_support::{ScriptedModel, Step};
 use minicore_runtime::ToolCallId;
 use minicore_runtime::execution::UserInput;
 use minicore_runtime::history::{
@@ -13,94 +15,22 @@ use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-#[derive(Clone)]
-enum RawBehavior {
-    Never,
-    ContextOverflow,
-    OverflowThenPending,
-    Summary(&'static str),
-    Summaries(Vec<String>),
+fn raw_model(steps: impl IntoIterator<Item = Step>) -> Arc<ScriptedModel> {
+    ScriptedModel::with_reasoning("main", 16_384, [ReasoningPreference::Auto].into(), steps)
 }
 
-struct RawTestModel {
-    descriptor: ModelDescriptor,
-    behavior: RawBehavior,
-    calls: Arc<AtomicUsize>,
-    before_start: Option<Arc<dyn Fn() + Send + Sync>>,
+fn summary_model(text: &str) -> Arc<ScriptedModel> {
+    let events = summary_events(text);
+    raw_model([]).with_fallback(move || Step::Events(events.clone()))
 }
 
-impl RawTestModel {
-    fn new(behavior: RawBehavior) -> Arc<Self> {
-        Self::with_hook(behavior, None)
-    }
-
-    fn with_hook(
-        behavior: RawBehavior,
-        before_start: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> Arc<Self> {
-        let descriptor = ModelDescriptor::new(
-            "main".parse().unwrap(),
-            16_384,
-            std::collections::BTreeSet::from([ReasoningPreference::Auto]),
-            true,
-        )
-        .unwrap();
-        Arc::new(Self {
-            descriptor,
-            behavior,
-            calls: Arc::new(AtomicUsize::new(0)),
-            before_start,
-        })
-    }
-}
-
-impl Model for RawTestModel {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn start(&self, _request: ModelRequest, _context: ModelCallContext) -> ModelStartFuture<'_> {
-        if let Some(hook) = &self.before_start {
-            hook();
-        }
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        match &self.behavior {
-            RawBehavior::Never => Box::pin(std::future::pending()),
-            RawBehavior::OverflowThenPending if call > 0 => Box::pin(std::future::pending()),
-            RawBehavior::OverflowThenPending | RawBehavior::ContextOverflow => Box::pin(async {
-                let diagnostic = minicore_runtime::error::DiagnosticSummary::new(
-                    minicore_runtime::error::DiagnosticCode::InvalidConfiguration,
-                    minicore_runtime::error::DiagnosticCategory::Model,
-                    BoundedText::new("context window exceeded").unwrap(),
-                    false,
-                )
-                .unwrap();
-                Err(ModelError::permanent(
-                    ModelErrorKind::ContextOverflow,
-                    DeliveryState::NotStarted,
-                    diagnostic,
-                ))
-            }),
-            RawBehavior::Summary(_) | RawBehavior::Summaries(_) => {
-                let text = match &self.behavior {
-                    RawBehavior::Summary(text) => (*text).to_owned(),
-                    RawBehavior::Summaries(texts) => texts[call].clone(),
-                    _ => unreachable!(),
-                };
-                Box::pin(async move {
-                    let events = vec![
-                        Ok(ModelEvent::text_delta(text).unwrap()),
-                        Ok(ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        }),
-                    ];
-                    let stream: minicore_runtime::model::ModelStream =
-                        Box::pin(futures_util::stream::iter(events));
-                    Ok(stream)
-                })
-            }
-        }
-    }
+fn summary_events(text: &str) -> Vec<ModelEvent> {
+    vec![
+        ModelEvent::text_delta(text).unwrap(),
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Stop,
+        },
+    ]
 }
 
 fn test_request() -> ModelRequest {
@@ -126,7 +56,7 @@ async fn wait_for_calls(calls: &AtomicUsize, target: usize) {
 
 #[tokio::test]
 async fn pre_start_cancellation_is_reported_not_started() {
-    let raw = RawTestModel::new(RawBehavior::Never);
+    let raw = raw_model([Step::Pending]);
     let compacting = CompactingModel::new(
         Arc::clone(&raw) as Arc<dyn Model>,
         Arc::new(DefaultProviderBudget),
@@ -157,7 +87,7 @@ async fn pre_start_cancellation_is_reported_not_started() {
 
 #[tokio::test]
 async fn pre_start_expired_deadline_is_reported_not_started() {
-    let raw = RawTestModel::new(RawBehavior::Never);
+    let raw = raw_model([Step::Pending]);
     let compacting = CompactingModel::new(
         Arc::clone(&raw) as Arc<dyn Model>,
         Arc::new(DefaultProviderBudget),
@@ -186,7 +116,7 @@ async fn pre_start_expired_deadline_is_reported_not_started() {
 
 #[tokio::test]
 async fn in_flight_cancellation_is_reported_unknown() {
-    let raw = RawTestModel::new(RawBehavior::Never);
+    let raw = raw_model([Step::Pending]);
     let compacting = CompactingModel::new(
         Arc::clone(&raw) as Arc<dyn Model>,
         Arc::new(DefaultProviderBudget),
@@ -217,7 +147,7 @@ async fn in_flight_cancellation_is_reported_unknown() {
 
 #[tokio::test]
 async fn in_flight_deadline_is_reported_unknown() {
-    let raw = RawTestModel::new(RawBehavior::Never);
+    let raw = raw_model([Step::Pending]);
     let compacting = CompactingModel::new(
         Arc::clone(&raw) as Arc<dyn Model>,
         Arc::new(DefaultProviderBudget),
@@ -244,7 +174,7 @@ async fn in_flight_deadline_is_reported_unknown() {
 
 #[tokio::test]
 async fn compacting_model_returns_structured_overflow_without_a_ticket() {
-    let raw = RawTestModel::new(RawBehavior::ContextOverflow);
+    let raw = raw_model([]).with_fallback(|| Step::ContextOverflowNotStarted);
     let compacting = CompactingModel::new(
         Arc::clone(&raw) as Arc<dyn Model>,
         Arc::new(DefaultProviderBudget),
@@ -315,7 +245,7 @@ fn big_request() -> ModelRequest {
     .unwrap()
 }
 
-fn recovery_auto(state: &Arc<CompactionState>, model: Arc<RawTestModel>) -> AutoContext {
+fn recovery_auto(state: &Arc<CompactionState>, model: Arc<ScriptedModel>) -> AutoContext {
     AutoContext {
         binding: crate::compaction::auto::AutoContextBinding {
             model: Arc::clone(&model) as Arc<dyn Model>,
@@ -336,7 +266,7 @@ fn recovery_auto(state: &Arc<CompactionState>, model: Arc<RawTestModel>) -> Auto
 
 fn register_recovery_test_ticket(
     state: &CompactionState,
-    raw: &RawTestModel,
+    raw: &ScriptedModel,
     auto: &AutoContext,
     loop_id: LoopId,
     request: &ModelRequest,
@@ -379,8 +309,8 @@ fn register_recovery_test_ticket(
 #[tokio::test]
 async fn second_start_in_flight_cancellation_is_unknown_and_keeps_utility_usage() {
     let loop_id = LoopId::new().unwrap();
-    let raw = RawTestModel::new(RawBehavior::OverflowThenPending);
-    let utility = RawTestModel::new(RawBehavior::Summary("compact summary"));
+    let raw = raw_model([Step::ContextOverflowNotStarted, Step::Pending]);
+    let utility = summary_model("compact summary");
     let state = CompactionState::new();
     let auto = recovery_auto(&state, utility);
     state.note_settings_installed();
@@ -422,8 +352,8 @@ async fn second_start_in_flight_cancellation_is_unknown_and_keeps_utility_usage(
 #[tokio::test]
 async fn second_start_in_flight_deadline_is_unknown_and_keeps_utility_usage() {
     let loop_id = LoopId::new().unwrap();
-    let raw = RawTestModel::new(RawBehavior::OverflowThenPending);
-    let utility = RawTestModel::new(RawBehavior::Summary("compact summary"));
+    let raw = raw_model([Step::ContextOverflowNotStarted, Step::Pending]);
+    let utility = summary_model("compact summary");
     let state = CompactionState::new();
     let auto = recovery_auto(&state, utility);
     state.note_settings_installed();
@@ -461,9 +391,9 @@ async fn second_start_in_flight_deadline_is_unknown_and_keeps_utility_usage() {
 #[tokio::test]
 async fn settings_change_before_start_blocks_recovery() {
     let loop_id = LoopId::new().unwrap();
-    let raw = RawTestModel::new(RawBehavior::ContextOverflow);
-    let utility_a = RawTestModel::new(RawBehavior::Summary("compact summary"));
-    let utility_b = RawTestModel::new(RawBehavior::Summary("newer summary"));
+    let raw = raw_model([]).with_fallback(|| Step::ContextOverflowNotStarted);
+    let utility_a = summary_model("compact summary");
+    let utility_b = summary_model("newer summary");
     let state = CompactionState::new();
     let auto_a = recovery_auto(&state, Arc::clone(&utility_a));
     state.note_settings_installed();
@@ -500,8 +430,8 @@ async fn settings_change_before_start_blocks_recovery() {
 #[tokio::test]
 async fn settings_change_during_raw_start_blocks_recovery() {
     let loop_id = LoopId::new().unwrap();
-    let utility_a = RawTestModel::new(RawBehavior::Summary("compact summary"));
-    let utility_b = RawTestModel::new(RawBehavior::Summary("newer summary"));
+    let utility_a = summary_model("compact summary");
+    let utility_b = summary_model("newer summary");
     let state = CompactionState::new();
     let auto_a = recovery_auto(&state, Arc::clone(&utility_a));
     state.note_settings_installed();
@@ -515,7 +445,10 @@ async fn settings_change_during_raw_start_blocks_recovery() {
     let hook = Arc::new(move || {
         switch_state.note_settings_installed();
     }) as Arc<dyn Fn() + Send + Sync>;
-    let raw = RawTestModel::with_hook(RawBehavior::ContextOverflow, Some(hook));
+    let raw = raw_model([Step::Custom(Box::new(move |_, _| {
+        hook();
+        Box::pin(async { Err(context_overflow()) })
+    }))]);
     register_recovery_test_ticket(&state, &raw, &auto_a, loop_id, &request, base, appended);
 
     let compacting = CompactingModel::new(
@@ -600,7 +533,7 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
         reasoning: ReasoningPreference::Auto,
         auto_binding: None,
     };
-    let utility = RawTestModel::new(RawBehavior::Summary("compact summary"));
+    let utility = summary_model("compact summary");
     let auto = AutoContext {
         binding: crate::compaction::auto::AutoContextBinding {
             model: Arc::clone(&utility) as Arc<dyn Model>,
@@ -720,7 +653,7 @@ async fn reconstruction_accounts_for_each_independent_group_once() {
     ticket.original_body_bytes = DefaultProviderBudget
         .estimate_request_bytes(&original, None, None)
         .unwrap();
-    let utility = RawTestModel::new(RawBehavior::Summary("compact summary"));
+    let utility = summary_model("compact summary");
     let state = CompactionState::new();
     let auto = recovery_auto(&state, Arc::clone(&utility));
     // Either raw 80 KiB result alone exceeds the 64 KiB input window, so
@@ -905,7 +838,7 @@ async fn reconstruct(
 #[tokio::test]
 async fn recovery_selects_largest_bytes_and_stops_at_soft_trigger() {
     let ticket = prose_ticket(&[1_000, 8_000, 2_000], 100);
-    let utility = RawTestModel::new(RawBehavior::Summary("summary"));
+    let utility = summary_model("summary");
     let state = CompactionState::new();
     let auto = recovery_auto(&state, Arc::clone(&utility));
     let request = reconstruct(&ticket, &auto).await.0.unwrap();
@@ -935,10 +868,11 @@ async fn recovery_selects_largest_bytes_and_stops_at_soft_trigger() {
 #[tokio::test]
 async fn recovery_skips_nonshrinking_group_and_accounts_for_both_calls() {
     let ticket = prose_ticket(&[2_000, 1_000], 100);
-    let utility = RawTestModel::new(RawBehavior::Summaries(vec![
-        "s".repeat(3_000),
-        "summary".into(),
-    ]));
+    let utility = raw_model(
+        vec!["s".repeat(3_000), "summary".into()]
+            .into_iter()
+            .map(|text| Step::Events(summary_events(&text))),
+    );
     let state = CompactionState::new();
     let auto = recovery_auto(&state, Arc::clone(&utility));
     let (result, usage) = reconstruct(&ticket, &auto).await;
@@ -963,7 +897,7 @@ async fn recovery_skips_nonshrinking_group_and_accounts_for_both_calls() {
 async fn recovery_continues_below_hard_limit_and_falls_back_only_after_exhaustion() {
     for (current_bytes, expected_calls) in [(100, 2), (55_000, 2)] {
         let ticket = prose_ticket(&[60_000, 55_000], current_bytes);
-        let utility = RawTestModel::new(RawBehavior::Summary("summary"));
+        let utility = summary_model("summary");
         let auto = recovery_auto(&CompactionState::new(), Arc::clone(&utility));
         let request = reconstruct(&ticket, &auto).await.0.unwrap();
         let tokens = DefaultProviderBudget

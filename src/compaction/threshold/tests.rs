@@ -1,57 +1,54 @@
 use super::*;
+use crate::test_support::{ScriptedModel, Step};
 use minicore_runtime::ToolCallId;
 use minicore_runtime::execution::UserInput;
 use minicore_runtime::history::{
     AssistantHistory, ToolResultHistory, UserHistory, UserMessageKind,
 };
 use minicore_runtime::model::{
-    AssistantPart, Model, ModelCallContext, ModelEvent, ModelFinishReason, ModelStartFuture,
-    ModelStream, ToolCall, Usage,
+    AssistantPart, Model, ModelEvent, ModelFinishReason, ModelStream, ToolCall, Usage,
 };
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
 use serde_json::json;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-struct Stub {
-    descriptor: ModelDescriptor,
-    calls: AtomicUsize,
-    requests: Mutex<Vec<ModelRequest>>,
-    output: String,
-    gate: Option<Arc<Notify>>,
-    partial_usage: bool,
-}
-impl Stub {
-    fn new(window: u64, output: &str, gate: Option<Arc<Notify>>) -> Arc<Self> {
-        Arc::new(Self {
-            descriptor: ModelDescriptor::new(
-                "main".parse().unwrap(),
-                window,
-                BTreeSet::from([ReasoningPreference::Auto]),
-                true,
-            )
-            .unwrap(),
-            calls: AtomicUsize::new(0),
-            requests: Mutex::new(Vec::new()),
-            output: output.into(),
-            gate,
-            partial_usage: false,
+fn summary_model(window: u64, output: &str, gate: Option<Arc<Notify>>) -> Arc<ScriptedModel> {
+    let events = vec![
+        ModelEvent::text_delta(output).unwrap(),
+        ModelEvent::Usage {
+            usage: Usage::new(7, 3, 0)
+                .with_cache_read_tokens(Some(0))
+                .with_cache_write_tokens(Some(0)),
+        },
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Stop,
+        },
+    ];
+    ScriptedModel::with_reasoning("main", window, [ReasoningPreference::Auto].into(), [])
+        .with_fallback(move || match &gate {
+            Some(gate) => {
+                let gate = Arc::clone(gate);
+                Step::Custom(Box::new(move |_, _| {
+                    Box::pin(async move {
+                        gate.notify_one();
+                        std::future::pending().await
+                    })
+                }))
+            }
+            None => Step::Events(events.clone()),
         })
-    }
 }
-impl Model for Stub {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-    fn start(&self, request: ModelRequest, _: ModelCallContext) -> ModelStartFuture<'_> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.requests.lock().unwrap().push(request);
-        Box::pin(async move {
-            if self.partial_usage {
+
+fn partial_usage_model(gate: Arc<Notify>) -> Arc<ScriptedModel> {
+    ScriptedModel::with_reasoning(
+        "main",
+        8_000,
+        [ReasoningPreference::Auto].into(),
+        [Step::Custom(Box::new(move |_, _| {
+            Box::pin(async move {
                 use futures_util::StreamExt;
-                let gate = Arc::clone(self.gate.as_ref().unwrap());
                 let stream = futures_util::stream::iter(vec![Ok(ModelEvent::Usage {
                     usage: Usage::new(7, 3, 0).with_provider_total_tokens(Some(10)),
                 })])
@@ -61,28 +58,13 @@ impl Model for Stub {
                     )
                     .await
                 }));
-                return Ok(Box::pin(stream) as ModelStream);
-            }
-            if let Some(gate) = &self.gate {
-                gate.notify_one();
-                std::future::pending::<()>().await;
-            }
-            let events = vec![
-                Ok(ModelEvent::text_delta(self.output.clone()).unwrap()),
-                Ok(ModelEvent::Usage {
-                    usage: Usage::new(7, 3, 0)
-                        .with_cache_read_tokens(Some(0))
-                        .with_cache_write_tokens(Some(0)),
-                }),
-                Ok(ModelEvent::Finish {
-                    reason: ModelFinishReason::Stop,
-                }),
-            ];
-            Ok(Box::pin(futures_util::stream::iter(events)) as ModelStream)
-        })
-    }
+                Ok(Box::pin(stream) as ModelStream)
+            })
+        }))],
+    )
 }
-fn context(model: &Arc<Stub>) -> AutoContext {
+
+fn context(model: &Arc<ScriptedModel>) -> AutoContext {
     AutoContext {
         binding: crate::compaction::auto::AutoContextBinding {
             model: Arc::clone(model) as Arc<dyn Model>,
@@ -181,7 +163,7 @@ fn input<'a>(
 
 #[tokio::test]
 async fn default_ninety_five_projects_large_tool_history_without_raw_ticket_cap() {
-    let model = Stub::new(
+    let model = summary_model(
         172_000,
         "All historical reads completed; preserve their results.",
         None,
@@ -243,7 +225,7 @@ async fn default_ninety_five_projects_large_tool_history_without_raw_ticket_cap(
 
 #[tokio::test]
 async fn many_small_sources_use_one_summary_and_generated_output_does_not_change_source_identity() {
-    let model = Stub::new(8_000, &"s".repeat(30_600), None);
+    let model = summary_model(8_000, &"s".repeat(30_600), None);
     let auto = context(&model);
     let system = BoundedText::new("s").unwrap();
     let old = LoopId::new().unwrap();
@@ -288,7 +270,7 @@ async fn many_small_sources_use_one_summary_and_generated_output_does_not_change
 
 #[tokio::test]
 async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
-    let model = Stub::new(9_000, "Older tool results summarized.", None);
+    let model = summary_model(9_000, "Older tool results summarized.", None);
     let auto = context(&model);
     let system = BoundedText::new("system").unwrap();
     let current = LoopId::new().unwrap();
@@ -330,7 +312,7 @@ async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
 
 #[tokio::test]
 async fn summary_only_projection_can_refresh_after_reopen_or_smaller_model() {
-    let model = Stub::new(12_000, "Refreshed old summary", None);
+    let model = summary_model(12_000, "Refreshed old summary", None);
     let mut auto = context(&model);
     auto.binding.policy.trigger_percent = 60;
     let system = BoundedText::new("s").unwrap();
@@ -372,7 +354,7 @@ async fn summary_only_projection_can_refresh_after_reopen_or_smaller_model() {
 
 #[tokio::test]
 async fn irreducible_floor_and_empty_source_do_not_spend_utility() {
-    let model = Stub::new(4_000, "summary", None);
+    let model = summary_model(4_000, "summary", None);
     let auto = context(&model);
     let system = BoundedText::new("s").unwrap();
     let current = LoopId::new().unwrap();
@@ -415,7 +397,7 @@ async fn irreducible_floor_and_empty_source_do_not_spend_utility() {
 #[tokio::test]
 async fn dropped_preparation_clears_current_before_any_following_event() {
     let entered = Arc::new(Notify::new());
-    let model = Stub::new(8_000, "unused", Some(Arc::clone(&entered)));
+    let model = summary_model(8_000, "unused", Some(Arc::clone(&entered)));
     let auto = context(&model);
     let system = BoundedText::new("s").unwrap();
     let current = LoopId::new().unwrap();
@@ -439,7 +421,7 @@ async fn dropped_preparation_clears_current_before_any_following_event() {
 
 #[tokio::test]
 async fn no_progress_preserves_projection_and_accounts_single_call() {
-    let model = Stub::new(15_000, &"g".repeat(55_000), None);
+    let model = summary_model(15_000, &"g".repeat(55_000), None);
     let mut auto = context(&model);
     auto.binding.policy.trigger_percent = 50;
     let system = BoundedText::new("s").unwrap();
@@ -474,7 +456,7 @@ async fn no_progress_preserves_projection_and_accounts_single_call() {
 
 #[test]
 fn usage_anchor_requires_matching_framing_and_projection_generation() {
-    let model = Stub::new(8_000, "summary", None);
+    let model = summary_model(8_000, "summary", None);
     let auto = context(&model);
     let current = LoopId::new().unwrap();
     let request = ModelRequest::new(
@@ -552,7 +534,7 @@ fn usage_anchor_requires_matching_framing_and_projection_generation() {
 
 #[tokio::test]
 async fn empty_system_and_empty_old_history_are_a_clean_first_boundary_noop() {
-    let model = Stub::new(4_000, "unused", None);
+    let model = summary_model(4_000, "unused", None);
     let auto = context(&model);
     let system = BoundedText::new("").unwrap();
     let current = LoopId::new().unwrap();
@@ -572,7 +554,7 @@ async fn empty_system_and_empty_old_history_are_a_clean_first_boundary_noop() {
 
 #[tokio::test]
 async fn recovery_uses_captured_rejected_body_ceiling_before_install() {
-    let model = Stub::new(15_000, "summary", None);
+    let model = summary_model(15_000, "summary", None);
     let auto = context(&model);
     let system = BoundedText::new("s").unwrap();
     let current = LoopId::new().unwrap();
@@ -597,8 +579,7 @@ async fn recovery_uses_captured_rejected_body_ceiling_before_install() {
 #[tokio::test]
 async fn dropped_preparation_preserves_live_partial_utility_usage() {
     let entered = Arc::new(Notify::new());
-    let mut model = Stub::new(8_000, "unused", Some(Arc::clone(&entered)));
-    Arc::get_mut(&mut model).unwrap().partial_usage = true;
+    let model = partial_usage_model(Arc::clone(&entered));
     let auto = context(&model);
     let system = BoundedText::new("s").unwrap();
     let current = LoopId::new().unwrap();
@@ -621,7 +602,7 @@ async fn dropped_preparation_preserves_live_partial_utility_usage() {
 
 #[test]
 fn settlement_qualifier_is_idempotent_and_preserves_failed_attempt_identity() {
-    let model = Stub::new(8_000, "summary", None);
+    let model = summary_model(8_000, "summary", None);
     let auto = context(&model);
     let loop_id = LoopId::new().unwrap();
     let original = AutomaticCompactionObservation {
@@ -663,7 +644,7 @@ impl ProjectionResult {
 async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
     for index in [0, 1] {
         for by_bytes in [false, true] {
-            let model = Stub::new(1_000_000, "historical summary", None);
+            let model = summary_model(1_000_000, "historical summary", None);
             let mut auto = context(&model);
             auto.binding.policy.trigger_percent = 50;
             let current = LoopId::new().unwrap();
@@ -715,7 +696,7 @@ async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
 async fn admission_pressure_returns_only_when_effective_history_grows() {
     for by_bytes in [false, true] {
         for emergency in [false, true] {
-            let model = Stub::new(1_000_000, "historical summary", None);
+            let model = summary_model(1_000_000, "historical summary", None);
             let mut auto = context(&model);
             auto.binding.policy.trigger_percent = 50;
             let old = LoopId::new().unwrap();

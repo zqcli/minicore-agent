@@ -940,32 +940,7 @@ fn reported_context_restores_only_last_valid_active_matching_model_usage() {
 
 #[test]
 fn reported_context_guards_same_label_config_and_emergency_summary_generations() {
-    struct InertModel(ModelDescriptor);
-    impl Model for InertModel {
-        fn descriptor(&self) -> &ModelDescriptor {
-            &self.0
-        }
-        fn start(
-            &self,
-            _: ModelRequest,
-            _: ModelCallContext,
-        ) -> minicore_runtime::model::ModelStartFuture<'_> {
-            unimplemented!()
-        }
-    }
-    let model = || -> Arc<dyn Model> {
-        Arc::new(InertModel(
-            ModelDescriptor::new(
-                "main".parse().unwrap(),
-                10_000,
-                std::collections::BTreeSet::from([
-                    minicore_runtime::model::ReasoningPreference::Auto,
-                ]),
-                true,
-            )
-            .unwrap(),
-        ))
-    };
+    let model = || -> Arc<dyn Model> { crate::test_support::ScriptedModel::inert("main", 10_000) };
     let (sender, mut events) = tokio::sync::mpsc::channel(8);
     let compaction = crate::compaction::CompactionState::new();
     let presentation = Presentation::new(

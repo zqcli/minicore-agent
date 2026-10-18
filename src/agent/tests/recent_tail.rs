@@ -70,14 +70,14 @@ async fn default_compact_retains_answers_tools_and_real_next_request_after_cold_
     );
     let original_count = history.len();
     let (data, _guard, id, model, mut agent) = auto_admission_fixture_with_window(
-        &format!("compact-tail-next-{}", next_id()),
+        "compact-tail-next",
         false,
         100_000,
         history,
         [
-            ModelScript::Text("OLD_PREFIX_SUMMARY"),
-            ModelScript::Text("NEXT_ANSWER"),
-            ModelScript::Text("UPDATED_PREFIX_SUMMARY"),
+            Step::Text("OLD_PREFIX_SUMMARY"),
+            Step::Text("NEXT_ANSWER"),
+            Step::Text("UPDATED_PREFIX_SUMMARY"),
         ],
         None,
         None,
@@ -138,10 +138,7 @@ async fn default_compact_retains_answers_tools_and_real_next_request_after_cold_
     );
     let turn = send_text(&mut agent, id, "NEXT_REAL_USER").await;
     let next = wait_text(&agent, turn).await;
-    assert_eq!(
-        next.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&next);
     {
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -233,7 +230,7 @@ async fn short_and_single_giant_loop_are_manual_noops_without_utility() {
         };
         let count = items.len();
         let (data, _guard, id, model, mut agent) = auto_admission_fixture_with_window(
-            &format!("compact-tail-noop-{bytes}-{}", next_id()),
+            &format!("compact-tail-noop-{bytes}"),
             false,
             100_000,
             items,
@@ -264,11 +261,11 @@ async fn automatic_no_safe_prefix_fails_only_when_trigger_is_reached() {
     ] {
         let answer = Box::leak("answer ".repeat(1_800).into_boxed_str());
         let (data, _guard, id, model, mut agent) = auto_admission_fixture_with_window(
-            &format!("compact-tail-auto-{window}-{}", next_id()),
+            &format!("compact-tail-auto-{window}"),
             true,
             window,
             vec![],
-            [ModelScript::Text(answer)],
+            [Step::Text(answer)],
             None,
             None,
         )
