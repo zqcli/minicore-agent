@@ -11,9 +11,9 @@ cargo test --locked --test rpc_soak
 
 The standalone `rpc_soak` target keeps the longer repeated-turn scenarios
 separate. `support/` contains the shared HTTP mock, RPC subprocess, temporary
-directory fixture, configuration and response helpers. The `it` entry point
-includes only the shared module declarations so both targets use the same
-normal module tree without `#[path]` attributes or dead-code allowances.
+directory fixture, configuration and response helpers. Both targets load it as
+one module tree (`tests/it/main.rs` through a single `#[path]`), without
+dead-code allowances.
 
 The stdio framing suite retains its raw-pipe driver to test malformed input,
 exact wire IDs, EOF and oversized frames. Startup rejection tests keep raw TOML
