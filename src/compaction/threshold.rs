@@ -452,12 +452,15 @@ pub(crate) async fn consolidate(
         {
             return Ok(ProjectionResult::unchanged(before_request));
         }
-        utility::check_active(input.cancellation, input.deadline)?;
+    }
+    utility::check_active(input.cancellation, input.deadline)?;
+    // Nothing fallible runs between installing the markers and arming the guard,
+    // so a cancelled attempt always releases its source for retry.
+    if !recovery {
         let mut threshold = state.threshold.lock().unwrap();
         threshold.attempted = Some((input.loop_id, input.request_index));
         threshold.source = Some(source);
     }
-    utility::check_active(input.cancellation, input.deadline)?;
     let live_usage = Arc::new(std::sync::Mutex::new(None));
     let mut observation = ObservationGuard::new(
         state,
@@ -511,9 +514,15 @@ pub(crate) async fn consolidate(
     {
         Ok(generated) => generated,
         Err(error) => {
-            observation.finish(error.error.kind(), None, error.utility_usage.clone());
-            if !recovery && error.error == UtilityError::Timeout && before <= budget.hard_tokens {
+            let unreduced =
+                !recovery && error.error == UtilityError::Timeout && before <= budget.hard_tokens;
+            if unreduced {
+                // Parent cancellation wins over the utility timeout; the still
+                // armed guard records it and releases the source.
                 utility::check_active(input.cancellation, input.deadline)?;
+            }
+            observation.finish(error.error.kind(), None, error.utility_usage.clone());
+            if unreduced {
                 return Ok(ProjectionResult {
                     request: before_request,
                     usage: error.utility_usage,
