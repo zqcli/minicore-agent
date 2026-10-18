@@ -126,7 +126,16 @@ impl Store {
                             {
                                 continue;
                             }
-                            records.push((stored.tool_ref, change));
+                            // Native tool timestamps use canonical UTC milliseconds.
+                            // Legacy/malformed timestamps carry no chronological evidence.
+                            let canonical = |time: &String| {
+                                time.len() == 24 && time.ends_with('Z') && valid_timestamp(time)
+                            };
+                            let observed_at = stored
+                                .started_at
+                                .filter(canonical)
+                                .or(stored.finished_at.filter(canonical));
+                            records.push((stored.tool_ref, change, observed_at));
                             if records.len() > limits.session_records {
                                 records.pop();
 
@@ -505,11 +514,18 @@ pub(in crate::store) fn change_blob_read_cost(revision: &ChangeRevision) -> usiz
 }
 
 fn make_tool_change_scan(
-    mut records: Vec<(ToolRef, StoredFileChange)>,
+    mut records: Vec<(ToolRef, StoredFileChange, Option<String>)>,
     skipped: bool,
     budget: &ChangeScanBudget,
 ) -> ToolChangeScan {
-    records.sort_by_cached_key(|entry| tool_ref_hash(&entry.0));
+    records.sort_by_cached_key(|(tool_ref, _, time)| {
+        (
+            time.clone(),
+            tool_ref.loop_id,
+            tool_ref.request_index,
+            tool_ref.tool_call_id.clone(),
+        )
+    });
     let fingerprint = hash_bytes(
         &serde_json::to_vec(&(
             &records,
@@ -520,8 +536,13 @@ fn make_tool_change_scan(
         ))
         .expect("serializing tool change metadata cannot fail"),
     );
+    let (observed_at, records) = records
+        .into_iter()
+        .map(|(tool_ref, change, time)| ((tool_ref.clone(), time), (tool_ref, change)))
+        .unzip();
     ToolChangeScan {
         records,
+        observed_at,
         skipped,
         #[cfg(test)]
         entries: budget.entries,

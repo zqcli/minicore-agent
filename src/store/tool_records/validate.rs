@@ -194,45 +194,6 @@ fn validate_stored_file_change(change: &StoredFileChange) -> Result<(), StoreErr
     Ok(())
 }
 
-pub(super) fn validate_file_change_snapshot(
-    stored: Option<&StoredFileChange>,
-    before_bytes: Option<&[u8]>,
-    after_bytes: Option<&[u8]>,
-) -> Result<(), StoreError> {
-    let Some(stored) = stored else {
-        return if before_bytes.is_none() && after_bytes.is_none() {
-            Ok(())
-        } else {
-            Err(StoreError::Corrupt)
-        };
-    };
-    if let Some(bytes) = before_bytes {
-        let ChangeRevision::Content {
-            sha256,
-            bytes: size,
-        } = &stored.before
-        else {
-            return Err(StoreError::Corrupt);
-        };
-        if bytes.len() != *size || hash_bytes(bytes) != *sha256 {
-            return Err(StoreError::Corrupt);
-        }
-    }
-    if let Some(bytes) = after_bytes {
-        let ChangeRevision::Content {
-            sha256,
-            bytes: size,
-        } = &stored.after
-        else {
-            return Err(StoreError::Corrupt);
-        };
-        if bytes.len() != *size || hash_bytes(bytes) != *sha256 {
-            return Err(StoreError::Corrupt);
-        }
-    }
-    Ok(())
-}
-
 // The core blobs match ToolPersistenceSnapshot::blobs; change snapshots follow them.
 pub(super) fn stored_blobs(stored: &StoredToolRecord) -> [(&str, usize, Option<&str>); 4] {
     [

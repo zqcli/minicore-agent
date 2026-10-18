@@ -2,7 +2,7 @@
 fn historical_memory_only_record_needs_stored_details() {
     let mut record = super::ToolRecord::new("bash".to_owned());
     record.state = super::ToolExecutionState::Succeeded;
-    record.outcome = Some(super::ToolResultOutcome::Success);
+    record.outcome = Some(ToolResultOutcome::Success);
     record.result_seen = true;
     assert!(record.needs_stored());
 }
@@ -11,7 +11,7 @@ fn historical_memory_only_record_needs_stored_details() {
 fn complete_empty_streams_do_not_need_stored_details() {
     let mut record = super::ToolRecord::new("bash".to_owned());
     record.state = super::ToolExecutionState::Succeeded;
-    record.outcome = Some(super::ToolResultOutcome::Success);
+    record.outcome = Some(ToolResultOutcome::Success);
     record.input_seen = true;
     record.result_seen = true;
     record.recording = super::ToolRecordingState::Saved;
@@ -36,7 +36,23 @@ use serde_json::json;
 
 use crate::changes::FileChange;
 
+use super::data::SNAPSHOT_GATES;
+use super::paging::fit_encoded_string;
 use super::*;
+use crate::budget::encoded_len;
+use crate::error::AgentError;
+use crate::ids::SessionId;
+use base64::Engine as _;
+use minicore_runtime::history::HistoryItem;
+use minicore_runtime::tools::{ToolInvocation, ToolResultOutcome};
+use minicore_runtime::{LoopId, ToolCallId};
+use serde_json::Value;
+
+pub(super) fn wait_snapshot_gate(tool_ref: &ToolRef) {
+    if let Some(gate) = SNAPSHOT_GATES.take(tool_ref) {
+        gate.pass_blocking();
+    }
+}
 
 impl ToolData {
     pub(crate) fn read(
@@ -142,6 +158,111 @@ fn invocation_of(data: &ToolData, tool_ref: &ToolRef, call: &str, name: &str, ar
 }
 
 #[test]
+fn wrapped_stream_pages_and_snapshots_preserve_raw_offsets_and_bytes() {
+    let data = ToolData::new();
+    let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "wrapped-stream");
+    data.note_requested(&tool_ref, "bash");
+    let first: Vec<_> = (0..MAX_TOOL_STREAM_BYTES)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let tail = b"\x00\xffwrapped stream tail\r\n";
+    data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, &first);
+    data.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, tail);
+    data.note_stream_end(&tool_ref, ToolDataStream::Stdout);
+    data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+        .unwrap();
+    assert_accounting(&data);
+    let expected: Vec<_> = first[tail.len()..].iter().chain(tail).copied().collect();
+    let offset = MAX_TOOL_STREAM_BYTES - 7;
+    let page = data
+        .output(
+            &output_request(
+                tool_ref.clone(),
+                ToolDataStream::Stdout,
+                offset as u64,
+                Some(1024),
+            ),
+            1024,
+        )
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&page.data)
+            .unwrap(),
+        first[offset..]
+            .iter()
+            .chain(tail)
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    assert!(page.eof);
+    assert_eq!(page.next_offset, (first.len() + tail.len()) as u64);
+    let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+    assert_eq!(snapshot.stdout_bytes.as_deref(), Some(expected.as_slice()));
+    assert_eq!(snapshot.record.stdout.start_offset, tail.len() as u64);
+    assert_eq!(
+        snapshot.record.stdout.file_sha256,
+        Some(crate::store::hash_bytes(&expected))
+    );
+}
+
+#[test]
+fn persistence_omits_empty_process_blobs() {
+    let data = ToolData::new();
+    let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "empty-snapshot");
+    data.note_requested(&tool_ref, "bash");
+    data.note_result(&tool_ref, "");
+    for stream in [ToolDataStream::Stdout, ToolDataStream::Stderr] {
+        data.note_stream_chunk(&tool_ref, stream, &[]);
+        data.note_stream_end(&tool_ref, stream);
+    }
+    data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+        .unwrap();
+    let snapshot = data.snapshot_for_persistence(&tool_ref).unwrap();
+    assert!(snapshot.blobs().iter().all(|(_, bytes)| bytes.is_none()));
+    assert!(snapshot.record.input.file_sha256.is_none());
+    assert!(snapshot.record.result.file_sha256.is_none());
+    assert!(snapshot.record.stdout.file_sha256.is_none());
+    assert!(snapshot.record.stderr.file_sha256.is_none());
+    assert!(snapshot.record.stdout.complete);
+    assert!(snapshot.record.stderr.complete);
+}
+
+#[tokio::test]
+async fn persistence_hashing_releases_the_lock_and_uses_an_isolated_snapshot() {
+    use std::sync::Arc;
+    let data = Arc::new(ToolData::new());
+    let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "snapshot-lock");
+    data.note_requested(&tool_ref, "bash");
+    data.note_result(&tool_ref, "captured result");
+    data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
+        .unwrap();
+    let gate = Arc::new(crate::test_support::Gate::new());
+    SNAPSHOT_GATES.arm(tool_ref.clone(), Arc::clone(&gate));
+    let snapshot = tokio::task::spawn_blocking({
+        let data = Arc::clone(&data);
+        let tool_ref = tool_ref.clone();
+        move || data.snapshot_for_persistence(&tool_ref).unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+        .await
+        .unwrap();
+    let unlocked = data.inner.try_lock().is_ok();
+    gate.release();
+    assert!(unlocked, "hashing must not hold the ToolData lock");
+    data.note_result(&tool_ref, "later result");
+    let snapshot = snapshot.await.unwrap();
+    assert_eq!(
+        snapshot.result_bytes.as_deref(),
+        Some(b"captured result".as_slice())
+    );
+    assert_eq!(
+        snapshot.record.result.file_sha256,
+        Some(crate::store::hash_bytes(b"captured result"))
+    );
+}
+
+#[test]
 fn session_window_bytes_are_counted_into_the_real_budget() {
     let data = ToolData::new();
     let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "window-budget");
@@ -178,7 +299,7 @@ fn multi_round_push_and_multi_stream_capacity_accounting_stays_within_budget() {
     }
     {
         let inner = data.lock();
-        let window = inner.records[&tool_ref].stdout.bytes.as_slice();
+        let window = &inner.records[&tool_ref].stdout.bytes;
         assert_eq!(window.len(), MAX_TOOL_STREAM_BYTES);
         let capacity = inner.records[&tool_ref].stdout.bytes.capacity();
         assert!(
@@ -1274,7 +1395,7 @@ fn merge_stored_reconciled_result_learns_input_and_command_from_disk() {
     stored.input_seen = true;
     stored.input_total = 10;
     stored.stdout.seen = true;
-    stored.stdout.bytes = b"cmd output\n".to_vec();
+    stored.stdout.bytes = b"cmd output\n".to_vec().into();
     stored.stdout.start_offset = 0;
     stored.stdout.observed_end = 11;
     stored.stdout.complete = true;

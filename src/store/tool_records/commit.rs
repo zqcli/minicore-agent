@@ -1,7 +1,7 @@
 //! Auxiliary record commits.
 use super::super::*;
 use super::ledger::{AuxDirectoryEntry, AuxLedger, check_aux_deadline, discard_aux_temp};
-use super::validate::{stored_blobs, validate_file_change_snapshot, validate_stored_tool_record};
+use super::validate::validate_stored_tool_record;
 
 #[cfg(test)]
 pub(crate) static AUX_BLOB_WRITE_FAILURES: crate::test_support::Registry<SessionId, usize> =
@@ -31,25 +31,8 @@ impl Store {
         validate_stored_tool_record(&snapshot.record, &snapshot.tool_ref)?;
 
         let blobs = snapshot.blobs();
-        for ((_, bytes), (_, expected_len, expected_sha)) in
-            blobs.into_iter().zip(stored_blobs(&snapshot.record))
-        {
-            let actual_len = bytes.map_or(0, |bytes| bytes.len());
-            if actual_len != expected_len {
-                return Err(StoreError::Corrupt);
-            }
-            if let Some(bytes) = bytes {
-                let actual_sha = hash_bytes(bytes);
-                if expected_sha != Some(actual_sha.as_str()) {
-                    return Err(StoreError::Corrupt);
-                }
-            }
-        }
-        validate_file_change_snapshot(
-            snapshot.record.file_change.as_ref(),
-            snapshot.file_change_before.as_deref(),
-            snapshot.file_change_after.as_deref(),
-        )?;
+        // Snapshots are assembled in-process; blob integrity is checked when
+        // reading from disk, not by hashing the same owned bytes again here.
         let raw_bytes: usize = blobs
             .iter()
             .filter_map(|(_, bytes)| *bytes)

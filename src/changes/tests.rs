@@ -257,8 +257,8 @@ async fn incremental_page_sizes_match_json_at_cursor_and_budget_boundaries() {
         })
         .collect();
     let warnings = vec![
-        ChangeListWarning::DetailsUnavailable,
         ChangeListWarning::RecordsSkipped,
+        ChangeListWarning::DetailsUnavailable,
     ];
     for (offset, count) in [(0, 500), (8, 3), (98, 3), (597, 3)] {
         let end = offset + count;
@@ -321,6 +321,185 @@ async fn incremental_page_sizes_match_json_at_cursor_and_budget_boundaries() {
             }
         }
     }
+}
+
+fn native_change(path: &str) -> FileChange {
+    FileChange {
+        path: path.to_owned(),
+        kind: ChangeKind::Modified,
+        before: content_revision(b"before"),
+        after: content_revision(b"after"),
+        commit_state: ChangeCommitState::Applied,
+        coverage: ChangeCoverage::Complete,
+        before_captured: true,
+        after_captured: true,
+        before_bytes: Some(b"before".to_vec()),
+        after_bytes: Some(b"after".to_vec()),
+        before_corrupt: false,
+        after_corrupt: false,
+    }
+}
+
+#[tokio::test]
+async fn tool_lists_keep_observation_order_page_warnings_and_order_bound_cursors() {
+    use std::sync::Arc;
+    let directory = crate::test_support::TempDir::new("ordered-changes");
+    let store = Store::open(directory.path().to_path_buf()).await.unwrap();
+    let session_id = session();
+    let now = crate::store::utc_timestamp().unwrap();
+    store
+        .create_session(&crate::store::SessionRecord {
+            format_version: crate::store::SESSION_FORMAT_VERSION,
+            session_id,
+            title: None,
+            profile: "coding".to_owned(),
+            workspace: directory.path().to_path_buf(),
+            model: "main".to_owned(),
+            reasoning: minicore_runtime::model::ReasoningPreference::Auto,
+            system_prompt: "system".to_owned(),
+            tools: vec!["write".to_owned()],
+            max_tool_rounds: 32,
+            approval: crate::profiles::ApprovalMode::Auto,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let warm = Arc::new(ToolData::new());
+    let loop_id = LoopId::new().unwrap();
+    let mut refs = Vec::new();
+    // Call IDs and timestamps deliberately disagree with live observation order.
+    for (call, time) in [("z-first", "02"), ("a-second", "01"), ("last", "03")] {
+        let tool_ref = ToolRef {
+            session_id,
+            loop_id,
+            request_index: 0,
+            tool_call_id: call.parse().unwrap(),
+        };
+        warm.note_requested(&tool_ref, "write");
+        warm.note_file_change(&tool_ref, native_change(call));
+        warm.finish_and_snapshot(
+            &tool_ref,
+            minicore_runtime::tools::ToolResultOutcome::Success,
+        )
+        .unwrap();
+        let mut snapshot = warm.snapshot_for_persistence(&tool_ref).unwrap();
+        snapshot.record.started_at = Some(format!("2026-01-01T00:00:{time}.000Z"));
+        store
+            .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        refs.push(tool_ref);
+    }
+    let broken = directory
+        .path()
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("tools")
+        .join(crate::store::tool_ref_hash(&refs[2]))
+        .join("after.bin");
+    tokio::fs::remove_file(broken).await.unwrap();
+    let request = ChangesListRequest {
+        session_id,
+        scope: ChangeScope::Session,
+        cursor: None,
+        limit: 1,
+        max_bytes: Some(4096),
+    };
+    let mut cold_cursor = None;
+    for (index, expected) in ["a-second", "z-first", "last"].iter().enumerate() {
+        let page = list_tool_changes(
+            store.clone(),
+            None,
+            ChangesListRequest {
+                cursor: cold_cursor.clone(),
+                ..request.clone()
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(!page.stale);
+        assert_eq!(page.records[0].path, *expected);
+        assert_eq!(
+            page.warnings
+                .contains(&ChangeListWarning::DetailsUnavailable),
+            index == 2
+        );
+        if index == 0 {
+            let stale = list_tool_changes(
+                store.clone(),
+                Some(Arc::clone(&warm)),
+                ChangesListRequest {
+                    cursor: page.next_cursor.clone(),
+                    ..request.clone()
+                },
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert!(stale.stale);
+            assert!(stale.records.is_empty());
+            assert!(
+                !stale
+                    .warnings
+                    .contains(&ChangeListWarning::DetailsUnavailable)
+            );
+        }
+        cold_cursor = page.next_cursor;
+    }
+    assert!(cold_cursor.is_none());
+    let mut cursor = None;
+    for expected in ["z-first", "a-second", "last"] {
+        let page = list_tool_changes(
+            store.clone(),
+            Some(Arc::clone(&warm)),
+            ChangesListRequest {
+                cursor,
+                ..request.clone()
+            },
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(!page.stale);
+        assert_eq!(page.records[0].path, expected);
+        assert!(
+            !page
+                .warnings
+                .contains(&ChangeListWarning::DetailsUnavailable)
+        );
+        cursor = page.next_cursor;
+    }
+    assert!(cursor.is_none());
+
+    // A partial live cache must not hide durable-only changes.
+    let partial = Arc::new(ToolData::new());
+    partial.note_requested(&refs[0], "write");
+    partial.note_file_change(&refs[0], native_change("z-first"));
+    let merged = list_tool_changes(
+        store,
+        Some(partial),
+        ChangesListRequest {
+            limit: 10,
+            ..request
+        },
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        merged
+            .records
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect::<Vec<_>>(),
+        ["a-second", "z-first", "last"]
+    );
 }
 
 #[test]
