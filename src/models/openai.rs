@@ -27,6 +27,7 @@ use super::ModelConfigError;
 
 const USER_AGENT: &str = concat!("minicore-agent/", env!("CARGO_PKG_VERSION"));
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_DRAIN_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_QUEUED_SSE_FRAMES: usize = 4_096;
@@ -89,6 +90,9 @@ impl OpenAiResponsesModel {
         .map_err(|_| ModelConfigError::InvalidConfiguration)?;
         let ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
         let client = build_http_client(settings.request_timeout, ssl_cert_file.as_deref())?;
+        if plaintext_remote_endpoint(&settings.endpoint) {
+            tracing::warn!(model = %descriptor.model_ref, "non-loopback HTTP model sends bearer credentials in plaintext");
+        }
         Ok(Self {
             descriptor,
             client,
@@ -227,11 +231,23 @@ impl OpenAiResponsesModel {
     }
 }
 
+fn plaintext_remote_endpoint(endpoint: &reqwest::Url) -> bool {
+    endpoint.scheme() == "http"
+        && !endpoint.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
 fn build_http_client(
     request_timeout: Option<Duration>,
     ssl_cert_file: Option<&OsStr>,
 ) -> Result<reqwest::Client, ModelConfigError> {
     let mut client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT);
     if let Some(timeout) = request_timeout {
@@ -400,17 +416,10 @@ impl<'a> ResponsesRequest<'a> {
                     for (part_index, part) in parts.iter().enumerate() {
                         match part {
                             AssistantPart::Text(text) => {
-                                input.push(InputItem::Message(InputMessage {
-                                    item_type: "message",
-                                    role: "assistant",
-                                    content: vec![InputContent {
-                                        content_type: "output_text",
-                                        text: text.clone(),
-                                        annotations: Some(Vec::new()),
-                                    }],
-                                    status: Some("completed"),
-                                    id: Some(format!("msg_minicore_{message_index}_{part_index}")),
-                                }));
+                                input.push(InputItem::Message(InputMessage::assistant(
+                                    format!("msg_minicore_{message_index}_{part_index}"),
+                                    text.clone(),
+                                )));
                             }
                             AssistantPart::Reasoning(_) => {
                                 // MiniCore's public ReasoningContent does not preserve the exact
@@ -516,6 +525,22 @@ struct InputMessage {
     status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+}
+
+impl InputMessage {
+    fn assistant(id: String, text: String) -> Self {
+        Self {
+            item_type: "message",
+            role: "assistant",
+            content: vec![InputContent {
+                content_type: "output_text",
+                text,
+                annotations: Some(Vec::new()),
+            }],
+            status: Some("completed"),
+            id: Some(id),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -646,7 +671,10 @@ async fn classify_http_error(
             ModelErrorKind::RateLimited,
             retry_target.and_then(|target| target.remaining(Instant::now(), SystemTime::now())),
         ),
-        500..=599 => unknown_error(ModelErrorKind::ProviderUnavailable),
+        503 | 529 => retryable_error(
+            ModelErrorKind::ProviderUnavailable,
+            retry_target.and_then(|target| target.remaining(Instant::now(), SystemTime::now())),
+        ),
         400..=499 => local_error(ModelErrorKind::InvalidRequest),
         _ => unknown_error(ModelErrorKind::ProviderUnavailable),
     }
@@ -777,9 +805,6 @@ fn retry_target(
 
 fn positive_duration(value: &str, divisor: f64) -> Option<Duration> {
     let seconds = value.trim().parse::<f64>().ok()? / divisor;
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return None;
-    }
     Duration::try_from_secs_f64(seconds)
         .ok()
         .filter(|duration| !duration.is_zero())
@@ -847,6 +872,8 @@ struct StreamState {
     output_item_indexes: BTreeSet<u32>,
     output_items: Option<BTreeMap<u32, Value>>,
     output_item_bytes: usize,
+    replay_too_large: bool,
+    output_text: BTreeMap<u32, String>,
     replay_identity: Option<(String, String)>,
     text: String,
     trace: Option<RequestTraceContext>,
@@ -869,15 +896,6 @@ struct ToolState {
 }
 
 impl StreamState {
-    #[cfg(test)]
-    fn new(
-        bytes: ByteStream,
-        cancellation: tokio_util::sync::CancellationToken,
-        deadline: TokioInstant,
-    ) -> Self {
-        Self::new_with_replay(bytes, cancellation, deadline, None, None)
-    }
-
     fn new_with_replay(
         bytes: ByteStream,
         cancellation: tokio_util::sync::CancellationToken,
@@ -898,6 +916,8 @@ impl StreamState {
             output_item_indexes: BTreeSet::new(),
             output_items,
             output_item_bytes: 0,
+            replay_too_large: false,
+            output_text: BTreeMap::new(),
             replay_identity,
             text: String::new(),
             trace,
@@ -938,30 +958,20 @@ impl StreamState {
         self.fail(error);
     }
 
-    fn validate_replay_bytes(&self, output_item_bytes: usize) -> Result<(), ()> {
-        if output_item_bytes > MAX_REPLAY_BYTES {
-            return Err(());
-        }
-        Ok(())
-    }
-
     fn finalize_output_items(&mut self, terminal_output: Option<Vec<Value>>) -> Result<(), ()> {
-        let Some(done_items) = self.output_items.as_ref() else {
-            return Ok(());
-        };
         let Some(terminal_output) = terminal_output else {
             return Ok(());
         };
         if terminal_output.len() > MAX_REPLAY_ITEMS_PER_RESPONSE
             || terminal_output
                 .iter()
-                .any(|item| validate_output_item(item).is_err())
+                .any(|item| replay::validate_item(item).is_err())
         {
             return Err(());
         }
         let output_item_bytes = serialized_output_item_bytes(terminal_output.iter())?;
-        self.validate_replay_bytes(output_item_bytes)?;
-        for (output_index, done_item) in done_items {
+        self.replay_too_large |= output_item_bytes > MAX_REPLAY_BYTES;
+        for (output_index, done_item) in self.output_items.iter().flatten() {
             let output_index = usize::try_from(*output_index).map_err(|_| ())?;
             if !terminal_output
                 .get(output_index)
@@ -989,7 +999,9 @@ impl StreamState {
         let Some((endpoint, model)) = &self.replay_identity else {
             return Ok(None);
         };
-        let output = self.output_items.as_ref().ok_or(())?;
+        let Some(output) = self.output_items.as_ref() else {
+            return self.without_replay();
+        };
         if !self.tools.is_empty()
             && self.reasoning_seen
             && !output
@@ -1039,8 +1051,21 @@ impl StreamState {
         if replay::visible_text(&output)? != self.text {
             return Err(());
         }
-        let replay = replay::capture(endpoint, model, output)?;
-        Ok(Some(ModelEvent::ProviderReplay { replay }))
+        if self.replay_too_large {
+            return self.without_replay();
+        }
+        match replay::capture(endpoint, model, output)? {
+            Some(replay) => Ok(Some(ModelEvent::ProviderReplay { replay })),
+            None => self.without_replay(),
+        }
+    }
+
+    fn without_replay(&self) -> Result<Option<ModelEvent>, ()> {
+        if self.text.is_empty() && self.tools.is_empty() && !self.reasoning_parts.emitted {
+            Err(())
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1083,6 +1108,9 @@ async fn next_stream_event(
                 if parser_failed && !state.done {
                     state.malformed();
                 }
+                if state.terminal_seen {
+                    drain_body(&mut state).await;
+                }
             }
             Some(Err(error)) => {
                 let kind = if error.is_timeout() {
@@ -1096,18 +1124,31 @@ async fn next_stream_event(
                 state.fail(error);
             }
             None => {
-                if state.terminal_seen {
-                    state.done = true;
+                let kind = if state.semantic_seen {
+                    ModelErrorKind::StreamInterrupted
                 } else {
-                    let kind = if state.semantic_seen {
-                        ModelErrorKind::StreamInterrupted
-                    } else {
-                        ModelErrorKind::IncompleteResponse
-                    };
-                    let error = stream_error(kind, state.provider_event_seen);
-                    state.fail(error);
-                }
+                    ModelErrorKind::IncompleteResponse
+                };
+                let error = stream_error(kind, state.provider_event_seen);
+                state.fail(error);
             }
+        }
+    }
+}
+
+// A terminal result is authoritative; draining is only a pooling optimization.
+async fn drain_body(state: &mut StreamState) {
+    let mut remaining = MAX_DRAIN_BYTES;
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = state.cancellation.cancelled() => break,
+            _ = tokio::time::sleep_until(state.deadline) => break,
+            chunk = state.bytes.next() => chunk,
+        };
+        match chunk {
+            Some(Ok(chunk)) if chunk.len() < remaining => remaining -= chunk.len(),
+            _ => break,
         }
     }
 }
@@ -1191,7 +1232,7 @@ impl SseParser {
 
     fn pop_frame(&mut self) -> Option<Vec<u8>> {
         let frame = self.frames.pop_front()?;
-        self.queued_frame_bytes = self.queued_frame_bytes.saturating_sub(frame.len());
+        self.queued_frame_bytes -= frame.len();
         Some(frame)
     }
 }
@@ -1206,9 +1247,6 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         return Ok(());
     }
     let value: Value = serde_json::from_slice(frame).map_err(|_| ())?;
-    if !value.is_object() {
-        return Err(());
-    }
     let event_type = value.get("type").and_then(Value::as_str).ok_or(())?;
     state.provider_event_seen = true;
     match event_type {
@@ -1218,7 +1256,7 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         }
         "response.refusal.delta" => {
             let event: DeltaEvent = from_value(value)?;
-            state.refusal_seen = true;
+            state.refusal_seen |= !event.delta.is_empty();
             queue_text(state, event.delta, false)?;
         }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
@@ -1238,7 +1276,7 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
             let event: OutputItemEvent = from_value(value)?;
             if item_type(&event.item) == Some("function_call") {
                 let item: FunctionCallItem = from_value(event.item)?;
-                start_tool(state, event.output_index, item, true)?;
+                start_tool(state, event.output_index, item)?;
             } else if item_type(&event.item) == Some("reasoning") {
                 state.reasoning_parts.mark_item_boundary();
             }
@@ -1342,10 +1380,10 @@ fn queue_reasoning_delta(
     state: &mut StreamState,
     event: ReasoningSummaryDeltaEvent,
 ) -> Result<(), ()> {
-    let delta = event.delta.clone();
     // The delta's explicit fields override the previous known part; omitted
     // fields inherit it, so a metadata gap never invents a boundary.
     let merged = merge_reasoning_key(state.reasoning_parts.last_key.clone(), &event);
+    let delta = event.delta;
     let identity_changed = merged != state.reasoning_parts.last_key;
     let lifecycle_changed = state.reasoning_parts.last_lifecycle != state.reasoning_parts.lifecycle;
 
@@ -1371,14 +1409,15 @@ fn queue_reasoning_delta(
     if needs_separator {
         queue_text(state, "\n".to_owned(), true)?;
     }
-    queue_text(state, delta.clone(), true)?;
+    let last_ends_newline = delta.ends_with('\n');
+    queue_text(state, delta, true)?;
     if boundary {
         state.reasoning_parts.last_key = merged;
         state.reasoning_parts.last_lifecycle = state.reasoning_parts.lifecycle;
     }
     state.reasoning_parts.pending_boundary = false;
     state.reasoning_parts.emitted = true;
-    state.reasoning_parts.last_ends_newline = delta.ends_with('\n');
+    state.reasoning_parts.last_ends_newline = last_ends_newline;
     Ok(())
 }
 
@@ -1405,49 +1444,49 @@ fn merge_reasoning_key(
         output_index: event
             .output_index
             .as_ref()
-            .and_then(|value| value_to_u32(value.clone()))
+            .and_then(value_to_u32)
             .or(previous.output_index),
         item_id: event.item_id.clone().or(previous.item_id),
         summary_index: event
             .summary_index
             .as_ref()
-            .and_then(|value| value_to_u32(value.clone()))
+            .and_then(value_to_u32)
             .or(previous.summary_index),
     })
 }
 
-fn value_to_u32(value: serde_json::Value) -> Option<u32> {
+fn value_to_u32(value: &Value) -> Option<u32> {
     value.as_u64().and_then(|number| u32::try_from(number).ok())
 }
 
 fn capture_output_item(state: &mut StreamState, output_index: u32, item: &Value) -> Result<(), ()> {
-    validate_output_item(item)?;
-    if state.output_item_indexes.contains(&output_index)
-        || state
-            .output_items
-            .as_ref()
-            .is_some_and(|items| items.len() >= MAX_REPLAY_ITEMS_PER_RESPONSE)
+    replay::validate_item(item)?;
+    if state.output_item_indexes.len() >= MAX_REPLAY_ITEMS_PER_RESPONSE
+        || !state.output_item_indexes.insert(output_index)
     {
         return Err(());
     }
-    let output_item_bytes = if state.output_items.is_some() {
-        let item_bytes = serialized_output_item_len(item)?;
-        let output_item_bytes = state.output_item_bytes.checked_add(item_bytes).ok_or(())?;
-        state.validate_replay_bytes(output_item_bytes)?;
-        Some(output_item_bytes)
-    } else {
-        None
-    };
-    state.output_item_indexes.insert(output_index);
+    if item_type(item) == Some("message") {
+        state.output_text.insert(
+            output_index,
+            replay::visible_text(std::slice::from_ref(item))?,
+        );
+        state.refusal_seen |= item["content"]
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .any(|part| item_type(part) == Some("refusal"));
+    }
     if let Some(output_items) = state.output_items.as_mut() {
-        output_items.insert(output_index, item.clone());
-        state.output_item_bytes = output_item_bytes.ok_or(())?;
+        state.output_item_bytes += serialized_output_item_len(item)?;
+        if state.output_item_bytes > MAX_REPLAY_BYTES {
+            state.replay_too_large = true;
+            state.output_items = None;
+        } else {
+            output_items.insert(output_index, item.clone());
+        }
     }
     Ok(())
-}
-
-fn validate_output_item(item: &Value) -> Result<(), ()> {
-    replay::validate_item(item)
 }
 
 fn serialized_output_item_len(item: &Value) -> Result<usize, ()> {
@@ -1522,21 +1561,21 @@ struct ProviderResponse {
 struct ProviderUsage {
     input_tokens: u64,
     output_tokens: u64,
-    total_tokens: u64,
-    input_tokens_details: InputTokenDetails,
-    output_tokens_details: OutputTokenDetails,
+    total_tokens: Option<u64>,
+    input_tokens_details: Option<InputTokenDetails>,
+    output_tokens_details: Option<OutputTokenDetails>,
 }
 
 #[derive(Deserialize)]
 struct InputTokenDetails {
-    cached_tokens: u64,
+    cached_tokens: Option<u64>,
     #[serde(default)]
     cache_write_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct OutputTokenDetails {
-    reasoning_tokens: u64,
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1546,17 +1585,16 @@ struct IncompleteDetails {
 }
 
 fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<(), ()> {
-    if text.is_empty()
-        || text
-            .chars()
-            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
     {
         return Err(());
     }
     if !reasoning {
         state.text.push_str(&text);
     }
-    for chunk in utf8_chunks(&text, MAX_EVENT_BYTES) {
+    for chunk in event_text_chunks(&text) {
         let event = if reasoning {
             ModelEvent::reasoning_delta(chunk)
         } else {
@@ -1568,28 +1606,25 @@ fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<
     Ok(())
 }
 
-fn utf8_chunks(value: &str, maximum: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < value.len() {
-        let mut end = (start + maximum).min(value.len());
-        while end > start && !value.is_char_boundary(end) {
-            end -= 1;
+fn event_text_chunks(mut value: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if value.is_empty() {
+            return None;
         }
-        chunks.push(&value[start..end]);
-        start = end;
-    }
-    chunks
+        let (chunk, rest) =
+            value.split_at(crate::text::floor_char_boundary(value, MAX_EVENT_BYTES));
+        value = rest;
+        Some(chunk)
+    })
 }
 
 fn start_tool(
     state: &mut StreamState,
     output_index: u32,
     item: FunctionCallItem,
-    reject_existing: bool,
 ) -> Result<(), ()> {
     if state.tools.contains_key(&output_index) {
-        return if reject_existing { Err(()) } else { Ok(()) };
+        return Err(());
     }
     let tool_call_id = openai_tool_call_id(&item.call_id)?;
     let name = item.name.parse::<ToolName>().map_err(|_| ())?;
@@ -1636,11 +1671,7 @@ fn append_tool_arguments(
     }
     tool.arguments.push_str(delta);
     let tool_call_id = tool.tool_call_id.clone();
-    let chunks = utf8_chunks(delta, MAX_EVENT_BYTES)
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for chunk in chunks {
+    for chunk in event_text_chunks(delta) {
         let event =
             ModelEvent::tool_call_arguments_delta(tool_call_id.clone(), chunk).map_err(|_| ())?;
         state.queue(event);
@@ -1687,9 +1718,8 @@ fn finish_tool_item(
     output_index: u32,
     item: FunctionCallItem,
 ) -> Result<(), ()> {
-    openai_tool_call_id(&item.call_id)?;
     if !state.tools.contains_key(&output_index) {
-        start_tool(state, output_index, item, false)?;
+        start_tool(state, output_index, item)?;
     } else {
         let tool = state.tools.get(&output_index).ok_or(())?;
         if tool.tool_call_id.to_string() != item.call_id || tool.name.as_str() != item.name {
@@ -1705,21 +1735,17 @@ fn finish_tool_item(
 }
 
 fn openai_tool_call_id(value: &str) -> Result<ToolCallId, ()> {
-    validate_openai_call_id(value)?;
+    if value.len() > MAX_OPENAI_CALL_ID_BYTES {
+        return Err(());
+    }
     ToolCallId::new(value).map_err(|_| ())
 }
 
 fn openai_request_call_id(value: &ToolCallId) -> Result<String, ModelError> {
-    validate_openai_call_id(value.as_str())
-        .map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
-    Ok(value.to_string())
-}
-
-fn validate_openai_call_id(value: &str) -> Result<(), ()> {
-    if value.is_empty() || value.len() > MAX_OPENAI_CALL_ID_BYTES {
-        return Err(());
+    if value.as_str().len() > MAX_OPENAI_CALL_ID_BYTES {
+        return Err(local_error(ModelErrorKind::InvalidRequest));
     }
-    ToolCallId::new(value).map(|_| ()).map_err(|_| ())
+    Ok(value.to_string())
 }
 
 fn end_tool_once(state: &mut StreamState, output_index: u32) -> Result<(), ()> {
@@ -1763,20 +1789,20 @@ fn finish_response(
     }
     let usage = response.usage.map(provider_usage).transpose()?;
     state.finalize_output_items(response.output)?;
-    if let Some(output) = &state.output_items {
+    let text = if let Some(output) = &state.output_items {
         state.refusal_seen |= output
             .values()
             .filter(|item| item_type(item) == Some("message"))
             .filter_map(|item| item.get("content").and_then(Value::as_array))
             .flatten()
             .any(|part| item_type(part) == Some("refusal"));
-        let text = replay::visible_text(&output.values().cloned().collect::<Vec<_>>())?;
-        if !text.is_empty() && text != state.text {
-            let suffix = text.strip_prefix(&state.text).ok_or(())?.to_owned();
-            if !suffix.is_empty() {
-                queue_text(state, suffix, false)?;
-            }
-        }
+        replay::visible_text(&output.values().cloned().collect::<Vec<_>>())?
+    } else {
+        state.output_text.values().map(String::as_str).collect()
+    };
+    if !text.is_empty() && text != state.text {
+        let suffix = text.strip_prefix(&state.text).ok_or(())?.to_owned();
+        queue_text(state, suffix, false)?;
     }
     let reason = if matches!(kind, TerminalKind::Incomplete) {
         match response
@@ -1818,28 +1844,41 @@ fn finish_response(
 }
 
 fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
-    let cached = usage.input_tokens_details.cached_tokens;
-    let cache_write = usage.input_tokens_details.cache_write_tokens;
-    let cached_and_written = cached.checked_add(cache_write.unwrap_or(0)).ok_or(())?;
-    let reasoning = usage.output_tokens_details.reasoning_tokens;
+    let cached = usage
+        .input_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens);
+    let cache_write = usage
+        .input_tokens_details
+        .and_then(|details| details.cache_write_tokens);
+    let cached_and_written = cached
+        .unwrap_or(0)
+        .checked_add(cache_write.unwrap_or(0))
+        .ok_or(())?;
     let input = usage
         .input_tokens
         .checked_sub(cached_and_written)
         .ok_or(())?;
-    let output = usage.output_tokens.checked_sub(reasoning).ok_or(())?;
-    let combined = usage
-        .input_tokens
-        .checked_add(usage.output_tokens)
+    let reasoning = usage
+        .output_tokens_details
+        .and_then(|details| details.reasoning_tokens);
+    let output = usage
+        .output_tokens
+        .checked_sub(reasoning.unwrap_or(0))
         .ok_or(())?;
-    if usage.total_tokens != combined {
-        return Err(());
+    if let Some(total) = usage.total_tokens {
+        if usage.input_tokens.checked_add(usage.output_tokens) != Some(total) {
+            return Err(());
+        }
     }
-    Ok(
-        Usage::from_optional(cache_write.map(|_| input), Some(output), Some(reasoning))
-            .with_cache_read_tokens(Some(cached))
-            .with_cache_write_tokens(cache_write)
-            .with_provider_total_tokens(Some(usage.total_tokens)),
+    Ok(Usage::from_optional(
+        cached.and(cache_write).map(|_| input),
+        reasoning.map(|_| output),
+        reasoning,
     )
+    .with_cache_read_tokens(cached)
+    .with_cache_write_tokens(cache_write)
+    .with_provider_total_tokens(usage.total_tokens))
 }
 
 fn local_error(kind: ModelErrorKind) -> ModelError {

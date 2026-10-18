@@ -65,6 +65,21 @@ never appear in TOML, logs, errors, fixtures, or documentation. Model IDs,
 provider URLs, and credential names are configuration inputs, not evidence that
 a request was sent.
 
+The Responses client has a 10-second connect timeout. `request_timeout_seconds`,
+when set, bounds the whole HTTP request; the Runtime model deadline and cancellation
+also apply. After a terminal event the adapter drains up to 64 KiB of additional
+body data within the remaining deadline to allow connection reuse. Trailing data
+is not interpreted as model output, and drain errors do not replace a terminal result.
+HTTP 503 and 529 are retryable and honor `Retry-After` (or `retry-after-ms`), like
+non-quota 429 responses. HTTP 408, 500, 502, and 504 retain unknown-delivery semantics
+and are not automatically retried, since the upstream may have processed the request.
+
+Compatible gateways may omit `total_tokens` and input/output token details.
+Missing counters remain unknown, not zero; disjoint input/output partitions remain
+unknown when the corresponding cache/reasoning breakdown is unavailable. Present
+counters must still have valid types and consistent totals. Empty text and refusal
+deltas are ignored.
+
 ## Paths And Prompt Files
 
 `AgentConfig::load` and `Agent::open_file` make the supplied config path

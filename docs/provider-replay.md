@@ -32,12 +32,24 @@ invented, ordinary empty constructors still reject, and completion/refusal/
 output-limit policy is unchanged. This compatibility repair is not a proven
 provider cache-hit fix.
 
+A missing message/reasoning item ID disables raw replay for that item, not the
+response. Anonymous reasoning (including ciphertext) is omitted; anonymous messages
+use only canonical text with a locally generated message ID. Other identified items
+remain replayable. Malformed IDs that are present are still rejected. An anonymous
+opaque-only response fails because it has neither usable replay nor canonical content.
+
 ## Bounds, persistence, and privacy
 
 The entire serialized Runtime replay envelope is limited to 256 KiB, depth 32,
 and 16,384 JSON nodes. Agent permits at most 256 output items per response.
 Replay bytes count toward the Runtime and mirrored Agent 2 MiB history limit;
-the existing 16 MiB JSONL record cap remains. No ciphertext is truncated.
+the existing 16 MiB JSONL record cap remains. No ciphertext is truncated. When
+capture exceeds a Runtime replay bound (including envelope framing), the adapter
+omits the entire replay attachment and keeps non-empty canonical text, reasoning,
+and tool calls from the already-billed response. A replay-only response still fails
+if its attachment cannot fit. Provider shape, canonical text/tool consistency, and
+the 256-item limit remain enforced; overflow is not permission to accept malformed
+provider output.
 
 Durable normalization retains validated replay. Public RPC, session/turn reads,
 export-like encoded items, Debug, and summary source prose remove it. Compaction

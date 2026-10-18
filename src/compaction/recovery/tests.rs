@@ -1,6 +1,6 @@
 use super::*;
 use crate::compaction::CompactionPolicy;
-use crate::models::DefaultProviderBudget;
+use crate::models::tests::DefaultProviderBudget;
 use minicore_runtime::ToolCallId;
 use minicore_runtime::execution::UserInput;
 use minicore_runtime::history::{

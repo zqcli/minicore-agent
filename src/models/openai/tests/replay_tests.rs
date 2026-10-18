@@ -173,7 +173,7 @@ fn late_ciphertext_enrichment_is_strictly_additive() {
 #[test]
 fn durable_tool_projection_preserves_raw_order_arguments_and_one_result() {
     let output = vec![reasoning(), tool("call_1")];
-    let replay = replay::capture(URL, MODEL, output.clone()).unwrap();
+    let replay = capture(URL, MODEL, output.clone()).unwrap();
     let mut messages = vec![
         ModelMessage::user("inspect").unwrap(),
         ModelMessage::assistant_with_provider_replay(parts(), Some(replay)).unwrap(),
@@ -224,7 +224,7 @@ fn incompatible_identity_and_unknown_version_fall_back_to_canonical() {
         ("http://localhost/other/responses", MODEL),
         (URL, "other-model"),
     ] {
-        let replay = replay::capture(url, name, vec![reasoning(), message("answer")]).unwrap();
+        let replay = capture(url, name, vec![reasoning(), message("answer")]).unwrap();
         let req = request(vec![AssistantPart::Text("answer".into())], replay);
         let bytes = model("http://localhost/v1").build_request(&req).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(SECRET));
@@ -245,7 +245,7 @@ fn incompatible_identity_and_unknown_version_fall_back_to_canonical() {
 
 #[test]
 fn stale_canonical_tool_or_text_is_rejected_even_with_incompatible_identity() {
-    let replay = replay::capture(URL, MODEL, vec![tool("call_1")]).unwrap();
+    let replay = capture(URL, MODEL, vec![tool("call_1")]).unwrap();
     for replacement in ["name", "arguments", "call_id"] {
         let mut value = serde_json::to_value(&replay).unwrap();
         value["payload"]["output"][0][replacement] = match replacement {
@@ -260,7 +260,7 @@ fn stale_canonical_tool_or_text_is_rejected_even_with_incompatible_identity() {
                 .is_err()
         );
     }
-    let replay = replay::capture(URL, MODEL, vec![message("other")]).unwrap();
+    let replay = capture(URL, MODEL, vec![message("other")]).unwrap();
     assert!(
         model("http://localhost/v1")
             .build_request(&request(vec![AssistantPart::Text("answer".into())], replay))
@@ -281,10 +281,10 @@ fn roles_input_kinds_duplicate_ids_and_empty_blobs_cannot_be_replayed() {
         invalid.push(item);
     }
     for item in invalid {
-        assert!(replay::capture(URL, MODEL, vec![item]).is_err());
+        assert!(capture(URL, MODEL, vec![item]).is_err());
     }
-    assert!(replay::capture(URL, MODEL, vec![reasoning(), reasoning()]).is_err());
-    assert!(replay::capture(URL, MODEL, vec![tool("call_1"), tool("call_1")]).is_err());
+    assert!(capture(URL, MODEL, vec![reasoning(), reasoning()]).is_err());
+    assert!(capture(URL, MODEL, vec![tool("call_1"), tool("call_1")]).is_err());
 }
 
 #[test]
@@ -334,14 +334,215 @@ fn replay_capture_bounds_fail_without_truncation_or_partial_attachment() {
             item
         })
         .collect();
-    assert!(replay::capture(URL, MODEL, too_many).is_err());
+    assert!(capture(URL, MODEL, too_many).is_err());
     let mut deep = json!(null);
     for _ in 0..40 {
         deep = json!([deep]);
     }
     let mut item = reasoning();
     item["extension"] = deep;
-    assert!(replay::capture(URL, MODEL, vec![item]).is_err());
+    assert!(capture(URL, MODEL, vec![item]).is_err());
+}
+
+#[test]
+fn oversized_replay_preserves_canonical_content_from_terminal_or_done_items() {
+    for terminal in [false, true] {
+        let mut oversized = reasoning();
+        oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES));
+        let output = vec![oversized, message("answer"), tool("call_1")];
+        let mut state = state();
+        for (index, item) in output.iter().enumerate() {
+            done(&mut state, index as u32, item.clone()).unwrap();
+        }
+        assert!(
+            state.output_items.is_none(),
+            "oversized raw items must not accumulate"
+        );
+        if terminal {
+            finish(&mut state, output).unwrap();
+        } else {
+            frame(
+                &mut state,
+                json!({"type":"response.completed","response":{}}),
+            )
+            .unwrap();
+        }
+        assert_eq!(state.text, "answer");
+        assert!(
+            !state
+                .pending
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
+        );
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::ToolCallEnd { .. })))
+        );
+        assert!(matches!(
+            state.pending.back(),
+            Some(Ok(ModelEvent::Finish {
+                reason: ModelFinishReason::ToolCalls
+            }))
+        ));
+    }
+    // No output-item events or text deltas: recover the terminal's canonical text.
+    let mut state = state();
+    let mut oversized = reasoning();
+    oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES));
+    finish(&mut state, vec![oversized, message("terminal answer")]).unwrap();
+    assert_eq!(state.text, "terminal answer");
+    assert!(
+        !state
+            .pending
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
+    );
+}
+
+#[test]
+fn replay_envelope_overflow_and_structural_limits_keep_nonempty_canonical_output() {
+    let mut oversized = reasoning();
+    oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES - 250));
+    let output = vec![oversized, message("answer")];
+    assert!(serialized_output_item_bytes(&output).unwrap() < ProviderReplay::MAX_BYTES);
+    assert!(
+        replay::capture(URL, MODEL, output.clone())
+            .unwrap()
+            .is_none()
+    );
+    let mut response = state();
+    finish(&mut response, output).unwrap();
+    assert_eq!(response.text, "answer");
+    assert!(
+        !response
+            .pending
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
+    );
+
+    for nodes in [false, true] {
+        let mut item = reasoning();
+        let mut extension = json!(null);
+        if nodes {
+            extension = json!(vec![Value::Null; ProviderReplay::MAX_NODES]);
+        } else {
+            for _ in 0..ProviderReplay::MAX_DEPTH {
+                extension = json!([extension]);
+            }
+        }
+        item["extension"] = extension;
+        let mut state = state();
+        finish(&mut state, vec![item, message("answer")]).unwrap();
+        assert_eq!(state.text, "answer");
+        assert!(
+            !state
+                .pending
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
+        );
+    }
+}
+
+#[test]
+fn oversized_replay_does_not_bypass_terminal_text_tool_or_shape_validation() {
+    for corrupt in ["text", "tool", "shape"] {
+        let mut state = state();
+        let mut oversized = reasoning();
+        oversized["encrypted_content"] = json!("x".repeat(ProviderReplay::MAX_BYTES));
+        frame(
+            &mut state,
+            json!({"type":"response.output_text.delta", "delta":"answer"}),
+        )
+        .unwrap();
+        done(&mut state, 0, oversized.clone()).unwrap();
+        done(&mut state, 2, tool("call_1")).unwrap();
+        let mut output = vec![oversized, message("answer"), tool("call_1")];
+        match corrupt {
+            "text" => output[1] = message("different"),
+            "tool" => output[2]["arguments"] = json!("{\"path\":\"other\"}"),
+            _ => output[0]["encrypted_content"] = json!(17),
+        }
+        assert!(finish(&mut state, output).is_err());
+        assert!(
+            !state
+                .pending
+                .iter()
+                .any(|event| matches!(event, Ok(ModelEvent::Finish { .. })))
+        );
+    }
+}
+
+#[test]
+fn missing_item_ids_preserve_canonical_text_and_other_items_replay() {
+    for missing_message in [false, true] {
+        let mut anonymous = reasoning();
+        anonymous.as_object_mut().unwrap().remove("id");
+        anonymous["encrypted_content"] = json!("ANONYMOUS-SECRET");
+        let mut text = message("answer");
+        if missing_message {
+            text.as_object_mut().unwrap().remove("id");
+            text["extension"] = json!("ANONYMOUS-EXTENSION");
+        }
+        let mut state = state();
+        finish(&mut state, vec![anonymous, text, reasoning()]).unwrap();
+        assert_eq!(state.text, "answer");
+        let replay = extract(&state);
+        replay::validate_history(&replay, &[AssistantPart::Text("answer".into())]).unwrap();
+        let body = model("http://localhost/v1")
+            .build_request(&request(vec![AssistantPart::Text("answer".into())], replay))
+            .unwrap();
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains(SECRET));
+        assert!(body.contains("answer"));
+        assert!(!body.contains("ANONYMOUS-SECRET"));
+        assert!(!body.contains("ANONYMOUS-EXTENSION"));
+    }
+    for id in [json!(null), json!(""), json!(12)] {
+        let mut item = message("answer");
+        item["id"] = id;
+        assert!(finish(&mut state(), vec![item]).is_err());
+    }
+    let mut item = reasoning();
+    item.as_object_mut().unwrap().remove("id");
+    assert!(
+        finish(&mut state(), vec![item]).is_err(),
+        "anonymous replay-only output has no usable content"
+    );
+}
+
+#[test]
+fn anonymous_item_fallback_does_not_create_duplicate_ids_or_empty_replay() {
+    let mut anonymous = message("answer");
+    anonymous.as_object_mut().unwrap().remove("id");
+    let mut identified = reasoning();
+    identified["id"] = json!("msg_minicore_0");
+    let mut response = state();
+    finish(&mut response, vec![anonymous, identified]).unwrap();
+    replay::validate_history(&extract(&response), &[AssistantPart::Text("answer".into())]).unwrap();
+
+    let mut anonymous = reasoning();
+    anonymous.as_object_mut().unwrap().remove("id");
+    let mut empty = reasoning();
+    empty["encrypted_content"] = json!("");
+    let mut response = state();
+    frame(
+        &mut response,
+        json!({"type":"response.reasoning_summary_text.delta", "delta":"thinking"}),
+    )
+    .unwrap();
+    finish(&mut response, vec![anonymous, empty]).unwrap();
+    assert!(
+        !response
+            .pending
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::ProviderReplay { .. })))
+    );
+    assert!(matches!(
+        response.pending.back(),
+        Some(Ok(ModelEvent::Finish { .. }))
+    ));
 }
 
 #[tokio::test]
@@ -363,7 +564,7 @@ async fn eof_and_cancellation_never_produce_durable_attachment() {
 
 #[test]
 fn durable_normalization_preserves_replay_public_normalization_redacts_it() {
-    let replay = replay::capture(URL, MODEL, vec![reasoning()]).unwrap();
+    let replay = capture(URL, MODEL, vec![reasoning()]).unwrap();
     let item = HistoryItem::Assistant(AssistantHistory {
         loop_id: LoopId::new().unwrap(),
         request_index: 0,
@@ -427,7 +628,7 @@ fn absent_cache_write_keeps_partition_unknown_and_validates_known_totals() {
 
 #[test]
 fn generic_utility_budget_includes_replay_conservatively_without_fake_identity_skip() {
-    let replay = replay::capture(
+    let replay = capture(
         "http://other.example/v2/responses",
         "different-model",
         vec![reasoning(), message("answer")],
@@ -469,7 +670,7 @@ fn normalized_projection_invalidates_only_changed_legacy_reasoning_usage() {
     let state = crate::compaction::CompactionState::new();
     let loop_id = LoopId::new().unwrap();
     let original_request = basic_request(ReasoningPreference::Auto);
-    let replay = replay::capture(URL, MODEL, vec![message("answer")]).unwrap();
+    let replay = capture(URL, MODEL, vec![message("answer")]).unwrap();
     let mut raw = vec![HistoryItem::Assistant(AssistantHistory {
         loop_id,
         request_index: 0,
@@ -527,4 +728,8 @@ fn normalized_projection_invalidates_only_changed_legacy_reasoning_usage() {
         123,
         "changed legacy opaque projection falls back to its current small estimate"
     );
+}
+
+fn capture(endpoint: &str, model: &str, output: Vec<Value>) -> Result<ProviderReplay, ()> {
+    replay::capture(endpoint, model, output)?.ok_or(())
 }
