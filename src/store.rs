@@ -516,6 +516,7 @@ struct ReadToolRecord {
 
 pub(crate) struct ToolChangeScan {
     pub(crate) records: Vec<(ToolRef, StoredFileChange)>,
+    pub(crate) observed_at: std::collections::HashMap<ToolRef, Option<String>>,
     pub(crate) skipped: bool,
     #[cfg(test)]
     pub(crate) entries: usize,
@@ -531,6 +532,7 @@ impl ToolChangeScan {
     pub(crate) fn unavailable() -> Self {
         Self {
             records: Vec::new(),
+            observed_at: std::collections::HashMap::new(),
             skipped: true,
             #[cfg(test)]
             entries: 0,

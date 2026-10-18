@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -482,7 +483,7 @@ pub(crate) fn workspace_records(
     if status.skipped_paths > 0 {
         push_warning(&mut warnings, ChangeListWarning::RecordsSkipped);
     }
-    let records = status
+    let mut records: Vec<_> = status
         .entries
         .iter()
         .map(|entry| ChangeRecord {
@@ -503,6 +504,7 @@ pub(crate) fn workspace_records(
             coverage: ChangeCoverage::Unavailable,
         })
         .collect();
+    records.sort_by(|left, right| left.change_ref.cmp(&right.change_ref));
     (records, observation, warnings)
 }
 
@@ -530,7 +532,7 @@ fn workspace_kind(entry: &WorkspaceStatusEntry) -> ChangeKind {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn page_records(
     request: &ChangesListRequest,
-    mut records: Vec<ChangeRecord>,
+    records: Vec<ChangeRecord>,
     observation: String,
     consistency: ChangeListConsistency,
     observed_at_unix_ms: Option<u64>,
@@ -541,10 +543,7 @@ pub(crate) async fn page_records(
     page_end: Option<usize>,
 ) -> Result<ChangesListResult, AgentError> {
     request.validate()?;
-    if records.iter().any(|record| !record.details_available) {
-        push_warning(&mut warnings, ChangeListWarning::DetailsUnavailable);
-    }
-    records.sort_by(|left, right| left.change_ref.cmp(&right.change_ref));
+    warnings.retain(|warning| *warning != ChangeListWarning::DetailsUnavailable);
     let total = records.len();
     let cursor = request.cursor.as_ref();
     let offset = cursor.map_or(0, |cursor| cursor.offset);
@@ -582,6 +581,12 @@ pub(crate) async fn page_records(
     )
     .await?;
     check_budget(cancellation, deadline)?;
+    if records[offset..end]
+        .iter()
+        .any(|record| !record.details_available)
+    {
+        push_warning(&mut warnings, ChangeListWarning::DetailsUnavailable);
+    }
     let result = ChangesListResult {
         session_id: request.session_id,
         scope: request.scope.clone(),
@@ -705,26 +710,12 @@ pub(crate) async fn list_tool_changes(
         }
     };
 
-    let mut records = warm_records;
+    let (mut records, compatible) = merge_tool_records(warm_records, &scan);
     let mut warnings = Vec::new();
-    let mut complete = !scan.skipped;
-    if scan.skipped {
-        push_warning(&mut warnings, ChangeListWarning::RecordsSkipped);
+    let mut complete = !scan.skipped && compatible;
+    if !complete {
+        warnings.push(ChangeListWarning::RecordsSkipped);
     }
-    for (tool_ref, change) in &scan.records {
-        if let Some(record) = records
-            .iter_mut()
-            .find(|record| record.tool_ref.as_ref() == Some(tool_ref))
-        {
-            if !compatible_change(record, tool_ref, change) {
-                complete = false;
-                push_warning(&mut warnings, ChangeListWarning::RecordsSkipped);
-            }
-            continue;
-        }
-        records.push(change.record(tool_ref, false));
-    }
-    records.sort_by(|left, right| left.change_ref.cmp(&right.change_ref));
     let observation = tool_observation(&records, &scan.observation, complete);
     if request
         .cursor
@@ -750,7 +741,6 @@ pub(crate) async fn list_tool_changes(
         )
         .await;
     }
-    let observation_complete = complete;
     let consistency = if warm.is_some() {
         ChangeListConsistency::Live
     } else {
@@ -772,6 +762,11 @@ pub(crate) async fn list_tool_changes(
         used_bytes: 0,
         exhausted: false,
     };
+    let stored: HashMap<_, _> = scan
+        .records
+        .iter()
+        .map(|(tool_ref, change)| (tool_ref, change))
+        .collect();
     for record in records
         .iter_mut()
         .skip(offset)
@@ -783,11 +778,7 @@ pub(crate) async fn list_tool_changes(
         let Some(tool_ref) = record.tool_ref.clone() else {
             continue;
         };
-        let Some((_, change)) = scan
-            .records
-            .iter()
-            .find(|(candidate, _)| candidate == &tool_ref)
-        else {
+        let Some(change) = stored.get(&tool_ref) else {
             continue;
         };
         if !compatible_change(record, &tool_ref, change) {
@@ -810,7 +801,6 @@ pub(crate) async fn list_tool_changes(
             break;
         }
     }
-    let observation = tool_observation(&records, &scan.observation, observation_complete);
     page_records(
         &request,
         records,
@@ -853,6 +843,50 @@ pub(crate) async fn list_workspace_changes(
     .await
 }
 
+/// Keep the live observation sequence; merge disk-only entries at their
+/// recorded times. Missing timestamps precede dated cold entries, while live
+/// entries not yet persisted follow the durable observations.
+fn merge_tool_records(
+    warm: Vec<ChangeRecord>,
+    scan: &crate::store::ToolChangeScan,
+) -> (Vec<ChangeRecord>, bool) {
+    let by_ref: HashMap<_, _> = warm
+        .iter()
+        .map(|record| (record.tool_ref.as_ref().unwrap(), record))
+        .collect();
+    let mut compatible = true;
+    let cold: Vec<_> = scan
+        .records
+        .iter()
+        .filter_map(|(tool_ref, change)| {
+            if let Some(record) = by_ref.get(tool_ref) {
+                compatible &= compatible_change(record, tool_ref, change);
+                None
+            } else {
+                Some((
+                    scan.observed_at[tool_ref].as_deref(),
+                    change.record(tool_ref, false),
+                ))
+            }
+        })
+        .collect();
+    let mut records = Vec::with_capacity(warm.len() + cold.len());
+    let mut warm = warm.into_iter().peekable();
+    for (time, record) in cold {
+        while warm.peek().is_some_and(|record| {
+            scan.observed_at
+                .get(record.tool_ref.as_ref().unwrap())
+                .and_then(|time| time.as_deref())
+                .is_some_and(|warm_time| Some(warm_time) <= time)
+        }) {
+            records.push(warm.next().unwrap());
+        }
+        records.push(record);
+    }
+    records.extend(warm);
+    (records, compatible)
+}
+
 fn compatible_change(record: &ChangeRecord, tool_ref: &ToolRef, change: &StoredFileChange) -> bool {
     record.origin == ChangeOrigin::Tool
         && record.tool_ref.as_ref() == Some(tool_ref)
@@ -866,11 +900,10 @@ fn compatible_change(record: &ChangeRecord, tool_ref: &ToolRef, change: &StoredF
 }
 
 fn tool_observation(records: &[ChangeRecord], scan_observation: &str, complete: bool) -> String {
-    let mut observations = records
+    let observations = records
         .iter()
         .map(|record| (record.change_ref.as_str(), record.coverage))
         .collect::<Vec<_>>();
-    observations.sort_by(|left, right| left.0.cmp(right.0));
     let bytes = serde_json::to_vec(&(scan_observation, complete, observations))
         .expect("serializing change observations cannot fail");
     crate::store::hash_bytes(&bytes)

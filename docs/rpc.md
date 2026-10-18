@@ -1612,6 +1612,20 @@ turn scopes use only retained native `write`, `edit`, and `apply_patch`
 records with their complete ToolRef identity. A turn scope is filtered by the
 exact Loop ID, not by presentation text or a request key.
 
+Loaded records retain their observed loop/request/call order, not hash order.
+Disk-only records are merged using their saved start time (or finish time when
+no start time is available). Cold lists use those times oldest first, breaking
+ties by Loop ID, request index, then Tool Call ID. Legacy records without a
+canonical UTC-millisecond timestamp come first in that same identity order;
+the storage format does not preserve their original observation sequence.
+Live records without a durable timestamp follow the disk-only records while
+preserving their in-memory relative order. Workspace ordering remains by
+`change_ref`. Ordering is part of the continuation fingerprint.
+
+Loaded lists still scan durable metadata: a complete in-memory snapshot does
+not prove that older or evicted records are absent from disk. This also keeps
+durable metadata changes visible to continuation validation.
+
 ```json
 {
   "scope": "session",
@@ -1649,7 +1663,9 @@ is returned only when the page ended at a record boundary and the observation
 or durable record set remains the same. Workspace cursors bind the Git
 observation fingerprint; a changed observation returns `stale` rather than
 silently reading a new version. Session and turn cursors bind the retained
-record fingerprint and are likewise stale when the record set changes.
+record fingerprint and are likewise stale when the record set or its order changes.
+`details_unavailable` describes only records returned on this page, not
+unverified later pages; an empty stale response does not carry that warning.
 The page end is planned once against the worst-case header and
 `details_unavailable`/`records_skipped` warnings with the longer
 `complete: false` encoding, then reused as an upper bound after blob
