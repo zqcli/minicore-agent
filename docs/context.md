@@ -54,17 +54,22 @@ Source range/hash coverage and the original summary hash bind each turn-local
 projection. Only a strictly smaller, well-paired complete provider request is
 installed. One logical request permits at most one threshold utility; a stable
 raw-source/binding fingerprint prevents another attempt for unchanged sources,
-including after a failed attempt. Generated summary text/generations are not new
-source. If the irreducible retained floor itself meets the soft trigger, there is
+including after a failed attempt, but cancellation releases the fingerprint for
+a later retry. Generated summary text/generations are not new source. The retained
+floor reserves up to 1,024 tokens (at most one eighth of the effective window)
+for a summary. If that floor meets the soft trigger, there is
 no useful threshold reduction and no utility call is spent. These are bounded
 attempts, not a guarantee of reaching target or fitting arbitrary contexts.
 
 Threshold input is streamed from borrowed history through the existing 256 KiB
-source projection, with 2,000-character tool-result projection. It does not clone
+source projection, with 2,000-character tool-result and serialized-argument projections. It does not clone
 raw history or apply the separate 512 KiB recovery-ticket retention limit to
 safely projectable tool history. Pure prose that still exceeds the source cap
 fails explicitly. Failure preserves the old projection and the normal request
-can still be sent; cancellation/deadline ends preparation instead.
+can still be sent. In-turn utility work receives half the remaining preparation
+time. A utility timeout sends the unchanged projection only if its local estimate
+fits the hard limit and the parent deadline/cancellation still permits sending;
+otherwise preparation fails. Emergency recovery keeps its original deadline.
 
 A provider/binding/framing and summary-generation anchor proves when actual
 assistant usage may be combined with estimates for later content. Otherwise
@@ -74,7 +79,7 @@ or changed framing invalidate old usage; no missing usage component becomes zero
 ## Independent Manual And Post-Turn Operations
 
 Manual `session.compact` is available only while idle. By default it retains
-approximately 20,000 recent tokens, rounded toward older history to complete
+approximately `min(20,000, effective_input_window / 4)` recent tokens, rounded toward older history to complete
 stored loop records. A loop, including its tool calls and results, is never split.
 The summary covers only the older prefix; display history and the next model
 request both retain the real recent answers. No raw history bytes are rewritten.
@@ -112,8 +117,9 @@ not retroactively cancel a reserved operation's captured configuration.
 
 Each selected source is projected into one bounded text request using the Pi
 initial/update summary prompts. User text, assistant text, visible reasoning
-text/summary, embedded historical summaries and complete tool-call arguments are
-retained. Provider replay, encrypted reasoning, signatures and history accounting
+text/summary and embedded historical summaries are retained. Tool-call arguments
+are serialized as JSON and limited to the first 2,000 Unicode scalar values,
+with an explicit omitted-character count, like tool results. Provider replay, encrypted reasoning, signatures and history accounting
 metadata are excluded. Each tool result keeps its tool name, call ID and outcome,
 plus the first 2,000 Unicode scalar values of its text and an explicit omitted
 character count. This can omit important details at the end of a long result;
@@ -127,6 +133,10 @@ complete retained tail. Both include fixed instructions and tool schemas. Tail
 and fixed-content headroom are checked before the utility, then the complete
 result is checked against the hard budget and for actual progress before commit.
 Other threshold/emergency operations keep their own selected-source rules.
+An old summary used for refresh retains its first 16,384 Unicode scalar values
+(at most 64 KiB), with an explicit omission marker; the original snapshot is
+unchanged. The adapted update prompt asks for condensation, not unbounded growth.
+Utility reasoning is Low, or Disabled when the session disables reasoning.
 Project instructions and tool schemas remain in the ordinary request and its
 budget checks, but are not repeated in the tool-free summary request. The source
 builder is bounded to the Runtime's 256 KiB message limit and checks cancellation
@@ -226,7 +236,8 @@ There is no guarantee that an arbitrarily long turn can always be recovered.
 - `automatic.current` / `last` describe the active/latest request-boundary
   threshold attempt, keyed by loop and request index. A drop-safe guard clears
   current before request/terminal events, retaining observed utility usage.
-  These are bounded latest observations, not cumulative utility accounting.
+  The latest observation accumulates utility usage across attempts in the same
+  turn; a new turn starts a new total. Unknown usage remains unknown.
   Independent operations use `current_operation` and `last_result`; overflow
   recovery uses `recovery`. Active threshold work is cancelled through the turn.
 - Utility usage is separate from ordinary turn usage; unknown fields are not

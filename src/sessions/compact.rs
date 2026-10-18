@@ -704,6 +704,7 @@ pub(super) async fn run_compaction_inner(
     let max_prefix_items = match crate::compaction::recent_tail_start(
         &reservation.history,
         reservation.previous_covered_item_count,
+        reservation.hard_tokens,
         &reservation.operation.cancellation,
         reservation.deadline,
     ) {

@@ -660,6 +660,79 @@ impl ProjectionResult {
 }
 
 #[tokio::test]
+async fn utility_timeout_preserves_a_fitting_request_but_not_an_overfull_one() {
+    for fits in [true, false] {
+        let model = Stub::new(8_000, "unused", Some(Arc::new(Notify::new())));
+        let mut auto = context(&model);
+        auto.binding.policy.trigger_percent = 50;
+        let current = LoopId::new().unwrap();
+        let base = exchange(
+            LoopId::new().unwrap(),
+            0,
+            if fits { 20_000 } else { 40_000 },
+        );
+        let appended = vec![user(current, "keep", false)];
+        let system = BoundedText::new("system").unwrap();
+        let cancel = CancellationToken::new();
+        let mut request = input(&auto, &system, None, &base, &appended, current, 0, &cancel);
+        request.deadline = Instant::now() + Duration::from_millis(200);
+        let result = consolidate(request, false).await;
+        if fits {
+            let result = result.unwrap();
+            assert!(!result.compacted);
+            assert!(result.request.messages().iter().any(|message| matches!(message, ModelMessage::Tool { output, .. } if output.content().byte_len() == 20_000)));
+        } else {
+            assert_eq!(result.err().unwrap().error, UtilityError::Timeout);
+        }
+        let observation = auto.state.automatic_view().last.unwrap();
+        assert_eq!(observation.outcome, "timeout");
+        assert_eq!(observation.utility_usage.unwrap().call_count, 1);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_releases_source_for_retry_and_usage_accumulates_per_turn() {
+    let gate = Arc::new(Notify::new());
+    let mut model = Stub::new(8_000, "unused", Some(Arc::clone(&gate)));
+    Arc::get_mut(&mut model).unwrap().partial_usage = true;
+    let auto = context(&model);
+    let current = LoopId::new().unwrap();
+    let base = exchange(LoopId::new().unwrap(), 0, 40_000);
+    let appended = vec![user(current, "keep", false)];
+    let system = BoundedText::new("system").unwrap();
+    for index in 0..2 {
+        let cancel = CancellationToken::new();
+        let future = consolidate(
+            input(
+                &auto, &system, None, &base, &appended, current, index, &cancel,
+            ),
+            false,
+        );
+        tokio::pin!(future);
+        tokio::select! {
+            _ = gate.notified() => {},
+            result = &mut future => panic!("utility did not start: {:?}", result.err()),
+        }
+        cancel.cancel();
+        assert_eq!(future.await.err().unwrap().error, UtilityError::Cancelled);
+        let usage = auto
+            .state
+            .automatic_view()
+            .last
+            .unwrap()
+            .utility_usage
+            .unwrap();
+        assert_eq!(usage.call_count, index + 1);
+        assert_eq!(
+            usage.usage.unwrap().provider_total_tokens(),
+            Some(10 * u64::from(index + 1))
+        );
+        assert!(!usage.complete);
+    }
+}
+
+#[tokio::test]
 async fn runtime_history_limits_trigger_even_with_a_large_model_window() {
     for index in [0, 1] {
         for by_bytes in [false, true] {

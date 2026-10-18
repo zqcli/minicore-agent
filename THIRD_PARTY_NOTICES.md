@@ -6,7 +6,8 @@ from @earendil-works/pi-coding-agent 1.0.1, dist/core/compaction/utils.js
 UPDATE_SUMMARIZATION_INSTRUCTIONS).
 Upstream: https://github.com/earendil-works/pi
 License: https://github.com/earendil-works/pi/blob/main/LICENSE
-MiniCore supplies its own historical-data envelopes and input-format adapters.
+MiniCore supplies its own historical-data envelopes and input-format adapters,
+and adapts the update instructions to bound summary size and condense obsolete detail.
 
 MIT License
 
