@@ -16,8 +16,8 @@ Agent environment, except configured credential variables are removed and
 `MINICORE_AGENT=1` is set. Profiles are not re-sourced by a login shell. Windows
 continues to use PowerShell with `-NoProfile`.
 
-Unix cancellation sends SIGTERM to the process group, allows a 500 ms grace,
-then sends SIGKILL and reaps it. Model-visible output keeps head and tail with an
+Unix cancellation sends SIGTERM to the process group and allows a 500 ms grace
+while draining both output pipes, then sends SIGKILL and reaps it. Model-visible output keeps head and tail with an
 omitted-bytes marker; stdout and stderr share one output budget. Use an init
 process (for example container `--init`) to reap orphaned descendants in containers.
 

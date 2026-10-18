@@ -281,13 +281,13 @@ async fn a_chunk_is_stored_before_it_is_observed_and_while_the_command_runs() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cancellation_allows_term_handlers_to_finish() {
+async fn cancellation_drains_both_pipes_while_term_handler_finishes() {
     let dir = crate::test_support::TempDir::new("term-handler");
     let owners = CommandOwners::new();
     let request = request(
         dir.path(),
         "term-handler",
-        "trap 'printf cleaned > cleaned; exit 0' TERM; echo $$ > child.pid; while :; do sleep 1; done",
+        "trap 'printf %1048576s x; printf %1048576s y >&2; printf cleaned > cleaned; exit 0' TERM; echo $$ > child.pid; while :; do sleep 1; done",
         30_000,
         None,
     );
@@ -295,12 +295,20 @@ async fn cancellation_allows_term_handlers_to_finish() {
     let mut worker = owners.start(request).unwrap();
     read_pid(&dir.path().join("child.pid")).await;
     cancel.cancel();
-    worker.completion().await;
+    let outcome = worker.completion().await;
     owners.join_all().await;
     assert_eq!(
         tokio::fs::read(dir.path().join("cleaned")).await.unwrap(),
         b"cleaned"
     );
+    assert_eq!(
+        outcome.stdout.len() as u64 + outcome.stdout_omitted,
+        1_048_576
+    );
+    // The shell can also print a diagnostic when its sleep receives SIGTERM.
+    assert!(outcome.stderr.len() as u64 + outcome.stderr_omitted >= 1_048_576);
+    assert_eq!(outcome.stdout.last(), Some(&b'x'));
+    assert_eq!(outcome.stderr.last(), Some(&b'y'));
 }
 
 #[cfg(unix)]

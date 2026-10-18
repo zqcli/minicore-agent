@@ -595,7 +595,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
     let mut pipes_cut = false;
     if cancel_requested || deadline_expired {
         announce_stop(&request, cancel_requested);
-        stop_scope(&mut child, leader).await;
+        stop_scope_and_drain(&mut child, leader, &mut drains, &mut drains_done).await;
         stopped_scope = true;
     } else if leader_status.is_none() {
         // The pipes closed first, but the leader still owns its exit: wait for
@@ -618,7 +618,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
                     cancel_requested = true;
                 }
                 announce_stop(&request, cancel_requested);
-                stop_scope(&mut child, leader).await;
+                stop_scope_and_drain(&mut child, leader, &mut drains, &mut drains_done).await;
                 stopped_scope = true;
             }
         }
@@ -640,7 +640,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
                 cancel_requested = true;
                 announce_stop(&request, true);
             }
-            stop_scope(&mut child, leader).await;
+            stop_scope_and_drain(&mut child, leader, &mut drains, &mut drains_done).await;
             stopped_scope = true;
             pipes_cut = true;
         }
@@ -659,7 +659,7 @@ async fn execute(mut request: CommandRequest, cancel: &CancellationToken) -> Com
     // before the owner finishes; only a process that actively left the scope is
     // outside the promise.
     if leader_status.is_some() && !stopped_scope && !scope_gone(leader).await {
-        stop_scope(&mut child, leader).await;
+        stop_scope_and_drain(&mut child, leader, &mut drains, &mut drains_done).await;
         stopped_scope = true;
         pipes_cut |= !drain_within(&mut drains, STOPPED_DRAIN_GRACE, None, &mut drains_done).await;
     }
@@ -927,6 +927,25 @@ pub(crate) static TERMINATION_FAILURES: crate::test_support::Registry<(
     Option<u32>,
     tests::TerminationFailure,
 )> = crate::test_support::Registry::new();
+
+/// Keep the pipes moving while a TERM handler runs; a full pipe must not force
+/// an otherwise cooperative handler to wait until SIGKILL.
+async fn stop_scope_and_drain(
+    child: &mut Box<dyn TokioChildWrapper>,
+    leader: Option<u32>,
+    drains: &mut Pin<Box<dyn Future<Output = ()> + Send + '_>>,
+    done: &mut bool,
+) {
+    let stopping = stop_scope(child, leader);
+    tokio::pin!(stopping);
+    tokio::select! {
+        _ = &mut stopping => {}
+        _ = &mut *drains, if !*done => {
+            *done = true;
+            stopping.await;
+        }
+    }
+}
 
 /// Stops the controlled scope: the leader first, then the whole group/job so no
 /// descendant survives the owner. Every step is attempted even when an earlier
