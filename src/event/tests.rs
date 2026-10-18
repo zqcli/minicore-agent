@@ -78,6 +78,7 @@ async fn preview_updates_cannot_displace_their_terminal_transition() {
         .into_iter()
         .find(|event| matches!(event, AgentEvent::ToolArgumentsPreview { .. }))
         .unwrap();
+    preview.set_dropped_before(0);
     for current in 3..20 {
         if let AgentEvent::ToolArgumentsPreview {
             revision, state, ..
@@ -96,12 +97,14 @@ async fn preview_updates_cannot_displace_their_terminal_transition() {
         *state = ToolArgumentsPreviewState::Discarded;
     }
     assert_eq!(sink.try_send(preview), AgentSendResult::Sent);
+    let terminal = stream.recv().await.unwrap();
+    assert_eq!(terminal.dropped_before(), 16);
     assert!(matches!(
-        stream.recv().await,
-        Some(AgentEvent::ToolArgumentsPreview {
+        terminal,
+        AgentEvent::ToolArgumentsPreview {
             state: ToolArgumentsPreviewState::Discarded,
             ..
-        })
+        }
     ));
 }
 

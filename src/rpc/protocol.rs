@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use minicore_runtime::interaction::InteractionAnswer;
@@ -51,22 +51,11 @@ pub(crate) struct RpcRequest {
     pub(crate) params: Option<Value>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
 pub(crate) enum RpcId {
     Number(serde_json::Number),
     String(String),
-}
-
-impl Serialize for RpcId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Number(value) => value.serialize(serializer),
-            Self::String(value) => value.serialize(serializer),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -468,21 +457,11 @@ impl RpcResponse {
     }
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
 pub(crate) enum RpcOutbound {
     Response(RpcResponse),
     Event(Box<AgentEventNotification>),
-}
-
-impl Serialize for RpcOutbound {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Response(response) => response.serialize(serializer),
-            Self::Event(notification) => notification.serialize(serializer),
-        }
-    }
 }
 
 #[derive(Serialize)]

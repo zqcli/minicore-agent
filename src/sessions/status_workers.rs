@@ -7,15 +7,12 @@ pub(crate) const MAX_STATUS_QUERY_WORKERS: usize = 4;
 /// child until the child is stopped and reaped, so closing the Session joins
 /// this set instead of relying on the child's drop behaviour.
 pub(super) struct StatusWorkers {
-    /// Set once the Session starts closing: no new worker may register.
-    closing: bool,
     pub(super) workers: Vec<JoinHandle<()>>,
 }
 
 impl StatusWorkers {
     pub(super) fn new() -> Self {
         Self {
-            closing: false,
             workers: Vec::new(),
         }
     }
@@ -173,7 +170,7 @@ impl Session {
     {
         let mut workers = self.shared.status_workers.lock().unwrap();
         workers.reap_finished();
-        if workers.closing || self.shared.close.is_cancelled() {
+        if self.shared.close.is_cancelled() {
             return Err(AgentError::SessionNotLoaded);
         }
         if workers.workers.len() >= MAX_STATUS_QUERY_WORKERS {
@@ -192,11 +189,10 @@ impl Session {
         })
     }
 
-    /// Refuses new status workers and gives cancelled workers a bounded reap grace.
+    /// Joins registered workers after Session cancellation has stopped admission.
     pub(super) async fn join_status_workers(&self) {
         let workers = {
             let mut workers = self.shared.status_workers.lock().unwrap();
-            workers.closing = true;
             std::mem::take(&mut workers.workers)
         };
         let deadline = tokio::time::Instant::now() + crate::workspace::WORKSPACE_CANCEL_GRACE;

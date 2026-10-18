@@ -65,9 +65,6 @@ impl CompletionGuard {
     }
 
     fn publish_finished(&mut self, result: Arc<TurnResult>) {
-        if !self.armed {
-            return;
-        }
         self.sender
             .send_replace(Some(TurnCompletion::Finished(result)));
         self.armed = false;
