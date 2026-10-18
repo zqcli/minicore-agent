@@ -2,193 +2,207 @@
 
 [![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
-MiniCore Agent **0.7.0** is an RPC-first local agent core. It provides a Rust
-library, a local Store, rooted Workspaces, multiple loaded Sessions, bounded
-Tool data, and a stdio JSON-RPC service for a client UI.
+MiniCore Agent is a local, RPC-first coding-agent backend written in Rust. It
+manages persistent Sessions over rooted Workspaces, runs model/tool turns on
+[MiniCore Runtime](https://github.com/zqcli/minicore-runtime), and exposes
+everything to a client UI through newline-delimited JSON-RPC on stdio. It can
+also be embedded directly as a Rust library.
 
-- Rust edition: 2024; MSRV: **1.85**
-- Runtime: `minicore-runtime 0.7.0`, pinned to Git revision
-  `86fba7893a09a6cdab76c52da07f5fc93c307a90`.
-- RPC protocol version: **1**
-- Versioned source delivery uses the `dev` branch and annotated release tags;
-  this does not imply a package-registry publication or binary installation.
-  Historical verification records retain their original scope and dates.
+| | |
+|---|---|
+| Version | 0.7.0 |
+| Rust | edition 2024, MSRV 1.85 |
+| Runtime | `minicore-runtime` 0.7.0, pinned to `86fba7893a09a6cdab76c52da07f5fc93c307a90` |
+| RPC protocol | 1 (33 methods) |
+| Provider | OpenAI Responses API and compatible endpoints |
+| License | MIT OR Apache-2.0 |
+
+## Features
+
+- **Sessions.** Several Sessions can be loaded at once, each with one active
+  turn at a time. History is an append-only JSONL file and survives restarts.
+  Turns can be steered, cancelled, waited on, and inspected after the fact.
+- **Tools.** `read`, `write`, `edit`, `apply_patch`, and `bash`, with approval
+  modes `ask`, `auto`, and `read_only`. Interactive approvals are answered
+  over RPC.
+- **Workspace queries.** Bounded file listing, search, file reads, Git status,
+  and per-turn change tracking with diffs. Paths are confined to the Workspace
+  root.
+- **Context management.** Automatic and manual compaction into source-bound
+  summaries, plus a one-time compact-and-retry when the provider rejects a
+  request for context length.
+- **Provider support.** Streaming Responses with reasoning, retries honoring
+  `Retry-After`, and durable provider replay across tool rounds and restarts.
+- **Bounded and redacted.** Queues, reads, tool output, and history scans have
+  explicit limits. Keys, prompts, and provider bodies stay out of logs and
+  errors.
+
+## How It Fits Together
+
+```text
+client UI ──stdio JSON-RPC──► minicore-agent
+                               ├─ Sessions ──► minicore-runtime AgentLoop (one per turn)
+                               ├─ Models ────► OpenAI Responses provider
+                               ├─ Tools ─────► Workspace (rooted file access, Bash)
+                               └─ Store ─────► <data_dir>/sessions/<session_id>/
+```
+
+Runtime runs a single loop of model requests and tool calls. The Agent owns
+everything around that loop: Sessions, persistence, providers, tools,
+compaction, and the RPC surface. See [Architecture](docs/architecture.md).
 
 ## Quickstart
 
-A standalone checkout fetches the fixed Runtime Git revision from `Cargo.toml`
-and `Cargo.lock`; no adjacent Runtime checkout or path override is required.
-Tool-round execution defaults to unlimited (`0`), while cancellation, deadlines,
-and other resource limits remain active.
-
-Edit `example.agent.toml` with a real provider model ID and provide the API key
-through the environment variable named by `api_key_env`. The example enables
-`approval = "auto"`; use it only in a trusted local environment.
+You need Rust 1.85 or newer and an API key for an OpenAI Responses-compatible
+endpoint. Cargo fetches the pinned Runtime revision itself; no sibling checkout
+is required.
 
 ```bash
 cargo build --locked --release
-./target/release/minicore-agent --version
-./target/release/minicore-agent --config ./example.agent.toml --stdio
+cp example.agent.toml agent.toml   # set models.main.model to a real model ID
+export OPENAI_API_KEY=...           # the variable named by api_key_env
+./target/release/minicore-agent --config ./agent.toml --stdio
 ```
 
-The binary accepts `--version` or `--config <path> --stdio`. It has no
-`--help` option. The stdio service reads one JSON-RPC object per input line and
-writes responses/events as newline-delimited JSON; see [the RPC contract](docs/rpc.md).
+The service reads one JSON-RPC request per line on stdin and writes responses
+and `agent.event` notifications to stdout. Diagnostics go to stderr.
 
-### Custom TLS Trust Store
-
-OpenAI Responses clients use reqwest's built-in trusted roots when `SSL_CERT_FILE`
-is unset. To use a custom CA bundle (for example, for a trusted TLS proxy), set
-`SSL_CERT_FILE` to a PEM file containing one or more CA certificates. The bundle
-replaces the built-in roots; include every CA your provider connections need.
-Relative paths resolve from the Agent process's working directory.
-
-An empty path, missing or unreadable file, bundle with no certificates, PEM
-parsing error reported by reqwest, or custom-client build failure stops startup
-with `ConfigError::InvalidTlsTrustStore`. PEM parsing follows reqwest's rules.
-The error does not expose the path or bundle contents, and there is no fallback
-to built-in roots. TLS certificate and hostname verification, proxy discovery,
-request timeouts, and the redirect policy remain enabled or unchanged.
-
-## API And Design
-
-The public Rust entry point is [`src/lib.rs`](src/lib.rs). Generate local
-rustdoc with:
-
-```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --open
+```json
+{"jsonrpc":"2.0","id":1,"method":"agent.ping"}
 ```
 
-Start with `Agent`, `AgentConfig`, `Workspace`, the session/turn DTOs,
-`AgentEventStream`, and `run_stdio`. `Agent::open_file` is the source-aware
-async constructor used by the binary; `Agent::open` is the embedded constructor
-without a reload source. `Agent::shutdown` is the async cleanup barrier for
-embedded callers; dropping an `Agent` with live work does not synchronously wait
-for its loop tasks. Session close and Agent shutdown request Runtime shutdown
-cancellation (`reason: "shutdown"`); explicit turn cancellation remains `"user"`.
-A cancellation that loses the Runtime completion race does not rewrite the outcome.
+The binary accepts only `--version` and `--config <path> --stdio`. It exits
+after an orderly shutdown on stdin EOF, Ctrl-C, SIGTERM (Unix), or
+`agent.shutdown`.
 
-A Session runs at most one active Runtime loop. Its persisted `session.json`,
-`history.jsonl`, and derived `summary.json` live below:
+> [!WARNING]
+> `example.agent.toml` uses `approval = "auto"`, which runs every enabled tool,
+> including Bash, without asking. Use it only in a trusted environment, or
+> switch to `ask`.
 
-```text
-<data_dir>/sessions/<session_id>/
-```
-
-The complete history is authoritative. `persistence: persisted` means the
-Agent's history append and data sync completed. Session and summary replacements
-also sync their parent directory after rename. This is not a transaction across
-history, metadata, summaries, and auxiliary tool records. A failed append returns
-the Runtime result with `persistence: failed` without changing in-memory history.
-A rejection before writing or a successfully synced rollback permits another
-turn; only an uncertain append outcome blocks further turns until close/reopen.
-On reopen, a valid final JSONL record missing only its newline is kept and synced
-with the newline restored. Other incomplete tails are truncated and synced; a
-malformed newline-terminated record is corruption, not recoverable crash state.
-Store startup reclaims its stale metadata temp files and hidden deletion
-directories. Session deletion first atomically hides the directory, so interrupted
-cleanup never exposes a partially deleted Session. Live
-events are best-effort; use `turn.wait`, `turn.result`, and history queries for
-authority. Existing v0.2 Session data is not migrated.
-Warm in-memory observations are preferred, while bounded cold reads use durable
-Store data when a Session is unloaded or retained bytes were evicted.
-
-## Durable Provider Replay
-
-Validated Responses output now follows the existing session history and JSONL
-pipeline across tool rounds, later turns, and process restarts. It is private
-provider metadata, excluded from RPC/read/summary prose and redacted Debug.
-See [the replay contract](docs/provider-replay.md) for identity fallback, bounds,
-usage uncertainty, and compatibility.
-
-## Context And Compatibility
-
-Client-visible 0.7.0 behavior changes (shutdown cancellation reason, deferred
-settlement after `turn.wait`, separate lifecycle event queue, path-based scan
-cursors, credential admission) are listed in the [changelog](CHANGELOG.md).
-
-Runtime owns model-text normalization: CRLF/CR become LF, other controls except
-LF/TAB become one space, and empty deltas emit no progress. Normalization never
-expands bytes; CRLF split across deltas or adapter chunks still produces one LF.
-Unknown future Runtime statuses, cancellation reasons, and outcomes map explicitly
-to `unknown` in Agent views rather than being mistaken for known states.
-
-Automatic compaction checks settled context before the first request, then
-checks between completed assistant/tool rounds, and independently after a
-Completed + Persisted turn. The default trigger is 95% of the effective input
-window; explicitly configured percentages remain unchanged. New User/Steer text
-and the newest unread tool exchange remain verbatim. Manual `/compact` is idle-only. A confirmed safe pre-output upstream
-context-capacity rejection can compact and retry that logical model request
-once, without restarting the task or replaying tools. Ordinary local token estimates do not veto provider requests. Utility calls
-retain explicit provider-aware budget checks. Partial output, unknown delivery
-and generic HTTP 413 are not capacity-recovery permission.
-
-`turn.wait` does not wait for post-turn compaction. Even a budget check that
-becomes Noop can briefly make submit busy; clients preserve drafts and reconcile
-state/context without auto-resending. Manual operation IDs cannot use `auto-`.
-`tool_rounds` statistics are now `u64`; clients restricted to `u16` cannot read
-counts above 65,535. RPC version and storage formats do not mechanically change.
-
-In-turn threshold/emergency reductions are promoted only after their source is persisted. The
-generated semantic summary remains limited to 64 KiB. A complete settled
-projection, including its retained tail, instead uses the existing 256 KiB
-snapshot-file limit and the Runtime historical-message envelope limit.
-`emergency_settlement_*` failures preserve the original turn/history and old
-in-memory projection. UnknownWrite remains non-blocking and does not imply
-success or a disk reload from context queries. See [context and compaction](docs/context.md).
+See [Configuration](docs/configuration.md) for every TOML field, prompt files,
+reload, and custom TLS roots (`SSL_CERT_FILE`).
 
 ## RPC Surface
 
-The service implements 33 methods, grouped here for orientation rather than as
-a second wire specification:
+| Area | Methods |
+|---|---|
+| Agent | `agent.ping`, `agent.reload`, `agent.shutdown` |
+| Discovery | `profile.list`, `model.list` |
+| Sessions | `session.create`, `session.open`, `session.close`, `session.delete`, `session.list`, `session.state`, `session.update`, `session.rename`, `session.context`, `session.compact`, `session.compact.cancel` |
+| Turns | `turn.send`, `turn.steer`, `turn.cancel`, `turn.wait`, `turn.result` |
+| Interaction | `interaction.answer` |
+| Read and review | `session.history`, `session.read`, `session.presentation`, `tool.read`, `tool.output`, `workspace.files`, `workspace.search`, `workspace.read`, `workspace.status`, `changes.list`, `changes.diff` |
 
-- Agent: `agent.*`
-- Discovery: `profile.list`, `model.list`
-- Sessions: `session.*`
-- Turns: `turn.send`, `turn.steer`, `turn.cancel`, `turn.wait`, `turn.result`
-- Read/review: `session.history`, `session.read`, `session.presentation`,
-  `tool.read`, `tool.output`, `workspace.*`, `changes.*`
-- Interaction: `interaction.answer`
+[docs/rpc.md](docs/rpc.md) is the normative wire contract: parameters, results,
+events, ordering, limits, and error codes.
 
-The exact method inventory, parameters, response shapes, event payloads,
-framing, ordering, limits, and error mapping are maintained in
-[docs/rpc.md](docs/rpc.md). The removed `session.transcript` and executable
-`subagent` Tool are not part of this surface.
+## Using It As A Library
+
+```toml
+[dependencies]
+# Pin a `rev` or release tag for reproducible builds.
+minicore-agent = { git = "https://github.com/zqcli/minicore-agent", branch = "dev" }
+```
+
+```rust
+use minicore_agent::{Agent, CreateSession, SendMessage};
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut agent = Agent::open_file("agent.toml").await?;
+    let session = agent
+        .create_session(CreateSession {
+            workspace: "/path/to/project".into(),
+            profile: String::new(), // empty selects default_profile
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await?;
+    let turn = agent
+        .send(SendMessage {
+            session_id: session.session_id,
+            text: "Summarize this repository.".into(),
+        })
+        .await?;
+    let result = agent.wait_turn(turn).await?;
+    println!("{:?} ({:?})", result.report.outcome, result.persistence);
+    agent.shutdown().await?;
+    Ok(())
+}
+```
+
+`Agent::open` builds an Agent from an in-memory `AgentConfig` without a reload
+source. `Agent::take_events` returns the live event stream, and `run_stdio`
+serves an Agent over stdin/stdout. Call `Agent::shutdown` to join outstanding
+work; dropping an Agent does not wait for it. Generate the API docs with
+`cargo doc --locked --no-deps --open`.
+
+## Data And Persistence
+
+Each Session lives under `<data_dir>/sessions/<session_id>/`: `session.json`
+for metadata, `history.jsonl` for the authoritative history, `summary.json` for
+the derived compaction snapshot, and `tools/` for auxiliary tool records.
+
+- A turn result reports `persistence: persisted` only after its history append
+  is synced to disk. A failed append leaves the Session usable unless the
+  outcome is uncertain, in which case the Session is blocked until reopened.
+- Events are best-effort. `turn.wait`, `turn.result`, and history queries are
+  authoritative.
+- Run one Agent process per `data_dir`; the Store takes no cross-process lock.
+- Session data from v0.2 is not migrated.
 
 ## Trust Boundary
 
-This is a local backend, not a security sandbox. Bash runs with the Agent
-process's host authority. Workspace path checks prevent ordinary traversal and
-symlink mistakes, but do not defend against a same-user process racing the
-filesystem. Unix commands use `/bin/bash -c` (or `/bin/sh -c` if Bash is absent),
-not a login shell, preserving the Agent's inherited environment apart from
-credential filtering and the Agent marker. Use OS/container isolation for
-untrusted commands or models, and an init process to reap container orphans.
-Atomic file replacement preserves existing permission bits, but not ownership
-or extended attributes.
+MiniCore Agent is a local backend, not a sandbox. Bash runs with the Agent
+process's authority, and Workspace path checks do not defend against another
+process racing the filesystem. Isolate untrusted models or commands with OS or
+container mechanisms. Presentation data intentionally shows local paths and
+commands to the trusted UI, so add your own policy before forwarding RPC
+elsewhere. See [Security](docs/security.md).
 
-RPC stdout is reserved for protocol frames and events; diagnostics go to
-stderr. API key values, prompts, provider bodies, Tool arguments, and Bash
-commands are excluded from logs, errors, and redacted debug output. Bounded
-presentation data intentionally exposes selected local command/path/input detail
-to a trusted local UI, so deployments forwarding RPC beyond that UI need their
-own policy. Run only one Agent process for a given `data_dir`; the Store has no
-cross-process lock.
+## Compatibility
 
-## Documentation And Evidence
+The RPC protocol and the storage formats are versioned independently of the
+package. 0.7.0 keeps protocol 1 and the existing on-disk formats, but changes
+some client-visible behavior: the shutdown cancellation reason, settlement
+finishing after `turn.wait`, a separate lifecycle event queue, path-based scan
+cursors, and credential checks. The [changelog](CHANGELOG.md) lists every change.
 
-- [Documentation index](docs/README.md)
-- [Configuration](docs/configuration.md)
-- [Architecture and ownership](docs/architecture.md)
-- [Context and compaction](docs/context.md)
-- [Security boundary](docs/security.md)
-- [Verification index](docs/verification/README.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
+## Development
 
-The [0.5.0 freeze verification record](docs/verification/0.5.0.md) documents
-that historical local freeze, not the current release. Verification records
-preserve the facts and limitations of the runs they record and are not substitutes
-for this current contract. Historical release notes remain under
-[`docs/releases`](docs/releases/0.3.3.md), and archived plans and specifications
-are indexed by [docs/archive](docs/archive/README.md).
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+```
+
+CI checks formatting, Clippy, and rustdoc on stable Rust, runs the tests on
+Ubuntu, macOS, and Windows, and runs the tests again with Rust 1.85.0. Unit tests live in `<module>/tests.rs` files.
+Integration tests are the `it` target plus `rpc_soak` (see
+[tests/README.md](tests/README.md)). Tests use loopback providers only; never
+use real credentials. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution
+rules and [AGENTS.md](AGENTS.md) for coding-agent guidance.
+
+## Documentation
+
+| Guide | Contents |
+|---|---|
+| [Configuration](docs/configuration.md) | TOML fields, secrets, prompt files, reload, TLS |
+| [RPC contract](docs/rpc.md) | Normative JSON-RPC methods, events, and errors |
+| [Architecture](docs/architecture.md) | Ownership of Agent, Session, Runtime, Tools, and Store |
+| [Context and compaction](docs/context.md) | Summaries, triggers, and emergency recovery |
+| [Provider replay](docs/provider-replay.md) | Durable provider output and redaction |
+| [Security](docs/security.md) | Trust assumptions, Workspace limits, and redaction |
+| [Changelog](CHANGELOG.md) | Release notes and compatibility |
+
+[docs/README.md](docs/README.md) also indexes historical verification records
+and archived specifications. Those describe past runs, not the current release.
+
+## License
+
+Licensed under `MIT OR Apache-2.0`, as declared in `Cargo.toml`. The compaction
+prompts in `src/compaction/prompts/` are adapted from
+[Pi](https://github.com/earendil-works/pi) under the MIT license; see
+[their notice](src/compaction/prompts/LICENSE).
