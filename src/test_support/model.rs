@@ -161,6 +161,11 @@ impl Model for ScriptedModel {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| (self.fallback)());
+        // A custom start may change settings synchronously, before its future is polled.
+        let script = match script {
+            Step::Custom(start) => return start(request, context),
+            script => script,
+        };
         Box::pin(async move {
             let events = |values| events(values, pacing);
             let mut script = script;

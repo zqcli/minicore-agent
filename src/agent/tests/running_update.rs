@@ -2,23 +2,17 @@ use super::*;
 
 #[tokio::test]
 async fn running_model_update_keeps_current_request_and_reports_revision() {
-    let (data_dir, _guard) = fixture_dir(&format!("running-update-{}", next_id()));
-    let (workspace, _guard) = workspace_file("running-update-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("running-update").file("a.txt", b"hello");
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "from a")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), Arc::clone(&model_a)),
-            ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a)),
+        ("other".to_owned(), Arc::clone(&model_b)),
+    ]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "hello").await;
 
     let updated = agent
@@ -34,28 +28,22 @@ async fn running_model_update_keeps_current_request_and_reports_revision() {
     gate.wait_started().await;
     gate.release();
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     // The current (unblocked) request used model A.
     let requests_a = model_a.requests();
     assert_eq!(requests_a.lock().unwrap().len(), 1);
     // Next turn uses the new model.
     let turn = send_text(&mut agent, info.session_id, "next").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let requests_b = model_b.requests();
     assert_eq!(requests_b.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn running_model_update_applies_to_next_request_in_same_loop() {
-    let (data_dir, _guard) = fixture_dir(&format!("same-loop-update-{}", next_id()));
-    let (workspace, _guard) = workspace_file("same-loop-update-ws", "a.txt", b"hello from a.txt");
+    let fixture = AgentFixture::new("same-loop-update").file("a.txt", b"hello from a.txt");
+    let data_dir = fixture.data_dir.clone();
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::new(
         "main",
@@ -68,16 +56,11 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
     .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from model b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), Arc::clone(&model_a)),
-            ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a)),
+        ("other".to_owned(), Arc::clone(&model_b)),
+    ]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "read then answer").await;
 
     gate.wait_started().await;
@@ -99,17 +82,11 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
 
     // Single turn / loop identity preserved.
     assert_eq!(result.turn.loop_id, turn.loop_id);
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(result.report.requests, 2);
     assert_eq!(result.report.tool_rounds, 1);
     assert_eq!(result.report.final_config_revision, active_revision);
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
     // Both models were called exactly once in this single loop.
     assert_eq!(model_a.calls.load(Ordering::SeqCst), 1);
@@ -163,13 +140,7 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
         "Request 1 must produce final text from Model B"
     );
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     assert_eq!(page.total, 4);
     let crate::history::HistoryItemView::Assistant(ref final_view) = page.items[3].item else {
         panic!("expected AssistantHistoryView at index 3");
@@ -184,8 +155,8 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
 
 #[tokio::test]
 async fn model_swap_keeps_request_identity_for_live_tool_display() {
-    let (data_dir, _guard) = fixture_dir(&format!("presentation-model-swap-{}", next_id()));
-    let (workspace, _guard) = workspace_file("presentation-model-swap-ws", "a.txt", b"a");
+    let fixture = AgentFixture::new("presentation-model-swap").file("a.txt", b"a");
+    let workspace = fixture.workspace.clone();
     std::fs::write(workspace.join("b.txt"), b"b").unwrap();
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::new(
@@ -205,15 +176,11 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), Arc::clone(&model_a)),
-            ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a)),
+        ("other".to_owned(), Arc::clone(&model_b)),
+    ]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read both").await;
@@ -231,10 +198,12 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
 
     let mut presentations = Vec::new();
     while presentations.len() < 2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("model-swap presentation event must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(
+                std::time::Duration::from_secs(1),
+                "model-swap presentation event must arrive",
+            )
+            .await;
         if let AgentEvent::ToolPresentation {
             turn: event_turn,
             request_index,
@@ -259,17 +228,11 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
 
 #[tokio::test]
 async fn invalid_update_does_not_write_or_change_memory() {
-    let (data_dir, _guard) = fixture_dir(&format!("invalid-update-{}", next_id()));
-    let (workspace, _guard) = workspace_file("invalid-update-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("invalid-update").file("a.txt", b"hello");
     let model_a = ScriptedModel::new("main", [Step::Text("from a")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]));
+    let (mut agent, info) = fixture.start().await;
 
     let error = agent
         .update_session(crate::agent::UpdateSession {

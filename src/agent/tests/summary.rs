@@ -3,20 +3,18 @@ use super::*;
 #[tokio::test]
 async fn reopened_session_projects_external_summary_as_bounded_user_data() {
     let (data_dir, _data_guard, session_id, history_path, history_before) =
-        synthetic_summary_session(&format!("summary-snapshot-{}", next_id()), false).await;
+        synthetic_summary_session("summary-snapshot", false).await;
 
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let next_model = ScriptedModel::new("other", [Step::Text("next answer")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model)),
             ("other".to_owned(), Arc::clone(&next_model)),
-        ]),
-        read_profile(),
-    )
-    .await;
+        ]))
+        .open()
+        .await;
     let reopened = agent.open_session(session_id).await.unwrap();
     assert_eq!(reopened.session_id, session_id);
     let context = agent.session_context(session_id).unwrap();
@@ -50,10 +48,7 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
 
     let turn = send_text(&mut agent, session_id, "current user").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
 
     let requests = next_model.requests();
     let requests = requests.lock().unwrap();
@@ -127,7 +122,7 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
 #[tokio::test]
 async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
     let (data_dir, _data_guard, session_id, _history_path, _history_before) =
-        synthetic_summary_session(&format!("summary-same-loop-update-{}", next_id()), true).await;
+        synthetic_summary_session("summary-same-loop-update", true).await;
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::new(
         "main",
@@ -140,15 +135,13 @@ async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
     .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from model b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
+        ]))
+        .open()
+        .await;
     agent.open_session(session_id).await.unwrap();
 
     let turn = send_text(&mut agent, session_id, "same loop current").await;
@@ -164,10 +157,7 @@ async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
     assert!(updated.active_revision.is_some());
     gate.release();
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
 
     let requests = model_b.requests();
     let requests = requests.lock().unwrap();
@@ -201,11 +191,7 @@ async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
 #[tokio::test]
 async fn snapshot_with_same_count_different_loaded_history_is_ignored() {
     let (data_dir, _data_guard, session_id, history_path, history_before) =
-        synthetic_summary_session(
-            &format!("summary-loaded-history-mismatch-{}", next_id()),
-            false,
-        )
-        .await;
+        synthetic_summary_session("summary-loaded-history-mismatch", false).await;
     let summary_path = history_path.parent().unwrap().join("summary.json");
     let summary_before = std::fs::read(&summary_path).unwrap();
     let store = Store::open(data_dir).await.unwrap();
@@ -252,8 +238,7 @@ async fn invalid_external_summary_falls_back_to_full_history() {
         "directory",
     ] {
         let (data_dir, _data_guard, session_id, history_path, history_before) =
-            synthetic_summary_session(&format!("summary-fallback-{variant}-{}", next_id()), false)
-                .await;
+            synthetic_summary_session(&format!("summary-fallback-{variant}"), false).await;
         let summary_path = history_path.parent().unwrap().join("summary.json");
         match variant {
             "hash" => {
@@ -361,12 +346,10 @@ async fn invalid_external_summary_falls_back_to_full_history() {
 
         let model = ScriptedModel::new("main", [Step::Text("fallback answer")])
             .with_pacing(std::time::Duration::from_millis(2));
-        let mut agent = open_agent(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-            read_profile(),
-        )
-        .await;
+        let mut agent = AgentFixture::at(&data_dir)
+            .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+            .open()
+            .await;
         agent.open_session(session_id).await.unwrap();
         assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
         let turn = send_text(&mut agent, session_id, "fallback current user").await;
@@ -411,7 +394,7 @@ async fn invalid_external_summary_falls_back_to_full_history() {
 #[tokio::test]
 async fn invalid_summary_does_not_mask_core_history_corruption() {
     let (data_dir, _data_guard, session_id, history_path, history_before) =
-        synthetic_summary_session(&format!("summary-core-corrupt-{}", next_id()), false).await;
+        synthetic_summary_session("summary-core-corrupt", false).await;
     let summary_path = history_path.parent().unwrap().join("summary.json");
     std::fs::write(&summary_path, vec![b'x'; 256 * 1024 + 1]).unwrap();
 
@@ -420,12 +403,10 @@ async fn invalid_summary_does_not_mask_core_history_corruption() {
     std::fs::write(&history_path, corrupt_history).unwrap();
 
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     assert!(matches!(
         agent.open_session(session_id).await,
         Err(AgentError::Store)
@@ -438,7 +419,7 @@ async fn summary_symlink_is_ignored_but_core_symlink_is_not() {
     use std::os::unix::fs::symlink;
 
     let (data_dir, _data_guard, session_id, history_path, history_before) =
-        synthetic_summary_session(&format!("summary-symlink-{}", next_id()), false).await;
+        synthetic_summary_session("summary-symlink", false).await;
     let summary_path = history_path.parent().unwrap().join("summary.json");
     let summary_target = data_dir.join("summary-target.json");
     std::fs::copy(&summary_path, &summary_target).unwrap();
@@ -447,12 +428,10 @@ async fn summary_symlink_is_ignored_but_core_symlink_is_not() {
 
     let model = ScriptedModel::new("main", [Step::Text("symlink fallback")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     agent.open_session(session_id).await.unwrap();
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     let turn = send_text(&mut agent, session_id, "symlink current user").await;
@@ -483,15 +462,13 @@ async fn summary_symlink_is_ignored_but_core_symlink_is_not() {
 #[tokio::test]
 async fn projected_summary_keeps_suffix_tool_exchange_and_current_user() {
     let (data_dir, _data_guard, session_id, history_path, history_before) =
-        synthetic_summary_session(&format!("summary-tool-suffix-{}", next_id()), true).await;
+        synthetic_summary_session("summary-tool-suffix", true).await;
     let model = ScriptedModel::new("main", [Step::Text("tool suffix answer")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     agent.open_session(session_id).await.unwrap();
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     let turn = send_text(&mut agent, session_id, "tool current user").await;

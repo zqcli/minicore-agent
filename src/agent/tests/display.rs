@@ -4,30 +4,22 @@ use super::*;
 async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_does_not_merge() {
     const OPAQUE: &str = "SYNTHETIC-READ-REPLAY-SECRET";
     for fail in [false, true] {
-        let (data_dir, _guard) = fixture_dir(&format!("replay-read-{fail}-{}", next_id()));
-        let (workspace, _workspace_guard) = workspace_file("replay-read-ws", "a.txt", b"hello");
+        let fixture = AgentFixture::new(&format!("replay-read-{fail}")).file("a.txt", b"hello");
+        let data_dir = fixture.data_dir.clone();
         let replay=minicore_runtime::model::ProviderReplay::new("openai-responses-v1", json!({
             "endpoint":"http://localhost/v1/responses", "model":"provider-model",
             "output":[{"type":"reasoning","id":"rs_only","summary":[],"encrypted_content":OPAQUE}]
         })).unwrap();
         let model = ScriptedModel::new("main", [Step::ReplayOnly(replay)])
             .with_pacing(std::time::Duration::from_millis(2));
-        let mut agent = open_agent(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), model)]),
-            read_profile(),
-        )
-        .await;
-        let info = create_session(&mut agent, &workspace).await;
+        let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+        let (mut agent, info) = fixture.start().await;
         if fail {
             crate::store::APPEND_FAILURES.arm(info.session_id, true);
         }
         let turn = send_text(&mut agent, info.session_id, "opaque-only response").await;
         let result = wait_text(&agent, turn).await;
-        assert_eq!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
-        );
+        assert_completed(&result);
         assert!(result.report.appended.iter().any(|item| matches!(item,HistoryItem::Assistant(a) if a.content.is_empty() && a.provider_replay.is_some())));
         let expected = if fail { 0 } else { 2 };
         assert_eq!(
@@ -117,14 +109,12 @@ pub(super) fn continue_display_read(request: &mut ReadSession, page: &crate::Rea
 #[tokio::test]
 async fn display_history_projects_summary_tool_metadata_and_original_indexes() {
     let (data_dir, _guard, session_id, history_path, before) =
-        synthetic_summary_session(&format!("display-history-{}", next_id()), true).await;
+        synthetic_summary_session("display-history", true).await;
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     let cold = agent.read_session(display_read(session_id)).await.unwrap();
     assert!(!cold.session.loaded);
     assert!(agent.loaded_session(session_id).is_none());
@@ -204,14 +194,12 @@ async fn display_history_projects_summary_tool_metadata_and_original_indexes() {
 #[tokio::test]
 async fn display_history_chunks_unicode_summary_and_rejects_summary_only_replacement() {
     let (data_dir, _guard, session_id, _, _) =
-        synthetic_summary_session(&format!("display-chunks-{}", next_id()), true).await;
+        synthetic_summary_session("display-chunks", true).await;
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     agent.open_session(session_id).await.unwrap();
     let state = agent.loaded_session(session_id).unwrap().compaction_state();
     let body = "中文🙂\\\"\n".repeat(1_000);
@@ -258,19 +246,17 @@ async fn display_history_chunks_unicode_summary_and_rejects_summary_only_replace
 #[tokio::test]
 async fn display_history_invalid_summary_falls_back_and_never_crosses_valid_boundary() {
     let (data_dir, _guard, session_id, history_path, _) =
-        synthetic_summary_session(&format!("display-fallback-{}", next_id()), false).await;
+        synthetic_summary_session("display-fallback", false).await;
     std::fs::write(
         history_path.parent().unwrap().join("summary.json"),
         b"invalid summary",
     )
     .unwrap();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     let cold = agent.read_session(display_read(session_id)).await.unwrap();
     assert_eq!(cold.projection.as_ref().unwrap().covered_item_count, 0);
     assert_eq!(cold.items[0].index, 0);
@@ -308,8 +294,7 @@ async fn cold_display_invalid_anchor_restores_cursor_and_limit_without_raw_tools
         ("last_loop_id", json!(SUMMARY_SUFFIX_LOOP_ID)),
     ] {
         let (data_dir, _guard, session_id, history_path, before) =
-            synthetic_summary_session(&format!("cold-display-invalid-{field}-{}", next_id()), true)
-                .await;
+            synthetic_summary_session(&format!("cold-display-invalid-{field}"), true).await;
         let summary_path = history_path.parent().unwrap().join("summary.json");
         let mut summary: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
@@ -317,12 +302,10 @@ async fn cold_display_invalid_anchor_restores_cursor_and_limit_without_raw_tools
         let summary_bytes = serde_json::to_vec(&summary).unwrap();
         std::fs::write(&summary_path, &summary_bytes).unwrap();
         let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-        let agent = open_agent(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-            read_profile(),
-        )
-        .await;
+        let agent = AgentFixture::at(&data_dir)
+            .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+            .open()
+            .await;
         let mut request = display_read(session_id);
         request.limit = 1;
         let first = agent.read_session(request.clone()).await.unwrap();
@@ -363,7 +346,7 @@ async fn cold_display_invalid_anchor_restores_cursor_and_limit_without_raw_tools
 #[tokio::test]
 async fn cold_display_unicode_pins_missing_workspace_and_partial_tail_are_read_only() {
     let (data_dir, _guard, session_id, history_path, mut before) =
-        synthetic_summary_session(&format!("cold-display-pins-{}", next_id()), true).await;
+        synthetic_summary_session("cold-display-pins", true).await;
     let directory = history_path.parent().unwrap();
     let record_path = directory.join("session.json");
     let mut record: serde_json::Value =
@@ -382,12 +365,10 @@ async fn cold_display_unicode_pins_missing_workspace_and_partial_tail_are_read_o
     before.extend_from_slice(b"{partial tail");
     std::fs::write(&history_path, &before).unwrap();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     let mut request = display_read(session_id);
     request.limit = 1;
     request.max_bytes = Some(2048);

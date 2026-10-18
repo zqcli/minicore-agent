@@ -26,21 +26,18 @@ async fn test_provider_overflow_recovery_success() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        profile,
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(profile)
+        .auto()
+        .open()
+        .await;
 
     let info = create_session(&mut agent, &workspace).await;
 
     let turn = send_text(&mut agent, info.session_id, "read note").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(model.calls.load(Ordering::SeqCst), 4);
 
     let history = read_store_history(&data_dir, info.session_id).await;
@@ -94,12 +91,12 @@ async fn test_provider_overflow_stops_on_second_failure() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        profile,
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(profile)
+        .auto()
+        .open()
+        .await;
 
     let info = create_session(&mut agent, &workspace).await;
 
@@ -151,12 +148,11 @@ async fn emergency_projection_survives_followups_new_growth_and_durable_reopen()
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read three files").await;
     let result = wait_text(&agent, turn).await;
@@ -238,12 +234,11 @@ async fn emergency_settlement_failure_is_observable_and_preserves_old_projection
             ],
         )
         .with_pacing(std::time::Duration::from_millis(2));
-        let mut agent = open_agent_auto(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-            read_profile(),
-        )
-        .await;
+        let mut agent = AgentFixture::at(&data_dir)
+            .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+            .auto()
+            .open()
+            .await;
         let info = create_session(&mut agent, &workspace).await;
         if unknown {
             crate::store::SUMMARY_UNKNOWN_WRITES.arm(info.session_id, ());
@@ -256,10 +251,7 @@ async fn emergency_settlement_failure_is_observable_and_preserves_old_projection
             result.report.outcome,
             minicore_runtime::LoopOutcome::Completed
         ));
-        assert_eq!(
-            result.persistence,
-            crate::sessions::TurnPersistence::Persisted
-        );
+        assert_persisted(&result);
         let context = agent.session_context(info.session_id).unwrap();
         assert_eq!(context.coverage.covered_item_count, 0);
         let observation = context.recovery.unwrap();
@@ -310,12 +302,11 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read a").await;
     let result = wait_text(&agent, turn).await;
@@ -323,10 +314,7 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     ));
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let context = agent.session_context(info.session_id).unwrap();
     let recovery = context.recovery.unwrap();
     assert_eq!(recovery.outcome, "recovery_failed");
@@ -365,12 +353,11 @@ async fn post_turn_estimates_and_refreshes_a_fully_covered_emergency_projection(
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read a").await;
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), agent.wait_turn(turn))
@@ -416,15 +403,14 @@ async fn emergency_projection_is_not_invalidated_by_request_boundary_settings_or
     .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::with_window("other", 16_384, [Step::Text("updated answer")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
+        ]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read a then b").await;
     tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_started())
@@ -480,12 +466,11 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
 
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read tiny").await;
@@ -585,12 +570,11 @@ async fn non_recoverable_model_failures_are_not_retried_as_recovery() {
         )
         .with_pacing(std::time::Duration::from_millis(2));
 
-        let mut agent = open_agent_auto(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-            read_profile(),
-        )
-        .await;
+        let mut agent = AgentFixture::at(&data_dir)
+            .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+            .auto()
+            .open()
+            .await;
 
         let info = create_session(&mut agent, &workspace).await;
 
@@ -645,12 +629,12 @@ async fn test_driver_retry_reentry_does_not_reset_recovery_quota() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        profile,
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(profile)
+        .auto()
+        .open()
+        .await;
 
     let info = create_session(&mut agent, &workspace).await;
 
@@ -751,7 +735,7 @@ async fn test_model_update_before_turn_uses_new_model() {
 
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let res = wait_text(&agent, turn).await;
-    assert_eq!(res.report.outcome, minicore_runtime::LoopOutcome::Completed);
+    assert_completed(&res);
     let history = read_store_history(&data_dir, info.session_id).await;
     let texts = flatten_texts(&history);
     assert!(texts.iter().any(|t| t == "from model b"));
@@ -815,10 +799,7 @@ async fn test_failed_update_does_not_publish_a_new_recovery_binding() {
     // recovery must be summarized by A, never by the failed update's model.
     let turn = send_text(&mut agent, info.session_id, "read note").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     let history = read_store_history(&data_dir, info.session_id).await;
     let texts = flatten_texts(&history);
     assert!(texts.iter().any(|t| t == "recovered by a"));
@@ -849,29 +830,23 @@ async fn test_recovery_two_sessions_isolated() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        profile,
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(profile)
+        .auto()
+        .open()
+        .await;
 
     let info_a = create_session(&mut agent, &workspace).await;
     let info_b = create_session(&mut agent, &workspace).await;
 
     let turn_a = send_text(&mut agent, info_a.session_id, "read a").await;
     let result_a = wait_text(&agent, turn_a).await;
-    assert_eq!(
-        result_a.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result_a);
 
     let turn_b = send_text(&mut agent, info_b.session_id, "hello from b").await;
     let result_b = wait_text(&agent, turn_b).await;
-    assert_eq!(
-        result_b.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result_b);
 
     let context_a = agent.session_context(info_a.session_id).unwrap();
     let recovery_a = context_a.recovery.expect("session A has recovery");

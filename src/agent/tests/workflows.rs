@@ -9,8 +9,9 @@ async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let (data_dir, _data_guard) = fixture_dir(&format!("i1-stub-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("i1-stub-ws", "file.txt", b"contents\n");
+    let fixture = AgentFixture::new("i1-stub").file("file.txt", b"contents\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     std::fs::create_dir_all(&data_dir).unwrap();
     let marker = data_dir.join("git-invocations");
     let script = data_dir.join("count-git");
@@ -39,14 +40,8 @@ async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     assert!(
         !marker.exists(),
         "session.create started an implicit Git query"
@@ -103,9 +98,9 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     use std::panic::{AssertUnwindSafe, resume_unwind};
     use std::sync::Weak;
 
-    let label = format!("i2-release-{}", next_id());
-    let (data_dir, _guard) = fixture_dir(&label);
-    let (workspace, _guard) = workspace_file(&label, "a.txt", b"hello");
+    let fixture = AgentFixture::new("i2-release").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let pid_file = workspace.join("child.pid");
     let model = ScriptedModel::new(
         "main",
@@ -115,12 +110,11 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
         )],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile())
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let session = agent.loaded_session(info.session_id).unwrap();
     let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
@@ -236,8 +230,9 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
     use futures_util::FutureExt;
     use std::panic::{AssertUnwindSafe, resume_unwind};
 
-    let (data_dir, _guard) = fixture_dir(&format!("e2e-a-{}", next_id()));
-    let (workspace, _guard) = workspace_file("e2e-a-ws", "value.txt", b"user\n");
+    let fixture = AgentFixture::new("e2e-a").file("value.txt", b"user\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let first_pid = workspace.join("first.pid");
     let release = workspace.join("release.txt");
     let model_a = ScriptedModel::new(
@@ -259,13 +254,13 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
         tools: vec!["bash".to_owned(), "write".to_owned()],
         ..read_profile()
     };
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .profile(profile)
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -274,10 +269,9 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        profile,
-    )
-    .await;
+        ]))
+        .auto();
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     assert_eq!(
@@ -380,10 +374,7 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
         assert_eq!(first_result.report.requests, 3);
         assert_eq!(first_result.report.tool_rounds, 2);
         assert_eq!(first_result.report.final_config_revision, active_revision);
-        assert_eq!(
-            first_result.persistence,
-            crate::sessions::TurnPersistence::Persisted
-        );
+        assert_persisted(&first_result);
         assert!(
             !process_is_listed(
                 std::fs::read_to_string(&first_pid)
@@ -492,8 +483,7 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
     use futures_util::FutureExt;
     use std::panic::{AssertUnwindSafe, resume_unwind};
 
-    let (data_dir, _guard) = fixture_dir(&format!("e2e-b-{}", next_id()));
-    let (workspace, _guard) = workspace_file("e2e-b-ws", "value.txt", b"user\n");
+    let fixture = AgentFixture::new("e2e-b").file("value.txt", b"user\n");
     // A short command that finishes on its own: the Turn's owner join still has
     // to reap it, but the test never depends on a fixed long sleep.
     let model = ScriptedModel::new(
@@ -514,26 +504,20 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
     };
     // Capacity-1 event queue drops nearly every best-effort event; the query
     // path must not depend on it.
-    let mut agent = open_agent_with(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        profile,
-        AgentOptions {
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(profile)
+        .options(AgentOptions {
             agent_event_capacity: 1,
             loop_event_capacity: Some(1),
-        },
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        });
+    let (mut agent, info) = fixture.start().await;
     crate::store::APPEND_FAILURES.arm(info.session_id, true);
 
     let workflow = AssertUnwindSafe(async {
         let turn = send_text(&mut agent, info.session_id, "run tools").await;
         let result = wait_text(&agent, turn).await;
-        assert_eq!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
-        );
+        assert_completed(&result);
         assert_eq!(
             result.persistence,
             crate::sessions::TurnPersistence::Failed,

@@ -2,22 +2,17 @@ use super::*;
 
 #[tokio::test]
 async fn idle_model_update_affects_next_loop() {
-    let (data_dir, _guard) = fixture_dir(&format!("idle-update-{}", next_id()));
-    let (workspace, _guard) = workspace_file("idle-update-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("idle-update").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let model_a = ScriptedModel::new("main", [Step::Text("from a")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), Arc::clone(&model_a)),
-            ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a)),
+        ("other".to_owned(), Arc::clone(&model_b)),
+    ]));
+    let (mut agent, info) = fixture.start().await;
 
     let updated = agent
         .update_session(crate::agent::UpdateSession {
@@ -36,10 +31,7 @@ async fn idle_model_update_affects_next_loop() {
 
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let stored = read_store_history(&data_dir, info.session_id).await;
     let texts = flatten_texts(&stored);
     assert!(texts.contains(&"from b".to_owned()));
@@ -49,19 +41,17 @@ async fn idle_model_update_affects_next_loop() {
 
 #[tokio::test]
 async fn f2_01_idle_model_update_installs_candidate_loop_options() {
-    let (data_dir, _guard) = fixture_dir(&format!("f2-01-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f2-01-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("f2-01").file("a.txt", b"hello");
     let model_a = ScriptedModel::new("main", [Step::Text("from a")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -70,11 +60,9 @@ async fn f2_01_idle_model_update_installs_candidate_loop_options() {
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        ]))
+        .auto();
+    let (mut agent, info) = fixture.start().await;
     let before = session_options(&agent, info.session_id);
     let before_generation = session_config_generation(&agent, info.session_id);
     assert_eq!(before.prompt_timeout, std::time::Duration::from_secs(31));
@@ -104,8 +92,7 @@ async fn f2_01_idle_model_update_installs_candidate_loop_options() {
 
 #[tokio::test]
 async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request() {
-    let (data_dir, _guard) = fixture_dir(&format!("f2-02-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f2-02-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("f2-02").file("a.txt", b"hello");
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::new(
         "main",
@@ -118,13 +105,12 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
     .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -133,11 +119,9 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        ]))
+        .auto();
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "use the tool").await;
     gate.wait_started().await;
 
@@ -172,18 +156,16 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
 
 #[tokio::test]
 async fn f2_03_close_and_reopen_rederives_installed_future_options() {
-    let (data_dir, _guard) = fixture_dir(&format!("f2-03-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f2-03-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("f2-03").file("a.txt", b"hello");
     let model_a = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -192,11 +174,9 @@ async fn f2_03_close_and_reopen_rederives_installed_future_options() {
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        ]))
+        .auto();
+    let (mut agent, info) = fixture.start().await;
     agent
         .update_session(UpdateSession {
             session_id: info.session_id,
@@ -230,8 +210,7 @@ async fn f2_03_close_and_reopen_rederives_installed_future_options() {
 
 #[tokio::test]
 async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
-    let (data_dir, _guard) = fixture_dir(&format!("f2-04-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f2-04-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("f2-04").file("a.txt", b"hello");
     let model_a = ScriptedModel::with_window("main", 16_000, [Step::Text("still a")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::with_reasoning(
@@ -241,13 +220,12 @@ async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
         [],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -256,11 +234,9 @@ async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        ]))
+        .auto();
+    let (mut agent, info) = fixture.start().await;
     let original_options = session_options(&agent, info.session_id);
     let original_generation = session_config_generation(&agent, info.session_id);
     let original_budget = agent
@@ -340,19 +316,17 @@ async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
 
 #[tokio::test]
 async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
-    let (data_dir, _guard) = fixture_dir(&format!("f2-05-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f2-05-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("f2-05").file("a.txt", b"hello");
     let model_a = ScriptedModel::new("main", [Step::Text("from a")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("other", [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -361,11 +335,9 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        ]))
+        .auto();
+    let (mut agent, info) = fixture.start().await;
     let before_options = session_options(&agent, info.session_id);
     assert_eq!(
         before_options.prompt_timeout,
@@ -375,19 +347,16 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
     PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
     let turn = send_text(&mut agent, info.session_id, "finish").await;
     gate.wait_started().await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if agent
+    wait_until(
+        std::time::Duration::from_secs(1),
+        "runtime must seal before the worker is joined",
+        || {
+            agent
                 .runtime_loop_finished_for_test(info.session_id)
                 .unwrap()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("runtime must seal before the worker is joined");
+        },
+    )
+    .await;
 
     let before_generation = session_config_generation(&agent, info.session_id);
     let updated = agent
@@ -427,19 +396,17 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
 /// the derived trigger/target budget is observably different.
 #[tokio::test]
 async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
-    let (data_dir, _guard) = fixture_dir(&format!("f2-06-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f2-06-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("f2-06").file("a.txt", b"hello");
     let model_a = ScriptedModel::with_window("main", 16_000, [Step::Text("from a")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::with_window("other", 8_000, [Step::Text("from b")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             (
                 "main".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 31),
@@ -448,11 +415,9 @@ async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
                 "other".to_owned(),
                 model_config_with_timeout("MINICORE_AGENT_TEST_KEY", 47),
             ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        ]))
+        .auto();
+    let (mut agent, info) = fixture.start().await;
     let before = agent.session_context(info.session_id).unwrap().budget;
     assert_eq!(before.input_budget_tokens, Some(16_000));
     assert_eq!(before.trigger_tokens, Some(12_800));
@@ -462,19 +427,16 @@ async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
     PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
     let turn = send_text(&mut agent, info.session_id, "finish").await;
     gate.wait_started().await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if agent
+    wait_until(
+        std::time::Duration::from_secs(1),
+        "runtime must seal before the worker is joined",
+        || {
+            agent
                 .runtime_loop_finished_for_test(info.session_id)
                 .unwrap()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("runtime must seal before the worker is joined");
+        },
+    )
+    .await;
 
     let updated = agent
         .update_session(UpdateSession {

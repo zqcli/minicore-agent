@@ -10,8 +10,8 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
     use crate::tool_data::{CommandStatus, ToolDataStream};
     use base64::Engine;
 
-    let (data_dir, _guard) = fixture_dir(&format!("bash-two-turns-{}", next_id()));
-    let (workspace, _guard) = workspace_file("bash-two-turns-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("bash-two-turns").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let first_pid_file = workspace.join("first.pid");
     let second_pid_file = workspace.join("second.pid");
 
@@ -49,25 +49,22 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
         approval: ApprovalMode::Auto,
     };
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
+    let fixture = fixture
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_a)),
             ("other".to_owned(), Arc::clone(&model_b)),
-        ]),
-        profile,
-    )
-    .await;
+        ]))
+        .profile(profile);
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
 
     // --- Turn 1 ---
     let turn_1 = send_text(&mut agent, info.session_id, "first run slowly").await;
     loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("bash events must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(std::time::Duration::from_secs(5), "bash events must arrive")
+            .await;
         if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn_1)
         {
             break;
@@ -130,10 +127,9 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
     )
     .await;
     loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("bash events must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(std::time::Duration::from_secs(5), "bash events must arrive")
+            .await;
         if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn_2)
         {
             break;
@@ -233,8 +229,8 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
-    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-fail-{}", next_id()));
-    let (workspace, _guard) = workspace_file("bash-aux-fail-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("bash-aux-fail").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let pid_file = workspace.join("child.pid");
 
     let model = ScriptedModel::new(
@@ -258,13 +254,10 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
         approval: ApprovalMode::Auto,
     };
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let (mut agent, info) = fixture.start().await;
 
     // Inject auxiliary write failure on this session
     crate::store::AUX_WRITE_FAILURES.arm(info.session_id, ());
@@ -273,14 +266,8 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
     let result = wait_text(&agent, turn).await;
 
     // Core loop outcome must be Completed and core history Persisted
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_completed(&result);
+    assert_persisted(&result);
 
     // Wait for the process to exit and confirm output
     for _ in 0..500 {
@@ -331,8 +318,7 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
 
 #[tokio::test]
 async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to_disk() {
-    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-success-{}", next_id()));
-    let (workspace, _guard) = workspace_file("bash-aux-success-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("bash-aux-success").file("a.txt", b"hello");
 
     let model = ScriptedModel::new(
         "main",
@@ -355,13 +341,10 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
         approval: ApprovalMode::Auto,
     };
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let (mut agent, info) = fixture.start().await;
 
     let turn = send_text(&mut agent, info.session_id, "run with aux success").await;
     let result = wait_text(&agent, turn).await;
@@ -372,14 +355,8 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
         .await
         .unwrap();
 
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_completed(&result);
+    assert_persisted(&result);
 
     let tool_refs = agent
         .loaded_session(info.session_id)
@@ -423,8 +400,7 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
 
 #[tokio::test]
 async fn session_close_while_aux_write_held_still_joins_owned_worker() {
-    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-close-{}", next_id()));
-    let (workspace, _guard) = workspace_file("bash-aux-close-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("bash-aux-close").file("a.txt", b"hello");
 
     let model = ScriptedModel::new(
         "main",
@@ -444,13 +420,10 @@ async fn session_close_while_aux_write_held_still_joins_owned_worker() {
         approval: ApprovalMode::Auto,
     };
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let (mut agent, info) = fixture.start().await;
 
     let gate = Arc::new(crate::test_support::Gate::new());
     crate::store::AUX_COMMIT_GATES.arm(info.session_id, Arc::clone(&gate));
@@ -463,10 +436,7 @@ async fn session_close_while_aux_write_held_still_joins_owned_worker() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait_text(&agent, turn))
         .await
         .expect("turn completion must not wait for auxiliary persistence");
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
     // 2. Poll close session while aux write is held: must remain pending on owned worker join
     let store = agent.store_handle();
@@ -489,8 +459,7 @@ async fn session_close_while_aux_write_held_still_joins_owned_worker() {
 
 #[tokio::test]
 async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
-    let (data_dir, _guard) = fixture_dir(&format!("bash-aux-deadline-{}", next_id()));
-    let (workspace, _guard) = workspace_file("bash-aux-deadline-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("bash-aux-deadline").file("a.txt", b"hello");
 
     let model = ScriptedModel::new(
         "main",
@@ -510,13 +479,10 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
         approval: ApprovalMode::Auto,
     };
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let (mut agent, info) = fixture.start().await;
 
     let session = agent.loaded_session(info.session_id).unwrap();
     let loop_id = minicore_runtime::LoopId::new().unwrap();

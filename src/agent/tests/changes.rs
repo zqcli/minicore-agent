@@ -11,8 +11,7 @@ async fn f1_native_write_changes_keep_the_first_request_identity() {
     use crate::changes::{ChangeScope, ChangesListRequest};
     use crate::diff::{ChangesDiffRequest, DiffComparison};
 
-    let (data_dir, _guard) = fixture_dir(&format!("f1-native-write-{}", next_id()));
-    let (workspace, _guard) = workspace_file("f1-native-write-ws", "value.txt", b"user\n");
+    let fixture = AgentFixture::new("f1-native-write").file("value.txt", b"user\n");
     let model_gate = Arc::new(Gate::new());
     let model = ScriptedModel::new(
         "main",
@@ -28,13 +27,10 @@ async fn f1_native_write_changes_keep_the_first_request_identity() {
         tools: vec!["write".to_owned()],
         ..read_profile()
     };
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        profile,
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(profile);
+    let (agent, info) = fixture.start().await;
     let gate = Arc::new(Gate::new());
     PAUSE_AFTER_RUNTIME_START.arm(info.session_id, Arc::clone(&gate));
 

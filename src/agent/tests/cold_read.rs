@@ -6,8 +6,8 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState, ToolRecordingState};
     use base64::Engine;
 
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-cold-read-closure-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-cold-read-closure-ws", "marker.txt", b"");
+    let fixture = AgentFixture::new("p5b2-cold-read-closure").file("marker.txt", b"");
+    let data_dir = fixture.data_dir.clone();
 
     let script = r"i=0; while [ $i -lt 512 ]; do printf '\316\273\000\377\033[31mX\033[0m'; printf '\347\225\214\033[2K\r' >&2; i=$((i+1)); done";
     let model = ScriptedModel::new(
@@ -19,13 +19,10 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile());
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     let result = wait_text(&agent, turn).await;
     agent
@@ -34,10 +31,7 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
         .cleanup_finished()
         .await
         .unwrap();
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
     let tool_refs = agent
         .loaded_session(info.session_id)
@@ -64,15 +58,14 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     drop(agent);
 
     // Re-open fresh agent without loading the session
-    let agent2 = open_agent(
-        &data_dir,
-        BTreeMap::from([(
+    let agent2 = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([(
             "main".to_owned(),
             ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        bash_profile(),
-    )
-    .await;
+        )]))
+        .profile(bash_profile())
+        .open()
+        .await;
     assert!(agent2.loaded_session(info.session_id).is_none());
 
     // 1. tool_read cold projection
@@ -144,8 +137,9 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     use crate::tool_data::{ToolDataStream, ToolExecutionState, ToolRecordingState};
     use base64::Engine;
 
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-readonly-guard-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-readonly-guard-ws", "marker.txt", b"");
+    let fixture = AgentFixture::new("p5b2-readonly-guard").file("marker.txt", b"");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
 
     let script = "echo hello-cold-read";
     let model = ScriptedModel::new(
@@ -157,13 +151,10 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile());
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
 
@@ -214,15 +205,14 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     assert!(!before_aux_files.is_empty());
 
     // Re-open agent without loading the session
-    let agent2 = open_agent(
-        &data_dir,
-        BTreeMap::from([(
+    let agent2 = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([(
             "main".to_owned(),
             ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        bash_profile(),
-    )
-    .await;
+        )]))
+        .profile(bash_profile())
+        .open()
+        .await;
 
     // Cold read must succeed seamlessly
     let cold_read = agent2
@@ -266,19 +256,14 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
 
 #[tokio::test]
 async fn cold_read_missing_aux_or_unknown_tool_maps_to_tool_not_found() {
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-not-found-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-not-found-ws", "marker.txt", b"");
-
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
+    let fixture = AgentFixture::new("p5b2-not-found")
+        .file("marker.txt", b"")
+        .models(BTreeMap::from([(
             "main".to_owned(),
             ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        bash_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        )]))
+        .profile(bash_profile());
+    let (mut agent, info) = fixture.start().await;
     agent.close_session(info.session_id).await.unwrap();
 
     let non_existent_ref = crate::tool_data::ToolRef {
@@ -317,8 +302,8 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     use crate::tool_data::{ToolDataStream, ToolExecutionState};
     use base64::Engine;
 
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-warm-gate-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-warm-gate-ws", "marker.txt", b"");
+    let fixture = AgentFixture::new("p5b2-warm-gate").file("marker.txt", b"");
+    let data_dir = fixture.data_dir.clone();
 
     let script = "printf 'warm-content\n'";
     let model = ScriptedModel::new(
@@ -330,13 +315,10 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile());
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
     agent
@@ -406,8 +388,7 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
     use crate::tool_data::{ToolDataAvailability, ToolDataStream, ToolRecordingState};
     use base64::Engine;
 
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-evicted-restore-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-evicted-restore-ws", "marker.txt", b"");
+    let fixture = AgentFixture::new("p5b2-evicted-restore").file("marker.txt", b"");
 
     let script = "printf 'persisted-stream-data\n'";
     let model = ScriptedModel::new(
@@ -419,13 +400,10 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile());
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
     agent
@@ -506,8 +484,8 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
 async fn both_sources_unavailable_preserves_known_offsets() {
     use crate::tool_data::{ToolDataAvailability, ToolDataStream};
 
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-unavailable-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-unavailable-ws", "marker.txt", b"");
+    let fixture = AgentFixture::new("p5b2-unavailable").file("marker.txt", b"");
+    let data_dir = fixture.data_dir.clone();
 
     let script = "printf 'should-be-unavailable\n'";
     let model = ScriptedModel::new(
@@ -519,13 +497,10 @@ async fn both_sources_unavailable_preserves_known_offsets() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile());
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
     wait_text(&agent, turn).await;
     agent
@@ -592,8 +567,8 @@ async fn both_sources_unavailable_preserves_known_offsets() {
 async fn reader_drop_or_timeout_does_not_cancel_running_bash() {
     use crate::tool_data::ToolDataStream;
 
-    let (data_dir, _guard) = fixture_dir(&format!("p5b2-reader-drop-{}", next_id()));
-    let (workspace, _guard) = workspace_file("p5b2-reader-drop-ws", "marker.txt", b"");
+    let fixture = AgentFixture::new("p5b2-reader-drop").file("marker.txt", b"");
+    let workspace = fixture.workspace.clone();
 
     let pid_file = workspace.join("child.pid");
     let script = format!("echo $$ > '{}'; sleep 5", pid_file.display());
@@ -606,12 +581,10 @@ async fn reader_drop_or_timeout_does_not_cancel_running_bash() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
 
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        bash_profile(),
-    )
-    .await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(bash_profile());
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "sleep bash").await;

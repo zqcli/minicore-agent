@@ -2,17 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn cancelled_open_does_not_publish_a_history_index() {
-    let (data_dir, _guard) = fixture_dir(&format!("cancel-open-{}", next_id()));
-    let (workspace, _guard) = workspace_file("cancel-open-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("cancel-open").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+
+    let fixture = fixture.script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "saved").await;
     wait_text(&agent, turn).await;
     agent.close_session(info.session_id).await.unwrap();
@@ -56,17 +50,12 @@ async fn cancelled_open_does_not_publish_a_history_index() {
 
 #[tokio::test]
 async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
-    let (data_dir, _guard) = fixture_dir(&format!("ws-identity-{}", next_id()));
-    let (workspace, _guard) = workspace_file("ws-identity-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("ws-identity").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture.script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "persist before close").await;
     wait_text(&agent, turn).await;
     agent.close_session(info.session_id).await.unwrap();
@@ -103,17 +92,11 @@ async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
 async fn reopen_rejects_workspace_redirected_by_symlink() {
     use std::os::unix::fs::symlink;
 
-    let (data_dir, _guard) = fixture_dir(&format!("ws-symlink-{}", next_id()));
-    let (workspace, _guard) = workspace_file("ws-symlink-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("ws-symlink").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture.script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
     agent.close_session(info.session_id).await.unwrap();
     let canonical = workspace.canonicalize().unwrap();
 
@@ -130,17 +113,12 @@ async fn reopen_rejects_workspace_redirected_by_symlink() {
 
 #[tokio::test]
 async fn reopen_after_profile_removal_still_works() {
-    let (data_dir, _guard) = fixture_dir(&format!("ws-profile-{}", next_id()));
-    let (workspace, _guard) = workspace_file("ws-profile-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("ws-profile").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let model = ScriptedModel::new("main", [Step::Text("done")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     agent.close_session(info.session_id).await.unwrap();
     drop(agent);
 
@@ -183,17 +161,11 @@ async fn reopen_after_profile_removal_still_works() {
 
 #[tokio::test]
 async fn invalid_agents_md_fails_the_turn_as_a_prompt_error() {
-    let (data_dir, _guard) = fixture_dir(&format!("agents-invalid-{}", next_id()));
-    let (workspace, _guard) = workspace_file("agents-invalid-ws", "AGENTS.md", b"\xff\xfe");
+    let fixture = AgentFixture::new("agents-invalid").file("AGENTS.md", b"\xff\xfe");
     let model = ScriptedModel::new("main", [Step::Text("done")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
 
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let result = agent.wait_turn(turn).await.unwrap();
@@ -203,26 +175,18 @@ async fn invalid_agents_md_fails_the_turn_as_a_prompt_error() {
         }
         other => panic!("expected a prompt failure, got {other:?}"),
     }
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 }
 
 #[tokio::test]
 async fn invalid_session_json_skipped_by_list_and_fails_open() {
-    let (data_dir, _guard) = fixture_dir(&format!("invalid-record-{}", next_id()));
-    let (workspace, _guard) = workspace_file("invalid-record-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("invalid-record").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let (mut agent, info) = fixture.start().await;
     agent.close_session(info.session_id).await.unwrap();
 
     let record_path = data_dir

@@ -9,15 +9,12 @@ use super::*;
 async fn session_close_detaches_a_stalled_status_worker_after_grace() {
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
-    let (data_dir, _data_guard) = fixture_dir(&format!("status-stalled-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("status-stalled-ws", "note", b"text");
-    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("status-stalled").file("note", b"text");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture.script([]);
+    let mut agent = fixture.open().await;
     let session_id = create_session(&mut agent, &workspace).await.session_id;
     let pid_path = data_dir.join("pid");
     let script = data_dir.join("git");
@@ -73,17 +70,12 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
 
-    let (data_dir, _data_guard) = fixture_dir(&format!("status-owner-{}", next_id()));
-    let (workspace, _workspace_guard) =
-        workspace_file("status-owner-ws", "note.txt", b"raw\ncontent\n");
+    let fixture = AgentFixture::new("status-owner").file("note.txt", b"raw\ncontent\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let session_id = info.session_id;
 
     // The public Agent path runs through the Session-owned worker.
@@ -196,17 +188,12 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
 
-    let (data_dir, _data_guard) = fixture_dir(&format!("status-prepare-{}", next_id()));
-    let (workspace, _workspace_guard) =
-        workspace_file("status-prepare-ws", "note.txt", b"raw\ncontent\n");
+    let fixture = AgentFixture::new("status-prepare").file("note.txt", b"raw\ncontent\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let session_id = info.session_id;
 
     // A child that reports its own process id and then holds its pipes open.
@@ -284,9 +271,9 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
     use std::os::unix::fs::PermissionsExt;
 
-    let (data_dir, _data_guard) = fixture_dir(&format!("diff-prepare-{}", next_id()));
-    let (workspace, _workspace_guard) =
-        workspace_file("diff-prepare-ws", "note.txt", b"raw\ncontent\n");
+    let fixture = AgentFixture::new("diff-prepare").file("note.txt", b"raw\ncontent\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     // A real repository is needed: `diff_sources` first resolves the work tree
     // through Git before it can report a missing side.
     let init = std::process::Command::new("git")
@@ -297,13 +284,8 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
     assert!(init.success());
 
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let session_id = info.session_id;
 
     // A real `workspace:` ref for the untracked file, taken from the live
@@ -419,8 +401,8 @@ pub(super) fn process_is_listed(pid: i32) -> bool {
 async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     use crate::tool_data::{CommandStatus, ToolDataStream};
 
-    let (data_dir, _guard) = fixture_dir(&format!("bash-owned-turn-{}", next_id()));
-    let (workspace, _guard) = workspace_file("bash-owned-turn-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("bash-owned-turn").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let pid_file = workspace.join("child.pid");
     let model = ScriptedModel::new(
         "main",
@@ -441,12 +423,10 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
         max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
 
@@ -454,10 +434,9 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     // Wait for the public ToolStarted boundary, then for the pid file, so the
     // cancel happens while a process is really owned.
     loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("bash events must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(std::time::Duration::from_secs(5), "bash events must arrive")
+            .await;
         if matches!(event, AgentEvent::ToolStarted { turn: event_turn, .. } if event_turn == turn) {
             break;
         }
@@ -476,10 +455,7 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
         result.report.outcome,
         minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
     );
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
     // Drain the live process events for this turn and keep the running and
     // terminal records, which must come from the same stored source as queries.

@@ -2,17 +2,10 @@ use super::*;
 
 #[tokio::test]
 async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
-    let (data_dir, _guard) = fixture_dir(&format!("worker-panic-{}", next_id()));
-    let (workspace, _guard) = workspace_file("worker-panic-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("unused")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("worker-panic")
+        .file("a.txt", b"hello")
+        .script([Step::Text("unused")]);
+    let (mut agent, info) = fixture.start().await;
     PANIC_WORKERS.arm(info.session_id, ());
 
     let turn = send_text(&mut agent, info.session_id, "panic").await;
@@ -50,17 +43,10 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
 
 #[tokio::test]
 async fn aborted_agent_worker_wait_close_and_shutdown_reclaim_without_busy_loop() {
-    let (data_dir, _guard) = fixture_dir(&format!("worker-abort-{}", next_id()));
-    let (workspace, _guard) = workspace_file("worker-abort-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("unused")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("worker-abort")
+        .file("a.txt", b"hello")
+        .script([Step::Text("unused")]);
+    let (mut agent, info) = fixture.start().await;
 
     let turn = send_text(&mut agent, info.session_id, "abort").await;
     // Abort immediately, including the case where the worker has not polled
@@ -84,80 +70,51 @@ async fn aborted_agent_worker_wait_close_and_shutdown_reclaim_without_busy_loop(
 
 #[tokio::test]
 async fn unobserved_event_stream_still_persists() {
-    let (data_dir, _guard) = fixture_dir(&format!("noevents-{}", next_id()));
-    let (workspace, _guard) = workspace_file("noevents-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("noevents").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture.script([Step::Text("done")]);
+    let mut agent = fixture.open().await;
     // Do not take_events at all.
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let stored = read_store_history(&data_dir, info.session_id).await;
     assert_eq!(stored.len(), 2);
 }
 
 #[tokio::test]
 async fn next_send_cleans_up_finished_turn_without_explicit_wait() {
-    let (data_dir, _guard) = fixture_dir(&format!("cleanup-{}", next_id()));
-    let (workspace, _guard) = workspace_file("cleanup-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
+    let fixture = AgentFixture::new("cleanup")
+        .file("a.txt", b"hello")
+        .script([Step::Text("one"), Step::Text("two")]);
+    let (mut agent, info) = fixture.start().await;
+    let turn = send_text(&mut agent, info.session_id, "one").await;
+    wait_until(
+        std::time::Duration::from_secs(2),
+        "first turn must reach Idle",
+        || {
+            agent.session_state(info.session_id).unwrap().status
+                == crate::sessions::SessionStatus::Idle
+        },
     )
     .await;
-    let info = create_session(&mut agent, &workspace).await;
-    let turn = send_text(&mut agent, info.session_id, "one").await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let state = agent.session_state(info.session_id).unwrap();
-        if state.status == crate::sessions::SessionStatus::Idle {
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            panic!(
-                "first turn did not reach Idle; final status: {:?}",
-                state.status
-            );
-        }
-        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
-    }
     // Send again after Agent-level completion, without waiting for the first turn.
     let second = send_text(&mut agent, info.session_id, "two").await;
     assert_ne!(turn.loop_id, second.loop_id);
     let result = wait_text(&agent, second).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 }
 
 #[tokio::test]
 async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
-    let (data_dir, _guard) = fixture_dir(&format!("append-rollback-{}", next_id()));
-    let (workspace, _guard) = workspace_file("append-rollback-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("append-rollback").file("a.txt", b"hello");
     let model = ScriptedModel::new("main", [Step::Text("not saved"), Step::Text("saved")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     crate::store::APPEND_FAILURES.arm(info.session_id, false);
     let first = send_text(&mut agent, info.session_id, "rolled back").await;
     let result = wait_text(&agent, first).await;
@@ -182,10 +139,7 @@ async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
     );
     let second = send_text(&mut agent, info.session_id, "keep this").await;
     let result = wait_text(&agent, second).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let expected = result.report.appended.len();
     agent.close_session(info.session_id).await.unwrap();
     agent.open_session(info.session_id).await.unwrap();
@@ -205,35 +159,19 @@ async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
 
 #[tokio::test]
 async fn append_failure_blocks_session_and_returns_failed_persistence() {
-    let (data_dir, _guard) = fixture_dir(&format!("blocked-{}", next_id()));
-    let (workspace, _guard) = workspace_file("blocked-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("blocked")
+        .file("a.txt", b"hello")
+        .script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
     crate::store::APPEND_FAILURES.arm(info.session_id, true);
 
     let turn = send_text(&mut agent, info.session_id, "will fail").await;
     let result = wait_text(&agent, turn).await;
     // The report is still fully returned.
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
     // History was not merged into memory.
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     assert_eq!(page.total, 0);
 
     // Session is blocked: further sends and updates are refused.
@@ -254,41 +192,29 @@ async fn append_failure_blocks_session_and_returns_failed_persistence() {
 
 #[tokio::test]
 async fn blocked_send_does_not_discard_previous_turn_result() {
-    let (data_dir, _guard) = fixture_dir(&format!("blocked-discard-{}", next_id()));
-    let (workspace, _guard) = workspace_file("blocked-discard-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("blocked-discard").file("a.txt", b"hello");
     let model = ScriptedModel::new("main", [Step::Text("persist me")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     crate::store::APPEND_FAILURES.arm(info.session_id, true);
 
     let turn = send_text(&mut agent, info.session_id, "first turn").await;
 
     // Wait deterministically for the session to transition to Blocked.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let state = agent.session_state(info.session_id).unwrap();
-        if state.status == crate::sessions::SessionStatus::Blocked {
-            assert_eq!(
-                state.block_reason,
-                Some(crate::sessions::SessionBlockReason::Persistence)
-            );
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            panic!(
-                "session did not reach Blocked; final status: {:?}",
-                state.status
-            );
-        }
-        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(10))).await;
-    }
+    wait_until(
+        std::time::Duration::from_secs(2),
+        "session must reach Blocked",
+        || {
+            agent.session_state(info.session_id).unwrap().status
+                == crate::sessions::SessionStatus::Blocked
+        },
+    )
+    .await;
+    assert_eq!(
+        agent.session_state(info.session_id).unwrap().block_reason,
+        Some(crate::sessions::SessionBlockReason::Persistence)
+    );
 
     // A second send fails with SessionBlocked.
     let second_send = agent
@@ -304,10 +230,7 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
         .wait_turn(turn)
         .await
         .expect("previous turn wait must succeed even after blocked send");
-    assert_eq!(
-        first_result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&first_result);
     assert_eq!(
         first_result.persistence,
         crate::sessions::TurnPersistence::Failed
@@ -318,10 +241,7 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
         .wait_turn(turn)
         .await
         .expect("repeated wait on blocked turn must succeed");
-    assert_eq!(
-        second_wait.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&second_wait);
     assert_eq!(
         second_wait.persistence,
         crate::sessions::TurnPersistence::Failed
@@ -335,17 +255,10 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
 
 #[tokio::test]
 async fn close_and_reopen_recovers_from_blocked_session() {
-    let (data_dir, _guard) = fixture_dir(&format!("recover-{}", next_id()));
-    let (workspace, _guard) = workspace_file("recover-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("recover")
+        .file("a.txt", b"hello")
+        .script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
     crate::store::APPEND_FAILURES.arm(info.session_id, true);
     let turn = send_text(&mut agent, info.session_id, "fail").await;
     let result = wait_text(&agent, turn).await;
@@ -359,40 +272,21 @@ async fn close_and_reopen_recovers_from_blocked_session() {
 
     let turn = send_text(&mut agent, info.session_id, "after recovery").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 }
 
 #[tokio::test]
 async fn metadata_write_failure_does_not_fail_the_turn() {
-    let (data_dir, _guard) = fixture_dir(&format!("metadata-{}", next_id()));
-    let (workspace, _guard) = workspace_file("metadata-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("metadata")
+        .file("a.txt", b"hello")
+        .script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
     crate::store::RECORD_WRITE_FAILURES.arm(info.session_id, ());
 
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     // History merged even though session.json updated_at write failed.
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     assert_eq!(page.total, 2);
 }

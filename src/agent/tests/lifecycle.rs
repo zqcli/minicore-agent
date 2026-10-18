@@ -2,19 +2,13 @@ use super::*;
 
 #[tokio::test]
 async fn create_and_open_do_not_start_agent_loop() {
-    let (data_dir, _guard) = fixture_dir(&format!("open-no-loop-{}", next_id()));
-    let (workspace, _guard) = workspace_file("open-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
-
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("open-no-loop").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let (mut agent, info) = fixture.start().await;
     assert!(agent.list_sessions().await.unwrap()[0].loaded);
 
     let state = agent.session_state(info.session_id).unwrap();
@@ -31,17 +25,13 @@ async fn create_and_open_do_not_start_agent_loop() {
 
 #[tokio::test]
 async fn create_and_loaded_open_emit_session_opened_once() {
-    let (data_dir, _guard) = fixture_dir(&format!("session-opened-{}", next_id()));
-    let (workspace, _guard) = workspace_file("session-opened-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("session-opened").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
 
     let info = create_session(&mut agent, &workspace).await;
@@ -116,18 +106,14 @@ async fn create_and_loaded_open_emit_session_opened_once() {
 
 #[tokio::test]
 async fn create_capability_precheck_leaves_no_session_directory() {
-    let (data_dir, _guard) = fixture_dir(&format!("create-capability-precheck-{}", next_id()));
-    let (workspace, _workspace_guard) =
-        workspace_file("create-capability-precheck-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("create-capability-precheck").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let mut agent = fixture.open().await;
     let mut invalid_profile = read_profile();
     invalid_profile.tools = vec!["read".to_owned(), "read".to_owned()];
     agent.profiles = crate::profiles::Profiles::from_values(BTreeMap::from([(
@@ -157,8 +143,8 @@ async fn create_capability_precheck_leaves_no_session_directory() {
 
 #[tokio::test]
 async fn i1_create_open_and_turns_leave_branch_unknown_until_explicit_status() {
-    let (data_dir, _data_guard) = fixture_dir(&format!("i1-turns-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("i1-turns-ws", "file.txt", b"contents\n");
+    let fixture = AgentFixture::new("i1-turns").file("file.txt", b"contents\n");
+    let workspace = fixture.workspace.clone();
     let init = std::process::Command::new("git")
         .args(["init", "--quiet"])
         .arg(&workspace)
@@ -182,14 +168,8 @@ async fn i1_create_open_and_turns_leave_branch_unknown_until_explicit_status() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     assert_eq!(
         agent
             .session_presentation(info.session_id)
@@ -235,8 +215,9 @@ async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
     use std::os::unix::fs::PermissionsExt;
     use tokio_util::sync::CancellationToken;
 
-    let (data_dir, _data_guard) = fixture_dir(&format!("i1-status-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("i1-status-ws", "file.txt", b"contents\n");
+    let fixture = AgentFixture::new("i1-status").file("file.txt", b"contents\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let init = std::process::Command::new("git")
         .args(["init", "--quiet"])
         .arg(&workspace)
@@ -252,13 +233,8 @@ async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
     assert!(head.success());
 
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     assert_eq!(
         agent
             .session_presentation(info.session_id)
@@ -347,16 +323,11 @@ async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
 
 #[tokio::test]
 async fn rename_loaded_session_trims_clears_and_rejects_invalid_titles() {
-    let (data_dir, _guard) = fixture_dir(&format!("rename-loaded-{}", next_id()));
-    let (workspace, _guard) = workspace_file("rename-loaded-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("rename-loaded").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let before = Store::open(data_dir.clone())
         .await
         .unwrap()
@@ -434,17 +405,13 @@ async fn rename_loaded_session_trims_clears_and_rejects_invalid_titles() {
 
 #[tokio::test]
 async fn rename_unloaded_session_updates_only_the_persistent_metadata() {
-    let (data_dir, _guard) = fixture_dir(&format!("rename-unloaded-{}", next_id()));
-    let (workspace, _guard) = workspace_file("rename-unloaded-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("rename-unloaded").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new("main", [Step::Text("done")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "keep history").await;
     wait_text(&agent, turn).await;
     let store = Store::open(data_dir.clone()).await.unwrap();
@@ -476,18 +443,12 @@ async fn rename_unloaded_session_updates_only_the_persistent_metadata() {
 
 #[tokio::test]
 async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session() {
-    let (data_dir, _guard) = fixture_dir(&format!("rename-busy-{}", next_id()));
-    let (workspace, _guard) = workspace_file("rename-busy-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("rename-busy").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let gate = Arc::new(Gate::new());
-    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+
+    let fixture = fixture.script([Step::gated_text(gate.clone(), "done")]);
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "busy").await;
     gate.wait_started().await;
 
@@ -509,17 +470,15 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
         .unwrap();
     assert_eq!(record.title.as_deref(), Some("While busy"));
 
-    let (blocked_data, _blocked_guard) = fixture_dir(&format!("rename-blocked-{}", next_id()));
+    let (blocked_data, _blocked_guard) = fixture_dir("rename-blocked");
     let (blocked_workspace, _blocked_workspace_guard) =
         workspace_file("rename-blocked-ws", "a.txt", b"hello");
     let blocked_model = ScriptedModel::new("main", [Step::Text("done")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut blocked_agent = open_agent(
-        &blocked_data,
-        BTreeMap::from([("main".to_owned(), blocked_model)]),
-        read_profile(),
-    )
-    .await;
+    let mut blocked_agent = AgentFixture::at(&blocked_data)
+        .models(BTreeMap::from([("main".to_owned(), blocked_model)]))
+        .open()
+        .await;
     let blocked_info = create_session(&mut blocked_agent, &blocked_workspace).await;
     crate::store::APPEND_FAILURES.arm(blocked_info.session_id, true);
     let blocked_turn = send_text(&mut blocked_agent, blocked_info.session_id, "block").await;
@@ -551,16 +510,11 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
 
 #[tokio::test]
 async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
-    let (data_dir, _guard) = fixture_dir(&format!("rename-failure-{}", next_id()));
-    let (workspace, _guard) = workspace_file("rename-failure-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("rename-failure").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let before = Store::open(data_dir.clone())
         .await
         .unwrap()
@@ -591,7 +545,7 @@ async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
 
 #[tokio::test]
 async fn system_prompt_file_is_loaded_once_and_session_snapshot_survives_reopen() {
-    let (base, _guard) = fixture_dir(&format!("prompt-file-snapshot-{}", next_id()));
+    let (base, _guard) = fixture_dir("prompt-file-snapshot");
     std::fs::create_dir_all(&base).unwrap();
     let (workspace, _workspace_guard) = workspace_file("prompt-file-ws", "a.txt", b"hello");
     let prompt_path = base.join("prompt");
@@ -671,18 +625,11 @@ fn rename_request_debug_does_not_include_the_title() {
 
 #[tokio::test]
 async fn single_active_loop_busy() {
-    let (data_dir, _guard) = fixture_dir(&format!("busy-{}", next_id()));
-    let (workspace, _guard) = workspace_file("busy-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("busy").file("a.txt", b"hello");
     let gate = Arc::new(Gate::new());
-    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "first")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+
+    let fixture = fixture.script([Step::gated_text(gate.clone(), "first")]);
+    let (mut agent, info) = fixture.start().await;
 
     let first = send_text(&mut agent, info.session_id, "first").await;
     let busy = agent
@@ -696,46 +643,25 @@ async fn single_active_loop_busy() {
     gate.wait_started().await;
     gate.release();
     let result = wait_text(&agent, first).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     agent.wait_turn(first).await.unwrap(); // already completed: no error
 }
 
 #[tokio::test]
 async fn basic_completion_persists_and_merges_history() {
-    let (data_dir, _guard) = fixture_dir(&format!("basic-{}", next_id()));
-    let (workspace, _guard) = workspace_file("basic-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("basic").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+
+    let fixture = fixture.script([Step::Text("done")]);
+    let (mut agent, info) = fixture.start().await;
 
     let turn = send_text(&mut agent, info.session_id, "hello agent").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_persisted(&result);
+    assert_completed(&result);
 
     // The history in memory and the durable JSONL agree.
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     assert_eq!(page.total, 2);
     let stored = read_store_history(&data_dir, info.session_id).await;
     assert_eq!(stored.len(), 2);

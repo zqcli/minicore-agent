@@ -7,12 +7,10 @@ async fn shutdown_broadcasts_to_all_sessions_before_waiting_for_any_worker() {
     let workspace = TempDir::new("core-shutdown-workspace");
     let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        data.path(),
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(data.path())
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     let store = agent.store_handle();
     let mut ids = Vec::new();
     let mut cancellations = Vec::new();

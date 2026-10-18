@@ -108,9 +108,13 @@ async fn post_turn_eligibility_excludes_failed_cancelled_disabled_and_unpersiste
                 .with_pacing(std::time::Duration::from_millis(2));
         let models = BTreeMap::from([("main".to_owned(), Arc::clone(&model))]);
         let mut agent = if mode == "disabled" {
-            open_agent(&data_dir, models, read_profile()).await
+            AgentFixture::at(&data_dir).models(models).open().await
         } else {
-            open_agent_auto(&data_dir, models, read_profile()).await
+            AgentFixture::at(&data_dir)
+                .models(models)
+                .auto()
+                .open()
+                .await
         };
         let info = create_session(&mut agent, &workspace).await;
         if mode == "append_failed" {
@@ -150,12 +154,11 @@ async fn manual_compaction_rejects_reserved_auto_namespace_but_cancel_accepts_it
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let request = CompactSession {
         session_id: info.session_id,
@@ -171,17 +174,11 @@ async fn manual_compaction_rejects_reserved_auto_namespace_but_cancel_accepts_it
 
 #[tokio::test]
 async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
-    let (data_dir, _guard) = fixture_dir(&format!("close-cancel-owned-{}", next_id()));
-    let (workspace, _guard) = workspace_file("close-cancel-owned-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("close-cancel-owned").file("a.txt", b"hello");
     let model = ScriptedModel::new("main", [Step::Text("done")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let gate = Arc::new(Gate::new());
     PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
 
@@ -213,21 +210,15 @@ async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
 
 #[tokio::test]
 async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
-    let (data_dir, _guard) = fixture_dir(&format!("compact-close-cancel-{}", next_id()));
-    let (workspace, _guard) = workspace_file("compact-close-cancel-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("compact-close-cancel").file("a.txt", b"hello");
     let model = ScriptedModel::with_window(
         "main",
         40_000,
         [Step::Text("settled"), Step::Text("summary")],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let settled_text = "settled history ".repeat(128);
     let turn = send_text(&mut agent, info.session_id, &settled_text).await;
     wait_text(&agent, turn).await;
@@ -285,16 +276,10 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
 
 #[tokio::test]
 async fn compaction_operation_ids_are_bounded_and_reset_on_reopen() {
-    let (data_dir, _guard) = fixture_dir(&format!("compact-id-cap-{}", next_id()));
-    let (workspace, _guard) = workspace_file("compact-id-cap-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("compact-id-cap").file("a.txt", b"hello");
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
 
     for index in 0..4_096 {
         let result = agent

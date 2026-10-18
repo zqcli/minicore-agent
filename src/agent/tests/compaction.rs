@@ -34,7 +34,7 @@ pub(super) fn pi_history_exchange(loop_id: LoopId, index: u32, bytes: usize) -> 
 
 #[tokio::test]
 async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer() {
-    let (data_dir, _guard) = fixture_dir(&format!("pi-in-run-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("pi-in-run");
     let content = "read-result ".repeat(900);
     let (workspace, _workspace_guard) =
         workspace_file("pi-in-run-workspace", "a.txt", content.as_bytes());
@@ -50,12 +50,11 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".into(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".into(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(
         &mut agent,
@@ -72,10 +71,7 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
         .unwrap();
     gate.release();
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(
         result.report.requests, 3,
         "utility is not an ordinary request"
@@ -135,7 +131,7 @@ async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
     let gate = Arc::new(Gate::new());
     let dropped = Arc::new(AtomicBool::new(false));
     let (_data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
-        &format!("pi-first-cancel-{}", next_id()),
+        "pi-first-cancel",
         true,
         8_000,
         pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
@@ -180,7 +176,7 @@ async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
 async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_input() {
     let large_summary: &str = Box::leak("old summary ".repeat(3_000).into_boxed_str());
     let (data, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
-        &format!("pi-summary-reopen-{}", next_id()),
+        "pi-summary-reopen",
         true,
         20_000,
         pi_history_exchange(LoopId::new().unwrap(), 0, 70_000),
@@ -233,19 +229,15 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data,
-        BTreeMap::from([("main".into(), Arc::clone(&smaller))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data)
+        .models(BTreeMap::from([("main".into(), Arc::clone(&smaller))]))
+        .auto()
+        .open()
+        .await;
     agent.open_session(session_id).await.unwrap();
     let turn = send_text(&mut agent, session_id, "new after reopening exact").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
     {
         let requests = smaller.requests.lock().unwrap();
@@ -281,7 +273,7 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
 async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summary() {
     let gate = Arc::new(Gate::new());
     let (_data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
-        &format!("pi-stale-prepare-{}", next_id()),
+        "pi-stale-prepare",
         true,
         8_000,
         pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
@@ -311,10 +303,7 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
         .unwrap();
     gate.release();
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(result.report.requests, 1);
     wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
     let requests = model.requests.lock().unwrap();
@@ -344,7 +333,7 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
 
 #[tokio::test]
 async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_without_tools_replay() {
-    let (data, _guard) = fixture_dir(&format!("pi-consolidated-retry-{}", next_id()));
+    let (data, _guard) = fixture_dir("pi-consolidated-retry");
     let (workspace, _workspace_guard) = workspace_file(
         "pi-consolidated-retry-ws",
         "a.txt",
@@ -376,19 +365,15 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data,
-        BTreeMap::from([("main".into(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data)
+        .models(BTreeMap::from([("main".into(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let session_id = create_session(&mut agent, &workspace).await.session_id;
     let turn = send_text(&mut agent, session_id, "new user exact").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(result.report.requests, 3);
     assert_eq!(result.report.tool_rounds, 2);
     wait_post_turn_noop(&agent, session_id, turn.loop_id).await;

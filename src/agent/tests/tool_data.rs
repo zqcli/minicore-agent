@@ -104,8 +104,8 @@ async fn read_output(agent: &Agent, tool_ref: crate::tool_data::ToolRef) -> Stri
 async fn tool_invocation_separates_requests_not_just_names() {
     use crate::tool_data::{ToolExecutionState, ToolSubject};
 
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-identity-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-identity-ws", "a.txt", b"alpha");
+    let fixture = AgentFixture::new("tool-data-identity").file("a.txt", b"alpha");
+    let workspace = fixture.workspace.clone();
     std::fs::write(workspace.join("b.txt"), b"beta").unwrap();
     // The same tool name runs in two different requests within one loop.
     let model = ScriptedModel::new(
@@ -117,13 +117,8 @@ async fn tool_invocation_separates_requests_not_just_names() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "read both").await;
     wait_text(&agent, turn).await;
 
@@ -163,7 +158,7 @@ async fn tool_invocation_separates_requests_not_just_names() {
 
 #[tokio::test]
 async fn tool_invocation_is_isolated_across_sessions() {
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-sessions-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("tool-data-sessions");
     let (workspace_a, _guard_a) = workspace_file("tool-data-session-a", "a.txt", b"alpha");
     let base = workspace_a.parent().unwrap();
     let workspace_b = base.join("session-b");
@@ -179,12 +174,10 @@ async fn tool_invocation_is_isolated_across_sessions() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     let session_a = create_session(&mut agent, &workspace_a).await;
     let turn_a = send_text(&mut agent, session_a.session_id, "read a").await;
     wait_text(&agent, turn_a).await;
@@ -241,16 +234,12 @@ fn workspace_read_request(session_id: SessionId, path: &str) -> crate::Workspace
 
 #[tokio::test]
 async fn workspace_read_requires_a_loaded_session_and_touches_nothing_else() {
-    let (data_dir, _guard) = fixture_dir(&format!("workspace-read-{}", next_id()));
-    let (workspace, _guard) = workspace_file("workspace-read-ws", "note.txt", b"raw\ncontent\n");
+    let fixture = AgentFixture::new("workspace-read").file("note.txt", b"raw\ncontent\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let session_id = info.session_id;
 
     let history_path = data_dir
@@ -321,16 +310,12 @@ fn workspace_search_request(session_id: SessionId, query: &str) -> crate::Worksp
 
 #[tokio::test]
 async fn workspace_files_and_search_require_a_loaded_session_and_touch_nothing_else() {
-    let (data_dir, _guard) = fixture_dir(&format!("workspace-scan-{}", next_id()));
-    let (workspace, _guard) = workspace_file("workspace-scan-ws", "note.txt", b"raw\nneedle\n");
+    let fixture = AgentFixture::new("workspace-scan").file("note.txt", b"raw\nneedle\n");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let session_id = info.session_id;
 
     let history_path = data_dir
@@ -401,8 +386,8 @@ async fn workspace_files_and_search_require_a_loaded_session_and_touch_nothing_e
 async fn tool_read_exposes_approval_time_data_without_running() {
     use crate::tool_data::{ToolExecutionState, ToolSubject};
 
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-policy-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-policy-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("tool-data-policy").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let profile = Profile {
         model: "main".to_owned(),
         reasoning: ReasoningPreference::Auto,
@@ -419,27 +404,26 @@ async fn tool_read_exposes_approval_time_data_without_running() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "write it").await;
 
     // Wait until the runtime reports the approval request, then query while
     // the tool is still blocked before execution.
-    let interaction = loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("interaction event must arrive")
-            .expect("event stream must remain open");
-        if let AgentEvent::InteractionRequested { interaction, .. } = event {
-            break interaction;
-        }
-    };
+    let interaction = events
+        .expect(
+            std::time::Duration::from_secs(2),
+            "interaction event must arrive",
+            |event| match event {
+                AgentEvent::InteractionRequested { interaction, .. } => Some(interaction),
+                _ => None,
+            },
+        )
+        .await;
     let tool_ref = crate::tool_data::ToolRef {
         session_id: info.session_id,
         loop_id: turn.loop_id,
@@ -489,8 +473,8 @@ async fn tool_read_exposes_approval_time_data_without_running() {
 
 #[tokio::test]
 async fn i2_02_tool_execution_event_matches_the_tool_read_query() {
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-events-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-events-ws", "a.txt", b"alpha\nbeta");
+    let fixture = AgentFixture::new("tool-data-events").file("a.txt", b"alpha\nbeta");
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new(
         "main",
         [
@@ -499,12 +483,8 @@ async fn i2_02_tool_execution_event_matches_the_tool_read_query() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
@@ -513,10 +493,12 @@ async fn i2_02_tool_execution_event_matches_the_tool_read_query() {
     let mut invocation_event = None;
     let mut execution_event = None;
     while execution_event.is_none() {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("tool data events must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(
+                std::time::Duration::from_secs(1),
+                "tool data events must arrive",
+            )
+            .await;
         match event {
             AgentEvent::ToolInvocation { data, .. } => invocation_event = Some(data),
             AgentEvent::ToolExecution { data, .. } => execution_event = Some(data),
@@ -543,8 +525,8 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
     use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState};
     use base64::Engine;
 
-    let (data_dir, _guard) = fixture_dir(&format!("startup-observation-{}", next_id()));
-    let (workspace, _guard) = workspace_file("startup-observation-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("startup-observation").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let model_gate = Arc::new(Gate::new());
     let model = ScriptedModel::new(
         "main",
@@ -556,12 +538,10 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
     )
     .with_pacing(std::time::Duration::from_millis(2));
     let model_started = model.start_entered();
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        bash_profile(),
-    )
-    .await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(bash_profile());
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let gate = Arc::new(Gate::new());
@@ -839,7 +819,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
 
 #[tokio::test]
 async fn tool_result_raw_text_is_readable_by_offset_without_escaping() {
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-offset-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("tool-data-offset");
     let expected = (1..=24)
         .map(|line| format!("line-{line}: 你好 café"))
         .collect::<Vec<_>>()
@@ -853,12 +833,10 @@ async fn tool_result_raw_text_is_readable_by_offset_without_escaping() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
     wait_text(&agent, turn).await;
@@ -881,8 +859,7 @@ async fn tool_result_raw_text_is_readable_by_offset_without_escaping() {
 async fn i2_03_tool_read_answers_without_consuming_live_events() {
     // A capacity-1 Agent event queue drops nearly every best-effort event, yet
     // the authoritative join report still reconciles terminal tool state.
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-lost-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-lost-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("tool-data-lost").file("a.txt", b"hello");
     let model = ScriptedModel::new(
         "main",
         [
@@ -891,17 +868,13 @@ async fn i2_03_tool_read_answers_without_consuming_live_events() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_with(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-        AgentOptions {
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .options(AgentOptions {
             agent_event_capacity: 1,
             loop_event_capacity: Some(1),
-        },
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        });
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
     wait_text(&agent, turn).await;
     // The live stream is never consumed: events were dropped, not delivered.
@@ -923,8 +896,7 @@ async fn i2_03_tool_read_answers_without_consuming_live_events() {
 async fn failed_tool_result_text_is_queryable_from_the_authoritative_report() {
     use crate::tool_data::{ToolDataAvailability, ToolExecutionState};
 
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-failed-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-failed-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("tool-data-failed").file("a.txt", b"hello");
     let model = ScriptedModel::new(
         "main",
         [
@@ -933,13 +905,8 @@ async fn failed_tool_result_text_is_queryable_from_the_authoritative_report() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "read missing").await;
     wait_text(&agent, turn).await;
 
@@ -965,8 +932,8 @@ async fn failed_tool_result_text_is_queryable_from_the_authoritative_report() {
 async fn running_tool_output_stream_is_never_a_false_empty_eof() {
     use crate::tool_data::{ToolDataAvailability, ToolExecutionState};
 
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-pending-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-pending-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("tool-data-pending").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new(
         "main",
         [
@@ -975,12 +942,8 @@ async fn running_tool_output_stream_is_never_a_false_empty_eof() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
@@ -988,15 +951,16 @@ async fn running_tool_output_stream_is_never_a_false_empty_eof() {
     // Wait for the invocation event, then query while the tool may still be
     // running. The page must never claim an empty, complete (`eof`) available
     // stream: an unobserved output is `pending`.
-    let data = loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("tool invocation event must arrive")
-            .expect("event stream must remain open");
-        if let AgentEvent::ToolInvocation { data, .. } = event {
-            break data;
-        }
-    };
+    let data = events
+        .expect(
+            std::time::Duration::from_secs(2),
+            "tool invocation event must arrive",
+            |event| match event {
+                AgentEvent::ToolInvocation { data, .. } => Some(data),
+                _ => None,
+            },
+        )
+        .await;
     let page = agent
         .tool_output(crate::tool_data::ToolOutputRequest {
             tool_ref: data.tool_ref.clone(),
@@ -1028,8 +992,8 @@ async fn running_tool_output_stream_is_never_a_false_empty_eof() {
 async fn rejected_tool_input_never_fabricates_a_file_operation() {
     use crate::tool_data::{ToolExecutionState, ToolSubject};
 
-    let (data_dir, _guard) = fixture_dir(&format!("tool-data-invalid-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-data-invalid-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("tool-data-invalid").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let profile = Profile {
         model: "main".to_owned(),
         reasoning: ReasoningPreference::Auto,
@@ -1048,13 +1012,10 @@ async fn rejected_tool_input_never_fabricates_a_file_operation() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        profile,
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(profile);
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "write it").await;
     wait_text(&agent, turn).await;
 

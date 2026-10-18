@@ -2,26 +2,25 @@ use super::*;
 
 #[tokio::test]
 async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() {
-    let (data_dir, _guard) = fixture_dir(&format!("i2-01-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("i2-01");
     let (workspace_a, _workspace_a_guard) = workspace_file("i2-01-a", "a.txt", b"a");
     let (workspace_b, _workspace_b_guard) = workspace_file("i2-01-b", "b.txt", b"b");
     let model_main =
         ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let model_other =
         ScriptedModel::new("other", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto_with_configs(
-        &data_dir,
-        BTreeMap::from([
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([
             ("main".to_owned(), Arc::clone(&model_main)),
             ("other".to_owned(), Arc::clone(&model_other)),
-        ]),
-        BTreeMap::from([
+        ]))
+        .model_configs(BTreeMap::from([
             ("main".to_owned(), model_config("MINICORE_AGENT_TEST_KEY")),
             ("other".to_owned(), model_config("MINICORE_AGENT_TEST_KEY")),
-        ]),
-        read_profile(),
-    )
-    .await;
+        ]))
+        .auto()
+        .open()
+        .await;
     let first = create_session(&mut agent, &workspace_a).await;
     let second = create_session(&mut agent, &workspace_b).await;
     let first_session = agent.loaded_session(first.session_id).unwrap();
@@ -76,18 +75,13 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
 
 #[tokio::test]
 async fn i2_05_session_observation_resources_are_released_without_cycles() {
-    let (data_dir, _guard) = fixture_dir(&format!("i2-05-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("i2-05-ws", "a.txt", b"a");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
+    let fixture = AgentFixture::new("i2-05")
+        .file("a.txt", b"a")
+        .models(BTreeMap::from([(
             "main".to_owned(),
             ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        )]));
+    let (mut agent, info) = fixture.start().await;
     let session = agent.loaded_session(info.session_id).unwrap();
     let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
     let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
@@ -103,17 +97,13 @@ async fn i2_05_session_observation_resources_are_released_without_cycles() {
 
 #[tokio::test]
 async fn embedded_open_without_a_file_source_cannot_reload() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-no-source-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reload-no-source-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("reload-no-source").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let mut agent = fixture.open().await;
 
     assert!(matches!(
         agent.reload().await,
@@ -124,20 +114,14 @@ async fn embedded_open_without_a_file_source_cannot_reload() {
 
 #[tokio::test]
 async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-active-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reload-active-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("reload-active").file("a.txt", b"hello");
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "old")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("main", [Step::Text("new")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]));
+    let (mut agent, info) = fixture.start().await;
     let first = send_text(&mut agent, info.session_id, "first").await;
     gate.wait_started().await;
 
@@ -165,8 +149,7 @@ async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
 
 #[tokio::test]
 async fn reload_does_not_change_a_running_compaction_binding() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-compaction-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reload-compaction-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("reload-compaction").file("a.txt", b"hello");
     let gate = Arc::new(Gate::new());
     let model_a = ScriptedModel::with_window(
         "main",
@@ -179,16 +162,11 @@ async fn reload_does_not_change_a_running_compaction_binding() {
     .with_pacing(std::time::Duration::from_millis(2));
     let model_b = ScriptedModel::new("main", [Step::Text("new turn")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), Arc::clone(&model_a)),
-            ("replacement".to_owned(), Arc::clone(&model_b)),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_a)),
+        ("replacement".to_owned(), Arc::clone(&model_b)),
+    ]));
+    let (mut agent, info) = fixture.start().await;
     let settled_text = "settled history ".repeat(128);
     let turn = send_text(&mut agent, info.session_id, &settled_text).await;
     wait_text(&agent, turn).await;
@@ -248,14 +226,12 @@ async fn reload_does_not_change_a_running_compaction_binding() {
 
 #[tokio::test]
 async fn reload_command_environment_accumulates_all_prior_credential_names() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-env-merge-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("reload-env-merge");
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
 
     let mut candidate_b = agent.config().clone();
     if let Some(ModelConfig::OpenAiResponses { api_key_env, .. }) =
@@ -307,8 +283,9 @@ async fn reload_command_environment_accumulates_all_prior_credential_names() {
 
 #[tokio::test]
 async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
-    let (data_dir, _data_guard) = fixture_dir(&format!("legacy-open-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("legacy-open-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("legacy-open").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let session_id = SessionId::new().unwrap();
     let store = Store::open(data_dir.clone()).await.unwrap();
     let record = SessionRecord {
@@ -371,12 +348,8 @@ async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
     .unwrap();
 
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let mut agent = fixture.open().await;
     let listed = agent.list_sessions().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].loaded);
@@ -445,15 +418,13 @@ async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
 
 #[tokio::test]
 async fn reload_rejects_removed_subagent_profile_without_publishing_or_starting_work() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-subagent-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("reload-subagent");
     let model = ScriptedModel::new("main", [Step::Text("unused")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     let original = agent.list_profiles();
     let mut candidate = agent.config().clone();
     candidate.profiles.get_mut("test").unwrap().tools = vec!["subagent".to_owned()];
@@ -476,24 +447,19 @@ async fn reload_rejects_removed_subagent_profile_without_publishing_or_starting_
 
 #[tokio::test]
 async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-atomic-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reload-atomic-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("reload-atomic").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let model_main = ScriptedModel::new("main", [Step::Text("main")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_other = ScriptedModel::new("other", [Step::Text("other")])
         .with_pacing(std::time::Duration::from_millis(2));
     let model_reloaded = ScriptedModel::new("main", [Step::Text("reloaded")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), Arc::clone(&model_main)),
-            ("other".to_owned(), Arc::clone(&model_other)),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), Arc::clone(&model_main)),
+        ("other".to_owned(), Arc::clone(&model_other)),
+    ]));
+    let (mut agent, info) = fixture.start().await;
     let first = send_text(&mut agent, info.session_id, "before reload").await;
     wait_text(&agent, first).await;
     let history_path = data_dir
@@ -641,17 +607,14 @@ async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
 
 #[tokio::test]
 async fn reload_rejects_store_and_event_capacity_changes_before_swap() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-restart-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reload-restart-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("reload-restart").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let mut agent = fixture.open().await;
     let _ = create_session(&mut agent, &workspace).await;
 
     let mut data_dir_candidate = agent.config().clone();
@@ -686,19 +649,14 @@ async fn reload_rejects_store_and_event_capacity_changes_before_swap() {
 
 #[tokio::test]
 async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
-    let (data_dir, _guard) = fixture_dir(&format!("reload-blocked-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reload-blocked-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
-            "main".to_owned(),
-            ScriptedModel::new("main", [Step::Text("done")])
-                .with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("reload-blocked").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let fixture = fixture.models(BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", [Step::Text("done")])
+            .with_pacing(std::time::Duration::from_millis(2)),
+    )]));
+    let (mut agent, info) = fixture.start().await;
     crate::store::APPEND_FAILURES.arm(info.session_id, true);
     let turn = send_text(&mut agent, info.session_id, "block").await;
     let result = wait_text(&agent, turn).await;

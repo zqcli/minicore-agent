@@ -62,7 +62,7 @@ async fn over_runtime_history_without_valid_summary_is_rejected() {
 #[tokio::test]
 async fn automatic_submit_rejects_runtime_overlimit_without_startup_summary() {
     let (data_dir, _guard, session_id, model, mut agent) =
-        auto_history_fixture(&format!("auto-append-only-{}", next_id()), true).await;
+        auto_history_fixture("auto-append-only", true).await;
     let path = data_dir
         .join("sessions")
         .join(session_id.to_string())
@@ -87,7 +87,7 @@ async fn automatic_submit_rejects_runtime_overlimit_without_startup_summary() {
 
 #[tokio::test]
 async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
-    let (data_dir, _guard) = fixture_dir(&format!("append-only-steer-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("append-only-steer");
     let content = "ordinary result ".repeat(900);
     let (workspace, _workspace_guard) =
         workspace_file("append-only-steer-ws", "a.txt", content.as_bytes());
@@ -102,12 +102,11 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_auto(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .auto()
+        .open()
+        .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read then steer").await;
     gate.wait_started().await;
@@ -180,7 +179,7 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
 #[tokio::test]
 async fn disabled_auto_keeps_over_runtime_history_rejected() {
     let (data_dir, _guard, session_id, model, mut agent) =
-        auto_history_fixture(&format!("auto-disabled-{}", next_id()), false).await;
+        auto_history_fixture("auto-disabled", false).await;
     let context = agent.session_context(session_id).unwrap();
     assert_eq!(context.budget.input_budget_tokens, None);
     assert_eq!(context.budget.trigger_tokens, None);

@@ -22,12 +22,9 @@ fn preview_write_events(source: &str, complete: bool) -> Vec<Result<ModelEvent, 
 async fn tool_argument_preview_cancel_leaves_existing_and_new_files_untouched() {
     use crate::ToolArgumentsPreviewState;
     for (name, existing) in [("existing.txt", true), ("new.txt", false)] {
-        let (data_dir, _data_guard) = fixture_dir(&format!("preview-cancel-data-{}", next_id()));
-        let (workspace, _workspace_guard) = workspace_file(
-            &format!("preview-cancel-ws-{}", next_id()),
-            "existing.txt",
-            b"original bytes\n",
-        );
+        let (data_dir, _data_guard) = fixture_dir("preview-cancel-data");
+        let (workspace, _workspace_guard) =
+            workspace_file("preview-cancel-ws", "existing.txt", b"original bytes\n");
         let path = workspace.join(name);
         let before = std::fs::metadata(&path)
             .ok()
@@ -46,12 +43,11 @@ async fn tool_argument_preview_cancel_leaves_existing_and_new_files_untouched() 
             tools: vec!["write".to_owned()],
             ..read_profile()
         };
-        let mut agent = open_agent(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), model)]),
-            profile,
-        )
-        .await;
+        let mut agent = AgentFixture::at(&data_dir)
+            .models(BTreeMap::from([("main".to_owned(), model)]))
+            .profile(profile)
+            .open()
+            .await;
         let mut events = agent.take_events().unwrap();
         let info = create_session(&mut agent, &workspace).await;
         let turn = send_text(
@@ -127,12 +123,9 @@ async fn tool_argument_preview_assembler_rejection_and_post_finish_event_never_e
             true,
         ),
     ] {
-        let (data_dir, _data_guard) = fixture_dir(&format!("preview-reject-data-{}", next_id()));
-        let (workspace, _workspace_guard) = workspace_file(
-            &format!("preview-reject-ws-{}", next_id()),
-            "target.txt",
-            b"original",
-        );
+        let (data_dir, _data_guard) = fixture_dir("preview-reject-data");
+        let (workspace, _workspace_guard) =
+            workspace_file("preview-reject-ws", "target.txt", b"original");
         let path = workspace.join("target.txt");
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         let mut raw = preview_write_events(source, true);
@@ -143,15 +136,14 @@ async fn tool_argument_preview_assembler_rejection_and_post_finish_event_never_e
         }
         let model = ScriptedModel::new("main", [Step::PreviewEvents(raw, None)])
             .with_pacing(std::time::Duration::from_millis(2));
-        let mut agent = open_agent(
-            &data_dir,
-            BTreeMap::from([("main".to_owned(), model)]),
-            Profile {
+        let mut agent = AgentFixture::at(&data_dir)
+            .models(BTreeMap::from([("main".to_owned(), model)]))
+            .profile(Profile {
                 tools: vec!["write".to_owned()],
                 ..read_profile()
-            },
-        )
-        .await;
+            })
+            .open()
+            .await;
         let mut events = agent.take_events().unwrap();
         let info = create_session(&mut agent, &workspace).await;
         let turn = send_text(&mut agent, info.session_id, "synthetic malformed stream").await;
@@ -191,12 +183,9 @@ async fn tool_argument_preview_assembler_rejection_and_post_finish_event_never_e
 #[tokio::test]
 async fn tool_argument_preview_normal_completion_is_followed_by_authoritative_invocation() {
     use crate::ToolArgumentsPreviewState;
-    let (data_dir, _data_guard) = fixture_dir(&format!("preview-upgrade-data-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file(
-        &format!("preview-upgrade-ws-{}", next_id()),
-        "target.txt",
-        b"original",
-    );
+    let (data_dir, _data_guard) = fixture_dir("preview-upgrade-data");
+    let (workspace, _workspace_guard) =
+        workspace_file("preview-upgrade-ws", "target.txt", b"original");
     let source = r#"{"path":"target.txt","content":"new content\n"}"#;
     let model = ScriptedModel::new(
         "main",
@@ -206,23 +195,19 @@ async fn tool_argument_preview_normal_completion_is_followed_by_authoritative_in
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        Profile {
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .profile(Profile {
             tools: vec!["write".to_owned()],
             ..read_profile()
-        },
-    )
-    .await;
+        })
+        .open()
+        .await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "synthetic complete write").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     let mut generated = false;
     let mut invoked = false;
     loop {
@@ -263,12 +248,9 @@ async fn tool_argument_preview_normal_completion_is_followed_by_authoritative_in
 #[tokio::test]
 async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
     use crate::ToolArgumentsPreviewState;
-    let (data_dir, _data_guard) = fixture_dir(&format!("preview-deadline-data-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file(
-        &format!("preview-deadline-ws-{}", next_id()),
-        "target.txt",
-        b"unchanged",
-    );
+    let (data_dir, _data_guard) = fixture_dir("preview-deadline-data");
+    let (workspace, _workspace_guard) =
+        workspace_file("preview-deadline-ws", "target.txt", b"unchanged");
     let gate = Arc::new(Gate::new());
     let model = ScriptedModel::new(
         "main",

@@ -2,8 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn history_view_exposes_whitelisted_tool_detail_without_raw_arguments() {
-    let (data_dir, _guard) = fixture_dir(&format!("view-{}", next_id()));
-    let (workspace, _guard) = workspace_file("view-ws", "file.txt", b"contents");
+    let fixture = AgentFixture::new("view").file("file.txt", b"contents");
     let model = ScriptedModel::new(
         "main",
         [
@@ -12,23 +11,12 @@ async fn history_view_exposes_whitelisted_tool_detail_without_raw_arguments() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
     wait_text(&agent, turn).await;
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     let serialized = serde_json::to_string(&page).unwrap();
     // A path is an explicitly permitted local-display detail; the raw
     // invocation object and unrelated argument keys are not.
@@ -43,16 +31,14 @@ async fn history_view_exposes_whitelisted_tool_detail_without_raw_arguments() {
 
 #[tokio::test]
 async fn two_sessions_write_independently() {
-    let (data_dir, _guard) = fixture_dir(&format!("multi-session-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("multi-session");
     let (workspace_a, _ga) = workspace_file("multi-session-a", "a.txt", b"a");
     let model = ScriptedModel::new("main", [Step::Text("a1"), Step::Text("a2")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .open()
+        .await;
     let session_x = create_session(&mut agent, &workspace_a).await;
     let (workspace_b, _gb) = workspace_file("multi-session-b", "b.txt", b"b");
     let session_y = create_session(&mut agent, &workspace_b).await;
@@ -61,40 +47,23 @@ async fn two_sessions_write_independently() {
     let turn_y = send_text(&mut agent, session_y.session_id, "y").await;
     let rx = wait_text(&agent, turn_x).await;
     let ry = wait_text(&agent, turn_y).await;
-    assert_eq!(rx.persistence, crate::sessions::TurnPersistence::Persisted);
-    assert_eq!(ry.persistence, crate::sessions::TurnPersistence::Persisted);
-    let hx = agent
-        .history(GetHistory {
-            session_id: session_x.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
-    let hy = agent
-        .history(GetHistory {
-            session_id: session_y.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    assert_persisted(&rx);
+    assert_persisted(&ry);
+    let hx = history_page(&agent, session_x.session_id, 100);
+    let hy = history_page(&agent, session_y.session_id, 100);
     assert_eq!(hx.total, 2);
     assert_eq!(hy.total, 2);
 }
 
 #[tokio::test]
 async fn send_is_rejected_for_unloaded_session() {
-    let (data_dir, _guard) = fixture_dir(&format!("unloaded-{}", next_id()));
-    let (workspace, _guard) = workspace_file("unloaded-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
+    let fixture = AgentFixture::new("unloaded")
+        .file("a.txt", b"hello")
+        .models(BTreeMap::from([(
             "main".to_owned(),
             ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        )]));
+    let (mut agent, info) = fixture.start().await;
     agent.close_session(info.session_id).await.unwrap();
 
     let error = agent
@@ -108,18 +77,13 @@ async fn send_is_rejected_for_unloaded_session() {
 
 #[tokio::test]
 async fn delete_rejects_loaded_session_and_removes_unloaded() {
-    let (data_dir, _guard) = fixture_dir(&format!("delete-{}", next_id()));
-    let (workspace, _guard) = workspace_file("delete-ws", "a.txt", b"hello");
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([(
+    let fixture = AgentFixture::new("delete")
+        .file("a.txt", b"hello")
+        .models(BTreeMap::from([(
             "main".to_owned(),
             ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
-        )]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+        )]));
+    let (mut agent, info) = fixture.start().await;
     assert!(matches!(
         agent.delete_session(info.session_id).await,
         Err(AgentError::SessionAlreadyLoaded)
@@ -131,42 +95,28 @@ async fn delete_rejects_loaded_session_and_removes_unloaded() {
 
 #[tokio::test]
 async fn persisted_history_after_failed_loop_is_still_durable() {
-    let (data_dir, _guard) = fixture_dir(&format!("failed-{}", next_id()));
-    let (workspace, _guard) = workspace_file("failed-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("failed").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let gate = Arc::new(Gate::new());
-    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "partial")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+
+    let fixture = fixture.script([Step::gated_text(gate.clone(), "partial")]);
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     gate.wait_started().await;
     gate.release();
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let stored = read_store_history(&data_dir, info.session_id).await;
     assert!(!stored.is_empty());
 }
 
 #[tokio::test]
 async fn event_stream_delivers_lifecycle_events() {
-    let (data_dir, _guard) = fixture_dir(&format!("events-{}", next_id()));
-    let (workspace, _guard) = workspace_file("events-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("final")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = AgentFixture::new("events").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture.script([Step::Text("final")]);
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "hello").await;
@@ -210,10 +160,7 @@ async fn event_stream_delivers_lifecycle_events() {
     });
 
     let result = agent.wait_turn(turn).await.unwrap();
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
     let (seen_turn_started, seen_request_started, seen_output, seen_finished) =
         drain.await.unwrap();
     assert!(seen_turn_started);
@@ -224,20 +171,14 @@ async fn event_stream_delivers_lifecycle_events() {
 
 #[tokio::test]
 async fn join_first_drains_queued_finished_without_duplicate_agent_completion() {
-    let (data_dir, _guard) = fixture_dir(&format!("join-first-{}", next_id()));
-    let (workspace, _guard) = workspace_file("join-first-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("done")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_with(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-        AgentOptions {
-            agent_event_capacity: 256,
-            loop_event_capacity: Some(32),
-        },
-    )
-    .await;
+    let fixture = AgentFixture::new("join-first").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture.script([Step::Text("done")]).options(AgentOptions {
+        agent_event_capacity: 256,
+        loop_event_capacity: Some(32),
+    });
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let gate = Arc::new(Gate::new());
@@ -245,19 +186,16 @@ async fn join_first_drains_queued_finished_without_duplicate_agent_completion() 
     let turn = send_text(&mut agent, info.session_id, "join first").await;
 
     gate.wait_started().await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if agent
+    wait_until(
+        std::time::Duration::from_secs(1),
+        "runtime must finish while the Agent worker is paused",
+        || {
+            agent
                 .runtime_loop_finished_for_test(info.session_id)
                 .unwrap()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("runtime must finish while the Agent worker is paused");
+        },
+    )
+    .await;
 
     let drain = tokio::spawn(async move {
         let mut turn_finished = 0;
@@ -274,26 +212,19 @@ async fn join_first_drains_queued_finished_without_duplicate_agent_completion() 
         .await
         .expect("join-first drain must not wait for channel closure")
         .unwrap();
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     agent.shutdown().await.unwrap();
     assert_eq!(drain.await.unwrap(), 1);
 }
 
 #[tokio::test]
 async fn queued_finished_drops_are_accounted_without_runtime_completion_mapping() {
-    let (data_dir, _guard) = fixture_dir(&format!("finished-drops-{}", next_id()));
-    let (workspace, _guard) = workspace_file("finished-drops-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("finished-drops").file("a.txt", b"hello");
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new("main", [Step::Text("unused")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let _ = events.recv().await;
@@ -339,8 +270,9 @@ async fn queued_finished_drops_are_accounted_without_runtime_completion_mapping(
 
 #[tokio::test]
 async fn loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritative() {
-    let (data_dir, _guard) = fixture_dir(&format!("loop-drops-{}", next_id()));
-    let (workspace, _guard) = workspace_file("loop-drops-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("loop-drops").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     // A back-to-back delta burst saturates the runtime's best-effort loop
     // event channel (capacity 1) during the runner's synchronous tail, so the
     // runtime deterministically drops events and reports them on the next
@@ -353,16 +285,13 @@ async fn loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritati
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_with(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-        AgentOptions {
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), model)]))
+        .options(AgentOptions {
             agent_event_capacity: 256,
             loop_event_capacity: Some(1),
-        },
-    )
-    .await;
+        });
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "burst").await;
@@ -390,14 +319,8 @@ async fn loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritati
     });
 
     let result = agent.wait_turn(turn).await.unwrap();
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_persisted(&result);
+    assert_completed(&result);
     // The rejected loop events are accounted for on a delivered Agent event
     // (here the tool round's `tool_finished`) instead of vanishing silently.
     let (saw_drops, _saw_tool_finished) = drain.await.unwrap();
@@ -412,38 +335,26 @@ async fn loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritati
 
 #[tokio::test]
 async fn full_agent_event_channel_keeps_wait_and_history_authoritative() {
-    let (data_dir, _guard) = fixture_dir(&format!("full-channel-{}", next_id()));
-    let (workspace, _guard) = workspace_file("full-channel-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent_with(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-        AgentOptions {
+    let fixture = AgentFixture::new("full-channel").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
+
+    let fixture = fixture
+        .script([Step::Text("one"), Step::Text("two")])
+        .options(AgentOptions {
             agent_event_capacity: 1,
             loop_event_capacity: None,
-        },
-    )
-    .await;
+        });
+    let mut agent = fixture.open().await;
     // Never read the event stream: the Agent event channel stays full and
     // best-effort events (including a dropped TurnFinished) must not block or
     // disturb the authoritative result.
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "first").await;
     let result = agent.wait_turn(turn).await.unwrap();
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     assert_eq!(page.total, 2);
     let stored = read_store_history(&data_dir, info.session_id).await;
     assert_eq!(stored.len(), 2);
@@ -451,40 +362,22 @@ async fn full_agent_event_channel_keeps_wait_and_history_authoritative() {
 
 #[tokio::test]
 async fn immediate_send_after_completion_does_not_report_busy() {
-    let (data_dir, _guard) = fixture_dir(&format!("reopen-race-{}", next_id()));
-    let (workspace, _guard) = workspace_file("reopen-race-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("reopen-race").file("a.txt", b"hello");
     let model = ScriptedModel::new(
         "main",
         [Step::Text("one"), Step::Text("two"), Step::Text("three")],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
     // Once a turn's agent-level completion is published, an immediate next
     // send must never observe a SessionBusy window.
     for expected in ["one", "two", "three"] {
         let turn = send_text(&mut agent, info.session_id, expected).await;
         let result = agent.wait_turn(turn).await.unwrap();
-        assert_eq!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
-        );
-        assert_eq!(
-            result.persistence,
-            crate::sessions::TurnPersistence::Persisted
-        );
+        assert_completed(&result);
+        assert_persisted(&result);
     }
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     assert_eq!(page.total, 6);
 }

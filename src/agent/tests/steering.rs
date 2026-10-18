@@ -2,18 +2,12 @@ use super::*;
 
 #[tokio::test]
 async fn steer_is_applied_and_persisted_in_order() {
-    let (data_dir, _guard) = fixture_dir(&format!("steer-{}", next_id()));
-    let (workspace, _guard) = workspace_file("steer-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("steer").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let gate = Arc::new(Gate::new());
-    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "final")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+
+    let fixture = fixture.script([Step::gated_text(gate.clone(), "final")]);
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "main prompt").await;
 
     agent
@@ -32,10 +26,7 @@ async fn steer_is_applied_and_persisted_in_order() {
     gate.release();
 
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
     let stored = read_store_history(&data_dir, info.session_id).await;
     let kinds = stored
@@ -54,13 +45,7 @@ async fn steer_is_applied_and_persisted_in_order() {
         ]
     );
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     let timestamps = page
         .items
         .iter()
@@ -106,17 +91,10 @@ async fn steer_is_applied_and_persisted_in_order() {
 
 #[tokio::test]
 async fn stale_turn_ref_is_rejected() {
-    let (data_dir, _guard) = fixture_dir(&format!("stale-{}", next_id()));
-    let (workspace, _guard) = workspace_file("stale-ws", "a.txt", b"hello");
-    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
-        .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = AgentFixture::new("stale")
+        .file("a.txt", b"hello")
+        .script([Step::Text("one"), Step::Text("two")]);
+    let (mut agent, info) = fixture.start().await;
     let first = send_text(&mut agent, info.session_id, "one").await;
     wait_text(&agent, first).await;
     let second = send_text(&mut agent, info.session_id, "two").await;

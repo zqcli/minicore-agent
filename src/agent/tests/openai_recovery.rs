@@ -182,10 +182,7 @@ async fn run_openai_overflow_loopback(preflight: bool) {
     let turn = send_text(&mut agent, info.session_id, "read file").await;
     let result = wait_text(&agent, turn).await;
     if preflight {
-        assert_eq!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
-        );
+        assert_completed(&result);
         assert!(
             agent
                 .session_context(info.session_id)
@@ -216,10 +213,7 @@ async fn run_openai_overflow_loopback(preflight: bool) {
         assert!(serde_json::to_vec(&body).unwrap().len().div_ceil(4) > 16_384);
         return;
     }
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
 
     let history = read_store_history(&data_dir, info.session_id).await;
     let texts = flatten_texts(&history);

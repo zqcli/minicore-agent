@@ -30,18 +30,24 @@ use display::display_read;
 use summary::flatten_texts;
 use tool_data::history_tool_refs;
 use tool_data::read_tool;
+#[cfg(unix)]
 use tool_data::wait_tool_stream_bytes;
+#[cfg(unix)]
 use workers::process_is_listed;
 
 mod core;
+mod wait;
+use wait::wait_until;
 
 use super::{ReloadResult, SteerMessage};
 use crate::test_support::model::supported_reasoning;
-use crate::test_support::{Gate, ScriptedModel, Step};
+use crate::test_support::{Gate, ScriptedModel, Step, TempDir};
+mod fixture;
+use fixture::AgentFixture;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use serde_json::json;
@@ -84,21 +90,9 @@ use super::{
 
 use crate::openai_mock::{CapturedRequest, MockResponse, MockServer};
 
-struct TestDirectoryGuard {
-    path: PathBuf,
-}
-
-impl Drop for TestDirectoryGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-fn fixture_dir(label: &str) -> (PathBuf, TestDirectoryGuard) {
-    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
-    let path = temp.join(format!("minicore-agent-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    (path.clone(), TestDirectoryGuard { path })
+fn fixture_dir(label: &str) -> (PathBuf, TempDir) {
+    let directory = TempDir::new(label);
+    (directory.path().to_path_buf(), directory)
 }
 
 fn toml_path(path: &Path) -> String {
@@ -201,97 +195,10 @@ fn model_config_with_timeout(api_key_env: &str, seconds: u64) -> ModelConfig {
     config
 }
 
-async fn open_agent(
-    data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
-    profile: Profile,
-) -> Agent {
-    let mut models_config = BTreeMap::new();
-    for id in fake_models.keys() {
-        models_config.insert(id.clone(), model_config("MINICORE_AGENT_TEST_KEY"));
-    }
-    open_agent_with_configs(data_dir, fake_models, models_config, profile).await
-}
-
-async fn open_agent_with_configs(
-    data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
-    models_config: BTreeMap<String, ModelConfig>,
-    profile: Profile,
-) -> Agent {
-    let models = fake_models
-        .iter()
-        .map(|(id, model)| (id.clone(), Arc::clone(model) as Arc<dyn Model>))
-        .collect::<BTreeMap<_, _>>();
-    let config = config(data_dir.to_path_buf(), models_config, profile);
-    Agent::open_with_models(config, Models::from_values(models))
-        .await
-        .unwrap()
-}
-
 #[derive(Clone, Copy, Default)]
 struct AgentOptions {
     agent_event_capacity: usize,
     loop_event_capacity: Option<usize>,
-}
-
-async fn open_agent_with(
-    data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
-    profile: Profile,
-    options: AgentOptions,
-) -> Agent {
-    let models = fake_models
-        .iter()
-        .map(|(id, model)| (id.clone(), Arc::clone(model) as Arc<dyn Model>))
-        .collect::<BTreeMap<_, _>>();
-    let mut models_config = BTreeMap::new();
-    for id in fake_models.keys() {
-        models_config.insert(id.clone(), model_config("MINICORE_AGENT_TEST_KEY"));
-    }
-    let mut config = config(data_dir.to_path_buf(), models_config, profile);
-    config.event_capacity = options.agent_event_capacity;
-    config.loop_options.event_capacity = options.loop_event_capacity;
-    Agent::open_with_models(config, Models::from_values(models))
-        .await
-        .unwrap()
-}
-
-async fn open_agent_auto(
-    data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
-    profile: Profile,
-) -> Agent {
-    let mut models_config = BTreeMap::new();
-    for id in fake_models.keys() {
-        models_config.insert(id.clone(), model_config("MINICORE_AGENT_TEST_KEY"));
-    }
-    open_agent_auto_with_configs(data_dir, fake_models, models_config, profile).await
-}
-
-async fn open_agent_auto_with_configs(
-    data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
-    models_config: BTreeMap<String, ModelConfig>,
-    profile: Profile,
-) -> Agent {
-    let models = fake_models
-        .iter()
-        .map(|(id, model)| (id.clone(), Arc::clone(model) as Arc<dyn Model>))
-        .collect::<BTreeMap<_, _>>();
-    let use_model_specific_timeouts = models_config
-        .values()
-        .any(|model| model.request_timeout().is_some());
-    let mut config = auto_config(data_dir.to_path_buf(), models_config, profile);
-    // Keep the global model timeout below the per-model provider timeouts so
-    // the candidate model remains observable in derived prompt options.
-    if use_model_specific_timeouts {
-        config.loop_options.prompt_timeout_seconds = Some(1);
-        config.loop_options.model_timeout_seconds = Some(5);
-    }
-    Agent::open_with_models(config, Models::from_values(models))
-        .await
-        .unwrap()
 }
 
 fn synthetic_loop_record(
@@ -438,7 +345,7 @@ fn synthetic_summary_json(
 async fn synthetic_summary_session(
     label: &str,
     tool_suffix: bool,
-) -> (PathBuf, TestDirectoryGuard, SessionId, PathBuf, Vec<u8>) {
+) -> (PathBuf, TempDir, SessionId, PathBuf, Vec<u8>) {
     let (data_dir, data_guard) = fixture_dir(label);
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -535,7 +442,7 @@ async fn install_valid_summary(data_dir: &Path, session_id: SessionId) {
 }
 
 async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary: bool) {
-    let (data_dir, _data_guard) = fixture_dir(&format!("summary-runtime-limit-{}", next_id()));
+    let (data_dir, _data_guard) = fixture_dir("summary-runtime-limit");
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let session_id = SessionId::new().unwrap();
@@ -595,12 +502,10 @@ async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary:
 
     let model = ScriptedModel::new("main", [Step::Text("started")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     agent.open_session(session_id).await.unwrap();
     let context = agent.session_context(session_id).unwrap();
     assert_eq!(context.budget.estimated_request_context_tokens, None);
@@ -643,13 +548,7 @@ async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary:
 async fn auto_history_fixture(
     label: &str,
     enabled: bool,
-) -> (
-    PathBuf,
-    TestDirectoryGuard,
-    SessionId,
-    Arc<ScriptedModel>,
-    Agent,
-) {
+) -> (PathBuf, TempDir, SessionId, Arc<ScriptedModel>, Agent) {
     let loop_id = LoopId::new().unwrap();
     let items = (0..4_097)
         .map(|_| {
@@ -678,13 +577,7 @@ async fn auto_admission_fixture(
     scripts: impl IntoIterator<Item = Step>,
     prompt_timeout_seconds: Option<u64>,
     model_timeout_seconds: Option<u64>,
-) -> (
-    PathBuf,
-    TestDirectoryGuard,
-    SessionId,
-    Arc<ScriptedModel>,
-    Agent,
-) {
+) -> (PathBuf, TempDir, SessionId, Arc<ScriptedModel>, Agent) {
     auto_admission_fixture_with_window(
         label,
         enabled,
@@ -705,13 +598,7 @@ async fn auto_admission_fixture_with_window(
     scripts: impl IntoIterator<Item = Step>,
     prompt_timeout_seconds: Option<u64>,
     model_timeout_seconds: Option<u64>,
-) -> (
-    PathBuf,
-    TestDirectoryGuard,
-    SessionId,
-    Arc<ScriptedModel>,
-    Agent,
-) {
+) -> (PathBuf, TempDir, SessionId, Arc<ScriptedModel>, Agent) {
     let (data_dir, guard) = fixture_dir(label);
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -819,8 +706,8 @@ async fn auto_admission_fixture_with_window(
     (data_dir, guard, session_id, model, agent)
 }
 
-fn workspace_file(label: &str, file: &str, content: &[u8]) -> (PathBuf, TestDirectoryGuard) {
-    let (base, _) = fixture_dir(label);
+fn workspace_file(label: &str, file: &str, content: &[u8]) -> (PathBuf, TempDir) {
+    let (base, directory) = fixture_dir(label);
     let root = base.join("workspace");
     std::fs::create_dir_all(&root).unwrap();
     if let Some(parent) = Path::new(file).parent() {
@@ -829,7 +716,7 @@ fn workspace_file(label: &str, file: &str, content: &[u8]) -> (PathBuf, TestDire
         }
     }
     std::fs::write(root.join(file), content).unwrap();
-    (root, TestDirectoryGuard { path: base })
+    (root, directory)
 }
 
 async fn create_session(agent: &mut Agent, workspace: &Path) -> crate::agent::SessionInfo {
@@ -852,6 +739,33 @@ async fn send_text(agent: &mut Agent, session_id: crate::ids::SessionId, text: &
             text: text.to_owned(),
         })
         .await
+        .unwrap()
+}
+
+#[track_caller]
+fn assert_completed(result: &crate::sessions::TurnResult) {
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
+}
+
+#[track_caller]
+fn assert_persisted(result: &crate::sessions::TurnResult) {
+    assert_eq!(
+        result.persistence,
+        crate::sessions::TurnPersistence::Persisted
+    );
+}
+
+#[track_caller]
+fn history_page(agent: &Agent, session_id: SessionId, limit: usize) -> crate::history::HistoryPage {
+    agent
+        .history(GetHistory {
+            session_id,
+            offset: 0,
+            limit,
+        })
         .unwrap()
 }
 
@@ -896,12 +810,6 @@ async fn read_store_history(
         .unwrap()
         .history
         .to_vec()
-}
-
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-
-fn next_id() -> usize {
-    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 mod recent_tail;

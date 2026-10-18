@@ -2,9 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
-    let (data_dir, _data_guard) = fixture_dir(&format!("legacy-rounds-{}", next_id()));
-    let (workspace, _workspace_guard) =
-        workspace_file("legacy-rounds-ws", "file.txt", b"file contents");
+    let fixture = AgentFixture::new("legacy-rounds").file("file.txt", b"file contents");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let session_id = SessionId::new().unwrap();
     let record = SessionRecord {
         format_version: SESSION_FORMAT_VERSION,
@@ -40,24 +40,19 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
     scripts.push(Step::Text("completed after forty tool rounds"));
     let model =
         ScriptedModel::new("main", scripts).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        Profile {
+    let fixture = fixture
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .profile(Profile {
             max_tool_rounds: 32,
             ..read_profile()
-        },
-    )
-    .await;
+        });
+    let mut agent = fixture.open().await;
     agent.open_session(session_id).await.unwrap();
     assert_eq!(session_options(&agent, session_id).max_tool_rounds, 0);
 
     let turn = send_text(&mut agent, session_id, "read forty times then finish").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(result.report.tool_rounds, 40);
     assert_eq!(result.report.requests, 41);
     assert_eq!(model.requests().lock().unwrap().len(), 41);
@@ -80,8 +75,8 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
 
 #[tokio::test]
 async fn tool_loop_runs_read_and_persists_one_loop_record() {
-    let (data_dir, _guard) = fixture_dir(&format!("tool-{}", next_id()));
-    let (workspace, _guard) = workspace_file("tool-ws", "file.txt", b"file contents");
+    let fixture = AgentFixture::new("tool").file("file.txt", b"file contents");
+    let data_dir = fixture.data_dir.clone();
     let model = ScriptedModel::new(
         "main",
         [
@@ -90,20 +85,12 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
 
     let turn = send_text(&mut agent, info.session_id, "read the file").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_completed(&result);
     assert_eq!(result.report.requests, 2);
     assert_eq!(result.report.tool_rounds, 1);
 
@@ -124,13 +111,7 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
         vec![(ToolResultOutcome::Success, "1: file contents".to_owned())]
     );
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     let crate::history::HistoryItemView::Assistant(assistant) = &page.items[1].item else {
         panic!("expected the first assistant history item");
     };
@@ -145,8 +126,8 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
 
 #[tokio::test]
 async fn live_tool_presentation_and_result_keep_runtime_identity() {
-    let (data_dir, _guard) = fixture_dir(&format!("presentation-live-{}", next_id()));
-    let (workspace, _guard) = workspace_file("presentation-live-ws", "file.txt", b"file contents");
+    let fixture = AgentFixture::new("presentation-live").file("file.txt", b"file contents");
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new(
         "main",
         [
@@ -155,28 +136,23 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
     let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.persistence,
-        crate::sessions::TurnPersistence::Persisted
-    );
+    assert_persisted(&result);
 
     let mut presentation = None;
     let mut tool_result = None;
     for _ in 0..32 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("live Agent event must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(
+                std::time::Duration::from_secs(1),
+                "live Agent event must arrive",
+            )
+            .await;
         match event {
             AgentEvent::ToolPresentation {
                 turn: event_turn,
@@ -214,9 +190,8 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
 
 #[tokio::test]
 async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
-    let (data_dir, _guard) = fixture_dir(&format!("presentation-failed-{}", next_id()));
-    let (workspace, _guard) =
-        workspace_file("presentation-failed-ws", "file.txt", b"file contents");
+    let fixture = AgentFixture::new("presentation-failed").file("file.txt", b"file contents");
+    let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new(
         "main",
         [
@@ -225,28 +200,23 @@ async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read the missing file").await;
     wait_text(&agent, turn).await;
 
-    let mut finished = None;
-    while let Some(event) = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-        .await
-        .expect("failed tool events must arrive")
-    {
-        if let AgentEvent::ToolFinished { result, .. } = event {
-            finished = Some(result);
-            break;
-        }
-    }
-    let result = finished.expect("failed tool must emit ToolFinished");
+    let result = events
+        .expect(
+            std::time::Duration::from_secs(1),
+            "failed tool must emit ToolFinished",
+            |event| match event {
+                AgentEvent::ToolFinished { result, .. } => Some(result),
+                _ => None,
+            },
+        )
+        .await;
     assert_eq!(result.outcome, ToolResultOutcome::Failed);
     assert_eq!(result.content.as_deref(), Some("tool execution failed"));
     assert!(
@@ -257,13 +227,7 @@ async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
             .contains("missing-secret.txt")
     );
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     let tool_result = page
         .items
         .iter()
@@ -280,8 +244,7 @@ async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
 #[tokio::test]
 async fn reported_context_tracks_last_request_reopen_compaction_and_model_change() {
     use crate::presentation::ContextKind;
-    let (data_dir, _guard) = fixture_dir(&format!("reported-context-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("reported-context-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("reported-context").file("a.txt", b"hello");
     let model = ScriptedModel::with_window(
         "provider/main",
         40_000,
@@ -293,20 +256,15 @@ async fn reported_context_tracks_last_request_reopen_compaction_and_model_change
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([
-            ("main".to_owned(), model),
-            (
-                "other".to_owned(),
-                ScriptedModel::new("provider/other", [])
-                    .with_pacing(std::time::Duration::from_millis(2)),
-            ),
-        ]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([
+        ("main".to_owned(), model),
+        (
+            "other".to_owned(),
+            ScriptedModel::new("provider/other", [])
+                .with_pacing(std::time::Duration::from_millis(2)),
+        ),
+    ]));
+    let (mut agent, info) = fixture.start().await;
     let context = |agent: &Agent| agent.session_presentation(info.session_id).unwrap().context;
     assert_eq!(context(&agent).kind, ContextKind::Unknown);
     let turn = send_text(&mut agent, info.session_id, &"history ".repeat(256)).await;
@@ -373,7 +331,7 @@ async fn reported_context_tracks_last_request_reopen_compaction_and_model_change
 
 #[tokio::test]
 async fn request_usage_events_carry_real_per_request_usage_across_two_sessions() {
-    let (data_dir, _guard) = fixture_dir(&format!("usage-two-sessions-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("usage-two-sessions");
     let (workspace_a, _guard_a) = workspace_file("usage-session-a", "a.txt", b"a");
     let (workspace_b, _guard_b) = workspace_file("usage-session-b", "b.txt", b"b");
     let model = ScriptedModel::new(
@@ -384,12 +342,10 @@ async fn request_usage_events_carry_real_per_request_usage_across_two_sessions()
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     let mut events = agent.take_events().unwrap();
     let session_a = create_session(&mut agent, &workspace_a).await;
     let session_b = create_session(&mut agent, &workspace_b).await;
@@ -400,10 +356,12 @@ async fn request_usage_events_carry_real_per_request_usage_across_two_sessions()
 
     let mut seen = Vec::new();
     while seen.len() < 2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("request_usage event must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(
+                std::time::Duration::from_secs(1),
+                "request_usage event must arrive",
+            )
+            .await;
         if let AgentEvent::RequestUsage {
             turn,
             request_index,
@@ -431,8 +389,8 @@ async fn request_usage_events_carry_real_per_request_usage_across_two_sessions()
 
 #[tokio::test]
 async fn request_usage_is_keyed_per_request_index_within_one_loop() {
-    let (data_dir, _guard) = fixture_dir(&format!("usage-requests-{}", next_id()));
-    let (workspace, _guard) = workspace_file("usage-requests-ws", "a.txt", b"file contents");
+    let fixture = AgentFixture::new("usage-requests").file("a.txt", b"file contents");
+    let workspace = fixture.workspace.clone();
     // Request 0 finishes with a tool call (its Usage is (1,1,0)); the tool
     // runs; request 1 reports a distinct usage (5,6,0). Both must surface as
     // separate RequestUsage events under the same loop with distinct indexes.
@@ -444,12 +402,8 @@ async fn request_usage_is_keyed_per_request_index_within_one_loop() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
@@ -457,10 +411,12 @@ async fn request_usage_is_keyed_per_request_index_within_one_loop() {
 
     let mut by_index = std::collections::BTreeMap::new();
     while by_index.len() < 2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("request_usage event must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(
+                std::time::Duration::from_secs(1),
+                "request_usage event must arrive",
+            )
+            .await;
         if let AgentEvent::RequestUsage {
             turn: event_turn,
             request_index,
@@ -479,7 +435,7 @@ async fn request_usage_is_keyed_per_request_index_within_one_loop() {
 
 #[tokio::test]
 async fn shared_model_keeps_live_presentation_identity_per_session() {
-    let (data_dir, _guard) = fixture_dir(&format!("presentation-sessions-{}", next_id()));
+    let (data_dir, _guard) = fixture_dir("presentation-sessions");
     let (workspace_a, _guard_a) = workspace_file("presentation-session-a", "a.txt", b"a");
     let (workspace_b, _guard_b) = workspace_file("presentation-session-b", "b.txt", b"b");
     let model = ScriptedModel::new(
@@ -492,12 +448,10 @@ async fn shared_model_keeps_live_presentation_identity_per_session() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let mut agent = AgentFixture::at(&data_dir)
+        .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
+        .open()
+        .await;
     let mut events = agent.take_events().unwrap();
     let session_a = create_session(&mut agent, &workspace_a).await;
     let session_b = create_session(&mut agent, &workspace_b).await;
@@ -508,10 +462,12 @@ async fn shared_model_keeps_live_presentation_identity_per_session() {
 
     let mut presentations = Vec::new();
     while presentations.len() < 2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("presentation event must arrive")
-            .expect("event stream must remain open");
+        let event = events
+            .next_event(
+                std::time::Duration::from_secs(1),
+                "presentation event must arrive",
+            )
+            .await;
         if let AgentEvent::ToolPresentation {
             turn,
             request_index,
@@ -536,8 +492,8 @@ async fn shared_model_keeps_live_presentation_identity_per_session() {
 
 #[tokio::test]
 async fn project_prompt_reloads_agents_between_requests_in_one_loop() {
-    let (data_dir, _guard) = fixture_dir(&format!("dynamic-agents-{}", next_id()));
-    let (workspace, _guard) = workspace_file("dynamic-agents-ws", "AGENTS.md", b"before\n");
+    let fixture = AgentFixture::new("dynamic-agents").file("AGENTS.md", b"before\n");
+    let workspace = fixture.workspace.clone();
     std::fs::write(workspace.join("a.txt"), b"file contents").unwrap();
     let gate = Arc::new(Gate::new());
     let model = ScriptedModel::new(
@@ -548,13 +504,8 @@ async fn project_prompt_reloads_agents_between_requests_in_one_loop() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
 
     gate.wait_started().await;
@@ -586,41 +537,26 @@ async fn project_prompt_reloads_agents_between_requests_in_one_loop() {
 
 #[tokio::test]
 async fn multi_turn_creates_new_loop_each_time_and_history_grows() {
-    let (data_dir, _guard) = fixture_dir(&format!("multi-{}", next_id()));
-    let (workspace, _guard) = workspace_file("multi-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("multi").file("a.txt", b"hello");
     let model = ScriptedModel::new(
         "main",
         [Step::Text("one"), Step::Text("two"), Step::Text("three")],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), model)]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), model)]));
+    let (mut agent, info) = fixture.start().await;
 
     let mut loop_ids = Vec::new();
     for text in ["one", "two", "three"] {
         let turn = send_text(&mut agent, info.session_id, text).await;
         loop_ids.push(turn.loop_id);
         let result = wait_text(&agent, turn).await;
-        assert_eq!(
-            result.persistence,
-            crate::sessions::TurnPersistence::Persisted
-        );
+        assert_persisted(&result);
     }
     assert_ne!(loop_ids[0], loop_ids[1]);
     assert_ne!(loop_ids[1], loop_ids[2]);
 
-    let page = agent
-        .history(GetHistory {
-            session_id: info.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+    let page = history_page(&agent, info.session_id, 100);
     // Three user prompts + three assistant texts.
     assert_eq!(page.total, 6);
     assert!(page.next_offset.is_none());

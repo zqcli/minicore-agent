@@ -8,8 +8,9 @@ use super::*;
 async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
     use crate::read::TurnResultAvailability;
 
-    let (data_dir, _data_guard) = fixture_dir(&format!("s1-public-read-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("s1-public-read-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("s1-public-read").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let session_id = SessionId::new().unwrap();
     let store = Store::open(data_dir.clone()).await.unwrap();
     let now = "2026-01-02T03:04:05.000Z".to_owned();
@@ -119,12 +120,8 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
     let history_before = std::fs::read(&history_path).unwrap();
 
     let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let mut agent = fixture.open().await;
 
     // list/read succeed without loading the removed executor.
     let listed = agent.list_sessions().await.unwrap();
@@ -205,8 +202,9 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
 /// whose history contains an old `subagent` exchange must still open and run.
 #[tokio::test]
 async fn s1_five_tool_subset_record_with_old_history_still_executes() {
-    let (data_dir, _data_guard) = fixture_dir(&format!("s1-five-subset-{}", next_id()));
-    let (workspace, _workspace_guard) = workspace_file("s1-five-subset-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("s1-five-subset").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
+    let workspace = fixture.workspace.clone();
     let session_id = SessionId::new().unwrap();
     let store = Store::open(data_dir.clone()).await.unwrap();
     let now = "2026-01-02T03:04:05.000Z".to_owned();
@@ -276,12 +274,8 @@ async fn s1_five_tool_subset_record_with_old_history_still_executes() {
 
     let model = ScriptedModel::new("main", [Step::Text("after old history")])
         .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let mut agent = fixture.open().await;
     let opened = agent.open_session(session_id).await.unwrap();
     assert!(opened.loaded);
     let turn = send_text(&mut agent, session_id, "continue").await;
@@ -295,8 +289,8 @@ async fn s1_five_tool_subset_record_with_old_history_still_executes() {
 /// dispatched child loop or a new process.
 #[tokio::test]
 async fn s1_hallucinated_subagent_is_an_unavailable_tool_not_a_dispatch() {
-    let (data_dir, _guard) = fixture_dir(&format!("s1-hallucinated-{}", next_id()));
-    let (workspace, _guard) = workspace_file("s1-hallucinated-ws", "a.txt", b"hello");
+    let fixture = AgentFixture::new("s1-hallucinated").file("a.txt", b"hello");
+    let data_dir = fixture.data_dir.clone();
     let model = ScriptedModel::new(
         "main",
         [
@@ -305,13 +299,8 @@ async fn s1_hallucinated_subagent_is_an_unavailable_tool_not_a_dispatch() {
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = open_agent(
-        &data_dir,
-        BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
-        read_profile(),
-    )
-    .await;
-    let info = create_session(&mut agent, &workspace).await;
+    let fixture = fixture.models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]));
+    let (mut agent, info) = fixture.start().await;
     let turn = send_text(&mut agent, info.session_id, "try to delegate").await;
     let result = wait_text(&agent, turn).await;
     // Runtime's existing unknown-tool handling rejects the response at
