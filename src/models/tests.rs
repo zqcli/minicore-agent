@@ -205,6 +205,7 @@ async fn in_stream_context_rejection_recovers_through_real_compaction() {
         .await
         .unwrap();
     let result = agent.wait_turn(turn).await.unwrap();
+    agent.join_turn_task_for_test(session.session_id).await;
     assert_eq!(
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed

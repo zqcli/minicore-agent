@@ -252,6 +252,7 @@ async fn emergency_settlement_failure_is_observable_and_preserves_old_projection
             minicore_runtime::LoopOutcome::Completed
         ));
         assert_persisted(&result);
+        agent.join_turn_task_for_test(info.session_id).await;
         let context = agent.session_context(info.session_id).unwrap();
         assert_eq!(context.coverage.covered_item_count, 0);
         let observation = context.recovery.unwrap();
@@ -315,6 +316,7 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
         minicore_runtime::LoopOutcome::Completed
     ));
     assert_persisted(&result);
+    agent.join_turn_task_for_test(info.session_id).await;
     let context = agent.session_context(info.session_id).unwrap();
     let recovery = context.recovery.unwrap();
     assert_eq!(recovery.outcome, "recovery_failed");

@@ -124,6 +124,18 @@ impl Session {
         task.abort();
         Ok(())
     }
+    /// `turn.wait` returns before settlement and tool-record persistence;
+    /// join the turn's owned task the way the next submit or close does.
+    pub(crate) async fn join_turn_task(&self) {
+        let task = self
+            .lock_inner()
+            .active
+            .as_ref()
+            .map(|active| active.task.clone());
+        if let Some(task) = task {
+            task.join().await.unwrap();
+        }
+    }
     pub(crate) fn runtime_loop_finished(&self) -> bool {
         let inner = self.lock_inner();
         inner

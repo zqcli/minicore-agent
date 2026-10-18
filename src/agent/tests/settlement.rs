@@ -161,6 +161,7 @@ async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_proj
         }
         let result = wait_text(&agent, turn).await;
         assert_persisted(&result);
+        agent.join_turn_task_for_test(id).await;
         if cancelled {
             assert!(matches!(
                 result.report.outcome,
@@ -347,6 +348,7 @@ async fn settled_projection_write_failures_qualify_threshold_result_without_eras
         let turn = send_text(&mut agent, id, "user survives settlement failure").await;
         let result = wait_text(&agent, turn).await;
         assert_persisted(&result);
+        agent.join_turn_task_for_test(id).await;
         assert!(matches!(
             result.report.outcome,
             minicore_runtime::LoopOutcome::Failed(_)
@@ -378,7 +380,7 @@ async fn settled_projection_write_failures_qualify_threshold_result_without_eras
 }
 
 #[tokio::test]
-async fn settled_projection_close_race_rejects_snapshot_without_losing_persisted_history() {
+async fn close_after_completion_joins_settlement_and_keeps_the_snapshot() {
     let (data, _guard, id, _model, mut agent) =
         settled_projection_fixture("wide-projection-close", 50_000, Step::Text("done")).await;
     let session = agent.loaded_session(id).unwrap().clone();
@@ -398,17 +400,16 @@ async fn settled_projection_close_race_rejects_snapshot_without_losing_persisted
         close.await.unwrap();
     }
     assert!(
-        !data
-            .join("sessions")
+        data.join("sessions")
             .join(id.to_string())
             .join("summary.json")
             .exists()
     );
     let history = read_store_history(&data, id).await;
     assert!(history.iter().any(|item| matches!(item, HistoryItem::User(user) if user.input.as_text() == "persist this user despite close race")));
-    assert_eq!(session.context().coverage.covered_item_count, 0);
+    assert!(session.context().coverage.covered_item_count > 0);
     assert_eq!(
         session.context().automatic.last.unwrap().outcome,
-        "compacted_settlement_failed"
+        "compacted"
     );
 }

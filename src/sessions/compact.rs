@@ -158,6 +158,8 @@ impl Drop for CompactionCompletionGuard {
 impl Session {
     /// In-turn threshold/emergency reductions become durable only once the entire
     /// source turn is definitely appended. No utility/model work happens here.
+    /// Close joins this bounded write instead of discarding it: completion has
+    /// already been published, so a client may close right after `turn.wait`.
     pub(super) async fn settle_emergency_projection(
         &self,
         turn: TurnRef,
@@ -219,8 +221,7 @@ impl Session {
                 deadline,
                 move || {
                     let inner = session.lock_inner();
-                    !inner.closing
-                        && Arc::ptr_eq(&inner.history, &expected)
+                    Arc::ptr_eq(&inner.history, &expected)
                         && inner
                             .active
                             .as_ref()
@@ -232,8 +233,7 @@ impl Session {
         match committed {
             SummaryCommit::Committed => {
                 let inner = self.lock_inner();
-                if inner.closing
-                    || !Arc::ptr_eq(&inner.history, &history)
+                if !Arc::ptr_eq(&inner.history, &history)
                     || inner
                         .active
                         .as_ref()

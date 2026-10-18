@@ -850,6 +850,11 @@ impl Agent {
         let session = self.session(session_id)?;
         session.abort_active_task()
     }
+    /// `turn.wait` returns before projection settlement and tool-record
+    /// persistence; this joins the turn's owned task like the next submit does.
+    pub(crate) async fn join_turn_task_for_test(&self, session_id: crate::ids::SessionId) {
+        self.session(session_id).unwrap().join_turn_task().await;
+    }
     pub(crate) fn runtime_loop_finished_for_test(
         &self,
         session_id: crate::ids::SessionId,
