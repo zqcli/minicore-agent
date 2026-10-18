@@ -5,8 +5,10 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
     let (data_dir, _guard) = fixture_dir(&format!("i2-01-{}", next_id()));
     let (workspace_a, _workspace_a_guard) = workspace_file("i2-01-a", "a.txt", b"a");
     let (workspace_b, _workspace_b_guard) = workspace_file("i2-01-b", "b.txt", b"b");
-    let model_main = FakeModel::new("main", []);
-    let model_other = FakeModel::new("other", []);
+    let model_main =
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
+    let model_other =
+        ScriptedModel::new("other", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
@@ -78,7 +80,10 @@ async fn i2_05_session_observation_resources_are_released_without_cycles() {
     let (workspace, _workspace_guard) = workspace_file("i2-05-ws", "a.txt", b"a");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -102,7 +107,10 @@ async fn embedded_open_without_a_file_source_cannot_reload() {
     let (workspace, _guard) = workspace_file("reload-no-source-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -118,9 +126,11 @@ async fn embedded_open_without_a_file_source_cannot_reload() {
 async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-active-{}", next_id()));
     let (workspace, _guard) = workspace_file("reload-active-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model_a = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "old")]);
-    let model_b = FakeModel::new("main", [ModelScript::Text("new")]);
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "old")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("main", [Step::Text("new")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]),
@@ -129,7 +139,7 @@ async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let first = send_text(&mut agent, info.session_id, "first").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     let candidate = agent.config().clone();
     let candidate_models = Models::from_values(BTreeMap::from([(
@@ -143,7 +153,7 @@ async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
         crate::agent::ReloadResult { ok: true }
     );
 
-    gate.release.notify_waiters();
+    gate.release();
     wait_text(&agent, first).await;
     assert_eq!(model_a.requests().lock().unwrap().len(), 1);
 
@@ -157,16 +167,18 @@ async fn reload_keeps_active_loop_snapshot_and_updates_the_next_turn() {
 async fn reload_does_not_change_a_running_compaction_binding() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-compaction-{}", next_id()));
     let (workspace, _guard) = workspace_file("reload-compaction-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model_a = FakeModel::with_window(
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::with_window(
         "main",
         40_000,
         [
-            ModelScript::Text("settled"),
-            ModelScript::BlockUntil(gate.clone(), "old summary"),
+            Step::Text("settled"),
+            Step::gated_text(gate.clone(), "old summary"),
         ],
-    );
-    let model_b = FakeModel::new("main", [ModelScript::Text("new turn")]);
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("main", [Step::Text("new turn")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -201,7 +213,7 @@ async fn reload_does_not_change_a_running_compaction_binding() {
         })
         .await
         .unwrap();
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     let candidate = agent.config().clone();
     let candidate_models = Models::from_values(BTreeMap::from([
@@ -215,7 +227,7 @@ async fn reload_does_not_change_a_running_compaction_binding() {
         .reload_settings_with_models(candidate, candidate_models)
         .unwrap();
 
-    gate.release.notify_waiters();
+    gate.release();
     let compacted = loop {
         if let Some(result) = result.borrow().clone() {
             break result;
@@ -237,7 +249,7 @@ async fn reload_does_not_change_a_running_compaction_binding() {
 #[tokio::test]
 async fn reload_command_environment_accumulates_all_prior_credential_names() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-env-merge-{}", next_id()));
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -358,7 +370,7 @@ async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
     )
     .unwrap();
 
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -434,7 +446,8 @@ async fn legacy_six_tool_session_is_listable_renameable_but_not_openable() {
 #[tokio::test]
 async fn reload_rejects_removed_subagent_profile_without_publishing_or_starting_work() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-subagent-{}", next_id()));
-    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
+    let model = ScriptedModel::new("main", [Step::Text("unused")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -465,9 +478,12 @@ async fn reload_rejects_removed_subagent_profile_without_publishing_or_starting_
 async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
     let (data_dir, _guard) = fixture_dir(&format!("reload-atomic-{}", next_id()));
     let (workspace, _guard) = workspace_file("reload-atomic-ws", "a.txt", b"hello");
-    let model_main = FakeModel::new("main", [ModelScript::Text("main")]);
-    let model_other = FakeModel::new("other", [ModelScript::Text("other")]);
-    let model_reloaded = FakeModel::new("main", [ModelScript::Text("reloaded")]);
+    let model_main = ScriptedModel::new("main", [Step::Text("main")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_other = ScriptedModel::new("other", [Step::Text("other")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_reloaded = ScriptedModel::new("main", [Step::Text("reloaded")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -629,7 +645,10 @@ async fn reload_rejects_store_and_event_capacity_changes_before_swap() {
     let (workspace, _guard) = workspace_file("reload-restart-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -642,7 +661,8 @@ async fn reload_rejects_store_and_event_capacity_changes_before_swap() {
             data_dir_candidate,
             Models::from_values(BTreeMap::from([(
                 "main".to_owned(),
-                FakeModel::new("main", []) as Arc<dyn Model>,
+                ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2))
+                    as Arc<dyn Model>,
             )]))
         ),
         Err(AgentError::ReloadRequiresRestart)
@@ -655,7 +675,8 @@ async fn reload_rejects_store_and_event_capacity_changes_before_swap() {
             event_capacity_candidate,
             Models::from_values(BTreeMap::from([(
                 "main".to_owned(),
-                FakeModel::new("main", []) as Arc<dyn Model>,
+                ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2))
+                    as Arc<dyn Model>,
             )]))
         ),
         Err(AgentError::ReloadRequiresRestart)
@@ -671,7 +692,8 @@ async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
         &data_dir,
         BTreeMap::from([(
             "main".to_owned(),
-            FakeModel::new("main", [ModelScript::Text("done")]),
+            ScriptedModel::new("main", [Step::Text("done")])
+                .with_pacing(std::time::Duration::from_millis(2)),
         )]),
         read_profile(),
     )
@@ -693,7 +715,8 @@ async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
 
     let candidate_models = Models::from_values(BTreeMap::from([(
         "main".to_owned(),
-        FakeModel::new("main", []) as Arc<dyn Model>,
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2))
+            as Arc<dyn Model>,
     )]));
     let candidate = agent.config().clone();
     agent

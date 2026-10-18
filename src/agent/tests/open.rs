@@ -4,7 +4,8 @@ use super::*;
 async fn cancelled_open_does_not_publish_a_history_index() {
     let (data_dir, _guard) = fixture_dir(&format!("cancel-open-{}", next_id()));
     let (workspace, _guard) = workspace_file("cancel-open-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -57,7 +58,8 @@ async fn cancelled_open_does_not_publish_a_history_index() {
 async fn reopen_rejects_missing_workspace_and_keeps_type_identity() {
     let (data_dir, _guard) = fixture_dir(&format!("ws-identity-{}", next_id()));
     let (workspace, _guard) = workspace_file("ws-identity-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -103,7 +105,8 @@ async fn reopen_rejects_workspace_redirected_by_symlink() {
 
     let (data_dir, _guard) = fixture_dir(&format!("ws-symlink-{}", next_id()));
     let (workspace, _guard) = workspace_file("ws-symlink-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -129,7 +132,8 @@ async fn reopen_rejects_workspace_redirected_by_symlink() {
 async fn reopen_after_profile_removal_still_works() {
     let (data_dir, _guard) = fixture_dir(&format!("ws-profile-{}", next_id()));
     let (workspace, _guard) = workspace_file("ws-profile-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -151,7 +155,10 @@ async fn reopen_after_profile_removal_still_works() {
         max_tool_rounds: 4,
         approval: ApprovalMode::Auto,
     };
-    let models = BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]);
+    let models = BTreeMap::from([(
+        "main".to_owned(),
+        ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+    )]);
     let models_config =
         BTreeMap::from([("main".to_owned(), model_config("MINICORE_AGENT_TEST_KEY"))]);
     let mut second_config = config(
@@ -178,7 +185,8 @@ async fn reopen_after_profile_removal_still_works() {
 async fn invalid_agents_md_fails_the_turn_as_a_prompt_error() {
     let (data_dir, _guard) = fixture_dir(&format!("agents-invalid-{}", next_id()));
     let (workspace, _guard) = workspace_file("agents-invalid-ws", "AGENTS.md", b"\xff\xfe");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -207,7 +215,10 @@ async fn invalid_session_json_skipped_by_list_and_fails_open() {
     let (workspace, _guard) = workspace_file("invalid-record-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;

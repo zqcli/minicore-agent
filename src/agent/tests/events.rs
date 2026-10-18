@@ -4,13 +4,14 @@ use super::*;
 async fn history_view_exposes_whitelisted_tool_detail_without_raw_arguments() {
     let (data_dir, _guard) = fixture_dir(&format!("view-{}", next_id()));
     let (workspace, _guard) = workspace_file("view-ws", "file.txt", b"contents");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -44,7 +45,8 @@ async fn history_view_exposes_whitelisted_tool_detail_without_raw_arguments() {
 async fn two_sessions_write_independently() {
     let (data_dir, _guard) = fixture_dir(&format!("multi-session-{}", next_id()));
     let (workspace_a, _ga) = workspace_file("multi-session-a", "a.txt", b"a");
-    let model = FakeModel::new("main", [ModelScript::Text("a1"), ModelScript::Text("a2")]);
+    let model = ScriptedModel::new("main", [Step::Text("a1"), Step::Text("a2")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -85,7 +87,10 @@ async fn send_is_rejected_for_unloaded_session() {
     let (workspace, _guard) = workspace_file("unloaded-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -107,7 +112,10 @@ async fn delete_rejects_loaded_session_and_removes_unloaded() {
     let (workspace, _guard) = workspace_file("delete-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -125,8 +133,9 @@ async fn delete_rejects_loaded_session_and_removes_unloaded() {
 async fn persisted_history_after_failed_loop_is_still_durable() {
     let (data_dir, _guard) = fixture_dir(&format!("failed-{}", next_id()));
     let (workspace, _guard) = workspace_file("failed-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "partial")]);
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "partial")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -135,8 +144,8 @@ async fn persisted_history_after_failed_loop_is_still_durable() {
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "hello").await;
-    gate.entered.notified().await;
-    gate.release.notify_waiters();
+    gate.wait_started().await;
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.persistence,
@@ -150,7 +159,8 @@ async fn persisted_history_after_failed_loop_is_still_durable() {
 async fn event_stream_delivers_lifecycle_events() {
     let (data_dir, _guard) = fixture_dir(&format!("events-{}", next_id()));
     let (workspace, _guard) = workspace_file("events-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("final")]);
+    let model = ScriptedModel::new("main", [Step::Text("final")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -216,7 +226,8 @@ async fn event_stream_delivers_lifecycle_events() {
 async fn join_first_drains_queued_finished_without_duplicate_agent_completion() {
     let (data_dir, _guard) = fixture_dir(&format!("join-first-{}", next_id()));
     let (workspace, _guard) = workspace_file("join-first-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_with(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -275,7 +286,8 @@ async fn join_first_drains_queued_finished_without_duplicate_agent_completion() 
 async fn queued_finished_drops_are_accounted_without_runtime_completion_mapping() {
     let (data_dir, _guard) = fixture_dir(&format!("finished-drops-{}", next_id()));
     let (workspace, _guard) = workspace_file("finished-drops-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
+    let model = ScriptedModel::new("main", [Step::Text("unused")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -333,13 +345,14 @@ async fn loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritati
     // event channel (capacity 1) during the runner's synchronous tail, so the
     // runtime deterministically drops events and reports them on the next
     // delivered envelope.
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::BurstTextThenTool("x", 300, "read", json!({"path": "a.txt", "limit": 32})),
-            ModelScript::Text("done"),
+            Step::BurstTextThenTool("x", 300, "read", json!({"path": "a.txt", "limit": 32})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_with(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -401,7 +414,8 @@ async fn loop_event_drops_surface_in_agent_events_but_turn_result_is_authoritati
 async fn full_agent_event_channel_keeps_wait_and_history_authoritative() {
     let (data_dir, _guard) = fixture_dir(&format!("full-channel-{}", next_id()));
     let (workspace, _guard) = workspace_file("full-channel-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("one"), ModelScript::Text("two")]);
+    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_with(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -439,14 +453,11 @@ async fn full_agent_event_channel_keeps_wait_and_history_authoritative() {
 async fn immediate_send_after_completion_does_not_report_busy() {
     let (data_dir, _guard) = fixture_dir(&format!("reopen-race-{}", next_id()));
     let (workspace, _guard) = workspace_file("reopen-race-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
-        [
-            ModelScript::Text("one"),
-            ModelScript::Text("two"),
-            ModelScript::Text("three"),
-        ],
-    );
+        [Step::Text("one"), Step::Text("two"), Step::Text("three")],
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

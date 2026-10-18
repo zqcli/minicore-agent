@@ -18,9 +18,9 @@ async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() 
         1_000_000,
         items,
         [
-            ModelScript::Text(answer),
-            ModelScript::Text("historical reads summarized"),
-            ModelScript::Text("next answer"),
+            Step::Text(answer),
+            Step::Text("historical reads summarized"),
+            Step::Text("next answer"),
         ],
         None,
         None,
@@ -97,17 +97,15 @@ async fn post_turn_eligibility_excludes_failed_cancelled_disabled_and_unpersiste
             )
             .unwrap(),
         );
-        let gate = BlockGate::new();
+        let gate = Arc::new(Gate::new());
         let script = match mode {
-            "failed" => ModelScript::StreamErrorAfterText(answer, error),
-            "cancelled" => ModelScript::BlockUntil(gate.clone(), answer),
-            _ => ModelScript::Text(answer),
+            "failed" => Step::StreamErrorAfterText(answer, error),
+            "cancelled" => Step::gated_text(gate.clone(), answer),
+            _ => Step::Text(answer),
         };
-        let model = FakeModel::with_window(
-            "main",
-            4_000,
-            [script, ModelScript::Text("must not summarize")],
-        );
+        let model =
+            ScriptedModel::with_window("main", 4_000, [script, Step::Text("must not summarize")])
+                .with_pacing(std::time::Duration::from_millis(2));
         let models = BTreeMap::from([("main".to_owned(), Arc::clone(&model))]);
         let mut agent = if mode == "disabled" {
             open_agent(&data_dir, models, read_profile()).await
@@ -120,7 +118,7 @@ async fn post_turn_eligibility_excludes_failed_cancelled_disabled_and_unpersiste
         }
         let turn = send_text(&mut agent, info.session_id, "answer").await;
         if mode == "cancelled" {
-            gate.entered.notified().await;
+            gate.wait_started().await;
             agent.cancel(turn).unwrap();
         }
         let result = wait_text(&agent, turn).await;
@@ -151,7 +149,7 @@ async fn manual_compaction_rejects_reserved_auto_namespace_but_cancel_accepts_it
     let (data_dir, _guard) = fixture_dir("manual-auto-namespace");
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -175,7 +173,8 @@ async fn manual_compaction_rejects_reserved_auto_namespace_but_cancel_accepts_it
 async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
     let (data_dir, _guard) = fixture_dir(&format!("close-cancel-owned-{}", next_id()));
     let (workspace, _guard) = workspace_file("close-cancel-owned-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -216,11 +215,12 @@ async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
 async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
     let (data_dir, _guard) = fixture_dir(&format!("compact-close-cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("compact-close-cancel-ws", "a.txt", b"hello");
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         40_000,
-        [ModelScript::Text("settled"), ModelScript::Text("summary")],
-    );
+        [Step::Text("settled"), Step::Text("summary")],
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -287,7 +287,7 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
 async fn compaction_operation_ids_are_bounded_and_reset_on_reopen() {
     let (data_dir, _guard) = fixture_dir(&format!("compact-id-cap-{}", next_id()));
     let (workspace, _guard) = workspace_file("compact-id-cap-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

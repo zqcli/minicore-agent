@@ -91,16 +91,17 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
     let content = "ordinary result ".repeat(900);
     let (workspace, _workspace_guard) =
         workspace_file("append-only-steer-ws", "a.txt", content.as_bytes());
-    let gate = BlockGate::new();
-    let model = FakeModel::with_window(
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::with_window(
         "main",
         4_000,
         [
-            ModelScript::ToolCallAfterGate(gate.clone(), "read", json!({"path": "a.txt"})),
-            ModelScript::Text("answer"),
-            ModelScript::Text("completed history summary"),
+            Step::gated_tool(gate.clone(), "read", json!({"path": "a.txt"})),
+            Step::Text("answer"),
+            Step::Text("completed history summary"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -109,7 +110,7 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read then steer").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
     agent
         .steer(super::SteerMessage {
             turn,
@@ -123,7 +124,7 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
             .current_operation
             .is_none()
     );
-    gate.release.notify_waiters();
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
         result.report.outcome,

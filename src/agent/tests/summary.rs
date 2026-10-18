@@ -5,8 +5,9 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
     let (data_dir, _data_guard, session_id, history_path, history_before) =
         synthetic_summary_session(&format!("summary-snapshot-{}", next_id()), false).await;
 
-    let model = FakeModel::new("main", []);
-    let next_model = FakeModel::new("other", [ModelScript::Text("next answer")]);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
+    let next_model = ScriptedModel::new("other", [Step::Text("next answer")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -127,16 +128,18 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
 async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
     let (data_dir, _data_guard, session_id, _history_path, _history_before) =
         synthetic_summary_session(&format!("summary-same-loop-update-{}", next_id()), true).await;
-    let gate = BlockGate::new();
-    let model_a = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCallAfterGate(
+        [Step::gated_tool(
             gate.clone(),
             "read",
             json!({"path": "suffix.txt"}),
         )],
-    );
-    let model_b = FakeModel::new("other", [ModelScript::Text("from model b")]);
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from model b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -149,7 +152,7 @@ async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
     agent.open_session(session_id).await.unwrap();
 
     let turn = send_text(&mut agent, session_id, "same loop current").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
     let updated = agent
         .update_session(UpdateSession {
             session_id,
@@ -159,7 +162,7 @@ async fn projected_summary_binding_survives_a_model_update_in_the_same_loop() {
         .await
         .unwrap();
     assert!(updated.active_revision.is_some());
-    gate.release.notify_waiters();
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.report.outcome,
@@ -356,7 +359,8 @@ async fn invalid_external_summary_falls_back_to_full_history() {
             _ => unreachable!("all summary fallback variants are listed above"),
         }
 
-        let model = FakeModel::new("main", [ModelScript::Text("fallback answer")]);
+        let model = ScriptedModel::new("main", [Step::Text("fallback answer")])
+            .with_pacing(std::time::Duration::from_millis(2));
         let mut agent = open_agent(
             &data_dir,
             BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -415,7 +419,7 @@ async fn invalid_summary_does_not_mask_core_history_corruption() {
     corrupt_history.extend_from_slice(b"{\"broken\":true}\n");
     std::fs::write(&history_path, corrupt_history).unwrap();
 
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -441,7 +445,8 @@ async fn summary_symlink_is_ignored_but_core_symlink_is_not() {
     std::fs::remove_file(&summary_path).unwrap();
     symlink(&summary_target, &summary_path).unwrap();
 
-    let model = FakeModel::new("main", [ModelScript::Text("symlink fallback")]);
+    let model = ScriptedModel::new("main", [Step::Text("symlink fallback")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -479,7 +484,8 @@ async fn summary_symlink_is_ignored_but_core_symlink_is_not() {
 async fn projected_summary_keeps_suffix_tool_exchange_and_current_user() {
     let (data_dir, _data_guard, session_id, history_path, history_before) =
         synthetic_summary_session(&format!("summary-tool-suffix-{}", next_id()), true).await;
-    let model = FakeModel::new("main", [ModelScript::Text("tool suffix answer")]);
+    let model = ScriptedModel::new("main", [Step::Text("tool suffix answer")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),

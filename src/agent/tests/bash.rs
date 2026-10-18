@@ -15,29 +15,30 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
     let first_pid_file = workspace.join("first.pid");
     let second_pid_file = workspace.join("second.pid");
 
-    let model_a = FakeModel::new(
+    let model_a = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall(
+            Step::ToolCall(
                 "bash",
                 json!({"command": "echo $$ > first.pid; exec sleep 30"}),
             ),
-            ModelScript::Text("first turn cancelled"),
+            Step::Text("first turn cancelled"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
-    let model_b = FakeModel::new(
+    let model_b = ScriptedModel::new(
         "other",
         [
-            ModelScript::ToolCall(
+            Step::ToolCall(
                 "bash",
                 json!({
                     "command": "printf 'turn2-stdout\\n'; printf 'turn2-stderr\\n' >&2; echo $$ > second.pid; exec sleep 30"
                 }),
             ),
-            ModelScript::Text("second turn done"),
+            Step::Text("second turn done"),
         ],
-    );
+    ).with_pacing(std::time::Duration::from_millis(2));
 
     let profile = Profile {
         model: "main".to_owned(),
@@ -236,16 +237,17 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
     let (workspace, _guard) = workspace_file("bash-aux-fail-ws", "a.txt", b"hello");
     let pid_file = workspace.join("child.pid");
 
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall(
+            Step::ToolCall(
                 "bash",
                 json!({"command": "echo $$ > child.pid; printf 'done' > output.txt"}),
             ),
-            ModelScript::Text("all done"),
+            Step::Text("all done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let profile = Profile {
         model: "main".to_owned(),
@@ -332,16 +334,17 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
     let (data_dir, _guard) = fixture_dir(&format!("bash-aux-success-{}", next_id()));
     let (workspace, _guard) = workspace_file("bash-aux-success-ws", "a.txt", b"hello");
 
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall(
+            Step::ToolCall(
                 "bash",
                 json!({"command": "printf 'persisted cold output' > output.txt"}),
             ),
-            ModelScript::Text("all done"),
+            Step::Text("all done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let profile = Profile {
         model: "main".to_owned(),
@@ -423,13 +426,14 @@ async fn session_close_while_aux_write_held_still_joins_owned_worker() {
     let (data_dir, _guard) = fixture_dir(&format!("bash-aux-close-{}", next_id()));
     let (workspace, _guard) = workspace_file("bash-aux-close-ws", "a.txt", b"hello");
 
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": "echo done > output.txt"})),
-            ModelScript::Text("finished"),
+            Step::ToolCall("bash", json!({"command": "echo done > output.txt"})),
+            Step::Text("finished"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let profile = Profile {
         model: "main".to_owned(),
@@ -488,13 +492,14 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
     let (data_dir, _guard) = fixture_dir(&format!("bash-aux-deadline-{}", next_id()));
     let (workspace, _guard) = workspace_file("bash-aux-deadline-ws", "a.txt", b"hello");
 
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": "printf 'fast'"})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": "printf 'fast'"})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let profile = Profile {
         model: "main".to_owned(),

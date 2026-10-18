@@ -32,15 +32,16 @@ async fn tool_argument_preview_cancel_leaves_existing_and_new_files_untouched() 
         let before = std::fs::metadata(&path)
             .ok()
             .and_then(|meta| meta.modified().ok());
-        let gate = BlockGate::new();
+        let gate = Arc::new(Gate::new());
         let source = format!(r#"{{"path":"{name}","content":"UNFINISHED"#);
-        let model = FakeModel::new(
+        let model = ScriptedModel::new(
             "main",
-            [ModelScript::PreviewEvents(
+            [Step::PreviewEvents(
                 preview_write_events(&source, false),
                 Some(gate.clone()),
             )],
-        );
+        )
+        .with_pacing(std::time::Duration::from_millis(2));
         let profile = Profile {
             tools: vec!["write".to_owned()],
             ..read_profile()
@@ -59,7 +60,7 @@ async fn tool_argument_preview_cancel_leaves_existing_and_new_files_untouched() 
             "synthetic half write then cancel",
         )
         .await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
             .await
             .unwrap();
         if existing {
@@ -140,7 +141,8 @@ async fn tool_argument_preview_assembler_rejection_and_post_finish_event_never_e
                 ModelEvent::text_delta("unexpected after finish").unwrap()
             ));
         }
-        let model = FakeModel::new("main", [ModelScript::PreviewEvents(raw, None)]);
+        let model = ScriptedModel::new("main", [Step::PreviewEvents(raw, None)])
+            .with_pacing(std::time::Duration::from_millis(2));
         let mut agent = open_agent(
             &data_dir,
             BTreeMap::from([("main".to_owned(), model)]),
@@ -196,13 +198,14 @@ async fn tool_argument_preview_normal_completion_is_followed_by_authoritative_in
         b"original",
     );
     let source = r#"{"path":"target.txt","content":"new content\n"}"#;
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::PreviewEvents(preview_write_events(source, true), None),
-            ModelScript::Text("done"),
+            Step::PreviewEvents(preview_write_events(source, true), None),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -266,14 +269,15 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
         "target.txt",
         b"unchanged",
     );
-    let gate = BlockGate::new();
-    let model = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new(
         "main",
-        [ModelScript::PreviewEvents(
+        [Step::PreviewEvents(
             preview_write_events(r#"{"path":"target.txt","content":"half"#, false),
             Some(gate.clone()),
         )],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let profile = Profile {
         tools: vec!["write".to_owned()],
         ..read_profile()
@@ -296,7 +300,7 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "synthetic deadline").await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
         .await
         .unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), wait_text(&agent, turn))

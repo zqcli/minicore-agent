@@ -1,69 +1,36 @@
 use super::*;
-use std::sync::Mutex;
+use crate::test_support::{ScriptedModel, Step};
 use std::time::Duration;
 
 use minicore_runtime::execution::UserInput;
 use minicore_runtime::history::{
     AssistantHistory, SummaryHistory, ToolResultHistory, UserHistory, UserMessageKind,
 };
-use minicore_runtime::model::{
-    ModelDescriptor, ModelStartFuture, ModelStream, ProviderReplay, ReasoningContent, ToolCall,
-};
+use minicore_runtime::model::{ProviderReplay, ReasoningContent, ToolCall};
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
 use serde_json::json;
 
 // This is an input contract fixture, not a model-quality oracle.
 const REPORT_STAGE_3: &str = include_str!("../fixtures/report-stage-3.txt");
 
-struct Fake {
-    descriptor: ModelDescriptor,
-    requests: Mutex<Vec<ModelRequest>>,
-    events: Mutex<Vec<ModelEvent>>,
+fn summary_model(text: &str) -> Arc<ScriptedModel> {
+    model_events(vec![
+        ModelEvent::text_delta(text).unwrap(),
+        usage_event(),
+        ModelEvent::Finish {
+            reason: ModelFinishReason::Stop,
+        },
+    ])
 }
 
-impl Fake {
-    fn new(text: &str) -> Arc<Self> {
-        Self::with_events(vec![
-            ModelEvent::text_delta(text).unwrap(),
-            usage_event(),
-            ModelEvent::Finish {
-                reason: ModelFinishReason::Stop,
-            },
-        ])
-    }
-
-    fn with_events(events: Vec<ModelEvent>) -> Arc<Self> {
-        Arc::new(Self {
-            descriptor: ModelDescriptor::new(
-                "fixture".parse().unwrap(),
-                100_000,
-                [ReasoningPreference::Auto].into(),
-                true,
-            )
-            .unwrap(),
-            requests: Mutex::new(Vec::new()),
-            events: Mutex::new(events),
-        })
-    }
-
-    fn calls(&self) -> usize {
-        self.requests.lock().unwrap().len()
-    }
-}
-
-impl Model for Fake {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-    fn start(&self, request: ModelRequest, _: ModelCallContext) -> ModelStartFuture<'_> {
-        self.requests.lock().unwrap().push(request);
-        let events = std::mem::take(&mut *self.events.lock().unwrap());
-        Box::pin(async {
-            let stream: ModelStream =
-                Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)));
-            Ok(stream)
-        })
-    }
+fn model_events(events: Vec<ModelEvent>) -> Arc<ScriptedModel> {
+    ScriptedModel::with_reasoning(
+        "fixture",
+        100_000,
+        [ReasoningPreference::Auto].into(),
+        [Step::Events(events)],
+    )
+    .with_fallback(|| Step::Events(Vec::new()))
 }
 
 fn usage_event() -> ModelEvent {
@@ -104,7 +71,7 @@ fn tool_result(text: &str) -> HistoryItem {
     })
 }
 
-fn input(model: &Arc<Fake>, history: Vec<HistoryItem>) -> CompactionInput {
+fn input(model: &Arc<ScriptedModel>, history: Vec<HistoryItem>) -> CompactionInput {
     CompactionInput {
         model: model.clone(),
         reasoning: ReasoningPreference::Auto,
@@ -132,7 +99,7 @@ fn projected(input: &CompactionInput) -> String {
 
 #[tokio::test]
 async fn pi_initial_prompt_preserves_stage_three_source_and_disables_tools() {
-    let model = Fake::new("## Goal\nContinue Stage 3");
+    let model = summary_model("## Goal\nContinue Stage 3");
     let input = input(&model, vec![user_item(REPORT_STAGE_3)]);
     let generated = generate_summary(&input, &CancellationToken::new())
         .await
@@ -174,7 +141,7 @@ async fn pi_initial_prompt_preserves_stage_three_source_and_disables_tools() {
 
 #[tokio::test]
 async fn update_contains_previous_once_and_only_uncovered_history_in_one_call() {
-    let model = Fake::new("updated summary");
+    let model = summary_model("updated summary");
     let previous = format!("PREVIOUS_SUMMARY {}", REPORT_STAGE_3);
     let mut input = input(
         &model,
@@ -202,7 +169,7 @@ async fn update_contains_previous_once_and_only_uncovered_history_in_one_call() 
 
 #[test]
 fn projection_keeps_visible_reasoning_arguments_and_embedded_summary_only() {
-    let model = Fake::new("summary");
+    let model = summary_model("summary");
     let thinking = "thinking é🙂".repeat(400);
     let arguments = json!({"path":"src/example.rs", "content":"arg text ".repeat(800)});
     let mut item = assistant(vec![
@@ -271,7 +238,7 @@ fn projection_keeps_visible_reasoning_arguments_and_embedded_summary_only() {
 
 #[test]
 fn tool_result_head_limit_is_unicode_safe_and_preserves_identity_and_outcome() {
-    let model = Fake::new("summary");
+    let model = summary_model("summary");
     for (text, omitted) in [
         ("a".repeat(2000), 0),
         (format!("{}😀TAIL", "中".repeat(1999)), 4),
@@ -300,7 +267,7 @@ fn tool_result_head_limit_is_unicode_safe_and_preserves_identity_and_outcome() {
 
 #[tokio::test]
 async fn complete_escaped_request_exact_budget_and_one_byte_over() {
-    let model = Fake::new("short summary");
+    let model = summary_model("short summary");
     let mut source = "é🙂\n\"\\".repeat(1000);
     let mut exact = input(&model, vec![user_item(&source)]);
     let bytes = loop {
@@ -320,7 +287,7 @@ async fn complete_escaped_request_exact_budget_and_one_byte_over() {
         .ok()
         .unwrap();
     assert_eq!(model.calls(), 1);
-    let over_model = Fake::new("unused");
+    let over_model = summary_model("unused");
     let mut over = exact.clone();
     over.model = over_model.clone();
     over.history = vec![user_item(&(source + "x"))].into();
@@ -335,7 +302,7 @@ async fn complete_escaped_request_exact_budget_and_one_byte_over() {
 
 #[tokio::test]
 async fn oversize_history_fails_before_call_without_discarding_content() {
-    let model = Fake::new("unused");
+    let model = summary_model("unused");
     let mut input = input(
         &model,
         vec![
@@ -358,7 +325,7 @@ async fn oversize_history_fails_before_call_without_discarding_content() {
 
 #[tokio::test]
 async fn large_tool_arguments_are_not_trimmed_to_force_admission() {
-    let model = Fake::new("unused");
+    let model = summary_model("unused");
     let argument = "write-content".repeat(4000);
     let items = (0..6)
         .map(|i| {
@@ -384,7 +351,7 @@ async fn large_tool_arguments_are_not_trimmed_to_force_admission() {
 
 #[tokio::test]
 async fn normal_request_floor_remains_without_repeating_it_in_summary_prompt() {
-    let model = Fake::new("unused");
+    let model = summary_model("unused");
     let mut input = input(&model, vec![user_item("historical request")]);
     input.project_instructions = BoundedText::new("fixed ".repeat(2000)).unwrap();
     input.hard_tokens = 1000;
@@ -398,7 +365,7 @@ async fn normal_request_floor_remains_without_repeating_it_in_summary_prompt() {
 
 #[tokio::test]
 async fn fitting_shrunk_summary_above_old_half_window_target_is_not_reduced_again() {
-    let model = Fake::new(&"s".repeat(10_000));
+    let model = summary_model(&"s".repeat(10_000));
     let mut input = input(&model, vec![user_item(&"u".repeat(12_000))]);
     input.hard_tokens = 4000;
     let generated = generate_summary(&input, &CancellationToken::new())
@@ -413,7 +380,7 @@ async fn fitting_shrunk_summary_above_old_half_window_target_is_not_reduced_agai
 
 #[tokio::test]
 async fn non_shrinking_summary_fails_without_a_second_call() {
-    let model = Fake::new(&"s".repeat(12_000));
+    let model = summary_model(&"s".repeat(12_000));
     let input = input(&model, vec![user_item(&"u".repeat(4000))]);
     let err = generate_summary(&input, &CancellationToken::new())
         .await
@@ -471,7 +438,7 @@ async fn invalid_outputs_fail_once_and_keep_observed_usage() {
         ),
     ];
     for (events, expected) in cases {
-        let model = Fake::with_events(events);
+        let model = model_events(events);
         let input = input(&model, vec![user_item(REPORT_STAGE_3)]);
         let err = generate_summary(&input, &CancellationToken::new())
             .await
@@ -488,7 +455,7 @@ async fn invalid_outputs_fail_once_and_keep_observed_usage() {
 
 #[tokio::test]
 async fn cancellation_and_deadline_fail_before_model_call() {
-    let model = Fake::new("unused");
+    let model = summary_model("unused");
     let mut input = input(&model, vec![user_item(REPORT_STAGE_3)]);
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -533,7 +500,7 @@ fn source_writer_checks_bounds_and_interrupts_between_writes() {
 
 #[test]
 fn invalid_covered_prefix_is_rejected() {
-    let model = Fake::new("unused");
+    let model = summary_model("unused");
     let mut input = input(&model, vec![user_item("source")]);
     input.previous_covered_item_count = 2;
     assert!(matches!(
@@ -574,7 +541,7 @@ fn recent_tail_selection_is_bounded_and_never_restores_covered_items() {
 
 #[tokio::test]
 async fn tail_generation_keeps_source_before_and_after_ranges_distinct() {
-    let model = Fake::new("small updated summary");
+    let model = summary_model("small updated summary");
     let mut input = input(
         &model,
         vec![
@@ -626,7 +593,7 @@ async fn tail_generation_keeps_source_before_and_after_ranges_distinct() {
 
 #[tokio::test]
 async fn retained_tail_and_fixed_request_budget_fail_before_utility() {
-    let model = Fake::new("unused");
+    let model = summary_model("unused");
     let mut input = input(
         &model,
         vec![
@@ -654,7 +621,7 @@ async fn retained_tail_and_fixed_request_budget_fail_before_utility() {
 
 #[tokio::test]
 async fn complete_after_budget_counts_escaped_summary_with_tail() {
-    let model = Fake::new(&"\"".repeat(6000));
+    let model = summary_model(&"\"".repeat(6000));
     let mut input = input(
         &model,
         vec![
@@ -679,7 +646,7 @@ async fn complete_after_budget_counts_escaped_summary_with_tail() {
 
 #[tokio::test]
 async fn summary_larger_than_new_prefix_is_not_progress_despite_large_tail() {
-    let model = Fake::new(&"summary bigger than prefix ".repeat(100));
+    let model = summary_model(&"summary bigger than prefix ".repeat(100));
     let input = input(
         &model,
         vec![
@@ -717,7 +684,7 @@ fn recent_tail_target_includes_exact_twenty_thousand_token_boundary() {
 
 #[tokio::test]
 async fn retained_tail_fits_without_schemas_but_fixed_schemas_prevent_utility() {
-    let model = Fake::new("summary");
+    let model = summary_model("summary");
     let mut input = input(
         &model,
         vec![

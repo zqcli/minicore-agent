@@ -36,24 +36,22 @@ use workers::process_is_listed;
 mod core;
 
 use super::{ReloadResult, SteerMessage};
-use crate::test_support::Gate;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use crate::test_support::model::supported_reasoning;
+use crate::test_support::{Gate, ScriptedModel, Step};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
-use futures_util::stream;
 use serde_json::json;
-use tokio::sync::Notify;
 
 use minicore_runtime::execution::ConfigRevision;
 use minicore_runtime::history::{
     AssistantHistory, HistoryItem, ToolResultHistory, UserHistory, UserMessageKind,
 };
 use minicore_runtime::model::{
-    AssistantPart, Model, ModelCallContext, ModelDescriptor, ModelError, ModelEvent,
-    ModelFinishReason, ModelMessage, ModelRef, ModelRequest, ModelStartFuture, ModelStream,
+    AssistantPart, Model, ModelError, ModelEvent, ModelFinishReason, ModelMessage, ModelRef,
     ReasoningContent, ReasoningPreference, ToolCall, Usage,
 };
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
@@ -105,348 +103,6 @@ fn fixture_dir(label: &str) -> (PathBuf, TestDirectoryGuard) {
 
 fn toml_path(path: &Path) -> String {
     toml::Value::String(path.to_string_lossy().into_owned()).to_string()
-}
-
-fn fake_supported_reasoning() -> BTreeSet<ReasoningPreference> {
-    BTreeSet::from([
-        ReasoningPreference::Auto,
-        ReasoningPreference::Disabled,
-        ReasoningPreference::Low,
-        ReasoningPreference::Medium,
-        ReasoningPreference::High,
-        ReasoningPreference::XHigh,
-        ReasoningPreference::Max,
-        ReasoningPreference::Ultra,
-    ])
-}
-
-/// A model call that parks on `release` and signals `entered` once parked.
-#[derive(Clone)]
-struct BlockGate {
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
-}
-
-struct DropSignal(Arc<AtomicBool>);
-
-impl Drop for DropSignal {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-impl BlockGate {
-    fn new() -> Self {
-        Self {
-            entered: Arc::new(Notify::new()),
-            release: Arc::new(Notify::new()),
-        }
-    }
-}
-
-#[derive(Clone)]
-enum ModelScript {
-    ReplayOnly(minicore_runtime::model::ProviderReplay),
-    PreviewEvents(Vec<Result<ModelEvent, ModelError>>, Option<BlockGate>),
-    Text(&'static str),
-    /// Text answer with a distinct per-request usage so per-request identity
-    /// (loop_id, request_index) can be asserted (spec 9.4/12.4).
-    TextWithUsage(&'static str, u64, u64),
-    ToolCall(&'static str, serde_json::Value),
-    ToolCallAfterGate(BlockGate, &'static str, serde_json::Value),
-    /// Parks until `release` fires and signals `entered` when parked.
-    BlockUntil(BlockGate, &'static str),
-    BlockUntilDrop(BlockGate, Arc<AtomicBool>, &'static str),
-
-    /// Emits many text deltas back-to-back with no awaits so the runtime can
-    /// saturate its best-effort event queue deterministically, then ends the
-    /// request with one tool call so the loop runs a tool (with an await)
-    /// before its next request.
-    BurstTextThenTool(&'static str, usize, &'static str, serde_json::Value),
-    ContextOverflowNotStarted,
-    Error(ModelError),
-    StreamErrorAfterText(&'static str, ModelError),
-}
-
-struct FakeModel {
-    model_ref: ModelRef,
-    descriptor: ModelDescriptor,
-    scripts: Arc<Mutex<VecDeque<ModelScript>>>,
-    requests: Arc<Mutex<Vec<ModelRequest>>>,
-    contexts: Arc<Mutex<Vec<ModelCallContext>>>,
-    start_entered: Arc<Notify>,
-    calls: Arc<AtomicUsize>,
-}
-
-impl FakeModel {
-    fn new(model_ref: &str, scripts: impl IntoIterator<Item = ModelScript>) -> Arc<Self> {
-        Self::with_window(model_ref, 16_384, scripts)
-    }
-
-    fn with_window(
-        model_ref: &str,
-        context_window: u64,
-        scripts: impl IntoIterator<Item = ModelScript>,
-    ) -> Arc<Self> {
-        Self::with_reasoning(
-            model_ref,
-            context_window,
-            fake_supported_reasoning(),
-            scripts,
-        )
-    }
-
-    fn with_reasoning(
-        model_ref: &str,
-        context_window: u64,
-        supported_reasoning: BTreeSet<ReasoningPreference>,
-        scripts: impl IntoIterator<Item = ModelScript>,
-    ) -> Arc<Self> {
-        let model_ref: ModelRef = model_ref.parse().unwrap();
-        let descriptor =
-            ModelDescriptor::new(model_ref.clone(), context_window, supported_reasoning, true)
-                .unwrap();
-        Arc::new(Self {
-            model_ref,
-            descriptor,
-            scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
-            requests: Arc::new(Mutex::new(Vec::new())),
-            contexts: Arc::new(Mutex::new(Vec::new())),
-            start_entered: Arc::new(Notify::new()),
-            calls: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    fn requests(&self) -> Arc<Mutex<Vec<ModelRequest>>> {
-        Arc::clone(&self.requests)
-    }
-
-    fn contexts(&self) -> Arc<Mutex<Vec<ModelCallContext>>> {
-        Arc::clone(&self.contexts)
-    }
-
-    fn start_entered(&self) -> Arc<Notify> {
-        Arc::clone(&self.start_entered)
-    }
-}
-
-impl Model for FakeModel {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn start(&self, request: ModelRequest, context: ModelCallContext) -> ModelStartFuture<'_> {
-        self.start_entered.notify_one();
-        let model_ref = self.model_ref.clone();
-        self.requests.lock().unwrap().push(request);
-        self.contexts.lock().unwrap().push(context);
-        let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
-        let script = self
-            .scripts
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(ModelScript::Text("default"));
-        Box::pin(async move {
-            let _ = model_ref;
-            let _ = call_index;
-            match script {
-                ModelScript::PreviewEvents(events, gate) => {
-                    let stream: ModelStream = Box::pin(stream::unfold(
-                        (events.into_iter(), gate),
-                        |(mut events, gate)| async move {
-                            if let Some(event) = events.next() {
-                                tokio::task::yield_now().await;
-                                Some((event, (events, gate)))
-                            } else {
-                                if let Some(gate) = gate {
-                                    gate.entered.notify_one();
-                                    gate.release.notified().await;
-                                }
-                                None
-                            }
-                        },
-                    ));
-                    Ok(stream)
-                }
-                ModelScript::BlockUntil(gate, text) => {
-                    gate.entered.notify_one();
-                    gate.release.notified().await;
-                    events(vec![
-                        ModelEvent::text_delta(text).unwrap(),
-                        ModelEvent::Usage {
-                            usage: Usage::new(1, 1, 0),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        },
-                    ])
-                }
-                ModelScript::BlockUntilDrop(gate, dropped, text) => {
-                    let _signal = DropSignal(dropped);
-                    gate.entered.notify_one();
-                    gate.release.notified().await;
-                    events(vec![
-                        ModelEvent::text_delta(text).unwrap(),
-                        ModelEvent::Usage {
-                            usage: Usage::new(1, 1, 0),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::Stop,
-                        },
-                    ])
-                }
-                ModelScript::ToolCall(name, arguments) => {
-                    let tool_call_id =
-                        ToolCallId::new(format!("{name}-call-{call_index}")).unwrap();
-                    events(vec![
-                        ModelEvent::ToolCallStart {
-                            tool_call_id: tool_call_id.clone(),
-                            tool_name: name.parse().unwrap(),
-                        },
-                        ModelEvent::tool_call_arguments_delta(
-                            tool_call_id.clone(),
-                            arguments.to_string(),
-                        )
-                        .unwrap(),
-                        ModelEvent::ToolCallEnd { tool_call_id },
-                        ModelEvent::Usage {
-                            usage: Usage::new(1, 1, 0),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::ToolCalls,
-                        },
-                    ])
-                }
-                ModelScript::ToolCallAfterGate(gate, name, arguments) => {
-                    gate.entered.notify_one();
-                    gate.release.notified().await;
-                    let tool_call_id =
-                        ToolCallId::new(format!("{name}-call-{call_index}")).unwrap();
-                    events(vec![
-                        ModelEvent::ToolCallStart {
-                            tool_call_id: tool_call_id.clone(),
-                            tool_name: name.parse().unwrap(),
-                        },
-                        ModelEvent::tool_call_arguments_delta(
-                            tool_call_id.clone(),
-                            arguments.to_string(),
-                        )
-                        .unwrap(),
-                        ModelEvent::ToolCallEnd { tool_call_id },
-                        ModelEvent::Usage {
-                            usage: Usage::new(1, 1, 0),
-                        },
-                        ModelEvent::Finish {
-                            reason: ModelFinishReason::ToolCalls,
-                        },
-                    ])
-                }
-                ModelScript::BurstTextThenTool(delta, count, name, arguments) => {
-                    let tool_call_id =
-                        ToolCallId::new(format!("{name}-call-{call_index}")).unwrap();
-                    let event_rows: Vec<Result<ModelEvent, ModelError>> = (0..count)
-                        .map(move |_| ModelEvent::text_delta(delta).unwrap())
-                        .chain([
-                            ModelEvent::ToolCallStart {
-                                tool_call_id: tool_call_id.clone(),
-                                tool_name: name.parse().unwrap(),
-                            },
-                            ModelEvent::tool_call_arguments_delta(
-                                tool_call_id.clone(),
-                                arguments.to_string(),
-                            )
-                            .unwrap(),
-                            ModelEvent::ToolCallEnd { tool_call_id },
-                            ModelEvent::Usage {
-                                usage: Usage::new(1, 1, 0),
-                            },
-                            ModelEvent::Finish {
-                                reason: ModelFinishReason::ToolCalls,
-                            },
-                        ])
-                        .map(Ok::<ModelEvent, ModelError>)
-                        .collect();
-                    let stream: ModelStream = Box::pin(stream::iter(event_rows));
-                    Ok(stream)
-                }
-                ModelScript::ReplayOnly(replay) => events(vec![
-                    ModelEvent::ProviderReplay { replay },
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ]),
-                ModelScript::Text(text) => {
-                    // Respect ModelEvent's delta bound while allowing fixtures
-                    // to exercise the independently bounded assembled response.
-                    let mut rows = Vec::new();
-                    let mut remaining = text;
-                    while !remaining.is_empty() {
-                        let mut end = remaining.len().min(4_096);
-                        while !remaining.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        rows.push(ModelEvent::text_delta(&remaining[..end]).unwrap());
-                        remaining = &remaining[end..];
-                    }
-                    rows.push(ModelEvent::Usage {
-                        usage: Usage::new(1, 1, 0),
-                    });
-                    rows.push(ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    });
-                    events(rows)
-                }
-                ModelScript::TextWithUsage(text, input, output) => events(vec![
-                    ModelEvent::text_delta(text).unwrap(),
-                    ModelEvent::Usage {
-                        usage: Usage::new(input, output, 0)
-                            .with_provider_total_tokens(Some(input + output)),
-                    },
-                    ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    },
-                ]),
-                ModelScript::ContextOverflowNotStarted => {
-                    let diagnostic = minicore_runtime::error::DiagnosticSummary::new(
-                        minicore_runtime::error::DiagnosticCode::InvalidConfiguration,
-                        minicore_runtime::error::DiagnosticCategory::Model,
-                        minicore_runtime::value::BoundedText::new("context window exceeded")
-                            .unwrap(),
-                        false,
-                    )
-                    .unwrap();
-                    Err(ModelError::permanent(
-                        minicore_runtime::model::ModelErrorKind::ContextOverflow,
-                        minicore_runtime::model::DeliveryState::NotStarted,
-                        diagnostic,
-                    ))
-                }
-                ModelScript::Error(err) => Err(err),
-                ModelScript::StreamErrorAfterText(text, err) => {
-                    let event_rows = vec![Ok(ModelEvent::text_delta(text).unwrap()), Err(err)];
-                    let stream: ModelStream = Box::pin(stream::iter(event_rows));
-                    Ok(stream)
-                }
-            }
-        })
-    }
-}
-
-fn events(values: Vec<ModelEvent>) -> Result<ModelStream, ModelError> {
-    // Stream each model event with a small tick so the best-effort loop event
-    // queue does not drop the burst, mirroring real network-timed delivery.
-    Ok(Box::pin(stream::unfold(
-        values.into_iter().collect::<Vec<_>>(),
-        |mut remaining| async move {
-            if remaining.is_empty() {
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            let event = remaining.remove(0);
-            Some((Ok(event), remaining))
-        },
-    )))
 }
 
 fn config(
@@ -526,7 +182,7 @@ fn model_config(api_key_env: &str) -> ModelConfig {
         physical_context_window: 10_000,
         output_budget_tokens: 1_000,
         safety_margin_tokens: 1_000,
-        supported_reasoning: fake_supported_reasoning(),
+        supported_reasoning: supported_reasoning(),
         supports_tools: true,
         // Fake models do not enforce a provider timeout. Leaving this unset
         // keeps tests that configure a short automatic deadline from inheriting
@@ -547,7 +203,7 @@ fn model_config_with_timeout(api_key_env: &str, seconds: u64) -> ModelConfig {
 
 async fn open_agent(
     data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<FakeModel>>,
+    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
     profile: Profile,
 ) -> Agent {
     let mut models_config = BTreeMap::new();
@@ -559,7 +215,7 @@ async fn open_agent(
 
 async fn open_agent_with_configs(
     data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<FakeModel>>,
+    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
     models_config: BTreeMap<String, ModelConfig>,
     profile: Profile,
 ) -> Agent {
@@ -581,7 +237,7 @@ struct AgentOptions {
 
 async fn open_agent_with(
     data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<FakeModel>>,
+    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
     profile: Profile,
     options: AgentOptions,
 ) -> Agent {
@@ -603,7 +259,7 @@ async fn open_agent_with(
 
 async fn open_agent_auto(
     data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<FakeModel>>,
+    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
     profile: Profile,
 ) -> Agent {
     let mut models_config = BTreeMap::new();
@@ -615,7 +271,7 @@ async fn open_agent_auto(
 
 async fn open_agent_auto_with_configs(
     data_dir: &Path,
-    fake_models: BTreeMap<String, Arc<FakeModel>>,
+    fake_models: BTreeMap<String, Arc<ScriptedModel>>,
     models_config: BTreeMap<String, ModelConfig>,
     profile: Profile,
 ) -> Agent {
@@ -937,7 +593,8 @@ async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary:
         .join("history.jsonl");
     let history_before = std::fs::read(&history_path).unwrap();
 
-    let model = FakeModel::new("main", [ModelScript::Text("started")]);
+    let model = ScriptedModel::new("main", [Step::Text("started")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -990,7 +647,7 @@ async fn auto_history_fixture(
     PathBuf,
     TestDirectoryGuard,
     SessionId,
-    Arc<FakeModel>,
+    Arc<ScriptedModel>,
     Agent,
 ) {
     let loop_id = LoopId::new().unwrap();
@@ -1007,10 +664,7 @@ async fn auto_history_fixture(
         label,
         enabled,
         items,
-        [
-            ModelScript::Text("folded summary"),
-            ModelScript::Text("answer"),
-        ],
+        [Step::Text("folded summary"), Step::Text("answer")],
         None,
         None,
     )
@@ -1021,14 +675,14 @@ async fn auto_admission_fixture(
     label: &str,
     enabled: bool,
     items: Vec<HistoryItem>,
-    scripts: impl IntoIterator<Item = ModelScript>,
+    scripts: impl IntoIterator<Item = Step>,
     prompt_timeout_seconds: Option<u64>,
     model_timeout_seconds: Option<u64>,
 ) -> (
     PathBuf,
     TestDirectoryGuard,
     SessionId,
-    Arc<FakeModel>,
+    Arc<ScriptedModel>,
     Agent,
 ) {
     auto_admission_fixture_with_window(
@@ -1048,14 +702,14 @@ async fn auto_admission_fixture_with_window(
     enabled: bool,
     context_window: u64,
     items: Vec<HistoryItem>,
-    scripts: impl IntoIterator<Item = ModelScript>,
+    scripts: impl IntoIterator<Item = Step>,
     prompt_timeout_seconds: Option<u64>,
     model_timeout_seconds: Option<u64>,
 ) -> (
     PathBuf,
     TestDirectoryGuard,
     SessionId,
-    Arc<FakeModel>,
+    Arc<ScriptedModel>,
     Agent,
 ) {
     let (data_dir, guard) = fixture_dir(label);
@@ -1137,7 +791,8 @@ async fn auto_admission_fixture_with_window(
             .await
             .unwrap();
     }
-    let model = FakeModel::with_window("main", context_window, scripts);
+    let model = ScriptedModel::with_window("main", context_window, scripts)
+        .with_pacing(std::time::Duration::from_millis(2));
     let profile = read_profile();
     let models = BTreeMap::from([("main".to_owned(), Arc::clone(&model))]);
     let models_config =

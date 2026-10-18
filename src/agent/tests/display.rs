@@ -10,7 +10,8 @@ async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_doe
             "endpoint":"http://localhost/v1/responses", "model":"provider-model",
             "output":[{"type":"reasoning","id":"rs_only","summary":[],"encrypted_content":OPAQUE}]
         })).unwrap();
-        let model = FakeModel::new("main", [ModelScript::ReplayOnly(replay)]);
+        let model = ScriptedModel::new("main", [Step::ReplayOnly(replay)])
+            .with_pacing(std::time::Duration::from_millis(2));
         let mut agent = open_agent(
             &data_dir,
             BTreeMap::from([("main".to_owned(), model)]),
@@ -117,7 +118,7 @@ pub(super) fn continue_display_read(request: &mut ReadSession, page: &crate::Rea
 async fn display_history_projects_summary_tool_metadata_and_original_indexes() {
     let (data_dir, _guard, session_id, history_path, before) =
         synthetic_summary_session(&format!("display-history-{}", next_id()), true).await;
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -204,7 +205,7 @@ async fn display_history_projects_summary_tool_metadata_and_original_indexes() {
 async fn display_history_chunks_unicode_summary_and_rejects_summary_only_replacement() {
     let (data_dir, _guard, session_id, _, _) =
         synthetic_summary_session(&format!("display-chunks-{}", next_id()), true).await;
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -263,7 +264,7 @@ async fn display_history_invalid_summary_falls_back_and_never_crosses_valid_boun
         b"invalid summary",
     )
     .unwrap();
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -315,7 +316,7 @@ async fn cold_display_invalid_anchor_restores_cursor_and_limit_without_raw_tools
         summary["source"][field] = value;
         let summary_bytes = serde_json::to_vec(&summary).unwrap();
         std::fs::write(&summary_path, &summary_bytes).unwrap();
-        let model = FakeModel::new("main", []);
+        let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
         let agent = open_agent(
             &data_dir,
             BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -380,7 +381,7 @@ async fn cold_display_unicode_pins_missing_workspace_and_partial_tail_are_read_o
     std::fs::write(&summary_path, &summary_bytes).unwrap();
     before.extend_from_slice(b"{partial tail");
     std::fs::write(&history_path, &before).unwrap();
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),

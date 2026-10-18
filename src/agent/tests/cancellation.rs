@@ -4,14 +4,15 @@ use super::*;
 async fn cancel_turn_returns_cancelled_report_and_session_recovers() {
     let (data_dir, _guard) = fixture_dir(&format!("cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("cancel-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::BlockUntil(gate.clone(), "blocked"),
-            ModelScript::Text("after cancel"),
+            Step::gated_text(gate.clone(), "blocked"),
+            Step::Text("after cancel"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -23,7 +24,7 @@ async fn cancel_turn_returns_cancelled_report_and_session_recovers() {
 
     // Wait until the first model call is actually parked before cancelling,
     // so the first script is consumed and the second turn gets `Text`.
-    gate.entered.notified().await;
+    gate.wait_started().await;
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(&agent, turn).await;
     assert_eq!(
@@ -48,13 +49,14 @@ async fn cancel_turn_returns_cancelled_report_and_session_recovers() {
 async fn cancelling_wrapped_tool_preserves_runtime_outcome_and_recovery() {
     let (data_dir, _guard) = fixture_dir(&format!("presentation-cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("presentation-cancel-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": "sleep 30"})),
-            ModelScript::Text("after cancel"),
+            Step::ToolCall("bash", json!({"command": "sleep 30"})),
+            Step::Text("after cancel"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let profile = Profile {
         model: "main".to_owned(),
         reasoning: ReasoningPreference::Auto,
@@ -106,8 +108,9 @@ async fn cancelling_wrapped_tool_preserves_runtime_outcome_and_recovery() {
 async fn close_active_session_cancels_and_waits() {
     let (data_dir, _guard) = fixture_dir(&format!("close-{}", next_id()));
     let (workspace, _guard) = workspace_file("close-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "blocked")]);
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "blocked")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -117,7 +120,7 @@ async fn close_active_session_cancels_and_waits() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "do work").await;
     let completion = agent.wait_turn_receiver(turn).unwrap();
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     agent.close_session(info.session_id).await.unwrap();
     let result = crate::sessions::await_turn_completion(completion)
@@ -137,7 +140,7 @@ async fn close_active_session_cancels_and_waits() {
             reason: crate::event::CancelReasonView::Shutdown
         }
     );
-    gate.release.notify_waiters();
+    gate.release();
     // No orphan task: reopening and running a fresh loop keeps working.
     agent.open_session(info.session_id).await.unwrap();
 }
@@ -146,16 +149,17 @@ async fn close_active_session_cancels_and_waits() {
 async fn agent_drop_cancels_an_active_model_future() {
     let (data_dir, _guard) = fixture_dir(&format!("drop-cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("drop-cancel-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let dropped = Arc::new(AtomicBool::new(false));
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
-        [ModelScript::BlockUntilDrop(
+        [Step::BlockUntilDrop(
             gate.clone(),
             Arc::clone(&dropped),
             "never returned",
         )],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -164,7 +168,7 @@ async fn agent_drop_cancels_an_active_model_future() {
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let _turn = send_text(&mut agent, info.session_id, "drop me").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     drop(agent);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -174,23 +178,24 @@ async fn agent_drop_cancels_an_active_model_future() {
     })
     .await
     .expect("Agent drop must cancel the active model future");
-    gate.release.notify_waiters();
+    gate.release();
 }
 
 #[tokio::test]
 async fn agent_drop_cancels_a_manual_compaction_model_future() {
     let (data_dir, _guard) = fixture_dir(&format!("drop-compact-cancel-{}", next_id()));
     let (workspace, _guard) = workspace_file("drop-compact-cancel-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let dropped = Arc::new(AtomicBool::new(false));
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         40_000,
         [
-            ModelScript::Text("settled"),
-            ModelScript::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "never returned"),
+            Step::Text("settled"),
+            Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "never returned"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -220,7 +225,7 @@ async fn agent_drop_cancels_a_manual_compaction_model_future() {
         })
         .await
         .unwrap();
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     drop(agent);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -230,18 +235,16 @@ async fn agent_drop_cancels_a_manual_compaction_model_future() {
     })
     .await
     .expect("Agent drop must cancel the manual model future");
-    gate.release.notify_waiters();
+    gate.release();
 }
 
 #[tokio::test]
 async fn active_shutdown_waits_for_the_session_owned_worker() {
     let (data_dir, _guard) = fixture_dir(&format!("shutdown-active-{}", next_id()));
     let (workspace, _guard) = workspace_file("shutdown-active-ws", "a.txt", b"hello");
-    let model_gate = BlockGate::new();
-    let model = FakeModel::new(
-        "main",
-        [ModelScript::BlockUntil(model_gate.clone(), "blocked")],
-    );
+    let model_gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new("main", [Step::gated_text(model_gate.clone(), "blocked")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -254,7 +257,7 @@ async fn active_shutdown_waits_for_the_session_owned_worker() {
     let turn = send_text(&mut agent, info.session_id, "shutdown").await;
     let completion = agent.wait_turn_receiver(turn).unwrap();
     gate.wait_started().await;
-    model_gate.entered.notified().await;
+    model_gate.wait_started().await;
 
     let mut shutdown = tokio::spawn(agent.shutdown());
     let pending = tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown).await;
@@ -278,7 +281,8 @@ async fn active_shutdown_waits_for_the_session_owned_worker() {
 async fn close_after_post_turn_result_still_joins_the_operation_worker() {
     let (data_dir, _guard) = fixture_dir(&format!("shutdown-admission-{}", next_id()));
     let (workspace, _workspace_guard) = workspace_file("shutdown-admission-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -309,7 +313,7 @@ async fn close_after_post_turn_result_still_joins_the_operation_worker() {
 
 #[tokio::test]
 async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_turn() {
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let dropped = Arc::new(AtomicBool::new(false));
     // Cross the post-turn trigger with an older prefix plus a complete
     // recent loop; the retained tail itself remains inside the hard budget.
@@ -326,8 +330,8 @@ async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_tur
         )
         .items,
         [
-            ModelScript::Text(answer),
-            ModelScript::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "summary"),
+            Step::Text(answer),
+            Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "summary"),
         ],
         None,
         None,
@@ -346,7 +350,7 @@ async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_tur
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_started())
         .await
         .expect("post-turn summary must start");
     let context = agent.session_context(session_id).unwrap();

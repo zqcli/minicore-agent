@@ -4,7 +4,8 @@ use super::*;
 async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
     let (data_dir, _guard) = fixture_dir(&format!("worker-panic-{}", next_id()));
     let (workspace, _guard) = workspace_file("worker-panic-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
+    let model = ScriptedModel::new("main", [Step::Text("unused")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -51,7 +52,8 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
 async fn aborted_agent_worker_wait_close_and_shutdown_reclaim_without_busy_loop() {
     let (data_dir, _guard) = fixture_dir(&format!("worker-abort-{}", next_id()));
     let (workspace, _guard) = workspace_file("worker-abort-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("unused")]);
+    let model = ScriptedModel::new("main", [Step::Text("unused")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -84,7 +86,8 @@ async fn aborted_agent_worker_wait_close_and_shutdown_reclaim_without_busy_loop(
 async fn unobserved_event_stream_still_persists() {
     let (data_dir, _guard) = fixture_dir(&format!("noevents-{}", next_id()));
     let (workspace, _guard) = workspace_file("noevents-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -107,7 +110,8 @@ async fn unobserved_event_stream_still_persists() {
 async fn next_send_cleans_up_finished_turn_without_explicit_wait() {
     let (data_dir, _guard) = fixture_dir(&format!("cleanup-{}", next_id()));
     let (workspace, _guard) = workspace_file("cleanup-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("one"), ModelScript::Text("two")]);
+    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -145,10 +149,8 @@ async fn next_send_cleans_up_finished_turn_without_explicit_wait() {
 async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
     let (data_dir, _guard) = fixture_dir(&format!("append-rollback-{}", next_id()));
     let (workspace, _guard) = workspace_file("append-rollback-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
-        "main",
-        [ModelScript::Text("not saved"), ModelScript::Text("saved")],
-    );
+    let model = ScriptedModel::new("main", [Step::Text("not saved"), Step::Text("saved")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -205,7 +207,8 @@ async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
 async fn append_failure_blocks_session_and_returns_failed_persistence() {
     let (data_dir, _guard) = fixture_dir(&format!("blocked-{}", next_id()));
     let (workspace, _guard) = workspace_file("blocked-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -253,7 +256,8 @@ async fn append_failure_blocks_session_and_returns_failed_persistence() {
 async fn blocked_send_does_not_discard_previous_turn_result() {
     let (data_dir, _guard) = fixture_dir(&format!("blocked-discard-{}", next_id()));
     let (workspace, _guard) = workspace_file("blocked-discard-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("persist me")]);
+    let model = ScriptedModel::new("main", [Step::Text("persist me")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -333,7 +337,8 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
 async fn close_and_reopen_recovers_from_blocked_session() {
     let (data_dir, _guard) = fixture_dir(&format!("recover-{}", next_id()));
     let (workspace, _guard) = workspace_file("recover-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -364,7 +369,8 @@ async fn close_and_reopen_recovers_from_blocked_session() {
 async fn metadata_write_failure_does_not_fail_the_turn() {
     let (data_dir, _guard) = fixture_dir(&format!("metadata-{}", next_id()));
     let (workspace, _guard) = workspace_file("metadata-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

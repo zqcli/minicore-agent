@@ -4,8 +4,10 @@ use super::*;
 async fn idle_model_update_affects_next_loop() {
     let (data_dir, _guard) = fixture_dir(&format!("idle-update-{}", next_id()));
     let (workspace, _guard) = workspace_file("idle-update-ws", "a.txt", b"hello");
-    let model_a = FakeModel::new("main", [ModelScript::Text("from a")]);
-    let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
+    let model_a = ScriptedModel::new("main", [Step::Text("from a")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -49,8 +51,10 @@ async fn idle_model_update_affects_next_loop() {
 async fn f2_01_idle_model_update_installs_candidate_loop_options() {
     let (data_dir, _guard) = fixture_dir(&format!("f2-01-{}", next_id()));
     let (workspace, _guard) = workspace_file("f2-01-ws", "a.txt", b"hello");
-    let model_a = FakeModel::new("main", [ModelScript::Text("from a")]);
-    let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
+    let model_a = ScriptedModel::new("main", [Step::Text("from a")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
@@ -102,16 +106,18 @@ async fn f2_01_idle_model_update_installs_candidate_loop_options() {
 async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request() {
     let (data_dir, _guard) = fixture_dir(&format!("f2-02-{}", next_id()));
     let (workspace, _guard) = workspace_file("f2-02-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model_a = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCallAfterGate(
+        [Step::gated_tool(
             gate.clone(),
             "read",
             json!({"path": "a.txt", "limit": 16}),
         )],
-    );
-    let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
@@ -133,7 +139,7 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "use the tool").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     let updated = agent
         .update_session(UpdateSession {
@@ -158,7 +164,7 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
         std::time::Duration::from_secs(47)
     );
 
-    gate.release.notify_waiters();
+    gate.release();
     wait_text(&agent, turn).await;
     assert_eq!(model_a.requests().lock().unwrap().len(), 1);
     assert_eq!(model_b.requests().lock().unwrap().len(), 1);
@@ -168,8 +174,9 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
 async fn f2_03_close_and_reopen_rederives_installed_future_options() {
     let (data_dir, _guard) = fixture_dir(&format!("f2-03-{}", next_id()));
     let (workspace, _guard) = workspace_file("f2-03-ws", "a.txt", b"hello");
-    let model_a = FakeModel::new("main", []);
-    let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
+    let model_a = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
@@ -225,13 +232,15 @@ async fn f2_03_close_and_reopen_rederives_installed_future_options() {
 async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
     let (data_dir, _guard) = fixture_dir(&format!("f2-04-{}", next_id()));
     let (workspace, _guard) = workspace_file("f2-04-ws", "a.txt", b"hello");
-    let model_a = FakeModel::with_window("main", 16_000, [ModelScript::Text("still a")]);
-    let model_b = FakeModel::with_reasoning(
+    let model_a = ScriptedModel::with_window("main", 16_000, [Step::Text("still a")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::with_reasoning(
         "other",
         4_000,
         BTreeSet::from([ReasoningPreference::Disabled]),
         [],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
@@ -333,8 +342,10 @@ async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
 async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
     let (data_dir, _guard) = fixture_dir(&format!("f2-05-{}", next_id()));
     let (workspace, _guard) = workspace_file("f2-05-ws", "a.txt", b"hello");
-    let model_a = FakeModel::new("main", [ModelScript::Text("from a")]);
-    let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
+    let model_a = ScriptedModel::new("main", [Step::Text("from a")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([
@@ -418,8 +429,10 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
 async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
     let (data_dir, _guard) = fixture_dir(&format!("f2-06-{}", next_id()));
     let (workspace, _guard) = workspace_file("f2-06-ws", "a.txt", b"hello");
-    let model_a = FakeModel::with_window("main", 16_000, [ModelScript::Text("from a")]);
-    let model_b = FakeModel::with_window("other", 8_000, [ModelScript::Text("from b")]);
+    let model_a = ScriptedModel::with_window("main", 16_000, [Step::Text("from a")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::with_window("other", 8_000, [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto_with_configs(
         &data_dir,
         BTreeMap::from([

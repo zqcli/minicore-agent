@@ -10,13 +10,14 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     let (workspace, _guard) = workspace_file("p5b2-cold-read-closure-ws", "marker.txt", b"");
 
     let script = r"i=0; while [ $i -lt 512 ]; do printf '\316\273\000\377\033[31mX\033[0m'; printf '\347\225\214\033[2K\r' >&2; i=$((i+1)); done";
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": script})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": script})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent(
         &data_dir,
@@ -65,7 +66,10 @@ async fn bash_dual_stream_cold_read_closure_after_restart_without_session_loaded
     // Re-open fresh agent without loading the session
     let agent2 = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         bash_profile(),
     )
     .await;
@@ -144,13 +148,14 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     let (workspace, _guard) = workspace_file("p5b2-readonly-guard-ws", "marker.txt", b"");
 
     let script = "echo hello-cold-read";
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": script})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": script})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent(
         &data_dir,
@@ -211,7 +216,10 @@ async fn cold_read_is_strictly_read_only_and_survives_missing_workspace_and_part
     // Re-open agent without loading the session
     let agent2 = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         bash_profile(),
     )
     .await;
@@ -263,7 +271,10 @@ async fn cold_read_missing_aux_or_unknown_tool_maps_to_tool_not_found() {
 
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         bash_profile(),
     )
     .await;
@@ -310,13 +321,14 @@ async fn warm_record_served_immediately_without_disk_or_gate() {
     let (workspace, _guard) = workspace_file("p5b2-warm-gate-ws", "marker.txt", b"");
 
     let script = "printf 'warm-content\n'";
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": script})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": script})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent(
         &data_dir,
@@ -398,13 +410,14 @@ async fn evicted_stream_restored_via_narrow_merge_from_disk() {
     let (workspace, _guard) = workspace_file("p5b2-evicted-restore-ws", "marker.txt", b"");
 
     let script = "printf 'persisted-stream-data\n'";
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": script})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": script})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent(
         &data_dir,
@@ -497,13 +510,14 @@ async fn both_sources_unavailable_preserves_known_offsets() {
     let (workspace, _guard) = workspace_file("p5b2-unavailable-ws", "marker.txt", b"");
 
     let script = "printf 'should-be-unavailable\n'";
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": script})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": script})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent(
         &data_dir,
@@ -583,13 +597,14 @@ async fn reader_drop_or_timeout_does_not_cancel_running_bash() {
 
     let pid_file = workspace.join("child.pid");
     let script = format!("echo $$ > '{}'; sleep 5", pid_file.display());
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("bash", json!({"command": script})),
-            ModelScript::Text("done"),
+            Step::ToolCall("bash", json!({"command": script})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent(
         &data_dir,

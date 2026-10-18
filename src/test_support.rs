@@ -2,8 +2,8 @@
 //! under `cfg(test)`. Registries are keyed so tests running in parallel never
 //! observe each other's faults or gates.
 
-// Removed by the 0.7.0 integration once every hook has migrated here.
-#![allow(dead_code)]
+pub(crate) mod model;
+pub(crate) use model::{ScriptedModel, Step};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,10 +91,6 @@ impl Gate {
 
     pub(crate) async fn wait_started(&self) {
         self.wait_until(|state| state.started).await;
-    }
-
-    pub(crate) fn has_started(&self) -> bool {
-        self.state.lock().unwrap().started
     }
 
     pub(crate) fn release(&self) {

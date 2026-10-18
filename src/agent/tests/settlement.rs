@@ -17,12 +17,12 @@ fn settled_projection_model_error() -> ModelError {
 async fn settled_projection_fixture(
     label: &str,
     window: u64,
-    terminal: ModelScript,
+    terminal: Step,
 ) -> (
     PathBuf,
     TestDirectoryGuard,
     SessionId,
-    Arc<FakeModel>,
+    Arc<ScriptedModel>,
     Agent,
 ) {
     let old = LoopId::new().unwrap();
@@ -34,8 +34,8 @@ async fn settled_projection_fixture(
             .flat_map(|index| pi_history_exchange(old, index, 100_000))
             .collect(),
         [
-            ModelScript::Text("FOLDED-OLD-SOURCE"),
-            ModelScript::ToolCall("read", json!({"path":"tail.txt"})),
+            Step::Text("FOLDED-OLD-SOURCE"),
+            Step::ToolCall("read", json!({"path":"tail.txt"})),
             terminal,
         ],
         None,
@@ -83,7 +83,7 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
     let (data, _guard, id, model, mut agent) = settled_projection_fixture(
         &format!("wide-projection-cold-{}", next_id()),
         50_000,
-        ModelScript::Text("done"),
+        Step::Text("done"),
     )
     .await;
     let turn = send_text(&mut agent, id, "EXACT-CURRENT-USER").await;
@@ -158,11 +158,11 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
 #[tokio::test]
 async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_projection() {
     for cancelled in [false, true] {
-        let gate = BlockGate::new();
+        let gate = Arc::new(Gate::new());
         let terminal = if cancelled {
-            ModelScript::BlockUntil(gate.clone(), "not reached")
+            Step::gated_text(gate.clone(), "not reached")
         } else {
-            ModelScript::Error(settled_projection_model_error())
+            Step::Fail(settled_projection_model_error())
         };
         let (data, _guard, id, model, mut agent) = settled_projection_fixture(
             &format!("wide-projection-terminal-{cancelled}-{}", next_id()),
@@ -172,7 +172,7 @@ async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_proj
         .await;
         let turn = send_text(&mut agent, id, "EXACT-TERMINAL-USER").await;
         if cancelled {
-            gate.entered.notified().await;
+            gate.wait_started().await;
             assert!(agent.cancel(turn).unwrap());
         }
         let result = wait_text(&agent, turn).await;
@@ -223,13 +223,13 @@ async fn settled_projection_post_turn_summarizes_promoted_source_and_keeps_it_on
         let (data, _guard, id, model, mut agent) = settled_projection_fixture(
             &format!("wide-projection-post-{fail}-{}", next_id()),
             28_500,
-            ModelScript::Text("done"),
+            Step::Text("done"),
         )
         .await;
         model.scripts.lock().unwrap().push_back(if fail {
-            ModelScript::Error(settled_projection_model_error())
+            Step::Fail(settled_projection_model_error())
         } else {
-            ModelScript::Text("FINAL-SEMANTIC-SUMMARY")
+            Step::Text("FINAL-SEMANTIC-SUMMARY")
         });
         let turn = send_text(&mut agent, id, "current user").await;
         let result = wait_text(&agent, turn).await;
@@ -283,25 +283,25 @@ async fn settled_projection_post_turn_summarizes_promoted_source_and_keeps_it_on
 
 #[tokio::test]
 async fn settled_projection_post_cancel_and_append_failure_preserve_their_committed_boundaries() {
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let (data, _guard, id, model, mut agent) = settled_projection_fixture(
         &format!("wide-projection-post-cancel-{}", next_id()),
         28_500,
-        ModelScript::Text("done"),
+        Step::Text("done"),
     )
     .await;
     model
         .scripts
         .lock()
         .unwrap()
-        .push_back(ModelScript::BlockUntil(gate.clone(), "not reached"));
+        .push_back(Step::gated_text(gate.clone(), "not reached"));
     let turn = send_text(&mut agent, id, "current user").await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     );
-    gate.entered.notified().await;
+    gate.wait_started().await;
     let path = data
         .join("sessions")
         .join(id.to_string())
@@ -327,7 +327,7 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
     let (data, _guard, id, _model, mut agent) = settled_projection_fixture(
         &format!("wide-projection-append-fail-{}", next_id()),
         50_000,
-        ModelScript::Text("done"),
+        Step::Text("done"),
     )
     .await;
     let history = data
@@ -364,7 +364,7 @@ async fn settled_projection_write_failures_qualify_threshold_result_without_eras
         let (data, _guard, id, model, mut agent) = settled_projection_fixture(
             &format!("wide-projection-write-fail-{unknown}-{}", next_id()),
             50_000,
-            ModelScript::Error(settled_projection_model_error()),
+            Step::Fail(settled_projection_model_error()),
         )
         .await;
         let history = data
@@ -418,7 +418,7 @@ async fn settled_projection_close_race_rejects_snapshot_without_losing_persisted
     let (data, _guard, id, _model, mut agent) = settled_projection_fixture(
         &format!("wide-projection-close-{}", next_id()),
         50_000,
-        ModelScript::Text("done"),
+        Step::Text("done"),
     )
     .await;
     let session = agent.loaded_session(id).unwrap().clone();

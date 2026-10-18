@@ -108,14 +108,15 @@ async fn tool_invocation_separates_requests_not_just_names() {
     let (workspace, _guard) = workspace_file("tool-data-identity-ws", "a.txt", b"alpha");
     std::fs::write(workspace.join("b.txt"), b"beta").unwrap();
     // The same tool name runs in two different requests within one loop.
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
-            ModelScript::ToolCall("read", json!({"path": "b.txt", "limit": 8})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            Step::ToolCall("read", json!({"path": "b.txt", "limit": 8})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -168,15 +169,16 @@ async fn tool_invocation_is_isolated_across_sessions() {
     let workspace_b = base.join("session-b");
     std::fs::create_dir_all(&workspace_b).unwrap();
     std::fs::write(workspace_b.join("b.txt"), b"beta").unwrap();
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
-            ModelScript::Text("a done"),
-            ModelScript::ToolCall("read", json!({"path": "b.txt", "limit": 8})),
-            ModelScript::Text("b done"),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            Step::Text("a done"),
+            Step::ToolCall("read", json!({"path": "b.txt", "limit": 8})),
+            Step::Text("b done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -241,7 +243,7 @@ fn workspace_read_request(session_id: SessionId, path: &str) -> crate::Workspace
 async fn workspace_read_requires_a_loaded_session_and_touches_nothing_else() {
     let (data_dir, _guard) = fixture_dir(&format!("workspace-read-{}", next_id()));
     let (workspace, _guard) = workspace_file("workspace-read-ws", "note.txt", b"raw\ncontent\n");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -321,7 +323,7 @@ fn workspace_search_request(session_id: SessionId, query: &str) -> crate::Worksp
 async fn workspace_files_and_search_require_a_loaded_session_and_touch_nothing_else() {
     let (data_dir, _guard) = fixture_dir(&format!("workspace-scan-{}", next_id()));
     let (workspace, _guard) = workspace_file("workspace-scan-ws", "note.txt", b"raw\nneedle\n");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -409,13 +411,14 @@ async fn tool_read_exposes_approval_time_data_without_running() {
         max_tool_rounds: 8,
         approval: ApprovalMode::Ask,
     };
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("write", json!({"path": "out.txt", "content": "written"})),
-            ModelScript::Text("done"),
+            Step::ToolCall("write", json!({"path": "out.txt", "content": "written"})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -488,13 +491,14 @@ async fn tool_read_exposes_approval_time_data_without_running() {
 async fn i2_02_tool_execution_event_matches_the_tool_read_query() {
     let (data_dir, _guard) = fixture_dir(&format!("tool-data-events-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-data-events-ws", "a.txt", b"alpha\nbeta");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 2})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 2})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -541,15 +545,16 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
 
     let (data_dir, _guard) = fixture_dir(&format!("startup-observation-{}", next_id()));
     let (workspace, _guard) = workspace_file("startup-observation-ws", "a.txt", b"hello");
-    let model_gate = BlockGate::new();
-    let model = FakeModel::new(
+    let model_gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCallAfterGate(
+        [Step::gated_tool(
             model_gate.clone(),
             "bash",
             json!({"command": "printf 'started\\n'; exec tail -f /dev/null"}),
         )],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let model_started = model.start_entered();
     let mut agent = open_agent(
         &data_dir,
@@ -574,7 +579,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
     let startup = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         gate.wait_started().await;
         model_started.notified().await;
-        model_gate.entered.notified().await;
+        model_gate.wait_started().await;
     })
     .await;
 
@@ -583,7 +588,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
     // AgentLoop::start and bind_started_loop, not merely before startup.
     let startup_boundary_observed = startup.is_ok() && !send_task.is_finished();
     gate.release();
-    model_gate.release.notify_one();
+    model_gate.release();
 
     let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut send_task).await;
     let turn = match send_result {
@@ -840,13 +845,14 @@ async fn tool_result_raw_text_is_readable_by_offset_without_escaping() {
         .collect::<Vec<_>>()
         .join("\n");
     let (workspace, _guard) = workspace_file("tool-data-offset-ws", "a.txt", expected.as_bytes());
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 64})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 64})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -877,13 +883,14 @@ async fn i2_03_tool_read_answers_without_consuming_live_events() {
     // the authoritative join report still reconciles terminal tool state.
     let (data_dir, _guard) = fixture_dir(&format!("tool-data-lost-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-data-lost-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_with(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -918,13 +925,14 @@ async fn failed_tool_result_text_is_queryable_from_the_authoritative_report() {
 
     let (data_dir, _guard) = fixture_dir(&format!("tool-data-failed-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-data-failed-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "missing.txt"})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "missing.txt"})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -959,13 +967,14 @@ async fn running_tool_output_stream_is_never_a_false_empty_eof() {
 
     let (data_dir, _guard) = fixture_dir(&format!("tool-data-pending-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-data-pending-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 8})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -1031,13 +1040,14 @@ async fn rejected_tool_input_never_fabricates_a_file_operation() {
     };
     // The schema requires `content`; the arguments are structurally valid JSON
     // but the tool's own parse rejects them.
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("write", json!({"path": "out.txt"})),
-            ModelScript::Text("done"),
+            Step::ToolCall("write", json!({"path": "out.txt"})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

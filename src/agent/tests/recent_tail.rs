@@ -75,9 +75,9 @@ async fn default_compact_retains_answers_tools_and_real_next_request_after_cold_
         100_000,
         history,
         [
-            ModelScript::Text("OLD_PREFIX_SUMMARY"),
-            ModelScript::Text("NEXT_ANSWER"),
-            ModelScript::Text("UPDATED_PREFIX_SUMMARY"),
+            Step::Text("OLD_PREFIX_SUMMARY"),
+            Step::Text("NEXT_ANSWER"),
+            Step::Text("UPDATED_PREFIX_SUMMARY"),
         ],
         None,
         None,
@@ -268,7 +268,7 @@ async fn automatic_no_safe_prefix_fails_only_when_trigger_is_reached() {
             true,
             window,
             vec![],
-            [ModelScript::Text(answer)],
+            [Step::Text(answer)],
             None,
             None,
         )

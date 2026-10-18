@@ -4,8 +4,9 @@ use super::*;
 async fn steer_is_applied_and_persisted_in_order() {
     let (data_dir, _guard) = fixture_dir(&format!("steer-{}", next_id()));
     let (workspace, _guard) = workspace_file("steer-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "final")]);
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "final")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -27,8 +28,8 @@ async fn steer_is_applied_and_persisted_in_order() {
             text: "steer two".to_owned(),
         })
         .unwrap();
-    gate.entered.notified().await;
-    gate.release.notify_waiters();
+    gate.wait_started().await;
+    gate.release();
 
     let result = wait_text(&agent, turn).await;
     assert_eq!(
@@ -107,7 +108,8 @@ async fn steer_is_applied_and_persisted_in_order() {
 async fn stale_turn_ref_is_rejected() {
     let (data_dir, _guard) = fixture_dir(&format!("stale-{}", next_id()));
     let (workspace, _guard) = workspace_file("stale-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("one"), ModelScript::Text("two")]);
+    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

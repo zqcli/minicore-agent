@@ -13,15 +13,16 @@ async fn f1_native_write_changes_keep_the_first_request_identity() {
 
     let (data_dir, _guard) = fixture_dir(&format!("f1-native-write-{}", next_id()));
     let (workspace, _guard) = workspace_file("f1-native-write-ws", "value.txt", b"user\n");
-    let model_gate = BlockGate::new();
-    let model = FakeModel::new(
+    let model_gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCallAfterGate(
+        [Step::gated_tool(
             model_gate.clone(),
             "write",
             json!({"path": "value.txt", "content": "agent\n"}),
         )],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let model_started = model.start_entered();
     let profile = Profile {
         tools: vec!["write".to_owned()],
@@ -47,12 +48,12 @@ async fn f1_native_write_changes_keep_the_first_request_identity() {
     let startup = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         gate.wait_started().await;
         model_started.notified().await;
-        model_gate.entered.notified().await;
+        model_gate.wait_started().await;
     })
     .await;
     let startup_boundary_observed = startup.is_ok() && !send_task.is_finished();
     gate.release();
-    model_gate.release.notify_one();
+    model_gate.release();
 
     let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut send_task).await;
     let turn = match send_result {

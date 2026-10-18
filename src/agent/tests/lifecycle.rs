@@ -6,7 +6,10 @@ async fn create_and_open_do_not_start_agent_loop() {
     let (workspace, _guard) = workspace_file("open-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -32,7 +35,10 @@ async fn create_and_loaded_open_emit_session_opened_once() {
     let (workspace, _guard) = workspace_file("session-opened-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -115,7 +121,10 @@ async fn create_capability_precheck_leaves_no_session_directory() {
         workspace_file("create-capability-precheck-ws", "a.txt", b"hello");
     let mut agent = open_agent(
         &data_dir,
-        BTreeMap::from([("main".to_owned(), FakeModel::new("main", []))]),
+        BTreeMap::from([(
+            "main".to_owned(),
+            ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2)),
+        )]),
         read_profile(),
     )
     .await;
@@ -164,14 +173,15 @@ async fn i1_create_open_and_turns_leave_branch_unknown_until_explicit_status() {
         .unwrap();
     assert!(head.success());
 
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::Text("no tool"),
-            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
-            ModelScript::Text("tool complete"),
+            Step::Text("no tool"),
+            Step::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            Step::Text("tool complete"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -241,7 +251,7 @@ async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
         .unwrap();
     assert!(head.success());
 
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -339,7 +349,7 @@ async fn i1_explicit_status_projects_and_failed_status_clears_branch_cache() {
 async fn rename_loaded_session_trims_clears_and_rejects_invalid_titles() {
     let (data_dir, _guard) = fixture_dir(&format!("rename-loaded-{}", next_id()));
     let (workspace, _guard) = workspace_file("rename-loaded-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -426,7 +436,8 @@ async fn rename_loaded_session_trims_clears_and_rejects_invalid_titles() {
 async fn rename_unloaded_session_updates_only_the_persistent_metadata() {
     let (data_dir, _guard) = fixture_dir(&format!("rename-unloaded-{}", next_id()));
     let (workspace, _guard) = workspace_file("rename-unloaded-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -467,8 +478,9 @@ async fn rename_unloaded_session_updates_only_the_persistent_metadata() {
 async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session() {
     let (data_dir, _guard) = fixture_dir(&format!("rename-busy-{}", next_id()));
     let (workspace, _guard) = workspace_file("rename-busy-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "done")]);
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -477,7 +489,7 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "busy").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     let renamed = agent
         .rename_session(RenameSession {
@@ -487,7 +499,7 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
         .await
         .unwrap();
     assert_eq!(renamed.title.as_deref(), Some("While busy"));
-    gate.release.notify_waiters();
+    gate.release();
     wait_text(&agent, turn).await;
     let record = Store::open(data_dir.clone())
         .await
@@ -500,7 +512,8 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
     let (blocked_data, _blocked_guard) = fixture_dir(&format!("rename-blocked-{}", next_id()));
     let (blocked_workspace, _blocked_workspace_guard) =
         workspace_file("rename-blocked-ws", "a.txt", b"hello");
-    let blocked_model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let blocked_model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut blocked_agent = open_agent(
         &blocked_data,
         BTreeMap::from([("main".to_owned(), blocked_model)]),
@@ -540,7 +553,7 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
 async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
     let (data_dir, _guard) = fixture_dir(&format!("rename-failure-{}", next_id()));
     let (workspace, _guard) = workspace_file("rename-failure-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -619,7 +632,7 @@ request_timeout_seconds = 30
         config.profiles["test"].system_prompt,
         "file prompt\noriginal"
     );
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = Agent::open_with_models(
         config,
         Models::from_values(BTreeMap::from([(
@@ -660,8 +673,9 @@ fn rename_request_debug_does_not_include_the_title() {
 async fn single_active_loop_busy() {
     let (data_dir, _guard) = fixture_dir(&format!("busy-{}", next_id()));
     let (workspace, _guard) = workspace_file("busy-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "first")]);
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "first")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -679,8 +693,8 @@ async fn single_active_loop_busy() {
         .await;
     assert!(matches!(busy, Err(AgentError::SessionBusy)));
 
-    gate.entered.notified().await;
-    gate.release.notify_waiters();
+    gate.wait_started().await;
+    gate.release();
     let result = wait_text(&agent, first).await;
     assert_eq!(
         result.persistence,
@@ -693,7 +707,8 @@ async fn single_active_loop_busy() {
 async fn basic_completion_persists_and_merges_history() {
     let (data_dir, _guard) = fixture_dir(&format!("basic-{}", next_id()));
     let (workspace, _guard) = workspace_file("basic-ws", "a.txt", b"hello");
-    let model = FakeModel::new("main", [ModelScript::Text("done")]);
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

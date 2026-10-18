@@ -118,7 +118,7 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
     }
     let history_before = std::fs::read(&history_path).unwrap();
 
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -274,7 +274,8 @@ async fn s1_five_tool_subset_record_with_old_history_still_executes() {
     };
     store.append_loop(session_id, &legacy_loop).await.unwrap();
 
-    let model = FakeModel::new("main", [ModelScript::Text("after old history")]);
+    let model = ScriptedModel::new("main", [Step::Text("after old history")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -296,13 +297,14 @@ async fn s1_five_tool_subset_record_with_old_history_still_executes() {
 async fn s1_hallucinated_subagent_is_an_unavailable_tool_not_a_dispatch() {
     let (data_dir, _guard) = fixture_dir(&format!("s1-hallucinated-{}", next_id()));
     let (workspace, _guard) = workspace_file("s1-hallucinated-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("subagent", json!({"task": "go delegate"})),
-            ModelScript::Text("after hallucination"),
+            Step::ToolCall("subagent", json!({"task": "go delegate"})),
+            Step::Text("after hallucination"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),

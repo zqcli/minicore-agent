@@ -11,7 +11,7 @@ async fn session_close_detaches_a_stalled_status_worker_after_grace() {
     use std::os::unix::fs::PermissionsExt;
     let (data_dir, _data_guard) = fixture_dir(&format!("status-stalled-{}", next_id()));
     let (workspace, _workspace_guard) = workspace_file("status-stalled-ws", "note", b"text");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -76,7 +76,7 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
     let (data_dir, _data_guard) = fixture_dir(&format!("status-owner-{}", next_id()));
     let (workspace, _workspace_guard) =
         workspace_file("status-owner-ws", "note.txt", b"raw\ncontent\n");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -199,7 +199,7 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     let (data_dir, _data_guard) = fixture_dir(&format!("status-prepare-{}", next_id()));
     let (workspace, _workspace_guard) =
         workspace_file("status-prepare-ws", "note.txt", b"raw\ncontent\n");
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -296,7 +296,7 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
         .expect("git must be available for the diff ownership regression");
     assert!(init.success());
 
-    let model = FakeModel::new("main", []);
+    let model = ScriptedModel::new("main", []).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -422,16 +422,17 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     let (data_dir, _guard) = fixture_dir(&format!("bash-owned-turn-{}", next_id()));
     let (workspace, _guard) = workspace_file("bash-owned-turn-ws", "a.txt", b"hello");
     let pid_file = workspace.join("child.pid");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall(
+            Step::ToolCall(
                 "bash",
                 json!({"command": "echo $$ > child.pid; exec sleep 30"}),
             ),
-            ModelScript::Text("cancelled"),
+            Step::Text("cancelled"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let profile = Profile {
         model: "main".to_owned(),
         reasoning: ReasoningPreference::Auto,

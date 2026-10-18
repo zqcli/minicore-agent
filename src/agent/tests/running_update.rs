@@ -4,9 +4,11 @@ use super::*;
 async fn running_model_update_keeps_current_request_and_reports_revision() {
     let (data_dir, _guard) = fixture_dir(&format!("running-update-{}", next_id()));
     let (workspace, _guard) = workspace_file("running-update-ws", "a.txt", b"hello");
-    let gate = BlockGate::new();
-    let model_a = FakeModel::new("main", [ModelScript::BlockUntil(gate.clone(), "from a")]);
-    let model_b = FakeModel::new("other", [ModelScript::Text("from b")]);
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::new("main", [Step::gated_text(gate.clone(), "from a")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -29,8 +31,8 @@ async fn running_model_update_keeps_current_request_and_reports_revision() {
         .unwrap();
     assert!(updated.active_revision.is_some());
 
-    gate.entered.notified().await;
-    gate.release.notify_waiters();
+    gate.wait_started().await;
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.persistence,
@@ -54,16 +56,18 @@ async fn running_model_update_keeps_current_request_and_reports_revision() {
 async fn running_model_update_applies_to_next_request_in_same_loop() {
     let (data_dir, _guard) = fixture_dir(&format!("same-loop-update-{}", next_id()));
     let (workspace, _guard) = workspace_file("same-loop-update-ws", "a.txt", b"hello from a.txt");
-    let gate = BlockGate::new();
-    let model_a = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCallAfterGate(
+        [Step::gated_tool(
             gate.clone(),
             "read",
             json!({"path": "a.txt", "limit": 32}),
         )],
-    );
-    let model_b = FakeModel::new("other", [ModelScript::Text("from model b")]);
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new("other", [Step::Text("from model b")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -76,7 +80,7 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read then answer").await;
 
-    gate.entered.notified().await;
+    gate.wait_started().await;
 
     let updated = agent
         .update_session(crate::agent::UpdateSession {
@@ -90,7 +94,7 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
         .active_revision
         .expect("running loop must accept update");
 
-    gate.release.notify_waiters();
+    gate.release();
     let result = wait_text(&agent, turn).await;
 
     // Single turn / loop identity preserved.
@@ -183,22 +187,24 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
     let (data_dir, _guard) = fixture_dir(&format!("presentation-model-swap-{}", next_id()));
     let (workspace, _guard) = workspace_file("presentation-model-swap-ws", "a.txt", b"a");
     std::fs::write(workspace.join("b.txt"), b"b").unwrap();
-    let gate = BlockGate::new();
-    let model_a = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::new(
         "provider/model-a",
-        [ModelScript::ToolCallAfterGate(
+        [Step::gated_tool(
             gate.clone(),
             "read",
             json!({"path": "a.txt"}),
         )],
-    );
-    let model_b = FakeModel::new(
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new(
         "provider/model-b",
         [
-            ModelScript::ToolCall("read", json!({"path": "b.txt"})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "b.txt"})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
@@ -211,7 +217,7 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read both").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
     agent
         .update_session(crate::agent::UpdateSession {
             session_id: info.session_id,
@@ -220,7 +226,7 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
         })
         .await
         .unwrap();
-    gate.release.notify_waiters();
+    gate.release();
     wait_text(&agent, turn).await;
 
     let mut presentations = Vec::new();
@@ -255,7 +261,8 @@ async fn model_swap_keeps_request_identity_for_live_tool_display() {
 async fn invalid_update_does_not_write_or_change_memory() {
     let (data_dir, _guard) = fixture_dir(&format!("invalid-update-{}", next_id()));
     let (workspace, _guard) = workspace_file("invalid-update-ws", "a.txt", b"hello");
-    let model_a = FakeModel::new("main", [ModelScript::Text("from a")]);
+    let model_a = ScriptedModel::new("main", [Step::Text("from a")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model_a))]),

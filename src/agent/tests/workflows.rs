@@ -30,14 +30,15 @@ async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
         script.into_os_string(),
     );
 
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::Text("no tool"),
-            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
-            ModelScript::Text("tool complete"),
+            Step::Text("no tool"),
+            Step::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            Step::Text("tool complete"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -106,13 +107,14 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     let (data_dir, _guard) = fixture_dir(&label);
     let (workspace, _guard) = workspace_file(&label, "a.txt", b"hello");
     let pid_file = workspace.join("child.pid");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCall(
+        [Step::ToolCall(
             "bash",
             json!({"command": "printf 'started\\n'; echo $$ > child.pid; exec sleep 30"}),
         )],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -238,20 +240,21 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
     let (workspace, _guard) = workspace_file("e2e-a-ws", "value.txt", b"user\n");
     let first_pid = workspace.join("first.pid");
     let release = workspace.join("release.txt");
-    let model_a = FakeModel::new(
+    let model_a = ScriptedModel::new(
         "main",
-        [ModelScript::ToolCall(
+        [Step::ToolCall(
             "bash",
             json!({"command": "printf 'out\\n'; printf 'err\\n' >&2; echo $$ > first.pid; while [ ! -f release.txt ]; do sleep 0.05; done"}),
         )],
-    );
-    let model_b = FakeModel::new(
+    ).with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::new(
         "other",
         [
-            ModelScript::ToolCall("write", json!({"path": "value.txt", "content": "agent\n"})),
-            ModelScript::Text("other finished"),
+            Step::ToolCall("write", json!({"path": "value.txt", "content": "agent\n"})),
+            Step::Text("other finished"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let profile = Profile {
         tools: vec!["bash".to_owned(), "write".to_owned()],
         ..read_profile()
@@ -493,17 +496,18 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
     let (workspace, _guard) = workspace_file("e2e-b-ws", "value.txt", b"user\n");
     // A short command that finishes on its own: the Turn's owner join still has
     // to reap it, but the test never depends on a fixed long sleep.
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall(
+            Step::ToolCall(
                 "bash",
                 json!({"command": "printf 'kept\\n'; printf 'stderr-line\\n' >&2"}),
             ),
-            ModelScript::ToolCall("write", json!({"path": "value.txt", "content": "agent\n"})),
-            ModelScript::Text("finished"),
+            Step::ToolCall("write", json!({"path": "value.txt", "content": "agent\n"})),
+            Step::Text("finished"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let profile = Profile {
         tools: vec!["bash".to_owned(), "write".to_owned()],
         ..read_profile()

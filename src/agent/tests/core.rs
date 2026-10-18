@@ -5,7 +5,8 @@ use crate::test_support::TempDir;
 async fn shutdown_broadcasts_to_all_sessions_before_waiting_for_any_worker() {
     let data = TempDir::new("core-shutdown-data");
     let workspace = TempDir::new("core-shutdown-workspace");
-    let model = FakeModel::new("main", [ModelScript::Text("one"), ModelScript::Text("two")]);
+    let model = ScriptedModel::new("main", [Step::Text("one"), Step::Text("two")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         data.path(),
         BTreeMap::from([("main".to_owned(), model)]),

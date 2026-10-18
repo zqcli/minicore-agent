@@ -38,17 +38,18 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
     let content = "read-result ".repeat(900);
     let (workspace, _workspace_guard) =
         workspace_file("pi-in-run-workspace", "a.txt", content.as_bytes());
-    let gate = BlockGate::new();
-    let model = FakeModel::with_window(
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::with_window(
         "main",
         5_000,
         [
-            ModelScript::ToolCallAfterGate(gate.clone(), "read", json!({"path":"a.txt"})),
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::Text("First read was completed; keep its findings."),
-            ModelScript::Text("done"),
+            Step::gated_tool(gate.clone(), "read", json!({"path":"a.txt"})),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::Text("First read was completed; keep its findings."),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".into(), Arc::clone(&model))]),
@@ -62,14 +63,14 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
         "read twice; preserve original input",
     )
     .await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
     agent
         .steer(super::SteerMessage {
             turn,
             text: "preserve this steer exactly".into(),
         })
         .unwrap();
-    gate.release.notify_waiters();
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.report.outcome,
@@ -131,14 +132,14 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
 
 #[tokio::test]
 async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let dropped = Arc::new(AtomicBool::new(false));
     let (_data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
         &format!("pi-first-cancel-{}", next_id()),
         true,
         8_000,
         pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
-        [ModelScript::BlockUntilDrop(
+        [Step::BlockUntilDrop(
             gate.clone(),
             Arc::clone(&dropped),
             "not reached",
@@ -153,7 +154,7 @@ async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
     )
     .await
     .unwrap();
-    gate.entered.notified().await;
+    gate.wait_started().await;
     let context = agent.session_context(session_id).unwrap();
     assert_eq!(context.automatic.current.unwrap().request_index, Some(0));
     assert!(context.current_operation.is_none());
@@ -183,7 +184,7 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
         true,
         20_000,
         pi_history_exchange(LoopId::new().unwrap(), 0, 70_000),
-        [ModelScript::Text(large_summary)],
+        [Step::Text(large_summary)],
         None,
         None,
     )
@@ -223,14 +224,15 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
     ));
     agent.close_session(session_id).await.unwrap();
     drop(agent);
-    let smaller = FakeModel::with_window(
+    let smaller = ScriptedModel::with_window(
         "main",
         10_000,
         [
-            ModelScript::Text("Refreshed historical facts."),
-            ModelScript::Text("answer"),
+            Step::Text("Refreshed historical facts."),
+            Step::Text("answer"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data,
         BTreeMap::from([("main".into(), Arc::clone(&smaller))]),
@@ -277,22 +279,22 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
 
 #[tokio::test]
 async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summary() {
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let (_data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
         &format!("pi-stale-prepare-{}", next_id()),
         true,
         8_000,
         pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
         [
-            ModelScript::BlockUntil(gate.clone(), "historical work summary"),
-            ModelScript::Text("new settings answer"),
+            Step::gated_text(gate.clone(), "historical work summary"),
+            Step::Text("new settings answer"),
         ],
         None,
         None,
     )
     .await;
     let turn = send_text(&mut agent, session_id, "original prompt exact").await;
-    gate.entered.notified().await;
+    gate.wait_started().await;
     agent
         .steer(super::SteerMessage {
             turn,
@@ -307,7 +309,7 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
         })
         .await
         .unwrap();
-    gate.release.notify_waiters();
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.report.outcome,
@@ -360,19 +362,20 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
         )
         .unwrap(),
     );
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         5_000,
         [
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::Text(first_summary),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("Recovered historical facts"),
-            ModelScript::Error(retryable),
-            ModelScript::Text("completed"),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::Text(first_summary),
+            Step::ContextOverflowNotStarted,
+            Step::Text("Recovered historical facts"),
+            Step::Fail(retryable),
+            Step::Text("completed"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data,
         BTreeMap::from([("main".into(), Arc::clone(&model))]),

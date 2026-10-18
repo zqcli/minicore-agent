@@ -34,10 +34,12 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
     );
     drop(store);
 
-    let mut scripts =
-        vec![ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})); 40];
-    scripts.push(ModelScript::Text("completed after forty tool rounds"));
-    let model = FakeModel::new("main", scripts);
+    let mut scripts: Vec<_> = (0..40)
+        .map(|_| Step::ToolCall("read", json!({"path": "file.txt", "limit": 32})))
+        .collect();
+    scripts.push(Step::Text("completed after forty tool rounds"));
+    let model =
+        ScriptedModel::new("main", scripts).with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -80,13 +82,14 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
 async fn tool_loop_runs_read_and_persists_one_loop_record() {
     let (data_dir, _guard) = fixture_dir(&format!("tool-{}", next_id()));
     let (workspace, _guard) = workspace_file("tool-ws", "file.txt", b"file contents");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
-            ModelScript::Text("final answer"),
+            Step::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            Step::Text("final answer"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -144,13 +147,14 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
 async fn live_tool_presentation_and_result_keep_runtime_identity() {
     let (data_dir, _guard) = fixture_dir(&format!("presentation-live-{}", next_id()));
     let (workspace, _guard) = workspace_file("presentation-live-ws", "file.txt", b"file contents");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "file.txt", "limit": 32})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -213,13 +217,14 @@ async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
     let (data_dir, _guard) = fixture_dir(&format!("presentation-failed-{}", next_id()));
     let (workspace, _guard) =
         workspace_file("presentation-failed-ws", "file.txt", b"file contents");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCall("read", json!({"path": "missing-secret.txt"})),
-            ModelScript::Text("done"),
+            Step::ToolCall("read", json!({"path": "missing-secret.txt"})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),
@@ -277,21 +282,26 @@ async fn reported_context_tracks_last_request_reopen_compaction_and_model_change
     use crate::presentation::ContextKind;
     let (data_dir, _guard) = fixture_dir(&format!("reported-context-{}", next_id()));
     let (workspace, _workspace_guard) = workspace_file("reported-context-ws", "a.txt", b"hello");
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "provider/main",
         40_000,
         [
-            ModelScript::TextWithUsage("first", 80, 20),
-            ModelScript::TextWithUsage("second", 180, 20),
-            ModelScript::Text("short summary"),
-            ModelScript::TextWithUsage("after compact", 40, 10),
+            Step::TextWithUsage("first", 80, 20),
+            Step::TextWithUsage("second", 180, 20),
+            Step::Text("short summary"),
+            Step::TextWithUsage("after compact", 40, 10),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([
             ("main".to_owned(), model),
-            ("other".to_owned(), FakeModel::new("provider/other", [])),
+            (
+                "other".to_owned(),
+                ScriptedModel::new("provider/other", [])
+                    .with_pacing(std::time::Duration::from_millis(2)),
+            ),
         ]),
         read_profile(),
     )
@@ -366,13 +376,14 @@ async fn request_usage_events_carry_real_per_request_usage_across_two_sessions()
     let (data_dir, _guard) = fixture_dir(&format!("usage-two-sessions-{}", next_id()));
     let (workspace_a, _guard_a) = workspace_file("usage-session-a", "a.txt", b"a");
     let (workspace_b, _guard_b) = workspace_file("usage-session-b", "b.txt", b"b");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "provider/model-id",
         [
-            ModelScript::TextWithUsage("a answer", 10, 20),
-            ModelScript::TextWithUsage("b answer", 300, 400),
+            Step::TextWithUsage("a answer", 10, 20),
+            Step::TextWithUsage("b answer", 300, 400),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -425,13 +436,14 @@ async fn request_usage_is_keyed_per_request_index_within_one_loop() {
     // Request 0 finishes with a tool call (its Usage is (1,1,0)); the tool
     // runs; request 1 reports a distinct usage (5,6,0). Both must surface as
     // separate RequestUsage events under the same loop with distinct indexes.
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "deep",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt", "limit": 32})),
-            ModelScript::TextWithUsage("final", 5, 6),
+            Step::ToolCall("read", json!({"path": "a.txt", "limit": 32})),
+            Step::TextWithUsage("final", 5, 6),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -470,15 +482,16 @@ async fn shared_model_keeps_live_presentation_identity_per_session() {
     let (data_dir, _guard) = fixture_dir(&format!("presentation-sessions-{}", next_id()));
     let (workspace_a, _guard_a) = workspace_file("presentation-session-a", "a.txt", b"a");
     let (workspace_b, _guard_b) = workspace_file("presentation-session-b", "b.txt", b"b");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "provider/model-id",
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt"})),
-            ModelScript::Text("a done"),
-            ModelScript::ToolCall("read", json!({"path": "b.txt"})),
-            ModelScript::Text("b done"),
+            Step::ToolCall("read", json!({"path": "a.txt"})),
+            Step::Text("a done"),
+            Step::ToolCall("read", json!({"path": "b.txt"})),
+            Step::Text("b done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -526,18 +539,15 @@ async fn project_prompt_reloads_agents_between_requests_in_one_loop() {
     let (data_dir, _guard) = fixture_dir(&format!("dynamic-agents-{}", next_id()));
     let (workspace, _guard) = workspace_file("dynamic-agents-ws", "AGENTS.md", b"before\n");
     std::fs::write(workspace.join("a.txt"), b"file contents").unwrap();
-    let gate = BlockGate::new();
-    let model = FakeModel::new(
+    let gate = Arc::new(Gate::new());
+    let model = ScriptedModel::new(
         "main",
         [
-            ModelScript::ToolCallAfterGate(
-                gate.clone(),
-                "read",
-                json!({"path": "a.txt", "limit": 32}),
-            ),
-            ModelScript::Text("done"),
+            Step::gated_tool(gate.clone(), "read", json!({"path": "a.txt", "limit": 32})),
+            Step::Text("done"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -547,9 +557,9 @@ async fn project_prompt_reloads_agents_between_requests_in_one_loop() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read it").await;
 
-    gate.entered.notified().await;
+    gate.wait_started().await;
     std::fs::write(workspace.join("AGENTS.md"), b"after\n").unwrap();
-    gate.release.notify_waiters();
+    gate.release();
     wait_text(&agent, turn).await;
 
     let requests = model.requests();
@@ -578,14 +588,11 @@ async fn project_prompt_reloads_agents_between_requests_in_one_loop() {
 async fn multi_turn_creates_new_loop_each_time_and_history_grows() {
     let (data_dir, _guard) = fixture_dir(&format!("multi-{}", next_id()));
     let (workspace, _guard) = workspace_file("multi-ws", "a.txt", b"hello");
-    let model = FakeModel::new(
+    let model = ScriptedModel::new(
         "main",
-        [
-            ModelScript::Text("one"),
-            ModelScript::Text("two"),
-            ModelScript::Text("three"),
-        ],
-    );
+        [Step::Text("one"), Step::Text("two"), Step::Text("three")],
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent(
         &data_dir,
         BTreeMap::from([("main".to_owned(), model)]),

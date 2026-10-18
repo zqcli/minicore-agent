@@ -14,16 +14,17 @@ async fn test_provider_overflow_recovery_success() {
     // One loop: request 0 runs the tool batch, request 1 rejects with
     // ContextOverflowNotStarted, utility summarizes the exchange, and the
     // same logical request is retried once with the clean projection.
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("Summary of prior read tool exchange"),
-            ModelScript::Text("recovered answer"),
+            Step::ToolCall("read", json!({"path": "note.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("Summary of prior read tool exchange"),
+            Step::Text("recovered answer"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent_auto(
         &data_dir,
@@ -80,17 +81,18 @@ async fn test_provider_overflow_stops_on_second_failure() {
 
     let profile = read_profile();
 
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("Summary of prior read exchange"),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("should not be reached"),
+            Step::ToolCall("read", json!({"path": "note.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("Summary of prior read exchange"),
+            Step::ContextOverflowNotStarted,
+            Step::Text("should not be reached"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent_auto(
         &data_dir,
@@ -133,21 +135,22 @@ async fn emergency_projection_survives_followups_new_growth_and_durable_reopen()
         )
         .unwrap();
     }
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("SUMMARY-A: read a has already executed"),
-            ModelScript::ToolCall("read", json!({"path":"b.txt"})),
-            ModelScript::ToolCall("read", json!({"path":"c.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("SUMMARY-B: read b has already executed"),
-            ModelScript::Text("completed after new growth"),
-            ModelScript::Text("next turn"),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("SUMMARY-A: read a has already executed"),
+            Step::ToolCall("read", json!({"path":"b.txt"})),
+            Step::ToolCall("read", json!({"path":"c.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("SUMMARY-B: read b has already executed"),
+            Step::Text("completed after new growth"),
+            Step::Text("next turn"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -224,16 +227,17 @@ async fn emergency_settlement_failure_is_observable_and_preserves_old_projection
         let workspace = data_dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("a.txt"), "RAW-SETTLEMENT ".repeat(600)).unwrap();
-        let model = FakeModel::with_window(
+        let model = ScriptedModel::with_window(
             "main",
             16_384,
             [
-                ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-                ModelScript::ContextOverflowNotStarted,
-                ModelScript::Text("summary with settled tool effects"),
-                ModelScript::Text("answer"),
+                Step::ToolCall("read", json!({"path":"a.txt"})),
+                Step::ContextOverflowNotStarted,
+                Step::Text("summary with settled tool effects"),
+                Step::Text("answer"),
             ],
-        );
+        )
+        .with_pacing(std::time::Duration::from_millis(2));
         let mut agent = open_agent_auto(
             &data_dir,
             BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -295,16 +299,17 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
     // The projection itself fits the Runtime envelope, but JSON-escaping it
     // again inside the snapshot exceeds the unchanged 256 KiB file limit.
     let answer = Box::leak("\"".repeat(80_000).into_boxed_str());
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         1_000_000,
         [
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("summary of read tool"),
-            ModelScript::Text(answer),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("summary of read tool"),
+            Step::Text(answer),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -346,19 +351,20 @@ async fn post_turn_estimates_and_refreshes_a_fully_covered_emergency_projection(
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("a.txt"), "large raw tool ".repeat(500)).unwrap();
     let answer = Box::leak("final answer ".repeat(4_200).into_boxed_str());
-    let gate = BlockGate::new();
+    let gate = Arc::new(Gate::new());
     let dropped = Arc::new(AtomicBool::new(false));
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("summary of read tool"),
-            ModelScript::Text(answer),
-            ModelScript::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "post-turn summary"),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("summary of read tool"),
+            Step::Text(answer),
+            Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "post-turn summary"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([("main".to_owned(), Arc::clone(&model))]),
@@ -375,7 +381,7 @@ async fn post_turn_estimates_and_refreshes_a_fully_covered_emergency_projection(
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_started())
         .await
         .expect("full emergency coverage still needs a near-budget post-turn check");
     let context = agent.session_context(info.session_id).unwrap();
@@ -396,18 +402,20 @@ async fn emergency_projection_is_not_invalidated_by_request_boundary_settings_or
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("a.txt"), "RAW-BEFORE-UPDATE ".repeat(500)).unwrap();
     std::fs::write(workspace.join("b.txt"), "small next result").unwrap();
-    let gate = BlockGate::new();
-    let model_a = FakeModel::with_window(
+    let gate = Arc::new(Gate::new());
+    let model_a = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path":"a.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("SUMMARY-UPDATE: a was read already"),
-            ModelScript::ToolCallAfterGate(gate.clone(), "read", json!({"path":"b.txt"})),
+            Step::ToolCall("read", json!({"path":"a.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("SUMMARY-UPDATE: a was read already"),
+            Step::gated_tool(gate.clone(), "read", json!({"path":"b.txt"})),
         ],
-    );
-    let model_b = FakeModel::with_window("other", 16_384, [ModelScript::Text("updated answer")]);
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::with_window("other", 16_384, [Step::Text("updated answer")])
+        .with_pacing(std::time::Duration::from_millis(2));
     let mut agent = open_agent_auto(
         &data_dir,
         BTreeMap::from([
@@ -419,7 +427,7 @@ async fn emergency_projection_is_not_invalidated_by_request_boundary_settings_or
     .await;
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read a then b").await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.notified())
+    tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_started())
         .await
         .unwrap();
     agent
@@ -431,7 +439,7 @@ async fn emergency_projection_is_not_invalidated_by_request_boundary_settings_or
         .await
         .unwrap();
     std::fs::write(workspace.join("AGENTS.md"), "new workspace instruction").unwrap();
-    gate.release.notify_waiters();
+    gate.release();
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
         result.report.outcome,
@@ -459,17 +467,18 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
     // is attempted, and the remaining model scripts stay unused.
     std::fs::write(workspace.join("tiny.txt"), "x").unwrap();
 
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path": "tiny.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("Summary of the tiny read exchange"),
-            ModelScript::Text("S"),
-            ModelScript::Text("never"),
+            Step::ToolCall("read", json!({"path": "tiny.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("Summary of the tiny read exchange"),
+            Step::Text("S"),
+            Step::Text("never"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent_auto(
         &data_dir,
@@ -561,19 +570,20 @@ async fn non_recoverable_model_failures_are_not_retried_as_recovery() {
         // recovery source exists; only `ContextOverflow + NotStarted` may use
         // it.
         let failing = if mid_stream {
-            ModelScript::StreamErrorAfterText("partial text", error)
+            Step::StreamErrorAfterText("partial text", error)
         } else {
-            ModelScript::Error(error)
+            Step::Fail(error)
         };
-        let model = FakeModel::with_window(
+        let model = ScriptedModel::with_window(
             "main",
             16_384,
             [
-                ModelScript::ToolCall("read", json!({"path": "note.txt"})),
+                Step::ToolCall("read", json!({"path": "note.txt"})),
                 failing,
-                ModelScript::Text("must not be reached"),
+                Step::Text("must not be reached"),
             ],
-        );
+        )
+        .with_pacing(std::time::Duration::from_millis(2));
 
         let mut agent = open_agent_auto(
             &data_dir,
@@ -621,18 +631,19 @@ async fn test_driver_retry_reentry_does_not_reset_recovery_quota() {
     // The second start fails with a Driver-retryable error, so the Driver
     // re-enters the same logical request. That retry must not grant another
     // ContextOverflow recovery even though the next attempt overflows again.
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("Summary of prior read exchange"),
-            ModelScript::Error(retryable),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("never reached"),
+            Step::ToolCall("read", json!({"path": "note.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("Summary of prior read exchange"),
+            Step::Fail(retryable),
+            Step::ContextOverflowNotStarted,
+            Step::Text("never reached"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent_auto(
         &data_dir,
@@ -699,15 +710,17 @@ async fn test_model_update_before_turn_uses_new_model() {
 
     let profile = read_profile();
 
-    let model_a = FakeModel::with_window(
+    let model_a = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("not reached because stale"),
+            Step::ContextOverflowNotStarted,
+            Step::Text("not reached because stale"),
         ],
-    );
-    let model_b = FakeModel::with_window("other", 16_384, [ModelScript::Text("from model b")]);
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
+    let model_b = ScriptedModel::with_window("other", 16_384, [Step::Text("from model b")])
+        .with_pacing(std::time::Duration::from_millis(2));
 
     let mut models_map = BTreeMap::new();
     models_map.insert("main".to_owned(), model_config("PATH"));
@@ -754,24 +767,26 @@ async fn test_failed_update_does_not_publish_a_new_recovery_binding() {
     let profile = read_profile();
 
     // Model A serves the session and its recovery utility.
-    let model_a = FakeModel::with_window(
+    let model_a = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path": "note.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("summary from a"),
-            ModelScript::Text("recovered by a"),
+            Step::ToolCall("read", json!({"path": "note.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("summary from a"),
+            Step::Text("recovered by a"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
     // Model B cannot serve High reasoning, so the update fails inside the
     // config factory after the model lookup succeeded.
-    let model_b = FakeModel::with_reasoning(
+    let model_b = ScriptedModel::with_reasoning(
         "other",
         16_384,
         BTreeSet::from([ReasoningPreference::Auto]),
-        [ModelScript::Text("summary from b")],
-    );
+        [Step::Text("summary from b")],
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut models_map = BTreeMap::new();
     models_map.insert("main".to_owned(), model_config("PATH"));
@@ -821,17 +836,18 @@ async fn test_recovery_two_sessions_isolated() {
 
     // Session A overflows inside the same loop that ran its tool batch;
     // session B must see no recovery observation and no shared ticket.
-    let model = FakeModel::with_window(
+    let model = ScriptedModel::with_window(
         "main",
         16_384,
         [
-            ModelScript::ToolCall("read", json!({"path": "a.txt"})),
-            ModelScript::ContextOverflowNotStarted,
-            ModelScript::Text("Summary for A"),
-            ModelScript::Text("recovered a"),
-            ModelScript::Text("session b answer"),
+            Step::ToolCall("read", json!({"path": "a.txt"})),
+            Step::ContextOverflowNotStarted,
+            Step::Text("Summary for A"),
+            Step::Text("recovered a"),
+            Step::Text("session b answer"),
         ],
-    );
+    )
+    .with_pacing(std::time::Duration::from_millis(2));
 
     let mut agent = open_agent_auto(
         &data_dir,
