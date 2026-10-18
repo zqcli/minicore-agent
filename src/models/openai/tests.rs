@@ -253,7 +253,7 @@ async fn terminal_drain_is_bounded_and_never_parses_trailing_events() {
         let count = Arc::clone(&polls);
         let terminal = Bytes::from(sse_body(&[completed(usage())]));
         let mut chunks = std::iter::once(terminal).chain(tail);
-        let bytes: ByteStream = Box::pin(stream::poll_fn(move |_| {
+        let bytes: ByteStream = Box::pin(futures_stream::poll_fn(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             std::task::Poll::Ready(chunks.next().map(Ok))
         }));
@@ -279,13 +279,13 @@ async fn terminal_drain_skips_near_deadline_or_cancelled_response() {
         let token = cancellation.clone();
         let terminal = Bytes::from(sse_body(&[completed(usage())]));
         let bytes: ByteStream = Box::pin(
-            stream::once(async move {
+            futures_stream::once(async move {
                 if cancelled {
                     token.cancel();
                 }
                 Ok(terminal)
             })
-            .chain(stream::poll_fn(|_| {
+            .chain(futures_stream::poll_fn(|_| {
                 panic!("unnecessary terminal body poll")
             })),
         );
