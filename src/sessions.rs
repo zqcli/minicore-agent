@@ -1454,7 +1454,7 @@ async fn run_active_loop(
     session: Session,
     turn: TurnRef,
     agent_loop: AgentLoop,
-    mut events: minicore_runtime::LoopEventStream,
+    events: minicore_runtime::LoopEventStream,
     mut completion: CompletionGuard,
 ) {
     let _ephemeral_cleanup = EphemeralSummaryCleanup {
@@ -1465,6 +1465,49 @@ async fn run_active_loop(
     tests::panic_worker(turn.session_id);
     #[cfg(test)]
     tests::pause_worker(&PAUSE_BEFORE_JOIN, turn.session_id).await;
+    let report = match join_runtime_loop(&session, turn, agent_loop, events).await {
+        Ok(report) => report,
+        Err(_) => {
+            completion.publish_internal();
+            return;
+        }
+    };
+    let sanitized = match normalize_history(report.appended.as_ref()) {
+        Ok(items) => items,
+        Err(_) => {
+            completion.publish_internal();
+            return;
+        }
+    };
+    let stored = reconcile_report(&session, turn, &report, &sanitized);
+    let persistence = persist_report(&session, turn, &stored, &sanitized).await;
+    if persistence == TurnPersistence::Persisted {
+        settle_persisted_projection(&session, turn, &report).await;
+    }
+    let result = Arc::new(TurnResult {
+        turn,
+        report: Arc::clone(&report),
+        persistence,
+    });
+    publish_completion_and_start_compaction(&session, &result, &mut completion).await;
+    // Remain in the owned task so close/shutdown still join auxiliary writes.
+    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
+
+    session.shared.events.try_send(AgentEvent::TurnFinished {
+        turn,
+        outcome: LoopOutcomeView::from_report(&report),
+        persistence,
+        meta: EventMeta::for_turn(turn),
+    });
+    session.emit_state();
+}
+
+async fn join_runtime_loop(
+    session: &Session,
+    turn: TurnRef,
+    agent_loop: AgentLoop,
+    mut events: minicore_runtime::LoopEventStream,
+) -> Result<Arc<LoopReport>, AgentError> {
     let join = agent_loop.join();
     tokio::pin!(join);
     let mut events_open = true;
@@ -1474,7 +1517,7 @@ async fn run_active_loop(
             result = &mut join => break result,
             envelope = events.recv(), if events_open => {
                 match envelope {
-                    Some(envelope) => forward_loop_event(turn.session_id, envelope, &session),
+                    Some(envelope) => forward_loop_event(turn.session_id, envelope, session),
                     None => events_open = false,
                 }
             }
@@ -1485,7 +1528,7 @@ async fn run_active_loop(
     // unnecessary completion dependency. This also accounts for a queued
     // `Finished` envelope without mapping it to Agent `TurnFinished`.
     while let Ok(envelope) = events.try_recv() {
-        forward_loop_event(turn.session_id, envelope, &session);
+        forward_loop_event(turn.session_id, envelope, session);
     }
     // Owned commands of this loop are joined before the report is reconciled
     // and persisted: a dropped tool future must not leave a process behind, and
@@ -1504,25 +1547,23 @@ async fn run_active_loop(
             }
             report
         }
-        Err(_) => {
-            completion.publish_internal();
-            return;
-        }
+        Err(_) => return Err(AgentError::Internal),
     };
+    Ok(report)
+}
 
-    let sanitized = match normalize_history(report.appended.as_ref()) {
-        Ok(items) => items,
-        Err(_) => {
-            completion.publish_internal();
-            return;
-        }
-    };
+fn reconcile_report(
+    session: &Session,
+    turn: TurnRef,
+    report: &LoopReport,
+    sanitized: &[HistoryItem],
+) -> StoredLoopRecord {
     // Durable normalization preserves validated replay but may remove legacy
     // opaque reasoning. Usage from the prior raw projection is then stale.
     session
         .shared
         .compaction
-        .note_normalized_projection(report.appended.as_ref(), sanitized.as_ref());
+        .note_normalized_projection(report.appended.as_ref(), sanitized);
     // The runtime loop is complete regardless of whether the later JSONL
     // append succeeds.
     session.presentation().note_loop_finished();
@@ -1532,15 +1573,15 @@ async fn run_active_loop(
     session
         .shared
         .tool_data
-        .reconcile(turn.session_id, &sanitized);
+        .reconcile(turn.session_id, sanitized);
     let user_item_count = sanitized
         .iter()
         .filter(|item| matches!(item, HistoryItem::User(_)))
         .count();
     let user_times = session.presentation().peek_user_times(user_item_count);
-    let stored = StoredLoopRecord {
+    StoredLoopRecord {
         loop_id: report.loop_id,
-        outcome: StoredLoopOutcome::from_report(&report),
+        outcome: StoredLoopOutcome::from_report(report),
         items: sanitized.to_vec(),
         usage: report.usage,
         requests: report.requests,
@@ -1548,95 +1589,103 @@ async fn run_active_loop(
         final_config_revision: report.final_config_revision,
         completed_at: utc_timestamp().unwrap_or_default(),
         user_times: (!user_times.is_empty()).then_some(user_times),
-    };
+    }
+}
 
-    let persistence = {
-        // The same per-session IO lock serializes this metadata touch with
-        // rename and settings updates; each write starts from current record state.
-        let _io = session.shared.io.lock().await;
-        match session
-            .shared
-            .store
-            .append_loop(turn.session_id, &stored)
-            .await
-        {
-            Ok(()) => {
-                let history = Arc::clone(&session.shared.inner.lock().unwrap().history);
-                let mut merged = Vec::with_capacity(history.len() + sanitized.len());
-                merged.extend(history.iter().cloned());
-                merged.extend(sanitized.iter().cloned());
-                let merged = merged.into();
-                {
-                    let mut inner = session.shared.inner.lock().unwrap();
-                    // Persisted user timestamps align by (loop_id, occurrence).
-                    let mut occurrence = 0usize;
-                    for item in sanitized.iter() {
-                        if let HistoryItem::User(_) = item {
-                            if let Some(Some(time)) = stored
-                                .user_times
-                                .as_ref()
-                                .and_then(|times| times.get(occurrence))
-                            {
-                                Arc::make_mut(&mut inner.user_times)
-                                    .insert((report.loop_id, occurrence), time.clone());
-                            }
-                            occurrence += 1;
-                        }
-                    }
-                    inner.history = merged;
-                    inner.blocked = None;
-                }
-                session.presentation().clear_user_times();
-                touch_updated_at_best_effort(&session).await;
-                TurnPersistence::Persisted
-            }
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %turn.session_id,
-                    loop_id = %turn.loop_id,
-                    error_kind = error.kind(),
-                    "history.jsonl append failed"
-                );
-                if matches!(error, crate::store::AppendError::Unknown) {
-                    session.shared.inner.lock().unwrap().blocked =
-                        Some(SessionBlockReason::Persistence);
-                }
-                TurnPersistence::Failed
-            }
-        }
-    };
-
-    if persistence == TurnPersistence::Persisted {
-        if let Err(kind) = session.settle_emergency_projection(turn, &report).await {
-            session.shared.compaction.note_settlement_failure(
-                turn.loop_id,
-                kind == "emergency_settlement_write_unknown",
-            );
-            if let Some(observation) = session
-                .shared
-                .compaction
-                .recovery_observation()
-                .filter(|observation| observation.loop_id == turn.loop_id)
+async fn persist_report(
+    session: &Session,
+    turn: TurnRef,
+    stored: &StoredLoopRecord,
+    sanitized: &[HistoryItem],
+) -> TurnPersistence {
+    // The same per-session IO lock serializes this metadata touch with
+    // rename and settings updates; each write starts from current record state.
+    let _io = session.shared.io.lock().await;
+    match session
+        .shared
+        .store
+        .append_loop(turn.session_id, stored)
+        .await
+    {
+        Ok(()) => {
+            let history = Arc::clone(&session.shared.inner.lock().unwrap().history);
+            let mut merged = Vec::with_capacity(history.len() + sanitized.len());
+            merged.extend(history.iter().cloned());
+            merged.extend(sanitized.iter().cloned());
+            let merged = merged.into();
             {
-                session.shared.compaction.record_recovery_failure(
-                    turn.loop_id,
-                    observation.request_index,
-                    observation.before_tokens,
-                    observation.utility_usage,
-                    kind,
-                );
+                let mut inner = session.shared.inner.lock().unwrap();
+                // Persisted user timestamps align by (loop_id, occurrence).
+                let mut occurrence = 0usize;
+                for item in sanitized.iter() {
+                    if let HistoryItem::User(_) = item {
+                        if let Some(Some(time)) = stored
+                            .user_times
+                            .as_ref()
+                            .and_then(|times| times.get(occurrence))
+                        {
+                            Arc::make_mut(&mut inner.user_times)
+                                .insert((stored.loop_id, occurrence), time.clone());
+                        }
+                        occurrence += 1;
+                    }
+                }
+                inner.history = merged;
+                inner.blocked = None;
             }
-            tracing::warn!(session_id = %turn.session_id, loop_id = %turn.loop_id,
-                failure_kind = kind, "emergency projection could not be durably settled");
+            session.presentation().clear_user_times();
+            touch_updated_at_best_effort(session).await;
+            TurnPersistence::Persisted
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id = %turn.session_id,
+                loop_id = %turn.loop_id,
+                error_kind = error.kind(),
+                "history.jsonl append failed"
+            );
+            if matches!(error, crate::store::AppendError::Unknown) {
+                session.shared.inner.lock().unwrap().blocked =
+                    Some(SessionBlockReason::Persistence);
+            }
+            TurnPersistence::Failed
         }
     }
+}
 
-    let result = Arc::new(TurnResult {
-        turn,
-        report: Arc::clone(&report),
-        persistence,
-    });
+async fn settle_persisted_projection(session: &Session, turn: TurnRef, report: &LoopReport) {
+    if let Err(kind) = session.settle_emergency_projection(turn, report).await {
+        session
+            .shared
+            .compaction
+            .note_settlement_failure(turn.loop_id, kind == "emergency_settlement_write_unknown");
+        if let Some(observation) = session
+            .shared
+            .compaction
+            .recovery_observation()
+            .filter(|observation| observation.loop_id == turn.loop_id)
+        {
+            session.shared.compaction.record_recovery_failure(
+                turn.loop_id,
+                observation.request_index,
+                observation.before_tokens,
+                observation.utility_usage,
+                kind,
+            );
+        }
+        tracing::warn!(session_id = %turn.session_id, loop_id = %turn.loop_id,
+            failure_kind = kind, "emergency projection could not be durably settled");
+    }
+}
 
+async fn publish_completion_and_start_compaction(
+    session: &Session,
+    result: &Arc<TurnResult>,
+    completion: &mut CompletionGuard,
+) {
+    let turn = result.turn;
+    let report = &result.report;
+    let persistence = result.persistence;
     // Own the join slot before reserving. Reservation excludes the next
     // submit and close captures its cancellation owner under the same lock.
     // There is no await between completion publication and handle installation.
@@ -1657,7 +1706,7 @@ async fn run_active_loop(
         .map(|_| compact::CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation)));
 
     // Authoritative completion precedes summary model work and best-effort events.
-    completion.publish_finished(Arc::clone(&result));
+    completion.publish_finished(Arc::clone(result));
     if let Some(reservation) = reservation {
         *join_slot = Some(tokio::spawn(compact::run_compaction(
             session.clone(),
@@ -1668,17 +1717,6 @@ async fn run_active_loop(
         }
     }
     drop(join_slot);
-
-    // Remain in the owned task so close/shutdown still join auxiliary writes.
-    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
-
-    session.shared.events.try_send(AgentEvent::TurnFinished {
-        turn,
-        outcome: LoopOutcomeView::from_report(&report),
-        persistence,
-        meta: EventMeta::for_turn(turn),
-    });
-    session.emit_state();
 }
 
 async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loop_id: LoopId) {

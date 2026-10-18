@@ -293,7 +293,35 @@ impl RpcServer {
     fn dispatch_inner(&mut self, request: RpcRequest) -> Result<Dispatch, RpcResponse> {
         let RpcRequest { id, method, params } = request;
         tracing::debug!(method = canonical_method(&method), "rpc dispatch");
-        Ok(match method.as_str() {
+        match method.as_str() {
+            name if matches!(name, "session.read" | "turn.result")
+                || name.starts_with("workspace.")
+                || name.starts_with("changes.")
+                || name.starts_with("tool.") =>
+            {
+                self.dispatch_query(id, name, params)
+            }
+            name if name.starts_with("agent.")
+                || name.starts_with("profile.")
+                || name.starts_with("model.") =>
+            {
+                self.dispatch_agent(id, name, params)
+            }
+            name if name.starts_with("session.") => self.dispatch_session(id, name, params),
+            name if name.starts_with("turn.") || name.starts_with("interaction.") => {
+                self.dispatch_turn(id, name, params)
+            }
+            _ => Err(method_not_found(id)),
+        }
+    }
+
+    fn dispatch_agent(
+        &mut self,
+        id: RpcId,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Dispatch, RpcResponse> {
+        Ok(match method {
             "agent.ping" => {
                 let _: EmptyParams = params_or_error(&id, params)?;
                 let result = self.agent().ping();
@@ -341,6 +369,17 @@ impl RpcServer {
                     },
                 ))
             }
+            _ => return Err(method_not_found(id)),
+        })
+    }
+
+    fn dispatch_session(
+        &mut self,
+        id: RpcId,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Dispatch, RpcResponse> {
+        Ok(match method {
             "session.list" => {
                 let _: EmptyParams = params_or_error(&id, params)?;
                 self.admit_operation(&id, None)?;
@@ -513,6 +552,22 @@ impl RpcServer {
                 let result = self.agent().history(params.into());
                 Dispatch::Response(agent_result(&id, result))
             }
+            "session.presentation" => {
+                let params: SessionParams = params_or_error(&id, params)?;
+                let result = self.agent().session_presentation(params.session_id);
+                Dispatch::Response(agent_result(&id, result))
+            }
+            _ => return Err(method_not_found(id)),
+        })
+    }
+
+    fn dispatch_query(
+        &mut self,
+        id: RpcId,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Dispatch, RpcResponse> {
+        Ok(match method {
             "session.read" => {
                 let params: ReadSession = params_or_error(&id, params)?;
                 let request = params;
@@ -650,11 +705,6 @@ impl RpcServer {
                 };
                 self.defer_query(id, query)
             }
-            "session.presentation" => {
-                let params: SessionParams = params_or_error(&id, params)?;
-                let result = self.agent().session_presentation(params.session_id);
-                Dispatch::Response(agent_result(&id, result))
-            }
             "tool.read" => {
                 let params: ToolReadParams = params_or_error(&id, params)?;
                 let request: ToolReadRequest = params.into();
@@ -679,6 +729,29 @@ impl RpcServer {
                     crate::queries::prepare_tool_output(store, tool_data, request, cancellation),
                 )
             }
+            "turn.result" => {
+                let params: TurnResultParams = params_or_error(&id, params)?;
+                let request: TurnResultRequest = params.into();
+                self.admit_query(&id, request.validate())?;
+                let store = self.agent().store_handle();
+                let loaded = self.agent().loaded_session(request.turn.session_id);
+                let cancellation = self.query_cancellation.clone();
+                self.defer_query(
+                    id,
+                    crate::queries::prepare_turn_result(store, loaded, request, cancellation),
+                )
+            }
+            _ => return Err(method_not_found(id)),
+        })
+    }
+
+    fn dispatch_turn(
+        &mut self,
+        id: RpcId,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Dispatch, RpcResponse> {
+        Ok(match method {
             "turn.send" => {
                 let request: SendMessage = params_or_error(&id, params)?;
                 let session_id = request.session_id;
@@ -733,18 +806,6 @@ impl RpcServer {
                     Err(error) => Dispatch::Response(agent_error(id, &error)),
                 }
             }
-            "turn.result" => {
-                let params: TurnResultParams = params_or_error(&id, params)?;
-                let request: TurnResultRequest = params.into();
-                self.admit_query(&id, request.validate())?;
-                let store = self.agent().store_handle();
-                let loaded = self.agent().loaded_session(request.turn.session_id);
-                let cancellation = self.query_cancellation.clone();
-                self.defer_query(
-                    id,
-                    crate::queries::prepare_turn_result(store, loaded, request, cancellation),
-                )
-            }
             "interaction.answer" => {
                 let params: InteractionAnswerParams = params_or_error(&id, params)?;
                 let answer = match params.answer.into_runtime() {
@@ -765,13 +826,7 @@ impl RpcServer {
                     .map(|()| OkResult::TRUE);
                 Dispatch::Response(agent_result(&id, result))
             }
-            _ => Dispatch::Response(RpcResponse::error(
-                Some(id),
-                METHOD_NOT_FOUND,
-                "method not found",
-                "method_not_found",
-                false,
-            )),
+            _ => return Err(method_not_found(id)),
         })
     }
 
@@ -1100,6 +1155,16 @@ where
         Ok(result) => success(id, result),
         Err(error) => agent_error(id.clone(), &error),
     }
+}
+
+fn method_not_found(id: RpcId) -> RpcResponse {
+    RpcResponse::error(
+        Some(id),
+        METHOD_NOT_FOUND,
+        "method not found",
+        "method_not_found",
+        false,
+    )
 }
 
 fn invalid_params(id: Option<RpcId>) -> RpcResponse {
