@@ -920,7 +920,7 @@ async fn stored_turn_page(
     let base = TurnResultPage {
         turn,
         availability: TurnResultAvailability::Stored,
-        outcome: Some(LoopOutcomeView::from_stored(&record.outcome)),
+        outcome: Some(record.outcome.clone()),
         persistence: Some(TurnPersistence::Persisted),
         usage: Some(record.usage),
         requests: Some(record.requests),
@@ -1301,7 +1301,7 @@ impl ReadTurnSummary {
     fn from_stored(summary: &StoredTurnSummary) -> Self {
         Self {
             loop_id: summary.loop_id,
-            outcome: LoopOutcomeView::from_stored(&summary.outcome),
+            outcome: summary.outcome.clone(),
             usage: summary.usage,
             requests: summary.requests,
             tool_rounds: summary.tool_rounds,
@@ -1365,7 +1365,7 @@ fn map_read_store_error(error: crate::error::StoreError) -> AgentError {
         crate::error::StoreError::HistoryChanged => AgentError::InvalidState,
         crate::error::StoreError::QueryLimit => AgentError::QueryLimit,
         crate::error::StoreError::InvalidArguments => AgentError::InvalidArguments,
-        other => crate::sessions::map_store_error(other),
+        other => AgentError::from(other),
     }
 }
 

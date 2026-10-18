@@ -101,6 +101,11 @@ and returns `reload_unavailable`. The Bash credential scrub set is cumulative:
 credential environment names from both the previous and reloaded model catalogs
 remain removed from future Bash children.
 
+RPC reload reads configuration outside the dispatch loop and applies the complete
+candidate atomically. Invalid configuration returns non-retryable `config_error`;
+pending deferred Agent mutations conflict with reload and return `session_busy`.
+Ping, turn cancellation, and shutdown remain available during reload.
+
 A Session copies its selected model/reasoning and the Profile's `tools`,
 `max_tool_rounds`, `approval`, and system-prompt text into its persistent
 Session record at creation. Reload does not retrofit those Profile defaults into

@@ -1,5 +1,6 @@
 //! Manual and independent post-turn compaction share ownership and commit helpers.
 use super::*;
+use crate::error::StoreError;
 
 pub(super) struct CompactionCompletionGuard {
     session: Session,
@@ -119,13 +120,7 @@ impl CompactionOperation {
     }
 
     pub(super) async fn join(&self) -> Result<(), AgentError> {
-        let mut slot = self.join.lock().await;
-        let Some(handle) = slot.as_mut() else {
-            return Ok(());
-        };
-        let result = std::pin::Pin::new(handle).await;
-        slot.take();
-        result.map_err(|_| AgentError::Internal)
+        join_task(&self.join).await
     }
 }
 
@@ -333,6 +328,13 @@ impl Session {
         model: Arc<dyn Model>,
         descriptor: ModelDescriptor,
     ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
+        if self
+            .lock_inner()
+            .used_compaction_ids
+            .contains(&operation_id)
+        {
+            return Err(AgentError::InvalidState);
+        }
         self.cleanup_finished().await?;
         let _io = self.shared.io.lock().await;
         let (operation, receiver) =
@@ -348,10 +350,10 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
-                return Err(AgentError::SessionBusy);
-            }
             if inner.used_compaction_ids.contains(&operation_id) {
+                return Err(AgentError::InvalidState);
+            }
+            if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
             }
             if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
@@ -646,10 +648,7 @@ pub(super) async fn run_compaction(session: Session, reservation: CompactionRese
     let result = run_compaction_inner(&session, &reservation).await;
     completion.publish(result);
     #[cfg(test)]
-    if let Some(gate) = take_pause_after_compaction_result(session.session_id()) {
-        gate.started.notify_one();
-        gate.release.notified().await;
-    }
+    super::tests::pause_worker(&PAUSE_AFTER_COMPACTION_RESULT, session.session_id()).await;
 }
 
 pub(super) async fn run_compaction_inner(

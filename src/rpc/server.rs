@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 
@@ -11,16 +12,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AnswerInteraction, SendMessage};
+use crate::agent::{
+    Agent, AnswerInteraction, CompactSession, CreateSession, RenameSession, SendMessage,
+    UpdateSession,
+};
 use crate::changes::{ChangesListRequest, change_deadline};
 use crate::diff::{ChangesDiffRequest, diff_deadline};
 use crate::error::AgentError;
-use crate::event::{AgentEventStream, HistoryPageView, SessionStateView, TurnResultView};
+use crate::event::{AgentEventStream, SessionStateView, TurnResultView};
 use crate::read::{ReadSession, TurnResultRequest};
 use crate::sessions::{TurnRef, await_compaction_completion, await_turn_completion};
 use crate::tool_data::{ToolOutputRequest, ToolReadRequest};
 use crate::workspace::listing::WorkspaceFilesRequest;
-use crate::workspace::query::{WORKSPACE_READ_DEADLINE, WorkspaceReadRequest};
+use crate::workspace::query::WorkspaceReadRequest;
 use crate::workspace::search::WorkspaceSearchRequest;
 use crate::workspace::status::WorkspaceStatusRequest;
 
@@ -31,11 +35,10 @@ use super::protocol::{
     MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult,
     QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE, RESOURCE_EXHAUSTED, RUNTIME_ERROR,
     RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND,
-    SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionCompactParams, SessionCreateParams,
-    SessionHistoryParams, SessionParams, SessionReadParams, SessionRenameParams, SessionResult,
-    SessionUpdateParams, SessionUpdateResult, SessionsResult, SteerResult, TOOL_NOT_FOUND,
+    SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionHistoryParams, SessionParams,
+    SessionResult, SessionUpdateResult, SessionsResult, SteerResult, TOOL_NOT_FOUND,
     TURN_NOT_FOUND, ToolOutputParams, ToolReadParams, TurnParams, TurnResult, TurnResultParams,
-    TurnSendParams, TurnSteerParams, WORKSPACE_ERROR, decode_params, parse_request, request_id,
+    TurnSteerParams, WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 const OUTBOUND_CAPACITY: usize = 128;
@@ -77,6 +80,8 @@ where
         outbound_tx,
         waiters: JoinSet::new(),
         queries: JoinSet::new(),
+        operations: JoinSet::new(),
+        reservations: HashSet::new(),
         query_cancellation: CancellationToken::new(),
     };
     server
@@ -95,7 +100,39 @@ struct RpcServer {
     outbound_tx: mpsc::Sender<RpcOutbound>,
     waiters: JoinSet<()>,
     queries: JoinSet<()>,
+    operations: JoinSet<DeferredResult>,
+    reservations: HashSet<Reservation>,
     query_cancellation: CancellationToken,
+}
+
+type ApplyOperation = Box<dyn FnOnce(&mut Agent) -> OperationReply + Send>;
+
+enum OperationReply {
+    Response(RpcResponse),
+    Waiter(futures_util::future::BoxFuture<'static, RpcResponse>),
+}
+
+impl From<RpcResponse> for OperationReply {
+    fn from(response: RpcResponse) -> Self {
+        Self::Response(response)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+enum Reservation {
+    Session(crate::ids::SessionId),
+    Reload,
+}
+
+#[cfg(test)]
+static OPERATION_GATES: crate::test_support::Registry<
+    Reservation,
+    std::sync::Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
+struct DeferredResult {
+    reservation: Option<Reservation>,
+    apply: ApplyOperation,
 }
 
 enum Dispatch {
@@ -156,6 +193,16 @@ impl RpcServer {
                         }
                     };
                 }
+                operation = self.operations.join_next(), if !self.operations.is_empty() => {
+                    match operation.expect("nonempty operations") {
+                        Ok(result) => {
+                            if self.complete_operation(result).await.is_err() {
+                                break StopReason::WriterStopped;
+                            }
+                        }
+                        Err(_) => break StopReason::Error(AgentError::Internal),
+                    }
+                }
                 waiter = self.waiters.join_next(), if !self.waiters.is_empty() => {
                     if waiter.is_some_and(|result| result.is_err()) {
                         tracing::warn!(kind = "waiter_join", "rpc waiter failed");
@@ -197,7 +244,7 @@ impl RpcServer {
                                     break StopReason::WriterStopped;
                                 }
                             }
-                            Ok(request) => match self.dispatch(request).await {
+                            Ok(request) => match self.dispatch(request) {
                                 Dispatch::Response(response) => {
                                     if self.send(response).await.is_err() {
                                         break StopReason::WriterStopped;
@@ -222,14 +269,14 @@ impl RpcServer {
         .await
     }
 
-    async fn dispatch(&mut self, request: RpcRequest) -> Dispatch {
-        match self.dispatch_inner(request).await {
+    fn dispatch(&mut self, request: RpcRequest) -> Dispatch {
+        match self.dispatch_inner(request) {
             Ok(dispatch) => dispatch,
             Err(response) => Dispatch::Response(response),
         }
     }
 
-    async fn dispatch_inner(&mut self, request: RpcRequest) -> Result<Dispatch, RpcResponse> {
+    fn dispatch_inner(&mut self, request: RpcRequest) -> Result<Dispatch, RpcResponse> {
         let RpcRequest { id, method, params } = request;
         tracing::debug!(method = canonical_method(&method), "rpc dispatch");
         Ok(match method.as_str() {
@@ -240,8 +287,23 @@ impl RpcServer {
             }
             "agent.reload" => {
                 let _: EmptyParams = params_or_error(&id, params)?;
-                let result = self.agent_mut().reload().await;
-                Dispatch::Response(agent_result(&id, result))
+                self.admit_operation(&id, Some(Reservation::Reload))?;
+                let future = self
+                    .agent()
+                    .prepare_reload()
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                self.defer_operation(Some(Reservation::Reload), async move {
+                    let result = future.await;
+                    Box::new(move |agent: &mut Agent| {
+                        agent_result(
+                            &id,
+                            result.and_then(|(config, models)| {
+                                agent.apply_reload_settings(config, models)
+                            }),
+                        )
+                        .into()
+                    }) as ApplyOperation
+                })
             }
             "agent.shutdown" => {
                 let _: EmptyParams = params_or_error(&id, params)?;
@@ -267,48 +329,104 @@ impl RpcServer {
             }
             "session.list" => {
                 let _: EmptyParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent()
-                    .list_sessions()
-                    .await
-                    .map(|sessions| SessionsResult { sessions });
-                Dispatch::Response(agent_result(&id, result))
+                self.admit_operation(&id, None)?;
+                let store = self.agent().store_handle();
+                self.defer_operation(None, async move {
+                    let result = store.list_sessions().await.map_err(AgentError::from);
+                    Box::new(move |agent: &mut Agent| {
+                        agent_result(
+                            &id,
+                            result.map(|records| SessionsResult {
+                                sessions: agent.session_infos(records),
+                            }),
+                        )
+                        .into()
+                    }) as ApplyOperation
+                })
             }
             "session.create" => {
-                let params: SessionCreateParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent_mut()
-                    .create_session(params.into())
-                    .await
-                    .map(|session| SessionResult { session });
-                Dispatch::Response(agent_result(&id, result))
+                let request: CreateSession = params_or_error(&id, params)?;
+                self.admit_operation(&id, None)?;
+                let session_id = crate::ids::SessionId::new()
+                    .map_err(|_| agent_error(id.clone(), &AgentError::Internal))?;
+                let future = self
+                    .agent()
+                    .prepare_create(request, session_id)
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                self.defer_operation(Some(Reservation::Session(session_id)), async move {
+                    let result = future.await;
+                    Box::new(move |agent: &mut Agent| {
+                        agent_result(
+                            &id,
+                            result.map(|(stored, workspace, setup)| SessionResult {
+                                session: agent.install_session(stored, workspace, setup),
+                            }),
+                        )
+                        .into()
+                    }) as ApplyOperation
+                })
             }
             "session.open" => {
                 let params: SessionParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent_mut()
-                    .open_session(params.session_id)
-                    .await
-                    .map(|session| SessionResult { session });
-                Dispatch::Response(agent_result(&id, result))
+                let session_id = params.session_id;
+                self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                if let Some(session) = self.agent().loaded_session(session_id) {
+                    Dispatch::Response(success(
+                        &id,
+                        SessionResult {
+                            session: session.info(true),
+                        },
+                    ))
+                } else {
+                    let store = self.agent().store_handle();
+                    self.defer_operation(Some(Reservation::Session(session_id)), async move {
+                        let result = Agent::prepare_open(store, session_id).await;
+                        Box::new(move |agent: &mut Agent| {
+                            agent_result(
+                                &id,
+                                result
+                                    .and_then(|prepared| agent.install_open(prepared))
+                                    .map(|session| SessionResult { session }),
+                            )
+                            .into()
+                        }) as ApplyOperation
+                    })
+                }
             }
             "session.close" => {
                 let params: SessionParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent_mut()
-                    .close_session(params.session_id)
-                    .await
-                    .map(|()| OkResult::TRUE);
-                Dispatch::Response(agent_result(&id, result))
+                let session_id = params.session_id;
+                self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                let session = self
+                    .agent()
+                    .loaded_session(session_id)
+                    .ok_or_else(|| agent_error(id.clone(), &AgentError::SessionNotLoaded))?;
+                session.begin_shutdown();
+                self.defer_operation(Some(Reservation::Session(session_id)), async move {
+                    let result = session.join_shutdown().await;
+                    Box::new(move |agent: &mut Agent| {
+                        agent.finish_close(session_id);
+                        agent_result(&id, result.map(|()| OkResult::TRUE)).into()
+                    }) as ApplyOperation
+                })
             }
             "session.delete" => {
                 let params: SessionParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent_mut()
-                    .delete_session(params.session_id)
-                    .await
-                    .map(|()| OkResult::TRUE);
-                Dispatch::Response(agent_result(&id, result))
+                let session_id = params.session_id;
+                self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                if self.agent().loaded_session(session_id).is_some() {
+                    return Err(agent_error(id, &AgentError::SessionAlreadyLoaded));
+                }
+                let store = self.agent().store_handle();
+                self.defer_operation(Some(Reservation::Session(session_id)), async move {
+                    let result = store
+                        .delete_session(session_id)
+                        .await
+                        .map_err(AgentError::from);
+                    Box::new(move |_: &mut Agent| {
+                        agent_result(&id, result.map(|()| OkResult::TRUE)).into()
+                    }) as ApplyOperation
+                })
             }
             "session.state" => {
                 let params: SessionParams = params_or_error(&id, params)?;
@@ -324,90 +442,74 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.compact" => {
-                let params: SessionCompactParams = params_or_error(&id, params)?;
-                // Reserve waiter capacity before starting the Session-owned
-                // operation, so a full waiter set never launches a compaction
-                // that cannot be awaited.
-                if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
-                    return Err(resource_exhausted(id));
-                }
-                match self.agent_mut().compact_session(params.into()).await {
-                    Ok(receiver) => {
-                        let outbound = self.outbound_tx.clone();
-                        self.waiters.spawn(async move {
-                            let response = match await_compaction_completion(receiver).await {
-                                Ok(result) => success(&id, result),
-                                Err(error) => agent_error(id, &error),
-                            };
-                            let _ = outbound.send(RpcOutbound::Response(response)).await;
-                        });
-                        Dispatch::Deferred
-                    }
-                    Err(error) => Dispatch::Response(agent_error(id, &error)),
-                }
+                let request: CompactSession = params_or_error(&id, params)?;
+                let reservation = Some(Reservation::Session(request.session_id));
+                self.admit_operation(&id, reservation)?;
+                let future = self
+                    .agent()
+                    .prepare_compact(request)
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                self.defer_operation(reservation, async move {
+                    let result = future.await;
+                    Box::new(move |_: &mut Agent| match result {
+                        Ok(receiver) => OperationReply::Waiter(Box::pin(async move {
+                            agent_result(&id, await_compaction_completion(receiver).await)
+                        })),
+                        Err(error) => agent_error(id, &error).into(),
+                    }) as ApplyOperation
+                })
             }
             "session.compact.cancel" => {
-                let params: SessionCompactParams = params_or_error(&id, params)?;
+                let params: CompactSession = params_or_error(&id, params)?;
                 let result = self
                     .agent()
-                    .cancel_compaction(params.into())
+                    .cancel_compaction(params)
                     .map(|cancelled| CancelledResult { cancelled });
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.update" => {
-                let params: SessionUpdateParams = params_or_error(&id, params)?;
-                if !params.has_field() {
+                let request: UpdateSession = params_or_error(&id, params)?;
+                if !request.has_field() {
                     return Err(invalid_params(Some(id)));
                 }
-                let result = self
-                    .agent_mut()
-                    .update_session(params.into())
-                    .await
-                    .map(SessionUpdateResult::from);
-                Dispatch::Response(agent_result(&id, result))
+                self.admit_operation(&id, Some(Reservation::Session(request.session_id)))?;
+                let session_id = request.session_id;
+                let future = self
+                    .agent()
+                    .prepare_update(request)
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                self.defer_response(id, Some(Reservation::Session(session_id)), async move {
+                    future.await.map(SessionUpdateResult::from)
+                })
             }
             "session.rename" => {
-                let params: SessionRenameParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent_mut()
-                    .rename_session(params.into())
-                    .await
-                    .map(|session| SessionResult { session });
-                Dispatch::Response(agent_result(&id, result))
+                let request: RenameSession = params_or_error(&id, params)?;
+                let session_id = request.session_id;
+                self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                let future = self
+                    .agent()
+                    .prepare_rename(request)
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                self.defer_response(id, Some(Reservation::Session(session_id)), async move {
+                    future.await.map(|session| SessionResult { session })
+                })
             }
             "session.history" => {
                 let params: SessionHistoryParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent()
-                    .history(params.into())
-                    .map(|page| HistoryPageView::from(&page));
+                let result = self.agent().history(params.into());
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.read" => {
-                let params: SessionReadParams = params_or_error(&id, params)?;
-                let request: ReadSession = params.into();
-                if let Err(error) = request.validate() {
-                    return Err(query_error(id, &error));
-                }
-                if !self.query_capacity_available() {
-                    return Err(resource_exhausted(id));
-                }
+                let params: ReadSession = params_or_error(&id, params)?;
+                let request = params;
+                self.admit_query(&id, request.validate())?;
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.session_id);
                 let cancellation = self.query_cancellation.clone();
-                // The outer read timeout stays here, in the future the helper
-                // only encodes; `QueryLimit` maps the same way as before.
-                self.defer_query(id, async move {
-                    match tokio::time::timeout(
-                        crate::read::READ_DEADLINE,
-                        crate::read::read_session(store, loaded, request, cancellation),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(AgentError::QueryLimit),
-                    }
-                })
+                self.defer_query(
+                    id,
+                    crate::queries::prepare_session_read(store, loaded, request, cancellation),
+                )
             }
             "workspace.read" => {
                 let request: WorkspaceReadRequest = params_or_error(&id, params)?;
@@ -422,28 +524,11 @@ impl RpcServer {
                 if !self.query_capacity_available() {
                     return Err(resource_exhausted(id));
                 }
-                let session_cancellation = session.query_cancellation();
-                let workspace = session.workspace();
-                drop(session);
                 let cancellation = self.query_cancellation.clone();
-                // The outer read timeout stays here, in the future the helper
-                // only encodes.
-                self.defer_query(id, async move {
-                    match tokio::time::timeout(
-                        WORKSPACE_READ_DEADLINE,
-                        crate::workspace::query::read(
-                            workspace,
-                            request,
-                            session_cancellation,
-                            cancellation,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(AgentError::QueryLimit),
-                    }
-                })
+                self.defer_query(
+                    id,
+                    crate::queries::prepare_workspace_read(session, request, cancellation),
+                )
             }
             "workspace.files" => {
                 let request: WorkspaceFilesRequest = params_or_error(&id, params)?;
@@ -456,21 +541,10 @@ impl RpcServer {
                 if !self.query_capacity_available() {
                     return Err(resource_exhausted(id));
                 }
-                let session_cancellation = session.query_cancellation();
-                let workspace = session.workspace();
-                drop(session);
                 let cancellation = self.query_cancellation.clone();
-                // The scan owns one retained blocking worker and enforces its
-                // own deadline, so an outer timeout here would drop the worker
-                // join instead of cancelling it.
                 self.defer_query(
                     id,
-                    crate::workspace::listing::files(
-                        workspace,
-                        request,
-                        session_cancellation,
-                        cancellation,
-                    ),
+                    crate::queries::prepare_workspace_files(session, request, cancellation),
                 )
             }
             "workspace.search" => {
@@ -484,19 +558,10 @@ impl RpcServer {
                 if !self.query_capacity_available() {
                     return Err(resource_exhausted(id));
                 }
-                let session_cancellation = session.query_cancellation();
-                let workspace = session.workspace();
-                drop(session);
                 let cancellation = self.query_cancellation.clone();
-                // Same retained-worker contract as `workspace.files`.
                 self.defer_query(
                     id,
-                    crate::workspace::search::search(
-                        workspace,
-                        request,
-                        session_cancellation,
-                        cancellation,
-                    ),
+                    crate::queries::prepare_workspace_search(session, request, cancellation),
                 )
             }
             "workspace.status" => {
@@ -529,12 +594,7 @@ impl RpcServer {
             }
             "changes.list" => {
                 let request: ChangesListRequest = params_or_error(&id, params)?;
-                if let Err(error) = request.validate() {
-                    return Err(query_error(id, &error));
-                }
-                if !self.query_capacity_available() {
-                    return Err(resource_exhausted(id));
-                }
+                self.admit_query(&id, request.validate())?;
                 let deadline = change_deadline();
                 let cancellation = self.query_cancellation.clone();
                 let store = self.agent().store_handle();
@@ -556,12 +616,7 @@ impl RpcServer {
             }
             "changes.diff" => {
                 let request: ChangesDiffRequest = params_or_error(&id, params)?;
-                if let Err(error) = request.validate() {
-                    return Err(query_error(id, &error));
-                }
-                if !self.query_capacity_available() {
-                    return Err(resource_exhausted(id));
-                }
+                self.admit_query(&id, request.validate())?;
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.session_id);
                 let deadline = diff_deadline();
@@ -589,61 +644,44 @@ impl RpcServer {
             "tool.read" => {
                 let params: ToolReadParams = params_or_error(&id, params)?;
                 let request: ToolReadRequest = params.into();
-                if let Err(error) = request.validate() {
-                    return Err(query_error(id, &error));
-                }
-                if !self.query_capacity_available() {
-                    return Err(resource_exhausted(id));
-                }
+                self.admit_query(&id, request.validate())?;
                 let store = self.agent().store_handle();
                 let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
                 let cancellation = self.query_cancellation.clone();
                 self.defer_query(
                     id,
-                    crate::read::tool_read(store, tool_data, request, cancellation),
+                    crate::queries::prepare_tool_read(store, tool_data, request, cancellation),
                 )
             }
             "tool.output" => {
                 let params: ToolOutputParams = params_or_error(&id, params)?;
                 let request: ToolOutputRequest = params.into();
-                if let Err(error) = request.validate() {
-                    return Err(query_error(id, &error));
-                }
-                if !self.query_capacity_available() {
-                    return Err(resource_exhausted(id));
-                }
+                self.admit_query(&id, request.validate())?;
                 let store = self.agent().store_handle();
                 let tool_data = self.agent().tool_data(request.tool_ref.session_id).ok();
                 let cancellation = self.query_cancellation.clone();
                 self.defer_query(
                     id,
-                    crate::read::tool_output(store, tool_data, request, cancellation),
+                    crate::queries::prepare_tool_output(store, tool_data, request, cancellation),
                 )
             }
             "turn.send" => {
-                let params: TurnSendParams = params_or_error(&id, params)?;
-                if minicore_runtime::execution::UserInput::text(&params.text).is_err() {
-                    return Err(invalid_params(Some(id)));
-                }
-                let submission = self
-                    .agent_mut()
-                    .submit_accepted(SendMessage {
-                        session_id: params.session_id,
-                        text: params.text,
+                let request: SendMessage = params_or_error(&id, params)?;
+                let session_id = request.session_id;
+                let input = minicore_runtime::execution::UserInput::text(request.text)
+                    .map_err(|_| invalid_params(Some(id.clone())))?;
+                self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                let future = self
+                    .agent()
+                    .prepare_submit(session_id, input)
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                self.defer_response(id, Some(Reservation::Session(session_id)), async move {
+                    let crate::sessions::LoopSubmission::Accepted(accepted) = future.await?;
+                    Ok(TurnResult {
+                        turn: accepted.turn,
+                        accepted_at: accepted.accepted_at,
                     })
-                    .await;
-                match submission {
-                    Ok(crate::sessions::LoopSubmission::Accepted(accepted)) => {
-                        Dispatch::Response(success(
-                            &id,
-                            TurnResult {
-                                turn: accepted.turn,
-                                accepted_at: accepted.accepted_at,
-                            },
-                        ))
-                    }
-                    Err(error) => Dispatch::Response(agent_error(id, &error)),
-                }
+                })
             }
             "turn.steer" => {
                 let params: TurnSteerParams = params_or_error(&id, params)?;
@@ -669,20 +707,14 @@ impl RpcServer {
                 let params: TurnParams = params_or_error(&id, params)?;
                 match self.agent().wait_turn_receiver(params.into()) {
                     Ok(receiver) => {
-                        if self.waiters.len() + self.queries.len() >= MAX_DEFERRED_WAITERS {
+                        if self.deferred_count() >= MAX_DEFERRED_WAITERS {
                             return Err(resource_exhausted(id));
                         }
-                        let outbound = self.outbound_tx.clone();
-                        self.waiters.spawn(async move {
-                            let response = match await_turn_completion(receiver).await {
-                                Ok(result) => {
-                                    success(&id, TurnResultView::from_turn_result(&result))
-                                }
-                                Err(error) => agent_error(id, &error),
-                            };
-                            let _ = outbound.send(RpcOutbound::Response(response)).await;
-                        });
-                        Dispatch::Deferred
+                        self.defer_waiter(id, async move {
+                            await_turn_completion(receiver)
+                                .await
+                                .map(|result| TurnResultView::from_turn_result(&result))
+                        })
                     }
                     Err(error) => Dispatch::Response(agent_error(id, &error)),
                 }
@@ -690,27 +722,14 @@ impl RpcServer {
             "turn.result" => {
                 let params: TurnResultParams = params_or_error(&id, params)?;
                 let request: TurnResultRequest = params.into();
-                if let Err(error) = request.validate() {
-                    return Err(query_error(id, &error));
-                }
-                if !self.query_capacity_available() {
-                    return Err(resource_exhausted(id));
-                }
+                self.admit_query(&id, request.validate())?;
                 let store = self.agent().store_handle();
                 let loaded = self.agent().loaded_session(request.turn.session_id);
                 let cancellation = self.query_cancellation.clone();
-                // Same outer read timeout as `session.read`, kept in the future.
-                self.defer_query(id, async move {
-                    match tokio::time::timeout(
-                        crate::read::READ_DEADLINE,
-                        crate::read::turn_result(store, loaded, request, cancellation),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(AgentError::QueryLimit),
-                    }
-                })
+                self.defer_query(
+                    id,
+                    crate::queries::prepare_turn_result(store, loaded, request, cancellation),
+                )
             }
             "interaction.answer" => {
                 let params: InteractionAnswerParams = params_or_error(&id, params)?;
@@ -724,12 +743,11 @@ impl RpcServer {
                 };
                 let result = self
                     .agent()
-                    .answer(AnswerInteraction {
+                    .answer_interaction(AnswerInteraction {
                         turn,
                         interaction_id: params.interaction_id,
                         answer,
                     })
-                    .await
                     .map(|()| OkResult::TRUE);
                 Dispatch::Response(agent_result(&id, result))
             }
@@ -766,6 +784,87 @@ impl RpcServer {
         Dispatch::Deferred
     }
 
+    fn defer_waiter<T: Serialize + Send + 'static>(
+        &mut self,
+        id: RpcId,
+        future: impl Future<Output = Result<T, AgentError>> + Send + 'static,
+    ) -> Dispatch {
+        let outbound = self.outbound_tx.clone();
+        self.waiters.spawn(async move {
+            let response = agent_result(&id, future.await);
+            let _ = outbound.send(RpcOutbound::Response(response)).await;
+        });
+        Dispatch::Deferred
+    }
+
+    fn defer_response<T: Serialize + Send + 'static>(
+        &mut self,
+        id: RpcId,
+        reservation: Option<Reservation>,
+        future: impl Future<Output = Result<T, AgentError>> + Send + 'static,
+    ) -> Dispatch {
+        self.defer_operation(reservation, async move {
+            let result = future.await;
+            Box::new(move |_: &mut Agent| agent_result(&id, result).into()) as ApplyOperation
+        })
+    }
+
+    fn deferred_count(&self) -> usize {
+        self.waiters.len() + self.queries.len() + self.operations.len()
+    }
+
+    fn admit_operation(
+        &self,
+        id: &RpcId,
+        reservation: Option<Reservation>,
+    ) -> Result<(), RpcResponse> {
+        if self.reservations.contains(&Reservation::Reload)
+            || (reservation == Some(Reservation::Reload) && !self.operations.is_empty())
+            || reservation.is_some_and(|id| self.reservations.contains(&id))
+        {
+            return Err(agent_error(id.clone(), &AgentError::SessionBusy));
+        }
+        if self.deferred_count() >= MAX_DEFERRED_WAITERS {
+            return Err(resource_exhausted(id.clone()));
+        }
+        Ok(())
+    }
+
+    fn defer_operation(
+        &mut self,
+        reservation: Option<Reservation>,
+        future: impl Future<Output = ApplyOperation> + Send + 'static,
+    ) -> Dispatch {
+        if let Some(id) = reservation {
+            self.reservations.insert(id);
+        }
+        self.operations.spawn(async move {
+            #[cfg(test)]
+            tests::pause_operation(reservation).await;
+            DeferredResult {
+                reservation,
+                apply: future.await,
+            }
+        });
+        Dispatch::Deferred
+    }
+
+    async fn complete_operation(&mut self, result: DeferredResult) -> Result<(), ()> {
+        if let Some(id) = result.reservation {
+            self.reservations.remove(&id);
+        }
+        match (result.apply)(self.agent_mut()) {
+            OperationReply::Response(response) => self.send(response).await,
+            OperationReply::Waiter(future) => {
+                let outbound = self.outbound_tx.clone();
+                self.waiters.spawn(async move {
+                    let _ = outbound.send(RpcOutbound::Response(future.await)).await;
+                });
+                Ok(())
+            }
+        }
+    }
+
     async fn send(&self, response: RpcResponse) -> Result<(), ()> {
         self.outbound_tx
             .send(RpcOutbound::Response(response))
@@ -798,6 +897,16 @@ impl RpcServer {
         };
 
         self.query_cancellation.cancel();
+        self.agent().begin_shutdown();
+        while let Some(result) = self.operations.join_next().await {
+            match result {
+                Ok(result) => {
+                    let _ = self.complete_operation(result).await;
+                }
+                Err(_) if primary_error.is_none() => primary_error = Some(AgentError::Internal),
+                Err(_) => {}
+            }
+        }
         let shutdown_result = self
             .agent
             .take()
@@ -856,9 +965,20 @@ impl RpcServer {
         self.agent.as_mut().expect("Agent is present while serving")
     }
 
+    fn admit_query(
+        &self,
+        id: &RpcId,
+        validation: Result<(), AgentError>,
+    ) -> Result<(), RpcResponse> {
+        validation.map_err(|error| query_error(id.clone(), &error))?;
+        if !self.query_capacity_available() {
+            return Err(resource_exhausted(id.clone()));
+        }
+        Ok(())
+    }
+
     fn query_capacity_available(&self) -> bool {
-        self.queries.len() < MAX_DEFERRED_QUERIES
-            && self.waiters.len() + self.queries.len() < MAX_DEFERRED_WAITERS
+        self.queries.len() < MAX_DEFERRED_QUERIES && self.deferred_count() < MAX_DEFERRED_WAITERS
     }
 }
 
@@ -1047,6 +1167,7 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             false,
         ),
         AgentError::Workspace => (WORKSPACE_ERROR, "workspace error", "workspace_error", false),
+        AgentError::StoreUnavailable => (STORE_ERROR, "store error", "store_error", true),
         AgentError::Store => (STORE_ERROR, "store error", "store_error", false),
         AgentError::SteerQueueFull => (
             STEER_QUEUE_FULL,
@@ -1082,8 +1203,13 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             return invalid_params(Some(id));
         }
         AgentError::QueryLimit => (QUERY_LIMIT, "query limit reached", "query_limit", true),
-        AgentError::Config(_)
-        | AgentError::Internal
+        AgentError::Config(_) => (
+            super::protocol::CONFIG_ERROR,
+            "configuration error",
+            "config_error",
+            false,
+        ),
+        AgentError::Internal
         | AgentError::EventStreamTaken
         | AgentError::InvalidArguments
         | AgentError::RpcSerialization
@@ -1093,43 +1219,48 @@ fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
     RpcResponse::error(Some(id), code, message, kind, retryable)
 }
 
+const METHODS: &[&str] = &[
+    "agent.ping",
+    "agent.reload",
+    "agent.shutdown",
+    "profile.list",
+    "model.list",
+    "session.list",
+    "session.create",
+    "session.open",
+    "session.close",
+    "session.delete",
+    "session.state",
+    "session.context",
+    "session.compact",
+    "session.compact.cancel",
+    "session.update",
+    "session.rename",
+    "session.history",
+    "session.read",
+    "session.presentation",
+    "workspace.read",
+    "workspace.files",
+    "workspace.search",
+    "workspace.status",
+    "changes.list",
+    "changes.diff",
+    "tool.read",
+    "tool.output",
+    "turn.send",
+    "turn.steer",
+    "turn.cancel",
+    "turn.wait",
+    "turn.result",
+    "interaction.answer",
+];
+
 fn canonical_method(method: &str) -> &'static str {
-    match method {
-        "agent.ping" => "agent.ping",
-        "agent.reload" => "agent.reload",
-        "agent.shutdown" => "agent.shutdown",
-        "profile.list" => "profile.list",
-        "model.list" => "model.list",
-        "session.list" => "session.list",
-        "session.create" => "session.create",
-        "session.open" => "session.open",
-        "session.close" => "session.close",
-        "session.delete" => "session.delete",
-        "session.state" => "session.state",
-        "session.context" => "session.context",
-        "session.compact" => "session.compact",
-        "session.compact.cancel" => "session.compact.cancel",
-        "session.update" => "session.update",
-        "session.rename" => "session.rename",
-        "session.history" => "session.history",
-        "session.read" => "session.read",
-        "session.presentation" => "session.presentation",
-        "workspace.read" => "workspace.read",
-        "workspace.files" => "workspace.files",
-        "workspace.search" => "workspace.search",
-        "workspace.status" => "workspace.status",
-        "changes.list" => "changes.list",
-        "changes.diff" => "changes.diff",
-        "tool.read" => "tool.read",
-        "tool.output" => "tool.output",
-        "turn.send" => "turn.send",
-        "turn.steer" => "turn.steer",
-        "turn.cancel" => "turn.cancel",
-        "turn.wait" => "turn.wait",
-        "turn.result" => "turn.result",
-        "interaction.answer" => "interaction.answer",
-        _ => "unknown",
-    }
+    METHODS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == method)
+        .unwrap_or("unknown")
 }
 
 async fn read_frame<R>(reader: &mut R, frame: &mut Vec<u8>) -> io::Result<Frame>

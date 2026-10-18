@@ -60,6 +60,8 @@ pub enum AgentError {
     Workspace,
     #[error("store error")]
     Store,
+    #[error("store is temporarily unavailable")]
+    StoreUnavailable,
     #[error("the operation is not valid in the current state")]
     InvalidState,
     #[error("configuration reload requires restart")]
@@ -128,6 +130,24 @@ impl StoreError {
             Self::HistoryChanged => "history_changed",
             Self::QueryLimit => "query_limit",
             Self::InvalidArguments => "invalid_arguments",
+        }
+    }
+}
+
+impl From<StoreError> for AgentError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::SessionNotFound => AgentError::SessionNotFound,
+            StoreError::SessionAlreadyExists
+            | StoreError::InvalidRoot
+            | StoreError::InvalidRecord
+            | StoreError::UnsupportedFormat
+            | StoreError::Corrupt
+            | StoreError::RecordTooLarge => AgentError::Store,
+            StoreError::Unavailable => AgentError::StoreUnavailable,
+            StoreError::HistoryChanged => AgentError::InvalidState,
+            StoreError::QueryLimit => AgentError::QueryLimit,
+            StoreError::InvalidArguments => AgentError::InvalidArguments,
         }
     }
 }

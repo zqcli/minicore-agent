@@ -1,3 +1,12 @@
+mod core;
+
+pub(super) async fn pause_operation(reservation: Option<super::Reservation>) {
+    if let Some(gate) = reservation.and_then(|key| super::OPERATION_GATES.take(&key)) {
+        gate.pass().await;
+    }
+}
+
+use crate::test_support::Gate;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::pending;
 use std::io;
@@ -34,12 +43,11 @@ use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
 use crate::read::{ToolReadGate, gate_next_tool_read};
-use crate::sessions::{WorkerGate, pause_next_compaction_after_result};
+use crate::sessions::PAUSE_AFTER_COMPACTION_RESULT;
 use crate::store::{
     SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
     force_unknown_summary_write, gate_next_summary_commit,
 };
-use crate::test_support::Gate;
 use crate::workspace::query::READ_GATES;
 use crate::workspace::scan::{ScanHold, hold_next_scan};
 
@@ -2578,6 +2586,22 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
 
     harness
         .send(
+            json!("reused-id"),
+            "session.compact",
+            Some(json!({
+                "session_id": session_id,
+                "operation_id": "compact-cancel-1"
+            })),
+        )
+        .await;
+    let reused = harness.response(json!("reused-id")).await;
+    assert_eq!(
+        reused["error"]["data"],
+        json!({"kind": "invalid_state", "retryable": false})
+    );
+
+    harness
+        .send(
             json!("busy-send"),
             "turn.send",
             Some(json!({"session_id": session_id, "text": "not admitted"})),
@@ -2661,8 +2685,8 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
     let _ = harness.response(json!("wait")).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_compaction_after_result(
+    let gate = Arc::new(Gate::new());
+    PAUSE_AFTER_COMPACTION_RESULT.arm(
         session_id.as_str().unwrap().parse().unwrap(),
         Arc::clone(&gate),
     );
@@ -4783,6 +4807,8 @@ async fn deferred_query_capacity_is_four_with_shared_total_limit() {
         outbound_tx,
         waiters: tokio::task::JoinSet::new(),
         queries: tokio::task::JoinSet::new(),
+        operations: tokio::task::JoinSet::new(),
+        reservations: std::collections::HashSet::new(),
         query_cancellation: CancellationToken::new(),
     };
     for _ in 0..MAX_DEFERRED_QUERIES {
@@ -5510,8 +5536,11 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
     // Closing the owning Session cancels the four started queries.
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("cap-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32020));
-        assert_eq!(response["error"]["data"]["kind"], json!("query_limit"));
+        assert_eq!(response["error"]["code"], json!(-32002));
+        assert_eq!(
+            response["error"]["data"]["kind"],
+            json!("session_not_loaded")
+        );
     }
 
     // The reader reaps the finished queries and admits a new one, and the
@@ -5808,8 +5837,11 @@ async fn closing_a_session_cancels_pending_workspace_scans_and_frees_capacity() 
     // Closing the owning Session cancels the four started scans.
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("scan-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32020));
-        assert_eq!(response["error"]["data"]["kind"], json!("query_limit"));
+        assert_eq!(response["error"]["code"], json!(-32002));
+        assert_eq!(
+            response["error"]["data"]["kind"],
+            json!("session_not_loaded")
+        );
     }
 
     // The reader reaps the finished queries and admits a new one, and the
@@ -6433,7 +6465,7 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
     );
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("diff-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32020));
+        assert_eq!(response["error"]["code"], json!(-32002));
     }
 
     harness.shutdown().await;
@@ -6504,7 +6536,7 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
     );
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("cl-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32020));
+        assert_eq!(response["error"]["code"], json!(-32002));
     }
 
     harness.shutdown().await;
@@ -6640,7 +6672,7 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     );
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("cap-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32020));
+        assert_eq!(response["error"]["code"], json!(-32002));
     }
 
     harness.shutdown().await;
@@ -6741,7 +6773,7 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
         json!({"ok": true})
     );
     let held = harness.response(json!("cl-held")).await;
-    assert_eq!(held["error"]["code"], json!(-32020));
+    assert_eq!(held["error"]["code"], json!(-32002));
 
     harness.shutdown().await;
     remove_base(&base).await;
@@ -6847,7 +6879,7 @@ async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     // Closing the owning Session cancels the started status queries.
     for index in 0..MAX_DEFERRED_QUERIES {
         let response = harness.response(json!(format!("status-{index}"))).await;
-        assert_eq!(response["error"]["code"], json!(-32020));
+        assert_eq!(response["error"]["code"], json!(-32002));
     }
     // The freed slots are usable again by the surviving Session.
     harness

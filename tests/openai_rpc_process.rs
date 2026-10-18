@@ -635,10 +635,10 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
         .send("missing-prompt", "agent.reload", json!({}))
         .await;
     let missing_prompt = process.response("missing-prompt").await;
-    assert_eq!(missing_prompt["error"]["code"], json!(-32603));
+    assert_eq!(missing_prompt["error"]["code"], json!(-32023));
     assert_eq!(
         missing_prompt["error"]["data"]["kind"],
-        json!("internal_error")
+        json!("config_error")
     );
     assert!(!missing_prompt.to_string().contains("missing.md"));
 
@@ -652,12 +652,12 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     );
     process.send("missing", "agent.reload", json!({})).await;
     let missing = process.response("missing").await;
-    assert_eq!(missing["error"]["code"], json!(-32603));
-    assert_eq!(missing["error"]["message"], json!("internal error"));
+    assert_eq!(missing["error"]["code"], json!(-32023));
+    assert_eq!(missing["error"]["message"], json!("configuration error"));
     assert_eq!(
         missing["error"]["data"],
         json!({
-            "kind": "internal_error",
+            "kind": "config_error",
             "retryable": false,
         })
     );
@@ -841,8 +841,11 @@ async fn process_reload_cumulatively_scrubs_previous_model_credentials_from_bash
         .send("reload-invalid", "agent.reload", json!({}))
         .await;
     let invalid = process.response("reload-invalid").await;
-    assert_eq!(invalid["error"]["code"], json!(-32603));
-    assert_eq!(invalid["error"]["data"]["kind"], json!("internal_error"));
+    assert_eq!(invalid["error"]["code"], json!(-32023));
+    assert_eq!(
+        invalid["error"]["data"],
+        json!({"kind": "config_error", "retryable": false})
+    );
 
     let (_, existing_wait) = process
         .send_turn_and_register_wait("existing", &existing_session, "probe existing session")

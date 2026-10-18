@@ -604,8 +604,7 @@ pub(crate) async fn resolve_tool_change(
     }
     let scan = store
         .list_tool_changes(session_id, None, cancellation, deadline)
-        .await
-        .map_err(crate::sessions::map_store_error)?;
+        .await?;
     for (tool_ref, stored) in &scan.records {
         if stored_tool_change_ref(tool_ref, stored) != change_ref {
             continue;
@@ -824,16 +823,14 @@ async fn compare_sources(
 ) -> Result<DiffResult, AgentError> {
     let context_lines = request.context_lines();
     let max_bytes = request.max_bytes();
-    let query = store
-        .spawn_cancellable_diff_query(
-            request.session_id,
-            Arc::clone(&before_bytes),
-            Arc::clone(&after_bytes),
-            context_lines,
-            deadline,
-            &cancellation,
-        )
-        .map_err(crate::sessions::map_store_error)?;
+    let query = store.spawn_cancellable_diff_query(
+        request.session_id,
+        Arc::clone(&before_bytes),
+        Arc::clone(&after_bytes),
+        context_lines,
+        deadline,
+        &cancellation,
+    )?;
     let outcome = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(AgentError::QueryLimit),

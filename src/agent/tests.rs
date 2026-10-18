@@ -1,3 +1,7 @@
+mod core;
+
+use super::ReloadResult;
+use crate::test_support::Gate;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -30,9 +34,8 @@ use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
 use crate::read::ReadSession;
 use crate::sessions::{
-    LoopSubmission, RuntimeStartGate, WorkerGate, panic_next_worker,
-    pause_next_compaction_after_result, pause_next_runtime_start_before_bind,
-    pause_next_worker_before_join,
+    LoopSubmission, PANIC_WORKERS, PAUSE_AFTER_COMPACTION_RESULT, PAUSE_AFTER_RUNTIME_START,
+    PAUSE_BEFORE_JOIN,
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
@@ -1978,7 +1981,7 @@ async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
             title: "Should not persist".to_owned(),
         })
         .await;
-    assert!(matches!(result, Err(AgentError::Store)));
+    assert!(matches!(result, Err(AgentError::StoreUnavailable)));
     let in_memory = agent.list_sessions().await.unwrap()[0].clone();
     assert_eq!(in_memory.title, info.title);
     assert_eq!(in_memory.updated_at, before.updated_at);
@@ -3551,8 +3554,8 @@ async fn active_shutdown_waits_for_the_session_owned_worker() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
     let _turn = send_text(&mut agent, info.session_id, "shutdown").await;
     gate.wait_started().await;
 
@@ -3575,8 +3578,8 @@ async fn close_after_post_turn_result_still_joins_the_operation_worker() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_compaction_after_result(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_AFTER_COMPACTION_RESULT.arm(info.session_id, Arc::clone(&gate));
     let session = agent.loaded_session(info.session_id).unwrap();
     let submission = session
         .submit(minicore_runtime::execution::UserInput::text("wait").unwrap())
@@ -3770,8 +3773,8 @@ async fn cancelling_close_future_keeps_normal_worker_owned_until_second_join() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
 
     let turn = send_text(&mut agent, info.session_id, "close later").await;
     gate.wait_started().await;
@@ -3832,8 +3835,8 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
         .unwrap();
     agent.open_session(info.session_id).await.unwrap();
 
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_compaction_after_result(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_AFTER_COMPACTION_RESULT.arm(info.session_id, Arc::clone(&gate));
     let result = agent
         .compact(CompactSession {
             session_id: info.session_id,
@@ -3931,7 +3934,7 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    panic_next_worker(info.session_id);
+    PANIC_WORKERS.arm(info.session_id, ());
 
     let turn = send_text(&mut agent, info.session_id, "panic").await;
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), agent.wait_turn(turn))
@@ -4531,7 +4534,8 @@ async fn f2_02_running_loop_keeps_its_request_and_uses_new_options_next_request(
     // The running loop keeps the options it captured at `AgentLoop::start`,
     // even though the future options now carry the candidate model's timeout.
     assert_eq!(
-        crate::sessions::installed_loop_options_for_test(turn.loop_id)
+        crate::sessions::INSTALLED_LOOP_OPTIONS
+            .get(&turn.loop_id)
             .expect("the running loop must record its install-time options")
             .prompt_timeout,
         std::time::Duration::from_secs(31)
@@ -4595,7 +4599,8 @@ async fn f2_03_close_and_reopen_rederives_installed_future_options() {
     let turn = send_text(&mut agent, info.session_id, "after reopen").await;
     // The reopened loop must derive exactly the options the pre-close update
     // installed, so a future Turn and a reopen cannot drift apart.
-    let started = crate::sessions::installed_loop_options_for_test(turn.loop_id)
+    let started = crate::sessions::INSTALLED_LOOP_OPTIONS
+        .get(&turn.loop_id)
         .expect("the reopened loop records its install-time options");
     assert_eq!(started.prompt_timeout, installed.prompt_timeout);
     assert_eq!(started.max_tool_rounds, installed.max_tool_rounds);
@@ -4683,7 +4688,7 @@ async fn f2_04_invalid_and_failed_updates_leave_future_state_unchanged() {
             reasoning: Some(ReasoningPreference::Disabled),
         })
         .await;
-    assert!(matches!(failed, Err(AgentError::Store)));
+    assert!(matches!(failed, Err(AgentError::StoreUnavailable)));
     assert_eq!(
         agent.sessions.get(info.session_id).unwrap().record().model,
         "main"
@@ -4742,8 +4747,8 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
         before_options.prompt_timeout,
         std::time::Duration::from_secs(31)
     );
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
     let turn = send_text(&mut agent, info.session_id, "finish").await;
     gate.wait_started().await;
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -4827,8 +4832,8 @@ async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
     assert_eq!(before.trigger_tokens, Some(12_800));
 
     // Seal the Runtime loop before the worker joins, then update.
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
     let turn = send_text(&mut agent, info.session_id, "finish").await;
     gate.wait_started().await;
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -4912,7 +4917,7 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
     let second_session = agent.loaded_session(second.session_id).unwrap();
     let first_data = first_session.tool_data();
     let first_owners = first_session.command_owners();
-    let first_observer = first_session.tool_observer();
+    let first_observer = first_session.parts().observer;
     assert!(Arc::ptr_eq(&first_data, &first_observer.tool_data()));
     assert_eq!(first_observer.session_id(), first.session_id);
     assert!(!Arc::ptr_eq(&first_data, &second_session.tool_data()));
@@ -4931,7 +4936,10 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
         .unwrap();
     assert!(Arc::ptr_eq(&first_data, &first_session.tool_data()));
     assert!(Arc::ptr_eq(&first_owners, &first_session.command_owners()));
-    assert!(Arc::ptr_eq(&first_observer, &first_session.tool_observer()));
+    assert!(Arc::ptr_eq(
+        &first_observer,
+        &first_session.parts().observer
+    ));
 
     let candidate = agent.config().clone();
     let models = Models::from_values(BTreeMap::from([
@@ -4949,7 +4957,10 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
     );
     assert!(Arc::ptr_eq(&first_data, &first_session.tool_data()));
     assert!(Arc::ptr_eq(&first_owners, &first_session.command_owners()));
-    assert!(Arc::ptr_eq(&first_observer, &first_session.tool_observer()));
+    assert!(Arc::ptr_eq(
+        &first_observer,
+        &first_session.parts().observer
+    ));
 }
 
 #[tokio::test]
@@ -4966,7 +4977,7 @@ async fn i2_05_session_observation_resources_are_released_without_cycles() {
     let session = agent.loaded_session(info.session_id).unwrap();
     let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
     let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
-    let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.tool_observer());
+    let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.parts().observer);
     drop(session);
 
     agent.close_session(info.session_id).await.unwrap();
@@ -6111,8 +6122,8 @@ async fn join_first_drains_queued_finished_without_duplicate_agent_completion() 
     .await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_worker_before_join(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_BEFORE_JOIN.arm(info.session_id, Arc::clone(&gate));
     let turn = send_text(&mut agent, info.session_id, "join first").await;
 
     gate.wait_started().await;
@@ -7081,8 +7092,8 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
     .await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(RuntimeStartGate::new());
-    pause_next_runtime_start_before_bind(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_AFTER_RUNTIME_START.arm(info.session_id, Arc::clone(&gate));
 
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
     let send_agent = Arc::clone(&agent);
@@ -9174,7 +9185,7 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     );
     assert_eq!(session.active_status_workers(), 0);
     // The unpolled future never saw a success; it observes the cancellation.
-    assert!(matches!(prepared.await, Err(AgentError::QueryLimit)));
+    assert!(matches!(prepared.await, Err(AgentError::SessionNotLoaded)));
 }
 
 /// P2b: `prepare_changes_diff` registers the Session-owned source worker
@@ -9903,7 +9914,7 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     let session = agent.loaded_session(info.session_id).unwrap();
     let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
     let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
-    let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.tool_observer());
+    let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.parts().observer);
     drop(session);
 
     let turn = send_text(&mut agent, info.session_id, "run bash").await;
@@ -10136,7 +10147,8 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
             .active_revision
             .expect("the loop accepts the update");
         assert_eq!(
-            crate::sessions::installed_loop_options_for_test(turn.loop_id)
+            crate::sessions::INSTALLED_LOOP_OPTIONS
+                .get(&turn.loop_id)
                 .expect("the running loop recorded install options")
                 .prompt_timeout,
             std::time::Duration::from_secs(31),
@@ -10214,7 +10226,8 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
 
         // Turn 2: the next Turn uses the candidate options and the new model.
         let second = send_text(&mut agent, info.session_id, "next turn").await;
-        let next_options = crate::sessions::installed_loop_options_for_test(second.loop_id)
+        let next_options = crate::sessions::INSTALLED_LOOP_OPTIONS
+            .get(&second.loop_id)
             .expect("the next loop recorded install options");
         assert_eq!(
             next_options.prompt_timeout,
@@ -11626,8 +11639,8 @@ async fn f1_native_write_changes_keep_the_first_request_identity() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(RuntimeStartGate::new());
-    pause_next_runtime_start_before_bind(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    PAUSE_AFTER_RUNTIME_START.arm(info.session_id, Arc::clone(&gate));
 
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
     let send_agent = Arc::clone(&agent);
@@ -13405,3 +13418,49 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
 }
 
 mod recent_tail;
+
+impl Agent {
+    pub(crate) async fn open_with_models(
+        config: AgentConfig,
+        models: Models,
+    ) -> Result<Self, AgentError> {
+        config.validate().map_err(AgentError::Config)?;
+        Self::open_parts(config, models, None).await
+    }
+    pub(crate) fn reload_settings_with_models(
+        &mut self,
+        candidate: AgentConfig,
+        models: Models,
+    ) -> Result<ReloadResult, AgentError> {
+        candidate.validate().map_err(AgentError::Config)?;
+        if candidate.data_dir != self.config.data_dir
+            || candidate.event_capacity != self.config.event_capacity
+        {
+            return Err(AgentError::ReloadRequiresRestart);
+        }
+        self.apply_reload_settings(candidate, models)
+    }
+    pub(crate) fn abort_active_task_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<(), AgentError> {
+        let session = self.session(session_id)?;
+        session.abort_active_task()
+    }
+    pub(crate) fn runtime_loop_finished_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<bool, AgentError> {
+        let session = self.session(session_id)?;
+        Ok(session.runtime_loop_finished())
+    }
+    pub(crate) fn forward_runtime_event_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+        envelope: minicore_runtime::LoopEventEnvelope,
+    ) -> Result<(), AgentError> {
+        let session = self.session(session_id)?;
+        crate::sessions::forward_loop_event(session_id, envelope, session);
+        Ok(())
+    }
+}

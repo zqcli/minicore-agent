@@ -721,7 +721,7 @@ pub(crate) async fn list_tool_changes(
     {
         Ok(scan) => scan,
         Err(error) => {
-            let mapped = crate::sessions::map_store_error(error);
+            let mapped = AgentError::from(error);
             if matches!(&mapped, AgentError::QueryLimit) || warm_records.is_empty() {
                 return Err(mapped);
             }
@@ -826,8 +826,7 @@ pub(crate) async fn list_tool_changes(
                 deadline,
                 &mut blob_budget,
             )
-            .await
-            .map_err(crate::sessions::map_store_error)?;
+            .await?;
         record.details_available = available;
         if blob_budget.exhausted {
             complete = false;

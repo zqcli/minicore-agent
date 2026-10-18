@@ -42,6 +42,18 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
   ownership boundary; independent Agent processes sharing a data directory are
   unsupported.
 
+The RPC dispatcher admits requests synchronously. Slow work runs in owned,
+bounded tasks whose completed results are applied with exclusive Agent access.
+Session lifecycle mutations reserve the affected ID until completion; reload
+reserves catalog replacement against concurrent deferred mutations. Shutdown
+signals all Sessions before joining any, drains deferred operations, and joins
+Session barriers concurrently. The loaded map retains Sessions until their
+workers are joined.
+
+Events use derived tagged serialization, and stored outcomes and public outcome
+views share the same redacted types. Byte-level event and history-record golden
+tests protect the existing wire and storage formats.
+
 ## Warm, Live, And Cold Data
 
 A loaded Session serves warm reads from its committed in-memory snapshots. A

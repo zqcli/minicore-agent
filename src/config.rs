@@ -183,7 +183,7 @@ impl AgentConfig {
             }
         }
         self.compaction.validate()?;
-        self.loop_options(32).map(|_| ())
+        self.loop_options().map(|_| ())
     }
 
     pub(crate) fn profiles(&self) -> Profiles {
@@ -194,34 +194,25 @@ impl AgentConfig {
     /// defaults and this config's `[loop]` overrides. Legacy stored/profile
     /// round budgets remain readable but no longer stop normal agent turns.
     /// Runtime `LoopLimits` are not configurable in this phase.
-    pub(crate) fn loop_options(&self, _max_tool_rounds: u16) -> Result<LoopOptions, ConfigError> {
+    pub(crate) fn loop_options(&self) -> Result<LoopOptions, ConfigError> {
         let mut options =
             LoopOptions::default_checked().map_err(|_| ConfigError::InvalidLoopOptions)?;
         options.max_tool_rounds = 0;
         let overrides = &self.loop_options;
-        if let Some(value) = overrides.event_capacity {
-            options.event_capacity = value;
+        macro_rules! apply_overrides {
+            ($($field:ident = $value:expr),+ $(,)?) => {
+                $(if let Some(value) = $value { options.$field = value; })+
+            };
         }
-        if let Some(value) = overrides.max_pending_steers {
-            options.max_pending_steers = value;
-        }
-        if let Some(value) = overrides.prompt_timeout_seconds {
-            options.prompt_timeout = Duration::from_secs(value);
-        }
-        if let Some(value) = overrides.model_timeout_seconds {
-            options.model_timeout = Duration::from_secs(value);
-        }
-        if let Some(value) = overrides.policy_timeout_seconds {
-            options.policy_timeout = Duration::from_secs(value);
-        }
-        if let Some(value) = overrides.tool_timeout_seconds {
-            options.tool_timeout = Duration::from_secs(value);
-        }
-        if let Some(value) = overrides.model_retry_attempts {
-            options.model_retry_attempts = value;
-        }
-        if let Some(value) = overrides.model_retry_base_delay_millis {
-            options.model_retry_base_delay = Duration::from_millis(value);
+        apply_overrides! {
+            event_capacity = overrides.event_capacity,
+            max_pending_steers = overrides.max_pending_steers,
+            prompt_timeout = overrides.prompt_timeout_seconds.map(Duration::from_secs),
+            model_timeout = overrides.model_timeout_seconds.map(Duration::from_secs),
+            policy_timeout = overrides.policy_timeout_seconds.map(Duration::from_secs),
+            tool_timeout = overrides.tool_timeout_seconds.map(Duration::from_secs),
+            model_retry_attempts = overrides.model_retry_attempts,
+            model_retry_base_delay = overrides.model_retry_base_delay_millis.map(Duration::from_millis),
         }
         options
             .validate()
@@ -229,30 +220,13 @@ impl AgentConfig {
         Ok(options)
     }
 
-    /// Returns loop options with the automatic prompt-preparation budget
-    /// widened to cover at least one configured model operation. The regular
-    /// `loop_options` path remains unchanged for disabled/manual behavior.
-    pub(crate) fn loop_options_for_automatic(
-        &self,
-        max_tool_rounds: u16,
-    ) -> Result<LoopOptions, ConfigError> {
-        let mut options = self.loop_options(max_tool_rounds)?;
-        if self.compaction.enabled {
-            options.prompt_timeout = options.prompt_timeout.max(options.model_timeout);
-            options
-                .validate()
-                .map_err(|_| ConfigError::InvalidLoopOptions)?;
-        }
-        Ok(options)
-    }
-
     pub(crate) fn loop_options_for_model(
         &self,
-        max_tool_rounds: u16,
         model_id: &str,
     ) -> Result<LoopOptions, ConfigError> {
-        let mut options = self.loop_options_for_automatic(max_tool_rounds)?;
+        let mut options = self.loop_options()?;
         if self.compaction.enabled {
+            options.prompt_timeout = options.prompt_timeout.max(options.model_timeout);
             if let Some(model) = self.models.get(model_id) {
                 if let Some(timeout) = model.request_timeout() {
                     options.prompt_timeout = options.prompt_timeout.max(timeout);

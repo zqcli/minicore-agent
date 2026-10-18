@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use minicore_runtime::LoopId;
 use minicore_runtime::execution::ConfigRevision;
 use minicore_runtime::history::HistoryItem;
-use minicore_runtime::model::{ModelError, ModelErrorKind, RetryHint, Usage};
+use minicore_runtime::model::{ModelErrorKind, Usage};
 use minicore_runtime::tools::ToolResultOutcome;
 
 use crate::changes::{ChangeRevision, StoredFileChange};
@@ -450,59 +450,7 @@ impl StoredLoopRecord {
     }
 }
 
-/// Stored record of how a loop ended. This is record-keeping only; it never
-/// reconstructs a runtime `LoopReport`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum StoredLoopOutcome {
-    Completed,
-    Cancelled {
-        reason: StoredCancelReason,
-    },
-    Failed {
-        kind: String,
-        model_error: Option<StoredModelError>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StoredCancelReason {
-    User,
-    OwnerDropped,
-    Shutdown,
-    Deadline,
-}
-
-/// Safe, redacted model failure summary. Provider bodies, diagnostic text,
-/// API keys, and prompts are never persisted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct StoredModelError {
-    pub(crate) kind: String,
-    pub(crate) delivery: String,
-    pub(crate) retryable: bool,
-    pub(crate) retry_after_millis: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) local_context_budget: Option<crate::event::LocalContextBudgetFailure>,
-}
-
-impl StoredModelError {
-    pub(crate) fn from_model(error: &ModelError) -> Self {
-        let retry_after_millis = match error.retry_hint() {
-            RetryHint::Never => None,
-            RetryHint::Retryable { retry_after } => {
-                retry_after.and_then(|duration| u64::try_from(duration.as_millis()).ok())
-            }
-        };
-        Self {
-            kind: model_error_kind(error.kind()),
-            delivery: delivery_state(error.delivery()),
-            retryable: error.diagnostic().retryable,
-            retry_after_millis,
-            local_context_budget: crate::event::LocalContextBudgetFailure::from_model(error),
-        }
-    }
-}
+pub(crate) use crate::event::LoopOutcomeView as StoredLoopOutcome;
 
 pub(crate) fn model_error_kind(kind: ModelErrorKind) -> String {
     match kind {
