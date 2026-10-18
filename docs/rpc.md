@@ -70,7 +70,8 @@ be recovered.
 ## Frame Interleaving
 
 All output passes through one bounded channel and one writer task, so every
-stdout line is complete and frames are never byte-interleaved. Ordinary
+stdout line is complete and frames are never byte-interleaved. The writer encodes
+successful responses once and flushes each bounded batch of queued frames. Ordinary
 requests are admitted sequentially, but disk work and worker joins run in bounded
 owned tasks. This includes `agent.reload`, `session.list/create/open/close/delete`,
 `session.update/rename/compact`, `turn.send/wait`, and all read queries. Completed
@@ -108,8 +109,10 @@ history query results, not the event stream.
 `agent.shutdown` first marks every loaded Session closing and broadcasts
 cancellation to its active loop, compaction, and queries. It then drains deferred
 operations and joins Sessions concurrently, plus pre-existing waiter/query tasks
-and the event pump, before queuing its response last. EOF, Ctrl-C,
+and the event pump, before queuing its response last. EOF, Ctrl-C, SIGTERM on Unix,
 writer failure, and explicit shutdown enter the same owned-task shutdown path.
+The binary exits after that barrier even when stdin remains open; it does not
+wait for Tokio's parked blocking stdin read.
 Closing or shutting down an active Session uses Runtime shutdown cancellation,
 so the turn outcome records `{"type":"cancelled","reason":"shutdown"}` when
 that request wins the Runtime completion race. A prior cancellation or completed
@@ -940,7 +943,7 @@ non-retryable) rather than a nearby match.
 
 In the RPC server, `tool.read` and `tool.output` are deferred queries executed
 in the query pool under a 10-second deadline. They are bounded by the 4-query
-concurrency ceiling and count against the shared 32-entry deferred admission
+concurrency ceiling and count against the shared 64-entry deferred admission
 capacity; requests exceeding capacity are rejected with `-32019`
 (`resource_exhausted`, retryable). Loaded Sessions serve complete records
 directly from memory with zero disk IO. Unloaded Sessions or records whose stream
@@ -1827,7 +1830,24 @@ Mapping: no active loop and not blocked is `idle`; a blocked Session is
 All events are notifications `{"jsonrpc":"2.0","method":"agent.event",...}`.
 Every event carries `params.data.meta` with `session_id`, an optional
 `loop_id`, and `dropped_before` counting best-effort drops preceding that
-event. Session lifecycle events do not carry `data.turn`; loop-scoped events
+event. This is one counter for the combined consumer-visible stream: Runtime
+reports and drops from either queue accumulate until the next event is dequeued,
+then are attached exactly once. Drops after the last delivered event cannot be
+reported without a subsequent event.
+
+Lifecycle events have a separate 64-entry queue, drained before streaming events.
+The configured `event_capacity` bounds the streaming queue. Output deltas, Tool
+progress, process chunks without command-state updates, and intermediate argument-preview
+revisions use streaming capacity. Preview start/first-input snapshots (revisions
+1–2) and generated/discarded transitions use lifecycle capacity; all other events (including Session/compaction state,
+turn/interaction transitions, and terminal Tool facts) use lifecycle capacity.
+Streaming floods cannot exhaust lifecycle capacity, but a lifecycle-only flood
+can still drop events. Both queues are bounded and non-blocking; authoritative
+queries remain necessary for recovery. Order is FIFO within a queue, not across
+queues: a terminal event can precede older queued deltas. Consumers must not
+infer execution order from that cross-queue delivery order.
+
+Session lifecycle events do not carry `data.turn`; loop-scoped events
 carry the exact `{session_id, loop_id}` reference in `data.turn` plus
 `request_index` where relevant.
 

@@ -339,7 +339,7 @@ async fn shutdown_signal_is_observed_while_a_close_is_pending() {
 
 #[test]
 fn method_labels_cover_exactly_the_dispatch_table() {
-    let source = include_str!("../../server.rs");
+    let source = include_str!("../../server/dispatch.rs");
     let dispatch = source
         .split("match method.as_str() {")
         .nth(1)

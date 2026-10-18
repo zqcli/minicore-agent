@@ -61,6 +61,29 @@ Runtime's `history::estimate_history_bytes` is the single admission estimator fo
 start checks, context queries, and compaction triggers. Context queries skip the
 byte scan above the item cap; otherwise they report the full estimate.
 
+## Core Modules
+
+- `sessions.rs` retains Session ownership and shared state. Its child modules
+  separate public types, the loaded registry, status-worker ownership, active-loop
+  execution, event mapping, and context-budget views. `compact.rs` retains
+  compaction ownership and commits.
+- The active-loop task names its join/drain, reconciliation, persistence,
+  projection settlement, and completion/compaction-handoff phases. Publication
+  still precedes auxiliary persistence; the owned task remains the close/join
+  barrier for those writes.
+- `rpc/server.rs` owns deferred tasks and shutdown. `server/dispatch.rs` separates
+  agent, session, query, and turn admission; `errors.rs` owns error mapping and
+  response construction; `io.rs` owns signals, framing, event pumping, and batched
+  output. Success responses carry pre-encoded JSON rather than an intermediate
+  `Value` tree.
+- `agent/session_setup.rs` builds the Session's execution resources and persisted
+  settings. Installation and index publication remain on the Agent.
+
+Lifecycle and streaming events have separate bounded queues. The event stream
+prioritizes lifecycle delivery and accounts for drops when dequeuing, so queue
+priority cannot duplicate or misplace drop counts. Loaded read snapshots share
+immutable timestamp maps; writers copy only when a reader still holds a snapshot.
+
 ## Warm, Live, And Cold Data
 
 A loaded Session serves warm reads from its committed in-memory snapshots. A

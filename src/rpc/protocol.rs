@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use minicore_runtime::interaction::InteractionAnswer;
@@ -51,22 +51,11 @@ pub(crate) struct RpcRequest {
     pub(crate) params: Option<Value>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
 pub(crate) enum RpcId {
     Number(serde_json::Number),
     String(String),
-}
-
-impl Serialize for RpcId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Number(value) => value.serialize(serializer),
-            Self::String(value) => value.serialize(serializer),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,14 +393,8 @@ impl OkResult {
 }
 
 #[derive(Serialize)]
-pub(crate) struct RpcResponse {
-    pub(crate) jsonrpc: &'static str,
-    pub(crate) id: Option<RpcId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<RpcError>,
-}
+#[serde(transparent)]
+pub(crate) struct RpcResponse(Box<serde_json::value::RawValue>);
 
 #[derive(Serialize)]
 pub(crate) struct RpcError {
@@ -427,13 +410,23 @@ pub(crate) struct RpcErrorData {
 }
 
 impl RpcResponse {
-    pub(crate) fn success(id: RpcId, result: Value) -> Self {
-        Self {
-            jsonrpc: JSONRPC_VERSION,
-            id: Some(id),
-            result: Some(result),
-            error: None,
+    pub(crate) fn success<T: Serialize>(id: RpcId, result: T) -> Result<Self, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Success<T> {
+            jsonrpc: &'static str,
+            id: RpcId,
+            result: T,
         }
+        serde_json::value::to_raw_value(&Success {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result,
+        })
+        .map(Self)
+    }
+
+    pub(crate) fn encoded(&self) -> &[u8] {
+        self.0.get().as_bytes()
     }
 
     pub(crate) fn error(
@@ -443,34 +436,32 @@ impl RpcResponse {
         kind: &'static str,
         retryable: bool,
     ) -> Self {
-        Self {
-            jsonrpc: JSONRPC_VERSION,
-            id,
-            result: None,
-            error: Some(RpcError {
-                code,
-                message,
-                data: RpcErrorData { kind, retryable },
-            }),
+        #[derive(Serialize)]
+        struct Failure {
+            jsonrpc: &'static str,
+            id: Option<RpcId>,
+            error: RpcError,
         }
+        Self(
+            serde_json::value::to_raw_value(&Failure {
+                jsonrpc: JSONRPC_VERSION,
+                id,
+                error: RpcError {
+                    code,
+                    message,
+                    data: RpcErrorData { kind, retryable },
+                },
+            })
+            .expect("RPC errors contain only JSON scalars"),
+        )
     }
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
 pub(crate) enum RpcOutbound {
     Response(RpcResponse),
     Event(Box<AgentEventNotification>),
-}
-
-impl Serialize for RpcOutbound {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Response(response) => response.serialize(serializer),
-            Self::Event(notification) => notification.serialize(serializer),
-        }
-    }
 }
 
 #[derive(Serialize)]

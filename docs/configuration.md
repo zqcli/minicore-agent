@@ -13,7 +13,8 @@ minicore-agent --config ./example.agent.toml --stdio
 
 - `data_dir` is required and must be non-empty. A relative path is interpreted
   from the process working directory; it is not rebased to the config file.
-- `event_capacity` defaults to `256` and is bounded to `1..=4096`.
+- `event_capacity` bounds the streaming-event queue, defaults to `256`, and is
+  bounded to `1..=4096`. Lifecycle events have a separate fixed 64-entry queue.
 - `default_profile` is required and must name an entry in `profiles`.
 - `profiles` and `models` are required non-empty tables.
 - `[loop]` is optional. Its fields are Runtime option overrides:

@@ -199,6 +199,21 @@ macro_rules! event_meta {
 }
 
 impl AgentEvent {
+    fn is_lifecycle(&self) -> bool {
+        match self {
+            Self::OutputDelta { .. } | Self::ToolProgress { .. } => false,
+            Self::ToolArgumentsPreview {
+                revision, state, ..
+            } => {
+                // Protect the start, first input snapshot, and terminal transitions.
+                *revision <= 2
+                    || *state != crate::presentation::ToolArgumentsPreviewState::Generating
+            }
+            Self::ToolProcess { data, .. } => data.command.is_some(),
+            _ => true,
+        }
+    }
+
     pub(crate) fn dropped_before(&self) -> u64 {
         self.meta().dropped_before
     }
@@ -237,11 +252,12 @@ pub(crate) enum AgentSendResult {
     Closed,
 }
 
-/// Cloneable sender that merges runtime-envelope drops and its own bounded
-/// queue drops into the next delivered event's `dropped_before`.
+/// Independent bounded lanes keep streaming traffic out of lifecycle capacity.
+/// Drops are attached at dequeue, in consumer-visible rather than enqueue order.
 #[derive(Clone)]
 pub(crate) struct AgentEventSink {
     sender: mpsc::Sender<AgentEvent>,
+    lifecycle: mpsc::Sender<AgentEvent>,
     drop_state: Arc<Mutex<DropState>>,
 }
 
@@ -250,11 +266,23 @@ struct DropState {
 }
 
 impl AgentEventSink {
-    pub(crate) fn new(sender: mpsc::Sender<AgentEvent>) -> Self {
-        Self {
-            sender,
-            drop_state: Arc::new(Mutex::new(DropState { pending: 0 })),
-        }
+    pub(crate) fn channel(capacity: usize) -> (Self, AgentEventStream) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (lifecycle, lifecycle_rx) = mpsc::channel(64);
+        let drop_state = Arc::new(Mutex::new(DropState { pending: 0 }));
+        let stream = AgentEventStream {
+            receiver,
+            lifecycle: lifecycle_rx,
+            drop_state: Arc::clone(&drop_state),
+        };
+        (
+            Self {
+                sender,
+                lifecycle,
+                drop_state,
+            },
+            stream,
+        )
     }
 
     pub(crate) fn try_send(&self, mut event: AgentEvent) -> AgentSendResult {
@@ -262,19 +290,18 @@ impl AgentEventSink {
             .drop_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.sender.is_closed() {
-            return AgentSendResult::Closed;
-        }
-        let own_drops = event.dropped_before();
-        let reported = pending.pending.saturating_add(own_drops);
-        event.set_dropped_before(reported);
-        match self.sender.try_send(event) {
-            Ok(()) => {
-                pending.pending = 0;
-                AgentSendResult::Sent
-            }
+        pending.pending = pending.pending.saturating_add(event.dropped_before());
+        // recv replaces this enqueue snapshot with delivery-order accounting.
+        event.set_dropped_before(pending.pending);
+        let sender = if event.is_lifecycle() {
+            &self.lifecycle
+        } else {
+            &self.sender
+        };
+        match sender.try_send(event) {
+            Ok(()) => AgentSendResult::Sent,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                pending.pending = pending.pending.saturating_add(own_drops).saturating_add(1);
+                pending.pending = pending.pending.saturating_add(1);
                 AgentSendResult::Dropped
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AgentSendResult::Closed,
@@ -641,19 +668,27 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Requests one paginated history slice through an Agent-owned session.
-/// Public single-consumer agent event stream.
+/// Single-consumer event stream, prioritizing lifecycle over queued streaming data.
 pub struct AgentEventStream {
     receiver: mpsc::Receiver<AgentEvent>,
+    lifecycle: mpsc::Receiver<AgentEvent>,
+    drop_state: Arc<Mutex<DropState>>,
 }
 
 impl AgentEventStream {
-    pub(crate) fn new(receiver: mpsc::Receiver<AgentEvent>) -> Self {
-        Self { receiver }
-    }
-
     pub async fn recv(&mut self) -> Option<AgentEvent> {
-        self.receiver.recv().await
+        let mut event = tokio::select! {
+            biased;
+            Some(event) = self.lifecycle.recv() => event,
+            Some(event) = self.receiver.recv() => event,
+            else => return None,
+        };
+        let mut drops = self
+            .drop_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        event.set_dropped_before(std::mem::take(&mut drops.pending));
+        Some(event)
     }
 }
 
