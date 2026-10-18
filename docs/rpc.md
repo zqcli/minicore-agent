@@ -1954,7 +1954,8 @@ recognizer is not the Runtime's input validator.
 There is no cumulative raw-argument buffer. Retained sanitized display strings
 are capped at 128 KiB per call and 512 KiB per model stream, with at most 16
 previewed calls. The accounting includes allocated String capacity, not only
-visible byte length. Buffers grow geometrically within their remaining capacity
+visible byte length. A content-first write reserves up to 32 charged bytes for
+a later path prefix before retaining its body. Buffers grow geometrically within their remaining capacity
 budget; spare allocation can therefore make a preview truncate earlier. Paths have the existing 512-byte detail cap, key recognition
 retains at most 32 bytes, and JSON nesting is capped at 64. Input is scanned
 incrementally once rather than reparsing every prefix; capped fields stop
@@ -1973,6 +1974,10 @@ is created. The existing bounded event queue may drop any snapshot, including
 the first or last. Later snapshots are independently usable; no client-side
 JSON concatenation is needed. A receiver must not trigger `tool.read`,
 `tool.output`, or process timing for a provisional call.
+
+A panic inside preview observation disables previews for that stream without
+changing model events or usage reporting. Any orphaned card is cleared at the
+authoritative turn boundary, like a dropped discard event.
 
 The stream must see both `Finish` and normal EOF to leave previews pending for
 an invocation. Errors, early drops (including assembler rejection), cancellation,

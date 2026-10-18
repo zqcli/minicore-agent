@@ -563,11 +563,11 @@ pub(crate) fn encoded_display_items<'a>(
         let summaries = keys.into_iter().map(|(key, name)| {
             let call = calls.get(&key);
             let result = results.get(&key);
-            let mut display = crate::presentation::build_tool_card_display(name, call.map(|call| call.arguments()));
+            let mut display = crate::presentation::tool_card_counts(name, call.map(|call| call.arguments()));
             let input_truncated = display.body_truncated;
             let (output_line_count, output_truncated) = result.map(|result| {
-                let (body, truncated) = crate::presentation::bounded_result_content(result.output.content().as_str(), crate::presentation::MAX_RESULT_DISPLAY_BYTES);
-                (Some(crate::presentation::count_lines(&body)), truncated)
+                let (lines, truncated) = crate::presentation::result_line_count(result.output.content().as_str());
+                (Some(lines), truncated)
             }).unwrap_or((None, false));
             let count_state = if result.is_none() {
                 if display.input_line_count.unwrap_or(0) > 0 { "lower_bound" } else { "unknown" }
@@ -575,7 +575,6 @@ pub(crate) fn encoded_display_items<'a>(
                 || (call.is_none() && matches!(name, "bash" | "write" | "edit" | "patch" | "apply_patch")) {
                 "lower_bound"
             } else { "exact" };
-            display.expanded_input = None;
             display.hidden_line_count = Some(display.input_line_count.unwrap_or(0) + output_line_count.unwrap_or(0));
             serde_json::json!({
                 "tool_ref": ToolRef {session_id, loop_id: key.0, request_index: key.1, tool_call_id: key.2.clone()},

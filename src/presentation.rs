@@ -795,6 +795,51 @@ pub(crate) enum ToolImpl {
     ApplyPatch(Arc<NativeApplyPatchTool>),
 }
 
+impl ToolImpl {
+    fn tool(&self) -> &dyn Tool {
+        match self {
+            ToolImpl::Plain(inner) => inner.as_ref(),
+            ToolImpl::Bash(inner) => inner.as_ref(),
+            ToolImpl::Write(inner) => inner.as_ref(),
+            ToolImpl::Edit(inner) => inner.as_ref(),
+            ToolImpl::ApplyPatch(inner) => inner.as_ref(),
+        }
+    }
+    async fn execute_bound(
+        self,
+        invocation: ToolInvocation,
+        context: ToolContext,
+        tool_ref: Option<ToolRef>,
+        tool_data: Arc<crate::tool_data::ToolData>,
+    ) -> Result<ToolExecutionOutcome, minicore_runtime::tools::ToolError> {
+        macro_rules! execute_native {
+            ($tool:expr) => {
+                $tool
+                    .execute_bound(invocation, context, tool_ref, Some(tool_data))
+                    .await
+            };
+        }
+        match self {
+            ToolImpl::Plain(inner) => inner.execute(invocation, context).await,
+            ToolImpl::Bash(inner) => inner.execute_bound(invocation, context, tool_ref).await,
+            ToolImpl::Write(inner) => execute_native!(inner),
+            ToolImpl::Edit(inner) => execute_native!(inner),
+            ToolImpl::ApplyPatch(inner) => execute_native!(inner),
+        }
+    }
+}
+
+impl ToolObserver {
+    fn tool_ref(&self, key: Option<RequestKey>, tool_call_id: &ToolCallId) -> Option<ToolRef> {
+        key.map(|key| ToolRef {
+            session_id: self.session_id(),
+            loop_id: key.loop_id,
+            request_index: key.request_index,
+            tool_call_id: tool_call_id.clone(),
+        })
+    }
+}
+
 impl PresentationTool {
     pub(crate) fn new(
         inner: ToolImpl,
@@ -807,21 +852,11 @@ impl PresentationTool {
             observer,
         })
     }
-
-    fn tool(&self) -> &dyn Tool {
-        match &self.inner {
-            ToolImpl::Plain(inner) => inner.as_ref(),
-            ToolImpl::Bash(inner) => inner.as_ref(),
-            ToolImpl::Write(inner) => inner.as_ref(),
-            ToolImpl::Edit(inner) => inner.as_ref(),
-            ToolImpl::ApplyPatch(inner) => inner.as_ref(),
-        }
-    }
 }
 
 impl Tool for PresentationTool {
     fn spec(&self) -> &ToolSpec {
-        self.tool().spec()
+        self.inner.tool().spec()
     }
 
     fn execute<'a>(
@@ -840,12 +875,7 @@ impl Tool for PresentationTool {
         // Complete identity: only a real `Model::start` request key plus the
         // Runtime's tool-call id. This is the single place the identity is
         // captured; it is passed downward, never recovered from a live table.
-        let tool_ref = key.map(|key| ToolRef {
-            session_id: observer.session_id(),
-            loop_id: key.loop_id,
-            request_index: key.request_index,
-            tool_call_id: invocation.tool_call_id().clone(),
-        });
+        let tool_ref = observer.tool_ref(key, invocation.tool_call_id());
         presentation.begin_tool(key, &invocation, display);
         if let Some(tool_ref) = &tool_ref {
             // Published before the work starts, never after it returns.
@@ -856,24 +886,9 @@ impl Tool for PresentationTool {
         let inner = self.inner.clone();
         let tool_data = observer.tool_data();
         Box::pin(async move {
-            macro_rules! execute_native {
-                ($tool:expr) => {
-                    $tool
-                        .execute_bound(invocation, context, tool_ref.clone(), Some(tool_data))
-                        .await
-                };
-            }
-            let result = match inner {
-                ToolImpl::Plain(inner) => inner.execute(invocation, context).await,
-                ToolImpl::Bash(inner) => {
-                    inner
-                        .execute_bound(invocation, context, tool_ref.clone())
-                        .await
-                }
-                ToolImpl::Write(inner) => execute_native!(inner),
-                ToolImpl::Edit(inner) => execute_native!(inner),
-                ToolImpl::ApplyPatch(inner) => execute_native!(inner),
-            };
+            let result = inner
+                .execute_bound(invocation, context, tool_ref.clone(), tool_data)
+                .await;
             finish_presentation_tool(
                 &presentation,
                 &observer,
@@ -940,12 +955,10 @@ impl minicore_runtime::tools::ToolPolicy for PresentationPolicy {
         &'a self,
         request: minicore_runtime::tools::ToolPolicyRequest,
     ) -> minicore_runtime::tools::ToolPolicyFuture<'a> {
-        let tool_ref = self.observer.request_key().map(|key| ToolRef {
-            session_id: self.observer.session_id(),
-            loop_id: key.loop_id,
-            request_index: key.request_index,
-            tool_call_id: request.invocation.tool_call_id().clone(),
-        });
+        let tool_ref = self.observer.tool_ref(
+            self.observer.request_key(),
+            request.invocation.tool_call_id(),
+        );
         if let Some(tool_ref) = &tool_ref {
             if let Some(data) = self
                 .observer
@@ -1031,55 +1044,105 @@ fn single_line(value: &str, max: usize) -> (String, bool) {
     bounded(&sanitized, max)
 }
 
+struct DisplayBody {
+    text: Option<String>,
+    bytes: usize,
+    lines: usize,
+    limit: usize,
+    truncated: bool,
+}
+
+impl DisplayBody {
+    fn new(limit: usize, retain: bool) -> Self {
+        Self {
+            text: retain.then(String::new),
+            bytes: 0,
+            lines: 0,
+            limit,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, value: &str) {
+        if self.truncated {
+            return;
+        }
+        let (prefix, cut) = crate::text::truncate(value, self.limit - self.bytes);
+        self.lines +=
+            prefix.matches('\n').count() + usize::from(self.bytes == 0 && !prefix.is_empty());
+        self.bytes += prefix.len();
+        if let Some(text) = &mut self.text {
+            text.push_str(prefix);
+        }
+        self.truncated = cut;
+    }
+
+    fn sanitized(&mut self, value: &str) {
+        for ch in value.chars() {
+            if self.truncated {
+                break;
+            }
+            if ch.is_control() && !matches!(ch, '\n' | '\t') {
+                for escaped in ch.escape_default() {
+                    self.push(escaped.encode_utf8(&mut [0; 4]));
+                }
+            } else {
+                self.push(ch.encode_utf8(&mut [0; 4]));
+            }
+        }
+    }
+
+    fn from_text(value: &str, limit: usize, retain: bool) -> Self {
+        let mut body = Self::new(limit, retain);
+        body.sanitized(value);
+        body
+    }
+}
+
 /// A display-only line diff with an explicit format marker. Bound both the
 /// diff inputs and emitted text; fixed complexity limits keep projection
 /// deterministic and prevent expensive alignments. No raw argument object
 /// is ever exposed through this whitelist.
-fn bounded_edit_diff(old: &str, new: &str) -> (String, bool) {
+fn edit_display_body(old: &str, new: &str, retain: bool) -> DisplayBody {
     use similar::{Algorithm, ChangeTag, TextDiff};
-    let (old, old_cut) = bounded(old, MAX_EXPANDED_INPUT_BYTES);
-    let (new, new_cut) = bounded(new, MAX_EXPANDED_INPUT_BYTES);
-    let mut text = String::from("--- before\n+++ after\n@@\n");
-    // A clock deadline can choose different alignments for the same pinned
-    // history item. Keep small edits exact and larger edits linear and stable.
-    if old.len() + new.len() > 64 * 1024 || count_lines(&old) + count_lines(&new) > 2_000 {
-        for (prefix, body) in [('-', old.as_str()), ('+', new.as_str())] {
-            for line in body.split_inclusive('\n') {
-                let row = format!(
-                    "{prefix}{}\n",
-                    sanitize_multiline(line.trim_end_matches('\n'))
-                );
-                let (row, cut) = bounded(&row, MAX_EXPANDED_INPUT_BYTES - text.len());
-                text.push_str(&row);
-                if cut {
-                    return (text, true);
+    let (old, old_cut) = crate::text::truncate(old, MAX_EXPANDED_INPUT_BYTES);
+    let (new, new_cut) = crate::text::truncate(new, MAX_EXPANDED_INPUT_BYTES);
+    let mut body = DisplayBody::new(MAX_EXPANDED_INPUT_BYTES, retain);
+    body.push("--- before\n+++ after\n@@\n");
+    let mut row = |prefix: &str, value: &str| {
+        body.push(prefix);
+        body.sanitized(value.trim_end_matches('\n'));
+        body.push("\n");
+        body.truncated
+    };
+    // Keep the same deterministic alignment for retained and count-only cards.
+    if old.len() + new.len() > 64 * 1024 || count_lines(old) + count_lines(new) > 2_000 {
+        for (prefix, value) in [("-", old), ("+", new)] {
+            for line in value.split_inclusive('\n') {
+                if row(prefix, line) {
+                    return body;
                 }
             }
         }
-        return (text, old_cut || new_cut);
-    }
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_lines(&old, &new);
-    for op in diff.ops() {
-        for change in diff.iter_changes(op) {
-            let prefix = match change.tag() {
-                ChangeTag::Equal => ' ',
-                ChangeTag::Delete => '-',
-                ChangeTag::Insert => '+',
-            };
-            // Alignment must compare source bytes: escaping first can collapse
-            // distinct edits (for example CRLF and a literal backslash-r).
-            let value = sanitize_multiline(change.value().trim_end_matches('\n'));
-            let row = format!("{prefix}{value}\n");
-            let (row, cut) = bounded(&row, MAX_EXPANDED_INPUT_BYTES - text.len());
-            text.push_str(&row);
-            if cut {
-                return (text, true);
+    } else {
+        let diff = TextDiff::configure()
+            .algorithm(Algorithm::Myers)
+            .diff_lines(old, new);
+        for op in diff.ops() {
+            for change in diff.iter_changes(op) {
+                let prefix = match change.tag() {
+                    ChangeTag::Equal => " ",
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                };
+                if row(prefix, change.value()) {
+                    return body;
+                }
             }
         }
     }
-    (text, old_cut || new_cut)
+    body.truncated |= old_cut || new_cut;
+    body
 }
 
 fn path_arg(args: &serde_json::Value, home: &str) -> Option<String> {
@@ -1157,6 +1220,15 @@ pub(crate) fn build_tool_display(
     args: Option<&serde_json::Value>,
     result_text: Option<&str>,
 ) -> ToolDisplay {
+    build_tool_display_inner(name, args, result_text, true)
+}
+
+fn build_tool_display_inner(
+    name: &str,
+    args: Option<&serde_json::Value>,
+    result_text: Option<&str>,
+    retain: bool,
+) -> ToolDisplay {
     let empty_arguments = serde_json::Value::Object(serde_json::Map::new());
     let arguments = args.unwrap_or(&empty_arguments);
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1194,8 +1266,7 @@ pub(crate) fn build_tool_display(
     truncated |= result_truncated;
 
     let detail_truncated = truncated;
-    truncated = false;
-    let expanded_input = if name == "edit" {
+    let body = if name == "edit" {
         match (
             arguments
                 .get("old_text")
@@ -1204,16 +1275,10 @@ pub(crate) fn build_tool_display(
                 .get("new_text")
                 .and_then(serde_json::Value::as_str),
         ) {
-            (Some(old), Some(new)) => {
-                let (text, cut) = bounded_edit_diff(old, new);
-                truncated |= cut;
-                Some(text)
+            (Some(old), Some(new)) => Some(edit_display_body(old, new, retain)),
+            (body, None) | (None, body) => {
+                body.map(|body| DisplayBody::from_text(body, MAX_EXPANDED_INPUT_BYTES, retain))
             }
-            (body, None) | (None, body) => body.map(|body| {
-                let (text, cut) = bounded(&sanitize_multiline(body), MAX_EXPANDED_INPUT_BYTES);
-                truncated |= cut;
-                text
-            }),
         }
     } else {
         let field = match name {
@@ -1226,15 +1291,12 @@ pub(crate) fn build_tool_display(
             .then(|| arguments.get(field))
             .flatten()
             .and_then(serde_json::Value::as_str)
-            .map(|body| {
-                let (text, cut) = bounded(&sanitize_multiline(body), MAX_EXPANDED_INPUT_BYTES);
-                truncated |= cut;
-                text
-            })
+            .map(|body| DisplayBody::from_text(body, MAX_EXPANDED_INPUT_BYTES, retain))
     };
-
-    let input_rows = expanded_input.as_deref().map_or(0, count_lines);
-    let input_line_count = expanded_input.as_ref().map(|_| input_rows);
+    let input_line_count = body.as_ref().map(|body| body.lines);
+    let input_rows = input_line_count.unwrap_or(0);
+    let truncated = body.as_ref().is_some_and(|body| body.truncated);
+    let expanded_input = body.and_then(|body| body.text);
 
     let mut display = ToolDisplay {
         detail,
@@ -1251,7 +1313,15 @@ pub(crate) fn build_tool_display(
 /// The compact card target is a command's first physical line or an explicit
 /// patch path. Body formatting remains shared with live/legacy displays.
 pub(crate) fn build_tool_card_display(name: &str, args: Option<&serde_json::Value>) -> ToolDisplay {
-    let mut display = build_tool_display(name, args, None);
+    tool_card(name, args, true)
+}
+
+pub(crate) fn tool_card_counts(name: &str, args: Option<&serde_json::Value>) -> ToolDisplay {
+    tool_card(name, args, false)
+}
+
+fn tool_card(name: &str, args: Option<&serde_json::Value>, retain: bool) -> ToolDisplay {
+    let mut display = build_tool_display_inner(name, args, None, retain);
     let field = match name {
         "bash" => "command",
         "apply_patch" | "patch" => "path",
@@ -1268,6 +1338,11 @@ pub(crate) fn build_tool_card_display(name: &str, args: Option<&serde_json::Valu
     display.detail = detail;
     display.truncated = display.body_truncated || cut;
     display
+}
+
+pub(crate) fn result_line_count(value: &str) -> (usize, bool) {
+    let body = DisplayBody::from_text(value, MAX_RESULT_DISPLAY_BYTES, false);
+    (body.lines, body.truncated)
 }
 
 fn bounded_display_copy(value: &str, max: usize) -> Option<(String, bool)> {

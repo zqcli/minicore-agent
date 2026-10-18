@@ -23,6 +23,10 @@ const MAX_STREAM_BYTES: usize = 512 * 1024;
 const MAX_DEPTH: usize = 64;
 const UPDATE_INTERVAL: Duration = Duration::from_nanos(33_333_334);
 
+#[cfg(test)]
+static PANIC_PREVIEWS: crate::test_support::Registry<RequestKey> =
+    crate::test_support::Registry::new();
+
 /// Input generation status, deliberately independent of tool execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,9 +80,10 @@ impl Stream for PreviewStream {
                         this.physical_window,
                     );
                 }
-                this.preview.observe(item, Instant::now());
+                this.preview
+                    .protect(|preview| preview.observe(item, Instant::now()));
             }
-            Poll::Ready(None) => this.preview.eof(),
+            Poll::Ready(None) => this.preview.protect(PreviewObserver::eof),
             Poll::Pending => {}
         }
         // Return the very same item, including errors and malformed ordering.
@@ -109,6 +114,25 @@ struct PreviewCall {
 }
 
 impl PreviewObserver {
+    fn protect(&mut self, update: impl FnOnce(&mut Self)) {
+        if self.discarded {
+            return;
+        }
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            tests::panic_preview(self.key);
+            update(self);
+        }))
+        .is_err()
+        {
+            // Preview failures must not reach Runtime's model-stream boundary.
+            // Clients also clear orphaned previews at authoritative turn termination.
+            self.discarded = true;
+            self.calls.clear();
+            self.retained_bytes = 0;
+        }
+    }
+
     fn new(presentation: Arc<Presentation>, key: RequestKey, attempt: Option<u64>) -> Self {
         Self {
             presentation,
@@ -265,7 +289,7 @@ impl PreviewObserver {
 impl Drop for PreviewObserver {
     fn drop(&mut self) {
         if !self.normal_eof {
-            self.discard();
+            self.protect(Self::discard);
         }
     }
 }
@@ -818,9 +842,18 @@ impl PreviewParser {
                     }
                     '"' => {
                         if field == Field::Path {
-                            self.path = Some(String::new());
+                            self.path.get_or_insert_with(String::new);
                             self.changes += 1;
                         } else if field == Field::Content {
+                            if self.path.is_none() {
+                                self.path = Some(String::new());
+                                // Charge a small path reservation before a content-first body
+                                // consumes the per-call or stream allocation budget.
+                                let reserve =
+                                    " ".repeat(32.min(MAX_STREAM_BYTES.saturating_sub(*bytes)));
+                                self.append_display(false, &reserve, bytes);
+                                self.path.as_mut().unwrap().clear();
+                            }
                             self.content = Some(String::new());
                             self.changes += 1;
                         }
@@ -876,7 +909,12 @@ impl PreviewParser {
     }
 
     fn display(&self) -> ToolDisplay {
-        let mut detail = self.path.clone().unwrap_or_else(|| "...".to_owned());
+        let mut detail = self
+            .path
+            .as_ref()
+            .filter(|path| !path.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "...".to_owned());
         detail.push_str(&super::format_read_range(self.offset, self.limit));
         let (detail, detail_cut) = single_line(&detail, MAX_DETAIL_BYTES);
         let rows = self.content.as_deref().map(count_lines);
