@@ -32,7 +32,10 @@ use crate::tools::KNOWN_TOOL_NAMES;
 
 mod history;
 pub(crate) use history::HistoryLine;
+mod time;
 mod tool_records;
+pub(crate) use time::utc_timestamp;
+use time::valid_timestamp;
 use tool_records::AuxLedger;
 #[cfg(test)]
 use tool_records::change_blob_read_cost;
@@ -47,13 +50,12 @@ pub(crate) const SUMMARY_FILE: &str = "summary.json";
 pub(crate) const MAX_SUMMARY_FILE_BYTES: usize = 256 * 1024;
 const LEGACY_MANIFEST_FILE: &str = "manifest.json";
 const LEGACY_CONVERSATION_FILE: &str = "conversation.log";
-const METADATA_TEMP_SUFFIX: &str = ".tmp";
+const DELETING_PREFIX: &str = ".deleting-";
 const MAX_LOOP_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SESSION_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4_096;
 const MAX_TITLE_BYTES: usize = 4_096;
-const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 128 * 1024;
 
 pub(crate) const AUX_TOOLS_DIR: &str = "tools";
@@ -86,7 +88,9 @@ pub(crate) const CHANGE_SCAN_METADATA_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const CHANGE_SCAN_BLOB_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const AUX_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 
-static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[cfg(test)]
+static DELETE_GATES: crate::test_support::Registry<SessionId, Arc<crate::test_support::Gate>> =
+    crate::test_support::Registry::new();
 
 #[cfg(test)]
 pub(crate) static SESSION_LOAD_GATES: crate::test_support::Registry<
@@ -635,14 +639,49 @@ impl Store {
                 return Err(StoreError::InvalidRoot);
             }
         }
-        Ok(Self {
+        let store = Self {
             root,
             history_indexes: Arc::default(),
             aux_lock: Arc::default(),
             diff_workers: Arc::new(Mutex::new(DiffWorkers::default())),
             #[cfg(test)]
             aux_limits: None,
-        })
+        };
+        store.reclaim_leftovers().await?;
+        Ok(store)
+    }
+
+    async fn reclaim_leftovers(&self) -> Result<(), StoreError> {
+        let sessions = self.sessions_directory();
+        let mut entries = fs::read_dir(&sessions).await.map_err(unavailable)?;
+        let mut removed = false;
+        while let Some(entry) = entries.next_entry().await.map_err(unavailable)? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let path = entry.path();
+            if !matches!(path_state(&path).await, Ok(PathState::Directory)) {
+                continue;
+            }
+            if name
+                .strip_prefix(DELETING_PREFIX)
+                .is_some_and(|id| id.parse::<SessionId>().is_ok())
+            {
+                match fs::remove_dir_all(&path).await {
+                    Ok(()) => removed = true,
+                    Err(error) => {
+                        unavailable(error);
+                    }
+                }
+            } else if name.parse::<SessionId>().is_ok() {
+                if let Err(error) = remove_metadata_temps(&path).await {
+                    unavailable(error);
+                }
+            }
+        }
+        if removed {
+            sync_directory(&sessions).await.map_err(unavailable)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn list_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
@@ -982,10 +1021,28 @@ impl Store {
     pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
         let mut ledger = self.aux_lock.lock().await;
         let directory = self.require_session_directory(session_id).await?;
-        fs::remove_dir_all(directory).await.map_err(unavailable)?;
+        let sessions = self.sessions_directory();
+        let deleting = sessions.join(format!("{DELETING_PREFIX}{session_id}"));
+        if path_state(&deleting).await? != PathState::Missing {
+            return Err(StoreError::Corrupt);
+        }
+        // Cancellation or an uncertain rename must not leave authoritative old accounting.
+        let mut cached = ledger.take();
+        fs::rename(directory, &deleting)
+            .await
+            .map_err(unavailable)?;
         self.unload_history(session_id);
-        if let Some(ledger) = ledger.as_mut() {
+        if let Some(ledger) = cached.as_mut() {
             ledger.remove_session(session_id);
+        }
+        *ledger = cached;
+        sync_directory(&sessions).await.map_err(unavailable)?;
+        #[cfg(test)]
+        if let Some(gate) = DELETE_GATES.take(&session_id) {
+            gate.pass().await;
+        }
+        if let Err(error) = fs::remove_dir_all(deleting).await {
+            unavailable(error);
         }
         Ok(())
     }
@@ -1013,7 +1070,9 @@ impl Store {
         match path_state(path).await? {
             PathState::RegularFile => {}
             PathState::Missing => {
-                let directory = path.parent().unwrap_or(path);
+                let directory = path
+                    .parent()
+                    .expect("session records have a parent directory");
                 let legacy = legacy_format_present(directory).await?;
                 return if legacy {
                     Err(StoreError::UnsupportedFormat)
@@ -1164,7 +1223,7 @@ async fn path_state(path: &Path) -> Result<PathState, StoreError> {
             })
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PathState::Missing),
-        Err(_) => Err(StoreError::Unavailable),
+        Err(error) => Err(unavailable(error)),
     }
 }
 
@@ -1183,14 +1242,18 @@ async fn reject_symlink_entries(directory: &Path) -> io::Result<()> {
 }
 
 fn map_io_store_error(error: io::Error) -> StoreError {
-    if error.kind() == io::ErrorKind::InvalidData {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+    ) {
         StoreError::Corrupt
     } else {
-        StoreError::Unavailable
+        unavailable(error)
     }
 }
 
-fn unavailable<E>(_: E) -> StoreError {
+fn unavailable(error: io::Error) -> StoreError {
+    tracing::warn!(error_kind = ?error.kind(), "store I/O failed");
     StoreError::Unavailable
 }
 fn corrupt<E>(_: E) -> StoreError {
@@ -1213,7 +1276,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 }
 
 async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit, StoreError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path.parent().expect("store files have a parent directory");
     match path_state(parent).await? {
         PathState::Directory => {}
         PathState::Symlink | PathState::RegularFile | PathState::Other => {
@@ -1230,51 +1293,81 @@ async fn atomic_write_status(path: &Path, bytes: &[u8]) -> Result<SummaryCommit,
             return Err(StoreError::Corrupt);
         }
     }
-    let temp_path = unique_temp_path(path);
-    match path_state(&temp_path).await? {
-        PathState::Missing => {}
-        PathState::RegularFile => return Err(StoreError::Unavailable),
-        PathState::Directory | PathState::Symlink | PathState::Other => {
-            return Err(StoreError::Corrupt);
-        }
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await
-        .map_err(unavailable)?;
-    if file.write_all(bytes).await.is_err()
-        || file.flush().await.is_err()
-        || file.sync_all().await.is_err()
-    {
-        drop(file);
+    let temp_path = unique_temp_path(path)?;
+    if let Err(error) = write_sync_file(&temp_path, bytes).await {
         let _ = fs::remove_file(&temp_path).await;
-        return Err(StoreError::Unavailable);
+        return Err(error);
     }
-    drop(file);
-    if fs::rename(&temp_path, path).await.is_err() {
+    if let Err(error) = fs::rename(&temp_path, path).await {
+        unavailable(error);
         let _ = fs::remove_file(&temp_path).await;
         return Ok(SummaryCommit::Unknown);
     }
-    if sync_directory(parent).await.is_err() {
+    if let Err(error) = sync_directory(parent).await {
+        unavailable(error);
         return Ok(SummaryCommit::Unknown);
     }
     Ok(SummaryCommit::Committed)
 }
 
-fn unique_temp_path(path: &Path) -> PathBuf {
+fn unique_temp_path(path: &Path) -> Result<PathBuf, StoreError> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("record");
-    let id = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(
-            ".{name}{METADATA_TEMP_SUFFIX}-{}-{id}",
-            std::process::id()
-        ))
+        .expect("store file names are UTF-8");
+    let mut random = [0; 16];
+    getrandom::fill(&mut random).map_err(|_| StoreError::Unavailable)?;
+    let id = u128::from_le_bytes(random);
+    Ok(path.with_file_name(format!(".{name}.tmp-{}-{id:032x}", std::process::id())))
+}
+
+async fn write_sync_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(unavailable)?;
+    file.write_all(bytes).await.map_err(unavailable)?;
+    file.flush().await.map_err(unavailable)?;
+    file.sync_all().await.map_err(unavailable)
+}
+
+fn valid_temp_suffix(suffix: &str) -> bool {
+    let Some((pid, id)) = suffix.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !id.is_empty()
+        && (id.bytes().all(|byte| byte.is_ascii_digit())
+            || (id.len() == 32
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))))
+}
+
+async fn remove_metadata_temps(directory: &Path) -> io::Result<()> {
+    let mut entries = fs::read_dir(directory).await?;
+    let mut removed = false;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if [".session.json.tmp-", ".summary.json.tmp-"]
+            .iter()
+            .any(|prefix| name.strip_prefix(prefix).is_some_and(valid_temp_suffix))
+            && entry.file_type().await?.is_file()
+        {
+            fs::remove_file(entry.path()).await?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory).await?;
+    }
+    Ok(())
 }
 
 pub(crate) fn tool_ref_hash(tool_ref: &ToolRef) -> String {
@@ -1334,152 +1427,6 @@ fn valid_multiline_text(value: &str, maximum: usize, allow_empty: bool) -> bool 
         && value
             .chars()
             .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-}
-
-fn valid_timestamp(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() > MAX_TIMESTAMP_BYTES || bytes.len() < 20 {
-        return false;
-    }
-    if bytes.get(4) != Some(&b'-')
-        || bytes.get(7) != Some(&b'-')
-        || bytes.get(10) != Some(&b'T')
-        || bytes.get(13) != Some(&b':')
-        || bytes.get(16) != Some(&b':')
-    {
-        return false;
-    }
-    let digits = |range: std::ops::Range<usize>| {
-        bytes
-            .get(range)
-            .is_some_and(|part| part.iter().all(u8::is_ascii_digit))
-    };
-    if !digits(0..4)
-        || !digits(5..7)
-        || !digits(8..10)
-        || !digits(11..13)
-        || !digits(14..16)
-        || !digits(17..19)
-    {
-        return false;
-    }
-    let number = |range: std::ops::Range<usize>| {
-        std::str::from_utf8(&bytes[range])
-            .ok()
-            .and_then(|part| part.parse::<u32>().ok())
-    };
-    let Some(year) = number(0..4) else {
-        return false;
-    };
-    let Some(month) = number(5..7) else {
-        return false;
-    };
-    let Some(day) = number(8..10) else {
-        return false;
-    };
-    let Some(hour) = number(11..13) else {
-        return false;
-    };
-    let Some(minute) = number(14..16) else {
-        return false;
-    };
-    let Some(second) = number(17..19) else {
-        return false;
-    };
-    if year == 0
-        || !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return false;
-    }
-
-    let mut index = 19;
-    if bytes.get(index) == Some(&b'.') {
-        index += 1;
-        let start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
-        if index == start {
-            return false;
-        }
-    }
-    match bytes.get(index) {
-        Some(b'Z') => index + 1 == bytes.len(),
-        Some(b'+' | b'-') => {
-            index += 1;
-            if index + 5 != bytes.len()
-                || bytes.get(index + 2) != Some(&b':')
-                || !digits(index..index + 2)
-                || !digits(index + 3..index + 5)
-            {
-                return false;
-            }
-            let offset_hour = number(index..index + 2).unwrap_or(24);
-            let offset_minute = number(index + 3..index + 5).unwrap_or(60);
-            offset_hour <= 23 && offset_minute <= 59
-        }
-        _ => false,
-    }
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-pub(crate) fn utc_timestamp() -> Result<String, StoreError> {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(unavailable)?;
-    Ok(format_rfc3339_millis(
-        duration.as_secs(),
-        duration.subsec_millis(),
-    ))
-}
-
-fn format_rfc3339_millis(total_seconds: u64, millis: u32) -> String {
-    const SECS_PER_DAY: i64 = 86_400;
-    let days = i64::try_from(total_seconds)
-        .unwrap_or(0)
-        .div_euclid(SECS_PER_DAY);
-    let seconds_of_day = i64::try_from(total_seconds)
-        .unwrap_or(0)
-        .rem_euclid(SECS_PER_DAY);
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3600;
-    let minute = (seconds_of_day % 3600) / 60;
-    let second = seconds_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
-}
-
-/// Howard Hinnant's `civil_from_days` algorithm.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month as u32, day as u32)
 }
 
 #[cfg(test)]

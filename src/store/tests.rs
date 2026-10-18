@@ -4759,6 +4759,406 @@ async fn index_history(store: &Store, id: SessionId) {
     store.install_history_index(id, loaded.history_index);
 }
 
+#[tokio::test]
+async fn open_reclaims_only_owned_metadata_temp_files() {
+    let (directory, store, id) = fixture("metadata-temp-recovery").await;
+    store.create_session(&record(id)).await.unwrap();
+    let session = store.session_directory(id);
+    let record_before = fs::read(session.join(SESSION_RECORD_FILE)).await.unwrap();
+    let old = session.join(format!(".session.json.tmp-{}-1", std::process::id()));
+    let new = unique_temp_path(&session.join(SUMMARY_FILE)).unwrap();
+    let next = unique_temp_path(&session.join(SUMMARY_FILE)).unwrap();
+    assert_ne!(new, next);
+    assert_eq!(
+        new.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .len(),
+        32
+    );
+    for path in [&old, &new] {
+        fs::write(path, b"incomplete metadata").await.unwrap();
+    }
+    let foreign = session.join(".unrelated.json.tmp-123-4");
+    let malformed = session.join(".summary.json.tmp-not-ours");
+    for path in [&foreign, &malformed] {
+        fs::write(path, b"keep").await.unwrap();
+    }
+    let temp_directory = session.join(".session.json.tmp-123-5");
+    fs::create_dir(&temp_directory).await.unwrap();
+    let reopened = Store::open(directory.path().to_path_buf()).await.unwrap();
+    assert!(!old.exists() && !new.exists());
+    assert!(temp_directory.is_dir());
+    for path in [&foreign, &malformed] {
+        assert_eq!(fs::read(path).await.unwrap(), b"keep");
+    }
+    assert_eq!(
+        fs::read(session.join(SESSION_RECORD_FILE)).await.unwrap(),
+        record_before
+    );
+    assert_eq!(reopened.load_record(id).await.unwrap().session_id, id);
+}
+
+#[tokio::test]
+async fn cancelled_delete_is_hidden_and_reclaimed_on_open() {
+    let (directory, store, id) = fixture("delete-recovery").await;
+    store.create_session(&record(id)).await.unwrap();
+    let other = SessionId::new().unwrap();
+    store.create_session(&record(other)).await.unwrap();
+    let store = store.with_aux_limits(AuxLimits {
+        global_records: 1,
+        ..DEFAULT_AUX_LIMITS
+    });
+    let first = empty_snapshot(make_tool_ref(id, "deleted"));
+    store
+        .commit_tool_record(&first, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::test_support::Gate::new());
+    DELETE_GATES.arm(id, Arc::clone(&gate));
+    let mut deleting = Box::pin(store.delete_session(id));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut deleting => panic!("delete finished before gate: {result:?}"),
+            _ = gate.wait_started() => {}
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        store.load_record(id).await,
+        Err(StoreError::SessionNotFound)
+    ));
+    assert_eq!(
+        store
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.session_id)
+            .collect::<Vec<_>>(),
+        vec![other]
+    );
+    drop(deleting);
+    let hidden = store
+        .sessions_directory()
+        .join(format!("{DELETING_PREFIX}{id}"));
+    assert!(hidden.is_dir());
+    let second = empty_snapshot(make_tool_ref(other, "retained"));
+    store
+        .commit_tool_record(&second, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    let reopened = Store::open(directory.path().to_path_buf()).await.unwrap();
+    assert!(!hidden.exists());
+    assert!(
+        reopened
+            .read_tool_record(&second.tool_ref)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        reopened.load_session(id).await,
+        Err(StoreError::SessionNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn valid_unterminated_history_is_kept_and_only_invalid_tails_are_truncated() {
+    let entry = loop_record("kept without newline");
+    let valid = serde_json::to_vec(&entry).unwrap();
+    let mut invalid = serde_json::to_value(&entry).unwrap();
+    invalid["items"] = json!("invalid history");
+    for (tail, keep) in [
+        (valid.clone(), true),
+        (valid[..valid.len() / 2].to_vec(), false),
+        (serde_json::to_vec(&invalid).unwrap(), false),
+    ] {
+        let (_directory, store, id) = fixture("history-final-newline").await;
+        store.create_session(&record(id)).await.unwrap();
+        store.append_loop(id, &loop_record("first")).await.unwrap();
+        let path = store.session_directory(id).join(HISTORY_FILE);
+        let prefix = fs::read(&path).await.unwrap();
+        let mut bytes = prefix.clone();
+        bytes.extend_from_slice(&tail);
+        fs::write(&path, &bytes).await.unwrap();
+        let loaded = store.load_session(id).await.unwrap();
+        assert_eq!(loaded.history.len(), 1 + usize::from(keep));
+        let expected = if keep {
+            bytes.push(b'\n');
+            bytes
+        } else {
+            prefix
+        };
+        assert_eq!(fs::read(&path).await.unwrap(), expected);
+        let anchor = store
+            .capture_history_anchor(id, &loaded.history)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.sha256, hash_bytes(&expected));
+        store
+            .append_loop(id, &loop_record("after repair"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_session(id).await.unwrap().history.len(),
+            2 + usize::from(keep)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_page_offsets_usage_and_corruption_depend_on_off_page_records() {
+    let (_directory, store, id) = fixture("cold-record-counts").await;
+    store.create_session(&record(id)).await.unwrap();
+    store
+        .append_loop(id, &loop_record_with_users(&["first", "second"]))
+        .await
+        .unwrap();
+    let mut hidden = loop_record("replaced");
+    hidden.items = vec![HistoryItem::Assistant(AssistantHistory {
+        provider_replay: None,
+        loop_id: hidden.loop_id,
+        request_index: 0,
+        model: "main".parse().unwrap(),
+        reasoning: ReasoningPreference::Auto,
+        content: vec![AssistantPart::Reasoning(
+            minicore_runtime::model::ReasoningContent::new(None, None, Some("opaque".into()), None)
+                .unwrap(),
+        )],
+        finish_reason: ModelFinishReason::Stop,
+        usage: hidden.usage,
+    })];
+    store.append_loop(id, &hidden).await.unwrap();
+    let tail = loop_record_with_users(&["tail one", "tail two", "tail three"]);
+    store.append_loop(id, &tail).await.unwrap();
+    let page = store
+        .read_history_page(
+            id,
+            3,
+            1,
+            None,
+            None,
+            None,
+            Some(2),
+            &history_limits(64 * 1024 * 1024, 100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.total_items, 5);
+    assert_eq!(page.items, tail.items[1..2]);
+    assert_eq!(page.covered_usage.loop_count, 2);
+    assert_eq!(page.covered_usage.last_loop_id, Some(hidden.loop_id));
+    let path = store.session_directory(id).join(HISTORY_FILE);
+    let bytes = fs::read(&path).await.unwrap();
+    assert_eq!(page.revision, hash_bytes(&bytes));
+    let mut corrupted = b"invalid record\n".to_vec();
+    corrupted
+        .extend_from_slice(&bytes[bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1..]);
+    fs::write(path, corrupted).await.unwrap();
+    assert!(matches!(
+        store
+            .read_history_page(
+                id,
+                3,
+                1,
+                None,
+                None,
+                None,
+                None,
+                &history_limits(64 * 1024 * 1024, 100)
+            )
+            .await,
+        Err(StoreError::Corrupt)
+    ));
+}
+
+#[tokio::test]
+async fn cold_tool_queries_distinguish_missing_and_corrupt_metadata() {
+    let (_directory, store, id) = fixture("tool-errors").await;
+    store.create_session(&record(id)).await.unwrap();
+    let snapshot = empty_snapshot(make_tool_ref(id, "record"));
+    let metadata = store
+        .session_directory(id)
+        .join(AUX_TOOLS_DIR)
+        .join(tool_ref_hash(&snapshot.tool_ref))
+        .join(TOOL_RECORD_FILE);
+    for failure in ["missing", "corrupt", "directory"] {
+        if failure == "corrupt" {
+            store
+                .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+                .await
+                .unwrap();
+            fs::write(&metadata, b"corrupt").await.unwrap();
+        } else if failure == "directory" {
+            fs::remove_file(&metadata).await.unwrap();
+            fs::create_dir(&metadata).await.unwrap();
+        }
+        let read = crate::read::tool_read(
+            store.clone(),
+            None,
+            crate::tool_data::ToolReadRequest {
+                tool_ref: snapshot.tool_ref.clone(),
+                display: false,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let output = crate::read::tool_output(
+            store.clone(),
+            None,
+            ToolOutputRequest {
+                tool_ref: snapshot.tool_ref.clone(),
+                stream: ToolDataStream::Stdout,
+                offset: 0,
+                max_bytes: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        for error in [read, output] {
+            assert!(if failure == "missing" {
+                matches!(error, AgentError::ToolNotFound)
+            } else {
+                matches!(error, AgentError::Store)
+            });
+        }
+    }
+    let unobserved = make_tool_ref(id, "evicted");
+    let outcomes = store
+        .persist_loop_tool_records(
+            &[unobserved],
+            &ToolData::new(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+    assert!(matches!(outcomes[0].1, Err(StoreError::Unavailable)));
+}
+
+#[test]
+fn io_warnings_retain_kind_without_paths_or_error_contents() {
+    let directory = crate::test_support::TempDir::new("store-log-redaction");
+    let output = directory.path().join("trace.log");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(std::fs::File::create(&output).unwrap())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let error = unavailable(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SECRET /private/session.json",
+        ));
+        assert!(matches!(error, StoreError::Unavailable));
+    });
+    let log = std::fs::read_to_string(output).unwrap();
+    assert!(log.contains("PermissionDenied"));
+    assert!(!log.contains("SECRET") && !log.contains("/private/session.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_does_not_follow_metadata_or_tombstone_symlinks() {
+    use std::os::unix::fs::symlink;
+    let (directory, store, id) = fixture("recovery-symlinks").await;
+    store.create_session(&record(id)).await.unwrap();
+    let outside = directory.path().join("outside");
+    fs::create_dir(&outside).await.unwrap();
+    let sentinel = outside.join("sentinel");
+    fs::write(&sentinel, b"unchanged").await.unwrap();
+    let temp = store.session_directory(id).join(".session.json.tmp-123-1");
+    symlink(&sentinel, &temp).unwrap();
+    let hidden = store
+        .sessions_directory()
+        .join(format!("{DELETING_PREFIX}{}", SessionId::new().unwrap()));
+    symlink(&outside, &hidden).unwrap();
+    Store::open(directory.path().to_path_buf()).await.unwrap();
+    assert!(
+        fs::symlink_metadata(temp)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::symlink_metadata(hidden)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(sentinel).await.unwrap(), b"unchanged");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn permission_failures_do_not_expose_half_deleted_sessions_or_hide_tool_errors() {
+    if run_as_unprivileged(
+        "store::tests::permission_failures_do_not_expose_half_deleted_sessions_or_hide_tool_errors",
+    ) {
+        return;
+    }
+    let (directory, store, id) = fixture("delete-permissions").await;
+    store.create_session(&record(id)).await.unwrap();
+    let snapshot = empty_snapshot(make_tool_ref(id, "unreadable"));
+    store
+        .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    let metadata = store
+        .session_directory(id)
+        .join(AUX_TOOLS_DIR)
+        .join(tool_ref_hash(&snapshot.tool_ref))
+        .join(TOOL_RECORD_FILE);
+    let permissions = RestorePermissions::set(&metadata, 0o000);
+    let result = crate::read::tool_read(
+        store.clone(),
+        None,
+        crate::tool_data::ToolReadRequest {
+            tool_ref: snapshot.tool_ref,
+            display: false,
+            max_bytes: None,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(AgentError::StoreUnavailable)));
+    drop(permissions);
+
+    let blocked = store.session_directory(id).join("blocked");
+    fs::create_dir(&blocked).await.unwrap();
+    fs::write(blocked.join("file"), b"keep until cleanup")
+        .await
+        .unwrap();
+    let mut permissions = RestorePermissions::set(&blocked, 0o555);
+    let result = store.delete_session(id).await;
+    let hidden = store
+        .sessions_directory()
+        .join(format!("{DELETING_PREFIX}{id}"));
+    if hidden.exists() {
+        permissions.0 = hidden.join("blocked");
+    }
+    result.unwrap();
+    assert!(hidden.exists());
+    assert!(matches!(
+        store.load_session(id).await,
+        Err(StoreError::SessionNotFound)
+    ));
+    assert!(store.list_sessions().await.unwrap().is_empty());
+    drop(permissions);
+    Store::open(directory.path().to_path_buf()).await.unwrap();
+    assert!(!hidden.exists());
+}
+
 #[cfg(unix)]
 fn run_as_unprivileged(test: &str) -> bool {
     use std::os::unix::{fs::PermissionsExt, process::CommandExt};

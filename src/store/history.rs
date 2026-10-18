@@ -113,7 +113,7 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(StoreError::Corrupt);
             }
-            Err(_) => return Err(StoreError::Unavailable),
+            Err(error) => return Err(unavailable(error)),
         };
         if !metadata.is_file() {
             return Err(StoreError::Corrupt);
@@ -304,10 +304,14 @@ impl Store {
         if let Some(rollback_fails) = APPEND_FAILURES.take(&session_id) {
             return tests::fail_append(file, &path, &bytes, previous_len, rollback_fails).await;
         }
-        if file.write_all(&bytes).await.is_err()
-            || file.flush().await.is_err()
-            || file.sync_data().await.is_err()
-        {
+        let written = async {
+            file.write_all(&bytes).await?;
+            file.flush().await?;
+            file.sync_data().await
+        }
+        .await;
+        if let Err(error) = written {
+            unavailable(error);
             return Err(rollback_append(&file, previous_len).await);
         }
         if let Some(index) = self.history_indexes.lock().unwrap().get_mut(&session_id) {
@@ -476,6 +480,8 @@ impl Store {
             if line.is_empty() {
                 return Err(StoreError::Corrupt);
             }
+            // JSONL has no item counts; legacy-only items can disappear on normalization.
+            // Off-page records still establish offsets, covered usage, and corruption status.
             let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
             let normalized = normalize_history(&record.items).map_err(corrupt)?;
             let record_start = total_items;
@@ -760,17 +766,35 @@ impl Store {
             if reached_eof && line_len == 0 && !oversized {
                 break;
             }
+            let parsed = if oversized {
+                Err(StoreError::Corrupt)
+            } else {
+                serde_json::from_slice::<StoredLoopRecord>(&buffer)
+                    .map_err(corrupt)
+                    .and_then(|record| {
+                        let normalized = normalize_history(&record.items).map_err(corrupt)?;
+                        Ok((record, normalized))
+                    })
+            };
+            let (record, normalized) = match parsed {
+                Ok(parsed) => parsed,
+                Err(_) if !is_complete => {
+                    saw_partial = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             if !is_complete {
-                saw_partial = true;
-                break;
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .await
+                    .map_err(unavailable)?;
+                file.write_all(b"\n").await.map_err(unavailable)?;
+                file.flush().await.map_err(unavailable)?;
+                file.sync_data().await.map_err(unavailable)?;
+                tracing::warn!(session_id = %session_id, "history final newline repaired");
             }
-            if oversized {
-                return Err(StoreError::Corrupt);
-            }
-            if buffer.is_empty() {
-                return Err(StoreError::Corrupt);
-            }
-            let record: StoredLoopRecord = serde_json::from_slice(&buffer).map_err(corrupt)?;
             let user_count = record
                 .items
                 .iter()
@@ -792,17 +816,15 @@ impl Store {
             }
             last_complete_offset += buffer.len() as u64 + 1;
             buffer.push(b'\n');
-            let normalized = normalize_history(&record.items).map_err(corrupt)?;
             index_line(&mut index, &buffer, &record, normalized.len());
             items.extend(normalized.iter().cloned());
+            if !is_complete {
+                break;
+            }
         }
         if saw_partial {
-            // The only allowed repair: truncate back to the last complete
-            // line. Works for a first-segment partial too (offset 0).
-            let had_partial = tail_repair(&path, last_complete_offset).await?;
-            if had_partial {
-                tracing::warn!(session_id = %session_id, "history tail repaired");
-            }
+            tail_repair(&path, last_complete_offset).await?;
+            tracing::warn!(session_id = %session_id, "history tail repaired");
         }
         let history = items.into();
         Ok((history, times, index))
@@ -814,10 +836,17 @@ struct ColdDisplayScan<'a> {
 }
 
 pub(super) async fn rollback_append(file: &File, previous_len: u64) -> AppendError {
-    if file.set_len(previous_len).await.is_ok() && file.sync_data().await.is_ok() {
-        AppendError::NotWritten(StoreError::Unavailable)
-    } else {
-        AppendError::Unknown
+    match async {
+        file.set_len(previous_len).await?;
+        file.sync_data().await
+    }
+    .await
+    {
+        Ok(()) => AppendError::NotWritten(StoreError::Unavailable),
+        Err(error) => {
+            unavailable(error);
+            AppendError::Unknown
+        }
     }
 }
 
@@ -981,20 +1010,12 @@ async fn scan_history_prefix(
     }))
 }
 
-/// If the file ends without a newline, truncate it back to the last complete
-/// line. Returns whether a repair happened.
-async fn tail_repair(path: &Path, complete_offset: u64) -> Result<bool, StoreError> {
-    let metadata = fs::metadata(path).await.map_err(unavailable)?;
-    if metadata.len() == complete_offset {
-        return Ok(false);
-    }
-    let mut file = OpenOptions::new()
+async fn tail_repair(path: &Path, complete_offset: u64) -> Result<(), StoreError> {
+    let file = OpenOptions::new()
         .write(true)
         .open(path)
         .await
         .map_err(unavailable)?;
     file.set_len(complete_offset).await.map_err(unavailable)?;
-    file.flush().await.map_err(unavailable)?;
-    file.sync_data().await.map_err(unavailable)?;
-    Ok(true)
+    file.sync_data().await.map_err(unavailable)
 }

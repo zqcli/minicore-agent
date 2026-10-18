@@ -82,8 +82,12 @@ history, metadata, summaries, and auxiliary tool records. A failed append return
 the Runtime result with `persistence: failed` without changing in-memory history.
 A rejection before writing or a successfully synced rollback permits another
 turn; only an uncertain append outcome blocks further turns until close/reopen.
-On reopen, only a trailing incomplete JSONL line may be truncated and synced; a
-complete malformed record is corruption, not recoverable crash state. Live
+On reopen, a valid final JSONL record missing only its newline is kept and synced
+with the newline restored. Other incomplete tails are truncated and synced; a
+malformed newline-terminated record is corruption, not recoverable crash state.
+Store startup reclaims its stale metadata temp files and hidden deletion
+directories. Session deletion first atomically hides the directory, so interrupted
+cleanup never exposes a partially deleted Session. Live
 events are best-effort; use `turn.wait`, `turn.result`, and history queries for
 authority. Existing v0.2 Session data is not migrated.
 Warm in-memory observations are preferred, while bounded cold reads use durable

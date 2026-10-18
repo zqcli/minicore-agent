@@ -129,7 +129,7 @@ async fn fragments_reconstruct_escaped_unicode_json_without_loss() {
             budget,
             &cancellation,
             deadline,
-            |items, next_cursor| Ok(encode_page(metadata, items, next_cursor, 1)),
+            |_, _, next_cursor| Ok(encode_page(metadata, &[], next_cursor, 1).len()),
         )
         .await
         .unwrap();
@@ -168,7 +168,7 @@ async fn page_budget_includes_metadata_and_rejects_too_small_pages() {
         budget,
         &cancellation,
         deadline,
-        |items, next_cursor| Ok(encode_page(metadata, items, next_cursor, 1)),
+        |_, _, next_cursor| Ok(encode_page(metadata, &[], next_cursor, 1).len()),
     )
     .await
     .unwrap();
@@ -181,11 +181,61 @@ async fn page_budget_includes_metadata_and_rejects_too_small_pages() {
         1,
         &cancellation,
         deadline,
-        |items, next_cursor| Ok(encode_page(metadata, items, next_cursor, 1)),
+        |_, _, next_cursor| Ok(encode_page(metadata, &[], next_cursor, 1).len()),
     )
     .await
     .unwrap_err();
     assert!(matches!(error, AgentError::InvalidArguments));
+}
+
+#[tokio::test]
+async fn incremental_page_sizes_match_exact_json_budgets_across_many_chunks() {
+    let bodies: Vec<_> = (0..100)
+        .map(|index| {
+            serde_json::to_string(&format!("{index}: {}", "é🙂\n\t\\\"".repeat(64))).unwrap()
+        })
+        .collect();
+    let complete: Vec<_> = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, json)| make_chunk(index, 0, json, json.len()))
+        .collect();
+    let total = bodies.len();
+    let metadata = "metadata with \"quotes\" and Unicode 🙂";
+    let exact = encode_page(metadata, &complete, None, total).len();
+    for budget in [4096, exact - 1, exact] {
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut cursor = ReadCursor::start();
+        let mut reconstructed = vec![String::new(); total];
+        let mut pages = 0;
+        loop {
+            let (page, next) = pack_items(
+                bodies.iter().cloned().enumerate().skip(cursor.item).map(Ok),
+                cursor,
+                total,
+                budget,
+                &cancellation,
+                deadline,
+                |_, _, next| Ok(encode_page(metadata, &[], next, total).len()),
+            )
+            .await
+            .unwrap();
+            assert!(encode_page(metadata, &page, next, total).len() <= budget);
+            for chunk in page {
+                assert_eq!(chunk.offset, reconstructed[chunk.index].len());
+                reconstructed[chunk.index].push_str(&chunk.data);
+            }
+            pages += 1;
+            let Some(next) = next else {
+                break;
+            };
+            assert_ne!(cursor, next);
+            cursor = next;
+        }
+        assert_eq!(reconstructed, bodies);
+        assert_eq!(pages == 1, budget == exact);
+    }
 }
 
 #[tokio::test]
@@ -199,7 +249,7 @@ async fn cursor_must_end_on_a_utf8_boundary() {
         256,
         &cancellation,
         deadline,
-        |items, next_cursor| Ok(encode_page("metadata", items, next_cursor, 1)),
+        |_, _, next_cursor| Ok(encode_page("metadata", &[], next_cursor, 1).len()),
     )
     .await
     .unwrap_err();
