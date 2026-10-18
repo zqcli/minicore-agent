@@ -39,7 +39,8 @@ use crate::store::{
     SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
     force_unknown_summary_write, gate_next_summary_commit,
 };
-use crate::workspace::query::{WorkspaceReadGate, gate_next_workspace_read};
+use crate::test_support::Gate;
+use crate::workspace::query::READ_GATES;
 use crate::workspace::scan::{ScanHold, hold_next_scan};
 
 use super::{
@@ -5407,8 +5408,8 @@ async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
         .await
         .expect("blocked model request did not start");
 
-    let gate = Arc::new(WorkspaceReadGate::new());
-    gate_next_workspace_read("pending-a.txt", Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    READ_GATES.arm("pending-a.txt".to_owned(), Arc::clone(&gate));
     harness
         .send(
             json!("ws-pending"),
@@ -5464,8 +5465,8 @@ async fn closing_a_session_cancels_pending_workspace_reads_and_frees_capacity() 
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
         let path = format!("cap-{index}.txt");
-        let gate = Arc::new(WorkspaceReadGate::new());
-        gate_next_workspace_read(&path, Arc::clone(&gate));
+        let gate = Arc::new(Gate::new());
+        READ_GATES.arm(path.clone(), Arc::clone(&gate));
         gates.push(gate);
         harness
             .send(

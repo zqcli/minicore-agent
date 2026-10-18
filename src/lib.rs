@@ -44,6 +44,8 @@ mod read;
 mod rpc;
 mod sessions;
 pub(crate) mod store;
+#[cfg(test)]
+mod test_support;
 mod tool_data;
 mod tools;
 mod workspace;

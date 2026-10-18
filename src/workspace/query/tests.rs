@@ -1,19 +1,21 @@
 use super::*;
+use crate::test_support::{Gate, TempDir};
 
 struct Fixture {
     root: std::path::PathBuf,
     workspace: Arc<Workspace>,
+    _dir: TempDir,
 }
 
 async fn fixture(label: &str) -> Fixture {
-    let base = std::env::temp_dir().join(format!(
-        "minicore-workspace-query-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    let root = base.join("root");
-    tokio::fs::create_dir_all(&root).await.unwrap();
+    let dir = TempDir::new(&format!("workspace-query-{label}"));
+    let root = dir.path().to_path_buf();
     let workspace = Arc::new(Workspace::open(root.clone()).await.unwrap());
-    Fixture { root, workspace }
+    Fixture {
+        root,
+        workspace,
+        _dir: dir,
+    }
 }
 
 async fn write(fixture: &Fixture, name: &str, bytes: impl AsRef<[u8]>) {
@@ -493,8 +495,8 @@ async fn deadline_and_cancellation_stop_a_pending_query() {
     assert!(matches!(result, Err(AgentError::QueryLimit)));
 
     // Cancelling the owning Session stops a started query.
-    let gate = Arc::new(WorkspaceReadGate::new());
-    gate_next_workspace_read("wait.txt", Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    READ_GATES.arm("wait.txt".to_owned(), Arc::clone(&gate));
     let session = CancellationToken::new();
     let pending = tokio::spawn({
         let workspace = Arc::clone(&fixture.workspace);
@@ -517,8 +519,8 @@ async fn deadline_and_cancellation_stop_a_pending_query() {
     ));
 
     // RPC shutdown cancels the query the same way.
-    let gate = Arc::new(WorkspaceReadGate::new());
-    gate_next_workspace_read("wait.txt", Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    READ_GATES.arm("wait.txt".to_owned(), Arc::clone(&gate));
     let shutdown = CancellationToken::new();
     let pending = tokio::spawn({
         let workspace = Arc::clone(&fixture.workspace);
@@ -541,8 +543,8 @@ async fn deadline_and_cancellation_stop_a_pending_query() {
     ));
 
     // The deadline wraps the pending step itself.
-    let gate = Arc::new(WorkspaceReadGate::new());
-    gate_next_workspace_read("wait.txt", Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    READ_GATES.arm("wait.txt".to_owned(), Arc::clone(&gate));
     let pending = tokio::spawn({
         let workspace = Arc::clone(&fixture.workspace);
         async move {
@@ -562,8 +564,8 @@ async fn deadline_and_cancellation_stop_a_pending_query() {
         Err(AgentError::QueryLimit)
     ));
 
-    let gate = Arc::new(WorkspaceReadGate::new());
-    gate_next_workspace_read("wait.txt", Arc::clone(&gate));
+    let gate = Arc::new(Gate::new());
+    READ_GATES.arm("wait.txt".to_owned(), Arc::clone(&gate));
     let pending = tokio::spawn({
         let workspace = Arc::clone(&fixture.workspace);
         async move {

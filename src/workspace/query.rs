@@ -10,8 +10,6 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -248,13 +246,15 @@ pub(crate) async fn read_until(
     let content_budget = max_bytes - envelope;
 
     #[cfg(test)]
-    take_and_pause_workspace_read(
-        &path,
-        &session_cancellation,
-        &shutdown_cancellation,
-        deadline,
-    )
-    .await?;
+    if let Some(gate) = READ_GATES.take(&path) {
+        with_query_budget(
+            gate.pass(),
+            &session_cancellation,
+            &shutdown_cancellation,
+            deadline,
+        )
+        .await?;
+    }
 
     let mut file = with_query_budget(
         workspace.open_regular_file(&path),
@@ -584,76 +584,13 @@ fn map_workspace_error(error: crate::workspace::WorkspaceError) -> AgentError {
     }
 }
 
+/// Holds the next read of a path after validation so a test can observe a
+/// genuinely pending query.
 #[cfg(test)]
-type WorkspaceReadGates = Vec<(String, Arc<WorkspaceReadGate>)>;
-
-#[cfg(test)]
-static WORKSPACE_READ_GATES: OnceLock<Mutex<WorkspaceReadGates>> = OnceLock::new();
-
-/// Test seam that holds the next query for `path` after validation, so a test
-/// can observe a genuinely pending read without a sleep.
-#[cfg(test)]
-pub(crate) struct WorkspaceReadGate {
-    started: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl WorkspaceReadGate {
-    pub(crate) fn new() -> Self {
-        Self {
-            started: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.started.notified().await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn gate_next_workspace_read(path: &str, gate: Arc<WorkspaceReadGate>) {
-    WORKSPACE_READ_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((path.to_owned(), gate));
-}
-
-#[cfg(test)]
-fn take_workspace_read_gate(path: &str) -> Option<Arc<WorkspaceReadGate>> {
-    let mut gates = WORKSPACE_READ_GATES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    let index = gates.iter().position(|(candidate, _)| candidate == path)?;
-    Some(gates.remove(index).1)
-}
-
-#[cfg(test)]
-async fn take_and_pause_workspace_read(
-    path: &str,
-    session_cancellation: &CancellationToken,
-    shutdown_cancellation: &CancellationToken,
-    deadline: Instant,
-) -> Result<(), AgentError> {
-    let Some(gate) = take_workspace_read_gate(path) else {
-        return Ok(());
-    };
-    gate.started.notify_one();
-    with_query_budget(
-        gate.release.notified(),
-        session_cancellation,
-        shutdown_cancellation,
-        deadline,
-    )
-    .await
-}
+pub(crate) static READ_GATES: crate::test_support::Registry<
+    String,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
 
 #[cfg(test)]
 mod tests;
