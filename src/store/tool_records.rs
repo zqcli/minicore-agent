@@ -104,19 +104,6 @@ impl Store {
         }
         validate_stored_tool_record(&snapshot.record, &snapshot.tool_ref)?;
 
-        let input_len = snapshot.input_bytes.as_ref().map_or(0, |b| b.len());
-        let result_len = snapshot.result_bytes.as_ref().map_or(0, |b| b.len());
-        let stdout_len = snapshot.stdout_bytes.as_ref().map_or(0, |b| b.len());
-        let stderr_len = snapshot.stderr_bytes.as_ref().map_or(0, |b| b.len());
-        let before_len = snapshot
-            .file_change_before
-            .as_ref()
-            .map_or(0, |bytes| bytes.len());
-        let after_len = snapshot
-            .file_change_after
-            .as_ref()
-            .map_or(0, |bytes| bytes.len());
-
         let streams = [
             (
                 snapshot.input_bytes.as_deref(),
@@ -156,12 +143,11 @@ impl Store {
             snapshot.file_change_before.as_deref(),
             snapshot.file_change_after.as_deref(),
         )?;
-        let raw_bytes = input_len
-            .saturating_add(result_len)
-            .saturating_add(stdout_len)
-            .saturating_add(stderr_len)
-            .saturating_add(before_len)
-            .saturating_add(after_len);
+        let raw_bytes: usize = snapshot
+            .blobs()
+            .iter()
+            .map(|(_, bytes)| bytes.map_or(0, <[u8]>::len))
+            .sum();
         if raw_bytes > 3 * 1024 * 1024 {
             return Err(StoreError::RecordTooLarge);
         }
@@ -220,13 +206,7 @@ impl Store {
             return Err(StoreError::RecordTooLarge);
         }
 
-        let item_bytes = (record_bytes.len()
-            + input_len
-            + result_len
-            + stdout_len
-            + stderr_len
-            + before_len
-            + after_len) as u64;
+        let item_bytes = (record_bytes.len() + raw_bytes) as u64;
         let reserve = item_bytes.saturating_mul(2);
 
         let limits = self.aux_limits();
@@ -259,15 +239,7 @@ impl Store {
             #[cfg(test)]
             wait_aux_temp_creation_gate(snapshot.tool_ref.session_id).await;
 
-            let blobs = [
-                (TOOL_INPUT_FILE, snapshot.input_bytes.as_deref()),
-                (TOOL_RESULT_FILE, snapshot.result_bytes.as_deref()),
-                (TOOL_STDOUT_FILE, snapshot.stdout_bytes.as_deref()),
-                (TOOL_STDERR_FILE, snapshot.stderr_bytes.as_deref()),
-                (TOOL_BEFORE_FILE, snapshot.file_change_before.as_deref()),
-                (TOOL_AFTER_FILE, snapshot.file_change_after.as_deref()),
-            ];
-            for (name, bytes) in blobs {
+            for (name, bytes) in snapshot.blobs() {
                 if let Some(bytes) = bytes {
                     if Instant::now() >= deadline {
                         return Err(StoreError::Unavailable);

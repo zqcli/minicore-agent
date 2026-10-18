@@ -26,7 +26,7 @@ use minicore_runtime::history::HistoryItem;
 use minicore_runtime::tools::{ToolInvocation, ToolResultOutcome};
 use minicore_runtime::{LoopId, ToolCallId};
 
-use crate::budget::encoded_len;
+use crate::budget::{encoded_len, encoded_result};
 use crate::changes::{CHANGE_METADATA_BYTES, ChangeRecord, FileChange};
 use crate::error::AgentError;
 use crate::ids::SessionId;
@@ -34,6 +34,7 @@ use crate::store::{
     StoredInputSummary, StoredResultSummary, StoredStreamWindow, StoredToolRecord,
     TOOL_RECORD_FORMAT_VERSION,
 };
+use crate::text::truncate;
 
 /// Maximum retained records for one loaded Session.
 pub(crate) const MAX_TOOL_RECORDS: usize = 1024;
@@ -360,6 +361,54 @@ struct StreamPush {
 }
 
 impl StreamWindow {
+    fn from_stored(stored: StoredStreamWindow, bytes: Option<Vec<u8>>, corrupt: bool) -> Self {
+        Self {
+            bytes: bytes.unwrap_or_default(),
+            start_offset: stored.start_offset,
+            observed_end: stored.observed_end,
+            seen: stored.seen,
+            complete: stored.complete,
+            truncated: stored.truncated,
+            expired: stored.expired,
+            corrupt,
+        }
+    }
+
+    fn merge_stored(&mut self, stored: Self) {
+        if !self.seen && !self.complete && self.observed_end == 0 {
+            *self = stored;
+        } else if self.expired || self.corrupt {
+            if (stored.seen || stored.complete) && !stored.expired && !stored.corrupt {
+                *self = stored;
+            } else if stored.corrupt {
+                self.corrupt = true;
+                if stored.observed_end > 0 {
+                    self.observed_end = stored.observed_end;
+                    self.start_offset = stored.start_offset;
+                }
+            }
+        } else if stored.complete {
+            self.complete = true;
+        }
+    }
+
+    fn snapshot(&self) -> (StoredStreamWindow, Option<Vec<u8>>) {
+        let (bytes, file_bytes, file_sha256) = snapshot_blob(&self.bytes, self.expired);
+        (
+            StoredStreamWindow {
+                start_offset: self.start_offset,
+                observed_end: self.observed_end,
+                seen: self.seen,
+                complete: self.complete,
+                truncated: self.truncated,
+                expired: self.expired,
+                file_bytes,
+                file_sha256,
+            },
+            bytes,
+        )
+    }
+
     /// Appends one chunk and evicts the oldest bytes beyond the window.
     fn push(&mut self, chunk: &[u8]) -> StreamPush {
         self.seen = true;
@@ -875,48 +924,8 @@ impl ToolRecord {
             }
         }
 
-        // 4. Process streams (stdout / stderr)
-        let stdout_unknown =
-            !self.stdout.seen && !self.stdout.complete && self.stdout.observed_end == 0;
-        if stdout_unknown {
-            self.stdout = stored.stdout;
-        } else if self.stdout.expired || self.stdout.corrupt {
-            if (stored.stdout.seen || stored.stdout.complete)
-                && !stored.stdout.expired
-                && !stored.stdout.corrupt
-            {
-                self.stdout = stored.stdout;
-            } else if stored.stdout.corrupt {
-                self.stdout.corrupt = true;
-                if stored.stdout.observed_end > 0 {
-                    self.stdout.observed_end = stored.stdout.observed_end;
-                    self.stdout.start_offset = stored.stdout.start_offset;
-                }
-            }
-        } else if !self.stdout.complete && stored.stdout.complete {
-            self.stdout.complete = true;
-        }
-
-        let stderr_unknown =
-            !self.stderr.seen && !self.stderr.complete && self.stderr.observed_end == 0;
-        if stderr_unknown {
-            self.stderr = stored.stderr;
-        } else if self.stderr.expired || self.stderr.corrupt {
-            if (stored.stderr.seen || stored.stderr.complete)
-                && !stored.stderr.expired
-                && !stored.stderr.corrupt
-            {
-                self.stderr = stored.stderr;
-            } else if stored.stderr.corrupt {
-                self.stderr.corrupt = true;
-                if stored.stderr.observed_end > 0 {
-                    self.stderr.observed_end = stored.stderr.observed_end;
-                    self.stderr.start_offset = stored.stderr.start_offset;
-                }
-            }
-        } else if !self.stderr.complete && stored.stderr.complete {
-            self.stderr.complete = true;
-        }
+        self.stdout.merge_stored(stored.stdout);
+        self.stderr.merge_stored(stored.stderr);
 
         // 5. Command record
         if self.command.is_none() {
@@ -1169,7 +1178,7 @@ impl ToolRecord {
     ) -> Result<ToolReadResult, AgentError> {
         let execution = self.execution_data(tool_ref);
         let invocation = (self.input_seen || self.input_expired).then(|| {
-            let (preview, cut) = truncate_prefix(&self.input, MAX_INVOCATION_PREVIEW_BYTES);
+            let (preview, cut) = truncate(&self.input, MAX_INVOCATION_PREVIEW_BYTES);
             ToolInvocationData {
                 tool_ref: tool_ref.clone(),
                 name: self.name.clone(),
@@ -1177,7 +1186,7 @@ impl ToolRecord {
                 subject_truncated: self.subject_truncated,
                 input: ToolInputSummary {
                     total_bytes: self.input_total,
-                    preview,
+                    preview: preview.to_owned(),
                     truncated: cut
                         || self.input_truncated
                         || self.input_expired
@@ -1311,7 +1320,7 @@ impl ToolRecord {
             data: String::new(),
         };
         if expired {
-            return bounded_page(
+            return encoded_result(
                 ToolOutputPage {
                     base_offset: observed as u64,
                     next_offset: observed as u64,
@@ -1326,7 +1335,7 @@ impl ToolRecord {
             if request.offset != 0 {
                 return Err(AgentError::InvalidArguments);
             }
-            return bounded_page(
+            return encoded_result(
                 ToolOutputPage {
                     eof: availability != ToolDataAvailability::Pending,
                     ..base
@@ -1340,7 +1349,7 @@ impl ToolRecord {
         let offset = usize::try_from(request.offset).unwrap_or(usize::MAX);
         let retained = content.len();
         if offset > retained {
-            return bounded_page(
+            return encoded_result(
                 ToolOutputPage {
                     base_offset: request.offset,
                     next_offset: observed as u64,
@@ -1372,7 +1381,7 @@ impl ToolRecord {
         let next = offset.saturating_add(data.len());
         let lossy = retained < observed || truncated;
         let eof = next >= retained;
-        bounded_page(
+        encoded_result(
             ToolOutputPage {
                 base_offset: offset as u64,
                 next_offset: next as u64,
@@ -1416,26 +1425,8 @@ impl ToolRecord {
             },
             None => String::new(),
         };
-        let stdout = StreamWindow {
-            bytes: stdout_bytes.unwrap_or_default(),
-            start_offset: stored.stdout.start_offset,
-            observed_end: stored.stdout.observed_end,
-            seen: stored.stdout.seen,
-            complete: stored.stdout.complete,
-            truncated: stored.stdout.truncated,
-            expired: stored.stdout.expired,
-            corrupt: stdout_corrupt,
-        };
-        let stderr = StreamWindow {
-            bytes: stderr_bytes.unwrap_or_default(),
-            start_offset: stored.stderr.start_offset,
-            observed_end: stored.stderr.observed_end,
-            seen: stored.stderr.seen,
-            complete: stored.stderr.complete,
-            truncated: stored.stderr.truncated,
-            expired: stored.stderr.expired,
-            corrupt: stderr_corrupt,
-        };
+        let stdout = StreamWindow::from_stored(stored.stdout, stdout_bytes, stdout_corrupt);
+        let stderr = StreamWindow::from_stored(stored.stderr, stderr_bytes, stderr_corrupt);
         let file_change = stored.file_change.map(|change| {
             FileChange::from_stored(
                 change,
@@ -1489,6 +1480,23 @@ pub(crate) struct ToolPersistenceSnapshot {
     pub(crate) stderr_bytes: Option<Vec<u8>>,
     pub(crate) file_change_before: Option<Vec<u8>>,
     pub(crate) file_change_after: Option<Vec<u8>>,
+}
+
+impl ToolPersistenceSnapshot {
+    pub(crate) fn blobs(&self) -> [(&'static str, Option<&[u8]>); 6] {
+        use crate::store::{
+            TOOL_AFTER_FILE, TOOL_BEFORE_FILE, TOOL_INPUT_FILE, TOOL_RESULT_FILE, TOOL_STDERR_FILE,
+            TOOL_STDOUT_FILE,
+        };
+        [
+            (TOOL_INPUT_FILE, self.input_bytes.as_deref()),
+            (TOOL_RESULT_FILE, self.result_bytes.as_deref()),
+            (TOOL_STDOUT_FILE, self.stdout_bytes.as_deref()),
+            (TOOL_STDERR_FILE, self.stderr_bytes.as_deref()),
+            (TOOL_BEFORE_FILE, self.file_change_before.as_deref()),
+            (TOOL_AFTER_FILE, self.file_change_after.as_deref()),
+        ]
+    }
 }
 
 impl fmt::Debug for ToolPersistenceSnapshot {
@@ -1796,9 +1804,9 @@ impl ToolData {
         invocation: &ToolInvocation,
     ) -> Option<ToolInvocationData> {
         let name = invocation.tool_name().as_str().to_owned();
-        let raw = serde_json::to_string(invocation.arguments()).unwrap_or_else(|_| "{}".to_owned());
+        let raw = serde_json::to_string(invocation.arguments()).expect("JSON arguments serialize");
         let (subject, subject_truncated) = subject_for(&name, invocation.arguments());
-        let (input, input_total, input_truncated) = bounded(&raw, MAX_TOOL_INPUT_BYTES);
+        let (input, input_truncated) = truncate(&raw, MAX_TOOL_INPUT_BYTES);
 
         let mut inner = self.lock();
         inner.track(tool_ref, &name);
@@ -1812,8 +1820,8 @@ impl ToolData {
             }
             record.subject = subject;
             record.subject_truncated = subject_truncated;
-            record.input = input;
-            record.input_total = input_total;
+            record.input = input.to_owned();
+            record.input_total = raw.len();
             record.input_seen = true;
             record.input_truncated = input_truncated;
             record.input_expired = false;
@@ -1830,7 +1838,9 @@ impl ToolData {
             subject_truncated: record.subject_truncated,
             input: ToolInputSummary {
                 total_bytes: record.input_total,
-                preview: truncate_prefix(&record.input, EVENT_INPUT_PREVIEW_BYTES).0,
+                preview: truncate(&record.input, EVENT_INPUT_PREVIEW_BYTES)
+                    .0
+                    .to_owned(),
                 truncated: record.input.len() > EVENT_INPUT_PREVIEW_BYTES || record.input_truncated,
                 encoding: INPUT_ENCODING,
             },
@@ -1876,12 +1886,12 @@ impl ToolData {
     /// Retains the raw result text observed by the wrapper. The authoritative
     /// terminal state still comes from the Runtime report.
     pub(crate) fn note_result(&self, tool_ref: &ToolRef, content: &str) {
-        let (result, result_total, result_truncated) = bounded(content, MAX_TOOL_RESULT_BYTES);
+        let (result, result_truncated) = truncate(content, MAX_TOOL_RESULT_BYTES);
         let mut inner = self.lock();
         inner.resize(tool_ref, |record| {
-            record.output_line_count = Some(crate::presentation::count_lines(&result));
-            record.result = result;
-            record.result_total = result_total;
+            record.output_line_count = Some(crate::presentation::count_lines(result));
+            record.result = result.to_owned();
+            record.result_total = content.len();
             record.result_seen = true;
             record.result_truncated = result_truncated;
             record.result_expired = false;
@@ -2082,9 +2092,9 @@ impl ToolData {
             // The report is the authority for the result text the model saw;
             // replace any best-effort early wrapper copy. Never resurrect bytes
             // that were evicted.
+            let content = result.output.content().as_str();
             let captured = inner.records.get(&tool_ref).and_then(|record| {
-                (!record.result_expired)
-                    .then(|| bounded(result.output.content().as_str(), MAX_TOOL_RESULT_BYTES))
+                (!record.result_expired).then(|| truncate(content, MAX_TOOL_RESULT_BYTES))
             });
             if let Some(record) = inner.records.get_mut(&tool_ref) {
                 record.state = ToolExecutionState::from_outcome(result.outcome);
@@ -2093,47 +2103,17 @@ impl ToolData {
                     record.finished_at = finished_at.clone();
                 }
             }
-            if let Some((content, total, truncated)) = captured {
+            if let Some((prefix, truncated)) = captured {
                 inner.resize(&tool_ref, |record| {
-                    record.output_line_count = Some(crate::presentation::count_lines(&content));
-                    record.result = content;
-                    record.result_total = total;
+                    record.output_line_count = Some(crate::presentation::count_lines(prefix));
+                    record.result = prefix.to_owned();
+                    record.result_total = content.len();
                     record.result_seen = true;
                     record.result_truncated = truncated;
                 });
             }
         }
         inner.enforce_limits();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read(
-        &self,
-        request: &ToolReadRequest,
-        max_bytes: usize,
-    ) -> Result<ToolReadResult, AgentError> {
-        let inner = self.lock();
-        let Some(record) = inner.records.get(&request.tool_ref) else {
-            return Err(AgentError::ToolNotFound);
-        };
-        if request.display {
-            record.project_display_read(&request.tool_ref, max_bytes)
-        } else {
-            record.project_read(&request.tool_ref, max_bytes)
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn output(
-        &self,
-        request: &ToolOutputRequest,
-        max_bytes: usize,
-    ) -> Result<ToolOutputPage, AgentError> {
-        let inner = self.lock();
-        let Some(record) = inner.records.get(&request.tool_ref) else {
-            return Err(AgentError::ToolNotFound);
-        };
-        record.project_output(request, max_bytes)
     }
 
     /// Returns all tool refs associated with a particular loop in insertion order.
@@ -2195,22 +2175,12 @@ impl ToolData {
         let inner = self.lock();
         let record = inner.records.get(tool_ref)?;
 
-        if !record.state.is_terminal() {
+        if !record.is_terminal() {
             return None;
         }
-        if let Some(command) = &record.command {
-            if !command.status.is_terminal() {
-                return None;
-            }
-        }
 
-        let input_bytes = if !record.input_expired && !record.input.is_empty() {
-            Some(record.input.as_bytes().to_vec())
-        } else {
-            None
-        };
-        let input_file_bytes = input_bytes.as_ref().map_or(0, |b| b.len());
-        let input_file_sha256 = input_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
+        let (input_bytes, input_file_bytes, input_file_sha256) =
+            snapshot_blob(record.input.as_bytes(), record.input_expired);
         let input_summary = StoredInputSummary {
             total_bytes: record.input_total,
             seen: record.input_seen,
@@ -2220,13 +2190,8 @@ impl ToolData {
             file_sha256: input_file_sha256,
         };
 
-        let result_bytes = if !record.result_expired && !record.result.is_empty() {
-            Some(record.result.as_bytes().to_vec())
-        } else {
-            None
-        };
-        let result_file_bytes = result_bytes.as_ref().map_or(0, |b| b.len());
-        let result_file_sha256 = result_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
+        let (result_bytes, result_file_bytes, result_file_sha256) =
+            snapshot_blob(record.result.as_bytes(), record.result_expired);
         let result_summary = StoredResultSummary {
             total_bytes: record.result_total,
             seen: record.result_seen,
@@ -2236,41 +2201,8 @@ impl ToolData {
             file_sha256: result_file_sha256,
         };
 
-        let stdout_bytes = if !record.stdout.expired && !record.stdout.bytes.is_empty() {
-            Some(record.stdout.bytes.clone())
-        } else {
-            None
-        };
-        let stdout_file_bytes = stdout_bytes.as_ref().map_or(0, |b| b.len());
-        let stdout_file_sha256 = stdout_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
-        let stdout_summary = StoredStreamWindow {
-            start_offset: record.stdout.start_offset,
-            observed_end: record.stdout.observed_end,
-            seen: record.stdout.seen,
-            complete: record.stdout.complete,
-            truncated: record.stdout.truncated,
-            expired: record.stdout.expired,
-            file_bytes: stdout_file_bytes,
-            file_sha256: stdout_file_sha256,
-        };
-
-        let stderr_bytes = if !record.stderr.expired && !record.stderr.bytes.is_empty() {
-            Some(record.stderr.bytes.clone())
-        } else {
-            None
-        };
-        let stderr_file_bytes = stderr_bytes.as_ref().map_or(0, |b| b.len());
-        let stderr_file_sha256 = stderr_bytes.as_ref().map(|b| crate::store::hash_bytes(b));
-        let stderr_summary = StoredStreamWindow {
-            start_offset: record.stderr.start_offset,
-            observed_end: record.stderr.observed_end,
-            seen: record.stderr.seen,
-            complete: record.stderr.complete,
-            truncated: record.stderr.truncated,
-            expired: record.stderr.expired,
-            file_bytes: stderr_file_bytes,
-            file_sha256: stderr_file_sha256,
-        };
+        let (stdout_summary, stdout_bytes) = record.stdout.snapshot();
+        let (stderr_summary, stderr_bytes) = record.stderr.snapshot();
 
         let command = record.command.clone().map(|cmd| record.live_command(cmd));
         let file_change = record.file_change.as_ref().map(FileChange::stored);
@@ -2315,11 +2247,15 @@ impl ToolData {
     }
 }
 
-fn bounded_page(page: ToolOutputPage, max_bytes: usize) -> Result<ToolOutputPage, AgentError> {
-    if encoded_len(&page) > max_bytes {
-        Err(AgentError::InvalidArguments)
+fn snapshot_blob(bytes: &[u8], expired: bool) -> (Option<Vec<u8>>, usize, Option<String>) {
+    if expired || bytes.is_empty() {
+        (None, 0, None)
     } else {
-        Ok(page)
+        (
+            Some(bytes.to_vec()),
+            bytes.len(),
+            Some(crate::store::hash_bytes(bytes)),
+        )
     }
 }
 
@@ -2354,7 +2290,7 @@ fn output_process(
         data: String::new(),
     };
     if window.corrupt {
-        return bounded_page(
+        return encoded_result(
             ToolOutputPage {
                 eof: stream_final,
                 truncated: true,
@@ -2369,7 +2305,7 @@ fn output_process(
     }
     if window.expired {
         // The window was freed; the observed end is the only honest anchor.
-        return bounded_page(
+        return encoded_result(
             ToolOutputPage {
                 truncated: true,
                 ..base
@@ -2386,7 +2322,7 @@ fn output_process(
         // The requested bytes were dropped from the retained window: report the
         // loss and where the window starts now so the next page can read the tail.
         let has_retained = !window.bytes.is_empty();
-        return bounded_page(
+        return encoded_result(
             ToolOutputPage {
                 base_offset: window.start_offset,
                 next_offset: if has_retained {
@@ -2405,7 +2341,7 @@ fn output_process(
     if bytes.is_empty() {
         // Nothing is retained at or after this offset; the frame reports the
         // real end without inventing content.
-        return bounded_page(
+        return encoded_result(
             ToolOutputPage {
                 base_offset: request.offset,
                 next_offset: request.offset,
@@ -2430,7 +2366,7 @@ fn output_process(
         return Err(AgentError::InvalidArguments);
     }
     let next = request.offset.saturating_add(take as u64);
-    bounded_page(
+    encoded_result(
         ToolOutputPage {
             base_offset: request.offset,
             next_offset: next,
@@ -2454,16 +2390,24 @@ fn subject_for(name: &str, arguments: &Value) -> (ToolSubject, bool) {
     match name {
         "read" | "write" | "edit" | "apply_patch" => {
             let path = string_arg(arguments, &["path", "file_path"]);
-            let (path, truncated) = truncate_prefix(&path, MAX_SUBJECT_BYTES);
-            (ToolSubject::File { path }, truncated)
+            let (path, truncated) = truncate(&path, MAX_SUBJECT_BYTES);
+            (
+                ToolSubject::File {
+                    path: path.to_owned(),
+                },
+                truncated,
+            )
         }
         "bash" => {
             let script = string_arg(arguments, &["command"]);
             let cwd = arguments.get("cwd").and_then(Value::as_str).unwrap_or(".");
-            let (script, script_truncated) = truncate_prefix(&script, MAX_SUBJECT_BYTES);
-            let (cwd, cwd_truncated) = truncate_prefix(cwd, MAX_SUBJECT_BYTES);
+            let (script, script_truncated) = truncate(&script, MAX_SUBJECT_BYTES);
+            let (cwd, cwd_truncated) = truncate(cwd, MAX_SUBJECT_BYTES);
             (
-                ToolSubject::Command { script, cwd },
+                ToolSubject::Command {
+                    script: script.to_owned(),
+                    cwd: cwd.to_owned(),
+                },
                 script_truncated || cwd_truncated,
             )
         }
@@ -2480,26 +2424,16 @@ fn string_arg(arguments: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
-fn bounded(value: &str, max_bytes: usize) -> (String, usize, bool) {
-    let (prefix, truncated) = crate::text::truncate(value, max_bytes);
-    (prefix.to_owned(), value.len(), truncated)
-}
-
-fn truncate_prefix(value: &str, max_bytes: usize) -> (String, bool) {
-    let (prefix, truncated) = crate::text::truncate(value, max_bytes);
-    (prefix.to_owned(), truncated)
-}
-
 /// Largest char-boundary prefix whose JSON string encoding fits `available`
-/// bytes, including the surrounding quotes. `json_len(prefix(k))` is monotonic
+/// bytes, including the surrounding quotes. `encoded_len(prefix(k))` is monotonic
 /// in the character count `k`, so a plain binary search over character counts
 /// is correct, including a first multibyte character whose boundary is farther
 /// than one byte step from the previous one.
 fn fit_encoded_string(value: &str, available: usize) -> (String, bool) {
-    if value.is_empty() || json_len("") > available {
+    if value.is_empty() || encoded_len("") > available {
         return (String::new(), !value.is_empty());
     }
-    if json_len(value) <= available {
+    if encoded_len(value) <= available {
         return (value.to_owned(), false);
     }
     let char_count = value.chars().count();
@@ -2513,7 +2447,7 @@ fn fit_encoded_string(value: &str, available: usize) -> (String, bool) {
     let mut high = char_count; // full value does not fit
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        if json_len(prefix(middle)) <= available {
+        if encoded_len(prefix(middle)) <= available {
             low = middle;
         } else {
             high = middle - 1;
@@ -2521,10 +2455,6 @@ fn fit_encoded_string(value: &str, available: usize) -> (String, bool) {
     }
     let end = prefix(low).len();
     (value[..end].to_owned(), low < char_count)
-}
-
-fn json_len(value: &str) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 #[cfg(test)]

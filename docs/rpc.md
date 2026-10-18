@@ -1688,9 +1688,20 @@ context, and hunk/line/offset; `base_version` and `target_version` are carried
 by the result. A different diff returns `stale: true` instead of continuing a
 new comparison under an old cursor. A start tuple that is not a real position
 inside the plan (a hunk/line index past its range, a byte offset past the line,
-or a non-UTF-8-boundary offset) is rejected as invalid arguments. The CPU
-comparison runs under one absolute deadline in an owned Store worker set
-(max four). `DiffQuery` is a wait-only observation handle; its Drop
+or a non-UTF-8-boundary offset) is rejected as invalid arguments. Cursors do
+not contain a `tool_ref` lookup hint; clients must return the cursor as issued.
+
+Alignment is deterministic: common leading and trailing lines are trimmed,
+then Myers runs without an algorithm deadline when the remaining middle has
+at most 2,048 lines across both sides. Larger middles are emitted as one
+replacement hunk (with the requested surrounding context). This coarser
+alignment retains every changed byte; it does not by itself set `truncated`.
+The fingerprint includes the alignment path, so CPU load cannot invalidate a
+continuation. The separate 100,000 combined-line ceiling still returns a
+truncated plan without hunks. Query cancellation or deadline expiry returns
+`query_limit`, never a time-dependent partial alignment.
+
+The comparison runs in an owned Store worker set (max four). `DiffQuery` is a wait-only observation handle; its Drop
 unconditionally calls `child_cancel.cancel()`, which requests child stop but is
 not the Store ownership or cleanup barrier. Store ownership retains the join
 handle; Session close joins that Session's workers, while Agent shutdown joins

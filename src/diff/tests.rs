@@ -5,6 +5,33 @@ use super::*;
 use crate::changes::{ChangeCommitState, ChangeCoverage, ChangeKind, FileChange, content_revision};
 use crate::tool_data::ToolData;
 
+pub(crate) fn comparison_key(before: &[u8], after: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((before.len() as u64).to_le_bytes());
+    hasher.update(before);
+    hasher.update((after.len() as u64).to_le_bytes());
+    hasher.update(after);
+    crate::store::digest_hex(hasher)
+}
+
+pub(super) fn block_on_diff_gate(
+    before: &[u8],
+    after: &[u8],
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), AgentError> {
+    if let Some(gate) = DIFF_GATES.take(&comparison_key(before, after)) {
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {},
+                _ = gate.pass() => {},
+            }
+        });
+    }
+    check_budget(cancellation, deadline)
+}
+
 fn session() -> SessionId {
     SessionId::new().unwrap()
 }
@@ -130,6 +157,151 @@ fn textual_plan_marks_added_and_removed_lines() {
     assert!(kinds.contains(&DiffLineKind::Removed));
     assert!(kinds.contains(&DiffLineKind::Added));
     assert_eq!(plan.fingerprint.len(), 64);
+}
+
+#[test]
+fn equal_ends_are_trimmed_before_applying_the_myers_bound() {
+    let prefix = "prefix\r\n".repeat(MAX_MYERS_LINES);
+    let suffix = "suffix\r".repeat(MAX_MYERS_LINES);
+    let before = format!("{prefix}old\nkeep\nold tail\n{suffix}");
+    let after = format!("{prefix}new\nkeep\nnew tail\n{suffix}");
+    let plan = plan(before.as_bytes(), after.as_bytes(), 0);
+    assert!(!plan.truncated);
+    assert_eq!(plan.hunks.len(), 2);
+    assert_eq!(plan.hunks[0].old_start, MAX_MYERS_LINES);
+    assert_eq!(plan.hunks[1].new_start, MAX_MYERS_LINES + 2);
+    assert_eq!(
+        reconstructed(&plan, before.as_bytes(), after.as_bytes()),
+        vec![
+            (DiffLineKind::Removed, b"old\n".to_vec()),
+            (DiffLineKind::Added, b"new\n".to_vec()),
+            (DiffLineKind::Removed, b"old tail\n".to_vec()),
+            (DiffLineKind::Added, b"new tail\n".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn middle_line_bound_selects_myers_or_one_lossless_replacement() {
+    for extra in [0, 1] {
+        let middle = "same\n".repeat(MAX_MYERS_LINES / 2 - 2);
+        let before = format!("prefix\nold\n{middle}old tail\nsuffix\n");
+        let after = format!(
+            "prefix\nnew\n{middle}{}new tail\nsuffix\n",
+            "extra\n".repeat(extra)
+        );
+        let plan = plan(before.as_bytes(), after.as_bytes(), 0);
+        assert!(!plan.truncated);
+        assert_eq!(plan.hunks.len(), if extra == 0 { 2 } else { 1 });
+        if extra == 1 {
+            let lines = reconstructed(&plan, before.as_bytes(), after.as_bytes());
+            for (kind, source) in [
+                (DiffLineKind::Removed, &before),
+                (DiffLineKind::Added, &after),
+            ] {
+                let rebuilt: Vec<_> = lines
+                    .iter()
+                    .filter(|(k, _)| *k == kind)
+                    .flat_map(|(_, bytes)| bytes.iter().copied())
+                    .collect();
+                assert_eq!(
+                    rebuilt,
+                    source
+                        .strip_prefix("prefix\n")
+                        .unwrap()
+                        .strip_suffix("suffix\n")
+                        .unwrap()
+                        .as_bytes()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn replacement_pages_replan_with_stable_cursors_and_exact_bytes() {
+    let before = "old é\r\n".repeat(MAX_MYERS_LINES);
+    let after = "new 🙂\r".repeat(2);
+    let base = page_base(Some(tool_ref(session())));
+    let mut request = ChangesDiffRequest {
+        session_id: base.session_id_for_test(),
+        change_ref: base.change_ref.clone(),
+        context_lines: Some(0),
+        comparison: None,
+        cursor: None,
+        max_bytes: Some(MIN_DIFF_MAX_BYTES),
+    };
+    let mut removed = String::new();
+    let mut added = String::new();
+    let mut pages = 0;
+    loop {
+        let plan = plan(before.as_bytes(), after.as_bytes(), 0);
+        let start = request.cursor.as_ref().map_or((0, 0, 0), |cursor| {
+            assert_eq!(cursor.ops_fingerprint, plan.fingerprint);
+            (
+                cursor.hunk_index,
+                cursor.line_index,
+                cursor.line_byte_offset,
+            )
+        });
+        let (hunks, cursor, complete) = build_page(
+            &request,
+            &base,
+            &plan,
+            before.as_bytes(),
+            after.as_bytes(),
+            0,
+            start,
+            MIN_DIFF_MAX_BYTES,
+        )
+        .unwrap();
+        for line in hunks.iter().flat_map(|hunk| &hunk.lines) {
+            match line.kind {
+                DiffLineKind::Removed => removed.push_str(&line.text),
+                DiffLineKind::Added => added.push_str(&line.text),
+                DiffLineKind::Context => panic!("no context requested"),
+            }
+        }
+        let result = DiffResult {
+            hunks,
+            next_cursor: cursor.clone(),
+            complete,
+            ..base.clone()
+        };
+        assert!(encoded_len(&result) <= MIN_DIFF_MAX_BYTES);
+        pages += 1;
+        assert!(pages < 2_000);
+        if complete {
+            break;
+        }
+        request.cursor = Some(cursor.expect("incomplete page has a cursor"));
+    }
+    assert!(pages > 1);
+    assert_eq!(removed, before);
+    assert_eq!(added, after);
+}
+
+#[test]
+fn myers_bound_handles_disjoint_full_size_snapshots() {
+    let line_count = MAX_MYERS_LINES / 2;
+    let shared = "x".repeat(crate::changes::MAX_CHANGE_SNAPSHOT_BYTES / line_count - 2);
+    let before = format!("{shared}a\n").repeat(line_count);
+    let after = format!("{shared}b\n").repeat(line_count);
+    let plan = plan(before.as_bytes(), after.as_bytes(), 0);
+    assert!(!plan.truncated);
+    assert_eq!(plan.hunks.len(), 1);
+    assert_eq!(plan.hunks[0].old_count, line_count);
+    assert_eq!(plan.hunks[0].new_count, line_count);
+    assert_eq!(plan.hunks[0].lines.len(), MAX_MYERS_LINES);
+}
+
+#[test]
+fn alignment_path_is_part_of_the_plan_fingerprint() {
+    let plan = plan(b"old\n", b"new\n", 0);
+    assert_ne!(
+        plan_fingerprint(0, false, &plan.hunks),
+        plan_fingerprint(0, true, &plan.hunks)
+    );
 }
 
 #[test]
@@ -273,7 +445,7 @@ fn page_all(
         )
         .unwrap();
         // The measured page must respect the budget on every step.
-        let mut check = clone_base(base);
+        let mut check = base.clone();
         check.hunks = hunks.clone();
         check.next_cursor = next.clone();
         assert!(crate::budget::encoded_len(&check) <= max_bytes);

@@ -38,6 +38,38 @@ use crate::changes::FileChange;
 
 use super::*;
 
+impl ToolData {
+    pub(crate) fn read(
+        &self,
+        request: &ToolReadRequest,
+        max_bytes: usize,
+    ) -> Result<ToolReadResult, AgentError> {
+        let inner = self.lock();
+        let record = inner
+            .records
+            .get(&request.tool_ref)
+            .ok_or(AgentError::ToolNotFound)?;
+        if request.display {
+            record.project_display_read(&request.tool_ref, max_bytes)
+        } else {
+            record.project_read(&request.tool_ref, max_bytes)
+        }
+    }
+
+    pub(crate) fn output(
+        &self,
+        request: &ToolOutputRequest,
+        max_bytes: usize,
+    ) -> Result<ToolOutputPage, AgentError> {
+        let inner = self.lock();
+        let record = inner
+            .records
+            .get(&request.tool_ref)
+            .ok_or(AgentError::ToolNotFound)?;
+        record.project_output(request, max_bytes)
+    }
+}
+
 fn session(value: u8) -> SessionId {
     let mut bytes = [0_u8; 16];
     bytes[15] = value;

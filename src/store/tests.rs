@@ -2601,7 +2601,6 @@ async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
             cursor: Some(crate::diff::DiffCursor {
                 session_id,
                 change_ref: change_ref.clone(),
-                tool_ref: Some(tool_ref.clone()),
                 ops_fingerprint: "a".repeat(64),
                 context_lines: 3,
                 hunk_index: 0,
@@ -2670,10 +2669,13 @@ async fn cold_changes_diff_caller_cancel_keeps_store_owned_worker() {
         &tool_ref,
         snapshot.record.file_change.as_ref().unwrap(),
     );
-    let gate = Arc::new(crate::diff::DiffGate::new());
-    crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::diff::DIFF_GATES.arm(
+        crate::diff::tests::comparison_key(&before, &after),
+        Arc::clone(&gate),
+    );
     // `loaded=None` makes the cold branch use its own Session token. The
-    // DiffGate waits on the worker's derived token or its explicit release;
+    // gate waits on the worker's derived token or its explicit release;
     // it does not observe this outer caller token.
     let caller = CancellationToken::new();
     let query = crate::queries::prepare_changes_diff(
@@ -2947,7 +2949,6 @@ async fn diff_warm_half_merges_with_its_disk_counterpart_only() {
         Some(&warm),
         session_id,
         &change_ref,
-        None,
         Instant::now() + Duration::from_secs(10),
         &CancellationToken::new(),
     )
@@ -3038,7 +3039,6 @@ async fn diff_metadata_conflict_keeps_the_valid_warm_side() {
         Some(&warm),
         session_id,
         &warm_ref,
-        None,
         Instant::now() + Duration::from_secs(10),
         &CancellationToken::new(),
     )
@@ -3051,98 +3051,6 @@ async fn diff_metadata_conflict_keeps_the_valid_warm_side() {
     );
     assert!(resolved.1.after_bytes.is_none());
     assert!(!resolved.1.details_available());
-
-    let _ = fs::remove_dir_all(base).await;
-}
-
-#[tokio::test]
-async fn diff_cursor_hint_must_match_the_resolved_reference() {
-    let (base, store, session_id) = fixture("diff-hint").await;
-    store
-        .create_session(&record(&store, session_id))
-        .await
-        .unwrap();
-    let tool_ref = ToolRef {
-        session_id,
-        loop_id: LoopId::new().unwrap(),
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-hint").unwrap(),
-    };
-    let data = ToolData::new();
-    data.note_requested(&tool_ref, "write");
-    data.note_file_change(
-        &tool_ref,
-        FileChange {
-            path: "value.txt".to_owned(),
-            kind: ChangeKind::Modified,
-            before: content_revision(b"before\n"),
-            after: content_revision(b"after\n"),
-            commit_state: ChangeCommitState::Applied,
-            coverage: ChangeCoverage::Complete,
-            before_captured: true,
-            after_captured: true,
-            before_bytes: Some(b"before\n".to_vec()),
-            after_bytes: Some(b"after\n".to_vec()),
-            before_corrupt: false,
-            after_corrupt: false,
-        },
-    );
-    data.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success)
-        .expect("diff record finishes");
-    store
-        .commit_tool_record(
-            &data.snapshot_for_persistence(&tool_ref).unwrap(),
-            Instant::now() + Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    let change_ref = crate::changes::stored_tool_change_ref(
-        &tool_ref,
-        &data.file_change(&tool_ref).unwrap().stored(),
-    );
-
-    // A hint pointing at the right session but the wrong change reference
-    // must not select a different change. The metadata scan is still
-    // consulted, so the real record is found and verified.
-    let wrong = ToolRef {
-        session_id,
-        loop_id: tool_ref.loop_id,
-        request_index: 0,
-        tool_call_id: ToolCallId::new("diff-hint-other").unwrap(),
-    };
-    let resolved = crate::diff::resolve_tool_change(
-        &store,
-        None,
-        session_id,
-        &change_ref,
-        Some(&wrong),
-        Instant::now() + Duration::from_secs(10),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap()
-    .expect("the real change is found despite the wrong hint");
-    assert_eq!(resolved.0, tool_ref);
-    assert_eq!(resolved.1.path, "value.txt");
-
-    // A forged hint for a different session is rejected without a lookup.
-    let other_session = SessionId::new().unwrap();
-    assert!(matches!(
-        crate::diff::resolve_tool_change(
-            &store,
-            None,
-            session_id,
-            &change_ref,
-            Some(&ToolRef {
-                session_id: other_session,
-                ..wrong.clone()
-            }),
-            Instant::now() + Duration::from_secs(10),
-            &CancellationToken::new(),
-        )
-        .await,
-        Err(AgentError::InvalidArguments)
-    ));
 
     let _ = fs::remove_dir_all(base).await;
 }
@@ -3161,8 +3069,11 @@ async fn diff_worker_capacity_is_bounded_and_shutdown_joins() {
     for index in 0..MAX_DIFF_WORKERS {
         let before: Arc<[u8]> = Arc::from(format!("line {index}\n").into_bytes());
         let after: Arc<[u8]> = Arc::from(format!("LINE {index}\n").into_bytes());
-        let gate = Arc::new(crate::diff::DiffGate::new());
-        crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        crate::diff::DIFF_GATES.arm(
+            crate::diff::tests::comparison_key(&before, &after),
+            Arc::clone(&gate),
+        );
         held.push(
             store
                 .spawn_diff_query(
@@ -3239,8 +3150,11 @@ async fn diff_cancelled_admission_refuses_to_spawn_a_worker() {
     let live = CancellationToken::new();
     let before: Arc<[u8]> = Arc::from(b"alpha\n".to_vec());
     let after: Arc<[u8]> = Arc::from(b"ALPHA\n".to_vec());
-    let gate = Arc::new(crate::diff::DiffGate::new());
-    crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::diff::DIFF_GATES.arm(
+        crate::diff::tests::comparison_key(&before, &after),
+        Arc::clone(&gate),
+    );
     let query = store
         .spawn_cancellable_diff_query(
             session_id,
@@ -3269,8 +3183,11 @@ async fn diff_shutdown_drop_and_concurrent_join_really_stop_the_worker() {
     let (base, store, session_id) = fixture("diff-shutdown-reentrant").await;
     let before: Arc<[u8]> = Arc::from(b"one\n".to_vec());
     let after: Arc<[u8]> = Arc::from(b"ONE\n".to_vec());
-    let gate = Arc::new(crate::diff::DiffGate::new());
-    crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::diff::DIFF_GATES.arm(
+        crate::diff::tests::comparison_key(&before, &after),
+        Arc::clone(&gate),
+    );
     let query = store
         .spawn_diff_query(
             session_id,
@@ -3299,8 +3216,11 @@ async fn diff_shutdown_drop_and_concurrent_join_really_stop_the_worker() {
     let (base, store, session_id) = fixture("diff-shutdown-dropped").await;
     let before: Arc<[u8]> = Arc::from(b"two\n".to_vec());
     let after: Arc<[u8]> = Arc::from(b"TWO\n".to_vec());
-    let gate = Arc::new(crate::diff::DiffGate::new());
-    crate::diff::gate_next_diff(&before, &after, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::diff::DIFF_GATES.arm(
+        crate::diff::tests::comparison_key(&before, &after),
+        Arc::clone(&gate),
+    );
     let _query = store
         .spawn_diff_query(
             session_id,
@@ -3335,10 +3255,16 @@ async fn diff_session_shutdown_joins_only_that_session() {
     let after_a: Arc<[u8]> = Arc::from(b"ALPHA\n".to_vec());
     let before_b: Arc<[u8]> = Arc::from(b"beta\n".to_vec());
     let after_b: Arc<[u8]> = Arc::from(b"BETA\n".to_vec());
-    let gate_a = Arc::new(crate::diff::DiffGate::new());
-    crate::diff::gate_next_diff(&before_a, &after_a, Arc::clone(&gate_a));
-    let gate_b = Arc::new(crate::diff::DiffGate::new());
-    crate::diff::gate_next_diff(&before_b, &after_b, Arc::clone(&gate_b));
+    let gate_a = Arc::new(crate::test_support::Gate::new());
+    crate::diff::DIFF_GATES.arm(
+        crate::diff::tests::comparison_key(&before_a, &after_a),
+        Arc::clone(&gate_a),
+    );
+    let gate_b = Arc::new(crate::test_support::Gate::new());
+    crate::diff::DIFF_GATES.arm(
+        crate::diff::tests::comparison_key(&before_b, &after_b),
+        Arc::clone(&gate_b),
+    );
     let query_a = store
         .spawn_diff_query(
             first,

@@ -28,7 +28,7 @@ use minicore_runtime::model::{
 };
 
 use crate::agent::Agent;
-use crate::changes::{ChangeListGate, gate_next_change_list};
+use crate::changes::CHANGE_LIST_GATES;
 use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
@@ -6388,8 +6388,11 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
 
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
-        let gate = Arc::new(crate::diff::DiffGate::new());
-        crate::diff::gate_next_diff(b"user\n", b"agent\n", Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        crate::diff::DIFF_GATES.arm(
+            crate::diff::tests::comparison_key(b"user\n", b"agent\n"),
+            Arc::clone(&gate),
+        );
         gates.push(gate);
         harness
             .send(
@@ -6450,8 +6453,8 @@ async fn changes_list_deferred_query_shares_pool_and_ping_stays_available() {
 
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
-        let gate = Arc::new(ChangeListGate::new());
-        gate_next_change_list(session_val, Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        CHANGE_LIST_GATES.arm(session_val, Arc::clone(&gate));
         gates.push(gate);
         harness
             .send(
@@ -6545,8 +6548,8 @@ async fn changes_capacity_precedes_missing_session_and_starts_no_worker() {
     // Hold every query slot with gated (already admitted) tool-change queries.
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
-        let gate = Arc::new(ChangeListGate::new());
-        gate_next_change_list(session_val, Arc::clone(&gate));
+        let gate = Arc::new(crate::test_support::Gate::new());
+        CHANGE_LIST_GATES.arm(session_val, Arc::clone(&gate));
         gates.push(gate);
         harness
             .send(
@@ -6682,8 +6685,8 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
     .expect("gated model request did not start");
 
     // One held changes.list query + one parked turn.wait per remaining slot.
-    let held_gate = Arc::new(ChangeListGate::new());
-    gate_next_change_list(session_val, Arc::clone(&held_gate));
+    let held_gate = Arc::new(crate::test_support::Gate::new());
+    CHANGE_LIST_GATES.arm(session_val, Arc::clone(&held_gate));
     harness
         .send(
             json!("cl-held"),
@@ -6755,8 +6758,8 @@ async fn changes_list_shutdown_cancels_a_waiting_query_within_deadline() {
     let session = create_and_open(&mut harness, &workspace).await;
     let session_val: SessionId = session.as_str().unwrap().parse().unwrap();
 
-    let gate = Arc::new(ChangeListGate::new());
-    gate_next_change_list(session_val, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    CHANGE_LIST_GATES.arm(session_val, Arc::clone(&gate));
     harness
         .send(
             json!("cl-pending"),
