@@ -46,7 +46,7 @@ async fn complete(
         .unwrap()
         .unwrap();
     server.complete_operation(result).await.unwrap();
-    serde_json::to_value(output.recv().await.unwrap()).unwrap()
+    output.recv().await.unwrap().json()
 }
 
 fn assert_busy(dispatch: Dispatch) {
@@ -54,7 +54,7 @@ fn assert_busy(dispatch: Dispatch) {
         panic!("conflicting operation was admitted");
     };
     assert_eq!(
-        serde_json::to_value(response).unwrap()["error"]["data"],
+        response.json()["error"]["data"],
         json!({"kind":"session_busy", "retryable":true})
     );
 }
@@ -466,7 +466,7 @@ async fn deferred_open_publishes_its_index_only_when_installed() {
             assert!(server.agent().loaded_session(id).is_none());
             if mode == "install" {
                 server.complete_operation(prepared).await.unwrap();
-                let response = serde_json::to_value(output.recv().await.unwrap()).unwrap();
+                let response = output.recv().await.unwrap().json();
                 assert_eq!(response["result"]["session"]["loaded"], true);
                 assert!(store.has_history_index(id));
                 assert!(matches!(

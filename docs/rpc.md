@@ -958,7 +958,7 @@ non-retryable) rather than a nearby match.
 
 In the RPC server, `tool.read` and `tool.output` are deferred queries executed
 in the query pool under a 10-second deadline. They are bounded by the 4-query
-concurrency ceiling and count against the shared 64-entry deferred admission
+concurrency ceiling and count against the shared 32-entry deferred admission
 capacity; requests exceeding capacity are rejected with `-32019`
 (`resource_exhausted`, retryable). Loaded Sessions serve complete records
 directly from memory with zero disk IO. Unloaded Sessions or records whose stream
@@ -1878,7 +1878,7 @@ reported without a subsequent event.
 
 Lifecycle events have a separate 64-entry queue, drained before streaming events.
 The configured `event_capacity` bounds the streaming queue. Output deltas, Tool
-progress, process chunks without command-state updates, and intermediate argument-preview
+progress, process output chunks, and intermediate argument-preview
 revisions use streaming capacity. Preview start/first-input snapshots (revisions
 1–2) and generated/discarded transitions use lifecycle capacity; all other events (including Session/compaction state,
 turn/interaction transitions, and terminal Tool facts) use lifecycle capacity.

@@ -392,9 +392,8 @@ impl OkResult {
     pub(crate) const TRUE: Self = Self { ok: true };
 }
 
-#[derive(Serialize)]
-#[serde(transparent)]
-pub(crate) struct RpcResponse(Box<serde_json::value::RawValue>);
+/// A complete pre-encoded JSON-RPC response frame, serialized exactly once.
+pub(crate) struct RpcResponse(Vec<u8>);
 
 #[derive(Serialize)]
 pub(crate) struct RpcError {
@@ -417,7 +416,7 @@ impl RpcResponse {
             id: RpcId,
             result: T,
         }
-        serde_json::value::to_raw_value(&Success {
+        serde_json::to_vec(&Success {
             jsonrpc: JSONRPC_VERSION,
             id,
             result,
@@ -426,7 +425,7 @@ impl RpcResponse {
     }
 
     pub(crate) fn encoded(&self) -> &[u8] {
-        self.0.get().as_bytes()
+        &self.0
     }
 
     pub(crate) fn error(
@@ -443,7 +442,7 @@ impl RpcResponse {
             error: RpcError,
         }
         Self(
-            serde_json::value::to_raw_value(&Failure {
+            serde_json::to_vec(&Failure {
                 jsonrpc: JSONRPC_VERSION,
                 id,
                 error: RpcError {
@@ -457,11 +456,26 @@ impl RpcResponse {
     }
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
 pub(crate) enum RpcOutbound {
     Response(RpcResponse),
     Event(Box<AgentEventNotification>),
+}
+
+#[cfg(test)]
+impl RpcOutbound {
+    pub(crate) fn json(&self) -> serde_json::Value {
+        match self {
+            Self::Response(response) => response.json(),
+            Self::Event(event) => serde_json::to_value(event).unwrap(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl RpcResponse {
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.0).unwrap()
+    }
 }
 
 #[derive(Serialize)]

@@ -107,13 +107,13 @@ async fn create_reserves_its_id_before_the_record_can_be_discovered() {
         panic!("delete must reject an in-progress creation");
     };
     assert_eq!(
-        serde_json::to_value(response).unwrap()["error"]["data"],
+        response.json()["error"]["data"],
         json!({"kind":"session_busy","retryable":true})
     );
     gate.release();
     let result = server.operations.join_next().await.unwrap().unwrap();
     server.complete_operation(result).await.unwrap();
-    let response = serde_json::to_value(outbound_rx.recv().await.unwrap()).unwrap();
+    let response = outbound_rx.recv().await.unwrap().json();
     assert_eq!(
         response["result"]["session"]["session_id"],
         json!(session_id)
@@ -376,7 +376,7 @@ fn transient_store_and_configuration_errors_have_stable_retryability() {
             false,
         ),
     ] {
-        let response = serde_json::to_value(super::super::agent_error(id.clone(), &error)).unwrap();
+        let response = super::super::agent_error(id.clone(), &error).json();
         assert_eq!(
             response["error"]["data"],
             json!({"kind": kind, "retryable": retryable})
