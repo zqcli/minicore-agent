@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::workspace::Workspace;
@@ -19,8 +20,7 @@ use crate::workspace::query::{
 };
 use crate::workspace::scan::{
     SCOPE_HEX_LEN, Visit, WalkOptions, WorkspaceFileKind, WorkspaceScanConsistency,
-    WorkspaceScanStop, display_path, encoded_len, now_unix_ms, run_scan, scope_digest, valid_scope,
-    walk_scope,
+    WorkspaceScanStop, display_path, now_unix_ms, run_scan, scope_digest, valid_scope, walk_scope,
 };
 
 const DEFAULT_LIMIT: u32 = 200;
@@ -302,7 +302,7 @@ fn scan_files(
                 kind: entry.kind,
                 size: entry.size,
             };
-            let encoded = encoded_len(&record)?;
+            let encoded = encoded_len(&record);
             if used + encoded + 1 > content_budget {
                 if result.entries.is_empty() {
                     // The budget cannot hold this entry even alone, so the page
@@ -357,7 +357,7 @@ fn envelope_bytes(directory: &str, max_bytes: usize) -> Result<usize, AgentError
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    let size = encoded_len(&probe)?;
+    let size = encoded_len(&probe);
     if size >= max_bytes {
         return Err(AgentError::InvalidArguments);
     }

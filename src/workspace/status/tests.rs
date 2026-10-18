@@ -652,7 +652,7 @@ async fn the_encoded_budget_truncates_entries_without_losing_the_summary() {
         result.warnings,
         vec![WorkspaceStatusWarning::OutputTruncated]
     );
-    assert!(encoded_len(&result).unwrap() <= MIN_RESULT_BYTES);
+    assert!(encoded_len(&result) <= MIN_RESULT_BYTES);
     cleanup(&fixture);
 }
 
@@ -1169,7 +1169,7 @@ fn a_long_branch_is_omitted_instead_of_failing_the_budget() {
     assert!(!result.complete);
     assert_eq!(result.branch, None);
     assert_eq!(result.warnings, vec![WorkspaceStatusWarning::StatusFailed]);
-    assert!(encoded_len(&result).unwrap() <= MIN_RESULT_BYTES);
+    assert!(encoded_len(&result) <= MIN_RESULT_BYTES);
 }
 
 #[tokio::test]
@@ -1180,12 +1180,12 @@ async fn every_cut_point_stays_within_the_encoded_budget() {
     }
     let full = observe(&fixture.workspace).await;
     assert_eq!(full.untracked, 30);
-    assert!(encoded_len(&full).unwrap() > MIN_RESULT_BYTES);
+    assert!(encoded_len(&full) > MIN_RESULT_BYTES);
 
     for budget in MIN_RESULT_BYTES..MIN_RESULT_BYTES + 64 {
         let result = request(&fixture.workspace, Some(budget)).await.unwrap();
         assert!(
-            encoded_len(&result).unwrap() <= budget,
+            encoded_len(&result) <= budget,
             "the result exceeded its {budget} byte budget"
         );
         assert_eq!(result.untracked, 30);
@@ -1216,7 +1216,7 @@ async fn json_escapes_are_counted_against_the_budget() {
     for budget in MIN_RESULT_BYTES..MIN_RESULT_BYTES + 64 {
         let result = request(&fixture.workspace, Some(budget)).await.unwrap();
         assert!(
-            encoded_len(&result).unwrap() <= budget,
+            encoded_len(&result) <= budget,
             "an escaped entry exceeded its {budget} byte budget"
         );
         assert_eq!(result.untracked, 8);

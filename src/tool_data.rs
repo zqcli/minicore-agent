@@ -26,6 +26,7 @@ use minicore_runtime::history::HistoryItem;
 use minicore_runtime::tools::{ToolInvocation, ToolResultOutcome};
 use minicore_runtime::{LoopId, ToolCallId};
 
+use crate::budget::encoded_len;
 use crate::changes::{CHANGE_METADATA_BYTES, ChangeRecord, FileChange};
 use crate::error::AgentError;
 use crate::ids::SessionId;
@@ -1190,7 +1191,7 @@ impl ToolRecord {
             invocation,
             execution,
         };
-        if encoded_len(&result)? > max_bytes {
+        if encoded_len(&result) > max_bytes {
             let Some(source) = result.invocation.as_ref().map(|i| i.input.preview.clone()) else {
                 return Err(AgentError::InvalidArguments);
             };
@@ -1199,7 +1200,7 @@ impl ToolRecord {
                 invocation.input.preview.clear();
                 invocation.input.truncated = true;
             }
-            let template_len = encoded_len(&template)?;
+            let template_len = encoded_len(&template);
             if template_len > max_bytes {
                 return Err(AgentError::InvalidArguments);
             }
@@ -1237,7 +1238,7 @@ impl ToolRecord {
             invocation: None,
             execution: self.execution_data(tool_ref),
         };
-        if encoded_len(&result)? > max_bytes {
+        if encoded_len(&result) > max_bytes {
             let source = result
                 .display
                 .as_mut()
@@ -1247,7 +1248,7 @@ impl ToolRecord {
             display.expanded_input = Some(String::new());
             display.truncated = true;
             display.body_truncated = true;
-            let template_len = encoded_len(&result)?;
+            let template_len = encoded_len(&result);
             if template_len > max_bytes {
                 return Err(AgentError::InvalidArguments);
             }
@@ -1359,7 +1360,7 @@ impl ToolRecord {
             next_offset: u64::MAX,
             ..base.clone()
         };
-        let template_len = encoded_len(&template)?;
+        let template_len = encoded_len(&template);
         if template_len > max_bytes {
             return Err(AgentError::InvalidArguments);
         }
@@ -2315,7 +2316,7 @@ impl ToolData {
 }
 
 fn bounded_page(page: ToolOutputPage, max_bytes: usize) -> Result<ToolOutputPage, AgentError> {
-    if encoded_len(&page)? > max_bytes {
+    if encoded_len(&page) > max_bytes {
         Err(AgentError::InvalidArguments)
     } else {
         Ok(page)
@@ -2419,7 +2420,7 @@ fn output_process(
         next_offset: u64::MAX,
         ..base.clone()
     };
-    let template_len = encoded_len(&template)?;
+    let template_len = encoded_len(&template);
     if template_len > max_bytes {
         return Err(AgentError::InvalidArguments);
     }
@@ -2480,22 +2481,13 @@ fn string_arg(arguments: &Value, keys: &[&str]) -> String {
 }
 
 fn bounded(value: &str, max_bytes: usize) -> (String, usize, bool) {
-    let total = value.len();
-    if total <= max_bytes {
-        (value.to_owned(), total, false)
-    } else {
-        let end = previous_boundary(value, max_bytes);
-        (value[..end].to_owned(), total, true)
-    }
+    let (prefix, truncated) = crate::text::truncate(value, max_bytes);
+    (prefix.to_owned(), value.len(), truncated)
 }
 
 fn truncate_prefix(value: &str, max_bytes: usize) -> (String, bool) {
-    if value.len() <= max_bytes {
-        (value.to_owned(), false)
-    } else {
-        let end = previous_boundary(value, max_bytes);
-        (value[..end].to_owned(), true)
-    }
+    let (prefix, truncated) = crate::text::truncate(value, max_bytes);
+    (prefix.to_owned(), truncated)
 }
 
 /// Largest char-boundary prefix whose JSON string encoding fits `available`
@@ -2533,20 +2525,6 @@ fn fit_encoded_string(value: &str, available: usize) -> (String, bool) {
 
 fn json_len(value: &str) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
-}
-
-fn previous_boundary(value: &str, mut offset: usize) -> usize {
-    offset = offset.min(value.len());
-    while offset > 0 && !value.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
-
-fn encoded_len<T: Serialize>(value: &T) -> Result<usize, AgentError> {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .map_err(|_| AgentError::RpcSerialization)
 }
 
 #[cfg(test)]

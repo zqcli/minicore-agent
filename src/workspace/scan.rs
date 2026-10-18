@@ -1061,12 +1061,6 @@ impl Drop for ScanGuard {
 
 /// Exact encoded size of one record, used to keep every page inside its
 /// `max_bytes` budget.
-pub(crate) fn encoded_len<T: Serialize>(record: &T) -> Result<usize, AgentError> {
-    serde_json::to_vec(record)
-        .map(|encoded| encoded.len())
-        .map_err(|_| AgentError::Internal)
-}
-
 /// Truncated SHA-256 fingerprint that binds a cursor to its session, method,
 /// and traversal parameters. It is a mismatch detector, not a secret.
 pub(crate) fn scope_digest(parts: &[&str]) -> String {
@@ -1096,14 +1090,6 @@ pub(crate) fn now_unix_ms() -> u64 {
 }
 
 /// Largest character-boundary prefix of `text` that is at most `index` bytes.
-pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
 /// Joins a native relative path into the `/`-separated form used by results.
 pub(crate) fn display_path(relative: &Path) -> String {
     let mut display = String::new();

@@ -12,12 +12,14 @@ use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::Usage;
 
 use crate::agent::SessionInfo;
+use crate::budget::{check_budget, encoded_len};
 use crate::error::AgentError;
 use crate::event::LoopOutcomeView;
 use crate::history::sanitize_history;
 use crate::ids::SessionId;
 use crate::sessions::{Session, TurnPersistence, TurnRef};
 use crate::store::{HistoryScanLimits, Store, StoredLoopRecord, StoredTurnSummary};
+use crate::text::floor_char_boundary;
 use crate::tool_data::{
     ToolData, ToolOutputPage, ToolOutputRequest, ToolReadRequest, ToolReadResult, ToolRecord,
     ToolRef,
@@ -269,7 +271,7 @@ pub(crate) async fn read_session(
     request.validate()?;
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
     let mut limits = scan_limits(cancellation);
-    check_read_budget(&limits.cancellation, limits.deadline)?;
+    check_budget(&limits.cancellation, limits.deadline)?;
     let snapshot = loaded.as_ref().map(Session::read_snapshot);
     let display = request.view == ReadView::Display;
     let (mut summary, mut cold_prefix) = if display {
@@ -302,7 +304,7 @@ pub(crate) async fn read_session(
         SessionInfo::from_record(&record, false)
     };
     let (covered, first_item, projection_revision, cursor, source_start, mut page) = loop {
-        check_read_budget(&limits.cancellation, limits.deadline)?;
+        check_budget(&limits.cancellation, limits.deadline)?;
         let covered = summary
             .as_ref()
             .map_or(0, |summary| summary.covered_item_count);
@@ -672,7 +674,7 @@ fn pending_turn_page(turn: TurnRef, max_bytes: usize) -> Result<TurnResultPage, 
         next_cursor: None,
         total: 0,
     };
-    if encoded_len(&page)? > max_bytes {
+    if encoded_len(&page) > max_bytes {
         return Err(AgentError::InvalidArguments);
     }
     Ok(page)
@@ -1034,12 +1036,12 @@ where
     let mut encoded = encoded.into_iter();
 
     loop {
-        check_read_budget(cancellation, deadline)?;
+        check_budget(cancellation, deadline)?;
         let Some(encoded_item) = encoded.next() else {
             break;
         };
         let (index, json) = encoded_item?;
-        check_read_budget(cancellation, deadline)?;
+        check_budget(cancellation, deadline)?;
         if index < position.item {
             continue;
         }
@@ -1106,9 +1108,9 @@ where
     }
 
     let next_cursor = (position.item < total).then_some(position);
-    check_read_budget(cancellation, deadline)?;
+    check_budget(cancellation, deadline)?;
     let encoded_page = build(&chunks, next_cursor)?;
-    check_read_budget(cancellation, deadline)?;
+    check_budget(cancellation, deadline)?;
     if encoded_page.len() > max_bytes {
         return Err(AgentError::InvalidArguments);
     }
@@ -1153,9 +1155,9 @@ where
     // still considered.
     let mut high = remaining.len().min(max_bytes);
     while low < high {
-        check_read_budget(cancellation, deadline)?;
+        check_budget(cancellation, deadline)?;
         let mut middle = low + (high - low).div_ceil(2);
-        middle = previous_boundary(remaining, middle);
+        middle = floor_char_boundary(remaining, middle);
         if middle == low {
             let next = next_boundary(remaining, low);
             if next > high {
@@ -1180,7 +1182,7 @@ where
         }
         tokio::task::yield_now().await;
     }
-    Ok(previous_boundary(remaining, low))
+    Ok(floor_char_boundary(remaining, low))
 }
 
 fn make_chunk(index: usize, offset: usize, json: &str, length: usize) -> ReadItemChunk {
@@ -1200,14 +1202,6 @@ fn next_position(index: usize, total: usize) -> Option<ReadCursor> {
         item: next,
         offset: 0,
     })
-}
-
-fn previous_boundary(value: &str, mut offset: usize) -> usize {
-    offset = offset.min(value.len());
-    while offset > 0 && !value.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }
 
 fn next_boundary(value: &str, offset: usize) -> usize {
@@ -1259,14 +1253,14 @@ async fn sanitized_record_items(
     }
     let mut items = Vec::new();
     for raw in &record.items {
-        check_read_budget(cancellation, deadline)?;
+        check_budget(cancellation, deadline)?;
         let cleaned = sanitize_history(std::slice::from_ref(raw))?;
         if let Some(item) = cleaned.first() {
             items.push(item.clone());
         }
         tokio::task::yield_now().await;
     }
-    check_read_budget(cancellation, deadline)?;
+    check_budget(cancellation, deadline)?;
     Ok(items)
 }
 
@@ -1281,11 +1275,11 @@ async fn sanitized_live_history(
     let mut sanitized = Vec::new();
     let mut source_bytes = 0_u64;
     for raw in items {
-        check_read_budget(cancellation, deadline)?;
+        check_budget(cancellation, deadline)?;
         let cleaned = sanitize_history(std::slice::from_ref(raw))?;
         for item in cleaned.iter() {
             let item_bytes =
-                u64::try_from(encoded_len(item)?).map_err(|_| AgentError::QueryLimit)?;
+                u64::try_from(encoded_len(item)).map_err(|_| AgentError::QueryLimit)?;
             source_bytes = source_bytes
                 .checked_add(item_bytes)
                 .ok_or(AgentError::QueryLimit)?;
@@ -1299,7 +1293,7 @@ async fn sanitized_live_history(
         }
         tokio::task::yield_now().await;
     }
-    check_read_budget(cancellation, deadline)?;
+    check_budget(cancellation, deadline)?;
     Ok(sanitized)
 }
 
@@ -1325,17 +1319,6 @@ fn scan_limits(cancellation: CancellationToken) -> HistoryScanLimits {
             .checked_add(READ_DEADLINE)
             .unwrap_or_else(Instant::now),
         cancellation,
-    }
-}
-
-fn check_read_budget(
-    cancellation: &CancellationToken,
-    deadline: Instant,
-) -> Result<(), AgentError> {
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        Err(AgentError::QueryLimit)
-    } else {
-        Ok(())
     }
 }
 
@@ -1375,12 +1358,6 @@ fn validate_cursor(cursor: ReadCursor, total: usize) -> Result<(), AgentError> {
 
 fn default_read_limit() -> usize {
     100
-}
-
-fn encoded_len<T: Serialize>(value: &T) -> Result<usize, AgentError> {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .map_err(|_| AgentError::RpcSerialization)
 }
 
 fn map_read_store_error(error: crate::error::StoreError) -> AgentError {

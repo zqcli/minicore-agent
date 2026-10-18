@@ -18,8 +18,10 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
+use crate::text::floor_char_boundary;
 use crate::tools::MAX_READ_BYTES;
 use crate::workspace::Workspace;
 use crate::workspace::query::{
@@ -27,9 +29,8 @@ use crate::workspace::query::{
 };
 use crate::workspace::scan::{
     MAX_SEARCH_PATHS, READ_CHUNK_BYTES, SCOPE_HEX_LEN, ScanBudget, Visit, WalkOptions,
-    WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop, encoded_len,
-    floor_char_boundary, normalized_roots, now_unix_ms, run_scan, scope_digest, valid_query_text,
-    valid_scope, walk_scope,
+    WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop, normalized_roots, now_unix_ms,
+    run_scan, scope_digest, valid_query_text, valid_scope, walk_scope,
 };
 
 const DEFAULT_MAX_MATCHES: u32 = 100;
@@ -687,7 +688,7 @@ fn build_candidate(
         line_text: line[start..end].to_owned(),
         line_truncated: start > 0 || end < line.len(),
     };
-    let encoded = encoded_len(&record)?;
+    let encoded = encoded_len(&record);
     if page.used + encoded + 1 > page.content_budget {
         return Ok(None);
     }
@@ -793,7 +794,7 @@ fn envelope_bytes(max_bytes: usize) -> Result<usize, AgentError> {
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    let size = encoded_len(&probe)?;
+    let size = encoded_len(&probe);
     if size >= max_bytes {
         return Err(AgentError::InvalidArguments);
     }

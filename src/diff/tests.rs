@@ -276,7 +276,7 @@ fn page_all(
         let mut check = clone_base(base);
         check.hunks = hunks.clone();
         check.next_cursor = next.clone();
-        assert!(crate::workspace::scan::encoded_len(&check).unwrap() <= max_bytes);
+        assert!(crate::budget::encoded_len(&check) <= max_bytes);
         for hunk in &hunks {
             for line in &hunk.lines {
                 assert_eq!(line.line_byte_offset, line_offset);

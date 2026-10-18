@@ -7,6 +7,7 @@ use minicore_runtime::LoopId;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::check_budget;
 use crate::error::AgentError;
 use crate::store::Store;
 use crate::tool_data::{ToolData, ToolRef};
@@ -918,14 +919,6 @@ fn encoded_result(
 fn push_warning(warnings: &mut Vec<ChangeListWarning>, warning: ChangeListWarning) {
     if !warnings.contains(&warning) {
         warnings.push(warning);
-    }
-}
-
-fn check_budget(cancellation: &CancellationToken, deadline: Instant) -> Result<(), AgentError> {
-    if cancellation.is_cancelled() || Instant::now() >= deadline {
-        Err(AgentError::QueryLimit)
-    } else {
-        Ok(())
     }
 }
 

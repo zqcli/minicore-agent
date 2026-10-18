@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod budget;
 mod changes;
 mod compaction;
 mod config;
@@ -46,6 +47,7 @@ mod sessions;
 pub(crate) mod store;
 #[cfg(test)]
 mod test_support;
+mod text;
 mod tool_data;
 mod tools;
 mod workspace;

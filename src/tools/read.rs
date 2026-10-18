@@ -10,6 +10,7 @@ use minicore_runtime::value::MAX_TEXT_BYTES;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::text::floor_char_boundary;
 use crate::workspace::ReadPrefix;
 use crate::{Workspace, WorkspaceError};
 
@@ -276,14 +277,6 @@ fn append_truncated(output: &mut String) {
         output.push('\n');
     }
     output.push_str(TRUNCATED);
-}
-
-fn floor_char_boundary(value: &str, maximum: usize) -> usize {
-    let mut end = maximum.min(value.len());
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
 }
 
 const fn default_offset() -> usize {

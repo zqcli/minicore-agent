@@ -404,7 +404,7 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
                     .unwrap()
                 };
                 assert!(
-                    encoded_len(&page).unwrap() <= MAX_BYTES,
+                    encoded_len(&page) <= MAX_BYTES,
                     "{label} {side} page over budget"
                 );
                 assert_eq!(

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::encoded_len;
 use crate::changes::{
     ChangeCommitState, ChangeCoverage, ChangeKind, ChangeOrigin, ChangeRevision, FileChange,
     stored_tool_change_ref, tool_change_ref,
@@ -25,6 +26,7 @@ use crate::error::AgentError;
 use crate::error::StoreError;
 use crate::ids::SessionId;
 use crate::store::Store;
+use crate::text::floor_char_boundary;
 use crate::tool_data::{ToolData, ToolRef};
 
 /// Wall-clock budget for one diff query. The CPU comparison gets a smaller
@@ -534,16 +536,6 @@ fn split_lines(text: &str, limit: usize) -> (Vec<(usize, usize)>, usize) {
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    if index >= text.len() {
-        return text.len();
-    }
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 /// Resolves one `tool:` change reference to its retained `FileChange`.
@@ -1059,7 +1051,7 @@ fn build_page(
             .unwrap_or(0),
         before.len().max(after.len()),
     ));
-    let base_empty = crate::workspace::scan::encoded_len(&template)?;
+    let base_empty = encoded_len(&template);
     let mut meter = PageMeter {
         base_empty,
         completed: Vec::new(),
@@ -1147,7 +1139,7 @@ fn build_page(
                 text: text[..part].to_owned(),
                 line_complete,
             };
-            let encoded = crate::workspace::scan::encoded_len(&fragment)?;
+            let encoded = encoded_len(&fragment);
             if meter.fits_with(encoded) {
                 chosen = Some((part, line_complete));
                 break;
@@ -1171,7 +1163,7 @@ fn build_page(
             text: text[..part].to_owned(),
             line_complete,
         };
-        let encoded = crate::workspace::scan::encoded_len(&fragment)?;
+        let encoded = encoded_len(&fragment);
         meter.commit_line(encoded);
         page.last_mut()
             .expect("the current hunk is open")
@@ -1216,7 +1208,7 @@ fn build_page(
     let mut check = clone_base(base);
     check.hunks = page.clone();
     check.next_cursor = next_cursor.clone();
-    if crate::workspace::scan::encoded_len(&check)? > max_bytes {
+    if encoded_len(&check) > max_bytes {
         return Err(AgentError::InvalidArguments);
     }
     Ok((page, next_cursor, complete))
@@ -1258,12 +1250,12 @@ fn hunk_open_len(hunk: &HunkPlan) -> Result<usize, AgentError> {
         new_count: hunk.new_count,
         lines: Vec::new(),
     };
-    let encoded = crate::workspace::scan::encoded_len(&empty)?;
+    let encoded = encoded_len(&empty);
     Ok(encoded.saturating_sub(2))
 }
 
 fn encoded_result(result: DiffResult, max_bytes: usize) -> Result<DiffResult, AgentError> {
-    if crate::workspace::scan::encoded_len(&result)? > max_bytes {
+    if encoded_len(&result) > max_bytes {
         Err(AgentError::InvalidArguments)
     } else {
         Ok(result)

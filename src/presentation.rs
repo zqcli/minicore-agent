@@ -1097,15 +1097,8 @@ pub(crate) fn count_lines(text: &str) -> usize {
 
 /// Bounds a string at a char boundary; returns (copy, truncated).
 fn bounded(value: &str, max: usize) -> (String, bool) {
-    if value.len() <= max {
-        (value.to_owned(), false)
-    } else {
-        let mut end = max;
-        while end > 0 && !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        (value[..end].to_owned(), true)
-    }
+    let (prefix, truncated) = crate::text::truncate(value, max);
+    (prefix.to_owned(), truncated)
 }
 
 /// Removes terminal control effects from display-only text. Newlines and tabs

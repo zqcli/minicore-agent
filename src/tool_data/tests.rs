@@ -1028,7 +1028,7 @@ fn response_byte_budget_includes_json_encoding() {
             1024,
         )
         .unwrap();
-    assert!(encoded_len(&page).unwrap() <= 1024);
+    assert!(encoded_len(&page) <= 1024);
     assert!(!page.eof || page.next_offset == page.observed_end || page.truncated);
 
     let large = make_tool_ref(session(1), loop_id(1), 1, "write-call");
@@ -1041,7 +1041,7 @@ fn response_byte_budget_includes_json_encoding() {
         json!({"path": "a.txt", "content": "z".repeat(16 * 1024)}),
     );
     let read = data.read(&read_request(large, Some(1024)), 1024).unwrap();
-    assert!(encoded_len(&read).unwrap() <= 1024);
+    assert!(encoded_len(&read) <= 1024);
     assert!(read.invocation.unwrap().input.truncated);
 
     let error = data

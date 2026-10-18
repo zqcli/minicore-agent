@@ -38,15 +38,14 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::workspace::Workspace;
 use crate::workspace::query::{
     DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, MAX_RESULT_BYTES, MIN_RESULT_BYTES,
 };
-use crate::workspace::scan::{
-    READ_CHUNK_BYTES, WorkspaceScanConsistency, encoded_len, now_unix_ms,
-};
+use crate::workspace::scan::{READ_CHUNK_BYTES, WorkspaceScanConsistency, now_unix_ms};
 
 mod diff;
 pub(crate) use diff::diff_sources;
@@ -644,7 +643,7 @@ fn assemble(
         WorkspaceStatusWarning::SkippedPaths,
         WorkspaceStatusWarning::NestedRepository,
     ];
-    let envelope = encoded_len(&envelope)?;
+    let envelope = encoded_len(&envelope);
     if envelope > max_bytes {
         // A valid budget that cannot hold even the summary is answered as a
         // failed observation whose summary fits, never as an invalid budget.
@@ -657,7 +656,7 @@ fn assemble(
     }
     let mut used = envelope;
     for entry in observation.entries {
-        let encoded = encoded_len(&entry)?;
+        let encoded = encoded_len(&entry);
         if used + encoded + 1 > max_bytes {
             result.complete = false;
             push_warning(
