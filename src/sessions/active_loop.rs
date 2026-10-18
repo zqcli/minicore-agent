@@ -128,15 +128,12 @@ async fn run_active_loop(
     };
     let stored = reconcile_report(&session, turn, &report, &sanitized);
     let persistence = persist_report(&session, turn, &stored, &sanitized).await;
-    if persistence == TurnPersistence::Persisted {
-        settle_persisted_projection(&session, turn, &report).await;
-    }
     let result = Arc::new(TurnResult {
         turn,
         report: Arc::clone(&report),
         persistence,
     });
-    publish_completion_and_start_compaction(&session, &result, &mut completion).await;
+    publish_settle_and_start_compaction(&session, &result, &mut completion).await;
     // Remain in the owned task so close/shutdown still join auxiliary writes.
     persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
 
@@ -325,7 +322,9 @@ async fn settle_persisted_projection(session: &Session, turn: TurnRef, report: &
     }
 }
 
-async fn publish_completion_and_start_compaction(
+/// Publishes completion first: waiters never wait for emergency-projection
+/// settlement or post-turn summary work, which stay owned by this task.
+async fn publish_settle_and_start_compaction(
     session: &Session,
     result: &Arc<TurnResult>,
     completion: &mut CompletionGuard,
@@ -335,7 +334,8 @@ async fn publish_completion_and_start_compaction(
     let persistence = result.persistence;
     // Own the join slot before reserving. Reservation excludes the next
     // submit and close captures its cancellation owner under the same lock.
-    // There is no await between completion publication and handle installation.
+    // The active task owns settlement; a reserved operation also owns cancellation
+    // while completion waiters are released before its worker is installed.
     let (operation, _) = CompactionOperation::new(
         format!("auto-{}", turn.loop_id),
         CompactionOrigin::Automatic,
@@ -354,7 +354,26 @@ async fn publish_completion_and_start_compaction(
 
     // Authoritative completion precedes summary model work and best-effort events.
     completion.publish_finished(Arc::clone(result));
-    if let Some(reservation) = reservation {
+    if persistence == TurnPersistence::Persisted {
+        settle_persisted_projection(session, turn, report).await;
+    }
+    if let Some(mut reservation) = reservation {
+        // Settlement may have promoted the entire reserved history while waiters
+        // observed completion. Never let post-turn work restore its raw sources.
+        if let Some(projection) = session
+            .shared
+            .compaction
+            .project(&reservation.history)
+            .filter(|projection| projection.suffix.is_empty())
+        {
+            reservation.previous_summary = Some(projection.summary);
+            reservation.previous_covered_item_count = reservation.history.len();
+            reservation.history_triggered = false;
+            if let Some(progress) = session.lock_inner().compaction_progress.as_mut() {
+                progress.covered_item_count = reservation.history.len();
+                progress.retained_item_count = 0;
+            }
+        }
         *join_slot = Some(tokio::spawn(compact::run_compaction(
             session.clone(),
             reservation,

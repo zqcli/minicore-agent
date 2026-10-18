@@ -218,7 +218,11 @@ fn projection_keeps_visible_reasoning_arguments_and_embedded_summary_only() {
         &thinking,
         "VISIBLE_REASONING_SUMMARY",
         "EMBEDDED_SUMMARY",
-        &serde_json::to_string(&arguments).unwrap(),
+        &serde_json::to_string(&arguments)
+            .unwrap()
+            .chars()
+            .take(TOOL_RESULT_MAX_CHARS)
+            .collect::<String>(),
     ] {
         assert!(text.contains(retained));
     }
@@ -324,7 +328,7 @@ async fn oversize_history_fails_before_call_without_discarding_content() {
 }
 
 #[tokio::test]
-async fn large_tool_arguments_are_not_trimmed_to_force_admission() {
+async fn large_tool_arguments_are_bounded_only_in_the_utility_source() {
     let model = summary_model("unused");
     let argument = "write-content".repeat(4000);
     let items = (0..6)
@@ -341,12 +345,25 @@ async fn large_tool_arguments_are_not_trimmed_to_force_admission() {
         })
         .collect();
     let input = input(&model, items);
-    let err = generate_summary(&input, &CancellationToken::new())
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(err.error, UtilityError::TooLarge);
-    assert_eq!(model.calls(), 0);
+    let original = serde_json::to_vec(input.history.as_ref()).unwrap();
+    let source = source_message(&input, &CancellationToken::new()).unwrap();
+    assert!(user_text(&source).len() < 20_000);
+    assert_eq!(
+        user_text(&source)
+            .matches("more characters truncated]")
+            .count(),
+        6
+    );
+    assert!(
+        generate_projected_summary(&input, source, &CancellationToken::new())
+            .await
+            .is_ok()
+    );
+    assert_eq!(model.calls(), 1);
+    assert_eq!(
+        serde_json::to_vec(input.history.as_ref()).unwrap(),
+        original
+    );
 }
 
 #[tokio::test]
@@ -514,7 +531,7 @@ fn recent_tail_selection_is_bounded_and_never_restores_covered_items() {
     let cancel = CancellationToken::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     let choose = |history: &[HistoryItem], covered| {
-        recent_tail_start(history, covered, &cancel, deadline).unwrap()
+        recent_tail_start(history, covered, 100_000, &cancel, deadline).unwrap()
     };
     assert_eq!(choose(&[], 0), 0);
     assert_eq!(choose(&[user_item("short")], 0), 0);
@@ -530,11 +547,17 @@ fn recent_tail_selection_is_bounded_and_never_restores_covered_items() {
     assert_eq!(choose(&[user_item(&"é\n\"".repeat(20_000))], 0), 0);
     cancel.cancel();
     assert_eq!(
-        recent_tail_start(&history, 0, &cancel, deadline),
+        recent_tail_start(&history, 0, 100_000, &cancel, deadline),
         Err(UtilityError::Cancelled)
     );
     assert_eq!(
-        recent_tail_start(&history, 0, &CancellationToken::new(), Instant::now()),
+        recent_tail_start(
+            &history,
+            0,
+            100_000,
+            &CancellationToken::new(),
+            Instant::now()
+        ),
         Err(UtilityError::Timeout)
     );
 }
@@ -673,6 +696,7 @@ fn recent_tail_target_includes_exact_twenty_thousand_token_boundary() {
         recent_tail_start(
             &[user_item("older"), last],
             0,
+            100_000,
             &CancellationToken::new(),
             Instant::now() + Duration::from_secs(10),
         )
@@ -698,7 +722,7 @@ async fn retained_tail_fits_without_schemas_but_fixed_schemas_prevent_utility() 
         &input.history[1..],
     )
     .unwrap();
-    input.hard_tokens = floor + 128;
+    input.hard_tokens = floor + 1024 + 128;
     assert!(summary_budget_with_tail(&input, &input.history[1..]).is_ok());
     let accepted = generate_summary_with_tail(&input, 1, &CancellationToken::new())
         .await
@@ -729,4 +753,42 @@ fn source_message(
     cancellation: &CancellationToken,
 ) -> Result<ModelMessage, UtilityError> {
     source_message_through(input, input.history.len(), cancellation)
+}
+
+#[test]
+fn recent_tail_scales_down_with_the_effective_window() {
+    let history = (0..8)
+        .map(|_| user_item(&"x".repeat(4_000)))
+        .collect::<Vec<_>>();
+    let cancel = CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert_eq!(
+        recent_tail_start(&history, 0, 8_000, &cancel, deadline).unwrap(),
+        6
+    );
+    assert_eq!(
+        recent_tail_start(&history, 0, 100_000, &cancel, deadline).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn large_previous_snapshot_is_bounded_and_utility_reasoning_is_low() {
+    let model = summary_model("concise summary");
+    let mut input = input(&model, vec![]);
+    input.reasoning = ReasoningPreference::High;
+    input.previous_summary = Some(BoundedText::new("old ".repeat(60_000)).unwrap());
+    let source = projected(&input);
+    assert!(source.len() < 70_000);
+    assert!(source.contains("more characters truncated]"));
+    assert!(
+        generate_summary(&input, &CancellationToken::new())
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        model.requests.lock().unwrap()[0].reasoning(),
+        ReasoningPreference::Low
+    );
+    assert_eq!(input.previous_summary.unwrap().byte_len(), 240_000);
 }

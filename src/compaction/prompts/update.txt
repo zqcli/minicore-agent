@@ -1,5 +1,5 @@
 Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
+- PRESERVE essential goals, constraints, decisions, and unresolved work from the previous summary; condense older detail
 - ADD new progress, decisions, and context from the new messages
 - UPDATE the Progress section: move items from "In Progress" to "Done" when completed
 - UPDATE "Next Steps" based on what was accomplished
@@ -33,4 +33,4 @@ Use this EXACT format:
 ## Critical Context
 - [Preserve important context, add new if needed]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.
+Keep the entire summary under 65536 UTF-8 bytes. Condense completed work and remove obsolete details before adding new information. Preserve exact file paths, function names, and error messages when they remain relevant.

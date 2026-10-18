@@ -436,8 +436,14 @@ pub(crate) async fn consolidate(
                 floor.push(message.clone());
             }
         }
+        floor.push(
+            super::summary_data_message(
+                &BoundedText::new("x".repeat(utility::summary_reserve_bytes(budget.hard_tokens)))
+                    .expect("summary reserve fits message limit"),
+            )
+            .map_err(super::auto::invalid)?,
+        );
         if !history_triggered
-            && !floor.is_empty()
             && auto
                 .budget
                 .estimate_request_tokens(&make(floor)?, None, None)
@@ -446,6 +452,7 @@ pub(crate) async fn consolidate(
         {
             return Ok(ProjectionResult::unchanged(before_request));
         }
+        utility::check_active(input.cancellation, input.deadline)?;
         let mut threshold = state.threshold.lock().unwrap();
         threshold.attempted = Some((input.loop_id, input.request_index));
         threshold.source = Some(source);
@@ -477,6 +484,12 @@ pub(crate) async fn consolidate(
     }
     let source_message =
         utility::projected_source_message(previous, parts, input.cancellation, input.deadline)?;
+    let now = Instant::now();
+    let utility_deadline = if recovery {
+        input.deadline
+    } else {
+        now + input.deadline.saturating_duration_since(now) / 2
+    };
     let utility_input = CompactionInput {
         model: Arc::clone(&auto.model),
         reasoning: input.reasoning,
@@ -486,7 +499,7 @@ pub(crate) async fn consolidate(
         project_instructions: input.system.clone(),
         tool_schemas: input.tools.to_vec(),
         hard_tokens: budget.hard_tokens,
-        operation_deadline: input.deadline,
+        operation_deadline: utility_deadline,
         live_usage: Some(live_usage),
     };
     let generated = match utility::generate_projected_summary(
@@ -499,6 +512,14 @@ pub(crate) async fn consolidate(
         Ok(generated) => generated,
         Err(error) => {
             observation.finish(error.error.kind(), None, error.utility_usage.clone());
+            if !recovery && error.error == UtilityError::Timeout && before <= budget.hard_tokens {
+                utility::check_active(input.cancellation, input.deadline)?;
+                return Ok(ProjectionResult {
+                    request: before_request,
+                    usage: error.utility_usage,
+                    compacted: false,
+                });
+            }
             return Err(ProjectionFailure {
                 error: error.error,
                 usage: error.utility_usage,
@@ -567,6 +588,7 @@ struct ObservationGuard<'a> {
     deadline: Instant,
     operation_id: String,
     live_usage: Arc<std::sync::Mutex<Option<CompactionUtilityUsage>>>,
+    previous_usage: Option<CompactionUtilityUsage>,
     armed: bool,
 }
 impl<'a> ObservationGuard<'a> {
@@ -578,6 +600,15 @@ impl<'a> ObservationGuard<'a> {
         live_usage: Arc<std::sync::Mutex<Option<CompactionUtilityUsage>>>,
     ) -> Self {
         let operation_id = format!("auto-boundary-{}-{}", input.loop_id, input.request_index);
+        let previous_usage = state
+            .threshold
+            .lock()
+            .unwrap()
+            .observation
+            .last
+            .as_ref()
+            .filter(|last| last.loop_id == Some(input.loop_id))
+            .and_then(|last| last.utility_usage.clone());
         if !recovery {
             let budget = input
                 .auto
@@ -595,7 +626,7 @@ impl<'a> ObservationGuard<'a> {
                     hard_tokens: budget.hard_tokens,
                     trigger_tokens: budget.trigger_tokens,
                     target_tokens: budget.target_tokens,
-                    utility_usage: None,
+                    utility_usage: previous_usage.clone(),
                     outcome: "summarizing".into(),
                 });
         }
@@ -605,6 +636,7 @@ impl<'a> ObservationGuard<'a> {
             deadline: input.deadline,
             operation_id,
             live_usage,
+            previous_usage,
             armed: !recovery,
         }
     }
@@ -622,8 +654,17 @@ impl<'a> ObservationGuard<'a> {
             if let Some(mut current) = state.observation.current.take() {
                 current.outcome = outcome.to_owned();
                 current.after_tokens = after;
-                current.utility_usage = usage.or_else(|| self.live_usage.lock().unwrap().clone());
+                let mut total = self.previous_usage.take();
+                super::auto::merge_utility_usage(
+                    &mut total,
+                    usage.or_else(|| self.live_usage.lock().unwrap().clone()),
+                );
+                current.utility_usage = total;
                 state.observation.last = Some(current);
+                if outcome == "cancelled" {
+                    state.source = None;
+                    state.attempted = None;
+                }
             }
         }
         self.armed = false;

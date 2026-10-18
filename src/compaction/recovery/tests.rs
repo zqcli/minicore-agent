@@ -10,6 +10,7 @@ use minicore_runtime::history::{
     AssistantHistory, ToolResultHistory, UserHistory, UserMessageKind,
 };
 use minicore_runtime::model::{ModelEvent, ModelFinishReason, ToolCall, Usage};
+use minicore_runtime::model::{ModelLimits, ReasoningPreference};
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};

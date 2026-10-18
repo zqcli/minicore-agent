@@ -42,25 +42,47 @@ fn summary_model(window: u64, output: &str, gate: Option<Arc<Notify>>) -> Arc<Sc
 }
 
 fn partial_usage_model(gate: Arc<Notify>) -> Arc<ScriptedModel> {
+    ScriptedModel::with_reasoning("main", 8_000, [ReasoningPreference::Auto].into(), [])
+        .with_fallback(move || {
+            let gate = Arc::clone(&gate);
+            Step::Custom(Box::new(move |_, _| {
+                Box::pin(async move {
+                    use futures_util::StreamExt;
+                    let stream = futures_util::stream::iter(vec![Ok(ModelEvent::Usage {
+                        usage: Usage::new(7, 3, 0).with_provider_total_tokens(Some(10)),
+                    })])
+                    .chain(futures_util::stream::once(async move {
+                        gate.notify_one();
+                        std::future::pending::<
+                            Result<ModelEvent, minicore_runtime::model::ModelError>,
+                        >()
+                        .await
+                    }));
+                    Ok(Box::pin(stream) as ModelStream)
+                })
+            }))
+        })
+}
+
+fn provider_timeout_model() -> Arc<ScriptedModel> {
+    use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
+    use minicore_runtime::model::{DeliveryState, ModelError, ModelErrorKind};
+    let summary = DiagnosticSummary::new(
+        DiagnosticCode::ModelTimeout,
+        DiagnosticCategory::Model,
+        BoundedText::new("utility timed out").unwrap(),
+        false,
+    )
+    .unwrap();
     ScriptedModel::with_reasoning(
         "main",
         8_000,
         [ReasoningPreference::Auto].into(),
-        [Step::Custom(Box::new(move |_, _| {
-            Box::pin(async move {
-                use futures_util::StreamExt;
-                let stream = futures_util::stream::iter(vec![Ok(ModelEvent::Usage {
-                    usage: Usage::new(7, 3, 0).with_provider_total_tokens(Some(10)),
-                })])
-                .chain(futures_util::stream::once(async move {
-                    gate.notify_one();
-                    std::future::pending::<Result<ModelEvent, minicore_runtime::model::ModelError>>(
-                    )
-                    .await
-                }));
-                Ok(Box::pin(stream) as ModelStream)
-            })
-        }))],
+        [Step::Fail(ModelError::permanent(
+            ModelErrorKind::Timeout,
+            DeliveryState::NotStarted,
+            summary,
+        ))],
     )
 }
 
@@ -637,6 +659,82 @@ fn settlement_qualifier_is_idempotent_and_preserves_failed_attempt_identity() {
 impl ProjectionResult {
     fn into_compacted(self) -> Option<Self> {
         self.compacted.then_some(self)
+    }
+}
+
+#[tokio::test]
+async fn utility_timeout_preserves_a_fitting_request_but_not_an_overfull_one() {
+    for (fits, provider_timeout) in [(true, false), (false, false), (true, true), (false, true)] {
+        let model = if provider_timeout {
+            provider_timeout_model()
+        } else {
+            summary_model(8_000, "unused", Some(Arc::new(Notify::new())))
+        };
+        let mut auto = context(&model);
+        auto.binding.policy.trigger_percent = 50;
+        let current = LoopId::new().unwrap();
+        let base = exchange(
+            LoopId::new().unwrap(),
+            0,
+            if fits { 20_000 } else { 40_000 },
+        );
+        let appended = vec![user(current, "keep", false)];
+        let system = BoundedText::new("system").unwrap();
+        let cancel = CancellationToken::new();
+        let mut request = input(&auto, &system, None, &base, &appended, current, 0, &cancel);
+        request.deadline = Instant::now() + Duration::from_millis(200);
+        let result = consolidate(request, false).await;
+        if fits {
+            let result = result.unwrap();
+            assert!(!result.compacted);
+            assert!(result.request.messages().iter().any(|message| matches!(message, ModelMessage::Tool { output, .. } if output.content().byte_len() == 20_000)));
+        } else {
+            assert_eq!(result.err().unwrap().error, UtilityError::Timeout);
+        }
+        let observation = auto.state.automatic_view().last.unwrap();
+        assert_eq!(observation.outcome, "timeout");
+        assert_eq!(observation.utility_usage.unwrap().call_count, 1);
+        assert_eq!(model.calls(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_releases_source_for_retry_and_usage_accumulates_per_turn() {
+    let gate = Arc::new(Notify::new());
+    let model = partial_usage_model(Arc::clone(&gate));
+    let auto = context(&model);
+    let current = LoopId::new().unwrap();
+    let base = exchange(LoopId::new().unwrap(), 0, 40_000);
+    let appended = vec![user(current, "keep", false)];
+    let system = BoundedText::new("system").unwrap();
+    for index in 0..2 {
+        let cancel = CancellationToken::new();
+        let future = consolidate(
+            input(
+                &auto, &system, None, &base, &appended, current, index, &cancel,
+            ),
+            false,
+        );
+        tokio::pin!(future);
+        tokio::select! {
+            _ = gate.notified() => {},
+            result = &mut future => panic!("utility did not start: {:?}", result.err()),
+        }
+        cancel.cancel();
+        assert_eq!(future.await.err().unwrap().error, UtilityError::Cancelled);
+        let usage = auto
+            .state
+            .automatic_view()
+            .last
+            .unwrap()
+            .utility_usage
+            .unwrap();
+        assert_eq!(usage.call_count, index + 1);
+        assert_eq!(
+            usage.usage.unwrap().provider_total_tokens(),
+            Some(10 * u64::from(index + 1))
+        );
+        assert!(!usage.complete);
     }
 }
 

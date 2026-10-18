@@ -6,6 +6,69 @@ use minicore_runtime::LoopId;
 use minicore_runtime::model::{DeliveryState, ModelErrorKind, ModelFinishReason};
 use tokio::sync::mpsc;
 
+pub(super) fn panic_preview(key: RequestKey) {
+    assert!(!PANIC_PREVIEWS.hit(&key), "injected preview panic");
+}
+
+#[tokio::test]
+async fn preview_panic_disables_only_preview_and_preserves_stream_and_usage() {
+    let (observer, mut receiver) = fixture(16);
+    let key = observer.key;
+    let events = vec![
+        start("a", "write"),
+        delta("a", "{}"),
+        Ok(ModelEvent::Usage {
+            usage: minicore_runtime::model::Usage::new(1, 2, 0),
+        }),
+        finish(),
+    ];
+    let mut stream = PreviewStream::new(
+        Box::pin(stream::iter(events)),
+        Arc::clone(&observer.presentation),
+        key,
+        Some(1),
+        None,
+        10_000,
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ModelEvent::ToolCallStart { .. }))
+    ));
+    PANIC_PREVIEWS.arm(key, ());
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ModelEvent::ToolCallArgumentsDelta { .. }))
+    ));
+    assert!(stream.preview.discarded);
+    assert!(stream.preview.calls.is_empty());
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ModelEvent::Usage { .. }))
+    ));
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ModelEvent::Finish { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    assert!(
+        drain(&mut receiver)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RequestUsage { .. }))
+    );
+}
+
+#[test]
+fn content_first_keeps_a_path_prefix_at_the_allocation_ceiling() {
+    let source = format!(
+        r#"{{"content":"{}","path":"important/path.txt"}}"#,
+        "x".repeat(MAX_CALL_BYTES * 2)
+    );
+    let parser = parse_chunks("write", &source, false);
+    assert_eq!(parser.display().detail, "important/path.txt");
+    assert!(parser.body_cut);
+    assert!(parser.retained <= MAX_CALL_BYTES);
+}
+
 fn parse_chunks(name: &str, source: &str, chunked: bool) -> PreviewParser {
     let mut parser = PreviewParser::new(name);
     let mut bytes = 0;
@@ -559,13 +622,14 @@ fn exact_capacity_ceiling_truncates_without_splitting_utf8_and_fail_releases_cha
     for _ in 0..4 {
         let mut parser = PreviewParser::new("write");
         parser.feed(r#"{"content":""#, &mut charged);
-        parser.feed(&"x".repeat(MAX_CALL_BYTES - 3), &mut charged);
+        let body_budget = MAX_CALL_BYTES - parser.path.as_ref().unwrap().capacity();
+        parser.feed(&"x".repeat(body_budget - 3), &mut charged);
         // 3 spare bytes cannot hold this 4-byte scalar. The buffer stays at
         // its already charged ceiling, without growth or malformed UTF-8.
         parser.feed("😀", &mut charged);
         parser.feed(r#""}"#, &mut charged);
         assert_eq!(display_capacity(&parser), MAX_CALL_BYTES);
-        assert_eq!(parser.content.as_ref().unwrap().len(), MAX_CALL_BYTES - 3);
+        assert_eq!(parser.content.as_ref().unwrap().len(), body_budget - 3);
         assert!(parser.body_cut);
         parsers.push(parser);
     }
@@ -577,7 +641,8 @@ fn exact_capacity_ceiling_truncates_without_splitting_utf8_and_fail_releases_cha
     assert_eq!(charged, MAX_STREAM_BYTES - MAX_CALL_BYTES);
     let mut replacement = PreviewParser::new("write");
     replacement.feed(r#"{"content":""#, &mut charged);
-    replacement.feed(&"é".repeat(MAX_CALL_BYTES / 2), &mut charged);
+    let body_budget = MAX_CALL_BYTES - replacement.path.as_ref().unwrap().capacity();
+    replacement.feed(&"é".repeat(body_budget / 2), &mut charged);
     replacement.feed(r#""}"#, &mut charged);
     assert!(replacement.complete());
     assert!(!replacement.body_cut);

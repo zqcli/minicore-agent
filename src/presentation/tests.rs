@@ -1026,3 +1026,43 @@ fn compact_card_target_is_the_command_prefix_or_explicit_patch_path() {
     assert_eq!(patch.detail, "src/a.rs");
     assert_eq!(patch.input_line_count, Some(3));
 }
+
+fn bounded_edit_diff(old: &str, new: &str) -> (String, bool) {
+    let body = edit_display_body(old, new, true);
+    (body.text.expect("retained display body"), body.truncated)
+}
+
+#[test]
+fn count_only_cards_match_retained_display_without_body_allocations() {
+    for (name, args) in [
+        (
+            "write",
+            serde_json::json!({"path":"a", "content":"a\n\u{1b}中\n".repeat(60_000)}),
+        ),
+        ("bash", serde_json::json!({"command":"echo x\ntrue"})),
+        (
+            "edit",
+            serde_json::json!({"path":"a", "old_text":"one\ntwo\n", "new_text":"one\nthree\n"}),
+        ),
+        (
+            "edit",
+            serde_json::json!({"path":"a", "old_text":"x\n".repeat(80_000), "new_text":"y\u{1b}\n".repeat(80_000)}),
+        ),
+        (
+            "patch",
+            serde_json::json!({"path":"a", "patch":"@@\n+hello\n"}),
+        ),
+        (
+            "read",
+            serde_json::json!({"path":"a", "offset":3, "limit":2}),
+        ),
+    ] {
+        let mut retained = build_tool_card_display(name, Some(&args));
+        retained.expanded_input = None;
+        assert_eq!(tool_card_counts(name, Some(&args)), retained);
+    }
+    for text in ["".into(), "a\n\u{1b}中\n".repeat(70_000)] {
+        let (body, cut) = bounded_result_content(&text, MAX_RESULT_DISPLAY_BYTES);
+        assert_eq!(result_line_count(&text), (count_lines(&body), cut));
+    }
+}
