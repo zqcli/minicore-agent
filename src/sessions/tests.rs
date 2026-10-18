@@ -1,12 +1,48 @@
 use super::*;
+
+#[tokio::test]
+async fn read_snapshots_share_timestamps_until_a_writer_changes_them() {
+    let directory = crate::test_support::TempDir::new("snapshot-timestamps");
+    let config = serde_json::from_value(serde_json::json!({
+        "data_dir": directory.path().join("data"), "default_profile": "test",
+        "profiles": {"test": {"model":"main", "reasoning":"auto", "system_prompt":"test", "tools":[], "approval":"auto"}},
+        "models": {"main": {"provider":"open_ai_responses", "model":"test", "base_url":"https://example.invalid/v1", "api_key_env":"PATH",
+            "physical_context_window":32000, "output_budget_tokens":2000, "safety_margin_tokens":1000, "supported_reasoning":["auto"], "supports_tools":true}},
+        "compaction":{"enabled":false}
+    })).unwrap();
+    let mut agent = crate::Agent::open(config).await.unwrap();
+    let info = agent
+        .create_session(crate::CreateSession {
+            workspace: directory.path().into(),
+            profile: "test".into(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let first = session.read_snapshot();
+    let second = session.read_snapshot();
+    assert!(Arc::ptr_eq(&first.user_times, &second.user_times));
+    let key = (LoopId::new().unwrap(), 0);
+    Arc::make_mut(&mut session.lock_inner().user_times).insert(key, "2026-01-01T00:00:00Z".into());
+    let next = session.read_snapshot();
+    assert!(first.user_times.is_empty());
+    assert!(next.user_times.contains_key(&key));
+    assert!(Arc::ptr_eq(
+        &next.user_times,
+        &session.read_snapshot().user_times
+    ));
+    agent.shutdown().await.unwrap();
+}
 use crate::compaction::EphemeralGroupKey;
 use crate::event::{AgentEvent, AgentEventSink, EventMeta, LoopOutcomeView};
 use crate::ids::SessionId;
 
 #[tokio::test]
 async fn ignored_finished_drops_accumulate_into_subsequent_agent_event() {
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-    let sink = AgentEventSink::new(sender);
+    let (sink, mut receiver) = AgentEventSink::channel(8);
     let turn = TurnRef {
         session_id: SessionId::new().unwrap(),
         loop_id: LoopId::new().unwrap(),

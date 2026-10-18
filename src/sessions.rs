@@ -278,7 +278,7 @@ pub(crate) struct Session {
 pub(crate) struct ReadSnapshot {
     pub(crate) info: SessionInfo,
     pub(crate) history: Arc<[HistoryItem]>,
-    pub(crate) user_times: HashMap<(LoopId, usize), String>,
+    pub(crate) user_times: Arc<HashMap<(LoopId, usize), String>>,
 }
 
 /// Owned `workspace.status` workers run at most this many at a time.
@@ -384,7 +384,7 @@ struct SessionInner {
     record: crate::store::SessionRecord,
     workspace: Arc<Workspace>,
     history: Arc<[HistoryItem]>,
-    user_times: std::collections::HashMap<(LoopId, usize), String>,
+    user_times: Arc<HashMap<(LoopId, usize), String>>,
     presentation: Arc<crate::presentation::Presentation>,
     config: ExecutionConfig,
     /// Automatic-compaction binding for the current execution config. It is
@@ -613,7 +613,7 @@ impl Session {
             record,
             workspace,
             history,
-            user_times,
+            user_times: Arc::new(user_times),
             presentation,
             config,
             auto,
@@ -1146,7 +1146,7 @@ impl Session {
         ReadSnapshot {
             info: SessionInfo::from_record(&inner.record, true),
             history: Arc::clone(&inner.history),
-            user_times: inner.user_times.clone(),
+            user_times: Arc::clone(&inner.user_times),
         }
     }
 
@@ -1577,8 +1577,7 @@ async fn run_active_loop(
                                 .as_ref()
                                 .and_then(|times| times.get(occurrence))
                             {
-                                inner
-                                    .user_times
+                                Arc::make_mut(&mut inner.user_times)
                                     .insert((report.loop_id, occurrence), time.clone());
                             }
                             occurrence += 1;

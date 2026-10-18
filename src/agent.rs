@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::InteractionId;
@@ -362,7 +362,7 @@ pub struct Agent {
     command_environment: CommandEnvironment,
     sessions: Sessions,
     event_sink: AgentEventSink,
-    events_rx: Option<mpsc::Receiver<AgentEvent>>,
+    events_rx: Option<AgentEventStream>,
 }
 
 impl Agent {
@@ -405,8 +405,7 @@ impl Agent {
         let command_environment = command_environment(&config);
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone()).await?;
-        let (events_tx, events_rx) = mpsc::channel(config.event_capacity);
-        let event_sink = AgentEventSink::new(events_tx);
+        let (event_sink, events_rx) = AgentEventSink::channel(config.event_capacity);
         let agent = Self {
             config,
             config_path,
@@ -496,10 +495,7 @@ impl Agent {
     }
 
     pub fn take_events(&mut self) -> Result<AgentEventStream, AgentError> {
-        self.events_rx
-            .take()
-            .map(AgentEventStream::new)
-            .ok_or(AgentError::EventStreamTaken)
+        self.events_rx.take().ok_or(AgentError::EventStreamTaken)
     }
 
     pub const fn ping(&self) -> PingResponse {

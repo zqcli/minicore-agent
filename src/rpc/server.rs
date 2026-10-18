@@ -54,9 +54,23 @@ pub async fn run_stdio(agent: Agent) -> Result<(), AgentError> {
         agent,
         BufReader::new(tokio_io::stdin()),
         BufWriter::new(tokio_io::stdout()),
-        tokio::signal::ctrl_c(),
+        shutdown_signal(),
     )
     .await
+}
+
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 pub(crate) async fn run_with_io<R, W, S>(
@@ -1019,10 +1033,19 @@ async fn write_outbound<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some(frame) = outbound.recv().await {
-        let encoded = serde_json::to_vec(&frame).map_err(|_| AgentError::RpcSerialization)?;
-        writer.write_all(&encoded).await?;
-        writer.write_all(b"\n").await?;
+    let mut batch = Vec::with_capacity(OUTBOUND_CAPACITY);
+    while outbound.recv_many(&mut batch, OUTBOUND_CAPACITY).await != 0 {
+        for frame in batch.drain(..) {
+            match frame {
+                RpcOutbound::Response(response) => writer.write_all(response.encoded()).await?,
+                RpcOutbound::Event(event) => {
+                    let encoded =
+                        serde_json::to_vec(&event).map_err(|_| AgentError::RpcSerialization)?;
+                    writer.write_all(&encoded).await?;
+                }
+            }
+            writer.write_all(b"\n").await?;
+        }
         writer.flush().await?;
     }
     Ok(())
@@ -1057,8 +1080,8 @@ fn success<T>(id: &RpcId, result: T) -> RpcResponse
 where
     T: Serialize,
 {
-    match serde_json::to_value(result) {
-        Ok(result) => RpcResponse::success(id.clone(), result),
+    match RpcResponse::success(id.clone(), result) {
+        Ok(response) => response,
         Err(_) => RpcResponse::error(
             Some(id.clone()),
             INTERNAL_ERROR,
@@ -1299,5 +1322,7 @@ where
     }
 }
 
+#[cfg(test)]
+mod delivery_tests;
 #[cfg(test)]
 mod tests;

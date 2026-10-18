@@ -2,7 +2,7 @@ use super::*;
 use crate::presentation::{ToolArgumentsPreviewState, ToolDisplay};
 use crate::tool_data::*;
 
-fn events() -> Vec<AgentEvent> {
+pub(super) fn events() -> Vec<AgentEvent> {
     let session_id = "ses_00000000000000000000000000000001".parse().unwrap();
     let loop_id = "lup_00000000000000000000000000000002".parse().unwrap();
     let interaction_id = "int_00000000000000000000000000000003".parse().unwrap();
