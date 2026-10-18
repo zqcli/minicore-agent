@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use minicore_runtime::LoopId;
-use minicore_runtime::model::{Model, ModelError, ModelRef, ModelRequest, ReasoningPreference};
+use minicore_runtime::model::{
+    Model, ModelDescriptor, ModelError, ModelRef, ModelRequest, ReasoningPreference,
+};
 
 mod openai;
 
@@ -215,10 +217,16 @@ impl Model for BudgetCheckedModel {
 }
 
 #[derive(Clone)]
-pub(crate) struct ModelEntry {
-    pub(crate) physical_context_window: u64,
-    pub(crate) model: Arc<dyn Model>,
-    pub(crate) budget: Arc<dyn ProviderBudget>,
+struct ModelEntry {
+    physical_context_window: u64,
+    descriptor: ModelDescriptor,
+    provider: Result<ModelProvider, ModelConfigError>,
+}
+
+#[derive(Clone)]
+struct ModelProvider {
+    model: Arc<dyn Model>,
+    budget: Arc<dyn ProviderBudget>,
 }
 
 #[derive(Clone)]
@@ -228,17 +236,17 @@ pub(crate) struct Models {
 
 impl Models {
     pub(crate) async fn from_config(
-        config: &BTreeMap<String, ModelConfig>,
+        config: &crate::config::AgentConfig,
     ) -> Result<Self, ModelConfigError> {
         Self::from_config_with_env(config, |name| std::env::var(name).ok())
     }
 
     fn from_config_with_env(
-        config: &BTreeMap<String, ModelConfig>,
+        config: &crate::config::AgentConfig,
         mut read_env: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ModelConfigError> {
         let mut values = BTreeMap::new();
-        for (id, value) in config {
+        for (id, value) in &config.models {
             value.validate()?;
             let entry = match value {
                 ModelConfig::OpenAiResponses {
@@ -252,36 +260,57 @@ impl Models {
                     supports_tools,
                     request_timeout_seconds,
                 } => {
-                    let api_key = read_env(api_key_env)
-                        .filter(|value| !value.trim().is_empty())
-                        .ok_or(ModelConfigError::MissingApiKey)?;
                     let reserved = output_budget_tokens + safety_margin_tokens;
-                    let settings = openai::OpenAiResponsesSettings {
-                        model_ref: Self::model_ref(id)?,
-                        provider_model: model.clone(),
-                        endpoint: openai::endpoint(base_url)?,
-                        api_key,
-                        effective_context_window: u64::from(physical_context_window - reserved),
-                        output_budget_tokens: *output_budget_tokens,
-                        supported_reasoning: supported_reasoning.clone(),
-                        supports_tools: *supports_tools,
-                        request_timeout: request_timeout_seconds.map(Duration::from_secs),
-                    };
-                    let openai_model = Arc::new(openai::OpenAiResponsesModel::new(settings)?);
+                    let descriptor = ModelDescriptor::new(
+                        Self::model_ref(id)?,
+                        u64::from(physical_context_window - reserved),
+                        supported_reasoning.clone(),
+                        *supports_tools,
+                    )
+                    .map_err(|_| ModelConfigError::InvalidConfiguration)?;
+                    let provider = read_env(api_key_env)
+                        .filter(|key| !key.trim().is_empty())
+                        .ok_or(ModelConfigError::MissingApiKey)
+                        .and_then(|api_key| {
+                            let model = Arc::new(openai::OpenAiResponsesModel::new(
+                                openai::OpenAiResponsesSettings {
+                                    descriptor: descriptor.clone(),
+                                    provider_model: model.clone(),
+                                    endpoint: openai::endpoint(base_url)?,
+                                    api_key,
+                                    output_budget_tokens: *output_budget_tokens,
+                                    request_timeout: request_timeout_seconds
+                                        .map(Duration::from_secs),
+                                },
+                            )?);
+                            Ok(ModelProvider {
+                                model: model.clone(),
+                                budget: model,
+                            })
+                        });
                     ModelEntry {
                         physical_context_window: u64::from(*physical_context_window),
-                        model: Arc::clone(&openai_model) as Arc<dyn Model>,
-                        budget: Arc::clone(&openai_model) as Arc<dyn ProviderBudget>,
+                        descriptor,
+                        provider,
                     }
                 }
             };
             values.insert(id.clone(), entry);
         }
-        Ok(Self { values })
+        let models = Self { values };
+        for profile in config.profiles.values() {
+            models.entry(&profile.model)?;
+        }
+        Ok(models)
     }
 
-    fn entry(&self, id: &str) -> Result<&ModelEntry, ModelConfigError> {
-        self.values.get(id).ok_or(ModelConfigError::NotFound)
+    fn entry(&self, id: &str) -> Result<&ModelProvider, ModelConfigError> {
+        self.values
+            .get(id)
+            .ok_or(ModelConfigError::NotFound)?
+            .provider
+            .as_ref()
+            .map_err(|error| *error)
     }
 
     pub(crate) fn get(&self, id: &str) -> Result<Arc<dyn Model>, ModelConfigError> {
@@ -298,8 +327,8 @@ impl Models {
     }
 
     pub(crate) fn physical_context_window(&self, id: &str) -> Option<u64> {
-        self.entry(id)
-            .ok()
+        self.values
+            .get(id)
             .map(|entry| entry.physical_context_window)
     }
 
@@ -311,7 +340,7 @@ impl Models {
         self.values
             .iter()
             .map(|(id, entry)| {
-                let descriptor = entry.model.descriptor();
+                let descriptor = &entry.descriptor;
                 ModelInfo {
                     id: id.clone(),
                     model_ref: descriptor.model_ref.clone(),
@@ -326,6 +355,18 @@ impl Models {
     pub(crate) fn model_ref(id: &str) -> Result<ModelRef, ModelConfigError> {
         id.parse().map_err(|_| ModelConfigError::InvalidReference)
     }
+}
+
+/// Conservative UTF-8 token estimate, not a provider tokenizer.
+pub(crate) fn estimate_tokens(utf8: &[u8]) -> u64 {
+    let non_ascii_chars = utf8.iter().filter(|&&byte| byte >= 0xc0).count();
+    utf8.len().div_ceil(4).max(non_ascii_chars) as u64
+}
+
+pub(crate) fn estimate_openai_request_tokens(request: &ModelRequest) -> Result<u64, ()> {
+    let mut body = Vec::new();
+    serialize_openai_request_for_budget(request, &mut body)?;
+    Ok(estimate_tokens(&body))
 }
 
 pub(crate) fn serialize_openai_request_for_budget(

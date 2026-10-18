@@ -60,10 +60,15 @@ provider-specific fields are `model`, `base_url`, `api_key_env`,
 `request_timeout_seconds`.
 
 `api_key_env` is only the name of an environment variable. The secret value is
-read when the Agent opens the model catalog and must be non-empty; it should
-never appear in TOML, logs, errors, fixtures, or documentation. Model IDs,
-provider URLs, and credential names are configuration inputs, not evidence that
-a request was sent.
+read from the process environment when the Agent constructs the catalog at startup
+or reload. Models referenced by any profile require a valid non-empty key then.
+Unreferenced models remain discoverable without credentials; selecting one for a
+session validates its captured credentials before use. Reload also validates every
+loaded session's model before swapping catalogs. Changing a parent shell's environment
+does not change the running process: rotate API keys by restarting the Agent.
+Keys must never appear in TOML, logs, errors, fixtures, or documentation. Model IDs,
+provider URLs, and credential names are configuration inputs, not evidence that a
+request was sent.
 
 The Responses client has a 10-second connect timeout. `request_timeout_seconds`,
 when set, bounds the whole HTTP request; the Runtime model deadline and cancellation
@@ -75,6 +80,23 @@ HTTP 503 and 529 are retryable and honor `Retry-After` (or `retry-after-ms`), li
 non-quota 429 responses. HTTP 408, 500, 502, and 504 retain unknown-delivery semantics
 and are not automatically retried, since the upstream may have processed the request. A truncated/reset error body does
 not change a known 503/529 classification; cancellation and deadlines still abort.
+
+In-stream `response.failed` and `error` events recognize exact context-overflow,
+quota, and rate-limit codes without exposing provider messages. Rejections before
+any output/text/reasoning/tool event are `NotStarted`; later failures are `Started`.
+Initial context-overflow rejections reach the existing compaction recovery path,
+and initial rate-limit rejections may be retried. Transport failures and malformed
+streams retain their conservative delivery classification.
+
+The adapter requests encrypted reasoning only when reasoning is not `disabled`
+and `supported_reasoning` contains an explicit level (`low` through `ultra`).
+This includes `auto` requests on such models; a model configured only for `auto`
+and/or `disabled` receives no encrypted-reasoning `include` field.
+
+Provider and utility request token estimates use the larger of rounded-up UTF-8
+JSON bytes divided by four and the number of non-ASCII characters. This avoids
+underestimating CJK through the byte ratio alone; it is still a heuristic, not a
+tokenizer or a guarantee that the provider will accept a request.
 
 Compatible gateways may omit `total_tokens` and input/output token details.
 Missing counters remain unknown, not zero; disjoint input/output partitions remain

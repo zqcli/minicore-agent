@@ -555,29 +555,96 @@ fn tls_client_accepts_non_utf8_bundle_path() {
 
 fn settings(base_url: &str) -> OpenAiResponsesSettings {
     OpenAiResponsesSettings {
-        model_ref: "main".parse().unwrap(),
+        descriptor: ModelDescriptor::new(
+            "main".parse().unwrap(),
+            16_384,
+            BTreeSet::from([
+                ReasoningPreference::Auto,
+                ReasoningPreference::Disabled,
+                ReasoningPreference::Low,
+                ReasoningPreference::Medium,
+                ReasoningPreference::High,
+                ReasoningPreference::XHigh,
+                ReasoningPreference::Max,
+                ReasoningPreference::Ultra,
+            ]),
+            true,
+        )
+        .unwrap(),
         provider_model: "provider-model".to_owned(),
         endpoint: endpoint(base_url).unwrap(),
         api_key: "TEST-API-KEY-SECRET".to_owned(),
-        effective_context_window: 16_384,
         output_budget_tokens: 1_024,
-        supported_reasoning: BTreeSet::from([
-            ReasoningPreference::Auto,
-            ReasoningPreference::Disabled,
-            ReasoningPreference::Low,
-            ReasoningPreference::Medium,
-            ReasoningPreference::High,
-            ReasoningPreference::XHigh,
-            ReasoningPreference::Max,
-            ReasoningPreference::Ultra,
-        ]),
-        supports_tools: true,
         request_timeout: Some(Duration::from_secs(5)),
     }
 }
 
 fn model(base_url: &str) -> OpenAiResponsesModel {
     OpenAiResponsesModel::new(settings(base_url)).unwrap()
+}
+
+#[test]
+fn encrypted_reasoning_is_requested_only_when_enabled_and_supported() {
+    for capable in [false, true] {
+        let mut settings = settings("https://example.invalid");
+        if !capable {
+            settings.descriptor.supported_reasoning =
+                BTreeSet::from([ReasoningPreference::Auto, ReasoningPreference::Disabled]);
+        }
+        let model = OpenAiResponsesModel::new(settings).unwrap();
+        for preference in [
+            ReasoningPreference::Auto,
+            ReasoningPreference::Disabled,
+            ReasoningPreference::High,
+        ] {
+            let request = basic_request(preference);
+            if !capable && preference == ReasoningPreference::High {
+                assert!(model.build_request(&request).is_err());
+                continue;
+            }
+            let bytes = model.build_request(&request).unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if capable && preference != ReasoningPreference::Disabled {
+                assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            } else {
+                assert!(body.get("include").is_none());
+            }
+            assert_eq!(
+                model.estimate_request_bytes(&request, None, None).unwrap(),
+                bytes.len()
+            );
+            assert_eq!(
+                model.estimate_request_tokens(&request, None, None).unwrap(),
+                super::super::estimate_tokens(&bytes)
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_and_utility_estimators_count_cjk_without_changing_byte_accounting() {
+    let request = ModelRequest::new(
+        vec![ModelMessage::user("界".repeat(8192)).unwrap()],
+        vec![],
+        ModelLimits::default(),
+        ReasoningPreference::Auto,
+    )
+    .unwrap();
+    let model = model("https://example.invalid");
+    let bytes = model.build_request(&request).unwrap();
+    assert_eq!(
+        model.estimate_request_bytes(&request, None, None).unwrap(),
+        bytes.len()
+    );
+    assert_eq!(
+        model.estimate_request_tokens(&request, None, None).unwrap(),
+        8192
+    );
+    assert_eq!(
+        crate::models::estimate_openai_request_tokens(&request).unwrap(),
+        8192
+    );
+    assert!(bytes.len().div_ceil(4) < 8192);
 }
 
 fn agent_model_config(base_url: &str) -> ModelConfig {
@@ -793,7 +860,10 @@ async fn run_until_error(
     request: ModelRequest,
     context: ModelCallContext,
 ) -> (Vec<ModelEvent>, ModelError) {
-    let mut stream = model.start(request, context).await.unwrap();
+    let mut stream = match model.start(request, context).await {
+        Ok(stream) => stream,
+        Err(error) => return (Vec::new(), error),
+    };
     let mut events = Vec::new();
     loop {
         match stream.next().await {
@@ -1033,7 +1103,7 @@ fn reasoning_mapping_preserves_structure_without_ordinary_estimate_veto() {
     let encoded = model.build_request(&request).unwrap();
     let estimated = encoded.len().div_ceil(4) as u64;
     let mut exact = settings("http://127.0.0.1:1");
-    exact.effective_context_window = estimated;
+    exact.descriptor.context_window = estimated;
     assert!(
         OpenAiResponsesModel::new(exact)
             .unwrap()
@@ -1041,7 +1111,7 @@ fn reasoning_mapping_preserves_structure_without_ordinary_estimate_veto() {
             .is_ok()
     );
     let mut too_small = settings("http://127.0.0.1:1");
-    too_small.effective_context_window = estimated - 1;
+    too_small.descriptor.context_window = estimated - 1;
     assert_eq!(
         OpenAiResponsesModel::new(too_small)
             .unwrap()
@@ -1057,7 +1127,7 @@ fn reasoning_mapping_preserves_structure_without_ordinary_estimate_veto() {
         ReasoningPreference::Ultra,
     ] {
         let mut unsupported = settings("http://127.0.0.1:1");
-        unsupported.supported_reasoning = BTreeSet::from([ReasoningPreference::Auto]);
+        unsupported.descriptor.supported_reasoning = BTreeSet::from([ReasoningPreference::Auto]);
         let error = OpenAiResponsesModel::new(unsupported)
             .unwrap()
             .build_request(&basic_request(reasoning))
@@ -2267,22 +2337,28 @@ async fn cancellation_before_send_and_during_stream_drop_owned_http_work() {
         .with_chunk_delay(Duration::from_millis(100))])
     .await;
     let cancellation = CancellationToken::new();
-    let mut stream = model(server.base_url())
-        .start(
-            basic_request(ReasoningPreference::Auto),
-            context(cancellation.clone(), Duration::from_secs(5)),
-        )
-        .await
-        .unwrap();
+    let pending_model = model(server.base_url());
+    let pending = pending_model.start(
+        basic_request(ReasoningPreference::Auto),
+        context(cancellation.clone(), Duration::from_secs(5)),
+    );
+    tokio::pin!(pending);
+    tokio::select! {
+        biased;
+        _ = &mut pending => panic!("provider has not sent output"),
+        _ = server.wait_for_requests(1) => {}
+    }
     cancellation.cancel();
-    let error = stream.next().await.unwrap().unwrap_err();
+    let error = match pending.await {
+        Err(error) => error,
+        Ok(_) => panic!("cancelled start succeeded"),
+    };
     assert_error(
         &error,
         ModelErrorKind::Cancelled,
         DeliveryState::Unknown,
         false,
     );
-    assert!(stream.next().await.is_none());
     server.finish().await;
 
     let first = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"seen\"}\n\n".to_vec();
@@ -2316,29 +2392,62 @@ async fn cancellation_before_send_and_during_stream_drop_owned_http_work() {
 }
 
 #[tokio::test]
-async fn provider_failure_event_is_started_and_never_exposes_raw_details() {
-    for event in [
-        json!({"type": "response.failed", "response": {
-            "error": {"code": "server_error", "message": "RAW-SECRET"}
-        }}),
-        json!({"type": "error", "code": "server_error", "message": "RAW-SECRET"}),
-    ] {
-        let server = MockServer::spawn([MockResponse::sse(&[event])]).await;
-        let error = run_model(
-            &model(server.base_url()),
-            basic_request(ReasoningPreference::Auto),
-            context(CancellationToken::new(), Duration::from_secs(5)),
-        )
-        .await
-        .unwrap_err();
-        assert_error(
-            &error,
+async fn in_stream_rejections_classify_codes_delivery_and_redact_messages() {
+    for (code, kind) in [
+        ("context_length_exceeded", ModelErrorKind::ContextOverflow),
+        ("insufficient_quota", ModelErrorKind::QuotaExceeded),
+        ("rate_limit_exceeded", ModelErrorKind::RateLimited),
+        ("server_error", ModelErrorKind::ProviderUnavailable),
+        (
+            "contains_context_length_exceeded",
             ModelErrorKind::ProviderUnavailable,
-            DeliveryState::Started,
-            false,
-        );
-        assert!(!format!("{error:?}").contains("RAW-SECRET"));
-        server.finish().await;
+        ),
+    ] {
+        for nested in [false, true] {
+            for output in [
+                None,
+                Some(json!({"type":"response.output_text.delta","delta":""})),
+                Some(
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r"}}),
+                ),
+                Some(
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read","arguments":""}}),
+                ),
+            ] {
+                let started = output.is_some();
+                let mut frames = vec![
+                    json!({"type":"response.created"}),
+                    json!({"type":"response.in_progress"}),
+                ];
+                frames.extend(output);
+                frames.push(if nested {
+                    json!({"type":"response.failed","response":{"error":{"code":code,"message":"RAW-SECRET"}}})
+                } else { json!({"type":"error","code":code,"message":"RAW-SECRET"}) });
+                let server = MockServer::spawn([MockResponse::sse(&frames)]).await;
+                let model = model(server.base_url());
+                let context = context(CancellationToken::new(), Duration::from_secs(5));
+                let error = if started {
+                    run_until_error(&model, basic_request(ReasoningPreference::Auto), context)
+                        .await
+                        .1
+                } else {
+                    // Recovery intercepts start errors, not errors returned later by the stream.
+                    start_error(&model, basic_request(ReasoningPreference::Auto), context).await
+                };
+                assert_error(
+                    &error,
+                    kind,
+                    if started {
+                        DeliveryState::Started
+                    } else {
+                        DeliveryState::NotStarted
+                    },
+                    !started && kind == ModelErrorKind::RateLimited,
+                );
+                assert!(!format!("{error:?}").contains("RAW-SECRET"));
+                server.finish().await;
+            }
+        }
     }
 }
 
@@ -2528,7 +2637,7 @@ fn live_settings(config: &LiveOpenAiConfig) -> OpenAiResponsesSettings {
     let mut value = settings(&config.base_url);
     value.provider_model.clone_from(&config.provider_model);
     value.api_key.clone_from(&config.api_key);
-    value.supported_reasoning = BTreeSet::from([config.reasoning]);
+    value.descriptor.supported_reasoning = BTreeSet::from([config.reasoning]);
     value.request_timeout = Some(Duration::from_secs(120));
     value
 }
@@ -2987,7 +3096,7 @@ fn queue_reasoning_delta_missing_identity_is_not_a_boundary_and_partial_fields_r
             item_id: item_id.map(str::to_owned),
             summary_index: summary_index.map(serde_json::Value::from),
         };
-        queue_reasoning_delta(&mut state, event).unwrap();
+        queue_reasoning_delta(&mut state, event);
     };
     frame("Plan", Some(0), Some("rs_x"), Some(0));
     frame("ning", None, None, None);
@@ -3021,7 +3130,7 @@ fn queue_reasoning_delta_empty_delta_with_new_index_signals_the_next_part() {
             item_id: None,
             summary_index: summary_index.map(serde_json::Value::from),
         };
-        queue_reasoning_delta(&mut state, event).unwrap();
+        queue_reasoning_delta(&mut state, event);
     };
     frame("Foo", Some(0));
     frame("", Some(1));
@@ -3088,7 +3197,7 @@ mod replay_tests;
 #[tokio::test]
 async fn utility_handle_enforces_exact_provider_budget_before_http() {
     let mut configured = settings("http://127.0.0.1:1");
-    configured.effective_context_window = 1;
+    configured.descriptor.context_window = 1;
     let raw = std::sync::Arc::new(OpenAiResponsesModel::new(configured).unwrap());
     let utility = super::super::BudgetCheckedModel {
         inner: std::sync::Arc::clone(&raw) as std::sync::Arc<dyn Model>,

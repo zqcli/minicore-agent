@@ -16,8 +16,8 @@ use tokio::time::Instant as TokioInstant;
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{
     AssistantPart, DeliveryState, Model, ModelCallContext, ModelDescriptor, ModelError,
-    ModelErrorKind, ModelEvent, ModelFinishReason, ModelMessage, ModelRef, ModelRequest,
-    ModelStartFuture, ModelStream, ReasoningPreference, RetryHint, Usage,
+    ModelErrorKind, ModelEvent, ModelFinishReason, ModelMessage, ModelRequest, ModelStartFuture,
+    ModelStream, ReasoningPreference, RetryHint, Usage,
 };
 use minicore_runtime::tools::ToolName;
 use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES};
@@ -39,14 +39,11 @@ mod replay;
 const MAX_REPLAY_BYTES: usize = minicore_runtime::model::ProviderReplay::MAX_BYTES;
 
 pub(super) struct OpenAiResponsesSettings {
-    pub(super) model_ref: ModelRef,
+    pub(super) descriptor: ModelDescriptor,
     pub(super) provider_model: String,
     pub(super) endpoint: reqwest::Url,
     pub(super) api_key: String,
-    pub(super) effective_context_window: u64,
     pub(super) output_budget_tokens: u32,
-    pub(super) supported_reasoning: BTreeSet<ReasoningPreference>,
-    pub(super) supports_tools: bool,
     pub(super) request_timeout: Option<Duration>,
 }
 
@@ -82,13 +79,7 @@ impl OpenAiResponsesModel {
             .map_err(|_| ModelConfigError::InvalidConfiguration)?;
         authorization.set_sensitive(true);
         drop(settings.api_key);
-        let descriptor = ModelDescriptor::new(
-            settings.model_ref,
-            settings.effective_context_window,
-            settings.supported_reasoning,
-            settings.supports_tools,
-        )
-        .map_err(|_| ModelConfigError::InvalidConfiguration)?;
+        let descriptor = settings.descriptor;
         let ssl_cert_file = std::env::var_os("SSL_CERT_FILE");
         let client = build_http_client(settings.request_timeout, ssl_cert_file.as_deref())?;
         if plaintext_remote_endpoint(&settings.endpoint) {
@@ -110,13 +101,26 @@ impl OpenAiResponsesModel {
         {
             return Err(local_error(ModelErrorKind::InvalidRequest));
         }
-        let body = ResponsesRequest::from_runtime(
+        serde_json::to_vec(&self.request_body(request)?)
+            .map_err(|_| local_error(ModelErrorKind::InvalidRequest))
+    }
+
+    fn request_body(&self, request: &ModelRequest) -> Result<ResponsesRequest<'_>, ModelError> {
+        ResponsesRequest::from_runtime(
             &self.provider_model,
             self.output_budget_tokens,
             request,
             Some(self.endpoint.as_str()),
-        )?;
-        serde_json::to_vec(&body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))
+            self.descriptor
+                .supported_reasoning
+                .iter()
+                .any(|preference| {
+                    !matches!(
+                        preference,
+                        ReasoningPreference::Auto | ReasoningPreference::Disabled
+                    )
+                }),
+        )
     }
 
     async fn start_request(
@@ -197,7 +201,15 @@ impl OpenAiResponsesModel {
             )),
             Some(trace),
         );
-        Ok(Box::pin(stream::unfold(state, next_stream_event)))
+        // Surface initial SSE rejections through start(), where compaction can
+        // recover ContextOverflow before the runtime begins consuming output.
+        let (first, state) = next_stream_event(state)
+            .await
+            .expect("initial stream event");
+        let first = first?;
+        Ok(Box::pin(
+            stream::once(async move { Ok(first) }).chain(stream::unfold(state, next_stream_event)),
+        ))
     }
 }
 
@@ -284,12 +296,12 @@ impl ProviderBudget for OpenAiResponsesModel {
     fn estimate_request_tokens(
         &self,
         request: &ModelRequest,
-        loop_id: Option<LoopId>,
-        request_index: Option<u32>,
+        _loop_id: Option<LoopId>,
+        _request_index: Option<u32>,
     ) -> Result<u64, ModelError> {
-        Ok(self
-            .estimate_request_bytes(request, loop_id, request_index)?
-            .div_ceil(4) as u64)
+        let body = serde_json::to_vec(&self.request_body(request)?)
+            .map_err(|_| local_error(ModelErrorKind::InvalidRequest))?;
+        Ok(super::estimate_tokens(&body))
     }
 
     fn estimate_request_bytes(
@@ -298,13 +310,7 @@ impl ProviderBudget for OpenAiResponsesModel {
         _loop_id: Option<LoopId>,
         _request_index: Option<u32>,
     ) -> Result<usize, ModelError> {
-        let body = ResponsesRequest::from_runtime(
-            &self.provider_model,
-            self.output_budget_tokens,
-            request,
-            Some(self.endpoint.as_str()),
-        )?;
-        serde_json::to_vec(&body)
+        serde_json::to_vec(&self.request_body(request)?)
             .map(|bytes| bytes.len())
             .map_err(|_| local_error(ModelErrorKind::InvalidRequest))
     }
@@ -336,7 +342,8 @@ struct ResponsesRequest<'a> {
     store: bool,
     truncation: &'static str,
     max_output_tokens: u32,
-    include: [&'static str; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<[&'static str; 1]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningWire>,
 }
@@ -347,6 +354,7 @@ impl<'a> ResponsesRequest<'a> {
         output_budget_tokens: u32,
         request: &ModelRequest,
         endpoint: Option<&str>,
+        supports_reasoning: bool,
     ) -> Result<Self, ModelError> {
         let mut input = Vec::new();
         for (message_index, message) in request.messages().iter().enumerate() {
@@ -449,7 +457,8 @@ impl<'a> ResponsesRequest<'a> {
             store: false,
             truncation: "disabled",
             max_output_tokens: output_budget_tokens,
-            include: ["reasoning.encrypted_content"],
+            include: (supports_reasoning && request.reasoning() != ReasoningPreference::Disabled)
+                .then_some(["reasoning.encrypted_content"]),
             reasoning,
         })
     }
@@ -460,7 +469,7 @@ pub(super) fn serialize_request_for_budget(
     writer: &mut dyn std::io::Write,
 ) -> Result<(), ModelError> {
     let model = "m".repeat(256);
-    let body = ResponsesRequest::from_runtime(&model, u32::MAX, request, None)?;
+    let body = ResponsesRequest::from_runtime(&model, u32::MAX, request, None, true)?;
     serde_json::to_writer(writer, &body).map_err(|_| local_error(ModelErrorKind::InvalidRequest))
 }
 
@@ -835,7 +844,7 @@ struct StreamState {
     text: String,
     trace: Option<RequestTraceContext>,
     provider_event_seen: bool,
-    semantic_seen: bool,
+    output_seen: bool,
     reasoning_seen: bool,
     refusal_seen: bool,
     terminal_seen: bool,
@@ -877,7 +886,7 @@ impl StreamState {
             text: String::new(),
             trace,
             provider_event_seen: false,
-            semantic_seen: false,
+            output_seen: false,
             reasoning_seen: false,
             refusal_seen: false,
             terminal_seen: false,
@@ -887,7 +896,6 @@ impl StreamState {
     }
 
     fn queue(&mut self, event: ModelEvent) {
-        self.semantic_seen = true;
         self.pending.push_back(Ok(event));
     }
 
@@ -1062,7 +1070,7 @@ async fn next_stream_event(
             Some(Err(error)) => {
                 let kind = if error.is_timeout() {
                     ModelErrorKind::Timeout
-                } else if state.semantic_seen {
+                } else if state.output_seen {
                     ModelErrorKind::StreamInterrupted
                 } else {
                     ModelErrorKind::RequestOutcomeUnknown
@@ -1071,7 +1079,7 @@ async fn next_stream_event(
                 state.fail(error);
             }
             None => {
-                let kind = if state.semantic_seen {
+                let kind = if state.output_seen {
                     ModelErrorKind::StreamInterrupted
                 } else {
                     ModelErrorKind::IncompleteResponse
@@ -1193,19 +1201,23 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
     let value: Value = serde_json::from_slice(frame).map_err(|_| ())?;
     let event_type = value.get("type").and_then(Value::as_str).ok_or(())?;
     state.provider_event_seen = true;
+    state.output_seen |= event_type.starts_with("response.output_")
+        || event_type.starts_with("response.reasoning_")
+        || event_type.starts_with("response.refusal.")
+        || event_type.starts_with("response.function_call_");
     match event_type {
         "response.output_text.delta" => {
             let event: DeltaEvent = from_value(value)?;
-            queue_text(state, event.delta, false)?;
+            queue_text(state, event.delta, false);
         }
         "response.refusal.delta" => {
             let event: DeltaEvent = from_value(value)?;
             state.refusal_seen |= !event.delta.is_empty();
-            queue_text(state, event.delta, false)?;
+            queue_text(state, event.delta, false);
         }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             let event: ReasoningSummaryDeltaEvent = from_value(value)?;
-            queue_reasoning_delta(state, event)?;
+            queue_reasoning_delta(state, event);
             state.reasoning_seen = true;
         }
         // Explicit summary-part lifecycle: some providers split ONE reasoning
@@ -1253,7 +1265,29 @@ fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), ()> {
         }
         "response.failed" | "error" => {
             state.terminal_seen = true;
-            state.fail(started_error(ModelErrorKind::ProviderUnavailable));
+            let error = value
+                .pointer("/response/error")
+                .or_else(|| value.get("error"))
+                .unwrap_or(&value);
+            let kind = ["code", "type"]
+                .into_iter()
+                .filter_map(|field| error.get(field).and_then(Value::as_str))
+                .find_map(|code| match code {
+                    "context_length_exceeded" | "context_window_exceeded" | "context_overflow" => {
+                        Some(ModelErrorKind::ContextOverflow)
+                    }
+                    "insufficient_quota" | "quota_exceeded" => Some(ModelErrorKind::QuotaExceeded),
+                    "rate_limit_exceeded" => Some(ModelErrorKind::RateLimited),
+                    _ => None,
+                })
+                .unwrap_or(ModelErrorKind::ProviderUnavailable);
+            state.fail(if state.output_seen {
+                started_error(kind)
+            } else if kind == ModelErrorKind::RateLimited {
+                retryable_error(kind, None)
+            } else {
+                local_error(kind)
+            });
         }
         _ => {}
     }
@@ -1317,10 +1351,7 @@ impl ReasoningParts {
     }
 }
 
-fn queue_reasoning_delta(
-    state: &mut StreamState,
-    event: ReasoningSummaryDeltaEvent,
-) -> Result<(), ()> {
+fn queue_reasoning_delta(state: &mut StreamState, event: ReasoningSummaryDeltaEvent) {
     // The delta's explicit fields override the previous known part; omitted
     // fields inherit it, so a metadata gap never invents a boundary.
     let merged = merge_reasoning_key(state.reasoning_parts.last_key.clone(), &event);
@@ -1337,7 +1368,7 @@ fn queue_reasoning_delta(
             state.reasoning_parts.last_lifecycle = state.reasoning_parts.lifecycle;
             state.reasoning_parts.pending_boundary = true;
         }
-        return Ok(());
+        return;
     }
 
     let boundary = identity_changed || lifecycle_changed || state.reasoning_parts.pending_boundary;
@@ -1348,10 +1379,10 @@ fn queue_reasoning_delta(
         && !state.reasoning_parts.last_ends_newline
         && !delta.starts_with(['\n', '\r']);
     if needs_separator {
-        queue_text(state, "\n".to_owned(), true)?;
+        queue_text(state, "\n".to_owned(), true);
     }
     let last_ends_newline = delta.ends_with(['\n', '\r']);
-    queue_text(state, delta, true)?;
+    queue_text(state, delta, true);
     if boundary {
         state.reasoning_parts.last_key = merged;
         state.reasoning_parts.last_lifecycle = state.reasoning_parts.lifecycle;
@@ -1359,7 +1390,6 @@ fn queue_reasoning_delta(
     state.reasoning_parts.pending_boundary = false;
     state.reasoning_parts.emitted = true;
     state.reasoning_parts.last_ends_newline = last_ends_newline;
-    Ok(())
 }
 
 /// Overlays a delta's EXPLICIT identity fields over the last known part.
@@ -1505,7 +1535,7 @@ struct IncompleteDetails {
     reason: Option<String>,
 }
 
-fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<(), ()> {
+fn queue_text(state: &mut StreamState, text: String, reasoning: bool) {
     if !reasoning {
         state.text.push_str(&text);
     }
@@ -1515,10 +1545,9 @@ fn queue_text(state: &mut StreamState, text: String, reasoning: bool) -> Result<
         } else {
             ModelEvent::text_delta(chunk)
         }
-        .map_err(|_| ())?;
+        .expect("event chunk fits the runtime byte limit");
         state.queue(event);
     }
-    Ok(())
 }
 
 fn event_text_chunks(value: &str) -> impl Iterator<Item = &str> {
@@ -1580,8 +1609,8 @@ fn append_tool_arguments(
     tool.arguments.push_str(delta);
     let tool_call_id = tool.tool_call_id.clone();
     for chunk in event_text_chunks(delta) {
-        let event =
-            ModelEvent::tool_call_arguments_delta(tool_call_id.clone(), chunk).map_err(|_| ())?;
+        let event = ModelEvent::tool_call_arguments_delta(tool_call_id.clone(), chunk)
+            .expect("event chunk fits the runtime byte limit");
         state.queue(event);
     }
     Ok(())
@@ -1711,7 +1740,7 @@ fn finish_response(
     };
     if !text.is_empty() && text != state.text {
         let suffix = text.strip_prefix(&state.text).ok_or(())?.to_owned();
-        queue_text(state, suffix, false)?;
+        queue_text(state, suffix, false);
     }
     let reason = if matches!(kind, TerminalKind::Incomplete) {
         match response
