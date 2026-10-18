@@ -118,16 +118,16 @@ impl Store {
                     return Err(StoreError::Corrupt);
                 }
             }
-            Err(_) => return Err(StoreError::Unavailable),
+            Err(error) => return Err(unavailable(error)),
         }
-        let temp_dir = unique_temp_path(&target_dir);
+        let temp_dir = unique_temp_path(&target_dir)?;
         if Instant::now() >= deadline {
             let _ = fs::remove_dir(&tools_dir).await;
             return Err(StoreError::Unavailable);
         }
-        if fs::create_dir(&temp_dir).await.is_err() {
+        if let Err(error) = fs::create_dir(&temp_dir).await {
             let _ = fs::remove_dir(&tools_dir).await;
-            return Err(StoreError::Unavailable);
+            return Err(unavailable(error));
         }
 
         let write_res = async {
@@ -164,9 +164,9 @@ impl Store {
             return Err(StoreError::Unavailable);
         }
 
-        if fs::rename(&temp_dir, &target_dir).await.is_err() {
+        if let Err(error) = fs::rename(&temp_dir, &target_dir).await {
             discard_aux_temp(&temp_dir, ledger).await;
-            return Err(StoreError::Unavailable);
+            return Err(unavailable(error));
         }
 
         ledger.as_mut().unwrap().insert(AuxDirectoryEntry {
@@ -176,11 +176,7 @@ impl Store {
             bytes: item_bytes,
         });
 
-        if sync_directory(&tools_dir).await.is_err() {
-            return Err(StoreError::Unavailable);
-        }
-
-        Ok(())
+        sync_directory(&tools_dir).await.map_err(unavailable)
     }
 
     /// Persists completed tool records of a loop under a shared lock and deadline.
@@ -253,20 +249,4 @@ impl Store {
 
         results
     }
-}
-
-async fn write_sync_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .map_err(unavailable)?;
-    if file.write_all(bytes).await.is_err()
-        || file.flush().await.is_err()
-        || file.sync_all().await.is_err()
-    {
-        return Err(StoreError::Unavailable);
-    }
-    Ok(())
 }

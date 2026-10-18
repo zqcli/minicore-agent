@@ -18,11 +18,19 @@ impl Store {
         let mut ledger = AuxLedger::default();
         // The read-query entry ceiling must not prevent budget eviction at startup.
         while let Some(entry) = next_aux_entry(&mut sessions, deadline).await? {
+            if entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix(DELETING_PREFIX))
+                .is_some_and(|id| id.parse::<SessionId>().is_ok())
+            {
+                continue;
+            }
             let path = entry.path();
             let meta = match fs::symlink_metadata(&path).await {
                 Ok(meta) => meta,
                 Err(error) => {
-                    tracing::warn!(entry = ?path, error_kind = ?error.kind(), "skipping unreadable auxiliary entry");
+                    tracing::warn!(error_kind = ?error.kind(), "skipping unreadable auxiliary entry");
                     continue;
                 }
             };
@@ -32,7 +40,7 @@ impl Store {
                 .and_then(|name| name.parse::<SessionId>().ok());
             let Some(session_id) = session_id.filter(|_| meta.is_dir()) else {
                 ledger.note_foreign(None, meta.len());
-                tracing::warn!(entry = ?path, "skipping foreign auxiliary budget entry");
+                tracing::warn!("skipping foreign auxiliary budget entry");
                 continue;
             };
             let tools = path.join(AUX_TOOLS_DIR);
@@ -44,7 +52,7 @@ impl Store {
                         .await
                         .map_or(0, |meta| meta.len());
                     ledger.note_foreign(Some(session_id), bytes);
-                    tracing::warn!(entry = ?tools, "skipping unreadable auxiliary directory");
+                    tracing::warn!("skipping unreadable auxiliary directory");
                     continue;
                 }
             }
@@ -57,7 +65,7 @@ impl Store {
                             .await
                             .map_or(0, |meta| meta.len()),
                     );
-                    tracing::warn!(entry = ?tools, error_kind = ?error.kind(), "skipping unreadable auxiliary directory");
+                    tracing::warn!(error_kind = ?error.kind(), "skipping unreadable auxiliary directory");
                     continue;
                 }
             };
@@ -67,7 +75,7 @@ impl Store {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
                     Err(error) => {
-                        tracing::warn!(entry = ?tools, error_kind = ?error.kind(), "stopping unreadable auxiliary directory scan");
+                        tracing::warn!(error_kind = ?error.kind(), "stopping unreadable auxiliary directory scan");
                         break;
                     }
                 };
@@ -75,7 +83,7 @@ impl Store {
                 let meta = match fs::symlink_metadata(&path).await {
                     Ok(meta) => meta,
                     Err(error) => {
-                        tracing::warn!(entry = ?path, error_kind = ?error.kind(), "skipping unreadable auxiliary entry");
+                        tracing::warn!(error_kind = ?error.kind(), "skipping unreadable auxiliary entry");
                         continue;
                     }
                 };
@@ -114,7 +122,7 @@ impl Store {
                     }
                 }
                 ledger.note_foreign(Some(session_id), bytes);
-                tracing::warn!(entry = ?path, "skipping foreign or corrupt auxiliary record");
+                tracing::warn!("skipping foreign or corrupt auxiliary record");
             }
         }
         Ok(ledger)
@@ -303,14 +311,5 @@ pub(super) fn is_valid_temp_name(name: &str) -> bool {
     if &bytes[65..70] != b".tmp-" {
         return false;
     }
-    let remainder = &bytes[70..];
-    let Some(dash_pos) = remainder.iter().position(|&b| b == b'-') else {
-        return false;
-    };
-    if dash_pos == 0 || dash_pos == remainder.len() - 1 {
-        return false;
-    }
-    let pid_part = &remainder[..dash_pos];
-    let id_part = &remainder[dash_pos + 1..];
-    pid_part.iter().all(u8::is_ascii_digit) && id_part.iter().all(u8::is_ascii_digit)
+    valid_temp_suffix(&name[70..])
 }

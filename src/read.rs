@@ -300,7 +300,7 @@ pub(crate) async fn read_session(
         let record = store
             .load_record(request.session_id)
             .await
-            .map_err(map_read_store_error)?;
+            .map_err(AgentError::from)?;
         SessionInfo::from_record(&record, false)
     };
     let (covered, first_item, projection_revision, cursor, source_start, mut page) = loop {
@@ -368,7 +368,7 @@ pub(crate) async fn read_session(
                 )
                 .await
         }
-        .map_err(map_read_store_error)?;
+        .map_err(AgentError::from)?;
         if cold_prefix.is_some() && !page.summary_anchor_valid {
             // Invalid optional snapshots do not hide source history. A retry
             // stays inside the original aggregate scan budget and starts from
@@ -472,6 +472,12 @@ pub(crate) async fn read_session(
         trailing_incomplete: page.trailing_incomplete,
         projection,
     };
+    let base_bytes = encoded_len(&result);
+    let record_bytes: Vec<_> = page
+        .turns
+        .iter()
+        .map(|summary| encoded_len(&ReadTurnSummary::from_stored(summary)))
+        .collect();
     let (items, next_cursor) = pack_items(
         encoded,
         cursor,
@@ -479,12 +485,21 @@ pub(crate) async fn read_session(
         max_bytes,
         &limits.cancellation,
         limits.deadline,
-        |items, next_cursor| {
-            let mut candidate = result.clone();
-            candidate.items = items.to_vec();
-            candidate.next_cursor = next_cursor;
-            candidate.records = records_for_chunks(&page.turns, items);
-            serde_json::to_vec(&candidate).map_err(|_| AgentError::RpcSerialization)
+        |items, candidate, next_cursor| {
+            let (bytes, count) = page
+                .turns
+                .iter()
+                .zip(&record_bytes)
+                .filter(|(summary, _)| {
+                    items.iter().chain(candidate).any(|chunk| {
+                        chunk.index >= summary.item_start && chunk.index < summary.item_end
+                    })
+                })
+                .fold((0_usize, 0_usize), |(bytes, count), (_, size)| {
+                    (bytes + size, count + 1)
+                });
+            // Empty items/records arrays and the null cursor are already in the base.
+            Ok(base_bytes + bytes + count.saturating_sub(1) + encoded_len(&next_cursor) - 4)
         },
     )
     .await?;
@@ -644,7 +659,7 @@ pub(crate) async fn turn_result(
     let record = store
         .read_loop_record(request.turn.session_id, request.turn.loop_id, &limits)
         .await
-        .map_err(map_read_store_error)?
+        .map_err(AgentError::from)?
         .ok_or(AgentError::TurnNotFound)?;
     stored_turn_page(
         request.turn,
@@ -760,8 +775,8 @@ async fn cold_read_only(
     match disk_result {
         Ok(Some(disk_record)) => Ok(disk_record),
         Ok(None) => Err(AgentError::ToolNotFound),
-        Err(crate::error::StoreError::QueryLimit) => Err(AgentError::QueryLimit),
-        Err(_) => Err(AgentError::ToolNotFound),
+        Err(crate::error::StoreError::SessionNotFound) => Err(AgentError::ToolNotFound),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -910,6 +925,7 @@ async fn assemble_turn_page(
     let timestamps = vec![None; end.saturating_sub(cursor.item)];
     let encoded = encoded_items(cursor.item, &sanitized[cursor.item..end], &timestamps)?;
     let total = sanitized.len();
+    let base_bytes = encoded_len(&base);
     let (items, next_cursor) = pack_items(
         encoded,
         cursor,
@@ -917,14 +933,7 @@ async fn assemble_turn_page(
         max_bytes,
         cancellation,
         deadline,
-        |items, next_cursor| {
-            serde_json::to_vec(&TurnResultPage {
-                items: items.to_vec(),
-                next_cursor,
-                ..base.clone()
-            })
-            .map_err(|_| AgentError::RpcSerialization)
-        },
+        |_, _, next_cursor| Ok(base_bytes + encoded_len(&next_cursor) - 4),
     )
     .await?;
     Ok(TurnResultPage {
@@ -972,13 +981,18 @@ async fn pack_items<I, F>(
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
-    mut build: F,
+    mut header_bytes: F,
 ) -> Result<(Vec<ReadItemChunk>, Option<ReadCursor>), AgentError>
 where
     I: IntoIterator<Item = Result<(usize, String), AgentError>>,
-    F: FnMut(&[ReadItemChunk], Option<ReadCursor>) -> Result<Vec<u8>, AgentError>,
+    F: FnMut(
+        &[ReadItemChunk],
+        Option<&ReadItemChunk>,
+        Option<ReadCursor>,
+    ) -> Result<usize, AgentError>,
 {
     let mut chunks = Vec::new();
+    let mut chunk_bytes = 0;
     let mut position = start;
     let mut encoded = encoded.into_iter();
 
@@ -1008,8 +1022,16 @@ where
         let complete_cursor = next_position(index, total);
         if remaining.len() <= max_bytes {
             let full = make_chunk(index, offset, &json, remaining.len());
-            if candidate_fits(&chunks, full, complete_cursor, max_bytes, &mut build)? {
-                chunks.push(make_chunk(index, offset, &json, remaining.len()));
+            if let Some(bytes) = fitting_chunk_bytes(
+                &chunks,
+                chunk_bytes,
+                &full,
+                complete_cursor,
+                max_bytes,
+                &mut header_bytes,
+            )? {
+                chunk_bytes += bytes;
+                chunks.push(full);
                 position = complete_cursor.unwrap_or(ReadCursor {
                     item: total,
                     offset: 0,
@@ -1021,6 +1043,7 @@ where
 
         let length = largest_fitting_prefix(
             &chunks,
+            chunk_bytes,
             index,
             offset,
             &json,
@@ -1028,7 +1051,7 @@ where
             max_bytes,
             cancellation,
             deadline,
-            &mut build,
+            &mut header_bytes,
         )
         .await?;
         if length == 0 {
@@ -1046,7 +1069,9 @@ where
                 offset: offset.saturating_add(length),
             })
         };
-        chunks.push(make_chunk(index, offset, &json, length));
+        let chunk = make_chunk(index, offset, &json, length);
+        chunk_bytes += encoded_len(&chunk) + usize::from(!chunks.is_empty());
+        chunks.push(chunk);
         position = next_cursor.unwrap_or(ReadCursor {
             item: total,
             offset: 0,
@@ -1056,32 +1081,41 @@ where
 
     let next_cursor = (position.item < total).then_some(position);
     check_budget(cancellation, deadline)?;
-    let encoded_page = build(&chunks, next_cursor)?;
+    let page_bytes = chunk_bytes + header_bytes(&chunks, None, next_cursor)?;
     check_budget(cancellation, deadline)?;
-    if encoded_page.len() > max_bytes {
+    if page_bytes > max_bytes {
         return Err(AgentError::InvalidArguments);
     }
     Ok((chunks, next_cursor))
 }
 
-fn candidate_fits<F>(
+fn fitting_chunk_bytes<F>(
     existing: &[ReadItemChunk],
-    candidate: ReadItemChunk,
+    existing_bytes: usize,
+    candidate: &ReadItemChunk,
     next_cursor: Option<ReadCursor>,
     max_bytes: usize,
-    build: &mut F,
-) -> Result<bool, AgentError>
+    header_bytes: &mut F,
+) -> Result<Option<usize>, AgentError>
 where
-    F: FnMut(&[ReadItemChunk], Option<ReadCursor>) -> Result<Vec<u8>, AgentError>,
+    F: FnMut(
+        &[ReadItemChunk],
+        Option<&ReadItemChunk>,
+        Option<ReadCursor>,
+    ) -> Result<usize, AgentError>,
 {
-    let mut items = existing.to_vec();
-    items.push(candidate);
-    Ok(build(&items, next_cursor)?.len() <= max_bytes)
+    let bytes = encoded_len(candidate) + usize::from(!existing.is_empty());
+    Ok(
+        (existing_bytes + bytes + header_bytes(existing, Some(candidate), next_cursor)?
+            <= max_bytes)
+            .then_some(bytes),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn largest_fitting_prefix<F>(
     existing: &[ReadItemChunk],
+    existing_bytes: usize,
     index: usize,
     offset: usize,
     json: &str,
@@ -1089,10 +1123,14 @@ async fn largest_fitting_prefix<F>(
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
-    build: &mut F,
+    header_bytes: &mut F,
 ) -> Result<usize, AgentError>
 where
-    F: FnMut(&[ReadItemChunk], Option<ReadCursor>) -> Result<Vec<u8>, AgentError>,
+    F: FnMut(
+        &[ReadItemChunk],
+        Option<&ReadItemChunk>,
+        Option<ReadCursor>,
+    ) -> Result<usize, AgentError>,
 {
     let remaining = &json[offset..];
     let mut low = 0_usize;
@@ -1122,7 +1160,16 @@ where
             })
         };
         let candidate = make_chunk(index, offset, json, middle);
-        if candidate_fits(existing, candidate, next_cursor, max_bytes, build)? {
+        if fitting_chunk_bytes(
+            existing,
+            existing_bytes,
+            &candidate,
+            next_cursor,
+            max_bytes,
+            header_bytes,
+        )?
+        .is_some()
+        {
             low = middle;
         } else {
             high = middle.saturating_sub(1);
@@ -1305,15 +1352,6 @@ fn validate_cursor(cursor: ReadCursor, total: usize) -> Result<(), AgentError> {
 
 fn default_read_limit() -> usize {
     100
-}
-
-fn map_read_store_error(error: crate::error::StoreError) -> AgentError {
-    match error {
-        crate::error::StoreError::HistoryChanged => AgentError::InvalidState,
-        crate::error::StoreError::QueryLimit => AgentError::QueryLimit,
-        crate::error::StoreError::InvalidArguments => AgentError::InvalidArguments,
-        other => AgentError::from(other),
-    }
 }
 
 #[cfg(test)]

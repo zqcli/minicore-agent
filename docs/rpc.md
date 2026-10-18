@@ -325,7 +325,13 @@ Sessions, ping, cancellation, and shutdown remain responsive.
 - `session.close` cancels any active loop and manual/post-turn compaction, joins all
   Session-owned workers, and returns `{"ok":true}`. Active loops receive Runtime
   shutdown cancellation, preserving reason `shutdown` rather than `user`.
-- `session.delete` takes a closed Session ID and returns `{"ok":true}`.
+- `session.delete` takes a closed Session ID and returns `{"ok":true}`. The Store
+  atomically renames the directory to `.deleting-<session_id>` and syncs its parent
+  before reclaiming its files. After that rename it is no longer listable/openable;
+  failed cleanup is warned about and retried on Store startup, not exposed as a
+  partially deleted Session. Startup also removes recognized leftover metadata
+  temp files; new temp names contain a random component rather than a restartable
+  counter.
 - `session.state` takes a loaded Session ID and returns the current Session
   state projection. While manual or post-turn compaction is in progress, the optional
   `compaction` member reports only its safe operation ID, phase, and item counts;
@@ -866,8 +872,10 @@ Cancellation reasons are `user`, `owner_dropped`, `shutdown`, `deadline`, or
 `unknown` for a future Runtime reason. `persistence` is `persisted` or `failed`.
 `persistence: persisted` means the Agent's history append and `sync_data`
 completed. Metadata/summary replacements sync the parent directory after rename;
-creating a Session and repairing a partial history tail are also synced. These
-writes are not a transaction across all Session files. A failed JSONL append
+creating a Session and repairing a partial history tail are also synced. A valid
+final record lacking only its newline is retained with a restored newline; other
+incomplete tails are truncated. Read-only queries never perform these repairs.
+These writes are not a transaction across all Session files. A failed JSONL append
 returns the completed loop report with `persistence: failed` and leaves committed
 in-memory history unchanged. If the record was rejected before writing, or a
 failed write was rolled back to the previous length and synced, the Session
@@ -945,8 +953,12 @@ capacity; requests exceeding capacity are rejected with `-32019`
 (`resource_exhausted`, retryable). Loaded Sessions serve complete records
 directly from memory with zero disk IO. Unloaded Sessions or records whose stream
 bytes were evicted under memory budget fall back to durable auxiliary storage on
-disk (cold read). If auxiliary records are absent or unreadable, the query
-cleanly returns `-32021` (`tool_not_found`).
+disk (cold read). Absent auxiliary records return `-32021` (`tool_not_found`).
+Unreadable or corrupt metadata instead returns `-32011` (`store_error`), retryable
+for temporary I/O unavailability but not corruption. Valid metadata with missing
+or corrupt payload blobs still projects the affected streams as unavailable;
+warm records remain usable when an optional cold merge fails. Store I/O warnings
+retain `io::ErrorKind`, never filesystem paths or error contents.
 
 In the Rust library API, `Agent::tool_read` and `Agent::tool_output` are
 `async fn` methods returning futures that must be `.await`ed. While the JSON-RPC

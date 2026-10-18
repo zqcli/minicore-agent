@@ -1,5 +1,5 @@
 //! RFC3339 timestamp validation and formatting.
-use super::{StoreError, unavailable};
+use super::StoreError;
 
 const MAX_TIMESTAMP_BYTES: usize = 64;
 
@@ -107,7 +107,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 pub(crate) fn utc_timestamp() -> Result<String, StoreError> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(unavailable)?;
+        .map_err(|_| StoreError::Unavailable)?;
     Ok(format_rfc3339_millis(
         duration.as_secs(),
         duration.subsec_millis(),

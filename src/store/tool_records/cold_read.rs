@@ -537,7 +537,7 @@ pub(super) async fn load_tool_metadata(
     let file = match safe_open_read(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(StoreError::Unavailable),
+        Err(error) => return Err(map_io_store_error(error)),
     };
     let mut bytes = Vec::new();
     file.take((MAX_TOOL_METADATA_BYTES + 1) as u64)
