@@ -349,7 +349,9 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   rejected while it is owned by the Session, while metadata-only
   `session.rename` remains allowed.
 - `session.compact.cancel` takes the same full identity and returns
-  `{"cancelled":true}` only when that exact operation is still owned. A wrong
+  `{"cancelled":true}` only when that exact operation is still owned. The identity
+  and cancellation token are registered at admission, before deferred preparation;
+  cancelling at that point prevents the summary model call. A wrong
   or stale ID returns `{"cancelled":false}` and, during that loaded Session
   lifetime, cannot cancel a later operation. Cancellation is cooperative; a
   write already in its atomic commit phase is allowed to finish and an uncertain
@@ -1201,7 +1203,8 @@ Cancellation and deadlines wrap the actual IO: the session close token, RPC
 shutdown, and the shared 10 s query deadline each interrupt a pending open,
 read, or metadata call. Session closure returns non-retryable `-32002`
 (`session_not_loaded`); caller cancellation or a deadline returns retryable
-`-32020` (`query_limit`). Finishing
+`-32020` (`query_limit`). Caller/RPC cancellation takes precedence over Session
+closure when both tokens are cancelled, so shutdown reports `query_limit`. Finishing
 or cancelling a query releases its slot, and shutdown cancels and joins all
 owned queries before the shutdown response.
 
@@ -1310,8 +1313,9 @@ operations. When it expires the scan stops with `stopped_by: deadline`, keeps th
 entries already found, reports `truncated` with `scan_complete: false`, and
 returns no `next_cursor` on purpose: a timeout is answered with a narrower
 request or a later retry, never with a continuation. Session close, RPC shutdown,
-and caller cancellation are not stops: they fail the query with `-32020`, and the
-worker is joined before that error is returned. A single blocking read on a
+and caller cancellation are not stops: caller/RPC cancellation yields `-32020`
+(`query_limit`), taking precedence over Session closure (`-32002`,
+`session_not_loaded`). The worker is joined before that error is returned. A single blocking read on a
 stalled remote filesystem can outlast the deadline, so the timeout is enforced
 at operation granularity rather than as a hard preemption guarantee; results
 already produced still appear in the partial page. `truncated` is true whenever
@@ -1844,6 +1848,7 @@ not corrupt or invalid stored data. An `interaction.answer` after its turn ended
 returns `turn_not_found`, matching `turn.steer`. Duplicate compaction IDs and
 configuration errors are non-retryable. Query cancellation/deadlines return
 `query_limit`; closure of the owning Session returns `session_not_loaded`.
+Caller/RPC cancellation wins when both cancellation sources are signalled.
 
 ## Presentation Data And Local Permission
 

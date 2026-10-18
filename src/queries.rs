@@ -39,9 +39,17 @@ pub(crate) fn prepare_workspace_status(
     let workspace = session.workspace();
     // Registration happens here, synchronously, so a later close observes the
     // worker. The worker captures only the workspace, request, and tokens.
-    let query = session.spawn_status_query(workspace, request, cancellation.clone())?;
+    let query = query_result(
+        session.spawn_status_query(workspace, request, cancellation.clone()),
+        &cancellation,
+        &session.query_cancellation(),
+    )?;
     Ok(Box::pin(async move {
-        let result = closed_query_result(query.wait().await, &session.query_cancellation())?;
+        let result = query_result(
+            query.wait().await,
+            &cancellation,
+            &session.query_cancellation(),
+        )?;
         // Only the explicit status entry updates the branch cache; a pure
         // changes query must never refresh it implicitly.
         session.complete_status_query(&result, &cancellation);
@@ -76,63 +84,39 @@ pub(crate) fn prepare_changes_list(
             // Registration is synchronous; the Session owns the worker even if
             // this future is never polled. The future observes only the
             // cancellation token, so it does not retain the Session.
-            let query = session.spawn_status_query_with_deadline(
-                session.workspace(),
-                status_request,
-                cancellation.clone(),
-                deadline,
+            let query = query_result(
+                session.spawn_status_query_with_deadline(
+                    session.workspace(),
+                    status_request,
+                    cancellation.clone(),
+                    deadline,
+                ),
+                &cancellation,
+                &session_cancellation,
             )?;
             drop(session);
-            Ok(Box::pin(async move {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                    _ = session_cancellation.cancelled() => Err(AgentError::SessionNotLoaded),
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        Err(AgentError::QueryLimit)
-                    }
-                    result = query.wait() => {
-                        let status = result?;
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                            _ = session_cancellation.cancelled() => Err(AgentError::SessionNotLoaded),
-                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                                Err(AgentError::QueryLimit)
-                            }
-                            result = list_workspace_changes(
-                                request,
-                                status,
-                                cancellation.clone(),
-                                deadline,
-                            ) => result,
-                        }
-                    }
-                }
-            }))
+            let caller = cancellation.clone();
+            Ok(Box::pin(bounded_query(
+                async move {
+                    let status = query.wait().await?;
+                    list_workspace_changes(request, status, cancellation, deadline).await
+                },
+                caller,
+                session_cancellation,
+                deadline,
+            )))
         }
         ChangeScope::Session | ChangeScope::Turn { .. } => {
             let (tool_data, session_cancellation) = match &loaded {
                 Some(session) => (Some(session.tool_data()), session.query_cancellation()),
                 None => (None, CancellationToken::new()),
             };
-            Ok(Box::pin(async move {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                    _ = session_cancellation.cancelled() => Err(AgentError::SessionNotLoaded),
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        Err(AgentError::QueryLimit)
-                    }
-                    result = list_tool_changes(
-                        store,
-                        tool_data,
-                        request,
-                        cancellation.clone(),
-                        deadline,
-                    ) => result,
-                }
-            }))
+            Ok(Box::pin(bounded_query(
+                list_tool_changes(store, tool_data, request, cancellation.clone(), deadline),
+                cancellation,
+                session_cancellation,
+                deadline,
+            )))
         }
     }
 }
@@ -159,56 +143,54 @@ pub(crate) fn prepare_changes_diff(
         // Registration is synchronous; the Session owns the source worker even
         // if this future is never polled. The future observes only the
         // cancellation token, so it does not retain the Session.
-        let query =
-            session.spawn_workspace_diff(request.clone(), cancellation.clone(), deadline)?;
+        let query = query_result(
+            session.spawn_workspace_diff(request.clone(), cancellation.clone(), deadline),
+            &cancellation,
+            &session_cancel,
+        )?;
         drop(session);
-        Ok(Box::pin(async move {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                _ = session_cancel.cancelled() => Err(AgentError::SessionNotLoaded),
-                _ = tokio::time::sleep_until(deadline.into()) => Err(AgentError::QueryLimit),
-                result = async {
-                    let sources = query.wait().await?;
-                    crate::diff::workspace_diff(store, request, sources, session_cancel.clone(), deadline).await
-                } => result,
-            }
-        }))
+        let close = session_cancel.clone();
+        Ok(Box::pin(bounded_query(
+            async move {
+                let sources = query.wait().await?;
+                crate::diff::workspace_diff(store, request, sources, session_cancel, deadline).await
+            },
+            cancellation,
+            close,
+            deadline,
+        )))
     } else {
         let (tool_data, session_cancellation) = match &loaded {
             Some(session) => (Some(session.tool_data()), session.query_cancellation()),
             None => (None, CancellationToken::new()),
         };
-        Ok(Box::pin(async move {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
-                _ = session_cancellation.cancelled() => Err(AgentError::SessionNotLoaded),
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                    Err(AgentError::QueryLimit)
-                }
-                result = changes_diff(
-                    store,
-                    tool_data,
-                    request,
-                    session_cancellation.clone(),
-                    deadline,
-                ) => result,
-            }
-        }))
+        Ok(Box::pin(bounded_query(
+            changes_diff(
+                store,
+                tool_data,
+                request,
+                session_cancellation.clone(),
+                deadline,
+            ),
+            cancellation,
+            session_cancellation,
+            deadline,
+        )))
     }
 }
 
-async fn bounded_read<T>(
+async fn bounded_query<T>(
     future: impl std::future::Future<Output = Result<T, AgentError>>,
+    cancellation: CancellationToken,
     close: CancellationToken,
-    deadline: std::time::Duration,
+    deadline: Instant,
 ) -> Result<T, AgentError> {
-    tokio::select! {
-        biased;
-        _ = close.cancelled() => Err(AgentError::SessionNotLoaded),
-        result = tokio::time::timeout(deadline, future) => result.unwrap_or(Err(AgentError::QueryLimit)),
-    }
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => Err(AgentError::QueryLimit),
+        _ = close.cancelled() => Err(AgentError::QueryLimit),
+        result = tokio::time::timeout_at(deadline.into(), future) => result.unwrap_or(Err(AgentError::QueryLimit)),
+    };
+    query_result(result, &cancellation, &close)
 }
 
 pub(crate) fn prepare_session_read(
@@ -220,10 +202,11 @@ pub(crate) fn prepare_session_read(
     let close = loaded
         .as_ref()
         .map_or_else(CancellationToken::new, Session::query_cancellation);
-    Box::pin(bounded_read(
-        crate::read::read_session(store, loaded, request, cancellation),
+    Box::pin(bounded_query(
+        crate::read::read_session(store, loaded, request, cancellation.clone()),
+        cancellation,
         close,
-        crate::read::READ_DEADLINE,
+        Instant::now() + crate::read::READ_DEADLINE,
     ))
 }
 
@@ -236,10 +219,11 @@ pub(crate) fn prepare_turn_result(
     let close = loaded
         .as_ref()
         .map_or_else(CancellationToken::new, Session::query_cancellation);
-    Box::pin(bounded_read(
-        crate::read::turn_result(store, loaded, request, cancellation),
+    Box::pin(bounded_query(
+        crate::read::turn_result(store, loaded, request, cancellation.clone()),
+        cancellation,
         close,
-        crate::read::READ_DEADLINE,
+        Instant::now() + crate::read::READ_DEADLINE,
     ))
 }
 
@@ -249,10 +233,16 @@ pub(crate) fn prepare_workspace_read(
     cancellation: CancellationToken,
 ) -> QueryFuture<crate::WorkspaceReadResult> {
     let close = session.query_cancellation();
-    Box::pin(bounded_read(
-        crate::workspace::query::read(session.workspace(), request, close.clone(), cancellation),
+    Box::pin(bounded_query(
+        crate::workspace::query::read(
+            session.workspace(),
+            request,
+            close.clone(),
+            cancellation.clone(),
+        ),
+        cancellation,
         close,
-        crate::workspace::query::WORKSPACE_READ_DEADLINE,
+        Instant::now() + crate::workspace::query::WORKSPACE_READ_DEADLINE,
     ))
 }
 
@@ -266,9 +256,14 @@ pub(crate) fn prepare_workspace_files(
     let close = session.query_cancellation();
     let workspace = session.workspace();
     Box::pin(async move {
-        let result =
-            crate::workspace::listing::files(workspace, request, close.clone(), cancellation).await;
-        closed_query_result(result, &close)
+        let result = crate::workspace::listing::files(
+            workspace,
+            request,
+            close.clone(),
+            cancellation.clone(),
+        )
+        .await;
+        query_result(result, &cancellation, &close)
     })
 }
 
@@ -280,17 +275,28 @@ pub(crate) fn prepare_workspace_search(
     let close = session.query_cancellation();
     let workspace = session.workspace();
     Box::pin(async move {
-        let result =
-            crate::workspace::search::search(workspace, request, close.clone(), cancellation).await;
-        closed_query_result(result, &close)
+        let result = crate::workspace::search::search(
+            workspace,
+            request,
+            close.clone(),
+            cancellation.clone(),
+        )
+        .await;
+        query_result(result, &cancellation, &close)
     })
 }
 
-fn closed_query_result<T>(
+fn query_result<T>(
     result: Result<T, AgentError>,
+    cancellation: &CancellationToken,
     close: &CancellationToken,
 ) -> Result<T, AgentError> {
-    if close.is_cancelled() {
+    // Shutdown signals the caller before closing Sessions; observe closure first
+    // so that broadcast cannot race a prior read of the caller token.
+    let session_closed = close.is_cancelled();
+    if cancellation.is_cancelled() {
+        Err(AgentError::QueryLimit)
+    } else if session_closed {
         Err(AgentError::SessionNotLoaded)
     } else {
         result

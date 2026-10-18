@@ -1053,10 +1053,9 @@ impl Agent {
             .get_utility(&record.model)
             .map_err(map_model_config_error)?;
         let descriptor = model.descriptor().clone();
+        let admission = session.admit_compaction(request.operation_id)?;
         Ok(Box::pin(async move {
-            session
-                .start_compaction(request.operation_id, model, descriptor)
-                .await
+            session.start_compaction(admission, model, descriptor).await
         }))
     }
 

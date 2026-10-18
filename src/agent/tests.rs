@@ -13420,6 +13420,14 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
 mod recent_tail;
 
 impl Agent {
+    pub(crate) async fn open_file_with_models(
+        path: PathBuf,
+        models: Models,
+    ) -> Result<Self, AgentError> {
+        let config = AgentConfig::load(&path).map_err(AgentError::Config)?;
+        Self::open_parts(config, models, Some(path)).await
+    }
+
     pub(crate) async fn open_with_models(
         config: AgentConfig,
         models: Models,

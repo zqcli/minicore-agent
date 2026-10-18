@@ -369,6 +369,8 @@ struct SessionInner {
     blocked: Option<SessionBlockReason>,
     closing: bool,
     compaction: Option<Arc<CompactionOperation>>,
+    // Cancellable admission while completed workers are still being reaped.
+    pending_compaction: Option<Arc<CompactionOperation>>,
     compaction_progress: Option<CompactionProgress>,
     last_compaction_result: Option<CompactionResult>,
     policy: CompactionPolicy,
@@ -438,6 +440,17 @@ async fn join_task(join: &tokio::sync::Mutex<Option<JoinHandle<()>>>) -> Result<
     let result = std::pin::Pin::new(handle).await;
     slot.take();
     result.map_err(|_| AgentError::Internal)
+}
+
+pub(crate) struct CompactionAdmission {
+    session: Session,
+    operation: Arc<CompactionOperation>,
+}
+
+impl Drop for CompactionAdmission {
+    fn drop(&mut self) {
+        self.session.lock_inner().pending_compaction = None;
+    }
 }
 
 struct CompactionOperation {
@@ -580,6 +593,7 @@ impl Session {
             blocked: None,
             closing: false,
             compaction: None,
+            pending_compaction: None,
             compaction_progress: None,
             last_compaction_result: None,
             policy,
@@ -1002,7 +1016,11 @@ impl Session {
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
-        if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
+        if inner.closing
+            || inner.active.is_some()
+            || inner.compaction.is_some()
+            || inner.pending_compaction.is_some()
+        {
             return Err(AgentError::SessionBusy);
         }
         Ok(())
@@ -1228,7 +1246,10 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.closing || (inner.active.is_none() && inner.compaction.is_some()) {
+            if inner.closing
+                || inner.pending_compaction.is_some()
+                || (inner.active.is_none() && inner.compaction.is_some())
+            {
                 return Err(AgentError::SessionBusy);
             }
             inner
@@ -1295,7 +1316,7 @@ impl Session {
         if let Some(active) = &inner.active {
             active.handle.cancel();
         }
-        if let Some(operation) = &inner.compaction {
+        for operation in inner.compaction.iter().chain(&inner.pending_compaction) {
             operation.cancel();
         }
     }

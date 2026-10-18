@@ -1,7 +1,8 @@
 mod core;
+mod review;
 
-pub(super) async fn pause_operation(reservation: Option<super::Reservation>) {
-    if let Some(gate) = reservation.and_then(|key| super::OPERATION_GATES.take(&key)) {
+pub(super) async fn pause_operation(key: PathBuf) {
+    if let Some(gate) = super::OPERATION_GATES.take(&key) {
         gate.pass().await;
     }
 }
@@ -5464,8 +5465,21 @@ async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
         .await;
     let _ = harness.response(json!("wait")).await;
 
-    // Shutdown cancels the pending read and still completes.
-    harness.shutdown().await;
+    // Both the RPC and Session tokens are cancelled; caller cancellation wins.
+    harness
+        .send(json!("shutdown"), "agent.shutdown", None)
+        .await;
+    let response = harness.response(json!("ws-pending")).await;
+    assert_eq!(
+        response["error"]["data"],
+        json!({"kind":"query_limit","retryable":true})
+    );
+    assert_eq!(
+        harness.response(json!("shutdown")).await["result"],
+        json!({"ok":true})
+    );
+    assert!(harness.next_frame().await.is_none());
+    harness.join().await.unwrap();
     remove_base(&base).await;
 }
 

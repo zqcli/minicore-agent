@@ -322,23 +322,57 @@ impl Session {
         Some(reservation)
     }
 
-    pub(crate) async fn start_compaction(
+    pub(crate) fn admit_compaction(
         &self,
         operation_id: String,
+    ) -> Result<CompactionAdmission, AgentError> {
+        let mut inner = self.lock_inner();
+        if inner.used_compaction_ids.contains(&operation_id) {
+            return Err(AgentError::InvalidState);
+        }
+        if inner.blocked.is_some() {
+            return Err(AgentError::SessionBlocked);
+        }
+        if inner.closing
+            || inner.pending_compaction.is_some()
+            || inner
+                .active
+                .as_ref()
+                .is_some_and(|active| active.completion.borrow().is_none())
+            || inner
+                .compaction
+                .as_ref()
+                .is_some_and(|operation| operation.result.borrow().is_none())
+        {
+            return Err(AgentError::SessionBusy);
+        }
+        if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
+            return Err(AgentError::InvalidInput);
+        }
+        let (operation, _) =
+            CompactionOperation::new(operation_id.clone(), CompactionOrigin::Manual);
+        inner.used_compaction_ids.insert(operation_id);
+        inner.pending_compaction = Some(Arc::clone(&operation));
+        Ok(CompactionAdmission {
+            session: self.clone(),
+            operation,
+        })
+    }
+
+    pub(crate) async fn start_compaction(
+        &self,
+        admission: CompactionAdmission,
         model: Arc<dyn Model>,
         descriptor: ModelDescriptor,
     ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
-        if self
-            .lock_inner()
-            .used_compaction_ids
-            .contains(&operation_id)
-        {
-            return Err(AgentError::InvalidState);
+        let operation = &admission.operation;
+        let receiver = operation.result.subscribe();
+        if operation.cancellation_requested() {
+            self.publish_compaction_result(operation, operation.failed_result("cancelled", None));
+            return Ok(receiver);
         }
         self.cleanup_finished().await?;
         let _io = self.shared.io.lock().await;
-        let (operation, receiver) =
-            CompactionOperation::new(operation_id.clone(), CompactionOrigin::Manual);
 
         // Acquire the operation's join slot before publishing the reservation.
         // From the point where the Session becomes busy to the point where the
@@ -350,14 +384,8 @@ impl Session {
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
             }
-            if inner.used_compaction_ids.contains(&operation_id) {
-                return Err(AgentError::InvalidState);
-            }
             if inner.closing || inner.active.is_some() || inner.compaction.is_some() {
                 return Err(AgentError::SessionBusy);
-            }
-            if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
-                return Err(AgentError::InvalidInput);
             }
             let previous = self.shared.compaction.project(&inner.history);
             let (previous_summary, previous_covered_item_count) = previous
@@ -372,16 +400,15 @@ impl Session {
                 .history
                 .len()
                 .saturating_sub(previous_covered_item_count);
-            inner.compaction = Some(Arc::clone(&operation));
-            inner.used_compaction_ids.insert(operation_id.clone());
+            inner.compaction = Some(Arc::clone(operation));
             inner.compaction_progress = Some(CompactionProgress {
-                operation_id: operation_id.clone(),
+                operation_id: operation.operation_id.clone(),
                 phase: CompactionPhase::Preparing,
                 covered_item_count: previous_covered_item_count,
                 retained_item_count,
             });
             CompactionReservation {
-                operation: Arc::clone(&operation),
+                operation: Arc::clone(operation),
                 model,
                 record: inner.record.clone(),
                 history: Arc::clone(&inner.history),
@@ -413,9 +440,10 @@ impl Session {
         let operation = {
             let inner = self.shared.inner.lock().unwrap();
             inner
-                .compaction
-                .as_ref()
-                .filter(|operation| operation.operation_id == operation_id)
+                .pending_compaction
+                .iter()
+                .chain(&inner.compaction)
+                .find(|operation| operation.operation_id == operation_id)
                 .cloned()
         };
         let Some(operation) = operation else {
@@ -427,12 +455,9 @@ impl Session {
 
 impl Session {
     pub(super) fn cancel_compaction_on_drop(&self) {
-        let operation = {
-            let inner = self.shared.inner.lock().unwrap();
-            inner.compaction.clone()
-        };
-        if let Some(operation) = operation {
-            let _ = operation.cancel();
+        let inner = self.lock_inner();
+        for operation in inner.pending_compaction.iter().chain(&inner.compaction) {
+            operation.cancel();
         }
     }
 }

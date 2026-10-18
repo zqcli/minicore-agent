@@ -27,10 +27,7 @@ async fn lifecycle_disk_work_is_deferred_and_reserves_the_session() {
             );
         }
         let gate = Arc::new(Gate::new());
-        OPERATION_GATES.arm(
-            Reservation::Session(session.as_str().unwrap().parse().unwrap()),
-            gate.clone(),
-        );
+        OPERATION_GATES.arm(base.join("data"), gate.clone());
         let mut params = json!({"session_id": session});
         if method == "session.compact" {
             params["operation_id"] = json!("held-start");
@@ -95,7 +92,7 @@ async fn create_reserves_its_id_before_the_record_can_be_discovered() {
         panic!("creation must reserve the new session ID");
     };
     let gate = Arc::new(Gate::new());
-    OPERATION_GATES.arm(Reservation::Session(session_id), gate.clone());
+    OPERATION_GATES.arm(base.join("data"), gate.clone());
     tokio::time::timeout(TIMEOUT, gate.wait_started())
         .await
         .unwrap();
@@ -290,7 +287,7 @@ async fn shutdown_signal_is_observed_while_a_close_is_pending() {
         .unwrap()
         .query_cancellation();
     let gate = Arc::new(Gate::new());
-    OPERATION_GATES.arm(Reservation::Session(info.session_id), gate.clone());
+    OPERATION_GATES.arm(base.join("data"), gate.clone());
     let (mut input, reader) = tokio::io::duplex(8192);
     let (writer, output) = tokio::io::duplex(8192);
     let (signal, received) = tokio::sync::oneshot::channel();

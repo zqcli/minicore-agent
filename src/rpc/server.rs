@@ -126,7 +126,7 @@ enum Reservation {
 
 #[cfg(test)]
 static OPERATION_GATES: crate::test_support::Registry<
-    Reservation,
+    std::path::PathBuf,
     std::sync::Arc<crate::test_support::Gate>,
 > = crate::test_support::Registry::new();
 
@@ -838,9 +838,11 @@ impl RpcServer {
         if let Some(id) = reservation {
             self.reservations.insert(id);
         }
+        #[cfg(test)]
+        let gate_key = self.agent().config().data_dir.clone();
         self.operations.spawn(async move {
             #[cfg(test)]
-            tests::pause_operation(reservation).await;
+            tests::pause_operation(gate_key).await;
             DeferredResult {
                 reservation,
                 apply: future.await,
