@@ -10,6 +10,10 @@
 //! before it so the next page re-finds it. Nothing here writes history, starts a
 //! model call, or mutates the file.
 
+use crate::workspace::page::{
+    DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, MAX_SEARCH_PATHS, SCOPE_HEX_LEN, normalized_roots,
+    now_unix_ms, scope_digest, valid_query_text, valid_scope, validate_result_bytes,
+};
 use std::fmt;
 use std::io::Read;
 use std::sync::Arc;
@@ -24,12 +28,10 @@ use crate::ids::SessionId;
 use crate::text::floor_char_boundary;
 use crate::tools::MAX_READ_BYTES;
 use crate::workspace::Workspace;
-use crate::workspace::query::MAX_PATH_BYTES;
-use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
+
 use crate::workspace::scan::{
-    MAX_SEARCH_PATHS, READ_CHUNK_BYTES, SCOPE_HEX_LEN, ScanBudget, Visit, WalkOptions,
-    WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop, normalized_roots, now_unix_ms,
-    run_scan, scope_digest, valid_query_text, valid_scope, walk_scope,
+    READ_CHUNK_BYTES, ScanBudget, Visit, WalkEntry, WalkOptions, WorkspaceFileKind,
+    WorkspaceScanConsistency, WorkspaceScanStop, run_scan, walk_scope,
 };
 
 const DEFAULT_MAX_MATCHES: u32 = 100;
@@ -466,7 +468,7 @@ fn scan_search(
                     return Ok(Visit::StopBefore(WorkspaceScanStop::Page));
                 }
                 let file_resume = resume.filter(|_| entry_start == Some(entry.relative.as_str()));
-                match scan_file(workspace, &entry.relative, file_resume, &mut page, budget)? {
+                match scan_file(workspace, entry, file_resume, &mut page, budget)? {
                     FileScan::Done => Ok(Visit::Next),
                     FileScan::StopInside { line, offset } => Ok(Visit::StopInside {
                         reason: WorkspaceScanStop::Page,
@@ -532,12 +534,13 @@ fn scan_search(
 
 fn scan_file(
     workspace: &Workspace,
-    relative: &str,
+    entry: &WalkEntry,
     resume: Option<(u32, u32)>,
     page: &mut SearchPage<'_>,
     budget: &mut ScanBudget,
 ) -> Result<FileScan, AgentError> {
-    let text = match read_searchable_file(workspace, relative, budget)? {
+    let relative = &entry.relative;
+    let text = match read_searchable_file(workspace, entry, budget)? {
         ReadFile::Text(text) => text,
         ReadFile::Unsupported => {
             page.skipped_files += 1;
@@ -742,18 +745,20 @@ fn commit(page: &mut SearchPage<'_>, pending: PendingLine) {
 /// bytes that were read are counted even when the file is then skipped.
 fn read_searchable_file(
     workspace: &Workspace,
-    relative: &str,
+    entry: &WalkEntry,
     budget: &mut ScanBudget,
 ) -> Result<ReadFile, AgentError> {
-    let mut file = match workspace.open_regular_file_sync(relative) {
+    if entry.kind == WorkspaceFileKind::Other {
+        return Ok(ReadFile::Unsupported);
+    }
+    let (mut file, metadata) = match workspace.open_regular_file_sync(&entry.relative) {
         Ok(file) => file,
         Err(error) => {
             return Ok(match error {
                 // A special file or a path outside the boundary is a known
                 // unsupported object, not a failed read.
                 crate::workspace::WorkspaceError::NotFound
-                    if std::fs::symlink_metadata(workspace.root().join(relative))
-                        .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+                    if entry.kind == WorkspaceFileKind::Symlink =>
                 {
                     ReadFile::Unsupported
                 }
@@ -765,13 +770,6 @@ fn read_searchable_file(
             });
         }
     };
-    let metadata = match file.metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(ReadFile::Failed),
-    };
-    if !metadata.is_file() {
-        return Ok(ReadFile::Unsupported);
-    }
     if metadata.len() > MAX_READ_BYTES as u64 {
         return Ok(ReadFile::Unsupported);
     }
@@ -836,7 +834,7 @@ fn envelope_bytes(max_bytes: usize) -> Result<usize, AgentError> {
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    crate::workspace::scan::envelope_size(&probe, max_bytes)
+    crate::workspace::page::envelope_size(&probe, max_bytes)
 }
 
 #[cfg(test)]

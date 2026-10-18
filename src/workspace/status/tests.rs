@@ -1,7 +1,9 @@
 use super::*;
-use crate::workspace::scan::MIN_RESULT_BYTES;
+use crate::workspace::page::MIN_RESULT_BYTES;
+use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
 use std::sync::Arc;
+use std::time::Duration;
 
 struct Fixture {
     _dir: crate::test_support::TempDir,

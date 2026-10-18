@@ -752,6 +752,13 @@ an old Profile, `session.json`, or `history.jsonl` on its own. The current Agent
 has no executable delegated child-session Tool; `subagent` remains unsupported
 in current Profiles.
 
+`apply_patch` changes one existing workspace file using unified diff or a Codex
+`*** Update File` envelope. Unified diffs may have `diff --git` and `index` lines
+before their `---`/`+++` headers. Trailing empty lines are accepted after the patch;
+an empty line inside a hunk is empty context, as if its leading space were present.
+Paths, hunk ranges, source text, and newline markers must still match exactly:
+there is no fuzzy matching, multi-file patching, rename, or binary patch support.
+
 ## History
 
 ### `session.history`
@@ -1203,7 +1210,10 @@ after. Unlike this RPC, the numbered `read` Tool streams past the requested line
 offset and returns a bounded window, so it can read later portions of large files.
 The Tool normalizes CRLF to LF and escapes control characters (except tabs);
 `edit` translates LF multiline inputs back to CRLF when editing a CRLF file.
-Binary/non-UTF-8 Tool reads and non-unique edits return explanatory text. The UTF-8/NUL check, `revision`, and the returned page all describe those
+Binary/non-UTF-8 Tool reads and non-unique edits return explanatory text. Directory
+listings from the `read` Tool escape non-UTF-8 name bytes and append
+`[non-UTF-8 name]`; entries that vanish before their metadata is read are skipped.
+Workspace RPC paths remain UTF-8. The UTF-8/NUL check, `revision`, and the returned page all describe those
 same bytes, so a response can never combine an older hash with newer content. A
 file larger than the bound returns `status: too_large` with empty `content` and
 `revision: null`; there is no partial preview and no partial revision.
@@ -1305,7 +1315,10 @@ page including metadata and JSON escaping.
 ```
 
 The traversal is depth-first pre-order, sorting names within each directory
-(case-sensitive native name order, not locale collation). `.git` metadata is never returned or expanded. `.ignore`,
+(case-sensitive native name order, not locale collation). `.git` metadata and
+reserved atomic-write names matching `.minicore-write-*.tmp` are never returned
+or expanded by files/search, regardless of ignore rules. These scans do not delete
+any files, including leftover temporary files. `.ignore`,
 `.gitignore`, and `.git/info/exclude` files inside the Workspace are applied
 whether or not the Workspace is a git repository, with `.ignore` outranking
 `.gitignore` outranking `.git/info/exclude`, and the closest directory winning

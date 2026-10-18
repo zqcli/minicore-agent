@@ -1,5 +1,5 @@
 use super::*;
-use crate::workspace::scan::MIN_RESULT_BYTES;
+use crate::workspace::page::MIN_RESULT_BYTES;
 use crate::workspace::scan::{SCAN_RESULT_EXPIRIES, ScanLimits};
 
 /// One collected match: path, line number, and absolute line byte ranges.
@@ -820,6 +820,18 @@ async fn a_cancelled_session_stops_the_scan() {
     .await
     .unwrap_err();
     assert!(matches!(error, AgentError::QueryLimit));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_regular_entry_swapped_to_a_fifo_before_open_is_rejected_without_blocking() {
+    let fixture = fixture("scan-fifo-swap").await;
+    write(&fixture, "file", b"needle\n");
+    crate::workspace::SWAP_OPEN_TO_FIFO.arm(fixture.workspace.root().join("file"), ());
+    let result = run(&fixture, request(&fixture, "needle")).await;
+    assert!(result.matches.is_empty());
+    assert_eq!(result.skipped_files, 1);
+    assert!(result.scan_complete);
 }
 
 #[cfg(unix)]

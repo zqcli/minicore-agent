@@ -377,7 +377,7 @@ async fn path_escape_is_invalid_and_directory_children_are_not_followed() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn directory_listing_rejects_non_utf8_names_without_lossy_merging() {
+async fn directory_listing_escapes_and_marks_non_utf8_names_without_merging() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -392,16 +392,27 @@ async fn directory_listing_rejects_non_utf8_names_without_lossy_merging() {
         tokio::fs::write(root.join(name), b"").await.unwrap();
     }
     assert_eq!(
-        tool.execute(
-            invocation(json!({"path": "non-utf8"})),
-            context(
-                CancellationToken::new(),
-                Instant::now() + Duration::from_secs(5)
-            )
-        )
-        .await,
-        Err(ToolError::Failed)
+        execute(&tool, json!({"path": "non-utf8"})).await.unwrap(),
+        "n\\xfe [non-UTF-8 name]\nn\\xff [non-UTF-8 name]\nn�"
     );
+    cleanup(&base).await;
+}
+
+#[tokio::test]
+async fn directory_listing_skips_an_entry_removed_before_its_metadata_read() {
+    let (base, workspace, tool) = fixture("vanished-entry").await;
+    let gone = workspace.root().join("gone");
+    tokio::fs::write(&gone, b"").await.unwrap();
+    tokio::fs::write(workspace.root().join("kept"), b"")
+        .await
+        .unwrap();
+    let gate = Arc::new(crate::test_support::Gate::new());
+    ENTRY_GATES.arm(gone.clone(), Arc::clone(&gate));
+    let task = tokio::spawn(async move { execute(&tool, json!({"path": "."})).await });
+    gate.wait_started().await;
+    tokio::fs::remove_file(gone).await.unwrap();
+    gate.release();
+    assert_eq!(task.await.unwrap().unwrap(), "kept");
     cleanup(&base).await;
 }
 

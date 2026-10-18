@@ -1,8 +1,17 @@
 //! Raw Git objects and bounded worktree reads; no diff driver or clean filter.
-use super::*;
+use super::WorkspaceStatusEntryKind;
+use super::git::{
+    GitOutput, GitRun, os_args, repository_root, run_git, status_caps, status_env, status_program,
+};
 use crate::changes::{ChangeCoverage, ChangeKind, ChangeRevision, content_revision};
 use crate::diff::{ChangesDiffRequest, DiffComparison, DiffSources, workspace_unavailable};
 use crate::workspace::FileCapture;
+use crate::{Workspace, error::AgentError};
+use std::ffi::OsString;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn diff_sources(
     workspace: &Workspace,

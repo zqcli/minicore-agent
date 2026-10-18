@@ -1,3 +1,4 @@
+use super::apply::{ApplyStats, apply_single_file_patch_with_stats};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -764,6 +765,53 @@ fn thousands_of_hunks_use_single_forward_source_and_patch_steps() {
         apply_single_file_patch("value.txt", &source, &over_limit_patch),
         Err(ToolError::InvalidInvocation)
     );
+}
+
+#[test]
+fn git_headers_and_stripped_blank_context_keep_matching_exact() {
+    let hunk = "@@ -1,3 +1,3 @@\n keep\n\n-old\n+new\n\n";
+    let headers = "--- a/value.txt\n+++ b/value.txt\n";
+    let git = "diff --git a/value.txt b/value.txt\n";
+    let index = "index 1111111..2222222 100644\n";
+    for patch in [
+        hunk.to_owned(),
+        format!("{headers}{hunk}"),
+        format!("{git}{headers}{hunk}"),
+        format!("{index}{headers}{hunk}"),
+        format!("{git}{index}{headers}{hunk}"),
+        "*** Begin Patch\n*** Update File: value.txt\n@@\n keep\n\n-old\n+new\n*** End Patch\n\n"
+            .into(),
+    ] {
+        assert_eq!(
+            apply_single_file_patch("value.txt", "keep\n\nold\n", &patch).unwrap(),
+            "keep\n\nnew\n"
+        );
+        assert_eq!(
+            apply_single_file_patch(
+                "value.txt",
+                "keep\r\n\r\nold\r\n",
+                &patch.replace('\n', "\r\n")
+            )
+            .unwrap(),
+            "keep\r\n\r\nnew\r\n"
+        );
+        assert_eq!(
+            apply_single_file_patch("value.txt", "keep\nnot blank\nold\n", &patch),
+            Err(ToolError::Failed)
+        );
+    }
+    for patch in [
+        format!("{git}{hunk}"),
+        format!("{index}{hunk}"),
+        format!("{git}{git}{headers}{hunk}"),
+        format!("{headers}{hunk}{git}{headers}{hunk}"),
+        format!("{headers}{hunk}trailing junk\n"),
+    ] {
+        assert_eq!(
+            apply_single_file_patch("value.txt", "keep\n\nold\n", &patch),
+            Err(ToolError::InvalidInvocation)
+        );
+    }
 }
 
 #[tokio::test]

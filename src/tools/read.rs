@@ -115,13 +115,32 @@ async fn list_directory(directory: PathBuf) -> Result<String, ToolError> {
     let mut entries = BinaryHeap::new();
     let mut count = 0usize;
     while let Some(entry) = reader.next_entry().await.map_err(|_| ToolError::Failed)? {
-        count = count.saturating_add(1);
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| ToolError::Failed)?;
-        let mut name = super::escape_control_characters(&name);
-        let file_type = entry.file_type().await.map_err(|_| ToolError::Failed)?;
+        #[cfg(test)]
+        if let Some(gate) = ENTRY_GATES.take(&entry.path()) {
+            gate.pass().await;
+        }
+        let metadata = match tokio::fs::symlink_metadata(entry.path()).await {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return Err(ToolError::Failed),
+        };
+        count += 1;
+        let name = entry.file_name();
+        let mut name = match name.to_str() {
+            Some(name) => super::escape_control_characters(name),
+            None => format!(
+                "{} [non-UTF-8 name]",
+                name.as_encoded_bytes().escape_ascii()
+            ),
+        };
+        let file_type = metadata.file_type();
         if file_type.is_dir() {
             name.push('/');
         }
@@ -302,6 +321,10 @@ const fn default_offset() -> usize {
 const fn default_limit() -> usize {
     DEFAULT_READ_LIMIT
 }
+
+#[cfg(test)]
+static ENTRY_GATES: crate::test_support::Registry<PathBuf, Arc<crate::test_support::Gate>> =
+    crate::test_support::Registry::new();
 
 #[cfg(test)]
 mod tests;
