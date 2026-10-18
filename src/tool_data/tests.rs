@@ -247,10 +247,21 @@ async fn persistence_hashing_releases_the_lock_and_uses_an_isolated_snapshot() {
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
         .await
         .unwrap();
-    let unlocked = data.inner.try_lock().is_ok();
-    gate.release();
-    assert!(unlocked, "hashing must not hold the ToolData lock");
+    // Mutate the live record between capture and hashing; the release guard
+    // keeps a failed assertion from stranding the blocking worker.
+    struct Release(Arc<crate::test_support::Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let release = Release(Arc::clone(&gate));
+    assert!(
+        data.inner.try_lock().is_ok(),
+        "hashing must not hold the ToolData lock"
+    );
     data.note_result(&tool_ref, "later result");
+    drop(release);
     let snapshot = snapshot.await.unwrap();
     assert_eq!(
         snapshot.result_bytes.as_deref(),
@@ -260,6 +271,7 @@ async fn persistence_hashing_releases_the_lock_and_uses_an_isolated_snapshot() {
         snapshot.record.result.file_sha256,
         Some(crate::store::hash_bytes(b"captured result"))
     );
+    assert_eq!(snapshot.record.result.total_bytes, b"captured result".len());
 }
 
 #[test]
