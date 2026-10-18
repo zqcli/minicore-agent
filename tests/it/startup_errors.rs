@@ -1,21 +1,14 @@
+use crate::support::fixture::Fixture;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use minicore_agent::{AgentError, ConfigError, SessionId};
+use minicore_agent::{AgentError, ConfigError};
 use serde_json::Value;
 
 const TEST_CREDENTIAL_ENV: &str = "MINICORE_STARTUP_TEST_KEY";
 const SECRET_MARKER: &str = "STARTUP-PARSE-SECRET-MARKER-9F2A";
-
-fn fresh_temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "minicore-agent-startup-{label}-{}",
-        SessionId::new().unwrap()
-    ));
-    std::fs::create_dir_all(dir.join("data")).unwrap();
-    dir
-}
 
 fn write_config(temp_dir: &Path, body: &str) -> PathBuf {
     let config_path = temp_dir.join("agent.toml");
@@ -114,7 +107,9 @@ fn config_error_display_carries_predefined_static_cause() {
 /// any config value.
 #[test]
 fn unsupported_compaction_field_rejected_without_leaking_config_text() {
-    let temp_dir = fresh_temp_dir("compaction-reject");
+    let fixture = Fixture::new("compaction-reject");
+    let temp_dir = fixture.path().to_owned();
+    std::fs::create_dir_all(temp_dir.join("data")).unwrap();
     let config_path = write_config(
         &temp_dir,
         &format!(
@@ -143,7 +138,6 @@ fn unsupported_compaction_field_rejected_without_leaking_config_text() {
             && !stderr.contains("mode ="),
         "stderr must not leak config text or the secret marker, got: {stderr}"
     );
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 /// A missing, empty or whitespace-only credential env must map to the distinct
@@ -156,7 +150,9 @@ fn missing_or_empty_api_key_reports_distinct_safe_message() {
         ("empty", Some("")),
         ("whitespace", Some("   ")),
     ] {
-        let temp_dir = fresh_temp_dir(&format!("missing-key-{label}"));
+        let fixture = Fixture::new(&format!("missing-key-{label}"));
+        let temp_dir = fixture.path().to_owned();
+        std::fs::create_dir_all(temp_dir.join("data")).unwrap();
         let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
         let mut command = command_with_config(&config_path, &temp_dir);
         match env_kind {
@@ -181,7 +177,6 @@ fn missing_or_empty_api_key_reports_distinct_safe_message() {
             !stderr.contains("model is invalid"),
             "{label}: the generic model diagnostic must no longer be used, got: {stderr}"
         );
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
@@ -201,7 +196,9 @@ fn custom_tls_bundle_boots_ping_and_shutdown() {
 
 #[test]
 fn custom_tls_bundle_with_chinese_path_boots_ping_and_shutdown() {
-    let temp_dir = fresh_temp_dir("tls-chinese-path");
+    let fixture = Fixture::new("tls-chinese-path");
+    let temp_dir = fixture.path().to_owned();
+    std::fs::create_dir_all(temp_dir.join("data")).unwrap();
     let cert_dir = temp_dir.join("证书");
     std::fs::create_dir(&cert_dir).unwrap();
     let bundle_path = cert_dir.join("公司根证书.pem");
@@ -211,11 +208,12 @@ fn custom_tls_bundle_with_chinese_path_boots_ping_and_shutdown() {
     )
     .unwrap();
     assert_fixed_config_boots(Some(&bundle_path));
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 fn assert_fixed_config_boots(ssl_cert_file: Option<&Path>) {
-    let temp_dir = fresh_temp_dir("boot-health");
+    let fixture = Fixture::new("boot-health");
+    let temp_dir = fixture.path().to_owned();
+    std::fs::create_dir_all(temp_dir.join("data")).unwrap();
     let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
     let mut command = command_with_config(&config_path, &temp_dir);
     command.env(TEST_CREDENTIAL_ENV, "startup-health-placeholder-key");
@@ -256,12 +254,13 @@ fn assert_fixed_config_boots(ssl_cert_file: Option<&Path>) {
         response_with_id(&responses, "shutdown")["result"]["ok"],
         serde_json::json!(true)
     );
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
 fn invalid_tls_bundle_fails_startup_without_leaking_paths_or_contents() {
-    let temp_dir = fresh_temp_dir("tls-reject");
+    let fixture = Fixture::new("tls-reject");
+    let temp_dir = fixture.path().to_owned();
+    std::fs::create_dir_all(temp_dir.join("data")).unwrap();
     let config_path = write_config(&temp_dir, &fixed_cus_resp_config());
     let bundle_path = temp_dir.join(format!("{SECRET_MARKER}.pem"));
     let missing_path = temp_dir.join(format!("{SECRET_MARKER}-missing.pem"));
@@ -331,5 +330,4 @@ fn invalid_tls_bundle_fails_startup_without_leaking_paths_or_contents() {
             "{label}: stderr must not leak paths, bundle contents or credentials, got: {stderr}"
         );
     }
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }

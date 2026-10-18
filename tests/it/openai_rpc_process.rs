@@ -1,16 +1,20 @@
-use std::path::{Path, PathBuf};
+use crate::support::config;
+use crate::support::fixture::Fixture;
+use crate::support::openai_mock;
+use crate::support::responses::{completed, text_response};
+use crate::support::rpc_process;
 
 use minicore_agent::SessionId;
+use std::path::{Path, PathBuf};
+
 use serde_json::{Value, json};
 
-use crate::support::openai_mock;
 use openai_mock::{MockResponse, MockServer};
 
-use crate::support::rpc_process;
 use rpc_process::RpcProcess;
 
 fn write_config(temp_dir: &Path, base_url: &str, key_env: &str, tools: &[&str]) -> PathBuf {
-    write_config_with_additional_models(temp_dir, base_url, key_env, tools, "")
+    config::write_config(temp_dir, config::provider_config(base_url, key_env, tools))
 }
 
 fn write_config_with_reasoning(
@@ -20,9 +24,9 @@ fn write_config_with_reasoning(
     tools: &[&str],
     reasoning: &str,
 ) -> PathBuf {
-    write_config_with_reasoning_and_additional_models(
-        temp_dir, base_url, key_env, tools, reasoning, "",
-    )
+    let mut config = config::provider_config(base_url, key_env, tools);
+    config["profiles"]["test"]["reasoning"] = json!(reasoning);
+    config::write_config(temp_dir, config)
 }
 
 fn write_two_model_config(
@@ -32,94 +36,12 @@ fn write_two_model_config(
     second_key_env: &str,
     tools: &[&str],
 ) -> PathBuf {
-    let additional_models = format!(
-        r#"
-[models.secondary]
-provider = "open_ai_responses"
-model = "secondary-provider-model"
-base_url = "{base_url}"
-api_key_env = "{second_key_env}"
-physical_context_window = 16000
-output_budget_tokens = 1024
-safety_margin_tokens = 1000
-supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
-supports_tools = true
-request_timeout_seconds = 5
-"#
-    );
-    write_config_with_additional_models(
-        temp_dir,
-        base_url,
-        first_key_env,
-        tools,
-        &additional_models,
-    )
-}
-
-fn write_config_with_additional_models(
-    temp_dir: &Path,
-    base_url: &str,
-    key_env: &str,
-    tools: &[&str],
-    additional_models: &str,
-) -> PathBuf {
-    write_config_with_reasoning_and_additional_models(
-        temp_dir,
-        base_url,
-        key_env,
-        tools,
-        "auto",
-        additional_models,
-    )
-}
-
-fn write_config_with_reasoning_and_additional_models(
-    temp_dir: &Path,
-    base_url: &str,
-    key_env: &str,
-    tools: &[&str],
-    reasoning: &str,
-    additional_models: &str,
-) -> PathBuf {
-    let config_path = temp_dir.join("agent.toml");
-    let tools = tools
-        .iter()
-        .map(|tool| format!("\"{tool}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"data_dir = {:?}
-event_capacity = 256
-default_profile = "test"
-
-[profiles.test]
-model = "main"
-reasoning = "{reasoning}"
-system_prompt = "Use configured tools and finish the task."
-tools = [{tools}]
-max_tool_rounds = 4
-approval = "auto"
-
-[models.main]
-provider = "open_ai_responses"
-model = "provider-model"
-base_url = "{base_url}"
-api_key_env = "{key_env}"
-physical_context_window = 16000
-output_budget_tokens = 1024
-safety_margin_tokens = 1000
-supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
-supports_tools = true
-request_timeout_seconds = 5
-{additional_models}
-"#,
-            temp_dir.join("data")
-        ),
-    )
-    .unwrap();
-    config_path
+    let mut config = config::provider_config(base_url, first_key_env, tools);
+    let mut secondary = config["models"]["main"].clone();
+    secondary["model"] = json!("secondary-provider-model");
+    secondary["api_key_env"] = json!(second_key_env);
+    config["models"]["secondary"] = secondary;
+    config::write_config(temp_dir, config)
 }
 
 fn write_reload_config(
@@ -150,62 +72,11 @@ fn write_reload_config_with_tools(
     prompt_file: &str,
     tools: &[&str],
 ) {
-    let tools = tools
-        .iter()
-        .map(|tool| format!("\"{tool}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    std::fs::write(
-        config_path,
-        format!(
-            r#"data_dir = {data_dir:?}
-event_capacity = 256
-default_profile = "test"
-
-[profiles.test]
-model = "main"
-reasoning = "auto"
-system_prompt = {{ file = {prompt_file:?} }}
-tools = [{tools}]
-max_tool_rounds = 4
-approval = "auto"
-
-[models.main]
-provider = "open_ai_responses"
-model = {provider_model:?}
-base_url = {base_url:?}
-api_key_env = {key_env:?}
-physical_context_window = 16000
-output_budget_tokens = 1024
-safety_margin_tokens = 1000
-supported_reasoning = ["auto", "disabled", "low", "medium", "high"]
-supports_tools = true
-request_timeout_seconds = 5
-"#,
-            data_dir = data_dir,
-            prompt_file = prompt_file,
-            provider_model = provider_model,
-            base_url = base_url,
-            key_env = key_env,
-        ),
-    )
-    .unwrap();
-}
-
-fn completed() -> Value {
-    json!({
-        "type": "response.completed",
-        "response": {
-            "status": "completed",
-            "usage": {
-                "input_tokens": 5,
-                "output_tokens": 3,
-                "total_tokens": 8,
-                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0}
-            }
-        }
-    })
+    let mut config = config::provider_config(base_url, key_env, tools);
+    config["data_dir"] = json!(data_dir);
+    config["profiles"]["test"]["system_prompt"] = json!({"file": prompt_file});
+    config["models"]["main"]["model"] = json!(provider_model);
+    config::write_config_at(config_path, config);
 }
 
 fn bash_call_response(call_id: &str, command: &str) -> MockResponse {
@@ -220,13 +91,6 @@ fn bash_call_response(call_id: &str, command: &str) -> MockResponse {
                 "arguments": serde_json::to_string(&json!({"command": command})).unwrap()
             }
         }),
-        completed(),
-    ])
-}
-
-fn text_response(text: &str) -> MockResponse {
-    MockResponse::sse(&[
-        json!({"type": "response.output_text.delta", "delta": text}),
         completed(),
     ])
 }
@@ -421,10 +285,8 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_history() {
         completed(),
     ]);
     let server = MockServer::spawn([first, second]).await;
-    let temp_dir = std::env::temp_dir().join(format!(
-        "minicore-agent-openai-process-{}",
-        minicore_agent::SessionId::new().unwrap()
-    ));
+    let fixture = Fixture::new("minicore-agent-openai-process");
+    let temp_dir = fixture.path().to_owned();
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join(&path), "PROCESS-READ-CONTENT").unwrap();
@@ -498,7 +360,6 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_history() {
             .iter()
             .any(|item| item["type"] == "function_call_output")
     );
-    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[cfg(unix)]
@@ -530,10 +391,8 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     ])
     .await;
 
-    let root = std::env::temp_dir().join(format!(
-        "minicore-agent-reload-process-{}",
-        minicore_agent::SessionId::new().unwrap()
-    ));
+    let fixture = Fixture::new("minicore-agent-reload-process");
+    let root = fixture.path().to_owned();
     let real_dir = root.join("real");
     let alias_dir = root.join("alias");
     let data_dir = root.join("data");
@@ -742,8 +601,6 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     .unwrap();
     assert!(new_record.contains("new reload prompt"));
     assert!(!new_record.contains("old reload prompt"));
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(any(unix, windows))]
@@ -757,10 +614,8 @@ async fn process_reload_cumulatively_scrubs_previous_model_credentials_from_bash
         text_response("new reload bash complete"),
     ])
     .await;
-    let root = std::env::temp_dir().join(format!(
-        "minicore-agent-reload-env-process-{}",
-        minicore_agent::SessionId::new().unwrap()
-    ));
+    let fixture = Fixture::new("minicore-agent-reload-env-process");
+    let root = fixture.path().to_owned();
     let data_dir = root.join("data");
     let workspace = root.join("workspace");
     let config = root.join("agent.toml");
@@ -921,8 +776,6 @@ async fn process_reload_cumulatively_scrubs_previous_model_credentials_from_bash
         assert!(body.contains("key_b_unset=true"));
         assert!(body.contains("key_c_unset=true"));
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -989,10 +842,8 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         ])
     };
     let server = MockServer::spawn([first, second, next(), next(), next()]).await;
-    let temp_dir = std::env::temp_dir().join(format!(
-        "minicore-agent-openai-reasoning-process-{}",
-        minicore_agent::SessionId::new().unwrap()
-    ));
+    let fixture = Fixture::new("minicore-agent-openai-reasoning-process");
+    let temp_dir = fixture.path().to_owned();
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(
@@ -1233,7 +1084,6 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     );
     assert!(String::from_utf8_lossy(requests[1].body()).contains(ENCRYPTED_MARKER));
     assert!(String::from_utf8_lossy(requests[1].body()).contains(OPAQUE_MARKER));
-    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[cfg(any(unix, windows))]
@@ -1267,10 +1117,8 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
         completed(),
     ]);
     let server = MockServer::spawn([first, second]).await;
-    let temp_dir = std::env::temp_dir().join(format!(
-        "minicore-agent-openai-bash-environment-{}",
-        minicore_agent::SessionId::new().unwrap()
-    ));
+    let fixture = Fixture::new("minicore-agent-openai-bash-environment");
+    let temp_dir = fixture.path().to_owned();
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = write_two_model_config(
@@ -1372,7 +1220,6 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
         .and_then(|item| item["output"].as_str())
         .expect("second request must contain the Bash tool output");
     assert_isolated_environment_probe(tool_output);
-    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1391,10 +1238,8 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
     )])
     .await;
     let base_url = server.base_url().to_owned();
-    let temp_dir = std::env::temp_dir().join(format!(
-        "minicore-agent-openai-error-process-{}",
-        minicore_agent::SessionId::new().unwrap()
-    ));
+    let fixture = Fixture::new("minicore-agent-openai-error-process");
+    let temp_dir = fixture.path().to_owned();
     let workspace = temp_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = write_config(&temp_dir, &base_url, KEY_ENV, &[]);
@@ -1447,7 +1292,6 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
     let (observed, stderr) = process.shutdown().await;
     let output = serde_json::to_string(&observed).unwrap();
     server.finish().await;
-    let _ = std::fs::remove_dir_all(temp_dir);
 
     for private in [KEY, RAW_BODY_SECRET, PROVIDER_MESSAGE, base_url.as_str()] {
         assert!(!output.contains(private));

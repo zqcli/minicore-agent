@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Included by unit and process test crates with different helper subsets.
-
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +8,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -124,7 +122,7 @@ impl CapturedRequest {
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
+        self.headers()
             .iter()
             .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
     }
@@ -146,18 +144,8 @@ pub struct MockServer {
     base_url: String,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
     captured_notify: Arc<Notify>,
-    fully_written: Arc<ProgressCounter>,
     handler_finished: Arc<ProgressCounter>,
     served: Arc<AtomicUsize>,
-    task: JoinHandle<io::Result<()>>,
-}
-
-pub struct ConcurrentMockServer {
-    base_url: String,
-    captured: Arc<Mutex<Vec<CapturedRequest>>>,
-    captured_notify: Arc<Notify>,
-    fully_written: Arc<ProgressCounter>,
-    handler_finished: Arc<ProgressCounter>,
     task: JoinHandle<io::Result<()>>,
 }
 
@@ -180,111 +168,6 @@ impl ProgressCounter {
     }
 }
 
-impl ConcurrentMockServer {
-    pub async fn spawn(responses: impl IntoIterator<Item = MockResponse>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("concurrent mock server must bind loopback");
-        let address = listener.local_addr().expect("concurrent mock address");
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let task_captured = Arc::clone(&captured);
-        let captured_notify = Arc::new(Notify::new());
-        let task_notify = Arc::clone(&captured_notify);
-        let fully_written = Arc::new(ProgressCounter::new());
-        let task_fully_written = Arc::clone(&fully_written);
-        let handler_finished = Arc::new(ProgressCounter::new());
-        let task_handler_finished = Arc::clone(&handler_finished);
-        let mut responses: VecDeque<_> = responses.into_iter().collect();
-        let task = tokio::spawn(async move {
-            let mut handlers = JoinSet::new();
-            while !responses.is_empty() {
-                let (stream, _) = listener.accept().await?;
-                let response = responses
-                    .pop_front()
-                    .expect("checked concurrent response queue must not be empty");
-                let handler_captured = Arc::clone(&task_captured);
-                let handler_notify = Arc::clone(&task_notify);
-                let handler_fully_written = Arc::clone(&task_fully_written);
-                let handler_finished = Arc::clone(&task_handler_finished);
-                handlers.spawn(async move {
-                    let result = handle_connection(
-                        stream,
-                        response,
-                        handler_captured,
-                        handler_notify,
-                        handler_fully_written,
-                    )
-                    .await;
-                    handler_finished.increment();
-                    result
-                });
-            }
-            while let Some(result) = handlers.join_next().await {
-                result.map_err(|_| io::Error::other("concurrent mock handler panicked"))??;
-            }
-            Ok(())
-        });
-        Self {
-            base_url: format!("http://{address}"),
-            captured,
-            captured_notify,
-            fully_written,
-            handler_finished,
-            task,
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub async fn wait_for_requests(&self, count: usize) {
-        wait_for_requests(&self.captured, &self.captured_notify, count).await;
-    }
-
-    pub async fn wait_for_fully_written(&self, count: usize) {
-        wait_for_progress(
-            &self.fully_written,
-            count,
-            "mock full response write timed out",
-        )
-        .await;
-    }
-
-    pub async fn wait_for_handler_finished(&self, count: usize) {
-        wait_for_progress(
-            &self.handler_finished,
-            count,
-            "mock response handler timed out",
-        )
-        .await;
-    }
-
-    pub async fn finish(self) -> Vec<CapturedRequest> {
-        finish_server(self.task).await;
-        Arc::try_unwrap(self.captured)
-            .expect("concurrent captured requests must have one owner")
-            .into_inner()
-            .expect("concurrent captured request mutex must not be poisoned")
-    }
-}
-
-async fn handle_connection(
-    mut stream: TcpStream,
-    response: MockResponse,
-    captured: Arc<Mutex<Vec<CapturedRequest>>>,
-    captured_notify: Arc<Notify>,
-    fully_written: Arc<ProgressCounter>,
-) -> io::Result<()> {
-    let request = read_request(&mut stream).await?;
-    captured.lock().unwrap().push(request);
-    captured_notify.notify_waiters();
-    if write_response(&mut stream, response).await? == WriteOutcome::FullyWritten {
-        fully_written.increment();
-    }
-    Ok(())
-}
-
 impl MockServer {
     pub async fn spawn(responses: impl IntoIterator<Item = MockResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -295,12 +178,10 @@ impl MockServer {
         let task_captured = Arc::clone(&captured);
         let captured_notify = Arc::new(Notify::new());
         let task_notify = Arc::clone(&captured_notify);
-        let fully_written = Arc::new(ProgressCounter::new());
         let handler_finished = Arc::new(ProgressCounter::new());
         let task_handler_finished = Arc::clone(&handler_finished);
         let served = Arc::new(AtomicUsize::new(0));
         let task_served = Arc::clone(&served);
-        let _ = fully_written;
         let mut responses: VecDeque<_> = responses.into_iter().collect();
         let task = tokio::spawn(async move {
             // A response only counts as served once a complete request has
@@ -339,7 +220,6 @@ impl MockServer {
             base_url: format!("http://{address}"),
             captured,
             captured_notify,
-            fully_written,
             handler_finished,
             served,
             task,
@@ -352,28 +232,6 @@ impl MockServer {
 
     pub async fn wait_for_requests(&self, count: usize) {
         wait_for_requests(&self.captured, &self.captured_notify, count).await;
-    }
-
-    pub async fn wait_for_fully_written(&self, count: usize) {
-        wait_for_progress(
-            &self.fully_written,
-            count,
-            "mock full response write timed out",
-        )
-        .await;
-    }
-
-    pub fn fully_written_count(&self) -> usize {
-        self.fully_written.count.load(Ordering::Acquire)
-    }
-
-    pub async fn wait_for_handler_finished(&self, count: usize) {
-        wait_for_progress(
-            &self.handler_finished,
-            count,
-            "mock response handler timed out",
-        )
-        .await;
     }
 
     pub async fn finish(self) -> Vec<CapturedRequest> {

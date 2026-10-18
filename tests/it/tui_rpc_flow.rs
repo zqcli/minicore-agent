@@ -1,10 +1,14 @@
-use std::path::{Path, PathBuf};
+use crate::support::config;
+use crate::support::fixture::Fixture;
+use crate::support::openai_mock;
+use crate::support::responses::{completed, text_response, turn_params};
+use crate::support::rpc_process;
 
 use minicore_agent::SessionId;
+use std::path::{Path, PathBuf};
+
 use serde_json::{Value, json};
 
-use crate::support::openai_mock;
-use crate::support::rpc_process;
 use openai_mock::{ChunkGate, MockResponse, MockServer};
 use rpc_process::RpcProcess;
 
@@ -12,13 +16,6 @@ const KEY_ENV: &str = "MINICORE_TUI_FLOW_KEY";
 const KEY: &str = "TUI-FLOW-API-KEY-SECRET";
 const FAST_PROVIDER: &str = "tui-fast-provider-private";
 const DEEP_PROVIDER: &str = "tui-deep-provider-private";
-
-fn test_dir(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "minicore-agent-tui-{label}-{}",
-        SessionId::new().unwrap()
-    ))
-}
 
 fn write_config(
     base: &Path,
@@ -28,88 +25,28 @@ fn write_config(
     coding_model: &str,
     coding_reasoning: &str,
 ) -> PathBuf {
-    std::fs::create_dir_all(base).unwrap();
-    let path = base.join("agent.toml");
-    let tools = tools
-        .iter()
-        .map(|tool| format!("\"{tool}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    std::fs::write(
-        &path,
-        format!(
-            r#"data_dir = {:?}
-event_capacity = {event_capacity}
-default_profile = "coding"
-
-[profiles.quick]
-model = "fast"
-reasoning = "low"
-system_prompt = "Fast TUI flow profile."
-tools = [{tools}]
-max_tool_rounds = 4
-approval = "auto"
-
-[profiles.coding]
-model = "{coding_model}"
-reasoning = "{coding_reasoning}"
-system_prompt = "Coding TUI flow profile."
-tools = [{tools}]
-max_tool_rounds = 4
-approval = "auto"
-
-[models.fast]
-provider = "open_ai_responses"
-model = "{FAST_PROVIDER}"
-base_url = "{base_url}"
-api_key_env = "{KEY_ENV}"
-physical_context_window = 16000
-output_budget_tokens = 1024
-safety_margin_tokens = 1000
-supported_reasoning = ["auto", "disabled", "low"]
-supports_tools = true
-request_timeout_seconds = 5
-
-[models.deep]
-provider = "open_ai_responses"
-model = "{DEEP_PROVIDER}"
-base_url = "{base_url}"
-api_key_env = "{KEY_ENV}"
-physical_context_window = 32000
-output_budget_tokens = 2048
-safety_margin_tokens = 1000
-supported_reasoning = ["auto", "low", "medium", "high"]
-supports_tools = true
-request_timeout_seconds = 5
-"#,
-            base.join("data")
-        ),
-    )
-    .unwrap();
-    path
-}
-
-fn completed() -> Value {
-    json!({
-        "type": "response.completed",
-        "response": {
-            "status": "completed",
-            "usage": {
-                "input_tokens": 5,
-                "output_tokens": 3,
-                "total_tokens": 8,
-                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0}
-            }
-        }
-    })
-}
-
-fn text_response(text: &str) -> MockResponse {
-    MockResponse::sse(&[
-        json!({"type": "response.output_text.delta", "delta": text}),
-        completed(),
-    ])
+    let mut config = config::provider_config(base_url, KEY_ENV, tools);
+    config["event_capacity"] = json!(event_capacity);
+    config["default_profile"] = json!("coding");
+    let mut quick = config["profiles"]["test"].take();
+    quick["model"] = json!("fast");
+    quick["reasoning"] = json!("low");
+    quick["system_prompt"] = json!("Fast TUI flow profile.");
+    let mut coding = quick.clone();
+    coding["model"] = json!(coding_model);
+    coding["reasoning"] = json!(coding_reasoning);
+    coding["system_prompt"] = json!("Coding TUI flow profile.");
+    config["profiles"] = json!({"quick": quick, "coding": coding});
+    let mut fast = config["models"]["main"].take();
+    fast["model"] = json!(FAST_PROVIDER);
+    fast["supported_reasoning"] = json!(["auto", "disabled", "low"]);
+    let mut deep = fast.clone();
+    deep["model"] = json!(DEEP_PROVIDER);
+    deep["physical_context_window"] = json!(32000);
+    deep["output_budget_tokens"] = json!(2048);
+    deep["supported_reasoning"] = json!(["auto", "low", "medium", "high"]);
+    config["models"] = json!({"fast": fast, "deep": deep});
+    config::write_config(base, config)
 }
 
 fn tool_response(call_id: &str, name: &str, arguments: Value) -> MockResponse {
@@ -132,13 +69,6 @@ fn gated_sse(events: Vec<Value>) -> (MockResponse, ChunkGate) {
     MockResponse::sse(&events).with_chunk_gate()
 }
 
-fn turn_params(turn: &Value) -> Value {
-    json!({
-        "session_id": turn["session_id"],
-        "loop_id": turn["loop_id"],
-    })
-}
-
 async fn create_session(
     process: &mut RpcProcess,
     id: &str,
@@ -147,9 +77,8 @@ async fn create_session(
     reasoning: &str,
 ) -> Value {
     process
-        .send(
+        .create_session(
             id,
-            "session.create",
             json!({
                 "workspace": workspace,
                 "profile": "coding",
@@ -157,8 +86,7 @@ async fn create_session(
                 "reasoning": reasoning,
             }),
         )
-        .await;
-    process.response(id).await["result"]["session"].clone()
+        .await
 }
 
 async fn history(process: &mut RpcProcess, id: &str, session_id: &Value) -> Value {
@@ -193,7 +121,8 @@ fn assert_error(response: &Value, code: i64, kind: &str) {
 async fn tui_discovery_create_history_and_reopen_flow() {
     let server = MockServer::spawn([text_response("first"), text_response("second")]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("discovery");
+    let fixture = Fixture::new("discovery");
+    let base = fixture.path().to_owned();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = write_config(&base, &base_url, 64, &[], "deep", "high");
@@ -309,7 +238,6 @@ async fn tui_discovery_create_history_and_reopen_flow() {
     assert!(!stderr.contains(FAST_PROVIDER));
     assert!(!stderr.contains(DEEP_PROVIDER));
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -321,7 +249,8 @@ async fn tui_steer_update_cancel_while_wait_is_pending() {
     let (gated, gate) = gated_sse(gate_events);
     let server = MockServer::spawn([gated, text_response("after cancel")]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("control");
+    let fixture = Fixture::new("control");
+    let base = fixture.path().to_owned();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = write_config(&base, &base_url, 256, &[], "deep", "high");
@@ -404,7 +333,6 @@ async fn tui_steer_update_cancel_while_wait_is_pending() {
     assert!(!serde_json::to_string(&observed).unwrap().contains(KEY));
     assert!(!stderr.contains(KEY));
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -416,7 +344,8 @@ async fn tui_streams_reasoning_and_text_channels() {
     ]);
     let server = MockServer::spawn([reasoning]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("stream");
+    let fixture = Fixture::new("stream");
+    let base = fixture.path().to_owned();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = write_config(&base, &base_url, 256, &[], "deep", "medium");
@@ -458,7 +387,6 @@ async fn tui_streams_reasoning_and_text_channels() {
 
     process.shutdown().await;
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -473,7 +401,8 @@ async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
     ])
     .await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("tool");
+    let fixture = Fixture::new("tool");
+    let base = fixture.path().to_owned();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("SECRET-PATH.txt"), "TOOL-CONTENT-TOKEN").unwrap();
@@ -519,14 +448,14 @@ async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
 
     process.shutdown().await;
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tui_two_sessions_run_independently() {
     let server = MockServer::spawn([text_response("session-a"), text_response("session-b")]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("two-sessions");
+    let fixture = Fixture::new("two-sessions");
+    let base = fixture.path().to_owned();
     let workspace_a = base.join("workspace-a");
     let workspace_b = base.join("workspace-b");
     std::fs::create_dir_all(&workspace_a).unwrap();
@@ -570,7 +499,6 @@ async fn tui_two_sessions_run_independently() {
 
     process.shutdown().await;
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -578,7 +506,8 @@ async fn tui_error_mappings_cover_new_wire_types() {
     // No turn is run in this test: an empty script keeps the mock idle.
     let server = MockServer::spawn([]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir("errors");
+    let fixture = Fixture::new("errors");
+    let base = fixture.path().to_owned();
     let workspace = base.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let config = write_config(&base, &base_url, 64, &[], "deep", "high");
@@ -615,5 +544,4 @@ async fn tui_error_mappings_cover_new_wire_types() {
 
     process.shutdown().await;
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }

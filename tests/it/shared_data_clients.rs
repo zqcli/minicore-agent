@@ -1,37 +1,22 @@
 #![cfg(unix)]
 
+use crate::support::config;
+use crate::support::fixture::Fixture;
+use crate::support::openai_mock;
+use crate::support::responses::done;
+use crate::support::rpc_process;
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::Engine;
-use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
-use crate::support::openai_mock;
-use crate::support::rpc_process;
 use openai_mock::{MockResponse, MockServer};
 use rpc_process::RpcProcess;
 
 const KEY_ENV: &str = "MINICORE_SHARED_DATA_TEST_KEY";
 const KEY: &str = "shared-data-fixture-secret";
-
-struct Fixture(PathBuf);
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-async fn call(process: &mut RpcProcess, method: &str, params: Value) -> Value {
-    process.send("query", method, params).await;
-    let response = process.response("query").await;
-    assert!(response.get("error").is_none(), "{method}: {response}");
-    response["result"].clone()
-}
-
-fn done() -> Value {
-    json!({"type":"response.completed", "response":{"status":"completed"}})
-}
 
 fn tool(name: &str, id: &str, args: Value) -> MockResponse {
     MockResponse::sse(&[
@@ -122,13 +107,13 @@ async fn read_diff(
     let mut cursor = Value::Null;
     let mut pages = Vec::new();
     loop {
-        let page = call(
-            process,
-            "changes.diff",
-            json!({"session_id":session,"change_ref":reference,
+        let page = process
+            .call_ok(
+                "changes.diff",
+                json!({"session_id":session,"change_ref":reference,
             "context_lines":0,"cursor":cursor,"max_bytes":budget}),
-        )
-        .await;
+            )
+            .await;
         assert!(serde_json::to_vec(&page).unwrap().len() <= budget);
         assert_eq!(page["stale"], false);
         cursor = page["next_cursor"].clone();
@@ -147,7 +132,7 @@ async fn history(process: &mut RpcProcess, session: &Value) -> Vec<Value> {
     let mut params = json!({"session_id":session,"max_bytes":2048});
     let mut items: BTreeMap<u64, String> = BTreeMap::new();
     loop {
-        let page = call(process, "session.read", params.clone()).await;
+        let page = process.call_ok("session.read", params.clone()).await;
         assert!(serde_json::to_vec(&page).unwrap().len() <= 2048);
         for chunk in page["items"].as_array().unwrap() {
             let text = items.entry(chunk["index"].as_u64().unwrap()).or_default();
@@ -169,9 +154,7 @@ async fn history(process: &mut RpcProcess, session: &Value) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_public_clients_share_queries_and_recover_after_process_restart() {
-    let fixture = Fixture(
-        std::env::temp_dir().join(format!("minicore-clients-{}", SessionId::new().unwrap())),
-    );
+    let fixture = Fixture::new("clients");
     let workspace = fixture.0.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     git(&workspace, &["init", "-q"]);
@@ -186,52 +169,29 @@ async fn two_public_clients_share_queries_and_recover_after_process_restart() {
         tool("bash", "shell", json!({"command":"printf 'out\\000\\377'; printf 'err' >&2; printf 'external' > external.txt"})),
         MockResponse::sse(&[json!({"type":"response.output_text.delta","delta":"done"}), done()]),
     ]).await;
-    let config = fixture.0.join("agent.toml");
-    std::fs::write(
-        &config,
-        format!(
-            r#"data_dir = {:?}
-default_profile = "test"
-event_capacity = 256
-[profiles.test]
-model = "test"
-reasoning = "auto"
-system_prompt = "Test data contracts."
-tools = ["write", "bash"]
-max_tool_rounds = 4
-approval = "auto"
-[models.test]
-provider = "open_ai_responses"
-model = "fixture"
-base_url = "{}"
-api_key_env = "{}"
-physical_context_window = 100000
-output_budget_tokens = 1000
-safety_margin_tokens = 1000
-supported_reasoning = ["auto"]
-supports_tools = true
-request_timeout_seconds = 5
-"#,
-            fixture.0.join("data"),
+    let config = config::write_config(
+        fixture.path(),
+        config::data_config(
             server.base_url(),
-            KEY_ENV
+            KEY_ENV,
+            "Test data contracts.",
+            &["write", "bash"],
         ),
-    )
-    .unwrap();
+    );
     let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
-    let ping = call(&mut process, "agent.ping", json!({})).await;
+    let ping = process.call_ok("agent.ping", json!({})).await;
     assert!(
         ping["capabilities"]
             .as_array()
             .unwrap()
             .contains(&json!("changes.diff"))
     );
-    let created = call(
-        &mut process,
-        "session.create",
-        json!({"workspace":workspace,"profile":"test"}),
-    )
-    .await;
+    let created = process
+        .call_ok(
+            "session.create",
+            json!({"workspace":workspace,"profile":"test"}),
+        )
+        .await;
     let session = created["session"]["session_id"].clone();
     assert!(session.is_string());
     let (turn, wait) = process
@@ -243,7 +203,7 @@ request_timeout_seconds = 5
     let bash_ref = bash["params"]["data"]["data"]["tool_ref"].clone();
     let waited = process.response(&wait).await;
     assert_eq!(waited["result"]["persistence"], "persisted");
-    let tool_read = call(&mut process, "tool.read", bash_ref.clone()).await;
+    let tool_read = process.call_ok("tool.read", bash_ref.clone()).await;
     assert_eq!(tool_read["execution"]["command"]["exit_code"], 0);
     for (stream, expected) in [
         ("stdout", b"out\x00\xff".as_slice()),
@@ -252,7 +212,7 @@ request_timeout_seconds = 5
         let mut params = bash_ref.clone();
         params["stream"] = json!(stream);
         params["offset"] = json!(0);
-        let page = call(&mut process, "tool.output", params).await;
+        let page = process.call_ok("tool.output", params).await;
         assert_eq!(
             base64::engine::general_purpose::STANDARD
                 .decode(page["data"].as_str().unwrap())
@@ -261,12 +221,12 @@ request_timeout_seconds = 5
         );
         assert_eq!(page["eof"], true);
     }
-    let listed = call(
-        &mut process,
-        "changes.list",
-        json!({"session_id":session,"scope":{"turn":{"loop_id":turn["loop_id"]}}}),
-    )
-    .await;
+    let listed = process
+        .call_ok(
+            "changes.list",
+            json!({"session_id":session,"scope":{"turn":{"loop_id":turn["loop_id"]}}}),
+        )
+        .await;
     assert_eq!(
         listed["records"].as_array().unwrap().len(),
         1,
@@ -291,12 +251,12 @@ request_timeout_seconds = 5
     for client in [hunk_client.contents("added"), line_client.contents("added")] {
         assert_eq!(client, output);
     }
-    let workspace_changes = call(
-        &mut process,
-        "changes.list",
-        json!({"session_id":session,"scope":"workspace"}),
-    )
-    .await;
+    let workspace_changes = process
+        .call_ok(
+            "changes.list",
+            json!({"session_id":session,"scope":"workspace"}),
+        )
+        .await;
     let external = workspace_changes["records"]
         .as_array()
         .unwrap()
@@ -304,12 +264,12 @@ request_timeout_seconds = 5
         .find(|record| record["path"] == "external.txt")
         .unwrap();
     assert!(external["tool_ref"].is_null());
-    let external_diff = call(
-        &mut process,
-        "changes.diff",
-        json!({"session_id":session,"change_ref":external["change_ref"]}),
-    )
-    .await;
+    let external_diff = process
+        .call_ok(
+            "changes.diff",
+            json!({"session_id":session,"change_ref":external["change_ref"]}),
+        )
+        .await;
     assert_eq!(external_diff["versions_refreshed"], true);
     assert_eq!(external_diff["base_version"]["kind"], "missing");
     assert_eq!(external_diff["hunks"][0]["lines"][0]["text"], "external");
@@ -322,7 +282,7 @@ request_timeout_seconds = 5
     ] {
         let mut params = extra;
         params["session_id"] = session.clone();
-        assert!(call(&mut process, method, params).await.is_object());
+        assert!(process.call_ok(method, params).await.is_object());
     }
     let warm_history = history(&mut process, &session).await;
     let (_, stderr) = process.shutdown().await;
@@ -337,7 +297,7 @@ request_timeout_seconds = 5
         recovered.consume(page);
     }
     assert_eq!(recovered.contents("added"), output);
-    let saved = call(&mut cold, "tool.read", bash_ref).await;
+    let saved = cold.call_ok("tool.read", bash_ref).await;
     assert_eq!(saved["execution"]["command"]["exit_code"], 0);
     assert!(!workspace.exists());
     cold.shutdown().await;

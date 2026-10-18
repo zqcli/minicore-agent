@@ -1,8 +1,11 @@
 pub mod support;
 
+use crate::support::config;
+use crate::support::fixture::Fixture;
+use crate::support::responses::{completed, text_response, turn_params};
+
 use std::path::{Path, PathBuf};
 
-use minicore_agent::SessionId;
 use serde_json::{Value, json};
 
 use openai_mock::{MockResponse, MockServer};
@@ -13,70 +16,22 @@ use support::rpc_process;
 const KEY_ENV: &str = "MINICORE_RPC_SOAK_KEY";
 const KEY: &str = "RPC-SOAK-API-KEY-SECRET";
 
-fn test_dir() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "minicore-agent-rpc-soak-{}",
-        SessionId::new().unwrap()
-    ))
-}
-
 fn write_config(base: &Path, base_url: &str) -> PathBuf {
-    let path = base.join("agent.toml");
-    std::fs::write(
-        &path,
-        format!(
-            r#"data_dir = {:?}
-event_capacity = 4
-default_profile = "soak"
-
-[profiles.soak]
-model = "soak"
-reasoning = "high"
-system_prompt = "Run the offline RPC soak."
-tools = ["read", "write"]
-max_tool_rounds = 4
-approval = "auto"
-
-[models.soak]
-provider = "open_ai_responses"
-model = "soak-provider"
-base_url = "{base_url}"
-api_key_env = "{KEY_ENV}"
-physical_context_window = 32000
-output_budget_tokens = 2048
-safety_margin_tokens = 1000
-supported_reasoning = ["auto", "low", "medium", "high"]
-supports_tools = true
-request_timeout_seconds = 5
-"#,
-            base.join("data")
-        ),
-    )
-    .unwrap();
-    path
-}
-
-fn completed() -> Value {
-    json!({
-        "type": "response.completed",
-        "response": {
-            "status": "completed",
-            "usage": {
-                "input_tokens": 5,
-                "output_tokens": 3,
-                "total_tokens": 8,
-                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0}
-            }
-        }
-    })
-}
-
-fn text_response(text: impl Into<String>) -> MockResponse {
-    MockResponse::sse(&[
-        json!({"type": "response.output_text.delta", "delta": text.into()}),
-        completed(),
-    ])
+    let mut config = config::provider_config(base_url, KEY_ENV, &["read", "write"]);
+    config["event_capacity"] = json!(4);
+    config["default_profile"] = json!("soak");
+    let mut profile = config["profiles"]["test"].take();
+    profile["model"] = json!("soak");
+    profile["reasoning"] = json!("high");
+    profile["system_prompt"] = json!("Run the offline RPC soak.");
+    config["profiles"] = json!({"soak": profile});
+    let mut model = config["models"]["main"].take();
+    model["model"] = json!("soak-provider");
+    model["physical_context_window"] = json!(32000);
+    model["output_budget_tokens"] = json!(2048);
+    model["supported_reasoning"] = json!(["auto", "low", "medium", "high"]);
+    config["models"] = json!({"soak": model});
+    config::write_config(base, config)
 }
 
 fn read_response(call_id: &str) -> MockResponse {
@@ -95,22 +50,10 @@ fn read_response(call_id: &str) -> MockResponse {
     ])
 }
 
-fn turn_params(turn: &Value) -> Value {
-    json!({
-        "session_id": turn["session_id"],
-        "loop_id": turn["loop_id"],
-    })
-}
-
 async fn create_session(process: &mut RpcProcess, id: &str, workspace: &Path) -> Value {
     process
-        .send(
-            id,
-            "session.create",
-            json!({"workspace": workspace, "profile": "soak"}),
-        )
-        .await;
-    process.response(id).await["result"]["session"].clone()
+        .create_session(id, json!({"workspace": workspace, "profile": "soak"}))
+        .await
 }
 
 async fn history_total(process: &mut RpcProcess, id: &str, session_id: &Value) -> usize {
@@ -140,7 +83,8 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
         .collect::<Vec<_>>();
     let server = MockServer::spawn(responses).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir();
+    let fixture = Fixture::new("rpc-soak");
+    let base = fixture.path().to_owned();
     std::fs::create_dir_all(&base).unwrap();
     std::fs::create_dir_all(base.join("workspace-a")).unwrap();
     std::fs::create_dir_all(base.join("workspace-b")).unwrap();
@@ -217,7 +161,6 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
     assert!(!serde_json::to_string(&observed).unwrap().contains(KEY));
     assert!(!stderr.contains(KEY));
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -229,7 +172,8 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
     .with_chunk_gate();
     let server = MockServer::spawn([text_response("first"), gated, text_response("third")]).await;
     let base_url = server.base_url().to_owned();
-    let base = test_dir();
+    let fixture = Fixture::new("rpc-soak");
+    let base = fixture.path().to_owned();
     std::fs::create_dir_all(&base).unwrap();
     std::fs::create_dir_all(base.join("workspace")).unwrap();
     let config = write_config(&base, &base_url);
@@ -313,5 +257,4 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
 
     process.shutdown().await;
     server.finish().await;
-    let _ = std::fs::remove_dir_all(base);
 }

@@ -1,9 +1,11 @@
+use crate::support::config;
+use crate::support::fixture::Fixture;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use minicore_agent::SessionId;
-
 use serde_json::{Value, json};
 
 const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
@@ -13,7 +15,7 @@ struct RpcProcess {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    temp_dir: PathBuf,
+    fixture: Fixture,
 }
 
 impl RpcProcess {
@@ -36,18 +38,14 @@ impl RpcProcess {
 
     fn finish(mut self) -> ExitStatus {
         drop(self.input);
-        let status = self.child.wait().unwrap();
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
-        status
+        self.child.wait().unwrap()
     }
 }
 
 fn spawn_server() -> RpcProcess {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "minicore-agent-rpc-test-{}",
-        SessionId::new().unwrap()
-    ));
-    let config_path = write_server_config(&temp_dir);
+    let fixture = Fixture::new("minicore-agent-rpc-test");
+    let temp_dir = fixture.path();
+    let config_path = write_server_config(temp_dir);
     let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
         .args(["--config", config_path.to_str().unwrap(), "--stdio"])
         .env(TEST_CREDENTIAL_ENV, "dummy-test-credential")
@@ -60,46 +58,22 @@ fn spawn_server() -> RpcProcess {
         input: child.stdin.take().unwrap(),
         output: BufReader::new(child.stdout.take().unwrap()),
         child,
-        temp_dir,
+        fixture,
     }
 }
 
 fn write_server_config(temp_dir: &std::path::Path) -> PathBuf {
-    let data_dir = temp_dir.join("data");
-    let config_path = temp_dir.join("agent.toml");
-    std::fs::create_dir_all(temp_dir).unwrap();
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"data_dir = {:?}
-event_capacity = 256
-default_profile = "test"
-
-[profiles.test]
-model = "main"
-reasoning = "auto"
-system_prompt = "RPC framing test system prompt"
-tools = []
-max_tool_rounds = 4
-approval = "ask"
-
-[models.main]
-provider = "open_ai_responses"
-model = "provider-model"
-base_url = "https://example.invalid/v1"
-api_key_env = "{TEST_CREDENTIAL_ENV}"
-physical_context_window = 10000
-output_budget_tokens = 1000
-safety_margin_tokens = 1000
-supported_reasoning = ["auto"]
-supports_tools = false
-request_timeout_seconds = 30
-"#,
-            data_dir
-        ),
-    )
-    .unwrap();
-    config_path
+    let mut config =
+        config::provider_config("https://example.invalid/v1", TEST_CREDENTIAL_ENV, &[]);
+    config["profiles"]["test"]["system_prompt"] = json!("RPC framing test system prompt");
+    config["profiles"]["test"]["approval"] = json!("ask");
+    let model = &mut config["models"]["main"];
+    model["physical_context_window"] = json!(10000);
+    model["output_budget_tokens"] = json!(1000);
+    model["supported_reasoning"] = json!(["auto"]);
+    model["supports_tools"] = json!(false);
+    model["request_timeout_seconds"] = json!(30);
+    config::write_config(temp_dir, config)
 }
 
 fn assert_error(response: Value, code: i64, id: Value) {
@@ -154,11 +128,9 @@ fn debug_logging_keeps_stdout_json_rpc_only_and_uses_safe_stderr_markers() {
     const STARTUP_LOG_MARKER: &str = "agent startup";
     const RPC_DISPATCH_LOG_MARKER: &str = "rpc dispatch";
 
-    let temp_dir = std::env::temp_dir().join(format!(
-        "minicore-agent-rpc-debug-log-test-{}",
-        SessionId::new().unwrap()
-    ));
-    let config_path = write_server_config(&temp_dir);
+    let fixture = Fixture::new("minicore-agent-rpc-debug-log-test");
+    let temp_dir = fixture.path();
+    let config_path = write_server_config(temp_dir);
     let mut child = Command::new(env!("CARGO_BIN_EXE_minicore-agent"))
         .args(["--config", config_path.to_str().unwrap(), "--stdio"])
         .env(TEST_CREDENTIAL_ENV, "dummy-test-credential")
@@ -281,7 +253,6 @@ fn debug_logging_keeps_stdout_json_rpc_only_and_uses_safe_stderr_markers() {
     ]
     .into_iter()
     .all(|marker| !stdout.contains(marker));
-    let _ = std::fs::remove_dir_all(&temp_dir);
 
     assert!(stderr_is_redacted);
     assert!(stdout_is_redacted);
@@ -383,13 +354,11 @@ fn eof_shuts_down_without_an_extra_frame() {
         "method": "agent.ping"
     }));
     assert_ping(process.response(), json!("before-eof"));
-    let temp_dir = process.temp_dir.clone();
     drop(process.input);
 
     let mut trailing = String::new();
     assert_eq!(process.output.read_line(&mut trailing).unwrap(), 0);
     assert!(process.child.wait().unwrap().success());
-    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[test]
@@ -460,7 +429,7 @@ fn complete_config_exposes_stable_profile_model_and_session_behavior() {
         "session_not_loaded",
     );
 
-    let workspace = process.temp_dir.join("workspace");
+    let workspace = process.fixture.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     process.send_json(json!({
         "jsonrpc": "2.0",

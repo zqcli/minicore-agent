@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Shared by process flow suites with different helper subsets.
-
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -25,6 +23,7 @@ pub struct RpcProcess {
     pending: VecDeque<Value>,
     events: Vec<Value>,
     observed: Vec<Value>,
+    next_id: u64,
 }
 
 impl RpcProcess {
@@ -112,7 +111,24 @@ impl RpcProcess {
             pending: VecDeque::new(),
             events: Vec::new(),
             observed: Vec::new(),
+            next_id: 0,
         }
+    }
+
+    pub async fn call_ok(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = format!("call-{}", self.next_id);
+        self.send(&id, method, params).await;
+        let response = self.response(&id).await;
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        response.get("result").expect("RPC result").clone()
+    }
+
+    pub async fn create_session(&mut self, id: &str, params: Value) -> Value {
+        self.send(id, "session.create", params).await;
+        let response = self.response(id).await;
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"]["session"].clone()
     }
 
     pub fn pid(&self) -> u32 {
