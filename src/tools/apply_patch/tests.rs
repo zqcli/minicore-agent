@@ -1,3 +1,4 @@
+use super::apply::{ApplyStats, apply_single_file_patch_with_stats};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

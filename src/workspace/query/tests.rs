@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{Gate, TempDir};
-use crate::workspace::scan::{MAX_RESULT_BYTES, MIN_RESULT_BYTES};
+use crate::workspace::page::{MAX_RESULT_BYTES, MIN_RESULT_BYTES};
 
 struct Fixture {
     root: std::path::PathBuf,

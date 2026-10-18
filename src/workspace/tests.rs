@@ -1,3 +1,4 @@
+use super::atomic::{TEMP_ID_OVERRIDES, temp_basename};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;

@@ -10,6 +10,10 @@
 //! before it so the next page re-finds it. Nothing here writes history, starts a
 //! model call, or mutates the file.
 
+use crate::workspace::page::{
+    DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, MAX_SEARCH_PATHS, SCOPE_HEX_LEN, normalized_roots,
+    now_unix_ms, scope_digest, valid_query_text, valid_scope, validate_result_bytes,
+};
 use std::fmt;
 use std::io::Read;
 use std::sync::Arc;
@@ -24,12 +28,10 @@ use crate::ids::SessionId;
 use crate::text::floor_char_boundary;
 use crate::tools::MAX_READ_BYTES;
 use crate::workspace::Workspace;
-use crate::workspace::query::MAX_PATH_BYTES;
-use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
+
 use crate::workspace::scan::{
-    MAX_SEARCH_PATHS, READ_CHUNK_BYTES, SCOPE_HEX_LEN, ScanBudget, Visit, WalkEntry, WalkOptions,
-    WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop, normalized_roots, now_unix_ms,
-    run_scan, scope_digest, valid_query_text, valid_scope, walk_scope,
+    READ_CHUNK_BYTES, ScanBudget, Visit, WalkEntry, WalkOptions, WorkspaceFileKind,
+    WorkspaceScanConsistency, WorkspaceScanStop, run_scan, walk_scope,
 };
 
 const DEFAULT_MAX_MATCHES: u32 = 100;
@@ -832,7 +834,7 @@ fn envelope_bytes(max_bytes: usize) -> Result<usize, AgentError> {
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    crate::workspace::scan::envelope_size(&probe, max_bytes)
+    crate::workspace::page::envelope_size(&probe, max_bytes)
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 //! newer content. Nothing here writes history, starts a model call, or mutates
 //! the file.
 
-use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
+use crate::workspace::page::{DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, validate_result_bytes};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -27,12 +27,6 @@ pub(crate) const WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(10);
 /// Same line window as the read Tool.
 const DEFAULT_MAX_LINES: u32 = DEFAULT_READ_LIMIT as u32;
 const MAX_MAX_LINES: u32 = MAX_READ_LINES as u32;
-/// A result budget smaller than this cannot hold any useful envelope plus
-/// content. `workspace.files` and `workspace.search` share the same range.
-/// A request path longer than this is rejected before any query slot or
-/// serialization work. The generic workspace path checks stay uncapped.
-pub(crate) const MAX_PATH_BYTES: usize = 4096;
-
 /// One bounded read of a workspace file.
 ///
 /// `path` is a workspace-relative path of at most 4096 bytes. `start_line` is
@@ -377,7 +371,7 @@ fn envelope_bytes(path: &str, max_bytes: usize) -> Result<usize, AgentError> {
         file_bytes: u64::MAX,
         file_modified_unix_ms: Some(u64::MAX),
     };
-    crate::workspace::scan::envelope_size(&probe, max_bytes)
+    crate::workspace::page::envelope_size(&probe, max_bytes)
 }
 
 fn revision_of(bytes: &[u8]) -> String {

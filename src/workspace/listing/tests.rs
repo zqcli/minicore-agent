@@ -1,6 +1,7 @@
 use super::*;
+use crate::workspace::page::{MAX_RESULT_BYTES, MIN_RESULT_BYTES};
 use crate::workspace::scan::tests::ScanHold;
-use crate::workspace::scan::{MAX_RESULT_BYTES, MIN_RESULT_BYTES};
+
 use crate::workspace::scan::{SCAN_HOLDS, ScanLimits};
 
 #[tokio::test]

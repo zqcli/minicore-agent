@@ -2,6 +2,8 @@ use super::tests::status;
 use super::*;
 use crate::changes::{ChangeRevision, workspace_records};
 use crate::diff::{ChangesDiffRequest, DiffComparison, workspace_diff};
+use std::path::PathBuf;
+use std::time::Duration;
 
 struct Fixture {
     _dir: crate::test_support::TempDir,

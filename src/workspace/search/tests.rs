@@ -1,5 +1,5 @@
 use super::*;
-use crate::workspace::scan::MIN_RESULT_BYTES;
+use crate::workspace::page::MIN_RESULT_BYTES;
 use crate::workspace::scan::{SCAN_RESULT_EXPIRIES, ScanLimits};
 
 /// One collected match: path, line number, and absolute line byte ranges.

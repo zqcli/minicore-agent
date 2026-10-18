@@ -5,6 +5,10 @@
 //! follows symlinked directories, and reports every bound it hit instead of
 //! inventing a global total.
 
+use crate::workspace::page::{
+    DEFAULT_RESULT_BYTES, MAX_PATH_BYTES, SCOPE_HEX_LEN, display_path, now_unix_ms, scope_digest,
+    valid_scope, validate_result_bytes,
+};
 use std::fmt;
 use std::sync::Arc;
 
@@ -15,11 +19,10 @@ use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::workspace::Workspace;
-use crate::workspace::query::MAX_PATH_BYTES;
-use crate::workspace::scan::{DEFAULT_RESULT_BYTES, validate_result_bytes};
+
 use crate::workspace::scan::{
-    SCOPE_HEX_LEN, Visit, WalkOptions, WorkspaceFileKind, WorkspaceScanConsistency,
-    WorkspaceScanStop, display_path, now_unix_ms, run_scan, scope_digest, valid_scope, walk_scope,
+    Visit, WalkOptions, WorkspaceFileKind, WorkspaceScanConsistency, WorkspaceScanStop, run_scan,
+    walk_scope,
 };
 
 const DEFAULT_LIMIT: u32 = 200;
@@ -65,7 +68,7 @@ impl WorkspaceFilesRequest {
                 .map_err(|_| AgentError::InvalidArguments)?,
         );
         if let Some(query) = self.query.as_deref() {
-            if !crate::workspace::scan::valid_query_text(query) {
+            if !crate::workspace::page::valid_query_text(query) {
                 return Err(AgentError::InvalidArguments);
             }
         }
@@ -357,7 +360,7 @@ fn envelope_bytes(directory: &str, max_bytes: usize) -> Result<usize, AgentError
         consistency: WorkspaceScanConsistency::Live,
         observed_at_unix_ms: u64::MAX,
     };
-    crate::workspace::scan::envelope_size(&probe, max_bytes)
+    crate::workspace::page::envelope_size(&probe, max_bytes)
 }
 
 #[cfg(test)]
