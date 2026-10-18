@@ -23,10 +23,7 @@ use super::{CompactionPolicy, CompactionState, EphemeralGroupKey, summary_data_m
 /// while the durable and ephemeral summaries stay valid.
 #[derive(Clone)]
 pub(crate) struct AutoContext {
-    pub(crate) model: Arc<dyn Model>,
-    pub(crate) budget: Arc<dyn crate::models::ProviderBudget>,
-    pub(crate) policy: CompactionPolicy,
-    pub(crate) max_prompt_messages: usize,
+    pub(crate) binding: AutoContextBinding,
     pub(crate) state: Arc<CompactionState>,
 }
 
@@ -40,27 +37,27 @@ pub(crate) struct AutoContextBinding {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) budget: Arc<dyn crate::models::ProviderBudget>,
     pub(crate) policy: CompactionPolicy,
-    pub(crate) max_prompt_messages: usize,
+    pub(crate) limits: minicore_runtime::LoopLimits,
 }
 
 impl AutoContext {
     pub(crate) fn binding(&self) -> AutoContextBinding {
-        AutoContextBinding {
-            model: Arc::clone(&self.model),
-            budget: Arc::clone(&self.budget),
-            policy: self.policy,
-            max_prompt_messages: self.max_prompt_messages,
-        }
+        self.binding.clone()
     }
 
     pub(crate) fn from_binding(binding: &AutoContextBinding, state: Arc<CompactionState>) -> Self {
         Self {
-            model: Arc::clone(&binding.model),
-            budget: Arc::clone(&binding.budget),
-            policy: binding.policy,
-            max_prompt_messages: binding.max_prompt_messages,
+            binding: binding.clone(),
             state,
         }
+    }
+}
+
+impl std::ops::Deref for AutoContext {
+    type Target = AutoContextBinding;
+
+    fn deref(&self) -> &Self::Target {
+        &self.binding
     }
 }
 
@@ -225,27 +222,9 @@ pub(crate) fn current_user_texts<'a>(
 /// one labeled historical summary data message. `fixed` (system and durable
 /// summary) is preserved exactly; `history` has exactly one entry per
 /// base-then-appended item.
-pub(crate) fn fold_history(
-    fixed: &[ModelMessage],
-    history: &[ModelMessage],
-    base: &[HistoryItem],
-    appended: &[HistoryItem],
-    loop_id: LoopId,
-    folded: &BTreeMap<EphemeralGroupKey, BoundedText>,
-    consolidated: Option<&super::threshold::ConsolidatedSummary>,
-) -> Result<Vec<ModelMessage>, UtilityError> {
-    let items: Vec<&HistoryItem> = base.iter().chain(appended.iter()).collect();
-    if history.len() != items.len() {
-        return Err(UtilityError::InvalidResponse);
-    }
-    let ranges = compressible_ranges(base.len(), &items, loop_id)?;
-    fold_history_with_ranges(fixed, history, items.len(), &ranges, folded, consolidated)
-}
-
 pub(crate) fn fold_history_with_ranges(
     fixed: &[ModelMessage],
     history: &[ModelMessage],
-    item_count: usize,
     ranges: &[(EphemeralGroupKey, usize)],
     folded: &BTreeMap<EphemeralGroupKey, BoundedText>,
     consolidated: Option<&super::threshold::ConsolidatedSummary>,
@@ -263,7 +242,7 @@ pub(crate) fn fold_history_with_ranges(
         result.extend_from_slice(fixed);
     }
     let mut index = 0usize;
-    while index < item_count {
+    while index < history.len() {
         let Some((key, end)) = ranges
             .iter()
             .find(|(key, _)| key.start == index)
@@ -343,6 +322,81 @@ pub(crate) fn estimate_tokens_with_budget(
         .map_err(|_| UtilityError::Serialization)
 }
 
+pub(crate) struct Projection<'a> {
+    pub(crate) items: Vec<&'a HistoryItem>,
+    pub(crate) ranges: Vec<(EphemeralGroupKey, usize)>,
+    pub(crate) folded: BTreeMap<EphemeralGroupKey, BoundedText>,
+    pub(crate) consolidated: Option<super::threshold::ConsolidatedSummary>,
+    pub(crate) fixed: Vec<ModelMessage>,
+    pub(crate) history: Vec<ModelMessage>,
+}
+
+impl<'a> Projection<'a> {
+    pub(crate) fn new(
+        state: &CompactionState,
+        system: &BoundedText,
+        summary: Option<&BoundedText>,
+        base: &'a [HistoryItem],
+        appended: &'a [HistoryItem],
+        loop_id: LoopId,
+    ) -> Result<Self, UtilityError> {
+        let items = base.iter().chain(appended).collect::<Vec<_>>();
+        let ranges = compressible_ranges(base.len(), &items, loop_id)?;
+        let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
+        let consolidated = state.consolidated(loop_id, summary, &valid);
+        let folded = state.emergency_groups(loop_id, &valid);
+        let (fixed, history) = compose(system, summary, base, appended)?;
+        Ok(Self {
+            items,
+            ranges,
+            folded,
+            consolidated,
+            fixed,
+            history,
+        })
+    }
+
+    pub(crate) fn messages(&self) -> Result<Vec<ModelMessage>, UtilityError> {
+        fold_history_with_ranges(
+            &self.fixed,
+            &self.history,
+            &self.ranges,
+            &self.folded,
+            self.consolidated.as_ref(),
+        )
+    }
+
+    pub(crate) fn coverage(
+        &self,
+        base_len: usize,
+        retain_newest: bool,
+    ) -> BTreeSet<EphemeralGroupKey> {
+        // The newest exchange must reach the assistant before threshold compaction covers it.
+        let newest = retain_newest
+            .then(|| {
+                self.ranges.iter().rev().find(|(key, _)| {
+                    key.start >= base_len
+                        && matches!(self.items[key.start], HistoryItem::Assistant(_))
+                })
+            })
+            .flatten()
+            .map(|(key, _)| key);
+        let mut covered = self
+            .consolidated
+            .as_ref()
+            .map(|old| old.covered.clone())
+            .unwrap_or_default();
+        covered.extend(
+            self.ranges
+                .iter()
+                .map(|(key, _)| key)
+                .filter(|key| Some(*key) != newest)
+                .cloned(),
+        );
+        covered
+    }
+}
+
 pub(crate) fn merge_utility_usage(
     total: &mut Option<super::CompactionUtilityUsage>,
     next: Option<super::CompactionUtilityUsage>,
@@ -399,7 +453,6 @@ pub(crate) async fn summarize_group(
         project_instructions: request.system.clone(),
         tool_schemas: request.tools,
         hard_tokens: request.hard_tokens,
-        safe_before_estimate: false,
         operation_deadline: request.deadline,
         live_usage: None,
     };

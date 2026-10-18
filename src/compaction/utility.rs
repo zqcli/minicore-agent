@@ -32,7 +32,10 @@ pub(crate) fn recent_tail_start(
     let suffix = history
         .get(previous_covered..)
         .ok_or(UtilityError::InvalidResponse)?;
-    let mut bytes = CountingWriter { bytes: 0 };
+    let mut bytes = CappedWriter {
+        bytes: 0,
+        cap: usize::MAX,
+    };
     for (offset, item) in suffix.iter().enumerate().rev() {
         check_active(cancellation, deadline)?;
         // The same bounded serialized-item bytes/4 fallback used by startup
@@ -79,11 +82,6 @@ pub(crate) struct CompactionInput {
     pub(crate) tool_schemas: Vec<ToolSpec>,
     /// Hard effective input ceiling for utility and reduced normal requests.
     pub(crate) hard_tokens: u64,
-    /// Startup admission may have a history that cannot be represented as one
-    /// `ModelRequest` yet. Its before estimate must then stay item-wise until
-    /// the utility replaces that history; manual/request-time groups retain
-    /// the precise request estimate used by the original compaction flow.
-    pub(crate) safe_before_estimate: bool,
     pub(crate) operation_deadline: Instant,
     pub(crate) live_usage: Option<Arc<std::sync::Mutex<Option<CompactionUtilityUsage>>>>,
 }
@@ -384,7 +382,10 @@ pub(crate) fn projected_source_message<'a>(
     ModelMessage::user(writer.finish()?).map_err(|_| UtilityError::TooLarge)
 }
 
-fn check_active(cancellation: &CancellationToken, deadline: Instant) -> Result<(), UtilityError> {
+pub(crate) fn check_active(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), UtilityError> {
     if cancellation.is_cancelled() {
         Err(UtilityError::Cancelled)
     } else if Instant::now() >= deadline {
@@ -392,14 +393,6 @@ fn check_active(cancellation: &CancellationToken, deadline: Instant) -> Result<(
     } else {
         Ok(())
     }
-}
-
-#[cfg(test)]
-fn source_message(
-    input: &CompactionInput,
-    cancellation: &CancellationToken,
-) -> Result<ModelMessage, UtilityError> {
-    source_message_through(input, input.history.len(), cancellation)
 }
 
 fn source_message_through(
@@ -867,45 +860,12 @@ fn sum_usage_field(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 }
 
 fn estimate_before_tokens(input: &CompactionInput) -> Result<u64, UtilityError> {
-    if input.previous_covered_item_count > input.history.len() {
-        return Err(UtilityError::InvalidResponse);
-    }
-    if !input.safe_before_estimate {
-        let request = normal_request(
-            input,
-            input.previous_summary.as_ref(),
-            &input.history[input.previous_covered_item_count..],
-        )?;
-        return Ok(bytes_to_tokens(estimate_request_bytes(&request)?));
-    }
-    // The source may be over Runtime's history limit or contain an exchange
-    // that cannot be represented as one ModelRequest. Estimate its bounded
-    // serialized payload item-by-item instead of constructing that invalid
-    // full request before the utility has had a chance to replace it.
-    let mut bytes = 128usize
-        .saturating_add(input.project_instructions.byte_len())
-        .saturating_add(
-            input
-                .previous_summary
-                .as_ref()
-                .map_or(0, BoundedText::byte_len),
-        )
-        .saturating_add(
-            serde_json::to_vec(&input.tool_schemas)
-                .map_err(|_| UtilityError::Serialization)?
-                .len(),
-        );
-    for item in &input.history[input.previous_covered_item_count..] {
-        if Instant::now() >= input.operation_deadline {
-            return Err(UtilityError::Timeout);
-        }
-        bytes = bytes.saturating_add(
-            serde_json::to_vec(item)
-                .map_err(|_| UtilityError::Serialization)?
-                .len(),
-        );
-    }
-    Ok(bytes_to_tokens(bytes))
+    let request = normal_request(
+        input,
+        input.previous_summary.as_ref(),
+        &input.history[input.previous_covered_item_count..],
+    )?;
+    Ok(bytes_to_tokens(estimate_request_bytes(&request)?))
 }
 
 fn estimate_after_tokens(
@@ -1005,7 +965,10 @@ fn make_request(
 }
 
 fn estimate_request_bytes(request: &ModelRequest) -> Result<usize, UtilityError> {
-    let mut writer = CountingWriter { bytes: 0 };
+    let mut writer = CappedWriter {
+        bytes: 0,
+        cap: usize::MAX,
+    };
     crate::models::serialize_openai_request_for_budget(request, &mut writer)
         .map_err(|_| UtilityError::Serialization)?;
     writer
@@ -1014,15 +977,17 @@ fn estimate_request_bytes(request: &ModelRequest) -> Result<usize, UtilityError>
         .ok_or(UtilityError::TooLarge)
 }
 
-struct CountingWriter {
-    bytes: usize,
+pub(super) struct CappedWriter {
+    pub(super) bytes: usize,
+    pub(super) cap: usize,
 }
 
-impl Write for CountingWriter {
+impl Write for CappedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.bytes = self
             .bytes
             .checked_add(bytes.len())
+            .filter(|total| *total <= self.cap)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "serialized length"))?;
         Ok(bytes.len())
     }

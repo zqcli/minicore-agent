@@ -47,7 +47,7 @@ use crate::tools::command::CommandOwners;
 use crate::tools::observe::ToolObserver;
 use crate::workspace::{Workspace, WorkspaceError};
 
-mod compact;
+pub(crate) mod compact;
 
 #[cfg(test)]
 static PANIC_WORKERS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
@@ -55,8 +55,6 @@ static PANIC_WORKERS: OnceLock<Mutex<Vec<SessionId>>> = OnceLock::new();
 type WorkerGateEntry = (SessionId, Arc<WorkerGate>);
 #[cfg(test)]
 static PAUSE_BEFORE_JOIN: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
-#[cfg(test)]
-static PAUSE_AFTER_COMPACTION_RESULT: OnceLock<Mutex<Vec<WorkerGateEntry>>> = OnceLock::new();
 #[cfg(test)]
 type RuntimeStartGateEntry = (SessionId, Arc<RuntimeStartGate>);
 #[cfg(test)]
@@ -204,27 +202,6 @@ fn take_pause_after_runtime_start(session_id: SessionId) -> Option<Arc<RuntimeSt
 #[cfg(test)]
 fn take_pause_before_join(session_id: SessionId) -> Option<Arc<WorkerGate>> {
     let mut gates = PAUSE_BEFORE_JOIN
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
-    gates
-        .iter()
-        .position(|(candidate, _)| *candidate == session_id)
-        .map(|position| gates.remove(position).1)
-}
-
-#[cfg(test)]
-pub(crate) fn pause_next_compaction_after_result(session_id: SessionId, gate: Arc<WorkerGate>) {
-    PAUSE_AFTER_COMPACTION_RESULT
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap()
-        .push((session_id, gate));
-}
-
-#[cfg(test)]
-fn take_pause_after_compaction_result(session_id: SessionId) -> Option<Arc<WorkerGate>> {
-    let mut gates = PAUSE_AFTER_COMPACTION_RESULT
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap();
@@ -658,6 +635,7 @@ struct CompactionReservation {
     /// never gated by this estimate.
     automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
     trigger_tokens: Option<u64>,
+    history_triggered: bool,
     deadline: Instant,
 }
 
@@ -2227,7 +2205,7 @@ fn map_loop_event(
             // the lookup remains best-effort because the event and presentation
             // channels have independent delivery/drop semantics. Terminal
             // structured facts are recorded once by `tool_execution_event`.
-            let presentation_result = session.presentation().tool_result(
+            let presentation_result = session.presentation().take_tool_result(
                 crate::tools::observe::RequestKey {
                     loop_id,
                     request_index,

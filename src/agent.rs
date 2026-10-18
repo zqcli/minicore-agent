@@ -223,10 +223,12 @@ impl ExecutionConfigFactory<'_> {
             .get_utility(&record.model)
             .map_err(map_model_config_error)?;
         let auto = self.policy.enabled.then(|| AutoContext {
-            model: utility_model,
-            budget: Arc::clone(&budget),
-            policy: self.policy,
-            max_prompt_messages: options.limits.max_prompt_messages,
+            binding: crate::compaction::auto::AutoContextBinding {
+                model: utility_model,
+                budget: Arc::clone(&budget),
+                policy: self.policy,
+                limits: options.limits,
+            },
             state: Arc::clone(&self.compaction),
         });
         // The binding is published only when the Session actually installs

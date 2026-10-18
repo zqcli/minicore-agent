@@ -1,6 +1,12 @@
 //! Manual and independent post-turn compaction share ownership and commit helpers.
 use super::*;
 
+#[cfg(test)]
+pub(crate) static PAUSE_AFTER_RESULT: crate::test_support::Registry<
+    SessionId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
 pub(super) struct CompactionCompletionGuard {
     session: Session,
     operation: Arc<CompactionOperation>,
@@ -82,16 +88,8 @@ impl CompactionOperation {
 
     fn unknown_write_result(&self) -> CompactionResult {
         CompactionResult {
-            operation_id: self.operation_id.clone(),
-            origin: self.origin,
             status: CompactionStatus::UnknownWrite,
-            before_tokens: None,
-            after_tokens: None,
-            covered_loop_count: 0,
-            covered_item_count: 0,
-            retained_item_count: 0,
-            utility_usage: None,
-            failure_kind: Some("write_outcome_unknown".to_owned()),
+            ..self.failed_result("write_outcome_unknown", None)
         }
     }
 
@@ -111,7 +109,6 @@ impl CompactionOperation {
                 self.state.store(COMPACTION_COMPLETED, Ordering::Release);
                 result
             }
-            Err(COMPACTION_COMPLETED) => result,
             Err(_) => result,
         };
         self.result.send_replace(Some(result.clone()));
@@ -310,6 +307,11 @@ impl Session {
             hard_tokens: budget.hard_tokens,
             automatic_budget: Some(Arc::clone(&auto.budget)),
             trigger_tokens: Some(budget.trigger_tokens),
+            history_triggered: auto.policy.history_triggered(
+                &inner.history[previous_covered_item_count..],
+                &[],
+                &auto.limits,
+            ),
             deadline: Instant::now()
                 .checked_add(inner.options.model_timeout)
                 .unwrap_or_else(Instant::now),
@@ -390,6 +392,7 @@ impl Session {
                 hard_tokens: descriptor.context_window,
                 automatic_budget: None,
                 trigger_tokens: None,
+                history_triggered: false,
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
                     .unwrap_or_else(Instant::now),
@@ -646,10 +649,7 @@ pub(super) async fn run_compaction(session: Session, reservation: CompactionRese
     let result = run_compaction_inner(&session, &reservation).await;
     completion.publish(result);
     #[cfg(test)]
-    if let Some(gate) = take_pause_after_compaction_result(session.session_id()) {
-        gate.started.notify_one();
-        gate.release.notified().await;
-    }
+    tests::pause_after_result(session.session_id()).await;
 }
 
 pub(super) async fn run_compaction_inner(
@@ -779,7 +779,6 @@ pub(super) async fn run_compaction_inner(
         project_instructions: system_prompt,
         tool_schemas: reservation.tool_schemas.clone(),
         hard_tokens: reservation.hard_tokens,
-        safe_before_estimate: false,
         operation_deadline: reservation.deadline,
         live_usage: None,
     };
@@ -821,7 +820,7 @@ pub(super) async fn run_compaction_inner(
                 history_len,
             );
         };
-        if before < trigger {
+        if before < trigger && !reservation.history_triggered {
             return CompactionResult {
                 operation_id: reservation.operation.operation_id.clone(),
                 origin: reservation.operation.origin,
@@ -984,32 +983,10 @@ fn failed_compaction_with_usage(
     utility_usage: Option<CompactionUtilityUsage>,
 ) -> CompactionResult {
     CompactionResult {
-        operation_id: operation.operation_id.clone(),
-        origin: operation.origin,
-        status: CompactionStatus::Failed,
-        before_tokens: None,
-        after_tokens: None,
-        covered_loop_count: 0,
-        covered_item_count: 0,
         retained_item_count: history_len,
-        utility_usage,
-        failure_kind: Some(failure_kind.to_owned()),
+        ..operation.failed_result(failure_kind, utility_usage)
     }
 }
 
 #[cfg(test)]
-mod origin_tests {
-    use super::*;
-    #[test]
-    fn origin_is_owned_by_operation_not_inferred_from_identifier() {
-        for (id, origin) in [
-            ("auto-looking-manual", CompactionOrigin::Manual),
-            ("opaque-id", CompactionOrigin::Automatic),
-        ] {
-            let (operation, _) = CompactionOperation::new(id.into(), origin);
-            assert_eq!(operation.failed_result("cancelled", None).origin, origin);
-            assert_eq!(operation.unknown_write_result().origin, origin);
-            assert_eq!(failed_compaction(&operation, "timeout", 0).origin, origin);
-        }
-    }
-}
+mod tests;

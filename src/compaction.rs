@@ -20,7 +20,8 @@ pub(crate) use auto::AutoContext;
 pub(crate) use auto::compose as auto_compose;
 pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
-    ActiveRecoveryTicket, CompactingModel, compute_content_hash, recovery_source_is_safe,
+    ActiveRecoveryTicket, CompactingModel, TicketFraming, compute_content_hash,
+    recovery_source_is_safe,
 };
 pub(crate) use utility::{
     CompactionInput, UtilityError, generate_summary, generate_summary_with_tail, recent_tail_start,
@@ -41,6 +42,23 @@ pub(crate) struct CompactionPolicy {
 }
 
 impl CompactionPolicy {
+    pub(crate) fn history_triggered(
+        self,
+        base: &[HistoryItem],
+        appended: &[HistoryItem],
+        limits: &minicore_runtime::LoopLimits,
+    ) -> bool {
+        let reached = |value: usize, limit: usize| {
+            value as u128 * 100 >= limit as u128 * u128::from(self.trigger_percent)
+        };
+        reached(base.len() + appended.len(), limits.max_history_items)
+            || reached(
+                crate::sessions::estimate_history_bytes(base)
+                    .saturating_add(crate::sessions::estimate_history_bytes(appended)),
+                limits.max_history_bytes,
+            )
+    }
+
     pub(crate) const fn budget(self, context_window: u64) -> InputBudget {
         InputBudget {
             hard_tokens: context_window,
@@ -160,16 +178,7 @@ pub(crate) struct CompactionState {
     /// `context_uncompressible`. It is process-local observation, not durable
     /// state, and is cleared by a successful preparation.
     prepare_failure: Mutex<Option<String>>,
-    recovery_ticket: Mutex<Option<ActiveRecoveryTicket>>,
-    /// The reduced body of one rejected logical request. Runtime's generic
-    /// transport driver retries the original ModelRequest without re-preparing
-    /// the prompt, so this bounded slot keeps those attempts on the new base.
-    recovery_retry: Mutex<Option<RecoveryRetry>>,
-    /// Highest logical request that already consumed its one recovery for the
-    /// current loop. `request_index` advances monotonically within a loop, so a
-    /// single high-water mark blocks Driver re-entry and every older index
-    /// without a bounded list that could evict entries.
-    recovery_high_water: Mutex<Option<(LoopId, u32)>>,
+    recovery: Mutex<RecoveryState>,
     recovery_observation: Mutex<Option<RecoveryObservation>>,
     threshold: Mutex<threshold::ThresholdState>,
     /// One immutable snapshot of the settings a request boundary binds:
@@ -186,6 +195,15 @@ pub(crate) struct CompactionState {
 pub(crate) struct RequestSettings {
     pub(crate) config_generation: u64,
     pub(crate) summary_generation: u64,
+}
+
+#[derive(Default)]
+struct RecoveryState {
+    ticket: Option<ActiveRecoveryTicket>,
+    // Delivery retries must reuse the reduced request without another utility call.
+    retry: Option<RecoveryRetry>,
+    // Monotonic within a loop: consuming a ticket also excludes older requests.
+    high_water: Option<(LoopId, u32)>,
 }
 
 struct RecoveryRetry {
@@ -250,9 +268,7 @@ impl CompactionState {
             ephemeral: Mutex::new(None),
             latest_request_tokens: Mutex::new(None),
             prepare_failure: Mutex::new(None),
-            recovery_ticket: Mutex::new(None),
-            recovery_retry: Mutex::new(None),
-            recovery_high_water: Mutex::new(None),
+            recovery: Mutex::new(RecoveryState::default()),
             recovery_observation: Mutex::new(None),
             threshold: Mutex::new(threshold::ThresholdState::default()),
             settings: Mutex::new(RequestSettings::default()),
@@ -409,32 +425,6 @@ impl CompactionState {
         validate_snapshot_content(&content).map(Some).ok_or(())
     }
 
-    /// Test-only observation of reductions bound to one active turn.
-    #[cfg(test)]
-    pub(crate) fn ephemeral(&self, loop_id: LoopId) -> Option<EphemeralSummary> {
-        self.ephemeral
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|summary| summary.loop_id == Some(loop_id))
-            .cloned()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cache_ephemeral(
-        &self,
-        loop_id: LoopId,
-        key: EphemeralGroupKey,
-        summary: BoundedText,
-    ) -> bool {
-        let mut groups = self
-            .ephemeral(loop_id)
-            .map(|entry| entry.groups)
-            .unwrap_or_default();
-        groups.insert(key, summary);
-        self.install_emergency_groups(loop_id, groups)
-    }
-
     pub(crate) fn clear_ephemeral(&self, loop_id: LoopId) {
         let mut projection_removed = self.clear_threshold(loop_id);
         let mut ephemeral = self.ephemeral.lock().unwrap();
@@ -453,18 +443,21 @@ impl CompactionState {
             let mut settings = self.settings.lock().unwrap();
             settings.summary_generation = settings.summary_generation.wrapping_add(1);
         }
-        let mut high_water = self.recovery_high_water.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        let RecoveryState {
+            high_water,
+            ticket: slot,
+            retry,
+        } = &mut *recovery;
         if high_water
             .as_ref()
             .is_some_and(|(candidate, _)| *candidate == loop_id)
         {
             *high_water = None;
         }
-        let mut ticket = self.recovery_ticket.lock().unwrap();
-        if ticket.as_ref().is_some_and(|t| t.loop_id == loop_id) {
-            *ticket = None;
+        if slot.as_ref().is_some_and(|t| t.loop_id == loop_id) {
+            *slot = None;
         }
-        let mut retry = self.recovery_retry.lock().unwrap();
         if retry
             .as_ref()
             .is_some_and(|request| request.loop_id == loop_id)
@@ -479,7 +472,8 @@ impl CompactionState {
         request_index: u32,
         original_hash: [u8; 32],
     ) -> Result<Option<minicore_runtime::model::ModelRequest>, ()> {
-        let mut slot = self.recovery_retry.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        let slot = &mut recovery.retry;
         let Some(retry) = slot.as_ref() else {
             return Ok(None);
         };
@@ -500,7 +494,7 @@ impl CompactionState {
         original_hash: [u8; 32],
         request: minicore_runtime::model::ModelRequest,
     ) {
-        *self.recovery_retry.lock().unwrap() = Some(RecoveryRetry {
+        self.recovery.lock().unwrap().retry = Some(RecoveryRetry {
             loop_id,
             request_index,
             original_hash,
@@ -530,8 +524,12 @@ impl CompactionState {
         request_index: u32,
         ticket: Option<ActiveRecoveryTicket>,
     ) {
-        let high_water = self.recovery_high_water.lock().unwrap();
-        let mut slot = self.recovery_ticket.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        let RecoveryState {
+            high_water,
+            ticket: slot,
+            ..
+        } = &mut *recovery;
         if high_water
             .as_ref()
             .is_some_and(|(candidate, index)| *candidate == loop_id && request_index <= *index)
@@ -546,7 +544,8 @@ impl CompactionState {
     /// Used when the request could not be bound (serialization failure or a
     /// content change after preparation) so recovery fails closed.
     pub(crate) fn discard_recovery_ticket(&self, loop_id: LoopId, request_index: u32) {
-        let mut slot = self.recovery_ticket.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        let slot = &mut recovery.ticket;
         if slot.as_ref().is_some_and(|ticket| {
             ticket.loop_id == loop_id && ticket.request_index == request_index
         }) {
@@ -554,7 +553,6 @@ impl CompactionState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_actual_request_ticket(
         &self,
         loop_id: LoopId,
@@ -563,9 +561,9 @@ impl CompactionState {
         ticket_hash: [u8; 32],
         limits: minicore_runtime::model::ModelLimits,
         original_body_bytes: usize,
-        original_tokens: u64,
     ) {
-        let mut slot = self.recovery_ticket.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        let slot = &mut recovery.ticket;
         let Some(ticket) = slot.as_ref() else {
             return;
         };
@@ -583,7 +581,6 @@ impl CompactionState {
         ticket.ticket_hash = Some(ticket_hash);
         ticket.limits = limits;
         ticket.original_body_bytes = original_body_bytes;
-        ticket.original_tokens = original_tokens;
     }
 
     pub(crate) fn claim_recovery_ticket(
@@ -593,14 +590,18 @@ impl CompactionState {
         request: &minicore_runtime::model::ModelRequest,
         model_descriptor: &minicore_runtime::model::ModelDescriptor,
     ) -> Result<ActiveRecoveryTicket, recovery::TicketClaimError> {
-        let mut high_water = self.recovery_high_water.lock().unwrap();
+        let mut recovery = self.recovery.lock().unwrap();
+        let RecoveryState {
+            high_water,
+            ticket: slot,
+            ..
+        } = &mut *recovery;
         if high_water
             .as_ref()
             .is_some_and(|(candidate, index)| *candidate == loop_id && request_index <= *index)
         {
             return Err(recovery::TicketClaimError::AlreadyConsumed);
         }
-        let mut slot = self.recovery_ticket.lock().unwrap();
         let Some(ticket) = slot.as_ref() else {
             return Err(recovery::TicketClaimError::NoTicket);
         };
@@ -611,35 +612,26 @@ impl CompactionState {
         // config or summary change during the raw start must invalidate the
         // ticket instead of silently recovering with stale sources.
         let settings = self.request_settings();
-        let content_hash = recovery::compute_content_hash(
+        let framing = recovery::TicketFraming {
             loop_id,
             request_index,
-            request.messages(),
-            request.tools(),
+            messages: request.messages(),
+            tools: request.tools(),
             model_descriptor,
-            request.reasoning(),
-            settings.config_generation,
-            settings.summary_generation,
-        )
-        .map_err(|_| recovery::TicketClaimError::StaleTicket)?;
+            reasoning: request.reasoning(),
+            config_generation: settings.config_generation,
+            summary_generation: settings.summary_generation,
+        };
+        let content_hash = recovery::compute_content_hash(&framing)
+            .map_err(|_| recovery::TicketClaimError::StaleTicket)?;
         if content_hash != ticket.content_hash {
             return Err(recovery::TicketClaimError::StaleTicket);
         }
         let Some(bound_hash) = ticket.ticket_hash else {
             return Err(recovery::TicketClaimError::StaleTicket);
         };
-        let ticket_hash = recovery::compute_ticket_hash(
-            loop_id,
-            request_index,
-            request.messages(),
-            request.tools(),
-            request.limits(),
-            model_descriptor,
-            request.reasoning(),
-            settings.config_generation,
-            settings.summary_generation,
-        )
-        .map_err(|_| recovery::TicketClaimError::StaleTicket)?;
+        let ticket_hash = recovery::compute_ticket_hash(&framing, request.limits())
+            .map_err(|_| recovery::TicketClaimError::StaleTicket)?;
         if ticket_hash != bound_hash {
             return Err(recovery::TicketClaimError::StaleTicket);
         }
@@ -653,15 +645,12 @@ impl CompactionState {
         request_index: u32,
         before_tokens: Option<u64>,
     ) {
-        *self.recovery_observation.lock().unwrap() = Some(RecoveryObservation {
+        *self.recovery_observation.lock().unwrap() = Some(RecoveryObservation::new(
             loop_id,
             request_index,
             before_tokens,
-            after_tokens: None,
-            utility_usage: None,
-            outcome: "recovering".to_owned(),
-            failure_kind: None,
-        });
+            "recovering",
+        ));
     }
 
     pub(crate) fn record_recovery_success(
@@ -673,13 +662,9 @@ impl CompactionState {
         utility_usage: Option<CompactionUtilityUsage>,
     ) {
         *self.recovery_observation.lock().unwrap() = Some(RecoveryObservation {
-            loop_id,
-            request_index,
-            before_tokens,
             after_tokens,
-            utility_usage: utility_usage.clone(),
-            outcome: "recovered".to_owned(),
-            failure_kind: None,
+            utility_usage,
+            ..RecoveryObservation::new(loop_id, request_index, before_tokens, "recovered")
         });
     }
 
@@ -692,13 +677,9 @@ impl CompactionState {
         failure_kind: &str,
     ) {
         *self.recovery_observation.lock().unwrap() = Some(RecoveryObservation {
-            loop_id,
-            request_index,
-            before_tokens,
-            after_tokens: None,
-            utility_usage: utility_usage.clone(),
-            outcome: "recovery_failed".to_owned(),
+            utility_usage,
             failure_kind: Some(failure_kind.to_owned()),
+            ..RecoveryObservation::new(loop_id, request_index, before_tokens, "recovery_failed")
         });
     }
 

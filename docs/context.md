@@ -29,7 +29,13 @@ The default trigger is `estimated_context >= 95% * effective_input_window`;
 existing explicit percentages are preserved. The denominator is physical context
 minus the configured output and safety allowances. This deliberately differs
 from Pi 1.0.1's strict `>` physical-window-minus-16384 condition and its recent-token
-cutoff. Target percent remains advisory.
+cutoff. The same configured trigger percentage also applies to Runtime's
+`max_history_items` and `max_history_bytes` admission limits: reaching either
+settled-history threshold starts a reduction attempt even with a large model
+window. First-request checks exclude newly accepted User/Steer items; later
+checks include the accumulated history. These are proactive attempts, not a
+startup bypass: history already over Runtime's admission limits is still rejected.
+Target percent remains advisory.
 
 First-request checks exclude the newly accepted Prompt and Steers. Later checks
 run only after complete assistant/tool exchanges, under the active turn's normal
@@ -81,8 +87,9 @@ usage and does not consume the manual operation-ID quota.
 
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
-trigger it finishes Noop without a utility call. At or above the trigger it uses
-the single-call summary engine only if a safe older prefix can advance. If the
+token trigger and both Runtime history triggers it finishes Noop without a
+utility call. At or above any trigger it uses the single-call summary engine
+only if a safe older prefix can advance. If the
 recent complete-loop tail leaves no progress or cannot fit with fixed request
 content and a summary, the operation fails explicitly without dropping that tail.
 An existing fully covered emergency projection keeps its automatic refresh path;
@@ -157,8 +164,14 @@ that the former post-serialization token veto did not prevent.
 Recovery shares the active request's cancellation/deadline and does not finish
 the turn early. It accumulates summaries locally, validates tool pairing and the
 actual provider-normalized reduced request, and installs only a successful,
-strictly smaller fitting projection. Failure, no reduction or a second overflow
-exits finitely. The installed source-hash-bound base survives subsequent requests
+strictly smaller fitting projection. Independent source groups are tried largest
+byte size first, with source order breaking ties. A non-shrinking group is skipped
+and its utility usage is still counted. Recovery stops once the reconstruction
+fits the soft trigger; if candidates are exhausted first, it accepts the smallest
+valid reconstruction found only when it is strictly smaller than the rejected
+body and within the hard limit. Exhausting candidates without an acceptable
+reconstruction reports `context_uncompressible`, including when every summary
+fails to shrink its group. Failure, no reduction or a second overflow exits finitely. The installed source-hash-bound base survives subsequent requests
 and ordinary delivery retries; later genuine context growth in a new logical
 request can have a new recovery opportunity, without imposing a tool-round cap.
 
@@ -221,7 +234,8 @@ compaction. Clients may reread state/context to confirm operation termination;
 those queries do not reload the disk snapshot. Subsequent ordinary loading uses
 the existing snapshot validation. Do not blindly retry an uncertain operation.
 
-`last_prepare_failure` and recovery observations are process-local. Bounded read
-cancellation/deadline uses `query_limit`, not a generic compaction error. No
+`last_prepare_failure` and recovery observations are process-local. A successful
+preparation, including a threshold Noop, clears an earlier preparation failure.
+Bounded read cancellation/deadline uses `query_limit`, not a generic compaction error. No
 compaction deletes `history.jsonl`, backfills old timestamps, or promotes summary
 text to a system instruction. See [the RPC contract](rpc.md) for wire fields.

@@ -34,7 +34,6 @@ use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
 use crate::read::{ToolReadGate, gate_next_tool_read};
-use crate::sessions::{WorkerGate, pause_next_compaction_after_result};
 use crate::store::{
     SummaryCommitGate, fail_next_append, fail_next_record_write, fail_next_summary_write,
     force_unknown_summary_write, gate_next_summary_commit,
@@ -2661,8 +2660,8 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
     let _ = harness.response(json!("wait")).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_compaction_after_result(
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::sessions::compact::PAUSE_AFTER_RESULT.arm(
         session_id.as_str().unwrap().parse().unwrap(),
         Arc::clone(&gate),
     );

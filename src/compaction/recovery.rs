@@ -16,11 +16,11 @@ use minicore_runtime::tools::ToolSpec;
 use minicore_runtime::value::BoundedText;
 
 use super::auto::{
-    AutoContext, AutoContextBinding, GroupSummaryRequest, compressible_ranges, current_user_texts,
-    estimate_tokens_with_budget, fold_history, merge_utility_usage, minimal_messages,
+    AutoContext, AutoContextBinding, GroupSummaryRequest, current_user_texts,
+    estimate_tokens_with_budget, fold_history_with_ranges, merge_utility_usage, minimal_messages,
     summarize_group,
 };
-use super::{CONTEXT_UNCOMPRESSIBLE, CompactionState, auto_compose};
+use super::{CONTEXT_UNCOMPRESSIBLE, CompactionState};
 use crate::compaction::CompactionUtilityUsage;
 use crate::models::ProviderBudget;
 
@@ -37,7 +37,6 @@ pub(crate) struct ActiveRecoveryTicket {
     pub(crate) content_hash: [u8; 32],
     pub(crate) ticket_hash: Option<[u8; 32]>,
     pub(crate) original_body_bytes: usize,
-    pub(crate) original_tokens: u64,
     pub(crate) system: BoundedText,
     pub(crate) summary: Option<BoundedText>,
     pub(crate) base: Vec<HistoryItem>,
@@ -64,7 +63,7 @@ pub(crate) fn recovery_source_is_safe(
     appended: &[HistoryItem],
     tools: &[ToolSpec],
 ) -> bool {
-    let mut writer = CappedWriter {
+    let mut writer = super::utility::CappedWriter {
         bytes: 0,
         cap: MAX_RECOVERY_SOURCE_BYTES,
     };
@@ -75,103 +74,44 @@ pub(crate) fn recovery_source_is_safe(
         && serde_json::to_writer(&mut writer, tools).is_ok()
 }
 
-struct CappedWriter {
-    bytes: usize,
-    cap: usize,
+pub(crate) struct TicketFraming<'a> {
+    pub(crate) loop_id: LoopId,
+    pub(crate) request_index: u32,
+    pub(crate) messages: &'a [ModelMessage],
+    pub(crate) tools: &'a [ToolSpec],
+    pub(crate) model_descriptor: &'a ModelDescriptor,
+    pub(crate) reasoning: ReasoningPreference,
+    pub(crate) config_generation: u64,
+    pub(crate) summary_generation: u64,
 }
 
-impl std::io::Write for CappedWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let next = self.bytes.saturating_add(bytes.len());
-        if next > self.cap {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "recovery source exceeds cap",
-            ));
-        }
-        self.bytes = next;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+/// Preparation binds content before Runtime supplies the actual model limits.
+pub(crate) fn compute_content_hash(framing: &TicketFraming<'_>) -> Result<[u8; 32], ModelError> {
+    hash_ticket_inputs(framing, None)
 }
 
-/// Hashes every request input except `ModelLimits`. Preparation uses this to
-/// fix the request content it planned; the start boundary recomputes it to
-/// prove the actual request still matches before binding real limits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compute_content_hash(
-    loop_id: LoopId,
-    request_index: u32,
-    messages: &[ModelMessage],
-    tools: &[ToolSpec],
-    model_descriptor: &ModelDescriptor,
-    reasoning: ReasoningPreference,
-    config_generation: u64,
-    summary_generation: u64,
-) -> Result<[u8; 32], ModelError> {
-    let mut hasher = Sha256::new();
-    hash_ticket_inputs(
-        &mut hasher,
-        loop_id,
-        request_index,
-        messages,
-        tools,
-        reasoning,
-        None,
-        model_descriptor,
-        config_generation,
-        summary_generation,
-    )?;
-    Ok(hasher.finalize().into())
-}
-
-/// Computes the strict binding hash for one recovery ticket, capturing full
-/// request framing including the actual `ModelLimits`, tool schemas,
-/// descriptor capabilities, generations, and loop/request identity.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_ticket_hash(
-    loop_id: LoopId,
-    request_index: u32,
-    messages: &[ModelMessage],
-    tools: &[ToolSpec],
+    framing: &TicketFraming<'_>,
     limits: &ModelLimits,
-    model_descriptor: &ModelDescriptor,
-    reasoning: ReasoningPreference,
-    config_generation: u64,
-    summary_generation: u64,
 ) -> Result<[u8; 32], ModelError> {
-    let mut hasher = Sha256::new();
-    hash_ticket_inputs(
-        &mut hasher,
+    hash_ticket_inputs(framing, Some(limits))
+}
+
+fn hash_ticket_inputs(
+    framing: &TicketFraming<'_>,
+    limits: Option<&ModelLimits>,
+) -> Result<[u8; 32], ModelError> {
+    let TicketFraming {
         loop_id,
         request_index,
         messages,
         tools,
-        reasoning,
-        Some(limits),
         model_descriptor,
+        reasoning,
         config_generation,
         summary_generation,
-    )?;
-    Ok(hasher.finalize().into())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn hash_ticket_inputs(
-    hasher: &mut Sha256,
-    loop_id: LoopId,
-    request_index: u32,
-    messages: &[ModelMessage],
-    tools: &[ToolSpec],
-    reasoning: ReasoningPreference,
-    limits: Option<&ModelLimits>,
-    model_descriptor: &ModelDescriptor,
-    config_generation: u64,
-    summary_generation: u64,
-) -> Result<(), ModelError> {
+    } = framing;
+    let mut hasher = Sha256::new();
     hasher.update(loop_id.to_string().as_bytes());
     hasher.update(request_index.to_le_bytes());
     let messages_json = serde_json::to_vec(messages)
@@ -196,7 +136,7 @@ fn hash_ticket_inputs(
     hasher.update(&reasoning_json);
     hasher.update(config_generation.to_le_bytes());
     hasher.update(summary_generation.to_le_bytes());
-    Ok(())
+    Ok(hasher.finalize().into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -209,6 +149,25 @@ pub struct RecoveryObservation {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<String>,
+}
+
+impl RecoveryObservation {
+    pub(super) fn new(
+        loop_id: LoopId,
+        request_index: u32,
+        before_tokens: Option<u64>,
+        outcome: &str,
+    ) -> Self {
+        Self {
+            loop_id,
+            request_index,
+            before_tokens,
+            after_tokens: None,
+            utility_usage: None,
+            outcome: outcome.into(),
+            failure_kind: None,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -282,31 +241,50 @@ pub(crate) enum RecoveryReconstructionError {
     Other(String),
 }
 
+impl RecoveryReconstructionError {
+    fn kind(&self) -> &str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timeout",
+            Self::Uncompressible => CONTEXT_UNCOMPRESSIBLE,
+            Self::InvalidToolExchanges => "invalid_tool_exchanges",
+            Self::Other(kind) => kind,
+        }
+    }
+}
+
+impl From<super::UtilityError> for RecoveryReconstructionError {
+    fn from(error: super::UtilityError) -> Self {
+        match error {
+            super::UtilityError::Cancelled => Self::Cancelled,
+            super::UtilityError::Timeout => Self::Timeout,
+            other => Self::Other(other.kind().into()),
+        }
+    }
+}
+
 /// Folds the retained sources exactly as the provider will see them and
 /// measures the real normalized request. Returns `None` when the projection
 /// cannot be represented as a valid request within the message ceiling.
-#[allow(clippy::too_many_arguments)]
 fn measure_reconstruction(
     ticket: &ActiveRecoveryTicket,
     auto: &AutoContext,
     budget: &dyn ProviderBudget,
-    fixed: &[ModelMessage],
-    history_messages: &[ModelMessage],
-    loop_id: LoopId,
-    request_index: u32,
+    projection: &super::auto::Projection<'_>,
     folded: &BTreeMap<super::EphemeralGroupKey, BoundedText>,
 ) -> Option<(ModelRequest, u64, usize)> {
-    let messages = fold_history(
-        fixed,
-        history_messages,
-        &ticket.base,
-        &ticket.appended,
-        loop_id,
+    let messages = fold_history_with_ranges(
+        &projection.fixed,
+        &projection.history,
+        &projection.ranges,
         folded,
         None,
     )
     .ok()?;
-    if messages.len() > auto.max_prompt_messages || !validate_clean_tool_exchanges(&messages) {
+    let loop_id = ticket.loop_id;
+    let request_index = ticket.request_index;
+    if messages.len() > auto.limits.max_prompt_messages || !validate_clean_tool_exchanges(&messages)
+    {
         return None;
     }
     let request = ModelRequest::new(
@@ -327,50 +305,57 @@ fn measure_reconstruction(
 
 /// Performs clean reconstruction by folding all remaining compressible groups
 /// and verifying that every tool exchange is valid and complete.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconstruct_for_recovery(
     ticket: &ActiveRecoveryTicket,
     auto: &AutoContext,
     budget: &dyn ProviderBudget,
     cancellation: &CancellationToken,
     deadline: Instant,
-    loop_id: LoopId,
-    request_index: u32,
-    existing_usage: Option<CompactionUtilityUsage>,
 ) -> (
     Result<ModelRequest, RecoveryReconstructionError>,
     Option<CompactionUtilityUsage>,
 ) {
-    let mut utility_usage = existing_usage;
+    let mut utility_usage = None;
+    let result = reconstruct_inner(
+        ticket,
+        auto,
+        budget,
+        cancellation,
+        deadline,
+        &mut utility_usage,
+    )
+    .await;
+    (result, utility_usage)
+}
 
-    if cancellation.is_cancelled() {
-        return (Err(RecoveryReconstructionError::Cancelled), utility_usage);
-    }
-    if Instant::now() >= deadline {
-        return (Err(RecoveryReconstructionError::Timeout), utility_usage);
-    }
+async fn reconstruct_inner(
+    ticket: &ActiveRecoveryTicket,
+    auto: &AutoContext,
+    budget: &dyn ProviderBudget,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    utility_usage: &mut Option<CompactionUtilityUsage>,
+) -> Result<ModelRequest, RecoveryReconstructionError> {
+    let loop_id = ticket.loop_id;
+    let request_index = ticket.request_index;
+    super::utility::check_active(cancellation, deadline)?;
 
     // No baseline body means the retry can never be proven smaller; refuse
     // before spending utility calls on a summary with no comparison point.
     if ticket.original_body_bytes == 0 {
-        return (
-            Err(RecoveryReconstructionError::Uncompressible),
-            utility_usage,
-        );
+        return Err(RecoveryReconstructionError::Uncompressible);
     }
 
-    let hard_tokens = auto.model.descriptor().context_window;
+    let limits = auto.policy.budget(auto.model.descriptor().context_window);
+    let hard_tokens = limits.hard_tokens;
     let users = current_user_texts(&ticket.base, &ticket.appended, loop_id);
     let minimal = match minimal_messages(&ticket.system, &users) {
         Ok(min) => min,
         Err(err) => {
-            return (
-                Err(RecoveryReconstructionError::Other(format!(
-                    "minimal messages: {:?}",
-                    err.kind()
-                ))),
-                utility_usage,
-            );
+            return Err(RecoveryReconstructionError::Other(format!(
+                "minimal messages: {:?}",
+                err.kind()
+            )));
         }
     };
     let minimal_tokens = match estimate_tokens_with_budget(
@@ -383,10 +368,7 @@ pub(crate) async fn reconstruct_for_recovery(
     ) {
         Ok(tok) => tok,
         Err(_) => {
-            return (
-                Err(RecoveryReconstructionError::Uncompressible),
-                utility_usage,
-            );
+            return Err(RecoveryReconstructionError::Uncompressible);
         }
     };
     // The irreducible system + current User/Steer + tool schema floor is
@@ -394,31 +376,17 @@ pub(crate) async fn reconstruct_for_recovery(
     // floor that already consumes the whole window leaves no room for a
     // summary at all.
     if minimal_tokens >= hard_tokens {
-        return (
-            Err(RecoveryReconstructionError::Uncompressible),
-            utility_usage,
-        );
+        return Err(RecoveryReconstructionError::Uncompressible);
     }
-    let items: Vec<&HistoryItem> = ticket.base.iter().chain(ticket.appended.iter()).collect();
-    let ranges = match compressible_ranges(ticket.base.len(), &items, loop_id) {
-        Ok(r) => r,
-        Err(err) => {
-            return (
-                Err(RecoveryReconstructionError::Other(format!(
-                    "ranges: {:?}",
-                    err.kind()
-                ))),
-                utility_usage,
-            );
-        }
-    };
-
-    let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
-    if auto
-        .state
-        .consolidated(loop_id, ticket.summary.as_ref(), &valid)
-        .is_some()
-    {
+    let mut projection = super::auto::Projection::new(
+        &auto.state,
+        &ticket.system,
+        ticket.summary.as_ref(),
+        &ticket.base,
+        &ticket.appended,
+        loop_id,
+    )?;
+    if projection.consolidated.is_some() {
         let result = super::threshold::consolidate(
             super::threshold::ProjectionInput {
                 auto,
@@ -440,53 +408,18 @@ pub(crate) async fn reconstruct_for_recovery(
         .await;
         return match result {
             Ok(result) if result.compacted => {
-                merge_utility_usage(&mut utility_usage, result.usage);
-                (Ok(result.request), utility_usage)
+                merge_utility_usage(utility_usage, result.usage);
+                Ok(result.request)
             }
-            Ok(_) => (
-                Err(RecoveryReconstructionError::Uncompressible),
-                utility_usage,
-            ),
+            Ok(_) => Err(RecoveryReconstructionError::Uncompressible),
             Err(error) => {
-                merge_utility_usage(&mut utility_usage, error.usage);
-                let error = match error.error {
-                    super::UtilityError::Cancelled => RecoveryReconstructionError::Cancelled,
-                    super::UtilityError::Timeout => RecoveryReconstructionError::Timeout,
-                    other => RecoveryReconstructionError::Other(other.kind().into()),
-                };
-                (Err(error), utility_usage)
+                merge_utility_usage(utility_usage, error.usage);
+                Err(error.error.into())
             }
         };
     }
 
-    // If there is no compressible group, recovery cannot shrink anything without dropping user constraints.
-    if ranges.is_empty() {
-        return (
-            Err(RecoveryReconstructionError::Uncompressible),
-            utility_usage,
-        );
-    }
-
-    let (fixed, history_messages) = match auto_compose(
-        &ticket.system,
-        ticket.summary.as_ref(),
-        &ticket.base,
-        &ticket.appended,
-    ) {
-        Ok(comp) => comp,
-        Err(err) => {
-            return (
-                Err(RecoveryReconstructionError::Other(format!(
-                    "auto compose: {:?}",
-                    err.kind()
-                ))),
-                utility_usage,
-            );
-        }
-    };
-
-    let valid_keys = ranges.iter().map(|(key, _)| key.clone()).collect();
-    let mut folded = auto.state.emergency_groups(loop_id, &valid_keys);
+    let mut folded = std::mem::take(&mut projection.folded);
 
     // A retry is only worthwhile when the real, provider-normalized body is
     // strictly smaller than the body that failed and stays inside the hard
@@ -494,32 +427,25 @@ pub(crate) async fn reconstruct_for_recovery(
     // their accounting excludes opaque replay and the summary wrapper, and it
     // ignores summaries retained from earlier requests. Fold the real sources
     // and measure the actual request every time a group is replaced.
-    let mut candidates = ranges;
-    candidates.sort_by(|(left, _), (right, _)| {
-        (right.end - right.start)
-            .cmp(&(left.end - left.start))
+    let mut candidates = projection.ranges.iter().collect::<Vec<_>>();
+    candidates.sort_by(|(left, left_bytes), (right, right_bytes)| {
+        right_bytes
+            .cmp(left_bytes)
             .then(left.start.cmp(&right.start))
     });
+    let mut best = None;
 
     // Existing groups are already in the rejected request. A fresh rejection
     // must reduce a new source group, not win merely by dropping opaque replay.
 
     for (key, _) in candidates {
-        if folded.contains_key(&key) {
+        if folded.contains_key(key) {
             continue;
         }
         if folded.len() >= super::MAX_EPHEMERAL_GROUPS {
-            return (
-                Err(RecoveryReconstructionError::Uncompressible),
-                utility_usage,
-            );
+            break;
         }
-        if cancellation.is_cancelled() {
-            return (Err(RecoveryReconstructionError::Cancelled), utility_usage);
-        }
-        if Instant::now() >= deadline {
-            return (Err(RecoveryReconstructionError::Timeout), utility_usage);
-        }
+        super::utility::check_active(cancellation, deadline)?;
         let start = key.start;
         let end = key.end;
         let group: Vec<HistoryItem> = ticket
@@ -530,9 +456,6 @@ pub(crate) async fn reconstruct_for_recovery(
             .take(end - start)
             .cloned()
             .collect();
-        if group.is_empty() {
-            continue;
-        }
         let generation = match summarize_group(
             GroupSummaryRequest {
                 model: Arc::clone(&auto.model),
@@ -549,88 +472,67 @@ pub(crate) async fn reconstruct_for_recovery(
         {
             Ok(generation) => generation,
             Err(error) => {
-                merge_utility_usage(&mut utility_usage, error.utility_usage);
-                match error.error {
-                    super::utility::UtilityError::Cancelled => {
-                        return (Err(RecoveryReconstructionError::Cancelled), utility_usage);
-                    }
-                    super::utility::UtilityError::Timeout => {
-                        return (Err(RecoveryReconstructionError::Timeout), utility_usage);
-                    }
-                    other => {
-                        return (
-                            Err(RecoveryReconstructionError::Other(other.kind().to_owned())),
-                            utility_usage,
-                        );
-                    }
+                merge_utility_usage(utility_usage, error.utility_usage);
+                if matches!(error.error, super::UtilityError::NoProgress) {
+                    continue;
                 }
+                return Err(error.error.into());
             }
         };
 
-        merge_utility_usage(&mut utility_usage, generation.utility_usage);
-        folded.insert(key, generation.content);
+        merge_utility_usage(utility_usage, generation.utility_usage);
+        folded.insert(key.clone(), generation.content);
 
-        if let Some((request, tokens, bytes)) = measure_reconstruction(
-            ticket,
-            auto,
-            budget,
-            &fixed,
-            &history_messages,
-            loop_id,
-            request_index,
-            &folded,
-        ) {
-            if tokens <= hard_tokens && bytes < ticket.original_body_bytes {
-                if cancellation.is_cancelled() {
-                    return (Err(RecoveryReconstructionError::Cancelled), utility_usage);
+        if let Some((request, tokens, bytes)) =
+            measure_reconstruction(ticket, auto, budget, &projection, &folded)
+        {
+            if tokens <= hard_tokens
+                && bytes < ticket.original_body_bytes
+                && folded.values().map(BoundedText::byte_len).sum::<usize>()
+                    <= super::MAX_EPHEMERAL_BYTES
+                && (tokens <= limits.trigger_tokens
+                    || best
+                        .as_ref()
+                        .is_none_or(|(_, best_bytes, _)| bytes < *best_bytes))
+            {
+                best = Some((request, bytes, folded.clone()));
+                if tokens <= limits.trigger_tokens {
+                    break;
                 }
-                if Instant::now() >= deadline {
-                    return (Err(RecoveryReconstructionError::Timeout), utility_usage);
-                }
-                if !auto.state.install_emergency_groups(loop_id, folded) {
-                    return (
-                        Err(RecoveryReconstructionError::Uncompressible),
-                        utility_usage,
-                    );
-                }
-                return (Ok(request), utility_usage);
             }
         }
+    }
+
+    super::utility::check_active(cancellation, deadline)?;
+    if let Some((request, _, groups)) = best {
+        if auto.state.install_emergency_groups(loop_id, groups) {
+            return Ok(request);
+        }
+        return Err(RecoveryReconstructionError::Uncompressible);
     }
 
     // Nothing retained or re-derived fits the window while being strictly
     // smaller than the failed body. Keep the structural failure explicit
     // instead of retrying an unchanged request.
-    match fold_history(
-        &fixed,
-        &history_messages,
-        &ticket.base,
-        &ticket.appended,
-        loop_id,
+    match fold_history_with_ranges(
+        &projection.fixed,
+        &projection.history,
+        &projection.ranges,
         &folded,
         None,
     ) {
         Ok(messages) if !validate_clean_tool_exchanges(&messages) => {
-            return (
-                Err(RecoveryReconstructionError::InvalidToolExchanges),
-                utility_usage,
-            );
+            return Err(RecoveryReconstructionError::InvalidToolExchanges);
         }
         Err(err) => {
-            return (
-                Err(RecoveryReconstructionError::Other(format!(
-                    "fold history: {:?}",
-                    err.kind()
-                ))),
-                utility_usage,
-            );
+            return Err(RecoveryReconstructionError::Other(format!(
+                "fold history: {:?}",
+                err.kind()
+            )));
         }
         Ok(_) => {}
     }
-    (
-        Err(RecoveryReconstructionError::Uncompressible),
-        utility_usage,
-    )
+    Err(RecoveryReconstructionError::Uncompressible)
 }
 
 /// Model wrapper that intercepts structured `ContextOverflow + NotStarted` from
@@ -667,28 +569,23 @@ impl CompactingModel {
         // Runtime request, not a freshly prepared projection. Match its exact
         // framing, then continue using the already reduced request without
         // granting another recovery opportunity.
-        let original_hash = compute_ticket_hash(
+        let framing = TicketFraming {
             loop_id,
             request_index,
-            request.messages(),
-            request.tools(),
-            request.limits(),
-            self.inner.descriptor(),
-            request.reasoning(),
-            0,
-            0,
-        )?;
+            messages: request.messages(),
+            tools: request.tools(),
+            model_descriptor: self.inner.descriptor(),
+            reasoning: request.reasoning(),
+            config_generation: 0,
+            summary_generation: 0,
+        };
+        let original_hash = compute_ticket_hash(&framing, request.limits())?;
         if let Some(reduced) = self
             .state
             .recovered_request(loop_id, request_index, original_hash)
             .map_err(|_| local_model_error(ModelErrorKind::InvalidRequest))?
         {
-            if context.cancellation.is_cancelled() {
-                return Err(local_model_error(ModelErrorKind::Cancelled));
-            }
-            if Instant::now() >= context.deadline {
-                return Err(local_model_error(ModelErrorKind::Timeout));
-            }
+            check_start(&context)?;
             let cancellation = context.cancellation.clone();
             let deadline = tokio::time::Instant::from_std(context.deadline);
             self.state.note_issued_projection(
@@ -748,27 +645,13 @@ impl CompactingModel {
         // generation pair is read as one snapshot; the utility binding itself
         // stays the one the preparing provider captured in the ticket.
         let settings = self.state.request_settings();
-        let content_hash = compute_content_hash(
-            loop_id,
-            request_index,
-            request.messages(),
-            request.tools(),
-            self.inner.descriptor(),
-            request.reasoning(),
-            settings.config_generation,
-            settings.summary_generation,
-        );
-        let ticket_hash = compute_ticket_hash(
-            loop_id,
-            request_index,
-            request.messages(),
-            request.tools(),
-            request.limits(),
-            self.inner.descriptor(),
-            request.reasoning(),
-            settings.config_generation,
-            settings.summary_generation,
-        );
+        let framing = TicketFraming {
+            config_generation: settings.config_generation,
+            summary_generation: settings.summary_generation,
+            ..framing
+        };
+        let content_hash = compute_content_hash(&framing);
+        let ticket_hash = compute_ticket_hash(&framing, request.limits());
         match (content_hash, ticket_hash) {
             (Ok(content_hash), Ok(ticket_hash)) => self.state.bind_actual_request_ticket(
                 loop_id,
@@ -777,7 +660,6 @@ impl CompactingModel {
                 ticket_hash,
                 *request.limits(),
                 original_body_bytes,
-                original_tokens,
             ),
             _ => self.state.discard_recovery_ticket(loop_id, request_index),
         }
@@ -790,12 +672,7 @@ impl CompactingModel {
         // can already run synchronous side effects (for example clearing an
         // OpenAI continuation), so any interruption after this boundary can
         // only report `Unknown`.
-        if context.cancellation.is_cancelled() {
-            return Err(local_model_error(ModelErrorKind::Cancelled));
-        }
-        if Instant::now() >= context.deadline {
-            return Err(local_model_error(ModelErrorKind::Timeout));
-        }
+        check_start(&context)?;
 
         self.state.note_issued_projection(
             loop_id,
@@ -852,26 +729,18 @@ impl CompactingModel {
             }
         };
 
-        if context.cancellation.is_cancelled() {
+        let fail = |kind: &str, usage, error| {
             self.state.record_recovery_failure(
                 loop_id,
                 request_index,
                 Some(original_tokens),
-                None,
-                "cancelled",
+                usage,
+                kind,
             );
-            return Err(local_model_error(ModelErrorKind::Cancelled));
-        }
-        if Instant::now() >= context.deadline {
-            self.state.record_recovery_failure(
-                loop_id,
-                request_index,
-                Some(original_tokens),
-                None,
-                "timeout",
-            );
-            return Err(local_model_error(ModelErrorKind::Timeout));
-        }
+            error
+        };
+        check_start(&context)
+            .map_err(|error| fail(model_error_kind_str(error.kind()), None, error))?;
 
         self.state
             .record_recovery_in_progress(loop_id, request_index, Some(original_tokens));
@@ -882,87 +751,34 @@ impl CompactingModel {
             &*self.budget,
             &context.cancellation,
             context.deadline,
-            loop_id,
-            request_index,
-            None,
         )
         .await;
 
         let reduced_request = match reconstruct_res {
             Ok(req) => req,
-            Err(RecoveryReconstructionError::Cancelled) => {
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    "cancelled",
-                );
-                return Err(local_model_error(ModelErrorKind::Cancelled));
-            }
-            Err(RecoveryReconstructionError::Timeout) => {
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    "timeout",
-                );
-                return Err(local_model_error(ModelErrorKind::Timeout));
-            }
-            Err(RecoveryReconstructionError::Uncompressible) => {
-                self.state.note_prepare_failure(CONTEXT_UNCOMPRESSIBLE);
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    CONTEXT_UNCOMPRESSIBLE,
-                );
-                return Err(error);
-            }
-            Err(RecoveryReconstructionError::InvalidToolExchanges) => {
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    "invalid_tool_exchanges",
-                );
-                return Err(error);
-            }
-            Err(RecoveryReconstructionError::Other(kind)) => {
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    &kind,
-                );
-                return Err(error);
+            Err(failure) => {
+                if matches!(failure, RecoveryReconstructionError::Uncompressible) {
+                    self.state.note_prepare_failure(CONTEXT_UNCOMPRESSIBLE);
+                }
+                let returned = match &failure {
+                    RecoveryReconstructionError::Cancelled => {
+                        local_model_error(ModelErrorKind::Cancelled)
+                    }
+                    RecoveryReconstructionError::Timeout => {
+                        local_model_error(ModelErrorKind::Timeout)
+                    }
+                    _ => error,
+                };
+                return Err(fail(failure.kind(), utility_usage, returned));
             }
         };
-
-        if context.cancellation.is_cancelled() {
-            self.state.record_recovery_failure(
-                loop_id,
-                request_index,
-                Some(original_tokens),
-                utility_usage,
-                "cancelled",
-            );
-            return Err(local_model_error(ModelErrorKind::Cancelled));
-        }
-        if Instant::now() >= context.deadline {
-            self.state.record_recovery_failure(
-                loop_id,
-                request_index,
-                Some(original_tokens),
-                utility_usage,
-                "timeout",
-            );
-            return Err(local_model_error(ModelErrorKind::Timeout));
-        }
+        check_start(&context).map_err(|error| {
+            fail(
+                model_error_kind_str(error.kind()),
+                utility_usage.clone(),
+                error,
+            )
+        })?;
 
         let after_tokens = self
             .budget
@@ -988,26 +804,8 @@ impl CompactingModel {
         );
         let second_result = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => {
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    "cancelled",
-                );
-                return Err(unknown_model_error(ModelErrorKind::Cancelled));
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    "timeout",
-                );
-                return Err(unknown_model_error(ModelErrorKind::Timeout));
-            }
+            _ = cancellation.cancelled() => Err(unknown_model_error(ModelErrorKind::Cancelled)),
+            _ = tokio::time::sleep_until(deadline) => Err(unknown_model_error(ModelErrorKind::Timeout)),
             res = self.inner.start(reduced_request, context) => res,
         };
 
@@ -1022,17 +820,11 @@ impl CompactingModel {
                 );
                 Ok(stream)
             }
-            Err(second_error) => {
-                let kind_str = model_error_kind_str(second_error.kind());
-                self.state.record_recovery_failure(
-                    loop_id,
-                    request_index,
-                    Some(original_tokens),
-                    utility_usage,
-                    kind_str,
-                );
-                Err(second_error)
-            }
+            Err(second_error) => Err(fail(
+                model_error_kind_str(second_error.kind()),
+                utility_usage,
+                second_error,
+            )),
         }
     }
 }
@@ -1081,6 +873,16 @@ fn model_error_diagnostic(kind: ModelErrorKind) -> minicore_runtime::error::Diag
         BoundedText::new(message).expect("static diagnostic text"),
         false,
     )
+}
+
+fn check_start(context: &ModelCallContext) -> Result<(), ModelError> {
+    if context.cancellation.is_cancelled() {
+        Err(local_model_error(ModelErrorKind::Cancelled))
+    } else if Instant::now() >= context.deadline {
+        Err(local_model_error(ModelErrorKind::Timeout))
+    } else {
+        Ok(())
+    }
 }
 
 /// Local failure raised before any raw model work was started.

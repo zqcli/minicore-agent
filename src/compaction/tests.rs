@@ -214,16 +214,16 @@ fn ticket_content_hash(
     request: &minicore_runtime::model::ModelRequest,
     descriptor: &minicore_runtime::model::ModelDescriptor,
 ) -> [u8; 32] {
-    super::recovery::compute_content_hash(
+    super::recovery::compute_content_hash(&crate::compaction::recovery::TicketFraming {
         loop_id,
         request_index,
-        request.messages(),
-        request.tools(),
-        descriptor,
-        request.reasoning(),
-        0,
-        0,
-    )
+        messages: request.messages(),
+        tools: request.tools(),
+        model_descriptor: descriptor,
+        reasoning: request.reasoning(),
+        config_generation: 0,
+        summary_generation: 0,
+    })
     .unwrap()
 }
 
@@ -236,15 +236,17 @@ fn ticket_full_hash(
     summary_generation: u64,
 ) -> [u8; 32] {
     super::recovery::compute_ticket_hash(
-        loop_id,
-        request_index,
-        request.messages(),
-        request.tools(),
+        &crate::compaction::recovery::TicketFraming {
+            loop_id,
+            request_index,
+            messages: request.messages(),
+            tools: request.tools(),
+            model_descriptor: descriptor,
+            reasoning: request.reasoning(),
+            config_generation,
+            summary_generation,
+        },
         request.limits(),
-        descriptor,
-        request.reasoning(),
-        config_generation,
-        summary_generation,
     )
     .unwrap()
 }
@@ -273,7 +275,6 @@ fn register_test_ticket(
                 0,
             )),
             original_body_bytes: 128,
-            original_tokens: 32,
             system: BoundedText::new("system").unwrap(),
             summary: None,
             base: Vec::new(),
@@ -402,7 +403,6 @@ fn recovery_ticket_binding_covers_actual_limits_and_content() {
         ticket_full_hash(loop_id, 0, &actual, &descriptor, 0, 0),
         *actual.limits(),
         256,
-        64,
     );
     assert!(matches!(
         claim_ticket(&dropped_state, loop_id, 0, &actual, &descriptor),
@@ -427,7 +427,6 @@ fn recovery_ticket_binding_covers_actual_limits_and_content() {
         ticket_full_hash(loop_id, 0, &actual, &descriptor, 0, 0),
         *actual.limits(),
         256,
-        64,
     );
     assert!(matches!(
         claim_ticket(&bound_state, loop_id, 0, &planned, &descriptor),
@@ -435,7 +434,6 @@ fn recovery_ticket_binding_covers_actual_limits_and_content() {
     ));
     let bound = claim_ticket(&bound_state, loop_id, 0, &actual, &descriptor).unwrap();
     assert_eq!(bound.original_body_bytes, 256);
-    assert_eq!(bound.original_tokens, 64);
     assert_eq!(bound.limits, *actual.limits());
 }
 
@@ -497,4 +495,29 @@ fn recovery_high_water_blocks_reentry_and_older_indices() {
         claim_ticket(&state, loop_b, 0, &request, &descriptor),
         Err(super::recovery::TicketClaimError::AlreadyConsumed)
     ));
+}
+
+impl CompactionState {
+    pub(crate) fn ephemeral(&self, loop_id: LoopId) -> Option<EphemeralSummary> {
+        self.ephemeral
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|summary| summary.loop_id == Some(loop_id))
+            .cloned()
+    }
+
+    pub(crate) fn cache_ephemeral(
+        &self,
+        loop_id: LoopId,
+        key: EphemeralGroupKey,
+        summary: BoundedText,
+    ) -> bool {
+        let mut groups = self
+            .ephemeral(loop_id)
+            .map(|entry| entry.groups)
+            .unwrap_or_default();
+        groups.insert(key, summary);
+        self.install_emergency_groups(loop_id, groups)
+    }
 }

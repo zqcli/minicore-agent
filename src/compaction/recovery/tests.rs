@@ -1,5 +1,6 @@
 use super::*;
 use crate::compaction::CompactionPolicy;
+use crate::compaction::{auto::compressible_ranges, auto_compose};
 use crate::models::DefaultProviderBudget;
 use minicore_runtime::ToolCallId;
 use minicore_runtime::execution::UserInput;
@@ -12,12 +13,13 @@ use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum RawBehavior {
     Never,
     ContextOverflow,
     OverflowThenPending,
     Summary(&'static str),
+    Summaries(Vec<String>),
 }
 
 struct RawTestModel {
@@ -62,7 +64,7 @@ impl Model for RawTestModel {
             hook();
         }
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        match self.behavior {
+        match &self.behavior {
             RawBehavior::Never => Box::pin(std::future::pending()),
             RawBehavior::OverflowThenPending if call > 0 => Box::pin(std::future::pending()),
             RawBehavior::OverflowThenPending | RawBehavior::ContextOverflow => Box::pin(async {
@@ -78,17 +80,24 @@ impl Model for RawTestModel {
                     diagnostic,
                 ))
             }),
-            RawBehavior::Summary(text) => Box::pin(async move {
-                let events = vec![
-                    Ok(ModelEvent::text_delta(text).unwrap()),
-                    Ok(ModelEvent::Finish {
-                        reason: ModelFinishReason::Stop,
-                    }),
-                ];
-                let stream: minicore_runtime::model::ModelStream =
-                    Box::pin(futures_util::stream::iter(events));
-                Ok(stream)
-            }),
+            RawBehavior::Summary(_) | RawBehavior::Summaries(_) => {
+                let text = match &self.behavior {
+                    RawBehavior::Summary(text) => (*text).to_owned(),
+                    RawBehavior::Summaries(texts) => texts[call].clone(),
+                    _ => unreachable!(),
+                };
+                Box::pin(async move {
+                    let events = vec![
+                        Ok(ModelEvent::text_delta(text).unwrap()),
+                        Ok(ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        }),
+                    ];
+                    let stream: minicore_runtime::model::ModelStream =
+                        Box::pin(futures_util::stream::iter(events));
+                    Ok(stream)
+                })
+            }
         }
     }
 }
@@ -307,14 +316,19 @@ fn big_request() -> ModelRequest {
 
 fn recovery_auto(state: &Arc<CompactionState>, model: Arc<RawTestModel>) -> AutoContext {
     AutoContext {
-        model: Arc::clone(&model) as Arc<dyn Model>,
-        budget: Arc::new(DefaultProviderBudget),
-        policy: CompactionPolicy {
-            enabled: true,
-            trigger_percent: 80,
-            target_percent: 50,
+        binding: crate::compaction::auto::AutoContextBinding {
+            model: Arc::clone(&model) as Arc<dyn Model>,
+            budget: Arc::new(DefaultProviderBudget),
+            policy: CompactionPolicy {
+                enabled: true,
+                trigger_percent: 80,
+                target_percent: 50,
+            },
+            limits: minicore_runtime::LoopLimits {
+                max_prompt_messages: usize::MAX,
+                ..Default::default()
+            },
         },
-        max_prompt_messages: usize::MAX,
         state: Arc::clone(state),
     }
 }
@@ -329,16 +343,16 @@ fn register_recovery_test_ticket(
     appended: Vec<HistoryItem>,
 ) {
     let settings = state.request_settings();
-    let content_hash = compute_content_hash(
+    let content_hash = compute_content_hash(&crate::compaction::recovery::TicketFraming {
         loop_id,
-        0,
-        request.messages(),
-        request.tools(),
-        raw.descriptor(),
-        request.reasoning(),
-        settings.config_generation,
-        settings.summary_generation,
-    )
+        request_index: 0,
+        messages: request.messages(),
+        tools: request.tools(),
+        model_descriptor: raw.descriptor(),
+        reasoning: request.reasoning(),
+        config_generation: settings.config_generation,
+        summary_generation: settings.summary_generation,
+    })
     .unwrap();
     state.register_recovery_ticket(
         loop_id,
@@ -349,7 +363,6 @@ fn register_recovery_test_ticket(
             content_hash,
             ticket_hash: None,
             original_body_bytes: 0,
-            original_tokens: 0,
             system: BoundedText::new("system").unwrap(),
             summary: None,
             base,
@@ -577,7 +590,6 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
         content_hash: [0; 32],
         ticket_hash: Some([0; 32]),
         original_body_bytes: usize::MAX,
-        original_tokens: 0,
         system: BoundedText::new("system").unwrap(),
         summary: None,
         base,
@@ -589,14 +601,19 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
     };
     let utility = RawTestModel::new(RawBehavior::Summary("compact summary"));
     let auto = AutoContext {
-        model: Arc::clone(&utility) as Arc<dyn Model>,
-        budget: Arc::new(DefaultProviderBudget),
-        policy: CompactionPolicy {
-            enabled: true,
-            trigger_percent: 80,
-            target_percent: 50,
+        binding: crate::compaction::auto::AutoContextBinding {
+            model: Arc::clone(&utility) as Arc<dyn Model>,
+            budget: Arc::new(DefaultProviderBudget),
+            policy: CompactionPolicy {
+                enabled: true,
+                trigger_percent: 80,
+                target_percent: 50,
+            },
+            limits: minicore_runtime::LoopLimits {
+                max_prompt_messages: usize::MAX,
+                ..Default::default()
+            },
         },
-        max_prompt_messages: usize::MAX,
         state: CompactionState::new(),
     };
     let cancellation = CancellationToken::new();
@@ -608,9 +625,6 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
         &DefaultProviderBudget,
         &cancellation,
         deadline,
-        loop_id,
-        1,
-        None,
     )
     .await;
     assert!(usage.is_some());
@@ -632,9 +646,6 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
         &DefaultProviderBudget,
         &cancellation,
         deadline,
-        loop_id,
-        1,
-        None,
     )
     .await;
     assert!(matches!(
@@ -650,9 +661,6 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
         &DefaultProviderBudget,
         &cancellation,
         deadline,
-        loop_id,
-        1,
-        None,
     )
     .await;
     assert!(matches!(
@@ -689,7 +697,6 @@ async fn reconstruction_accounts_for_each_independent_group_once() {
         content_hash: [0; 32],
         ticket_hash: Some([0; 32]),
         original_body_bytes: 0,
-        original_tokens: 0,
         system: BoundedText::new("system").unwrap(),
         summary: None,
         base,
@@ -723,9 +730,6 @@ async fn reconstruction_accounts_for_each_independent_group_once() {
         &DefaultProviderBudget,
         &CancellationToken::new(),
         Instant::now() + Duration::from_secs(5),
-        loop_id,
-        1,
-        None,
     )
     .await;
     let request = result.expect("both complete exchanges can shrink");
@@ -841,4 +845,136 @@ fn test_clean_tool_pairs_validation() {
         .unwrap(),
     ];
     assert!(!validate_clean_tool_exchanges(&orphan));
+}
+
+fn prose_ticket(sizes: &[usize], current_bytes: usize) -> ActiveRecoveryTicket {
+    let loop_id = LoopId::new().unwrap();
+    let old = LoopId::new().unwrap();
+    let user = |owner, size| {
+        HistoryItem::User(UserHistory {
+            loop_id: owner,
+            kind: UserMessageKind::Prompt,
+            input: UserInput::text("x".repeat(size)).unwrap(),
+        })
+    };
+    let mut ticket = ActiveRecoveryTicket {
+        loop_id,
+        request_index: 1,
+        content_hash: [0; 32],
+        ticket_hash: None,
+        original_body_bytes: 0,
+        system: BoundedText::new("system").unwrap(),
+        summary: None,
+        base: sizes.iter().map(|size| user(old, *size)).collect(),
+        appended: vec![user(loop_id, current_bytes)],
+        tools: vec![],
+        limits: ModelLimits::default(),
+        reasoning: ReasoningPreference::Auto,
+        auto_binding: None,
+    };
+    let (mut messages, history) =
+        auto_compose(&ticket.system, None, &ticket.base, &ticket.appended).unwrap();
+    messages.extend(history);
+    let request = ModelRequest::new(messages, vec![], ticket.limits, ticket.reasoning).unwrap();
+    ticket.original_body_bytes = DefaultProviderBudget
+        .estimate_request_bytes(&request, None, None)
+        .unwrap();
+    ticket
+}
+
+async fn reconstruct(
+    ticket: &ActiveRecoveryTicket,
+    auto: &AutoContext,
+) -> (
+    Result<ModelRequest, RecoveryReconstructionError>,
+    Option<CompactionUtilityUsage>,
+) {
+    reconstruct_for_recovery(
+        ticket,
+        auto,
+        &DefaultProviderBudget,
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn recovery_selects_largest_bytes_and_stops_at_soft_trigger() {
+    let ticket = prose_ticket(&[1_000, 8_000, 2_000], 100);
+    let utility = RawTestModel::new(RawBehavior::Summary("summary"));
+    let state = CompactionState::new();
+    let auto = recovery_auto(&state, Arc::clone(&utility));
+    let request = reconstruct(&ticket, &auto).await.0.unwrap();
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+    let items = ticket
+        .base
+        .iter()
+        .chain(&ticket.appended)
+        .collect::<Vec<_>>();
+    let keys = compressible_ranges(ticket.base.len(), &items, ticket.loop_id).unwrap();
+    let folded = state.emergency_groups(
+        ticket.loop_id,
+        &keys.iter().map(|(key, _)| key.clone()).collect(),
+    );
+    assert_eq!(folded.keys().map(|key| key.start).collect::<Vec<_>>(), [1]);
+    assert!(
+        DefaultProviderBudget
+            .estimate_request_tokens(&request, None, None)
+            .unwrap()
+            <= auto
+                .policy
+                .budget(auto.model.descriptor().context_window)
+                .trigger_tokens
+    );
+}
+
+#[tokio::test]
+async fn recovery_skips_nonshrinking_group_and_accounts_for_both_calls() {
+    let ticket = prose_ticket(&[2_000, 1_000], 100);
+    let utility = RawTestModel::new(RawBehavior::Summaries(vec![
+        "s".repeat(3_000),
+        "summary".into(),
+    ]));
+    let state = CompactionState::new();
+    let auto = recovery_auto(&state, Arc::clone(&utility));
+    let (result, usage) = reconstruct(&ticket, &auto).await;
+    let request = result.unwrap();
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(usage.unwrap().call_count, 2);
+    assert!(
+        request
+            .messages()
+            .iter()
+            .any(|message| matches!(message, ModelMessage::User(text) if text.len() == 2_000))
+    );
+    assert!(
+        !request
+            .messages()
+            .iter()
+            .any(|message| matches!(message, ModelMessage::User(text) if text.len() == 1_000))
+    );
+}
+
+#[tokio::test]
+async fn recovery_continues_below_hard_limit_and_falls_back_only_after_exhaustion() {
+    for (current_bytes, expected_calls) in [(100, 2), (55_000, 2)] {
+        let ticket = prose_ticket(&[60_000, 55_000], current_bytes);
+        let utility = RawTestModel::new(RawBehavior::Summary("summary"));
+        let auto = recovery_auto(&CompactionState::new(), Arc::clone(&utility));
+        let request = reconstruct(&ticket, &auto).await.0.unwrap();
+        let tokens = DefaultProviderBudget
+            .estimate_request_tokens(&request, None, None)
+            .unwrap();
+        let budget = auto.policy.budget(auto.model.descriptor().context_window);
+        assert_eq!(utility.calls.load(Ordering::SeqCst), expected_calls);
+        assert!(tokens <= budget.hard_tokens);
+        assert_eq!(tokens > budget.trigger_tokens, current_bytes == 55_000);
+        assert!(
+            DefaultProviderBudget
+                .estimate_request_bytes(&request, None, None)
+                .unwrap()
+                < ticket.original_body_bytes
+        );
+    }
 }

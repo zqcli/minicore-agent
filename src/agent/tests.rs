@@ -31,8 +31,7 @@ use crate::profiles::{ApprovalMode, Profile};
 use crate::read::ReadSession;
 use crate::sessions::{
     LoopSubmission, RuntimeStartGate, WorkerGate, panic_next_worker,
-    pause_next_compaction_after_result, pause_next_runtime_start_before_bind,
-    pause_next_worker_before_join,
+    pause_next_runtime_start_before_bind, pause_next_worker_before_join,
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
@@ -3575,8 +3574,8 @@ async fn close_after_post_turn_result_still_joins_the_operation_worker() {
     )
     .await;
     let info = create_session(&mut agent, &workspace).await;
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_compaction_after_result(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::sessions::compact::PAUSE_AFTER_RESULT.arm(info.session_id, Arc::clone(&gate));
     let session = agent.loaded_session(info.session_id).unwrap();
     let submission = session
         .submit(minicore_runtime::execution::UserInput::text("wait").unwrap())
@@ -3666,6 +3665,84 @@ async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_tur
             .iter()
             .any(|text| text == answer)
     );
+}
+
+#[tokio::test]
+async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() {
+    let items = (0..18)
+        .flat_map(|_| {
+            let mut record = synthetic_tool_loop_record(LoopId::new().unwrap());
+            if let HistoryItem::ToolResult(result) = &mut record.items[2] {
+                result.output = ToolOutput::new("x".repeat(90_000)).unwrap();
+            }
+            record.items
+        })
+        .collect::<Vec<_>>();
+    let answer = Box::leak("a".repeat(160_000).into_boxed_str());
+    let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
+        "post-turn-runtime-trigger",
+        true,
+        1_000_000,
+        items,
+        [
+            ModelScript::Text(answer),
+            ModelScript::Text("historical reads summarized"),
+            ModelScript::Text("next answer"),
+        ],
+        None,
+        None,
+    )
+    .await;
+    let state = agent.loaded_session(session_id).unwrap().compaction_state();
+    state.note_prepare_failure("previous_attempt_failed");
+    let turn = send_text(&mut agent, session_id, "answer").await;
+    let result = wait_text(&agent, turn).await;
+    assert!(matches!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    ));
+    assert!(
+        state.prepare_failure().is_none(),
+        "successful Noop preparation clears a stale failure"
+    );
+    let compacted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let context = agent.session_context(session_id).unwrap();
+            if context.current_operation.is_none() {
+                break context.last_result.unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        compacted.status,
+        crate::compaction::CompactionStatus::Compacted
+    );
+    assert_eq!(compacted.utility_usage.unwrap().call_count, 1);
+    assert!(compacted.before_tokens.unwrap() < 800_000);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        agent
+            .session_context(session_id)
+            .unwrap()
+            .budget
+            .estimated_history_bytes
+            .unwrap()
+            < 200_000
+    );
+    assert!(
+        flatten_texts(&read_store_history(&data_dir, session_id).await)
+            .iter()
+            .any(|text| text == answer)
+    );
+    let next = send_text(&mut agent, session_id, "continue").await;
+    assert!(matches!(
+        wait_text(&agent, next).await.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    ));
+    agent.close_session(session_id).await.unwrap();
 }
 
 #[tokio::test]
@@ -3832,8 +3909,8 @@ async fn cancelling_close_future_keeps_manual_worker_owned_until_second_join() {
         .unwrap();
     agent.open_session(info.session_id).await.unwrap();
 
-    let gate = Arc::new(WorkerGate::new());
-    pause_next_compaction_after_result(info.session_id, Arc::clone(&gate));
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::sessions::compact::PAUSE_AFTER_RESULT.arm(info.session_id, Arc::clone(&gate));
     let result = agent
         .compact(CompactSession {
             session_id: info.session_id,
@@ -8086,7 +8163,10 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
         .recovery
         .expect("recovery observation must be recorded");
     assert_eq!(recovery.outcome, "recovery_failed");
-    assert_eq!(recovery.failure_kind.as_deref(), Some("no_progress"));
+    assert_eq!(
+        recovery.failure_kind.as_deref(),
+        Some("context_uncompressible")
+    );
     assert_eq!(recovery.utility_usage.unwrap().call_count, 1);
 }
 

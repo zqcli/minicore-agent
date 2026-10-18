@@ -114,7 +114,6 @@ fn input(model: &Arc<Fake>, history: Vec<HistoryItem>) -> CompactionInput {
         project_instructions: BoundedText::new("PROJECT_ONLY_NORMAL_REQUEST").unwrap(),
         tool_schemas: Vec::new(),
         hard_tokens: 100_000,
-        safe_before_estimate: false,
         operation_deadline: Instant::now() + Duration::from_secs(30),
         live_usage: None,
     }
@@ -756,4 +755,11 @@ async fn retained_tail_fits_without_schemas_but_fixed_schemas_prevent_utility() 
         1,
         "schemas must reject before another utility call"
     );
+}
+
+fn source_message(
+    input: &CompactionInput,
+    cancellation: &CancellationToken,
+) -> Result<ModelMessage, UtilityError> {
+    source_message_through(input, input.history.len(), cancellation)
 }

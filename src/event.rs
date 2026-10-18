@@ -27,6 +27,16 @@ pub struct EventMeta {
     pub dropped_before: u64,
 }
 
+impl EventMeta {
+    pub(crate) fn for_loop(session_id: SessionId, loop_id: LoopId) -> Self {
+        Self {
+            session_id,
+            loop_id: Some(loop_id),
+            dropped_before: 0,
+        }
+    }
+}
+
 /// Best-effort live events. Events never participate in correctness; the
 /// authoritative results are `turn.wait` and `session.history`.
 #[derive(Clone, Debug, Eq, PartialEq)]

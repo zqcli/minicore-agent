@@ -99,8 +99,8 @@ fn build_tools_with(
         let register = |builder: &mut ToolSetBuilder,
                         tool: Arc<dyn minicore_runtime::tools::Tool>| {
             if let Some((presentation, observer, _)) = presentation {
-                builder.register_arc(PresentationTool::new_with_observer(
-                    tool,
+                builder.register_arc(PresentationTool::new(
+                    crate::presentation::ToolImpl::Plain(tool),
                     Arc::clone(presentation),
                     Arc::clone(observer),
                 ));
@@ -112,8 +112,8 @@ fn build_tools_with(
             "apply_patch" => {
                 let tool = Arc::new(ApplyPatchTool::new(Arc::clone(&workspace)));
                 if let Some((presentation, observer, _)) = presentation {
-                    builder.register_arc(PresentationTool::new_apply_patch_with_observer(
-                        tool,
+                    builder.register_arc(PresentationTool::new(
+                        crate::presentation::ToolImpl::ApplyPatch(tool),
                         Arc::clone(presentation),
                         Arc::clone(observer),
                     ));
@@ -132,8 +132,8 @@ fn build_tools_with(
                     Some((presentation, observer, _)) => {
                         // Bash and native file tools receive captured identity
                         // through explicit wrapper variants.
-                        builder.register_arc(PresentationTool::new_bash_with_observer(
-                            Arc::clone(&tool),
+                        builder.register_arc(PresentationTool::new(
+                            crate::presentation::ToolImpl::Bash(Arc::clone(&tool)),
                             Arc::clone(presentation),
                             Arc::clone(observer),
                         ));
@@ -146,8 +146,8 @@ fn build_tools_with(
             "edit" => {
                 let tool = Arc::new(EditTool::new(Arc::clone(&workspace)));
                 if let Some((presentation, observer, _)) = presentation {
-                    builder.register_arc(PresentationTool::new_edit_with_observer(
-                        tool,
+                    builder.register_arc(PresentationTool::new(
+                        crate::presentation::ToolImpl::Edit(tool),
                         Arc::clone(presentation),
                         Arc::clone(observer),
                     ));
@@ -164,8 +164,8 @@ fn build_tools_with(
             "write" => {
                 let tool = Arc::new(WriteTool::new(Arc::clone(&workspace)));
                 if let Some((presentation, observer, _)) = presentation {
-                    builder.register_arc(PresentationTool::new_write_with_observer(
-                        tool,
+                    builder.register_arc(PresentationTool::new(
+                        crate::presentation::ToolImpl::Write(tool),
                         Arc::clone(presentation),
                         Arc::clone(observer),
                     ));
