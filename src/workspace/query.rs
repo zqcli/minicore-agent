@@ -377,13 +377,7 @@ fn envelope_bytes(path: &str, max_bytes: usize) -> Result<usize, AgentError> {
         file_bytes: u64::MAX,
         file_modified_unix_ms: Some(u64::MAX),
     };
-    let size = serde_json::to_vec(&probe)
-        .map_err(|_| AgentError::Internal)?
-        .len();
-    if size >= max_bytes {
-        return Err(AgentError::InvalidArguments);
-    }
-    Ok(size)
+    crate::workspace::scan::envelope_size(&probe, max_bytes)
 }
 
 fn revision_of(bytes: &[u8]) -> String {

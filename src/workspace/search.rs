@@ -395,11 +395,12 @@ fn scan_search(
     plan: &SearchPlan,
     budget: &mut ScanBudget,
 ) -> Result<WorkspaceSearchResult, AgentError> {
-    // Lexically disjoint roots can alias through intermediate symlinks. Reject
-    // that overlap too, before emitting the same resolved path twice.
-    if plan.roots.len() > 1 {
+    // Lexically disjoint roots can alias through intermediate symlinks. Check
+    // remaining roots for overlap; completed roots may no longer exist.
+    let remaining_roots = &plan.roots[plan.start_path..];
+    if remaining_roots.len() > 1 {
         let mut resolved = Vec::new();
-        for root in &plan.roots {
+        for root in remaining_roots {
             budget.check()?;
             if budget.time_expired() {
                 break;
@@ -485,7 +486,7 @@ fn scan_search(
             (path_index > plan.start_path
                 && matches!(
                     outcome.reason,
-                    WorkspaceScanStop::Entries | WorkspaceScanStop::Bytes
+                    WorkspaceScanStop::Page | WorkspaceScanStop::Entries | WorkspaceScanStop::Bytes
                 ))
             .then(String::new)
         });

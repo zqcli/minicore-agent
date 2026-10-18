@@ -1271,6 +1271,8 @@ never followed: a requested root that is itself a symlinked directory is
 rejected instead of being expanded through the alias, and a requested directory
 that resolves outside the Workspace is rejected. An intermediate symlink inside
 the Workspace uses its resolved relative path for ignore matching and display.
+A requested root whose resolved relative path is not valid UTF-8 is rejected
+with `-32010`; it is never converted to a lossy path.
 
 `kind` is `file`, `directory`, `symlink`, or `other`, and `size` is present for
 regular files only. `skipped_count` counts visited entries that were not
@@ -1349,8 +1351,11 @@ boundaries of the returned `line_text`. `paths` restricts the search to at most
 32 workspace-relative files or directories and defaults to the whole Workspace.
 The list is normalized and de-duplicated, and overlapping roots such as `src`
 together with `src/main.rs` are rejected with `-32602` so no file is searched
-twice. Roots that overlap after resolving intermediate symlinks are also rejected; each path is validated lexically before a query slot is reserved, a path
-that does not exist or resolves outside the Workspace fails with `-32010`, and
+twice. Roots that overlap after resolving intermediate symlinks are also rejected.
+On continuation, only roots still to visit are resolved and checked for overlap;
+deleting a completed root does not invalidate the cursor. Each path is validated
+lexically before a query slot is reserved. A remaining root that does not exist
+or resolves outside the Workspace fails with `-32010`, and
 explicitly named paths are still subject to the same ignore rules as a walk from
 the Workspace root. `max_matches` accepts `1..=1000` and defaults to `100`;
 `max_bytes` has the same range and default as `workspace.files`.

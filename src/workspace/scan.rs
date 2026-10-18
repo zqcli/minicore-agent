@@ -356,6 +356,9 @@ where
         .strip_prefix(workspace.root())
         .map_err(|_| AgentError::Workspace)?
         .to_path_buf();
+    // Display paths are also used to reopen search files. A lossy root could
+    // redirect that read to a different, replacement-character sibling.
+    relative.to_str().ok_or(AgentError::Workspace)?;
     let display = display_path(&relative);
     let is_repo = std_fs::symlink_metadata(workspace.root().join(".git")).is_ok();
     let limits = budget.limits();

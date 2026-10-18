@@ -45,6 +45,40 @@ async fn resolved_root_aliases_cannot_duplicate_matches() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn unrepresentable_resolved_roots_never_read_a_lossy_sibling() {
+    use std::os::unix::ffi::OsStringExt;
+    let fixture = fixture("non-utf8-root").await;
+    let raw = std::ffi::OsString::from_vec(b"invalid-\xff".to_vec());
+    let actual = fixture.workspace.root().join(&raw).join("sub");
+    std::fs::create_dir_all(&actual).unwrap();
+    std::fs::write(actual.join("file"), b"original\n").unwrap();
+    write(
+        &fixture,
+        "invalid-\u{fffd}/sub/file",
+        b"needle from sibling\n",
+    );
+    std::os::unix::fs::symlink(&raw, fixture.workspace.root().join("alias")).unwrap();
+    for root in ["alias/sub", "alias/sub/file"] {
+        let mut req = request(&fixture, "needle");
+        req.paths = Some(vec![root.into()]);
+        assert!(
+            matches!(
+                search(
+                    Arc::clone(&fixture.workspace),
+                    req,
+                    CancellationToken::new(),
+                    CancellationToken::new()
+                )
+                .await,
+                Err(AgentError::Workspace)
+            ),
+            "resolved root {root} must not be made lossy"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn dangling_links_are_unsupported_not_failed_reads() {
     let fixture = fixture("dangling").await;
     std::os::unix::fs::symlink("missing", fixture.workspace.root().join("link")).unwrap();
@@ -622,6 +656,56 @@ async fn an_exhausted_page_continues_at_the_next_explicit_root() {
         assert_eq!(second.matches.len(), 1);
         assert_eq!(second.matches[0].path, "b");
         assert!(second.scan_complete);
+    }
+}
+
+#[tokio::test]
+async fn match_limit_continues_between_file_and_directory_roots() {
+    for next_file in ["b", "b/file"] {
+        let fixture = fixture("match-limit-root-boundary").await;
+        write(&fixture, "a", b"hit\n");
+        write(&fixture, next_file, b"hit\n");
+        let mut req = request(&fixture, "hit");
+        req.paths = Some(vec!["a".into(), "b".into()]);
+        req.max_matches = Some(1);
+        let first = run(&fixture, req.clone()).await;
+        assert_eq!(first.matches.len(), 1);
+        assert_eq!(first.matches[0].path, "a");
+        assert_eq!(first.stopped_by, WorkspaceScanStop::Page);
+        let cursor = first
+            .next_cursor
+            .expect("match limit must retain the next root");
+        assert_eq!(cursor.path_index, 1);
+        assert_eq!(cursor.path, "");
+        req.cursor = Some(cursor);
+        let second = run(&fixture, req).await;
+        assert_eq!(second.matches.len(), 1);
+        assert_eq!(second.matches[0].path, next_file);
+        assert!(second.scan_complete);
+        assert!(second.next_cursor.is_none());
+    }
+}
+
+#[tokio::test]
+async fn resuming_does_not_resolve_deleted_completed_roots() {
+    let mut fixture = fixture("deleted-completed-root").await;
+    for name in ["a", "b", "c"] {
+        write(&fixture, name, b"hit\n");
+    }
+    Arc::make_mut(&mut fixture.workspace).scan_limits.entries = 1;
+    let mut req = request(&fixture, "hit");
+    req.paths = Some(vec!["a".into(), "b".into(), "c".into()]);
+    for name in ["a", "b", "c"] {
+        let page = run(&fixture, req.clone()).await;
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].path, name);
+        std::fs::remove_file(fixture.workspace.root().join(name)).unwrap();
+        if name == "c" {
+            assert!(page.scan_complete);
+            assert!(page.next_cursor.is_none());
+        } else {
+            req.cursor = Some(page.next_cursor.expect("later roots remain"));
+        }
     }
 }
 
