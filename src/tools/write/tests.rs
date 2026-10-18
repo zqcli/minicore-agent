@@ -22,7 +22,7 @@ async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, WriteTool) {
     let root = base.join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root).await.unwrap());
-    let tool = WriteTool::new(Arc::clone(&workspace));
+    let tool = WriteTool::new(Arc::clone(&workspace), None);
     (base, workspace, tool)
 }
 
@@ -525,6 +525,51 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
             .unwrap()
             .is_none()
     );
+    cleanup(&base).await;
+}
+
+#[tokio::test]
+async fn the_loop_barrier_joins_a_commit_whose_caller_was_cancelled() {
+    let (base, workspace, _) = fixture("owned-commit").await;
+    let owners = crate::tools::command::ToolOwners::new();
+    let tool = WriteTool::new(Arc::clone(&workspace), Some(Arc::clone(&owners)));
+    let target = workspace.resolve_for_write("value").await.unwrap();
+    let gate = Arc::new(crate::test_support::Gate::new());
+    BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
+    let data = Arc::new(ToolData::new());
+    let tool_ref = bound_ref();
+    data.note_requested(&tool_ref, TOOL_NAME);
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let (data, tool_ref, cancellation) =
+            (Arc::clone(&data), tool_ref.clone(), cancellation.clone());
+        async move {
+            tool.execute_bound(
+                invocation(json!({"path": "value", "content": "new"})),
+                context(cancellation, Instant::now() + Duration::from_secs(10)),
+                Some(tool_ref),
+                Some(data),
+            )
+            .await
+        }
+    });
+    gate.wait_started().await;
+    cancellation.cancel();
+    assert_eq!(task.await.unwrap(), Err(ToolError::Cancelled));
+    // Persistence follows this barrier; it must not pass while the commit runs.
+    let join = owners.join_loop(tool_ref.loop_id);
+    tokio::pin!(join);
+    tokio::select! {
+        biased;
+        () = &mut join => panic!("the loop barrier passed a running commit"),
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    gate.release();
+    join.await;
+    let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].commit_state, crate::ChangeCommitState::Applied);
+    assert_eq!(tokio::fs::read(&target).await.unwrap(), b"new");
     cleanup(&base).await;
 }
 

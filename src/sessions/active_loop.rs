@@ -177,7 +177,7 @@ async fn join_runtime_loop(
     // Owned commands of this loop are joined before the report is reconciled
     // and persisted: a dropped tool future must not leave a process behind, and
     // the process record must be final before the terminal state is written.
-    session.shared.command_owners.join_loop(turn.loop_id).await;
+    session.shared.tool_owners.join_loop(turn.loop_id).await;
     let report = match result {
         Ok(report) => {
             if let minicore_runtime::LoopOutcome::Failed(failure) = &report.outcome {

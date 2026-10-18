@@ -1029,7 +1029,7 @@ fn windows_grandchild_command(parent_waits: bool) -> String {
 #[tokio::test]
 async fn execute_bound_records_under_the_captured_identity() {
     let (base, workspace, _) = fixture("bound-identity").await;
-    let owners = crate::tools::command::CommandOwners::new();
+    let owners = crate::tools::command::ToolOwners::new();
     let data = Arc::new(crate::tool_data::ToolData::new());
     let sink = IdentitySink::new(Arc::clone(&data));
     let streams: Arc<dyn crate::tools::command::CommandStreamSink> =

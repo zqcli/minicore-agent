@@ -47,10 +47,10 @@ use super::CommandEnvironment;
 #[cfg(windows)]
 static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Maximum concurrently registered command owners for one owner boundary. A
+/// Maximum concurrently registered tool workers for one owner boundary. A
 /// command in flight holds a process and two pipes, so this is bounded like the
 /// Session tool-record store rather than exposed as user configuration.
-pub(crate) const MAX_COMMAND_OWNERS: usize = 1024;
+pub(crate) const MAX_TOOL_OWNERS: usize = 1024;
 
 /// Short grace for a leader that exited while descendants still hold a pipe.
 const LEADER_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -97,16 +97,16 @@ pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
 /// that reached the real `Tool::execute` boundary passes the complete
 /// `ToolRef` explicitly.
 pub(crate) struct CommandBinding {
-    owners: Arc<CommandOwners>,
+    owners: Arc<ToolOwners>,
     sink: Arc<dyn CommandStreamSink>,
 }
 
 impl CommandBinding {
-    pub(crate) fn new(owners: Arc<CommandOwners>, sink: Arc<dyn CommandStreamSink>) -> Self {
+    pub(crate) fn new(owners: Arc<ToolOwners>, sink: Arc<dyn CommandStreamSink>) -> Self {
         Self { owners, sink }
     }
 
-    pub(crate) fn owners(&self) -> &Arc<CommandOwners> {
+    pub(crate) fn owners(&self) -> &Arc<ToolOwners> {
         &self.owners
     }
 
@@ -324,10 +324,11 @@ impl Drop for CommandWorker {
     }
 }
 
-/// Owned command workers for one owner boundary: a Session or standalone
-/// owner. At most one worker exists per complete `ToolRef`, and never more than
-/// one for the same call.
-pub(crate) struct CommandOwners {
+/// Owned tool workers for one owner boundary (a Session or standalone owner):
+/// Bash commands and started workspace commits. At most one worker exists per
+/// complete `ToolRef`. Loop and Session barriers join them even after the
+/// Runtime dropped the tool future that started them.
+pub(crate) struct ToolOwners {
     inner: Mutex<OwnersInner>,
 }
 
@@ -382,14 +383,14 @@ enum OwnerKey {
     Local(u64),
 }
 
-impl CommandOwners {
+impl ToolOwners {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(OwnersInner::default()),
         })
     }
 
-    /// Registers and starts one owner. A duplicate identity, a closing owner,
+    /// Registers and starts one command. A duplicate identity, a closing owner,
     /// or a full registry is refused instead of being guessed around. The
     /// registry is bounded like the Session tool-record store, and finished
     /// owners are reaped on every registration so a long-lived Session cannot
@@ -400,13 +401,49 @@ impl CommandOwners {
         let (sender, receiver) = watch::channel(None);
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
+        let tool_ref = request.tool_ref.clone();
+        self.register(tool_ref.as_ref(), cancel.clone(), move || {
+            tokio::spawn(async move {
+                let outcome = execute(request, &worker_cancel).await;
+                let _ = sender.send(Some(Arc::new(outcome)));
+            })
+        })?;
+        Ok(CommandWorker {
+            completion: receiver,
+            cancel,
+        })
+    }
+
+    /// Runs blocking work that must finish once started, such as a workspace
+    /// commit and its observation. A dropped caller stops waiting, not the work.
+    /// A lost worker means the outcome is unknown.
+    pub(crate) async fn run_blocking<T: Send + 'static>(
+        &self,
+        tool_ref: Option<&ToolRef>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ToolError> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.register(tool_ref, CancellationToken::new(), move || {
+            tokio::task::spawn_blocking(move || {
+                let _ = sender.send(work());
+            })
+        })?;
+        receiver.await.map_err(|_| ToolError::Failed)
+    }
+
+    fn register(
+        &self,
+        tool_ref: Option<&ToolRef>,
+        cancel: CancellationToken,
+        spawn: impl FnOnce() -> JoinHandle<()>,
+    ) -> Result<(), ToolError> {
         let mut inner = self.inner.lock().unwrap();
         // Reap finished handles first, then refuse rather than exceed the cap.
         inner.workers.retain(|worker| !worker.is_finished());
-        if inner.workers.len() >= MAX_COMMAND_OWNERS {
+        if inner.workers.len() >= MAX_TOOL_OWNERS {
             return Err(ToolError::Internal);
         }
-        let key = match &request.tool_ref {
+        let key = match tool_ref {
             Some(tool_ref) => OwnerKey::Tool(tool_ref.clone()),
             None => {
                 inner.next_local = inner.next_local.saturating_add(1);
@@ -416,17 +453,11 @@ impl CommandOwners {
         if inner.closing || inner.workers.iter().any(|worker| worker.key == key) {
             return Err(ToolError::Internal);
         }
-        let handle = tokio::spawn(async move {
-            let outcome = execute(request, &worker_cancel).await;
-            let _ = sender.send(Some(Arc::new(outcome)));
-        });
+        let handle = spawn();
         inner
             .workers
-            .push(Arc::new(OwnedWorker::new(key, cancel.clone(), handle)));
-        Ok(CommandWorker {
-            completion: receiver,
-            cancel,
-        })
+            .push(Arc::new(OwnedWorker::new(key, cancel, handle)));
+        Ok(())
     }
 
     /// Waits for every owner started by one loop. The owner's stop request is

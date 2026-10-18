@@ -16,7 +16,7 @@ use minicore_runtime::tools::{Tool, ToolError, ToolSet};
 use thiserror::Error;
 
 use crate::presentation::{Presentation, PresentationTool, ToolImpl};
-use crate::tools::command::CommandOwners;
+use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
 use crate::{Workspace, WorkspaceError};
 
@@ -56,13 +56,13 @@ pub(crate) fn build_tools_with_presentation(
     command_environment: CommandEnvironment,
     presentation: &Arc<Presentation>,
     observer: &Arc<ToolObserver>,
-    command_owners: &Arc<CommandOwners>,
+    tool_owners: &Arc<ToolOwners>,
 ) -> Result<ToolSet, BuildToolsError> {
     build_tools_with(
         names,
         workspace,
         command_environment,
-        Some((presentation, observer, command_owners)),
+        Some((presentation, observer, tool_owners)),
     )
 }
 
@@ -70,7 +70,7 @@ fn build_tools_with(
     names: &[String],
     workspace: Arc<Workspace>,
     command_environment: CommandEnvironment,
-    presentation: Option<(&Arc<Presentation>, &Arc<ToolObserver>, &Arc<CommandOwners>)>,
+    presentation: Option<(&Arc<Presentation>, &Arc<ToolObserver>, &Arc<ToolOwners>)>,
 ) -> Result<ToolSet, BuildToolsError> {
     let mut builder = ToolSet::builder();
     let mut seen = BTreeSet::new();
@@ -78,19 +78,21 @@ fn build_tools_with(
         if !seen.insert(name.as_str()) {
             return Err(BuildToolsError::InvalidConfiguration);
         }
+        let owners = || presentation.map(|(_, _, owners)| Arc::clone(owners));
         let tool = match name.as_str() {
-            "apply_patch" => {
-                ToolImpl::ApplyPatch(Arc::new(ApplyPatchTool::new(Arc::clone(&workspace))))
-            }
+            "apply_patch" => ToolImpl::ApplyPatch(Arc::new(ApplyPatchTool::new(
+                Arc::clone(&workspace),
+                owners(),
+            ))),
             "bash" => ToolImpl::Bash(Arc::new(BashTool::with_binding(
                 Arc::clone(&workspace),
                 command_environment.clone(),
                 presentation
                     .map(|(_, observer, owners)| observer.command_binding(Arc::clone(owners))),
             ))),
-            "edit" => ToolImpl::Edit(Arc::new(EditTool::new(Arc::clone(&workspace)))),
+            "edit" => ToolImpl::Edit(Arc::new(EditTool::new(Arc::clone(&workspace), owners()))),
             "read" => ToolImpl::Plain(Arc::new(ReadTool::new(Arc::clone(&workspace)))),
-            "write" => ToolImpl::Write(Arc::new(WriteTool::new(Arc::clone(&workspace)))),
+            "write" => ToolImpl::Write(Arc::new(WriteTool::new(Arc::clone(&workspace), owners()))),
             _ => return Err(BuildToolsError::InvalidConfiguration),
         };
         let tool: Arc<dyn Tool> = match presentation {

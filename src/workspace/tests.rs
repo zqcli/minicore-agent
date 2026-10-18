@@ -530,9 +530,10 @@ impl Workspace {
         path: &str,
         bytes: &[u8],
     ) -> Result<(), WorkspaceError> {
-        self.write_atomic_observed(path.to_owned(), bytes.to_vec(), None, |_, _, _| {})
-            .await
-            .outcome
+        let commit = self
+            .prepare_atomic_write(path.to_owned(), bytes.to_vec(), None, |_, _, _| {})
+            .await;
+        tokio::task::spawn_blocking(commit).await.unwrap().outcome
     }
 }
 

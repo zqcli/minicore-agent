@@ -13,7 +13,7 @@ use crate::tool_data::{
     ToolRecordingState, ToolRef, ToolStreamNotice,
 };
 
-use super::command::{CommandBinding, CommandOwners, CommandStreamSink};
+use super::command::{CommandBinding, CommandStreamSink, ToolOwners};
 
 /// Fixed identity of one model request, captured at the real model boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -70,10 +70,10 @@ impl ToolObserver {
 
     pub(crate) fn command_binding(
         self: &Arc<Self>,
-        command_owners: Arc<CommandOwners>,
+        tool_owners: Arc<ToolOwners>,
     ) -> CommandBinding {
         let sink: Arc<dyn CommandStreamSink> = Arc::clone(self) as Arc<dyn CommandStreamSink>;
-        CommandBinding::new(command_owners, sink)
+        CommandBinding::new(tool_owners, sink)
     }
 
     pub(crate) fn note_request_start(&self, key: RequestKey) {
@@ -378,7 +378,7 @@ mod tests {
         let (events, event_stream) = AgentEventSink::channel(1);
         drop(event_stream);
         let data = Arc::new(ToolData::new());
-        let owners = crate::tools::command::CommandOwners::new();
+        let owners = crate::tools::command::ToolOwners::new();
         let observer = ToolObserver::new(session_id, Arc::clone(&data), events);
         let bash = Arc::new(OwnedBashTool::with_binding(
             Arc::clone(&workspace),
@@ -506,7 +506,7 @@ mod tests {
             json!({"path": "value.txt", "content": "after\n"}),
         );
         observer.publish_tool_invocation(&native_ref, &native_invocation);
-        let write = NativeWriteTool::new(Arc::clone(&workspace));
+        let write = NativeWriteTool::new(Arc::clone(&workspace), None);
         let outcome = write
             .execute_bound(
                 native_invocation,

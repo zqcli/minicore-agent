@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::Workspace;
 use crate::tool_data::{ToolData, ToolRef};
 
+use super::command::ToolOwners;
 use super::file_change::{commit_text, read_source_before};
 use super::{
     MAX_PATCH_BYTES, emit_phase, escape_control_characters, map_workspace_error, run_controlled,
@@ -24,6 +25,7 @@ use super::{
 const TOOL_NAME: &str = "apply_patch";
 pub(crate) struct ApplyPatchTool {
     workspace: Arc<Workspace>,
+    owners: Option<Arc<ToolOwners>>,
     spec: ToolSpec,
 }
 
@@ -35,7 +37,7 @@ struct ApplyPatchInput {
 }
 
 impl ApplyPatchTool {
-    pub(crate) fn new(workspace: Arc<Workspace>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>, owners: Option<Arc<ToolOwners>>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("apply_patch is a valid tool name"),
             "Apply one complete patch to one existing workspace file. Standard unified diffs are single-file only; Codex envelopes must contain exactly one *** Update File operation. Add File, Delete File, Move to, and multifile envelopes are rejected.",
@@ -63,7 +65,11 @@ impl ApplyPatchTool {
             }),
         )
         .expect("static apply_patch tool specification is valid");
-        Self { workspace, spec }
+        Self {
+            workspace,
+            owners,
+            spec,
+        }
     }
 }
 
@@ -129,6 +135,7 @@ impl ApplyPatchTool {
                 emit_phase(&context, "committing");
                 commit_text(
                     &self.workspace,
+                    self.owners.as_deref(),
                     tool_ref,
                     tool_data,
                     input.path,

@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::Workspace;
 use crate::tool_data::{ToolData, ToolRef};
 
+use super::command::ToolOwners;
 use super::file_change::{commit_text, read_source_before};
 use super::{
     MAX_PATCH_BYTES, emit_phase, escape_control_characters, map_workspace_error, run_controlled,
@@ -19,6 +20,7 @@ const TOOL_NAME: &str = "edit";
 
 pub(crate) struct EditTool {
     workspace: Arc<Workspace>,
+    owners: Option<Arc<ToolOwners>>,
     spec: ToolSpec,
 }
 
@@ -33,7 +35,7 @@ struct EditInput {
 }
 
 impl EditTool {
-    pub(crate) fn new(workspace: Arc<Workspace>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>, owners: Option<Arc<ToolOwners>>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("edit is a valid tool name"),
             "Replace exact literal UTF-8 text in one existing workspace file.",
@@ -65,7 +67,11 @@ impl EditTool {
             }),
         )
         .expect("static edit tool specification is valid");
-        Self { workspace, spec }
+        Self {
+            workspace,
+            owners,
+            spec,
+        }
     }
 }
 
@@ -128,7 +134,7 @@ impl EditTool {
                 ))
                 .map_err(|_| ToolError::Internal)?;
                 emit_phase(&context, "committing");
-                commit_text(&self.workspace, tool_ref, tool_data,
+                commit_text(&self.workspace, self.owners.as_deref(), tool_ref, tool_data,
                     input.path, before, result.into_bytes()).await?;
                 Ok(ToolExecutionOutcome::Completed(output))
             })

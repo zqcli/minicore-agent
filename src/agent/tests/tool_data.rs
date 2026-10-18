@@ -727,7 +727,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
         if agent
             .loaded_session(info.session_id)
             .ok_or_else(|| "Session was unloaded while Bash was running".to_owned())?
-            .command_owners()
+            .tool_owners()
             .active()
             == 0
         {
@@ -793,7 +793,7 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
         if agent
             .loaded_session(info.session_id)
             .ok_or_else(|| "Session was unloaded before owner join check".to_owned())?
-            .command_owners()
+            .tool_owners()
             .active()
             != 0
         {

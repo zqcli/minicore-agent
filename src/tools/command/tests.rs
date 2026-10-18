@@ -201,7 +201,7 @@ async fn wait_for_exit(pid: u32) {
 
 #[tokio::test]
 async fn a_second_call_with_the_same_identity_is_refused() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("duplicate-identity");
     let sink = RecordingSink::new(Arc::new(ToolData::new()));
     let data: Arc<dyn CommandStreamSink> = Arc::clone(&sink) as Arc<dyn CommandStreamSink>;
@@ -225,7 +225,7 @@ async fn a_second_call_with_the_same_identity_is_refused() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_chunk_is_stored_before_it_is_observed_and_while_the_command_runs() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("live-chunk");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -283,7 +283,7 @@ async fn a_chunk_is_stored_before_it_is_observed_and_while_the_command_runs() {
 #[tokio::test]
 async fn cancellation_drains_both_pipes_while_term_handler_finishes() {
     let dir = crate::test_support::TempDir::new("term-handler");
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let request = request(
         dir.path(),
         "term-handler",
@@ -330,7 +330,7 @@ fn shell_is_not_a_login_shell() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelling_records_cancelling_then_a_confirmed_group_end() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("cancel-owner");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -372,7 +372,7 @@ async fn cancelling_records_cancelling_then_a_confirmed_group_end() {
 #[cfg(unix)]
 #[tokio::test]
 async fn an_injected_reap_failure_never_claims_confirmed_termination() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("reap-failure");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -404,7 +404,7 @@ async fn an_injected_reap_failure_never_claims_confirmed_termination() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_pipe_holding_grandchild_is_stopped_after_a_bounded_grace() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("held-pipe");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -438,7 +438,7 @@ async fn a_pipe_holding_grandchild_is_stopped_after_a_bounded_grace() {
 #[cfg(unix)]
 #[tokio::test]
 async fn the_window_keeps_the_tail_with_raw_offsets() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("tail-window");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -494,7 +494,7 @@ async fn the_window_keeps_the_tail_with_raw_offsets() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_queued_owner_that_was_already_cancelled_never_runs_its_script() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("queued-cancel");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -526,7 +526,7 @@ async fn a_queued_owner_that_was_already_cancelled_never_runs_its_script() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_queued_owner_past_its_deadline_never_runs_its_script() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("queued-deadline");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -552,7 +552,7 @@ async fn a_queued_owner_past_its_deadline_never_runs_its_script() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_background_group_member_is_stopped_before_the_turn_join_returns() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("background-group");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -594,7 +594,7 @@ async fn a_background_group_member_is_stopped_before_the_turn_join_returns() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_loop_join_leaves_another_loops_owner_running() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("loop-identity");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -652,7 +652,7 @@ async fn a_loop_join_leaves_another_loops_owner_running() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_turn_join_stops_and_reaps_a_command_whose_future_was_dropped() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("join-dropped-future");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -688,7 +688,7 @@ async fn a_turn_join_stops_and_reaps_a_command_whose_future_was_dropped() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_joined_owner_reaps_both_the_leader_and_its_group_member() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("join-group");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -721,7 +721,7 @@ async fn a_joined_owner_reaps_both_the_leader_and_its_group_member() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_drain_cut_before_the_scope_ends_reports_truncated_eof_pages() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("cut-stream");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -768,7 +768,7 @@ async fn a_drain_cut_before_the_scope_ends_reports_truncated_eof_pages() {
 
 #[tokio::test]
 async fn a_deadline_cut_is_recorded_as_timed_out_not_cancelled() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("deadline-class");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -795,7 +795,7 @@ async fn a_deadline_cut_is_recorded_as_timed_out_not_cancelled() {
 
 #[tokio::test]
 async fn a_zero_byte_stream_that_really_ended_is_available_not_pending() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("empty-stream");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -831,7 +831,7 @@ async fn a_zero_byte_stream_that_really_ended_is_available_not_pending() {
 
 #[tokio::test]
 async fn a_spawn_failure_never_claims_a_confirmed_termination() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
     let streams: Arc<dyn CommandStreamSink> = Arc::clone(&sink) as Arc<dyn CommandStreamSink>;
@@ -855,7 +855,7 @@ async fn a_spawn_failure_never_claims_a_confirmed_termination() {
 
 #[tokio::test]
 async fn a_spawn_failure_is_reported_without_a_process() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
     let streams: Arc<dyn CommandStreamSink> = Arc::clone(&sink) as Arc<dyn CommandStreamSink>;
@@ -895,7 +895,7 @@ async fn a_spawn_failure_is_reported_without_a_process() {
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_cancellation_reports_a_confirmed_job_end() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let dir = fixture("windows-cancel");
     let data = Arc::new(ToolData::new());
     let sink = RecordingSink::new(Arc::clone(&data));
@@ -945,7 +945,7 @@ async fn windows_capture_keeps_the_server_end_as_the_reader() {
 
 #[tokio::test]
 async fn join_future_drop_preserves_handle_for_subsequent_join() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let loop_key = LoopId::new().unwrap();
     let (_cancel, release) = owners.add_held_worker(loop_key);
     assert_eq!(owners.active(), 1);
@@ -978,7 +978,7 @@ async fn join_future_drop_preserves_handle_for_subsequent_join() {
 
 #[tokio::test]
 async fn concurrent_joins_both_wait_for_worker_completion_and_leave_registry_empty() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let loop_key = LoopId::new().unwrap();
     let (_cancel, release) = owners.add_held_worker(loop_key);
     assert_eq!(owners.active(), 1);
@@ -1005,7 +1005,7 @@ async fn concurrent_joins_both_wait_for_worker_completion_and_leave_registry_emp
 
 #[tokio::test]
 async fn unfinished_held_worker_occupies_registry_capacity() {
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let loop_key = LoopId::new().unwrap();
     let (_cancel, release) = owners.add_held_worker(loop_key);
     assert_eq!(owners.active(), 1);
@@ -1027,7 +1027,7 @@ async fn unfinished_held_worker_occupies_registry_capacity() {
     assert_eq!(owners.active(), 0);
 }
 
-impl CommandOwners {
+impl ToolOwners {
     #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         let inner = self.inner.lock().unwrap();

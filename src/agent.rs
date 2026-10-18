@@ -31,7 +31,7 @@ use crate::prompt::ProjectPromptProvider;
 use crate::sessions::{Sessions, TurnCompletion, await_compaction_completion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
 use crate::tool_data::ToolData;
-use crate::tools::command::CommandOwners;
+use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
 use crate::tools::{BuildToolsError, CommandEnvironment};
 

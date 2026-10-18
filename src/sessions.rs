@@ -40,7 +40,7 @@ use crate::presentation::SteerReceiptPrompt;
 use crate::prompt::ProjectPromptProvider;
 use crate::store::{Store, StoredLoopOutcome, StoredLoopRecord, SummaryCommit, utc_timestamp};
 use crate::tool_data::ToolData;
-use crate::tools::command::CommandOwners;
+use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
 use crate::workspace::{Workspace, WorkspaceError};
 
@@ -107,7 +107,7 @@ struct SessionShared {
     events: AgentEventSink,
     compaction: Arc<CompactionState>,
     tool_data: Arc<ToolData>,
-    command_owners: Arc<CommandOwners>,
+    tool_owners: Arc<ToolOwners>,
     tool_observer: Arc<ToolObserver>,
 }
 
@@ -244,7 +244,7 @@ impl Session {
         let crate::agent::SessionParts {
             presentation,
             observer: tool_observer,
-            command_owners,
+            tool_owners,
             compaction,
         } = parts;
         compaction.note_settings_installed();
@@ -278,7 +278,7 @@ impl Session {
                 events,
                 compaction,
                 tool_data,
-                command_owners,
+                tool_owners,
                 tool_observer,
             }),
         }
@@ -394,15 +394,15 @@ impl Session {
         Arc::clone(&self.shared.tool_data)
     }
 
-    pub(crate) fn command_owners(&self) -> Arc<CommandOwners> {
-        Arc::clone(&self.shared.command_owners)
+    pub(crate) fn tool_owners(&self) -> Arc<ToolOwners> {
+        Arc::clone(&self.shared.tool_owners)
     }
 
     pub(crate) fn parts(&self) -> crate::agent::SessionParts {
         crate::agent::SessionParts {
             presentation: self.presentation(),
             observer: Arc::clone(&self.shared.tool_observer),
-            command_owners: self.command_owners(),
+            tool_owners: self.tool_owners(),
             compaction: self.compaction_state(),
         }
     }
@@ -570,7 +570,7 @@ impl Session {
         // Owned commands are joined after every owner was told to stop, and
         // before the Session reports closure: a command is only finished when
         // its owner really reaped it.
-        self.shared.command_owners.join_all().await;
+        self.shared.tool_owners.join_all().await;
         first_error.map_or(Ok(()), Err)
     }
 }

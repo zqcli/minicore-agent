@@ -14,7 +14,7 @@ use tokio::process::Command;
 use crate::Workspace;
 use crate::tool_data::{CommandStatus, ToolRef};
 
-use super::command::{Capture, CommandBinding, CommandOutcome, CommandOwners, CommandRequest};
+use super::command::{Capture, CommandBinding, CommandOutcome, CommandRequest, ToolOwners};
 use super::{DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT};
 
 /// Bounded model-facing head and tail of one stream, kept separately from the
@@ -72,7 +72,7 @@ pub(crate) struct BashTool {
     /// Owner boundary for every command this tool starts. A tool built without
     /// a presentation still owns its commands instead of relying on the
     /// Runtime dropping a future.
-    owners: Arc<CommandOwners>,
+    owners: Arc<ToolOwners>,
     /// Narrow presentation binding: complete identity of the current call and
     /// the sink its streams go to. `None` for a standalone tool.
     binding: Option<CommandBinding>,
@@ -97,7 +97,7 @@ impl BashTool {
     ) -> Self {
         let owners = binding
             .as_ref()
-            .map_or_else(CommandOwners::new, |binding| Arc::clone(binding.owners()));
+            .map_or_else(ToolOwners::new, |binding| Arc::clone(binding.owners()));
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("bash is a valid tool name"),
             "Run one bounded shell command in a workspace directory.",

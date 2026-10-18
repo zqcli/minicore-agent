@@ -1,6 +1,6 @@
 use super::*;
 use crate::tool_data::{ToolData, ToolExecutionState};
-use crate::tools::command::CommandOwners;
+use crate::tools::command::ToolOwners;
 use crate::tools::{
     CommandEnvironment, NativeApplyPatchTool, NativeEditTool, NativeWriteTool, OwnedBashTool,
 };
@@ -577,7 +577,7 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
     assert_ne!(first_ref.loop_id, second_ref.loop_id);
     assert_eq!(second_ref.loop_id, second_key.loop_id);
     // The new loop's binding only owns the new loop's registry.
-    let binding = observer.command_binding(CommandOwners::new());
+    let binding = observer.command_binding(ToolOwners::new());
     assert_eq!(binding.owners().active(), 0);
 }
 
@@ -638,7 +638,7 @@ async fn presentation_tool_variants_share_binding_and_finish() {
         Presentation::new(session_id, sink, crate::compaction::CompactionState::new());
     let (sink, mut observer_events) = crate::event::AgentEventSink::channel(16);
     let observer = ToolObserver::new(session_id, Arc::new(ToolData::new()), sink);
-    let owners = CommandOwners::new();
+    let owners = ToolOwners::new();
     let plain = crate::tools::tests::build_tools(
         &["read".to_owned()],
         Arc::clone(&workspace),
@@ -652,9 +652,9 @@ async fn presentation_tool_variants_share_binding_and_finish() {
         CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),
         Some(observer.command_binding(Arc::clone(&owners))),
     ));
-    let write = Arc::new(NativeWriteTool::new(Arc::clone(&workspace)));
-    let edit = Arc::new(NativeEditTool::new(Arc::clone(&workspace)));
-    let apply_patch = Arc::new(NativeApplyPatchTool::new(Arc::clone(&workspace)));
+    let write = Arc::new(NativeWriteTool::new(Arc::clone(&workspace), None));
+    let edit = Arc::new(NativeEditTool::new(Arc::clone(&workspace), None));
+    let apply_patch = Arc::new(NativeApplyPatchTool::new(Arc::clone(&workspace), None));
     let tools = [
         (
             "read",

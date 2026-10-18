@@ -63,27 +63,26 @@ impl Workspace {
         Ok(target)
     }
 
-    /// Once started, the blocking commit and its observer finish together even
-    /// if the caller stops awaiting them. Path preflight remains cancellable.
-    pub(crate) async fn write_atomic_observed(
+    /// Resolves `path` (cancellable) and returns the blocking commit. Once
+    /// started, the commit and its observer must run to completion together;
+    /// the caller owns that guarantee (see `ToolOwners::run_blocking`).
+    pub(crate) async fn prepare_atomic_write(
         &self,
         path: String,
         bytes: Vec<u8>,
         expected: Option<ExpectedFileState>,
         observe: impl FnOnce(&str, &[u8], &AtomicWriteObservation) + Send + 'static,
-    ) -> AtomicWriteObservation {
+    ) -> impl FnOnce() -> AtomicWriteObservation + Send + 'static {
         let resolved = self.resolve_for_write(&path).await;
         let root = Arc::clone(&self.root);
-        tokio::task::spawn_blocking(move || {
+        move || {
             let observation = match resolved {
                 Ok(target) => commit_write(&root, &target, &bytes, expected),
                 Err(error) => failed_observation(error),
             };
             observe(&path, &bytes, &observation);
             observation
-        })
-        .await
-        .unwrap_or_else(|_| failed_observation(WorkspaceError::UnknownOutcome))
+        }
     }
 
     async fn resolve_write_parent(&self, relative: &Path) -> Result<PathBuf, WorkspaceError> {

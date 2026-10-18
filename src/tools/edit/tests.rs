@@ -22,7 +22,7 @@ async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, EditTool) {
     let root = base.join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root).await.unwrap());
-    let tool = EditTool::new(Arc::clone(&workspace));
+    let tool = EditTool::new(Arc::clone(&workspace), None);
     (base, workspace, tool)
 }
 

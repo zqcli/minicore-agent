@@ -14,7 +14,7 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
    │             │             │                 └─ cancellation and deadlines
    │             │             ├─ Workspace + execution snapshot
    │             │             ├─ ToolObserver ──► ToolData
-   │             │             ├─ CommandOwners ─► Bash workers/process scope
+   │             │             ├─ ToolOwners ──► Bash workers, started commits
    │             │             ├─ Presentation ──► display-only facts/events
    │             │             └─ CompactionState
    │             └─ Store ─────► session.json / history.jsonl / summary.json / aux
@@ -27,7 +27,7 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
   model/profile catalogs, and Agent-level shutdown.
 - A loaded `Session` owns its canonical Workspace, persisted record and in-memory
   history, execution configuration, compaction state, `ToolData`,
-  `CommandOwners`, `ToolObserver`, Presentation state, and Session-owned query
+  `ToolOwners`, `ToolObserver`, Presentation state, and Session-owned query
   workers. Close cancels and joins those workers before unloading the Session.
 - Runtime 0.7.0 owns the `AgentLoop` semantics, model-text normalization, and
   model/tool scheduling. Immutable text, arguments, replay, and request payloads
@@ -36,8 +36,9 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
   settled history, and publishes Agent-level completion.
 - `ToolObserver` captures the real request/Tool identity at Runtime boundaries.
   `ToolData` retains bounded invocation, execution, stream, and change facts.
-  `CommandOwners` owns Bash child cleanup even if the Runtime drops a Tool
-  future. `Presentation` formats bounded local display data without changing
+  `ToolOwners` owns Bash child cleanup and started workspace commits even if the
+  Runtime drops a Tool future; loop completion joins them before tool records
+  are persisted, and close joins them before reporting closure. `Presentation` formats bounded local display data without changing
   execution or persistence.
 - `Store` is the durable authority for Session records, JSONL history, derived
   summaries, and auxiliary Tool/change files. A Store clone shares one budget and

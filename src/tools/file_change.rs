@@ -1,3 +1,4 @@
+use super::command::ToolOwners;
 use super::{map_source_error, map_workspace_error};
 use crate::changes::{
     ChangeCommitState, ChangeCoverage, ChangeKind, ChangeRevision, FileChange, content_revision,
@@ -46,16 +47,21 @@ pub(super) fn source_failure(
     }
 }
 
+/// Commits text and records its observation. With `owners`, a started commit
+/// is joined by the loop and Session barriers even if this future is dropped,
+/// so tool records are never persisted without the change they observed.
 pub(super) async fn commit_text(
     workspace: &Workspace,
+    owners: Option<&ToolOwners>,
     tool_ref: Option<ToolRef>,
     tool_data: Option<Arc<ToolData>>,
     path: String,
     before: FileBefore,
     bytes: Vec<u8>,
 ) -> Result<(), ToolError> {
-    let observation = workspace
-        .write_atomic_observed(
+    let owner_ref = tool_ref.clone();
+    let commit = workspace
+        .prepare_atomic_write(
             path,
             bytes,
             expected_file_state(&before),
@@ -71,6 +77,12 @@ pub(super) async fn commit_text(
             },
         )
         .await;
+    let observation = match owners {
+        Some(owners) => owners.run_blocking(owner_ref.as_ref(), commit).await?,
+        None => tokio::task::spawn_blocking(commit)
+            .await
+            .map_err(|_| ToolError::Failed)?,
+    };
     observation.outcome.map_err(map_workspace_error)
 }
 

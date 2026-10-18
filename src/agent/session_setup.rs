@@ -34,12 +34,12 @@ impl ExecutionConfigFactory<'_> {
         );
         presentation.set_model_label(record.model.clone());
         let tool_data = Arc::new(ToolData::new());
-        let command_owners = CommandOwners::new();
+        let tool_owners = ToolOwners::new();
         let observer = ToolObserver::new(record.session_id, Arc::clone(&tool_data), events.clone());
         let parts = SessionParts {
             presentation,
             observer,
-            command_owners,
+            tool_owners,
             compaction,
         };
         let (config, auto) = self.build(record, workspace, &parts, &options)?;
@@ -108,7 +108,7 @@ impl ExecutionConfigFactory<'_> {
             self.command_environment.clone(),
             &parts.presentation,
             &parts.observer,
-            &parts.command_owners,
+            &parts.tool_owners,
         )
         .map_err(map_build_tools_error)?;
         let policy: Option<Arc<dyn ToolPolicy>> = if record.tools.is_empty() {
@@ -139,7 +139,7 @@ impl ExecutionConfigFactory<'_> {
 
 pub(crate) struct SessionParts {
     pub(crate) presentation: Arc<crate::presentation::Presentation>,
-    pub(crate) command_owners: Arc<CommandOwners>,
+    pub(crate) tool_owners: Arc<ToolOwners>,
     pub(crate) observer: Arc<ToolObserver>,
     pub(crate) compaction: Arc<CompactionState>,
 }

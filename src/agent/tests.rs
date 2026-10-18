@@ -80,7 +80,7 @@ use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
 };
 use crate::tool_data::ToolData;
-use crate::tools::command::CommandOwners;
+use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
 
 use super::{

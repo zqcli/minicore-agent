@@ -26,15 +26,12 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
     let first_session = agent.loaded_session(first.session_id).unwrap();
     let second_session = agent.loaded_session(second.session_id).unwrap();
     let first_data = first_session.tool_data();
-    let first_owners = first_session.command_owners();
+    let first_owners = first_session.tool_owners();
     let first_observer = first_session.parts().observer;
     assert!(Arc::ptr_eq(&first_data, &first_observer.tool_data()));
     assert_eq!(first_observer.session_id(), first.session_id);
     assert!(!Arc::ptr_eq(&first_data, &second_session.tool_data()));
-    assert!(!Arc::ptr_eq(
-        &first_owners,
-        &second_session.command_owners()
-    ));
+    assert!(!Arc::ptr_eq(&first_owners, &second_session.tool_owners()));
 
     agent
         .update_session(UpdateSession {
@@ -45,7 +42,7 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&first_data, &first_session.tool_data()));
-    assert!(Arc::ptr_eq(&first_owners, &first_session.command_owners()));
+    assert!(Arc::ptr_eq(&first_owners, &first_session.tool_owners()));
     assert!(Arc::ptr_eq(
         &first_observer,
         &first_session.parts().observer
@@ -66,7 +63,7 @@ async fn i2_01_session_reuses_observation_resources_across_updates_and_reload() 
         crate::agent::ReloadResult { ok: true }
     );
     assert!(Arc::ptr_eq(&first_data, &first_session.tool_data()));
-    assert!(Arc::ptr_eq(&first_owners, &first_session.command_owners()));
+    assert!(Arc::ptr_eq(&first_owners, &first_session.tool_owners()));
     assert!(Arc::ptr_eq(
         &first_observer,
         &first_session.parts().observer
@@ -84,7 +81,7 @@ async fn i2_05_session_observation_resources_are_released_without_cycles() {
     let (mut agent, info) = fixture.start().await;
     let session = agent.loaded_session(info.session_id).unwrap();
     let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
-    let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
+    let weak_owners: Weak<ToolOwners> = Arc::downgrade(&session.tool_owners());
     let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.parts().observer);
     drop(session);
 

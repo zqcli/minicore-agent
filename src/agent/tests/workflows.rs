@@ -118,7 +118,7 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     let info = create_session(&mut agent, &workspace).await;
     let session = agent.loaded_session(info.session_id).unwrap();
     let weak_data: Weak<ToolData> = Arc::downgrade(&session.tool_data());
-    let weak_owners: Weak<CommandOwners> = Arc::downgrade(&session.command_owners());
+    let weak_owners: Weak<ToolOwners> = Arc::downgrade(&session.tool_owners());
     let weak_observer: Weak<ToolObserver> = Arc::downgrade(&session.parts().observer);
     drop(session);
 
@@ -172,7 +172,7 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
         let active = agent
             .loaded_session(info.session_id)
             .unwrap()
-            .command_owners()
+            .tool_owners()
             .active();
         (
             cancelled,
@@ -207,7 +207,7 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
     assert!(weak_data.upgrade().is_none(), "ToolData was not released");
     assert!(
         weak_owners.upgrade().is_none(),
-        "CommandOwners was not released"
+        "ToolOwners was not released"
     );
     assert!(
         weak_observer.upgrade().is_none(),
