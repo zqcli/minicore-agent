@@ -2413,6 +2413,9 @@ async fn in_stream_rejections_classify_codes_delivery_and_redact_messages() {
                 Some(
                     json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read","arguments":""}}),
                 ),
+                Some(
+                    json!({"type":"response.content_part.done","item_id":"m","output_index":0,"content_index":0,"part":{"type":"output_text","text":"partial"}}),
+                ),
             ] {
                 let started = output.is_some();
                 let mut frames = vec![
@@ -2449,6 +2452,29 @@ async fn in_stream_rejections_classify_codes_delivery_and_redact_messages() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn a_failure_that_carries_output_is_started() {
+    let server = MockServer::spawn([MockResponse::sse(&[
+        json!({"type":"response.created"}),
+        json!({"type":"response.failed","response":{
+            "output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],
+            "error":{"code":"context_length_exceeded","message":"RAW-SECRET"}
+        }}),
+    ])])
+    .await;
+    let model = model(server.base_url());
+    let context = context(CancellationToken::new(), Duration::from_secs(5));
+    let (_, error) =
+        run_until_error(&model, basic_request(ReasoningPreference::Auto), context).await;
+    assert_error(
+        &error,
+        ModelErrorKind::ContextOverflow,
+        DeliveryState::Started,
+        false,
+    );
+    server.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

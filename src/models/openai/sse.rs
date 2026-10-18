@@ -90,6 +90,7 @@ pub(super) fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), 
     let event_type = value.get("type").and_then(Value::as_str).ok_or(())?;
     state.provider_event_seen = true;
     state.output_seen |= event_type.starts_with("response.output_")
+        || event_type.starts_with("response.content_part.")
         || event_type.starts_with("response.reasoning_")
         || event_type.starts_with("response.refusal.")
         || event_type.starts_with("response.function_call_");
@@ -169,7 +170,11 @@ pub(super) fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), 
                     _ => None,
                 })
                 .unwrap_or(ModelErrorKind::ProviderUnavailable);
-            state.fail(if state.output_seen {
+            let failed_output = value
+                .pointer("/response/output")
+                .and_then(Value::as_array)
+                .is_some_and(|output| !output.is_empty());
+            state.fail(if state.output_seen || failed_output {
                 started_error(kind)
             } else if kind == ModelErrorKind::RateLimited {
                 retryable_error(kind, None)

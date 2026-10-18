@@ -246,8 +246,8 @@ impl Models {
         mut read_env: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ModelConfigError> {
         let mut values = BTreeMap::new();
+        // Callers pass a validated AgentConfig; only credentials are admitted here.
         for (id, value) in &config.models {
-            value.validate()?;
             let entry = match value {
                 ModelConfig::OpenAiResponses {
                     model,
