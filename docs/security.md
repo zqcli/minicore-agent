@@ -46,7 +46,9 @@ has no cross-process lock: run only one Agent process per data directory.
 
 ## Secrets, Logs, And Data
 
-API key values are read from the environment variable named by `api_key_env`;
+API key values are read from the process environment variable named by `api_key_env`;
+rotating them requires restarting the Agent. Unreferenced models may lack keys,
+but profile models and models selected by loaded sessions must have valid credentials;
 the value is not part of the TOML contract. Tracing is stderr-only and excludes
 keys, authorization headers, provider URLs/bodies, prompts, reasoning text,
 Tool arguments, and Bash commands/paths/content. Agent errors and redacted

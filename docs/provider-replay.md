@@ -28,8 +28,9 @@ locally rather than silently dropping context. Known malformed/stale payloads
 are rejected, including when the selected identity differs. Old history with
 no attachment or a null attachment remains readable.
 
-Responses requests include `reasoning.encrypted_content`. Final text, tool, and
-reasoning output can be captured. A terminal reasoning item may add a previously
+Responses requests include `reasoning.encrypted_content` only when reasoning is
+not disabled and the model configuration supports an explicit reasoning level.
+Final text, tool, and reasoning output can be captured regardless of that request field. A terminal reasoning item may add a previously
 missing/null encrypted-content string only if every other field is identical;
 existing ciphertext is never replaced. An encrypted-only response can survive
 as an empty canonical assistant with real validated replay. No visible text is
@@ -70,7 +71,9 @@ Actual model admission and recovery estimates serialize through exactly the
 same model/endpoint-aware request projection as sending. The generic utility
 size estimate is deliberately conservative, uses maximum framing allowances,
 and includes valid replay regardless of identity instead of accidentally
-skipping it with a synthetic model. It is not an exact provider-token count.
+skipping it with a synthetic model. The shared token heuristic takes the maximum
+of rounded-up serialized bytes / 4 and non-ASCII character count; utility request
+estimates retain their framing margin. It is not an exact provider-token count.
 The utility's source prose itself remains redacted.
 
 ## Verification boundaries

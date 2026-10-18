@@ -227,7 +227,7 @@ impl Agent {
 
     pub async fn open(config: AgentConfig) -> Result<Self, AgentError> {
         config.validate().map_err(AgentError::Config)?;
-        let models = Models::from_config(&config.models)
+        let models = Models::from_config(&config)
             .await
             .map_err(map_model_config_error)?;
         Self::open_parts(config, models, None).await
@@ -238,7 +238,7 @@ impl Agent {
     pub async fn open_file(path: impl AsRef<std::path::Path>) -> Result<Self, AgentError> {
         let path = AgentConfig::absolute_lexical_path(path.as_ref()).map_err(AgentError::Config)?;
         let config = AgentConfig::load(&path).map_err(AgentError::Config)?;
-        let models = Models::from_config(&config.models)
+        let models = Models::from_config(&config)
             .await
             .map_err(map_model_config_error)?;
         Self::open_parts(config, models, Some(path)).await
@@ -294,7 +294,7 @@ impl Agent {
             if config.data_dir != data_dir || config.event_capacity != event_capacity {
                 return Err(AgentError::ReloadRequiresRestart);
             }
-            let models = Models::from_config(&config.models)
+            let models = Models::from_config(&config)
                 .await
                 .map_err(map_model_config_error)?;
             Ok((config, models))

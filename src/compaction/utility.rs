@@ -65,8 +65,8 @@ const SOURCE_SUFFIX: &str = "\n[END MINICORE HISTORICAL SOURCE DATA]";
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 const SOURCE_WRITE_BYTES: usize = 4096;
 const RUNTIME_SUMMARY_PREFIX: &str = "Conversation summary:\n";
-// The OpenAI adapter uses this same bytes/4 heuristic after serializing its
-// Responses JSON shape. The adapter's complete body is counted below; this
+// Token estimates share the OpenAI adapter's UTF-8-aware heuristic. The
+// adapter's complete Responses JSON body is counted below; this
 // small margin covers provider fields that are not part of the Runtime model
 // without pretending to be a provider tokenizer guarantee.
 const PROVIDER_ESTIMATE_MARGIN_BYTES: usize = 512;
@@ -864,7 +864,9 @@ fn estimate_before_tokens(input: &CompactionInput) -> Result<u64, UtilityError> 
         input.previous_summary.as_ref(),
         &input.history[input.previous_covered_item_count..],
     )?;
-    Ok(bytes_to_tokens(estimate_request_bytes(&request)?))
+    crate::models::estimate_openai_request_tokens(&request)
+        .map(|tokens| tokens + bytes_to_tokens(PROVIDER_ESTIMATE_MARGIN_BYTES))
+        .map_err(|_| UtilityError::Serialization)
 }
 
 fn estimate_after_tokens(
@@ -880,7 +882,9 @@ fn estimate_after_tokens_with_tail(
     tail: &[HistoryItem],
 ) -> Result<u64, UtilityError> {
     let request = normal_request(input, Some(summary), tail)?;
-    Ok(bytes_to_tokens(estimate_request_bytes(&request)?))
+    crate::models::estimate_openai_request_tokens(&request)
+        .map(|tokens| tokens + bytes_to_tokens(PROVIDER_ESTIMATE_MARGIN_BYTES))
+        .map_err(|_| UtilityError::Serialization)
 }
 
 fn summary_budget_with_tail(
