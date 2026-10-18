@@ -824,6 +824,18 @@ async fn a_cancelled_session_stops_the_scan() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_regular_entry_swapped_to_a_fifo_before_open_is_rejected_without_blocking() {
+    let fixture = fixture("scan-fifo-swap").await;
+    write(&fixture, "file", b"needle\n");
+    crate::workspace::SWAP_OPEN_TO_FIFO.arm(fixture.workspace.root().join("file"), ());
+    let result = run(&fixture, request(&fixture, "needle")).await;
+    assert!(result.matches.is_empty());
+    assert_eq!(result.skipped_files, 1);
+    assert!(result.scan_complete);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn special_files_and_escaping_symlinks_are_skipped_without_blocking() {
     use std::os::unix::fs::symlink;
     use std::time::Duration;

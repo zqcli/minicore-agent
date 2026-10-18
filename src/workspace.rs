@@ -207,28 +207,19 @@ impl Workspace {
         Ok(resolved)
     }
 
-    /// Synchronous twin of `resolve_existing` for blocking scan workers. It
-    /// enforces the same boundary: canonical inside the root, regular file.
-    pub(crate) fn resolve_existing_sync(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
+    /// The walker already classified the entry. Keep canonical containment,
+    /// no-follow/non-blocking open, and validate the actual opened descriptor.
+    pub(crate) fn open_regular_file_sync(
+        &self,
+        path: &str,
+    ) -> Result<(StdFile, std_fs::Metadata), WorkspaceError> {
         let resolved = self.resolve_inside_sync(path, false)?;
-        let metadata = std_fs::metadata(&resolved).map_err(map_io_error)?;
-        ensure_regular(&metadata)?;
-        Ok(resolved)
-    }
-
-    /// Synchronous twin of `open_regular_file` for blocking scan workers. It
-    /// applies the same regular-file checks, and on Unix the same non-blocking
-    /// no-follow open.
-    pub(crate) fn open_regular_file_sync(&self, path: &str) -> Result<StdFile, WorkspaceError> {
-        let resolved = self.resolve_existing_sync(path)?;
-        let metadata = std_fs::symlink_metadata(&resolved).map_err(map_io_error)?;
-        if metadata.file_type().is_symlink() {
-            return Err(WorkspaceError::Escape);
-        }
-        ensure_regular(&metadata)?;
+        #[cfg(all(test, unix))]
+        tests::swap_open_target_with_fifo(&resolved);
         let file = open_read_only_sync(&resolved)?;
-        ensure_regular(&file.metadata().map_err(map_io_error)?)?;
-        Ok(file)
+        let metadata = file.metadata().map_err(map_io_error)?;
+        ensure_regular(&metadata)?;
+        Ok((file, metadata))
     }
 
     pub(crate) async fn resolve_directory(&self, path: &str) -> Result<PathBuf, WorkspaceError> {

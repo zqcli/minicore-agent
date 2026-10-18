@@ -676,7 +676,10 @@ where
     /// ancestor or a sibling, and a requested root is never filtered by its own
     /// rule file.
     fn excluded(&self, relative: &Path, name: &OsStr, is_dir: bool) -> bool {
-        if name == OsStr::new(".git") {
+        let bytes = name.as_encoded_bytes();
+        if name == OsStr::new(".git")
+            || (bytes.starts_with(b".minicore-write-") && bytes.ends_with(b".tmp"))
+        {
             return true;
         }
         for category in [RuleCategory::Ignore, RuleCategory::GitIgnore] {

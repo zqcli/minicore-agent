@@ -38,6 +38,73 @@ async fn an_unrepresentable_cursor_does_not_exceed_the_result_budget() {
 }
 
 #[tokio::test]
+async fn atomic_write_artifacts_are_hidden_without_deleting_reserved_names() {
+    let fixture = fixture("atomic-artifacts").await;
+    write(&fixture, "value", b"before").await;
+    write(&fixture, ".minicore-write-user.tmp", b"needle").await;
+    let gate = Arc::new(crate::test_support::Gate::new());
+    crate::workspace::BEFORE_RENAME_GATES
+        .arm(fixture.workspace.root().join("value"), Arc::clone(&gate));
+    let writer = tokio::spawn({
+        let workspace = Arc::clone(&fixture.workspace);
+        async move { workspace.write_atomic("value", b"needle").await }
+    });
+    gate.wait_started().await;
+    let listing = files(
+        Arc::clone(&fixture.workspace),
+        request(&fixture),
+        CancellationToken::new(),
+        CancellationToken::new(),
+    )
+    .await;
+    let matches = crate::workspace::search::search(
+        Arc::clone(&fixture.workspace),
+        crate::workspace::search::WorkspaceSearchRequest {
+            session_id: fixture.session,
+            query: "needle".into(),
+            paths: None,
+            case_sensitive: None,
+            cursor: None,
+            max_matches: None,
+            max_bytes: None,
+        },
+        CancellationToken::new(),
+        CancellationToken::new(),
+    )
+    .await;
+    let temps = std::fs::read_dir(fixture.workspace.root()).map(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".minicore-write-")
+            })
+            .count()
+    });
+    gate.release();
+    writer.await.unwrap().unwrap();
+    assert_eq!(
+        temps.unwrap(),
+        2,
+        "the test must observe a live commit temp file"
+    );
+    let listing = listing.unwrap();
+    assert_eq!(paths(&listing), ["value"]);
+    assert!(listing.scan_complete);
+    let matches = matches.unwrap();
+    assert!(matches.matches.is_empty());
+    assert!(matches.scan_complete);
+    assert_eq!(
+        tokio::fs::read(fixture.workspace.root().join(".minicore-write-user.tmp"))
+            .await
+            .unwrap(),
+        b"needle"
+    );
+}
+
+#[tokio::test]
 async fn worktree_metadata_is_absent_and_pages_are_stable_under_insertions() {
     let fixture = fixture("path-cursor").await;
     write(&fixture, ".git", b"gitdir: /outside/metadata").await;
