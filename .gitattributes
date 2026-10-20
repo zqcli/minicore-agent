@@ -5,3 +5,6 @@
 # Runtime message text rejects CR; keep embedded prompt assets LF on Windows.
 /src/compaction/prompts/*.txt text eol=lf
 /src/compaction/fixtures/*.txt text eol=lf
+
+# The event snapshot is compared byte for byte.
+/src/event/events.jsonl text eol=lf

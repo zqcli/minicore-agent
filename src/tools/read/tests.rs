@@ -266,7 +266,7 @@ fn decoder_excludes_lookahead_and_strips_split_crlf() {
 async fn binary_content_is_explained_and_controls_are_escaped() {
     let (base, _, tool) = fixture("binary").await;
     let root = base.join("root");
-    tokio::fs::write(root.join("nul"), b"text\0more")
+    tokio::fs::write(root.join("nul-byte"), b"text\0more")
         .await
         .unwrap();
     tokio::fs::write(root.join("invalid"), [0xff, 0xfe])
@@ -277,7 +277,7 @@ async fn binary_content_is_explained_and_controls_are_escaped() {
         .unwrap();
 
     assert_eq!(
-        execute(&tool, json!({"path": "nul"})).await.unwrap(),
+        execute(&tool, json!({"path": "nul-byte"})).await.unwrap(),
         "Cannot read binary or non-UTF-8 content as text."
     );
     assert_eq!(

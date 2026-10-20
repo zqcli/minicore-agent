@@ -902,12 +902,12 @@ async fn patch_source_and_result_limits_are_enforced_without_writing() {
     tokio::fs::write(root.join("binary"), [0xff, 0xfe])
         .await
         .unwrap();
-    tokio::fs::write(root.join("nul"), b"text\0value")
+    tokio::fs::write(root.join("nul-byte"), b"text\0value")
         .await
         .unwrap();
     tokio::fs::create_dir(root.join("directory")).await.unwrap();
     let patch = "@@ -1 +1 @@\n-a\n+b\n";
-    for path in ["binary", "nul"] {
+    for path in ["binary", "nul-byte"] {
         let before = tokio::fs::read(root.join(path)).await.unwrap();
         assert_eq!(
             execute(

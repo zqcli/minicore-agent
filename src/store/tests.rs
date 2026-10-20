@@ -28,9 +28,11 @@ pub(super) async fn fail_append(
     file.write_all(&bytes[..bytes.len() / 2]).await.unwrap();
     file.flush().await.unwrap();
     if rollback_fails {
-        file = File::open(path).await.unwrap();
+        // A read-only handle cannot truncate.
+        let file = File::open(path).await.unwrap();
+        return Err(super::history::truncate_append(&file, previous_len).await);
     }
-    Err(super::history::rollback_append(&file, previous_len).await)
+    Err(super::history::rollback_append(path, previous_len).await)
 }
 
 pub(super) async fn pass_summary_gate(session_id: SessionId, deadline: Instant) -> bool {

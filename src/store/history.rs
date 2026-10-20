@@ -312,7 +312,7 @@ impl Store {
         .await;
         if let Err(error) = written {
             unavailable(error);
-            return Err(rollback_append(&file, previous_len).await);
+            return Err(rollback_append(&path, previous_len).await);
         }
         if let Some(index) = self.history_indexes.lock().unwrap().get_mut(&session_id) {
             index_line(index, &bytes, record, normalized_items.len());
@@ -835,7 +835,18 @@ struct ColdDisplayScan<'a> {
     summary: Option<&'a HistoryPrefix>,
 }
 
-pub(super) async fn rollback_append(file: &File, previous_len: u64) -> AppendError {
+pub(super) async fn rollback_append(path: &Path, previous_len: u64) -> AppendError {
+    // A Windows append handle lacks the write-data right that truncation needs.
+    match OpenOptions::new().write(true).open(path).await {
+        Ok(file) => truncate_append(&file, previous_len).await,
+        Err(error) => {
+            unavailable(error);
+            AppendError::Unknown
+        }
+    }
+}
+
+pub(super) async fn truncate_append(file: &File, previous_len: u64) -> AppendError {
     match async {
         file.set_len(previous_len).await?;
         file.sync_data().await

@@ -331,11 +331,11 @@ async fn input_source_and_result_limits_are_enforced_before_allocation_or_write(
     tokio::fs::write(root.join("binary"), [0xff, 0xfe])
         .await
         .unwrap();
-    tokio::fs::write(root.join("nul"), b"text\0value")
+    tokio::fs::write(root.join("nul-byte"), b"text\0value")
         .await
         .unwrap();
     tokio::fs::create_dir(root.join("directory")).await.unwrap();
-    for path in ["binary", "nul"] {
+    for path in ["binary", "nul-byte"] {
         let before = tokio::fs::read(root.join(path)).await.unwrap();
         assert_eq!(
             execute(

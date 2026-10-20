@@ -43,7 +43,8 @@ async fn resolved_root_aliases_cannot_duplicate_matches() {
     ));
 }
 
-#[cfg(unix)]
+// macOS file systems refuse names that are not UTF-8.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn unrepresentable_resolved_roots_never_read_a_lossy_sibling() {
     use std::os::unix::ffi::OsStringExt;
