@@ -10,9 +10,9 @@ also be embedded directly as a Rust library.
 
 | | |
 |---|---|
-| Version | 0.7.0 |
+| Version | 0.7.1 |
 | Rust | edition 2024, MSRV 1.85 |
-| Runtime | `minicore-runtime` 0.7.0, pinned to `b93aea38fea32b4ee416e4bbf5e66254157e1463` |
+| Runtime | `minicore-runtime` 0.7.1, pinned to `c0181d1983280c8cdd14a3196b1ea199b7e6206d` |
 | RPC protocol | 1 (33 methods) |
 | Provider | OpenAI Responses API and compatible endpoints |
 | License | MIT OR Apache-2.0 |

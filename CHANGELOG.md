@@ -1,7 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 — 2026-10-21
 
+- Pin Runtime 0.7.1 at `c0181d1983280c8cdd14a3196b1ea199b7e6206d` (no API change).
+- A failed history append now rolls back on Windows. The append handle there
+  cannot truncate, so the rollback reported an unknown outcome and blocked the
+  session; it now truncates through a separate writable handle.
+- CI runs on every branch and tag, tests Linux, macOS and Windows without
+  stopping at the first failure, and uploads a release build per platform
+  (Linux x86_64, macOS arm64 and x86_64, Windows x86_64) as an artifact.
 - The binary runs its Tokio runtime on two worker threads instead of one per
   core. A single-client stdio Agent spends its time waiting on the network and
   on tool processes; on a 24-core host this cuts the process from about 30

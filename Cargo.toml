@@ -1,6 +1,6 @@
 [package]
 name = "minicore-agent"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -15,8 +15,8 @@ name = "minicore-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Public API is pinned to the reviewed Runtime 0.7.0 revision.
-minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "b93aea38fea32b4ee416e4bbf5e66254157e1463", version = "0.7.0" }
+# Public API is pinned to the reviewed Runtime 0.7.1 revision.
+minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "c0181d1983280c8cdd14a3196b1ea199b7e6206d", version = "0.7.1" }
 # Owned process groups/jobs for the Bash command worker. `tracing` is left off
 # on purpose: a wrapped command must never be logged with its script text.
 process-wrap = { version = "=8.2.0", default-features = false, features = [
