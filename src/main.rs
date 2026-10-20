@@ -16,7 +16,13 @@ enum Command {
 fn main() {
     init_tracing();
     tracing::info!("agent startup");
-    let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime initialization");
+    // The Agent serves one client and waits on the network or on child tools;
+    // a worker (and its allocator arena) per core only holds memory.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Tokio runtime initialization");
     let result = runtime.block_on(run());
     // run_stdio has joined owned work. A parked Tokio stdin read cannot be
     // cancelled; do not wait for that blocking thread when dropping the runtime.

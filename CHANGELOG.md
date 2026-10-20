@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The binary runs its Tokio runtime on two worker threads instead of one per
+  core. A single-client stdio Agent spends its time waiting on the network and
+  on tool processes; on a 24-core host this cuts the process from about 30
+  threads to 7 and its resident memory by 10–15 % after a few turns, with no
+  change in turn latency. Blocking work keeps Tokio's own pool.
+
 ## 0.7.0 — 2026-10-17
 
 Compatibility (RPC protocol stays 1; history, snapshot and auxiliary formats,
