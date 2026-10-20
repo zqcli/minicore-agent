@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches:
-      - dev
-      - main
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --all-targets --no-fail-fast
 
   msrv:
     name: MSRV (Rust 1.85.0)
@@ -49,3 +49,49 @@ jobs:
         with:
           toolchain: 1.85.0
       - run: cargo test --locked --all-targets
+
+  package:
+    name: Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage
+        id: stage
+        shell: bash
+        env:
+          EXE: ${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          name="minicore-agent-$version-${{ matrix.target }}"
+          mkdir -p "$name/bin"
+          cp "target/${{ matrix.target }}/release/minicore-agent$EXE" "$name/bin/"
+          cp README.md CHANGELOG.md example.agent.toml "$name/"
+          # A tarball keeps the executable bit, which artifact zips drop.
+          if [ -z "$EXE" ]; then
+            tar -czf "$name.tar.gz" "$name"
+            echo "path=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$name" >> "$GITHUB_OUTPUT"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: ${{ steps.stage.outputs.path }}
+          if-no-files-found: error
