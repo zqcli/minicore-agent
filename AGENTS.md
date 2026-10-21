@@ -25,7 +25,7 @@ runs Tokio on two workers).
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | Binary entry: Tokio runtime (two workers), `run_stdio` |
+| `src/main.rs`, `src/cli.rs` | Binary entry; `cli::run` is the command line (tracing, Tokio on two workers, `run_stdio`), which `minicore-tui` also calls to embed the Agent |
 | `src/lib.rs`, `src/agent.rs`, `src/agent/session_setup.rs` | Public API (`Agent`, DTOs) and Session construction |
 | `src/sessions.rs`, `src/sessions/` | Loaded Sessions, the active-loop task, event mapping, compaction ownership |
 | `src/rpc/` | JSON-RPC protocol types, dispatcher, deferred work, stdio I/O |

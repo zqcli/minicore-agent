@@ -28,6 +28,7 @@
 mod agent;
 mod budget;
 mod changes;
+pub mod cli;
 mod compaction;
 mod config;
 mod diff;
