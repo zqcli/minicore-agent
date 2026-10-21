@@ -10,7 +10,7 @@ also be embedded directly as a Rust library.
 
 | | |
 |---|---|
-| Version | 0.7.1 |
+| Version | 0.7.2 |
 | Rust | edition 2024, MSRV 1.85 |
 | Runtime | `minicore-runtime` 0.7.1, pinned to `c0181d1983280c8cdd14a3196b1ea199b7e6206d` |
 | RPC protocol | 1 (33 methods) |

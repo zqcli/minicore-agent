@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2 — 2026-10-21
+
+- The command line moves into the library as `minicore_agent::cli::run`, so a
+  host such as `minicore-tui` can embed the Agent and start it as a subcommand
+  of its own executable. The `minicore-agent` binary behaves as before. Tracing
+  is installed only when no subscriber exists yet.
+
 ## 0.7.1 — 2026-10-21
 
 - Pin Runtime 0.7.1 at `c0181d1983280c8cdd14a3196b1ea199b7e6206d` (no API change).

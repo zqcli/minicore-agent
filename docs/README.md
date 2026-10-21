@@ -21,7 +21,7 @@ verification evidence.
 - [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
-These guides describe the current source package **0.7.1**, Rust 2024/MSRV 1.85,
+These guides describe the current source package **0.7.2**, Rust 2024/MSRV 1.85,
 Runtime `0.7.1` at revision
 `c0181d1983280c8cdd14a3196b1ea199b7e6206d`, and RPC protocol version `1`.
 A package version change does not by itself change the RPC protocol or storage
