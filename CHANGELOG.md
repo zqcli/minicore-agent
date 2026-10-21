@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.3 — 2026-10-21
 
 - No minimum Rust version is declared or tested; build with current stable.
 - Dependencies are no longer pinned with `=`; `Cargo.lock` fixes the build.
