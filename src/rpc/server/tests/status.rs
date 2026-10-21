@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(unix)]
 #[tokio::test]
 async fn workspace_status_projects_the_shared_presentation_branch_and_clears_failures() {
     use crate::workspace::status::STATUS_PROGRAMS;
@@ -98,7 +97,6 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     harness.shutdown().await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn closing_a_session_stops_pending_status_queries_and_frees_capacity() {
     use crate::workspace::status::STATUS_PROGRAMS;

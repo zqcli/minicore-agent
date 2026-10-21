@@ -18,7 +18,7 @@ cargo clippy --locked --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 ```
 
-The supported Rust floor is 1.85. Run the focused tests relevant to a change,
+Use current stable Rust; no older toolchain is supported or tested. Run the focused tests relevant to a change,
 then the all-target suite. Do not use real provider credentials for routine
 checks; Live/provider smoke tests remain explicitly opt-in where marked.
 
@@ -28,8 +28,7 @@ The workflow in `.github/workflows/ci.yml` is the source of truth:
 
 - Quality on Ubuntu with stable Rust: rustfmt, all-target Clippy with warnings
   denied, and warning-denied rustdoc.
-- Stable all-target tests on Ubuntu, macOS, and Windows.
-- All-target tests on Ubuntu with Rust 1.85.0.
+- Stable all-target Clippy and tests on Ubuntu, macOS, and Windows.
 
 Platform behavior that was only cross-compiled, provider behavior that was not
 run, and native UI behavior that was not exercised must remain described as

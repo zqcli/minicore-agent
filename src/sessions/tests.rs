@@ -146,10 +146,10 @@ impl Session {
 }
 impl SessionTask {
     fn abort(&self) {
-        if let Ok(slot) = self.join.try_lock() {
-            if let Some(handle) = slot.as_ref() {
-                handle.abort();
-            }
+        if let Ok(slot) = self.join.try_lock()
+            && let Some(handle) = slot.as_ref()
+        {
+            handle.abort();
         }
     }
 }

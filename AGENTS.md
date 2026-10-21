@@ -47,22 +47,23 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo +1.85.0 test --locked --all-targets   # MSRV
+cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings   # Windows-only code
 ```
 
 Focused runs: `cargo test --locked --lib store::` for unit tests, or
 `cargo test --locked --test it rpc_stdio::` for one integration suite. Always
-pass `--locked`. Do not run a broad `cargo update`; when one package must move,
-check that the lock diff touches nothing else.
+pass `--locked`. Updating dependencies is its own commit: run `cargo update`,
+then the full checks.
 
 ## Code Rules
 
-- Rust edition 2024, MSRV 1.85. Do not use std APIs stabilized later, such as
-  `str::floor_char_boundary`. Use `crate::text::{floor_char_boundary, truncate}`
-  instead.
+- Rust edition 2024 on current stable; no minimum version is declared or
+  tested, so new language features and std APIs are fine.
 - `unsafe` is forbidden (`unsafe_code = "forbid"`).
-- Keep existing exact (`=`) dependency pins, and add a dependency only with a
-  clear need.
+- Dependencies use plain version requirements (`"1"`, `"0.12"`), never `=`
+  pins: `Cargo.lock` and `--locked` make builds reproducible, and `minicore-tui`
+  links this crate, so exact pins would force its shared crates down. Add a
+  dependency only with a clear need.
 - Write the least code that solves the problem. No speculative abstractions,
   configuration, or features; no state for cases that cannot happen.
 - No defensive programming: validate inputs once at the boundary that owns them
@@ -111,7 +112,7 @@ These are compatibility decisions. Do not change them as a side effect:
   is normative, and `src/event/events.jsonl` is a byte-level event snapshot.
 - On-disk formats: `session.json`, `history.jsonl`, `summary.json`, and
   `tools/`. History revision strings must stay byte-identical.
-- The pinned Runtime revision. When moving it, update the `rev` and `version`
+- The pinned Runtime release tag. When moving it, update the `tag` and `version`
   in `Cargo.toml` and only the matching `minicore-runtime` entry in
   `Cargo.lock`, plus the Runtime line in `README.md` and `docs/README.md`.
 
@@ -141,15 +142,16 @@ plus `CHANGELOG.md`. Records under `docs/verification/`, `docs/archive/`, and
 ## CI And Releases
 
 - `.github/workflows/ci.yml` runs on every branch and tag: quality (fmt,
-  Clippy, rustdoc), tests on Linux, macOS and Windows with `--no-fail-fast`,
-  MSRV, and a release build per platform uploaded as
+  Clippy, rustdoc), Clippy and tests on Linux, macOS and Windows with
+  `--no-fail-fast`, and a release build per platform uploaded as
   `minicore-agent-<version>-<target>`.
 - A release bumps `version` in `Cargo.toml` and the `minicore-agent` entry in
   `Cargo.lock` only, moves `Unreleased` in `CHANGELOG.md` to the version, and
   updates the version shown in `README.md`, `docs/README.md` and the
   `docs/rpc.md` examples. Tag `vX.Y.Z` (annotated) only after CI is green on
   that commit. A Runtime release is adopted before the Agent release that
-  depends on it; `minicore-tui` then pins the Agent tag's full SHA.
+  depends on it; `minicore-tui` then pins the Agent tag (`tag = "vX.Y.Z"`).
+  Tags are never moved.
 
 ## Commits
 

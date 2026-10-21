@@ -4,6 +4,7 @@ use crate::support::fixture::Fixture;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use minicore_agent::SessionId;

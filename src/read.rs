@@ -19,7 +19,6 @@ use crate::history::sanitize_history;
 use crate::ids::SessionId;
 use crate::sessions::{Session, TurnPersistence, TurnRef};
 use crate::store::{HistoryScanLimits, Store, StoredLoopRecord, StoredTurnSummary};
-use crate::text::floor_char_boundary;
 use crate::tool_data::{
     ToolData, ToolOutputPage, ToolOutputRequest, ToolReadRequest, ToolReadResult, ToolRecord,
     ToolRef,
@@ -1141,7 +1140,7 @@ where
     while low < high {
         check_budget(cancellation, deadline)?;
         let mut middle = low + (high - low).div_ceil(2);
-        middle = floor_char_boundary(remaining, middle);
+        middle = remaining.floor_char_boundary(middle);
         if middle == low {
             let next = next_boundary(remaining, low);
             if next > high {
@@ -1175,7 +1174,7 @@ where
         }
         tokio::task::yield_now().await;
     }
-    Ok(floor_char_boundary(remaining, low))
+    Ok(remaining.floor_char_boundary(low))
 }
 
 fn make_chunk(index: usize, offset: usize, json: &str, length: usize) -> ReadItemChunk {

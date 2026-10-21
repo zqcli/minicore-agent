@@ -44,6 +44,7 @@ fn write_two_model_config(
     config::write_config(temp_dir, config)
 }
 
+#[cfg(unix)]
 fn write_reload_config(
     config_path: &Path,
     data_dir: &Path,

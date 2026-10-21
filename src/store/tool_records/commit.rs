@@ -174,14 +174,14 @@ impl Store {
         }
 
         #[cfg(test)]
-        if let Some(first) = tool_refs.first() {
-            if AUX_WRITE_FAILURES.hit(&first.session_id) {
-                return tool_refs
-                    .iter()
-                    .cloned()
-                    .map(|r| (r, Err(StoreError::Unavailable)))
-                    .collect();
-            }
+        if let Some(first) = tool_refs.first()
+            && AUX_WRITE_FAILURES.hit(&first.session_id)
+        {
+            return tool_refs
+                .iter()
+                .cloned()
+                .map(|r| (r, Err(StoreError::Unavailable)))
+                .collect();
         }
 
         let mut ledger = match tokio::time::timeout_at(deadline.into(), self.aux_lock.lock()).await
@@ -197,10 +197,10 @@ impl Store {
         };
 
         #[cfg(test)]
-        if let Some(first) = tool_refs.first() {
-            if let Some(gate) = AUX_COMMIT_GATES.take(&first.session_id) {
-                gate.pass().await;
-            }
+        if let Some(first) = tool_refs.first()
+            && let Some(gate) = AUX_COMMIT_GATES.take(&first.session_id)
+        {
+            gate.pass().await;
         }
 
         let mut results = Vec::with_capacity(tool_refs.len().min(DEFAULT_SESSION_AUX_RECORDS));

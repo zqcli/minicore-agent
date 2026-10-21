@@ -26,7 +26,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   platform-tests:
-    name: Tests (${{ matrix.os }})
+    name: Clippy and tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,17 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked --all-targets --no-fail-fast
-
-  msrv:
-    name: MSRV (Rust 1.85.0)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.85.0
-      - run: cargo test --locked --all-targets
+          components: clippy
+      # Platform-only code is linted where it compiles.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets --no-fail-fast
 
   package:
     name: Package (${{ matrix.target }})

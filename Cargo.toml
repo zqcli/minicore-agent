@@ -2,7 +2,6 @@
 name = "minicore-agent"
 version = "0.7.2"
 edition = "2024"
-rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "RPC-first MiniCore Agent"
 
@@ -15,33 +14,33 @@ name = "minicore-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Public API is pinned to the reviewed Runtime 0.7.1 revision.
-minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "c0181d1983280c8cdd14a3196b1ea199b7e6206d", version = "0.7.1" }
+# The Runtime release this Agent is built and tested against.
+minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", rev = "e0f945f", version = "0.7.3" }
 # Owned process groups/jobs for the Bash command worker. `tracing` is left off
 # on purpose: a wrapped command must never be logged with its script text.
-process-wrap = { version = "=8.2.0", default-features = false, features = [
+process-wrap = { version = "8.2", default-features = false, features = [
   "tokio1",
   "process-group",
   "job-object",
   "kill-on-drop",
 ] }
-base64 = "=0.22.1"
-getrandom = "=0.3.3"
-bytes = "=1.10.1"
-futures-util = "=0.3.33"
-httpdate = "=1.0.3"
-ignore = "=0.4.23"
-regex = "=1.11.1"
-reqwest = { version = "=0.12.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-sha2 = "=0.10.9"
-# Structured line diffs for `changes.diff`. Pinned like the other public deps.
-similar = { version = "=2.7.0", default-features = false, features = ["text"] }
-thiserror = "2.0.12"
+base64 = "0.22"
+getrandom = "0.4"
+bytes = "1"
+futures-util = "0.3"
+httpdate = "1"
+ignore = "0.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Structured line diffs for `changes.diff`.
+similar = { version = "3", default-features = false, features = ["text"] }
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1.53.1", default-features = false, features = [
+tokio = { version = "1", default-features = false, features = [
   "io-std",
   "io-util",
   "fs",
@@ -53,15 +52,15 @@ tokio = { version = "1.53.1", default-features = false, features = [
   "sync",
   "time",
 ] }
-tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
-toml = "0.8.23"
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+toml = "1"
 
 # Unix-only: non-blocking, no-follow flags for workspace file reads, and the
 # process-group observation the Bash command worker needs.
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+libc = "0.2"
 # Process-group signalling and liveness only; no filesystem or net features.
-nix = { version = "=0.29.0", default-features = false, features = [
+nix = { version = "0.30", default-features = false, features = [
   "signal",
   "process",
 ] }

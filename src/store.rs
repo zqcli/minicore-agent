@@ -674,10 +674,10 @@ impl Store {
                         unavailable(error);
                     }
                 }
-            } else if name.parse::<SessionId>().is_ok() {
-                if let Err(error) = remove_metadata_temps(&path).await {
-                    unavailable(error);
-                }
+            } else if name.parse::<SessionId>().is_ok()
+                && let Err(error) = remove_metadata_temps(&path).await
+            {
+                unavailable(error);
             }
         }
         if removed {

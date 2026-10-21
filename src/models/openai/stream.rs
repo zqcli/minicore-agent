@@ -309,8 +309,7 @@ pub(super) fn event_text_chunks(value: &str) -> impl Iterator<Item = &str> {
     let mut remaining = Some(value);
     std::iter::from_fn(move || {
         let value = remaining.take()?;
-        let (chunk, rest) =
-            value.split_at(crate::text::floor_char_boundary(value, MAX_EVENT_BYTES));
+        let (chunk, rest) = value.split_at(value.floor_char_boundary(MAX_EVENT_BYTES));
         remaining = (!rest.is_empty()).then_some(rest);
         Some(chunk)
     })

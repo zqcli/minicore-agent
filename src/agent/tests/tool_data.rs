@@ -635,14 +635,14 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
                         data,
                         ..
                     } if event_turn == turn => {
-                        if let Some(chunk) = data.chunk {
-                            if chunk.stream == ToolDataStream::Stdout {
-                                let bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(&chunk.data)
-                                    .map_err(|error| format!("decode Bash output: {error}"))?;
-                                process_ref = Some(data.tool_ref);
-                                output_chunk = Some(bytes);
-                            }
+                        if let Some(chunk) = data.chunk
+                            && chunk.stream == ToolDataStream::Stdout
+                        {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(&chunk.data)
+                                .map_err(|error| format!("decode Bash output: {error}"))?;
+                            process_ref = Some(data.tool_ref);
+                            output_chunk = Some(bytes);
                         }
                     }
                     _ => {}

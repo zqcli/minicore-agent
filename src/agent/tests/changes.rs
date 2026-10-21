@@ -5,7 +5,6 @@ use super::*;
 /// change records. This is the native-tool counterpart of the Bash F1
 /// regression, and it reads the facts back through `changes.list` /
 /// `changes.diff` rather than only through final History.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f1_native_write_changes_keep_the_first_request_identity() {
     use crate::changes::{ChangeScope, ChangesListRequest};

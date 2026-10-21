@@ -224,10 +224,10 @@ impl ToolRecord {
         if !self.state.is_terminal() {
             return false;
         }
-        if let Some(cmd) = &self.command {
-            if !cmd.status.is_terminal() {
-                return false;
-            }
+        if let Some(cmd) = &self.command
+            && !cmd.status.is_terminal()
+        {
+            return false;
         }
         true
     }

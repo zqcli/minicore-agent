@@ -3,7 +3,6 @@ use super::*;
 /// I1 stub: create, open, and both a no-tool and a tool-bearing Turn must not
 /// invoke Git at all. The status stub records every invocation, so a single
 /// implicit query would leave a marker behind.
-#[cfg(unix)]
 #[tokio::test]
 async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
     use crate::workspace::status::STATUS_PROGRAMS;
@@ -90,7 +89,6 @@ async fn i1_status_stub_proves_no_implicit_git_during_session_and_turns() {
 /// after close/shutdown. The reclamation evidence is captured before the
 /// unconditional `close_session`, so a failed assertion cannot be turned into a
 /// pass by the close itself; no other process cleanup is introduced.
-#[cfg(unix)]
 #[tokio::test]
 async fn i2_real_command_releases_owners_and_observation_resources() {
     use crate::tool_data::CommandStatus;
@@ -221,7 +219,6 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
 /// a native write change are read back; a same-loop update changes the model
 /// for the next request and the future options for the next Turn; close/open
 /// keeps configuration and history consistent.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
     use crate::changes::{ChangeScope, ChangesListRequest};
@@ -293,10 +290,9 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
                     data,
                     ..
                 } = event
+                    && event_turn == turn
                 {
-                    if event_turn == turn {
-                        return data;
-                    }
+                    return data;
                 }
             }
         })
@@ -475,7 +471,6 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
 /// readable; a rejected new send keeps the previous result; close still shuts
 /// the Session down cleanly. This workflow does not start a status query, so it
 /// makes no claim about reclaiming never-started query workers.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
     use crate::tool_data::{CommandStatus, ToolDataStream, ToolExecutionState, ToolRecordingState};

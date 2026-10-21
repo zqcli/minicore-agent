@@ -182,10 +182,10 @@ pub(super) fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
         .output_tokens
         .checked_sub(reasoning.unwrap_or(0))
         .ok_or(())?;
-    if let Some(total) = usage.total_tokens {
-        if usage.input_tokens.checked_add(usage.output_tokens) != Some(total) {
-            return Err(());
-        }
+    if let Some(total) = usage.total_tokens
+        && usage.input_tokens.checked_add(usage.output_tokens) != Some(total)
+    {
+        return Err(());
     }
     Ok(Usage::from_optional(
         cached.and(cache_write).map(|_| input),

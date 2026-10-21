@@ -25,7 +25,6 @@ use crate::error::AgentError;
 use crate::error::StoreError;
 use crate::ids::SessionId;
 use crate::store::Store;
-use crate::text::floor_char_boundary;
 use crate::tool_data::{ToolData, ToolRef};
 
 /// Wall-clock budget for one diff query.
@@ -387,7 +386,7 @@ pub(crate) fn plan_diff(
             new_end = new_end.max(new_range.end);
             for change in op.iter_changes(&before_tokens, &after_tokens) {
                 scanned += 1;
-                if scanned % 256 == 0 {
+                if scanned.is_multiple_of(256) {
                     check_budget(cancellation, deadline)?;
                 }
                 let (kind, source, old_index, new_index) = match change.tag() {
@@ -829,17 +828,17 @@ async fn compare_sources(
                     .map_err(|_| AgentError::RpcSerialization)?,
                 );
             }
-            if let Some(cursor) = &request.cursor {
-                if cursor.ops_fingerprint != plan.fingerprint {
-                    return encoded_result(
-                        DiffResult {
-                            stale: true,
-                            availability: DiffAvailability::Available,
-                            ..base
-                        },
-                        max_bytes,
-                    );
-                }
+            if let Some(cursor) = &request.cursor
+                && cursor.ops_fingerprint != plan.fingerprint
+            {
+                return encoded_result(
+                    DiffResult {
+                        stale: true,
+                        availability: DiffAvailability::Available,
+                        ..base
+                    },
+                    max_bytes,
+                );
             }
             let start = request
                 .cursor
@@ -1067,7 +1066,7 @@ fn build_page(
         let mut take = text.len();
         let mut chosen: Option<(usize, bool)> = None;
         while take > 0 {
-            let part = floor_char_boundary(text, take);
+            let part = text.floor_char_boundary(take);
             if part == 0 {
                 break;
             }

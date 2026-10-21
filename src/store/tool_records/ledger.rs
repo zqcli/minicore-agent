@@ -102,24 +102,21 @@ impl Store {
                     if remove_aux_directory(&path).await.is_ok() {
                         continue;
                     }
-                } else if valid_files && valid_sha256(name) {
-                    if let Ok(Some(record)) = load_tool_metadata(&path.join(TOOL_RECORD_FILE)).await
-                    {
-                        if record.tool_ref.session_id == session_id
-                            && tool_ref_hash(&record.tool_ref) == name
-                            && validate_stored_tool_record(&record, &record.tool_ref).is_ok()
-                        {
-                            if let Ok(mtime) = meta.modified() {
-                                ledger.insert(AuxDirectoryEntry {
-                                    session_id,
-                                    path,
-                                    bytes,
-                                    mtime,
-                                });
-                                continue;
-                            }
-                        }
-                    }
+                } else if valid_files
+                    && valid_sha256(name)
+                    && let Ok(Some(record)) = load_tool_metadata(&path.join(TOOL_RECORD_FILE)).await
+                    && record.tool_ref.session_id == session_id
+                    && tool_ref_hash(&record.tool_ref) == name
+                    && validate_stored_tool_record(&record, &record.tool_ref).is_ok()
+                    && let Ok(mtime) = meta.modified()
+                {
+                    ledger.insert(AuxDirectoryEntry {
+                        session_id,
+                        path,
+                        bytes,
+                        mtime,
+                    });
+                    continue;
                 }
                 ledger.note_foreign(Some(session_id), bytes);
                 tracing::warn!("skipping foreign or corrupt auxiliary record");

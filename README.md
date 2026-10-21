@@ -11,8 +11,8 @@ also be embedded directly as a Rust library.
 | | |
 |---|---|
 | Version | 0.7.2 |
-| Rust | edition 2024, MSRV 1.85 |
-| Runtime | `minicore-runtime` 0.7.1, pinned to `c0181d1983280c8cdd14a3196b1ea199b7e6206d` |
+| Rust | edition 2024, current stable |
+| Runtime | `minicore-runtime` 0.7.3, pinned to tag `v0.7.3` |
 | RPC protocol | 1 (33 methods) |
 | Provider | OpenAI Responses API and compatible endpoints |
 | License | MIT OR Apache-2.0 |
@@ -53,7 +53,7 @@ compaction, and the RPC surface. See [Architecture](docs/architecture.md).
 
 ## Quickstart
 
-You need Rust 1.85 or newer and an API key for an OpenAI Responses-compatible
+You need current stable Rust and an API key for an OpenAI Responses-compatible
 endpoint. Cargo fetches the pinned Runtime revision itself; no sibling checkout
 is required.
 
@@ -179,7 +179,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 ```
 
 CI checks formatting, Clippy, and rustdoc on stable Rust, runs the tests on
-Ubuntu, macOS, and Windows, and runs the tests again with Rust 1.85.0. Unit tests live in `<module>/tests.rs` files.
+Ubuntu, macOS, and Windows, with Clippy on each. No older Rust is tested. Unit
+tests live in `<module>/tests.rs` files.
 Integration tests are the `it` target plus `rpc_soak` (see
 [tests/README.md](tests/README.md)). Routine tests use loopback providers; the
 live provider tests are `#[ignore]` and opt-in. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution

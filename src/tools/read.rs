@@ -11,7 +11,6 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-use crate::text::floor_char_boundary;
 use crate::workspace::ReadPrefix;
 use crate::{Workspace, WorkspaceError};
 
@@ -302,7 +301,7 @@ fn push_bounded_line(output: &mut String, line: &str) -> bool {
         output.push_str(line);
         return true;
     }
-    let end = floor_char_boundary(line, available);
+    let end = line.floor_char_boundary(available);
     output.push_str(&line[..end]);
     false
 }

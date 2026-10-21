@@ -296,26 +296,25 @@ impl minicore_runtime::tools::ToolPolicy for PresentationPolicy {
             self.observer.request_key(),
             request.invocation.tool_call_id(),
         );
-        if let Some(tool_ref) = &tool_ref {
-            if let Some(data) = self
+        if let Some(tool_ref) = &tool_ref
+            && let Some(data) = self
                 .observer
                 .tool_data()
                 .note_invocation(tool_ref, &request.invocation)
-            {
-                self.observer.emit_tool_invocation(data);
-            }
+        {
+            self.observer.emit_tool_invocation(data);
         }
         let observer = Arc::clone(&self.observer);
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let decision = inner.decide(request).await;
-            if let (Some(tool_ref), Ok(decision)) = (&tool_ref, &decision) {
-                if matches!(
+            if let (Some(tool_ref), Ok(decision)) = (&tool_ref, &decision)
+                && matches!(
                     decision,
                     minicore_runtime::tools::ToolDecision::RequireApproval { .. }
-                ) {
-                    observer.tool_data().mark_awaiting_policy(tool_ref);
-                }
+                )
+            {
+                observer.tool_data().mark_awaiting_policy(tool_ref);
             }
             decision
         })

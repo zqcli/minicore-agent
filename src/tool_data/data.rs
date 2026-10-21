@@ -138,11 +138,11 @@ impl ToolDataInner {
                 })
             });
             self.total_bytes = self.total_bytes.saturating_sub(freed);
-            if let Some(record) = self.records.get_mut(&victim) {
-                if let Some(change) = record.file_change.as_mut() {
-                    change.before_bytes = None;
-                    change.after_bytes = None;
-                }
+            if let Some(record) = self.records.get_mut(&victim)
+                && let Some(change) = record.file_change.as_mut()
+            {
+                change.before_bytes = None;
+                change.after_bytes = None;
             }
             return true;
         }
@@ -166,10 +166,10 @@ impl ToolDataInner {
                 .and_then(|record| record.stream(stream))
                 .map_or(0, StreamWindow::retained);
             self.total_bytes = self.total_bytes.saturating_sub(freed);
-            if let Some(record) = self.records.get_mut(&victim) {
-                if let Some(window) = record.stream_mut(stream) {
-                    window.evict();
-                }
+            if let Some(record) = self.records.get_mut(&victim)
+                && let Some(window) = record.stream_mut(stream)
+            {
+                window.evict();
             }
             return true;
         }
@@ -310,10 +310,10 @@ impl ToolData {
     /// the tool has not been invoked before the decision.
     pub(crate) fn mark_awaiting_policy(&self, tool_ref: &ToolRef) {
         let mut inner = self.lock();
-        if let Some(record) = inner.records.get_mut(tool_ref) {
-            if record.state == ToolExecutionState::Requested {
-                record.state = ToolExecutionState::AwaitingPolicy;
-            }
+        if let Some(record) = inner.records.get_mut(tool_ref)
+            && record.state == ToolExecutionState::Requested
+        {
+            record.state = ToolExecutionState::AwaitingPolicy;
         }
     }
 
@@ -362,10 +362,10 @@ impl ToolData {
     /// terminal: the owner reports the real end separately.
     pub(crate) fn mark_cancelling(&self, tool_ref: &ToolRef) {
         let mut inner = self.lock();
-        if let Some(record) = inner.records.get_mut(tool_ref) {
-            if !record.state.is_terminal() {
-                record.state = ToolExecutionState::Cancelling;
-            }
+        if let Some(record) = inner.records.get_mut(tool_ref)
+            && !record.state.is_terminal()
+        {
+            record.state = ToolExecutionState::Cancelling;
         }
     }
 

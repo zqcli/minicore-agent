@@ -25,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 use crate::budget::encoded_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
-use crate::text::floor_char_boundary;
 use crate::tools::MAX_READ_BYTES;
 use crate::workspace::Workspace;
 
@@ -577,7 +576,7 @@ fn scan_file(
         if line_number >= resume_line.max(1) {
             let from = if line_number == resume_line {
                 let offset = usize::try_from(resume_offset).unwrap_or(usize::MAX);
-                floor_char_boundary(line, offset.min(line.len()))
+                line.floor_char_boundary(offset)
             } else {
                 0
             };
@@ -682,8 +681,8 @@ fn build_record(
     if let Some(record) = build_candidate(page, path, line_number, line, ranges, 0, line.len())? {
         return Ok(Some(record));
     }
-    let start = floor_char_boundary(line, first.0.saturating_sub(LINE_CONTEXT_BYTES));
-    let end = floor_char_boundary(line, last.1.min(line.len()));
+    let start = line.floor_char_boundary(first.0.saturating_sub(LINE_CONTEXT_BYTES));
+    let end = line.floor_char_boundary(last.1);
     if start >= end {
         return Ok(None);
     }

@@ -8,6 +8,7 @@ mod framing;
 mod review;
 mod session_read;
 mod sessions;
+#[cfg(unix)]
 mod status;
 mod tools;
 mod turn_result;

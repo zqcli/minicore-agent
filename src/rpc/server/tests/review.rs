@@ -240,7 +240,8 @@ async fn failed_reload_application_preserves_loaded_snapshots_and_releases_reser
     let session = create(&mut agent, &workspace).await;
     write_config(base.path(), 1);
     let path = base.path().join("agent.toml");
-    let mut candidate: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let mut candidate: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     candidate["profiles"]["test"]["model"] = toml::Value::String("other".into());
     let models = candidate["models"].as_table_mut().unwrap();
     let model = models.remove("fake").unwrap();

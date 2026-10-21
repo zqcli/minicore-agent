@@ -57,9 +57,9 @@ impl FromStr for SessionId {
             return Err(SessionIdError::InvalidLength);
         }
         let mut bytes = [0; 16];
-        for (index, pair) in payload.as_bytes().chunks_exact(2).enumerate() {
-            let high = decode_lower_hex(pair[0]).ok_or(SessionIdError::InvalidHex)?;
-            let low = decode_lower_hex(pair[1]).ok_or(SessionIdError::InvalidHex)?;
+        for (index, [high, low]) in payload.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let high = decode_lower_hex(*high).ok_or(SessionIdError::InvalidHex)?;
+            let low = decode_lower_hex(*low).ok_or(SessionIdError::InvalidHex)?;
             bytes[index] = (high << 4) | low;
         }
         if bytes.iter().all(|byte| *byte == 0) {

@@ -419,10 +419,10 @@ impl Store {
         if target > length {
             return Err(StoreError::HistoryChanged);
         }
-        if let Some(expected) = expected_revision {
-            if !valid_sha256(expected) {
-                return Err(StoreError::InvalidArguments);
-            }
+        if let Some(expected) = expected_revision
+            && !valid_sha256(expected)
+        {
+            return Err(StoreError::InvalidArguments);
         }
         check_history_scan(limits)?;
         if visible_item_count == Some(0) {
@@ -565,17 +565,17 @@ impl Store {
             hasher.update(&line);
             hasher.update(b"\n");
             complete_end = scan_target - remaining;
-            if let Some(expected) = display.as_ref().and_then(|read| read.summary) {
-                if complete_end == expected.prefix_bytes {
-                    let actual = HistoryPrefix {
-                        prefix_bytes: complete_end,
-                        covered_loop_count: line_count as u64,
-                        covered_item_count: total_items as u64,
-                        last_loop_id: Some(record.loop_id),
-                        sha256: digest_hex(hasher.clone()),
-                    };
-                    summary_anchor_valid = &actual == expected;
-                }
+            if let Some(expected) = display.as_ref().and_then(|read| read.summary)
+                && complete_end == expected.prefix_bytes
+            {
+                let actual = HistoryPrefix {
+                    prefix_bytes: complete_end,
+                    covered_loop_count: line_count as u64,
+                    covered_item_count: total_items as u64,
+                    last_loop_id: Some(record.loop_id),
+                    sha256: digest_hex(hasher.clone()),
+                };
+                summary_anchor_valid = &actual == expected;
             }
             tokio::task::yield_now().await;
             if visible_item_count.is_some_and(|cap| cap > 0 && cap == total_items) {

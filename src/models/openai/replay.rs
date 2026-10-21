@@ -112,10 +112,10 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
     if !matches!(kind, "message" | "reasoning" | "function_call") {
         return Err(());
     }
-    if let Some(role) = object.get("role") {
-        if role.as_str() != Some("assistant") {
-            return Err(());
-        }
+    if let Some(role) = object.get("role")
+        && role.as_str() != Some("assistant")
+    {
+        return Err(());
     }
     if let Some(id) = object.get("id") {
         let id = id.as_str().ok_or(())?;
@@ -123,10 +123,10 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
             return Err(());
         }
     }
-    if let Some(status) = object.get("status") {
-        if !matches!(status.as_str(), Some("completed" | "incomplete")) {
-            return Err(());
-        }
+    if let Some(status) = object.get("status")
+        && !matches!(status.as_str(), Some("completed" | "incomplete"))
+    {
+        return Err(());
     }
     match kind {
         "message" => {
@@ -150,10 +150,11 @@ pub(super) fn validate_item(item: &Value) -> Result<(), ()> {
             }
         }
         "reasoning" => {
-            if let Some(encrypted) = item.get("encrypted_content") {
-                if !encrypted.is_null() && !encrypted.is_string() {
-                    return Err(());
-                }
+            if let Some(encrypted) = item.get("encrypted_content")
+                && !encrypted.is_null()
+                && !encrypted.is_string()
+            {
+                return Err(());
             }
             if let Some(summary) = item.get("summary") {
                 for part in summary.as_array().ok_or(())? {
@@ -186,10 +187,10 @@ pub(super) fn validate_output(output: &[Value]) -> Result<(), ()> {
     let mut calls = BTreeSet::new();
     for item in output {
         validate_item(item)?;
-        if let Some(id) = item.get("id").and_then(Value::as_str) {
-            if !ids.insert(id) {
-                return Err(());
-            }
+        if let Some(id) = item.get("id").and_then(Value::as_str)
+            && !ids.insert(id)
+        {
+            return Err(());
         }
         if item_type(item) == Some("function_call") && !calls.insert(string(item, "call_id")?) {
             return Err(());

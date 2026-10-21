@@ -333,10 +333,10 @@ async fn terminal_drain_allows_two_requests_on_one_http_connection() {
                 if line == "\r\n" {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = Some(value.trim().parse::<usize>().unwrap());
-                    }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = Some(value.trim().parse::<usize>().unwrap());
                 }
             }
             socket
@@ -2879,10 +2879,9 @@ async fn openai_live_reasoning_tool_smoke() {
                 delta,
                 ..
             } = event
+                && !delta.is_empty()
             {
-                if !delta.is_empty() {
-                    *reasoning_by_turn.entry(turn).or_default() += 1;
-                }
+                *reasoning_by_turn.entry(turn).or_default() += 1;
             }
         }
         reasoning_by_turn

@@ -17,10 +17,10 @@ pub(super) fn validate_stored_tool_record(
     if !stored.state.is_terminal() {
         return Err(StoreError::Corrupt);
     }
-    if let Some(outcome) = stored.outcome {
-        if !stored.state.matches_outcome(outcome) {
-            return Err(StoreError::Corrupt);
-        }
+    if let Some(outcome) = stored.outcome
+        && !stored.state.matches_outcome(outcome)
+    {
+        return Err(StoreError::Corrupt);
     }
 
     for (seen, total_bytes, file_bytes, file_sha256, expired, cap) in [

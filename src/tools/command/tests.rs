@@ -165,10 +165,10 @@ fn request(
 #[cfg(unix)]
 async fn read_pid(path: &Path) -> u32 {
     for _ in 0..200 {
-        if let Ok(value) = tokio::fs::read_to_string(path).await {
-            if let Ok(pid) = value.trim().parse() {
-                return pid;
-            }
+        if let Ok(value) = tokio::fs::read_to_string(path).await
+            && let Ok(pid) = value.trim().parse()
+        {
+            return pid;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

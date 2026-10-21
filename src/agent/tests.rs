@@ -1,6 +1,7 @@
 mod admission;
 mod bash;
 mod cancellation;
+#[cfg(unix)]
 mod changes;
 mod cold_read;
 mod compaction;
@@ -22,13 +23,16 @@ mod steering;
 mod summary;
 mod tool_data;
 mod tool_loop;
+#[cfg(unix)]
 mod workers;
+#[cfg(unix)]
 mod workflows;
 use compaction::pi_history_exchange;
 use display::continue_display_read;
 use display::display_read;
 use summary::flatten_texts;
 use tool_data::history_tool_refs;
+#[cfg(unix)]
 use tool_data::read_tool;
 #[cfg(unix)]
 use tool_data::wait_tool_stream_bytes;
@@ -72,9 +76,10 @@ use crate::ids::SessionId;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
 use crate::read::ReadSession;
+#[cfg(unix)]
+use crate::sessions::PAUSE_AFTER_RUNTIME_START;
 use crate::sessions::{
-    LoopSubmission, PANIC_WORKERS, PAUSE_AFTER_COMPACTION_RESULT, PAUSE_AFTER_RUNTIME_START,
-    PAUSE_BEFORE_JOIN,
+    LoopSubmission, PANIC_WORKERS, PAUSE_AFTER_COMPACTION_RESULT, PAUSE_BEFORE_JOIN,
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
@@ -710,10 +715,10 @@ fn workspace_file(label: &str, file: &str, content: &[u8]) -> (PathBuf, TempDir)
     let (base, directory) = fixture_dir(label);
     let root = base.join("workspace");
     std::fs::create_dir_all(&root).unwrap();
-    if let Some(parent) = Path::new(file).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(root.join(parent)).unwrap();
-        }
+    if let Some(parent) = Path::new(file).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(root.join(parent)).unwrap();
     }
     std::fs::write(root.join(file), content).unwrap();
     (root, directory)

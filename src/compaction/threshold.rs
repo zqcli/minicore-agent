@@ -236,16 +236,14 @@ impl CompactionState {
             .last
             .as_mut()
             .filter(|last| last.loop_id == Some(loop_id))
+            && !last.outcome.ends_with("_settlement_failed")
+            && !last.outcome.ends_with("_settlement_unknown")
         {
-            if !last.outcome.ends_with("_settlement_failed")
-                && !last.outcome.ends_with("_settlement_unknown")
-            {
-                last.outcome.push_str(if unknown {
-                    "_settlement_unknown"
-                } else {
-                    "_settlement_failed"
-                });
-            }
+            last.outcome.push_str(if unknown {
+                "_settlement_unknown"
+            } else {
+                "_settlement_failed"
+            });
         }
     }
 
@@ -659,21 +657,20 @@ impl<'a> ObservationGuard<'a> {
             .current
             .as_ref()
             .is_some_and(|entry| entry.operation_id == self.operation_id)
+            && let Some(mut current) = state.observation.current.take()
         {
-            if let Some(mut current) = state.observation.current.take() {
-                current.outcome = outcome.to_owned();
-                current.after_tokens = after;
-                let mut total = self.previous_usage.take();
-                super::auto::merge_utility_usage(
-                    &mut total,
-                    usage.or_else(|| self.live_usage.lock().unwrap().clone()),
-                );
-                current.utility_usage = total;
-                state.observation.last = Some(current);
-                if outcome == "cancelled" {
-                    state.source = None;
-                    state.attempted = None;
-                }
+            current.outcome = outcome.to_owned();
+            current.after_tokens = after;
+            let mut total = self.previous_usage.take();
+            super::auto::merge_utility_usage(
+                &mut total,
+                usage.or_else(|| self.live_usage.lock().unwrap().clone()),
+            );
+            current.utility_usage = total;
+            state.observation.last = Some(current);
+            if outcome == "cancelled" {
+                state.source = None;
+                state.attempted = None;
             }
         }
         self.armed = false;

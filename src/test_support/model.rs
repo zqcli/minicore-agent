@@ -139,6 +139,7 @@ impl ScriptedModel {
         Arc::clone(&self.contexts)
     }
 
+    #[cfg(unix)]
     pub(crate) fn start_entered(&self) -> Arc<Notify> {
         Arc::clone(&self.start_entered)
     }

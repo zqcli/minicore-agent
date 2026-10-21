@@ -227,10 +227,10 @@ impl AgentConfig {
         let mut options = self.loop_options()?;
         if self.compaction.enabled {
             options.prompt_timeout = options.prompt_timeout.max(options.model_timeout);
-            if let Some(model) = self.models.get(model_id) {
-                if let Some(timeout) = model.request_timeout() {
-                    options.prompt_timeout = options.prompt_timeout.max(timeout);
-                }
+            if let Some(model) = self.models.get(model_id)
+                && let Some(timeout) = model.request_timeout()
+            {
+                options.prompt_timeout = options.prompt_timeout.max(timeout);
             }
             options
                 .validate()

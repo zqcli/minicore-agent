@@ -280,7 +280,7 @@ async fn complete_escaped_request_exact_budget_and_one_byte_over() {
         let bytes = fixed
             .utility_request_bytes(&source_message(&exact, &CancellationToken::new()).unwrap())
             .unwrap();
-        if bytes % 4 == 0 {
+        if bytes.is_multiple_of(4) {
             break bytes;
         }
         source.push('x');

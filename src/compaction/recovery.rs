@@ -365,20 +365,18 @@ async fn reconstruct_inner(
 
         if let Some((request, tokens, bytes)) =
             measure_reconstruction(ticket, auto, budget, &projection, &folded)
+            && tokens <= hard_tokens
+            && bytes < ticket.original_body_bytes
+            && folded.values().map(BoundedText::byte_len).sum::<usize>()
+                <= super::MAX_EPHEMERAL_BYTES
+            && (tokens <= limits.trigger_tokens
+                || best
+                    .as_ref()
+                    .is_none_or(|(_, best_bytes, _)| bytes < *best_bytes))
         {
-            if tokens <= hard_tokens
-                && bytes < ticket.original_body_bytes
-                && folded.values().map(BoundedText::byte_len).sum::<usize>()
-                    <= super::MAX_EPHEMERAL_BYTES
-                && (tokens <= limits.trigger_tokens
-                    || best
-                        .as_ref()
-                        .is_none_or(|(_, best_bytes, _)| bytes < *best_bytes))
-            {
-                best = Some((request, bytes, folded.clone()));
-                if tokens <= limits.trigger_tokens {
-                    break;
-                }
+            best = Some((request, bytes, folded.clone()));
+            if tokens <= limits.trigger_tokens {
+                break;
             }
         }
     }

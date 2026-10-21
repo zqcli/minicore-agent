@@ -100,10 +100,10 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_millis(300), events.recv()).await
     {
-        if let AgentEvent::ToolProcess { turn, data, .. } = event {
-            if turn == turn_1 {
-                turn_1_ref = Some(data.tool_ref);
-            }
+        if let AgentEvent::ToolProcess { turn, data, .. } = event
+            && turn == turn_1
+        {
+            turn_1_ref = Some(data.tool_ref);
         }
     }
     let tool_ref_1 = turn_1_ref.expect("turn 1 produced tool process event");
@@ -154,10 +154,10 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await
     {
-        if let AgentEvent::ToolProcess { turn, data, .. } = event {
-            if turn == turn_2 {
-                turn_2_ref = Some(data.tool_ref);
-            }
+        if let AgentEvent::ToolProcess { turn, data, .. } = event
+            && turn == turn_2
+        {
+            turn_2_ref = Some(data.tool_ref);
         }
     }
     let tool_ref_2 = turn_2_ref.expect("turn 2 produced tool process event");

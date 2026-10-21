@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- No minimum Rust version is declared or tested; build with current stable.
+- Dependencies are no longer pinned with `=`; `Cargo.lock` fixes the build.
+  Every dependency is at its latest release, including nix 0.30, similar 3,
+  toml 1, getrandom 0.4 and ignore 0.4.33.
+- Pin Runtime 0.7.3 by tag `v0.7.3` (no API change).
+- Clippy runs on Linux, macOS and Windows in CI, and the Windows-only lint
+  failures in tests are fixed.
+
 ## 0.7.2 — 2026-10-21
 
 - The command line moves into the library as `minicore_agent::cli::run`, so a

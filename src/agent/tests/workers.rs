@@ -4,7 +4,6 @@ use super::*;
 /// registers an owned worker for it, dropping the awaiter leaves the worker in
 /// charge of the git child, and closing the Session joins that worker only
 /// after its child was stopped and reaped.
-#[cfg(unix)]
 #[tokio::test]
 async fn session_close_detaches_a_stalled_status_worker_after_grace() {
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
@@ -64,7 +63,6 @@ async fn session_close_detaches_a_stalled_status_worker_after_grace() {
     assert!(!process_is_listed(pid));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() {
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
@@ -182,7 +180,6 @@ async fn an_owned_status_worker_outlives_its_awaiter_until_the_session_closes() 
 /// polled and the Session closes immediately, the close must still cancel and
 /// join the worker it registered, and the unpolled future must then observe
 /// the cancellation instead of a fake success.
-#[cfg(unix)]
 #[tokio::test]
 async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
@@ -265,7 +262,6 @@ async fn prepared_status_future_never_polled_is_still_reclaimed_by_close() {
 /// synchronously for a `workspace:` ref and returns a wait-only future. If that
 /// future is never polled and the Session closes immediately, the close must
 /// still cancel and join the worker it registered.
-#[cfg(unix)]
 #[tokio::test]
 async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close() {
     use crate::workspace::status::{STATUS_PROGRAMS, STATUS_REAP_GATES};
@@ -365,13 +361,12 @@ async fn prepared_workspace_diff_future_never_polled_is_still_reclaimed_by_close
 }
 
 /// Waits until a fake git child has appended its process id, and returns it.
-#[cfg(unix)]
 async fn wait_for_started_child(pid_path: &Path, index: usize) -> i32 {
     for _ in 0..200 {
-        if let Ok(text) = std::fs::read_to_string(pid_path) {
-            if let Some(pid) = text.lines().nth(index) {
-                return pid.trim().parse().unwrap();
-            }
+        if let Ok(text) = std::fs::read_to_string(pid_path)
+            && let Some(pid) = text.lines().nth(index)
+        {
+            return pid.trim().parse().unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -380,7 +375,6 @@ async fn wait_for_started_child(pid_path: &Path, index: usize) -> i32 {
 
 /// `ps` lists a process that exists, including one that is still a zombie, so
 /// an empty listing is evidence that it was reaped rather than merely signalled.
-#[cfg(unix)]
 pub(super) fn process_is_listed(pid: i32) -> bool {
     let output = std::process::Command::new("ps")
         .arg("-p")
@@ -396,7 +390,6 @@ pub(super) fn process_is_listed(pid: i32) -> bool {
 /// cancelled with its loop, the stored process record matches the live
 /// `tool_process` event and the `tool.read`/`tool.output` queries, and
 /// `close_session` returns only after the owned command was reaped.
-#[cfg(unix)]
 #[tokio::test]
 async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     use crate::tool_data::{CommandStatus, ToolDataStream};
@@ -464,16 +457,16 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await
     {
-        if let AgentEvent::ToolProcess { data, .. } = event {
-            if let Some(command) = data.command {
-                match command.status {
-                    CommandStatus::Running => running = Some((data.tool_ref, command)),
-                    CommandStatus::Cancelled => {
-                        terminal = Some((data.tool_ref, command));
-                        break;
-                    }
-                    _ => {}
+        if let AgentEvent::ToolProcess { data, .. } = event
+            && let Some(command) = data.command
+        {
+            match command.status {
+                CommandStatus::Running => running = Some((data.tool_ref, command)),
+                CommandStatus::Cancelled => {
+                    terminal = Some((data.tool_ref, command));
+                    break;
                 }
+                _ => {}
             }
         }
     }

@@ -885,10 +885,10 @@ async fn assert_termination_failure_is_honest(label: &str, failure: TerminationF
 #[cfg(unix)]
 async fn read_pid(path: &Path) -> u32 {
     for _ in 0..200 {
-        if let Ok(value) = tokio::fs::read_to_string(path).await {
-            if let Ok(pid) = value.trim().parse() {
-                return pid;
-            }
+        if let Ok(value) = tokio::fs::read_to_string(path).await
+            && let Ok(pid) = value.trim().parse()
+        {
+            return pid;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -919,10 +919,10 @@ async fn read_pid_or_task(
     const READY_TIMEOUT: Duration = Duration::from_secs(15);
     let wait = async {
         loop {
-            if let Ok(value) = tokio::fs::read_to_string(path).await {
-                if let Ok(pid) = value.trim().parse() {
-                    return pid;
-                }
+            if let Ok(value) = tokio::fs::read_to_string(path).await
+                && let Ok(pid) = value.trim().parse()
+            {
+                return pid;
             }
             tokio::select! {
                 result = &mut *task => report_finished_pid_task(result),

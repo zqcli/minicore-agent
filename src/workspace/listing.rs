@@ -52,14 +52,14 @@ pub struct WorkspaceFilesRequest {
 
 impl WorkspaceFilesRequest {
     pub fn validate(&self) -> Result<(), AgentError> {
-        if let Some(directory) = self.directory.as_deref() {
-            if !directory.is_empty() {
-                if directory.len() > MAX_PATH_BYTES {
-                    return Err(AgentError::InvalidArguments);
-                }
-                crate::workspace::validate_relative_path(directory)
-                    .map_err(|_| AgentError::InvalidArguments)?;
+        if let Some(directory) = self.directory.as_deref()
+            && !directory.is_empty()
+        {
+            if directory.len() > MAX_PATH_BYTES {
+                return Err(AgentError::InvalidArguments);
             }
+            crate::workspace::validate_relative_path(directory)
+                .map_err(|_| AgentError::InvalidArguments)?;
         }
         // "." and ".." are rejected above; this is the normalized form the
         // traversal and the cursor scope are built from.
@@ -67,10 +67,10 @@ impl WorkspaceFilesRequest {
             &crate::workspace::normalize_relative(self.directory(), true)
                 .map_err(|_| AgentError::InvalidArguments)?,
         );
-        if let Some(query) = self.query.as_deref() {
-            if !crate::workspace::page::valid_query_text(query) {
-                return Err(AgentError::InvalidArguments);
-            }
+        if let Some(query) = self.query.as_deref()
+            && !crate::workspace::page::valid_query_text(query)
+        {
+            return Err(AgentError::InvalidArguments);
         }
         if self
             .limit
@@ -287,11 +287,11 @@ fn scan_files(
             if !budget.byte_available(u64::try_from(entry.relative.len()).unwrap_or(u64::MAX)) {
                 return Ok(Visit::StopBefore(WorkspaceScanStop::Bytes));
             }
-            if let Some(query) = plan.query.as_deref() {
-                if !entry.relative.contains(query) {
-                    result.skipped_count += 1;
-                    return Ok(Visit::Next);
-                }
+            if let Some(query) = plan.query.as_deref()
+                && !entry.relative.contains(query)
+            {
+                result.skipped_count += 1;
+                return Ok(Visit::Next);
             }
             let record = WorkspaceFileEntry {
                 path: entry.relative.clone(),

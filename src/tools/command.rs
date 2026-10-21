@@ -795,11 +795,10 @@ fn announce_start(request: &CommandRequest) {
 }
 
 fn announce_stop(request: &CommandRequest, cancel_requested: bool) {
-    if cancel_requested {
-        if let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) {
-            sink.mark_cancelling(tool_ref);
-            sink.note_command(tool_ref, &live_record(request, CommandStatus::Cancelling));
-        }
+    if cancel_requested && let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref)
+    {
+        sink.mark_cancelling(tool_ref);
+        sink.note_command(tool_ref, &live_record(request, CommandStatus::Cancelling));
     }
 }
 
@@ -986,10 +985,10 @@ async fn stop_scope_and_drain(
 /// request that may not have reached the OS.
 async fn stop_scope(child: &mut Box<dyn TokioChildWrapper>, leader: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = leader {
-        if signal_group(pid, nix::sys::signal::Signal::SIGTERM).is_ok() {
-            tokio::time::sleep(STOPPED_DRAIN_GRACE).await;
-        }
+    if let Some(pid) = leader
+        && signal_group(pid, nix::sys::signal::Signal::SIGTERM).is_ok()
+    {
+        tokio::time::sleep(STOPPED_DRAIN_GRACE).await;
     }
     let leader_stopped = start_kill(child, leader).is_ok();
     #[cfg(unix)]

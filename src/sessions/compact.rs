@@ -859,10 +859,9 @@ pub(super) async fn run_compaction_inner(
     };
     if !reservation.operation.cancellation_requested()
         && !matches!(&generation, Err(error) if matches!(error.error, crate::compaction::UtilityError::Cancelled | crate::compaction::UtilityError::Timeout))
+        && let Some(fingerprint) = fingerprint
     {
-        if let Some(fingerprint) = fingerprint {
-            session.shared.compaction.note_post_turn_source(fingerprint);
-        }
+        session.shared.compaction.note_post_turn_source(fingerprint);
     }
     let generated = match generation {
         Ok(generated) => generated,
