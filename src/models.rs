@@ -90,6 +90,18 @@ impl ModelConfig {
         }
     }
 
+    /// The context window left for input after the output budget and margin.
+    pub(crate) fn input_budget_tokens(&self) -> u64 {
+        match self {
+            Self::OpenAiResponses {
+                physical_context_window,
+                output_budget_tokens,
+                safety_margin_tokens,
+                ..
+            } => u64::from(physical_context_window - output_budget_tokens - safety_margin_tokens),
+        }
+    }
+
     pub(crate) fn credential_env_name(&self) -> &str {
         match self {
             Self::OpenAiResponses { api_key_env, .. } => api_key_env,
@@ -255,15 +267,14 @@ impl Models {
                     api_key_env,
                     physical_context_window,
                     output_budget_tokens,
-                    safety_margin_tokens,
                     supported_reasoning,
                     supports_tools,
                     request_timeout_seconds,
+                    ..
                 } => {
-                    let reserved = output_budget_tokens + safety_margin_tokens;
                     let descriptor = ModelDescriptor::new(
                         Self::model_ref(id)?,
-                        u64::from(physical_context_window - reserved),
+                        value.input_budget_tokens(),
                         supported_reasoning.clone(),
                         *supports_tools,
                     )

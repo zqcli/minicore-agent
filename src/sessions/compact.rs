@@ -301,6 +301,7 @@ impl Session {
                 estimate_history_bytes(&inner.history[previous_covered_item_count..]),
                 &auto.limits,
             ),
+            fit_limits: None,
             deadline: Instant::now()
                 .checked_add(inner.options.model_timeout)
                 .unwrap_or_else(Instant::now),
@@ -326,6 +327,43 @@ impl Session {
         if inner.used_compaction_ids.contains(&operation_id) {
             return Err(AgentError::InvalidState);
         }
+        Self::check_compaction_admissible(&inner)?;
+        if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
+            return Err(AgentError::InvalidInput);
+        }
+        inner.used_compaction_ids.insert(operation_id.clone());
+        Ok(self.install_admission(&mut inner, operation_id, CompactionOrigin::Manual))
+    }
+
+    /// Admits the compaction a turn needs first when its history exceeds the
+    /// loop limits.
+    pub(crate) fn admit_compaction_before_turn(
+        &self,
+    ) -> Result<Option<CompactionAdmission>, AgentError> {
+        let mut inner = self.lock_inner();
+        let fits = {
+            let projection = self.shared.compaction.project(&inner.history);
+            let history = projection
+                .as_ref()
+                .map_or(&inner.history[..], |projection| projection.suffix);
+            history_fits_runtime_limits(history, &inner.options.limits)
+        };
+        if fits {
+            return Ok(None);
+        }
+        Self::check_compaction_admissible(&inner)?;
+        let operation_id = format!(
+            "auto-before-{}",
+            minicore_runtime::LoopId::new().map_err(|_| AgentError::Internal)?
+        );
+        Ok(Some(self.install_admission(
+            &mut inner,
+            operation_id,
+            CompactionOrigin::Automatic,
+        )))
+    }
+
+    fn check_compaction_admissible(inner: &SessionInner) -> Result<(), AgentError> {
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
@@ -342,17 +380,21 @@ impl Session {
         {
             return Err(AgentError::SessionBusy);
         }
-        if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
-            return Err(AgentError::InvalidInput);
-        }
-        let (operation, _) =
-            CompactionOperation::new(operation_id.clone(), CompactionOrigin::Manual);
-        inner.used_compaction_ids.insert(operation_id);
+        Ok(())
+    }
+
+    fn install_admission(
+        &self,
+        inner: &mut SessionInner,
+        operation_id: String,
+        origin: CompactionOrigin,
+    ) -> CompactionAdmission {
+        let (operation, _) = CompactionOperation::new(operation_id, origin);
         inner.pending_compaction = Some(Arc::clone(&operation));
-        Ok(CompactionAdmission {
+        CompactionAdmission {
             session: self.clone(),
             operation,
-        })
+        }
     }
 
     pub(crate) async fn start_compaction(
@@ -416,6 +458,9 @@ impl Session {
                 automatic_budget: None,
                 trigger_tokens: None,
                 history_triggered: false,
+                // Only a compaction admitted before a turn is automatic here.
+                fit_limits: (operation.origin == CompactionOrigin::Automatic)
+                    .then_some(inner.options.limits),
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
                     .unwrap_or_else(Instant::now),
@@ -790,6 +835,23 @@ pub(super) async fn run_compaction_inner(
     let eligible_prefix = anchors.prefix.as_ref().filter(|prefix| {
         prefix.covered_item_count > reservation.previous_covered_item_count as u64
     });
+    // A waiting turn needs history within the loop limits; when the recent
+    // tail alone exceeds them, every settled loop is covered.
+    let eligible_prefix = match reservation.fit_limits {
+        Some(limits)
+            if eligible_prefix.is_none_or(|prefix| {
+                !history_fits_runtime_limits(
+                    &reservation.history[prefix.covered_item_count as usize..],
+                    &limits,
+                )
+            }) =>
+        {
+            Some(&anchors.full).filter(|full| {
+                full.covered_item_count > reservation.previous_covered_item_count as u64
+            })
+        }
+        _ => eligible_prefix,
+    };
     // Manual no-progress needs neither project instructions nor a utility
     // budget. In particular, an unrelated invalid AGENTS.md cannot turn a
     // short-history or repeated-compaction Noop into a workspace failure.

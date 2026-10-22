@@ -209,6 +209,8 @@ struct CompactionReservation {
     automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
     trigger_tokens: Option<u64>,
     history_triggered: bool,
+    /// Set when a turn waits on the operation: its history must fit these.
+    fit_limits: Option<minicore_runtime::LoopLimits>,
     deadline: Instant,
 }
 

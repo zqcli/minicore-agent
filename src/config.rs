@@ -14,6 +14,9 @@ use crate::profiles::Profiles;
 pub use crate::profiles::{ApprovalMode, Profile};
 use crate::tools::KNOWN_TOOL_NAMES;
 
+// Runtime's absolute history byte ceiling.
+const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
+
 const MAX_EVENT_CAPACITY: usize = 4_096;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 /// System prompt is merged with AGENTS.md into one model system message, so
@@ -225,6 +228,14 @@ impl AgentConfig {
         model_id: &str,
     ) -> Result<LoopOptions, ConfigError> {
         let mut options = self.loop_options()?;
+        if let Some(model) = self.models.get(model_id) {
+            // About four bytes a token, doubled for the provider replay that
+            // history stores beside the visible text. Smaller windows keep the
+            // default and rely on token-based compaction.
+            options.limits.max_history_bytes = usize::try_from(model.input_budget_tokens() * 8)
+                .unwrap_or(usize::MAX)
+                .clamp(options.limits.max_history_bytes, MAX_HISTORY_BYTES);
+        }
         if self.compaction.enabled {
             options.prompt_timeout = options.prompt_timeout.max(options.model_timeout);
             if let Some(model) = self.models.get(model_id)

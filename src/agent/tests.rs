@@ -525,27 +525,24 @@ async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary:
         assert_eq!(context.budget.estimated_history_tokens, None);
         assert_eq!(context.budget.within_runtime_limits, Some(false));
     }
-    if !install_summary {
-        assert!(matches!(
-            agent
-                .send(super::SendMessage {
-                    session_id,
-                    text: "current after unbounded history".to_owned(),
-                })
-                .await,
-            Err(AgentError::HistoryTooLarge)
-        ));
-        assert_eq!(model.requests().lock().unwrap().len(), 0);
-        assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
-        return;
-    }
     let turn = send_text(&mut agent, session_id, "current after bounded history").await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     );
-    assert_eq!(model.requests().lock().unwrap().len(), 1);
+    if install_summary {
+        assert_eq!(model.requests().lock().unwrap().len(), 1);
+    } else {
+        // Without a summary the send compacts the whole history first.
+        assert!(
+            data_dir
+                .join("sessions")
+                .join(session_id.to_string())
+                .join("summary.json")
+                .exists()
+        );
+    }
     let after = std::fs::read(&history_path).unwrap();
     assert!(after.starts_with(&history_before));
 }
