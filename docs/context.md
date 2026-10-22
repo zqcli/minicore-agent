@@ -41,8 +41,9 @@ the fixed prompt outside Runtime history admission. Post-turn checks likewise
 measure only the suffix not covered by the durable snapshot. First-request
 checks exclude newly accepted User/Steer items; later checks include accumulated
 uncovered history, so admission pressure can fall after a reduction and return
-as new exchanges grow. These are proactive attempts, not a
-startup bypass: history already over Runtime's admission limits is still rejected.
+as new exchanges grow. These are proactive attempts; a history
+already over Runtime's admission limits is compacted before the send instead,
+as described under independent operations below.
 Target percent remains advisory.
 
 First-request checks exclude the newly accepted Prompt and Steers. Later checks
