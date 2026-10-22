@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.5 — 2026-10-22
+
+Runtime stays 0.7.4.
 
 - Visible reasoning also streams from the legacy `response.reasoning.delta`
   event that some proxies send (DeepSeek through a Responses proxy), and a
