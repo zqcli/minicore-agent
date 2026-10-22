@@ -8,8 +8,21 @@ pub(super) fn history_fits_runtime_limits(
         && estimate_history_bytes(history) <= limits.max_history_bytes
 }
 
-fn bytes_to_tokens(bytes: usize) -> u64 {
-    u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(4)
+/// Estimates history tokens at four bytes each, without provider replay.
+fn history_tokens(history: &[HistoryItem], bytes: usize) -> u64 {
+    // Replay is opaque provider state that the provider mostly drops from
+    // context, so counting it would overstate the history.
+    let replay: usize = history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::Assistant(assistant) => assistant.provider_replay.as_ref(),
+            _ => None,
+        })
+        .map(|replay| replay.byte_len())
+        .sum();
+    u64::try_from(bytes - replay)
+        .unwrap_or(u64::MAX)
+        .div_ceil(4)
 }
 
 impl Session {
@@ -58,7 +71,8 @@ impl Session {
             last_prepare_failure: self.shared.compaction.prepare_failure(),
             budget: ContextBudget {
                 estimated_history_items,
-                estimated_history_tokens: estimated_history_bytes.map(bytes_to_tokens),
+                estimated_history_tokens: estimated_history_bytes
+                    .map(|bytes| history_tokens(projected_history, bytes)),
                 estimated_history_bytes,
                 estimated_request_context_tokens,
                 input_budget_tokens,
@@ -73,3 +87,6 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
