@@ -529,7 +529,7 @@ async fn missing_manual_utility_usage_remains_unknown() {
 }
 
 #[tokio::test]
-async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot() {
+async fn repeated_compaction_updates_the_summary_and_splits_an_oversize_source() {
     let base = std::env::temp_dir().join(format!(
         "minicore-single-summary-{}",
         SessionId::new().unwrap()
@@ -545,6 +545,10 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
             Step::Text("second answer"),
             observe(Arc::clone(&observations), "UPDATED_SUMMARY"),
             Step::Text("oversize settled answer"),
+            observe(Arc::clone(&observations), "CHUNK_SUMMARY_1"),
+            observe(Arc::clone(&observations), "CHUNK_SUMMARY_2"),
+            observe(Arc::clone(&observations), "CHUNK_SUMMARY_3"),
+            observe(Arc::clone(&observations), "FOLDED_SUMMARY"),
         ],
     );
     let agent = Agent::open_with_models(
@@ -561,8 +565,6 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
         .join(session_id.as_str().unwrap());
     let summary_path = session_dir.join("summary.json");
     let history_path = session_dir.join("history.jsonl");
-    let mut summary_before_failure = Vec::new();
-    let mut covered_before_failure = json!(null);
     for index in 0..3 {
         let text = if index == 2 {
             "oversized source ".repeat(7_000)
@@ -593,33 +595,24 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
         harness.send(compact_id.clone(), "session.compact", Some(json!({"session_id": session_id, "operation_id": format!("single-operation-{index}")}))).await;
         let result = harness.response(compact_id).await;
         assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
-        if index < 2 {
-            assert_eq!(result["result"]["status"], json!("compacted"));
-            assert_eq!(result["result"]["utility_usage"]["call_count"], json!(1));
-            assert_eq!(model.calls.load(Ordering::SeqCst), calls_before + 1);
-            summary_before_failure = std::fs::read(&summary_path).unwrap();
-            covered_before_failure = result["result"]["covered_item_count"].clone();
-        } else {
-            assert_eq!(result["result"]["status"], json!("failed"));
-            assert_eq!(result["result"]["failure_kind"], json!("budget_exceeded"));
-            assert!(result["result"]["utility_usage"].is_null());
-            assert_eq!(model.calls.load(Ordering::SeqCst), calls_before);
-            assert_eq!(
-                std::fs::read(&summary_path).unwrap(),
-                summary_before_failure
-            );
-            let context = harness
-                .call_ok("session.context", Some(json!({"session_id": session_id})))
-                .await;
-            assert_eq!(
-                context["result"]["coverage"]["covered_item_count"],
-                covered_before_failure
-            );
-        }
+        // The last source no longer fits one call: the previous retained
+        // tail, the oversize prompt and its answer each take a chunk.
+        let calls = if index < 2 { 1 } else { 4 };
+        assert_eq!(result["result"]["status"], json!("compacted"));
+        assert_eq!(
+            result["result"]["utility_usage"]["call_count"],
+            json!(calls)
+        );
+        assert_eq!(model.calls.load(Ordering::SeqCst), calls_before + calls);
     }
+    assert!(
+        std::fs::read_to_string(&summary_path)
+            .unwrap()
+            .contains("FOLDED_SUMMARY")
+    );
     {
         let observations = observations.lock().unwrap();
-        assert_eq!(observations.len(), 2);
+        assert_eq!(observations.len(), 6);
         let projected = |index: usize| {
             observations[index]
                 .request
@@ -639,6 +632,20 @@ async fn repeated_single_call_compaction_and_oversize_failure_preserve_snapshot(
         assert!(update.contains("NEW_HISTORY_1"));
         assert_eq!(update.matches("FIRST_SUMMARY").count(), 1);
         assert!(update.contains("<previous-summary>\nFIRST_SUMMARY\n</previous-summary>"));
+        let previous = [
+            "UPDATED_SUMMARY",
+            "CHUNK_SUMMARY_1",
+            "CHUNK_SUMMARY_2",
+            "CHUNK_SUMMARY_3",
+        ];
+        for (index, previous) in previous.into_iter().enumerate() {
+            let chunk = projected(index + 2);
+            assert!(chunk.contains(&format!(
+                "<previous-summary>\n{previous}\n</previous-summary>"
+            )));
+            assert_eq!(chunk.contains("oversized source"), index == 2);
+        }
+        assert!(projected(5).contains("oversize settled answer"));
     }
     harness.shutdown().await;
     remove_base(&base).await;

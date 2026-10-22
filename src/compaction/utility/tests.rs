@@ -305,8 +305,22 @@ async fn complete_escaped_request_exact_budget_and_one_byte_over() {
 }
 
 #[tokio::test]
-async fn oversize_history_fails_before_call_without_discarding_content() {
-    let model = summary_model("unused");
+async fn oversize_history_is_summarized_in_chunks_that_fold_into_one_summary() {
+    let step = |text: &str| {
+        Step::Events(vec![
+            ModelEvent::text_delta(text).unwrap(),
+            usage_event(),
+            ModelEvent::Finish {
+                reason: ModelFinishReason::Stop,
+            },
+        ])
+    };
+    let model = ScriptedModel::with_reasoning(
+        "fixture",
+        1_000_000,
+        [ReasoningPreference::Auto].into(),
+        [step("first summary"), step("second summary")],
+    );
     let mut input = input(
         &model,
         vec![
@@ -314,17 +328,21 @@ async fn oversize_history_fails_before_call_without_discarding_content() {
             user_item(&"v".repeat(140_000)),
         ],
     );
+    input.hard_tokens = 1_000_000;
     input.previous_summary = Some(BoundedText::new("old summary").unwrap());
-    let before = serde_json::to_vec(input.history.as_ref()).unwrap();
-    let err = generate_summary(&input, &CancellationToken::new())
+    let generated = generate_summary(&input, &CancellationToken::new())
         .await
-        .err()
+        .ok()
         .unwrap();
-    assert_eq!(err.error, UtilityError::TooLarge);
-    assert!(err.utility_usage.is_none());
-    assert_eq!(model.calls(), 0);
-    assert_eq!(input.previous_summary.unwrap().as_str(), "old summary");
-    assert_eq!(before, serde_json::to_vec(input.history.as_ref()).unwrap());
+    assert_eq!(generated.content.as_str(), "second summary");
+    assert_eq!(generated.utility_usage.unwrap().call_count, 2);
+    let requests = model.requests.lock().unwrap();
+    let first = user_text(&requests[0].messages()[1]);
+    assert!(first.contains("uuuu") && !first.contains("vvvv"));
+    assert!(first.contains("<previous-summary>\nold summary"));
+    let second = user_text(&requests[1].messages()[1]);
+    assert!(second.contains("vvvv") && !second.contains("uuuu"));
+    assert!(second.contains("<previous-summary>\nfirst summary"));
 }
 
 #[tokio::test]
@@ -355,9 +373,14 @@ async fn large_tool_arguments_are_bounded_only_in_the_utility_source() {
         6
     );
     assert!(
-        generate_projected_summary(&input, source, &CancellationToken::new())
-            .await
-            .is_ok()
+        generate_projected_summary(
+            &input,
+            None,
+            input.history.iter().map(SourcePart::Item).collect(),
+            &CancellationToken::new()
+        )
+        .await
+        .is_ok()
     );
     assert_eq!(model.calls(), 1);
     assert_eq!(
@@ -515,15 +538,17 @@ fn source_writer_checks_bounds_and_interrupts_between_writes() {
     assert_eq!(writer.append("second"), Err(UtilityError::Timeout));
 }
 
-#[test]
-fn invalid_covered_prefix_is_rejected() {
+#[tokio::test]
+async fn invalid_covered_prefix_is_rejected() {
     let model = summary_model("unused");
     let mut input = input(&model, vec![user_item("source")]);
     input.previous_covered_item_count = 2;
-    assert!(matches!(
-        source_message(&input, &CancellationToken::new()),
-        Err(UtilityError::InvalidResponse)
-    ));
+    let error = generate_summary(&input, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.error, UtilityError::InvalidResponse);
+    assert_eq!(model.calls(), 0);
 }
 
 #[test]
@@ -752,7 +777,14 @@ fn source_message(
     input: &CompactionInput,
     cancellation: &CancellationToken,
 ) -> Result<ModelMessage, UtilityError> {
-    source_message_through(input, input.history.len(), cancellation)
+    projected_source_message(
+        input.previous_summary.as_ref(),
+        input.history[input.previous_covered_item_count..]
+            .iter()
+            .map(SourcePart::Item),
+        cancellation,
+        input.operation_deadline,
+    )
 }
 
 #[test]

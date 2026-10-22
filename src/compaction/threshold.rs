@@ -483,8 +483,6 @@ pub(crate) async fn consolidate(
             );
         }
     }
-    let source_message =
-        utility::projected_source_message(previous, parts, input.cancellation, input.deadline)?;
     let now = Instant::now();
     let utility_deadline = if recovery {
         input.deadline
@@ -505,7 +503,8 @@ pub(crate) async fn consolidate(
     };
     let generated = match utility::generate_projected_summary(
         &utility_input,
-        source_message,
+        previous,
+        parts,
         input.cancellation,
     )
     .await

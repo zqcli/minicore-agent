@@ -72,6 +72,9 @@ pub(crate) fn summary_reserve_bytes(hard_tokens: u64) -> usize {
     (hard_tokens / 8).min(1024) as usize * 4
 }
 const SOURCE_WRITE_BYTES: usize = 4096;
+// Each summary call carries the running summary and the fixed prompts next to
+// its chunk of history.
+const CHUNK_RESERVE_BYTES: usize = MAX_SUMMARY_CONTENT_BYTES + 16 * 1024;
 const RUNTIME_SUMMARY_PREFIX: &str = "Conversation summary:\n";
 // Token estimates share the OpenAI adapter's UTF-8-aware heuristic. The
 // adapter's complete Responses JSON body is counted below; this
@@ -263,16 +266,20 @@ async fn generate_summary_inner(
         .get(covered_item_count..)
         .filter(|_| covered_item_count >= input.previous_covered_item_count)
         .ok_or(UtilityError::InvalidResponse)?;
-    let message = source_message_through(input, covered_item_count, cancellation)?;
+    let covered = input
+        .history
+        .get(input.previous_covered_item_count..covered_item_count)
+        .ok_or(UtilityError::InvalidResponse)?;
     let before_tokens = estimate_before_tokens(input)?;
     let max_output_bytes = if reserve_tail_budget {
         summary_budget_with_tail(input, tail)?
     } else {
         MAX_SUMMARY_CONTENT_BYTES
     };
-    let content = generate_prepared_inner(
+    let content = generate_rolling(
         input,
-        message,
+        input.previous_summary.as_ref(),
+        covered.iter().map(SourcePart::Item).collect(),
         max_output_bytes,
         cancellation,
         utility_usage,
@@ -300,13 +307,15 @@ pub(crate) struct ProjectedGeneration {
 /// not invented utility token estimates for the borrowed source.
 pub(crate) async fn generate_projected_summary(
     input: &CompactionInput,
-    source: ModelMessage,
+    previous: Option<&BoundedText>,
+    parts: Vec<SourcePart<'_>>,
     cancellation: &CancellationToken,
 ) -> Result<ProjectedGeneration, SummaryGenerationError> {
     let mut usage = UtilityUsageAccumulator::default();
-    let result = std::panic::AssertUnwindSafe(generate_prepared_inner(
+    let result = std::panic::AssertUnwindSafe(generate_rolling(
         input,
-        source,
+        previous,
+        parts,
         MAX_SUMMARY_CONTENT_BYTES,
         cancellation,
         &mut usage,
@@ -328,27 +337,107 @@ pub(crate) async fn generate_projected_summary(
     }
 }
 
-async fn generate_prepared_inner(
+/// Summarizes the sources in one call, or in chunks that each fit one call
+/// when they do not, folding every chunk into the summary before it.
+async fn generate_rolling(
     input: &CompactionInput,
-    message: ModelMessage,
+    previous: Option<&BoundedText>,
+    parts: Vec<SourcePart<'_>>,
     max_output_bytes: usize,
     cancellation: &CancellationToken,
     usage: &mut UtilityUsageAccumulator,
 ) -> Result<BoundedText, UtilityError> {
     check_active(cancellation, input.operation_deadline)?;
     let fixed = FixedPrompt::new(input)?;
+    match projected_source_message(
+        previous,
+        parts.iter().copied(),
+        cancellation,
+        input.operation_deadline,
+    ) {
+        Ok(message) if fixed.utility_request_bytes(&message)? <= fixed.hard_input_bytes => {
+            return generate_prepared_inner(
+                input,
+                &fixed,
+                message,
+                max_output_bytes,
+                cancellation,
+                usage,
+            )
+            .await;
+        }
+        Err(error) if error != UtilityError::TooLarge => return Err(error),
+        _ => {}
+    }
+    // JSON escaping can double the source in the request body.
+    let available = BoundedText::MAX_BYTES.min(fixed.hard_input_bytes / 2);
+    let chunk_bytes = available - CHUNK_RESERVE_BYTES.min(available / 2);
+    let chunks = source_chunks(parts, chunk_bytes, cancellation, input.operation_deadline)?;
+    let last = chunks.len() - 1;
+    let mut summary = previous.cloned();
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let message = projected_source_message(
+            summary.as_ref(),
+            chunk,
+            cancellation,
+            input.operation_deadline,
+        )?;
+        let limit = if index == last {
+            max_output_bytes
+        } else {
+            MAX_SUMMARY_CONTENT_BYTES
+        };
+        summary = Some(
+            generate_prepared_inner(input, &fixed, message, limit, cancellation, usage).await?,
+        );
+    }
+    summary.ok_or(UtilityError::InvalidResponse)
+}
+
+/// Splits sources at item boundaries into chunks of at most `limit` projected
+/// bytes; a tool result stays with the call it answers.
+fn source_chunks<'a>(
+    parts: Vec<SourcePart<'a>>,
+    limit: usize,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<Vec<Vec<SourcePart<'a>>>, UtilityError> {
+    let mut chunks = vec![Vec::new()];
+    let mut size = 0;
+    for part in parts {
+        let mut writer = SourceWriter::new(cancellation, deadline);
+        match part {
+            SourcePart::Item(item) => writer.project(item)?,
+            SourcePart::Summary(summary) => {
+                writer.labeled("[Historical summary]: ", summary.as_str())?
+            }
+        }
+        let bytes = writer.bytes.len();
+        let answers_a_call = matches!(part, SourcePart::Item(HistoryItem::ToolResult(_)));
+        if size + bytes > limit && size > 0 && !answers_a_call {
+            chunks.push(Vec::new());
+            size = 0;
+        }
+        size += bytes;
+        chunks.last_mut().expect("one chunk").push(part);
+    }
+    Ok(chunks)
+}
+
+async fn generate_prepared_inner(
+    input: &CompactionInput,
+    fixed: &FixedPrompt,
+    message: ModelMessage,
+    max_output_bytes: usize,
+    cancellation: &CancellationToken,
+    usage: &mut UtilityUsageAccumulator,
+) -> Result<BoundedText, UtilityError> {
+    check_active(cancellation, input.operation_deadline)?;
     if fixed.utility_request_bytes(&message)? > fixed.hard_input_bytes {
         return Err(UtilityError::Budget);
     }
-    let generated = call_model_accounted(
-        input,
-        &fixed,
-        message,
-        max_output_bytes,
-        cancellation,
-        usage,
-    )
-    .await?;
+    let generated =
+        call_model_accounted(input, fixed, message, max_output_bytes, cancellation, usage).await?;
     check_active(cancellation, input.operation_deadline)?;
     let content =
         validate_summary_content(generated.content.as_str()).ok_or(UtilityError::TooLarge)?;
@@ -358,6 +447,7 @@ async fn generate_prepared_inner(
     Ok(content)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum SourcePart<'a> {
     Item(&'a HistoryItem),
     Summary(&'a BoundedText),
@@ -365,7 +455,7 @@ pub(crate) enum SourcePart<'a> {
 
 /// Streams borrowed effective sources through the existing 256 KiB writer.
 /// Large raw tool history does not become another history-sized allocation.
-pub(crate) fn projected_source_message<'a>(
+fn projected_source_message<'a>(
     previous: Option<&BoundedText>,
     parts: impl IntoIterator<Item = SourcePart<'a>>,
     cancellation: &CancellationToken,
@@ -412,23 +502,6 @@ pub(crate) fn check_active(
     } else {
         Ok(())
     }
-}
-
-fn source_message_through(
-    input: &CompactionInput,
-    covered_item_count: usize,
-    cancellation: &CancellationToken,
-) -> Result<ModelMessage, UtilityError> {
-    let history = input
-        .history
-        .get(input.previous_covered_item_count..covered_item_count)
-        .ok_or(UtilityError::InvalidResponse)?;
-    projected_source_message(
-        input.previous_summary.as_ref(),
-        history.iter().map(SourcePart::Item),
-        cancellation,
-        input.operation_deadline,
-    )
 }
 
 /// Bounded derived text only: no HistoryItem JSON, provider replay, signatures,
