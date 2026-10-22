@@ -2112,7 +2112,9 @@ and free-form diagnostics are never exposed. Stored legacy errors remain valid.
 Compaction results include `origin`, either `manual` or `automatic`, from the
 operation that produced the result. Clients must not infer origin from IDs.
 
-Responses providers may omit `cache_write_tokens`. In that case both cache-write
-and ordinary input usage remain unknown; cached read, ordinary output, reasoning,
-and provider total remain available when reported and arithmetically valid.
+Responses providers may omit `cache_write_tokens`, as OpenAI does. Cache-write
+usage then stays unknown, and ordinary input is the input tokens less the cached
+read when that is reported; without input details it stays unknown. Cached read,
+ordinary output, reasoning, and provider total remain available when reported
+and arithmetically valid.
 RPC protocol version remains 1; these are additive fields and optional usage.

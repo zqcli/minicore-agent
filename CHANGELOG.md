@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Visible reasoning also streams from the legacy `response.reasoning.delta`
+  event that some proxies send (DeepSeek through a Responses proxy), and a
+  response that streams no reasoning text shows the text of its finished
+  reasoning items.
+- Usage without `cache_write_tokens`, as OpenAI reports it, now gives ordinary
+  input tokens as input less the cached read instead of leaving them unknown.
+
 ## 0.7.4 — 2026-10-22
 
 - A history too large for the loop limits no longer rejects a send: the send

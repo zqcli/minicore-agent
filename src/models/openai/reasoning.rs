@@ -94,6 +94,36 @@ pub(super) fn queue_reasoning_delta(state: &mut StreamState, event: ReasoningSum
     state.reasoning_parts.last_ends_newline = last_ends_newline;
 }
 
+/// Queues the text parts of a finished reasoning item: its reasoning text,
+/// else its summary.
+pub(super) fn queue_item_reasoning(state: &mut StreamState, output_index: u32, item: &Value) {
+    let texts = |field: &str, kind: &str| -> Vec<String> {
+        item.get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| item_type(part) == Some(kind))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut parts = texts("content", "reasoning_text");
+    if parts.is_empty() {
+        parts = texts("summary", "summary_text");
+    }
+    for (index, delta) in parts.into_iter().enumerate() {
+        queue_reasoning_delta(
+            state,
+            ReasoningSummaryDeltaEvent {
+                delta,
+                output_index: Some(Value::from(output_index)),
+                item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
+                summary_index: Some(Value::from(index)),
+            },
+        );
+    }
+}
+
 /// Overlays a delta's EXPLICIT identity fields over the last known part.
 /// Missing identity (no fields at all) returns the previous key unchanged:
 /// NOT a boundary. A partial delta retains the known fields and only overrides

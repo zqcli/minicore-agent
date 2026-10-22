@@ -736,7 +736,7 @@ fn durable_normalization_preserves_replay_public_normalization_redacts_it() {
 }
 
 #[test]
-fn absent_cache_write_keeps_partition_unknown_and_validates_known_totals() {
+fn absent_cache_write_counts_as_none_and_validates_known_totals() {
     for value in [None, Some(Value::Null), Some(json!(0)), Some(json!(3))] {
         let mut raw = usage();
         match value {
@@ -751,7 +751,7 @@ fn absent_cache_write_keeps_partition_unknown_and_validates_known_totals() {
         let usage = provider_usage(serde_json::from_value(raw.clone()).unwrap()).unwrap();
         let known = raw["input_tokens_details"]["cache_write_tokens"].as_u64();
         assert_eq!(usage.cache_write_tokens(), known);
-        assert_eq!(usage.input_tokens(), known.map(|write| 20 - 5 - write));
+        assert_eq!(usage.input_tokens(), Some(20 - 5 - known.unwrap_or(0)));
         assert_eq!(usage.cache_read_tokens(), Some(5));
         assert_eq!(usage.provider_total_tokens(), Some(31));
     }

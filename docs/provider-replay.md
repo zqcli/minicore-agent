@@ -38,6 +38,13 @@ invented, ordinary empty constructors still reject, and completion/refusal/
 output-limit policy is unchanged. This compatibility repair is not a proven
 provider cache-hit fix.
 
+Visible reasoning streams from `response.reasoning_text.delta` and
+`response.reasoning_summary_text.delta`, and from `response.reasoning.delta`,
+the name OpenAI used before `reasoning_text` that some proxies still send; a
+non-text delta of that event is skipped. When a response streamed no reasoning
+text at all, each finished reasoning item contributes its `reasoning_text`
+content, or else its summary text, as visible reasoning.
+
 A missing message/reasoning item ID disables raw replay for that item, not the
 response. Anonymous reasoning (including ciphertext) is omitted; anonymous messages
 use only canonical text without an input message ID. Other identified items

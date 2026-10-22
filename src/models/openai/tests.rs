@@ -223,6 +223,18 @@ async fn omitted_usage_details_are_unknown_not_zero() {
         assert!(matches!(events.last(), Some(ModelEvent::Finish { .. })));
         server.finish().await;
     }
+    // OpenAI reports cached tokens without a cache-write count.
+    let usage = provider_usage(
+        serde_json::from_value(json!({
+            "input_tokens": 20, "output_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 5},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(usage.input_tokens(), Some(15));
+    assert_eq!(usage.cache_read_tokens(), Some(5));
+    assert_eq!(usage.cache_write_tokens(), None);
     for details in [Value::Null, json!({})] {
         let usage = provider_usage(
             serde_json::from_value(json!({
@@ -1138,6 +1150,75 @@ fn reasoning_mapping_preserves_structure_without_ordinary_estimate_veto() {
             DeliveryState::NotStarted,
             false,
         );
+    }
+}
+
+#[tokio::test]
+async fn legacy_and_item_only_reasoning_reach_the_runtime_once() {
+    let item = |content: Value| json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": content});
+    let done = |index: u32, item: Value| json!({"type": "response.output_item.done", "output_index": index, "item": item});
+    let answer = || {
+        [
+            json!({"type": "response.output_text.delta", "delta": "answer"}),
+            done(
+                1,
+                json!({"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                       "content": [{"type": "output_text", "text": "answer"}]}),
+            ),
+        ]
+    };
+    let streamed = json!([{"type": "reasoning_text", "text": "streamed"}]);
+    let cases = [
+        // The pre-`reasoning_text` event name; a non-text delta is skipped.
+        (
+            vec![
+                json!({"type": "response.reasoning.delta", "item_id": "rs_1", "output_index": 0,
+                       "content_index": 0, "delta": "legacy"}),
+                json!({"type": "response.reasoning.delta", "delta": {"opaque": true}}),
+                json!({"type": "response.output_text.delta", "delta": "answer"}),
+                completed(usage()),
+            ],
+            vec!["legacy", "answer"],
+        ),
+        // No streamed reasoning: the finished item carries it.
+        (
+            [
+                vec![done(
+                    0,
+                    item(json!([{"type": "reasoning_text", "text": "from item"}])),
+                )],
+                answer().to_vec(),
+                vec![completed(usage())],
+            ]
+            .concat(),
+            vec!["from item", "answer"],
+        ),
+        // Streamed reasoning is not repeated from the finished item.
+        (
+            [
+                vec![
+                    json!({"type": "response.reasoning_text.delta", "delta": "streamed"}),
+                    done(0, item(streamed)),
+                ],
+                answer().to_vec(),
+                vec![completed(usage())],
+            ]
+            .concat(),
+            vec!["streamed", "answer"],
+        ),
+    ];
+    for (events, expected) in cases {
+        let server = MockServer::spawn([MockResponse::sse(&events)]).await;
+        let events = run_model(
+            &model(server.base_url()),
+            basic_request(ReasoningPreference::Auto),
+            context(CancellationToken::new(), Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        let text = events.iter().filter_map(event_text).collect::<Vec<_>>();
+        assert_eq!(text, expected);
+        server.finish().await;
     }
 }
 

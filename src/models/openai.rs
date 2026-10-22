@@ -50,7 +50,9 @@ use http_error::{
     classify_http_error, classify_send_error, http_status_class, log_provider_request_failure,
     model_error_retryable,
 };
-use reasoning::{ReasoningParts, ReasoningSummaryDeltaEvent, queue_reasoning_delta};
+use reasoning::{
+    ReasoningParts, ReasoningSummaryDeltaEvent, queue_item_reasoning, queue_reasoning_delta,
+};
 use request::{InputMessage, ResponsesRequest};
 pub(super) use request::{endpoint, serialize_request_for_budget};
 use sse::{SseParser, handle_frame, item_type};

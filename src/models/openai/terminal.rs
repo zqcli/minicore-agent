@@ -187,12 +187,11 @@ pub(super) fn provider_usage(usage: ProviderUsage) -> Result<Usage, ()> {
     {
         return Err(());
     }
-    Ok(Usage::from_optional(
-        cached.and(cache_write).map(|_| input),
-        reasoning.map(|_| output),
-        reasoning,
+    // OpenAI reports cached tokens only; a missing cache-write count is none.
+    Ok(
+        Usage::from_optional(cached.map(|_| input), reasoning.map(|_| output), reasoning)
+            .with_cache_read_tokens(cached)
+            .with_cache_write_tokens(cache_write)
+            .with_provider_total_tokens(usage.total_tokens),
     )
-    .with_cache_read_tokens(cached)
-    .with_cache_write_tokens(cache_write)
-    .with_provider_total_tokens(usage.total_tokens))
 }

@@ -109,6 +109,15 @@ pub(super) fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), 
             queue_reasoning_delta(state, event);
             state.reasoning_seen = true;
         }
+        // The name OpenAI used before `reasoning_text`, still sent by some
+        // proxies; its delta was not always text, and only text is shown.
+        "response.reasoning.delta" => {
+            if value.get("delta").is_some_and(Value::is_string) {
+                let event: ReasoningSummaryDeltaEvent = from_value(value)?;
+                queue_reasoning_delta(state, event);
+                state.reasoning_seen = true;
+            }
+        }
         // Explicit summary-part lifecycle: some providers split ONE reasoning
         // item into several summary parts and only signal the part via these
         // events (the delta frames carry no index). Each event is a real part
@@ -141,6 +150,11 @@ pub(super) fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), 
                 let item: FunctionCallItem = from_value(event.item)?;
                 finish_tool_item(state, event.output_index, item)?;
             } else if item_type(&event.item) == Some("reasoning") {
+                // A provider that streamed no reasoning text may still return
+                // it in the finished item.
+                if !state.reasoning_seen {
+                    queue_item_reasoning(state, event.output_index, &event.item);
+                }
                 state.reasoning_parts.mark_item_boundary();
             }
         }
