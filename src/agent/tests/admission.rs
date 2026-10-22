@@ -69,11 +69,7 @@ async fn a_send_over_the_runtime_limits_compacts_first_then_runs_the_turn() {
     let context = agent.session_context(session_id).unwrap();
     assert_eq!(context.budget.within_runtime_limits, Some(false));
     let turn = send_text(&mut agent, session_id, "next").await;
-    let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    // Read before the turn ends, after which a post-turn compaction reports.
     let context = agent.session_context(session_id).unwrap();
     let compaction = context.last_result.unwrap();
     assert_eq!(
@@ -85,6 +81,11 @@ async fn a_send_over_the_runtime_limits_compacts_first_then_runs_the_turn() {
         crate::compaction::CompactionStatus::Compacted
     );
     assert_eq!(compaction.covered_item_count, 4_097);
+    let result = wait_text(&agent, turn).await;
+    assert_eq!(
+        result.report.outcome,
+        minicore_runtime::LoopOutcome::Completed
+    );
     let requests = model.requests();
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
