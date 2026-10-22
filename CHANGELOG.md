@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.4 — 2026-10-22
 
 - A history too large for the loop limits no longer rejects a send: the send
   first compacts it (`auto-before-…`), covering every settled loop when the
