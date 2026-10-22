@@ -578,19 +578,14 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     assert_eq!(new_requests[1].path(), "/responses");
     assert_eq!(new_requests[0].json_body()["model"], "provider-model-new");
     assert_eq!(new_requests[1].json_body()["model"], "provider-model-new");
-    assert_eq!(
-        new_requests[0].json_body()["input"][0]["content"][0]["text"],
-        "old reload prompt"
-    );
-    assert_eq!(
-        new_requests[1].json_body()["input"][0]["content"][0]["text"],
-        "new reload prompt"
-    );
+    // The loaded session takes the reloaded prompt from its next turn on.
+    for request in &new_requests {
+        assert_eq!(
+            request.json_body()["input"][0]["content"][0]["text"],
+            "new reload prompt"
+        );
+    }
     assert_eq!(new_requests[2].json_body()["model"], "provider-model-new");
-    assert_eq!(
-        new_requests[2].json_body()["input"][0]["content"][0]["text"],
-        "old reload prompt"
-    );
 
     let new_session_text = new_session.as_str().unwrap();
     let new_record = std::fs::read_to_string(
@@ -602,6 +597,14 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     .unwrap();
     assert!(new_record.contains("new reload prompt"));
     assert!(!new_record.contains("old reload prompt"));
+    let first_record = std::fs::read_to_string(
+        data_dir
+            .join("sessions")
+            .join(first_session.as_str().unwrap())
+            .join("session.json"),
+    )
+    .unwrap();
+    assert!(first_record.contains("new reload prompt"));
 }
 
 #[cfg(any(unix, windows))]

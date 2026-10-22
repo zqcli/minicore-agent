@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A Session follows its profile's system prompt: opening it after a restart,
+  or `agent.reload` while it is loaded, replaces the stored prompt from the
+  next turn on, and `session.json` records the new one. Without a reload the
+  running Agent keeps the prompt it read at startup.
+
 ## 0.7.3 — 2026-10-21
 
 - No minimum Rust version is declared or tested; build with current stable.

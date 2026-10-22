@@ -544,7 +544,7 @@ async fn rename_persistence_failure_leaves_memory_and_disk_unchanged() {
 }
 
 #[tokio::test]
-async fn system_prompt_file_is_loaded_once_and_session_snapshot_survives_reopen() {
+async fn a_reopened_session_takes_the_prompt_file_read_at_agent_startup() {
     let (base, _guard) = fixture_dir("prompt-file-snapshot");
     std::fs::create_dir_all(&base).unwrap();
     let (workspace, _workspace_guard) = workspace_file("prompt-file-ws", "a.txt", b"hello");
@@ -607,11 +607,51 @@ request_timeout_seconds = 30
         "file prompt\noriginal"
     );
 
+    // Without a reload the running Agent keeps the prompt it read at startup.
     std::fs::write(&prompt_path, "changed after Agent startup").unwrap();
     agent.close_session(info.session_id).await.unwrap();
     agent.open_session(info.session_id).await.unwrap();
+    assert_eq!(
+        agent
+            .loaded_session(info.session_id)
+            .unwrap()
+            .record()
+            .system_prompt,
+        "file prompt\noriginal"
+    );
+    agent.shutdown().await.unwrap();
+
+    // A restarted Agent replaces the stored prompt when the session reopens.
+    let model = ScriptedModel::new("main", [Step::Text("done")])
+        .with_pacing(std::time::Duration::from_millis(2));
+    let mut agent = Agent::open_with_models(
+        AgentConfig::load(&config_path).unwrap(),
+        Models::from_values(BTreeMap::from([(
+            "main".to_owned(),
+            Arc::clone(&model) as Arc<dyn Model>,
+        )])),
+    )
+    .await
+    .unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    let turn = send_text(&mut agent, info.session_id, "hello").await;
+    wait_text(&agent, turn).await;
+    let requests = model.requests();
+    let system = requests.lock().unwrap()[0]
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            ModelMessage::System(text) => Some(text.to_string()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        system.starts_with("changed after Agent startup"),
+        "{system}"
+    );
+    assert!(!system.contains("original"), "{system}");
     let reopened = store.load_record(info.session_id).await.unwrap();
-    assert_eq!(reopened.system_prompt, "file prompt\noriginal");
+    assert_eq!(reopened.system_prompt, "changed after Agent startup");
 }
 
 #[test]

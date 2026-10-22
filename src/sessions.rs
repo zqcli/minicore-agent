@@ -411,16 +411,18 @@ impl Session {
         self.presentation().snapshot()
     }
 
-    /// Replaces only the future-turn execution snapshot. This never persists
-    /// Session metadata and never forwards a config update to an active loop.
+    /// Replaces only the future-turn execution snapshot and system prompt. The
+    /// record is persisted with the next turn; an active loop keeps its config.
     pub(crate) fn replace_future_config(
         &self,
+        system_prompt: String,
         config: ExecutionConfig,
         auto: Option<AutoContext>,
         policy: CompactionPolicy,
         options: LoopOptions,
     ) {
         let mut inner = self.lock_inner();
+        inner.record.system_prompt = system_prompt;
         inner.presentation.install_model(config.model());
         inner.config = config;
         inner.auto = auto;

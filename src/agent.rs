@@ -310,7 +310,8 @@ impl Agent {
         let command_environment = reload_command_environment(&self.command_environment, &candidate);
         let mut session_candidates = Vec::with_capacity(self.sessions.iter().count());
         for session in self.sessions.iter() {
-            let record = session.record();
+            let mut record = session.record();
+            refresh_system_prompt(&mut record, &profiles);
             let workspace = session.workspace();
             let options = candidate
                 .loop_options_for_model(&record.model)
@@ -323,6 +324,7 @@ impl Agent {
             let (config, auto) = factory.build(&record, workspace, &session.parts(), &options)?;
             session_candidates.push((
                 session.clone(),
+                record.system_prompt,
                 config,
                 auto,
                 candidate.compaction.policy(),
@@ -334,8 +336,8 @@ impl Agent {
         self.profiles = profiles;
         self.models = models;
         self.command_environment = command_environment;
-        for (session, config, auto, policy, options) in session_candidates {
-            session.replace_future_config(config, auto, policy, options);
+        for (session, system_prompt, config, auto, policy, options) in session_candidates {
+            session.replace_future_config(system_prompt, config, auto, policy, options);
         }
         tracing::info!("agent configuration reloaded");
         Ok(ReloadResult { ok: true })
@@ -699,10 +701,11 @@ impl Agent {
         prepared: PreparedSession,
     ) -> Result<SessionInfo, AgentError> {
         let PreparedSession {
-            stored,
+            mut stored,
             workspace,
             compaction,
         } = prepared;
+        refresh_system_prompt(&mut stored.record, &self.profiles);
         let session_id = stored.record.session_id;
         let options = self
             .config
@@ -1058,6 +1061,14 @@ impl Agent {
 
 pub const fn agent_version() -> &'static str {
     VERSION
+}
+
+/// The Session takes its profile's current system prompt, replacing the stored
+/// one; a removed profile leaves the stored prompt in place.
+fn refresh_system_prompt(record: &mut crate::store::SessionRecord, profiles: &Profiles) {
+    if let Some(profile) = profiles.get(&record.profile) {
+        record.system_prompt.clone_from(&profile.system_prompt);
+    }
 }
 
 #[cfg(test)]

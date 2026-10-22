@@ -443,7 +443,7 @@ async fn reload_rejects_removed_subagent_profile_without_publishing_or_starting_
 }
 
 #[tokio::test]
-async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
+async fn reload_replaces_the_session_prompt_keeps_history_and_is_atomic_on_failure() {
     let fixture = AgentFixture::new("reload-atomic").file("a.txt", b"hello");
     let data_dir = fixture.data_dir.clone();
     let model_main = ScriptedModel::new("main", [Step::Text("main")])
@@ -576,9 +576,16 @@ async fn reload_preserves_session_snapshots_history_and_is_atomic_on_failure() {
                 _ => None,
             })
             .expect("reloaded request must have a system prompt");
-        assert!(system_prompt.contains("test system prompt"));
-        assert!(!system_prompt.contains("new profile prompt"));
+        assert!(system_prompt.contains("new profile prompt"));
+        assert!(!system_prompt.contains("test system prompt"));
     }
+    let record_persisted = Store::open(data_dir.clone())
+        .await
+        .unwrap()
+        .load_record(info.session_id)
+        .await
+        .unwrap();
+    assert_eq!(record_persisted.system_prompt, "new profile prompt");
 
     let (new_workspace, _new_workspace_guard) =
         workspace_file("reload-atomic-new-ws", "b.txt", b"new");

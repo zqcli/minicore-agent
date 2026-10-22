@@ -181,13 +181,14 @@ different path:
 
 On success it returns `{"ok":true}`. The reload parses prompt files and
 rebuilds the model/profile catalog and command environment before validating
-every loaded Session's future execution snapshot. Session records, selected
-models, reasoning, tools, system-prompt snapshots, history, and Store files
-are not rewritten. Existing Sessions keep those persisted snapshots; newly
-created Sessions use the reloaded profile/default catalog. An active Loop keeps
-the complete execution configuration and LoopOptions captured when it started;
-reload does not update any request in that Loop. The rebuilt future snapshot
-applies when a new Loop is created. `data_dir` and the
+every loaded Session's future execution snapshot. Each loaded Session takes
+its profile's reloaded system prompt, replacing the old one, from its next
+Loop on; `session.json` records it when that Loop settles. A Session whose
+profile was removed keeps its prompt. Selected models, reasoning, tools,
+history, and Store files are not rewritten, and newly created Sessions use the
+reloaded profile/default catalog. An active Loop keeps the complete execution
+configuration and LoopOptions captured when it started; reload does not update
+any request in that Loop. `data_dir` and the
 Agent-level `event_capacity` require restart.
 
 `Agent::open` creates an embedded Agent without a reload source and therefore
@@ -199,8 +200,8 @@ Sessions, and configuration unchanged. Loading configuration runs off the
 dispatch loop; ping, cancellation, and shutdown remain serviceable. Reload and
 other pending deferred Agent operations are mutually exclusive: conflicting
 requests return `session_busy` rather than installing stale configuration. The reload operation
-does not reload the Agent binary or previously stored Session system-prompt
-snapshots; workspace `AGENTS.md` remains request-level behavior.
+does not reload the Agent binary; workspace `AGENTS.md` remains request-level
+behavior.
 
 ## Discovery
 

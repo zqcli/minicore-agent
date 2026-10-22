@@ -35,7 +35,10 @@ A profile requires `model` and `system_prompt`; `reasoning`, `tools`,
 `max_tool_rounds`, and `approval` are optional and have defaults described below.
 
 - `system_prompt` can be an inline non-empty string or
-  `{ file = "prompts/coding.md" }`.
+  `{ file = "prompts/coding.md" }`. A file is read at startup and on
+  `agent.reload`. Opening a Session, and reloading while it is loaded, replace
+  its prompt with its profile's current one; a removed profile leaves the
+  Session's stored prompt in place.
 - `tools` defaults to an empty list and otherwise accepts the five executable
   names: `read`, `write`, `edit`, `apply_patch`, and `bash`. Names must be
   unique. `subagent` is not supported in current profiles.
