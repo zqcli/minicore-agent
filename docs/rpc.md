@@ -351,7 +351,7 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   operation ID is non-empty printable ASCII and at most 128 bytes, must not
   start with reserved `auto-`, and cannot be reused during one loaded Session
   lifetime. At most 4096 manual IDs are retained per loaded Session; automatic
-  `auto-{completed_loop_id}` IDs do not consume that quota. The bounded manual
+  `auto-{completed_loop_id}` and `auto-before-{id}` IDs do not consume that quota. The bounded manual
   set resets on close/reopen, and a new manual ID at
   the cap is rejected as invalid input. Compaction is admitted only for a
   loaded, idle, settled, unblocked Session. Other active work yields retryable
@@ -476,7 +476,8 @@ The result is returned directly:
 
 `current_operation`, when non-null, has the same safe progress shape exposed
 by `session.state` for independent manual or post-turn compaction. Automatic IDs
-are `auto-{completed_loop_id}`; manual creation rejects `auto-`, but cancellation
+are `auto-{completed_loop_id}`, or `auto-before-{id}` for the compaction a send
+runs first; manual creation rejects `auto-`, but cancellation
 accepts the actual automatic ID. `coverage` is
 non-zero only for a currently validated summary snapshot; `retained_item_count`
 is calculated against the complete loaded history. `estimated_history_items`,
@@ -484,7 +485,8 @@ is calculated against the complete loaded history. `estimated_history_items`,
 current projected history-suffix snapshot: the suffix a next preparation would
 pass as `LoopRequest.history` (or full history when no valid summary is loaded).
 They exclude the summary, system/AGENTS text, tool schemas, current User/Steer
-input, framing, and provider tokenization. The byte scan is bounded; bytes and
+input, framing, and provider tokenization; tokens also leave out provider
+replay bytes, which bytes include. The byte scan is bounded; bytes and
 tokens are `null` when the query cannot finish within that bound, and
 `within_runtime_limits` is then also `null` unless the item
 count already proves an over-limit history. `estimated_request_context_tokens`
@@ -831,9 +833,11 @@ The successful result preserves the original `turn` member and may add
 The timestamp is when the Agent accepted the Prompt, not when the loop or
 provider request completes. It may be omitted if the clock was unavailable.
 
-`Session::submit` follows the normal loop installation path; there is no startup
-admission compaction or `LoopSubmission::Preparing`. Runtime structural history
-limits can still reject submission with `history_too_large`. A successfully
+When the uncovered history exceeds the Runtime loop limits, the send first runs
+an automatic `auto-before-{id}` compaction, visible through `session.state` and
+`session.context` like any other, and the response waits for it. If history
+still does not fit, the send fails with `history_too_large`; the compaction's
+`last_result` carries the reason. There is no `LoopSubmission::Preparing`. A successfully
 installed turn may later fail request preparation, utility cancellation, or a
 provider request; `turn.wait`/`turn.result` report that failure and its persistence,
 rather than pretending that the already accepted submit never started.

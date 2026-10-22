@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A history too large for the loop limits no longer rejects a send: the send
+  first compacts it (`auto-before-…`), covering every settled loop when the
+  recent tail alone is too large, and fails with `history_too_large` only when
+  that compaction fails.
+- A compaction source too large for one summary request is summarized in
+  chunks folded into one summary, instead of failing with `too_large`.
+- The history byte limit follows the model: eight bytes per token of its
+  effective input window, between Runtime's 2 MiB default and 32 MiB. Requires
+  Runtime 0.7.4, pinned by tag `v0.7.4`.
+- `session.context` history token estimates leave out provider replay bytes.
+
 - A Session follows its profile's system prompt: opening it after a restart,
   or `agent.reload` while it is loaded, replaces the stored prompt from the
   next turn on, and `session.json` records the new one. Without a reload the

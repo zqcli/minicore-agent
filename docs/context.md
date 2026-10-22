@@ -33,7 +33,9 @@ from Pi 1.0.1's strict `>` physical-window-minus-16384 condition and its recent-
 cutoff. The same configured trigger percentage also applies to Runtime's
 `max_history_items` and `max_history_bytes` admission limits: reaching either
 effective-history threshold starts a reduction attempt even with a large model
-window. Covered source ranges no longer count: emergency groups count as their
+window. `max_history_bytes` is eight bytes per token of the model's effective
+input window (four bytes a token, doubled for provider replay), never below
+Runtime's 2 MiB default and at most its 32 MiB ceiling. Covered source ranges no longer count: emergency groups count as their
 replacement summary messages, while durable/consolidated summaries remain in
 the fixed prompt outside Runtime history admission. Post-turn checks likewise
 measure only the suffix not covered by the durable snapshot. First-request
@@ -64,8 +66,8 @@ attempts, not a guarantee of reaching target or fitting arbitrary contexts.
 Threshold input is streamed from borrowed history through the existing 256 KiB
 source projection, with 2,000-character tool-result and serialized-argument projections. It does not clone
 raw history or apply the separate 512 KiB recovery-ticket retention limit to
-safely projectable tool history. Pure prose that still exceeds the source cap
-fails explicitly. Failure preserves the old projection and the normal request
+safely projectable tool history. A source over the cap is summarized in
+chunks, as described below. Failure preserves the old projection and the normal request
 can still be sent. In-turn utility work receives half the remaining preparation
 time. A utility timeout sends the unchanged projection only if its local estimate
 fits the hard limit and the parent deadline/cancellation still permits sending;
@@ -95,6 +97,13 @@ The operation is reserved before the next submit can enter, but the original
 turn completion is published without waiting for summary generation. An
 `auto-{completed_loop_id}` operation owns its own result, cancellation and utility
 usage and does not consume the manual operation-ID quota.
+
+A turn whose uncovered history exceeds the loop limits is not rejected outright:
+`turn.send` first runs an automatic `auto-before-{id}` compaction and waits for
+it. It keeps the recent tail like a manual compaction, but covers every settled
+loop when that tail alone would still exceed the limits. When the history still
+does not fit, the send fails with `history_too_large` and the compaction result
+carries the reason.
 
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
@@ -142,8 +151,13 @@ Project instructions and tool schemas remain in the ordinary request and its
 budget checks, but are not repeated in the tool-free summary request. The source
 builder is bounded to the Runtime's 256 KiB message limit and checks cancellation
 and deadline while writing. The complete framed, JSON-escaped request must fit
-the existing effective input budget before any model call. Oversized input fails
-explicitly; there is no chunking, map/reduce or silent trimming of other content.
+the existing effective input budget before any model call. A source that does
+not fit one request is split at item boundaries, keeping each tool result with
+its call, into chunks that each fit next to a 64 KiB running summary. Each chunk
+is folded into the summary of the chunks before it with the update prompt, and
+the last output becomes the summary. Every call is accounted and all share the
+operation deadline. An item that cannot fit a request alone still fails
+explicitly; nothing is silently trimmed.
 
 One successful generation must be nonempty, finish normally without tool calls,
 fit the existing 64 KiB summary limit, and produce a strictly smaller ordinary
