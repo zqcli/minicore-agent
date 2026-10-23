@@ -81,6 +81,7 @@ use crate::read::ReadSession;
 use crate::sessions::PAUSE_AFTER_RUNTIME_START;
 use crate::sessions::{
     LoopSubmission, PANIC_WORKERS, PAUSE_AFTER_COMPACTION_RESULT, PAUSE_BEFORE_JOIN,
+    PAUSE_IN_POST_TURN_CHECK,
 };
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
@@ -784,11 +785,13 @@ async fn wait_post_turn_noop(agent: &Agent, session_id: SessionId, loop_id: Loop
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let context = agent.session_context(session_id).unwrap();
-            if context.current_operation.is_none() {
-                let result = context
-                    .last_result
-                    .expect("automatic budget check must publish its result");
-                assert_eq!(result.operation_id, format!("auto-{loop_id}"));
+            // The check is silent until it compacts, so only its result tells
+            // that it has finished.
+            if let Some(result) = context
+                .last_result
+                .filter(|result| result.operation_id == format!("auto-{loop_id}"))
+            {
+                assert!(context.current_operation.is_none());
                 assert_eq!(result.status, crate::compaction::CompactionStatus::Noop);
                 assert!(result.utility_usage.is_none());
                 agent

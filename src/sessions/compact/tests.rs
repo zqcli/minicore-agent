@@ -164,6 +164,26 @@ fn reservation(
     }
 }
 
+async fn run_post_turn(session: &Session, reservation: CompactionReservation) -> CompactionResult {
+    match check_post_turn(session, &reservation).await {
+        PostTurnCheck::Settled(result) => result,
+        PostTurnCheck::Compact(input) => {
+            run_compaction_inner(session, &reservation, Some(input)).await
+        }
+    }
+}
+
+async fn run_post_turn_worker(session: Session, reservation: CompactionReservation) {
+    match check_post_turn(&session, &reservation).await {
+        PostTurnCheck::Settled(result) => {
+            session.publish_compaction_result(&reservation.operation, result);
+        }
+        PostTurnCheck::Compact(input) => {
+            run_compaction(session, reservation, Some(input)).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn below_trigger_does_not_scan_history_anchors() {
     let (temp, agent, session, model) = fixture("summary", 100_000).await;
@@ -176,7 +196,7 @@ async fn below_trigger_does_not_scan_history_anchors() {
         "not history\n",
     )
     .unwrap();
-    let result = run_compaction_inner(&session, &reservation(&session, &model, 95_000)).await;
+    let result = run_post_turn(&session, reservation(&session, &model, 95_000)).await;
     assert_eq!(result.status, CompactionStatus::Noop);
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     agent.shutdown().await.unwrap();
@@ -187,15 +207,15 @@ async fn post_turn_retries_only_when_a_new_complete_prefix_is_available() {
     let (_temp, agent, session, model) = fixture(&"s".repeat(8_000), 4_000).await;
     append_text(&session, 6_000).await;
     append_text(&session, 4_000).await;
-    let first = run_compaction_inner(&session, &reservation(&session, &model, 1_000)).await;
+    let first = run_post_turn(&session, reservation(&session, &model, 1_000)).await;
     assert_eq!(first.failure_kind.as_deref(), Some("no_progress"));
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     append_text(&session, 100).await;
-    let same = run_compaction_inner(&session, &reservation(&session, &model, 1_000)).await;
+    let same = run_post_turn(&session, reservation(&session, &model, 1_000)).await;
     assert_eq!(same.status, CompactionStatus::Noop);
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     append_text(&session, 4_000).await;
-    run_compaction_inner(&session, &reservation(&session, &model, 1_000)).await;
+    run_post_turn(&session, reservation(&session, &model, 1_000)).await;
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     agent.shutdown().await.unwrap();
 }
@@ -210,7 +230,7 @@ async fn cancellation_during_post_turn_commit_allows_the_same_source_again() {
     session.lock_inner().compaction = Some(Arc::clone(&operation));
     let gate = Arc::new(Gate::new());
     crate::store::SUMMARY_COMMIT_GATES.arm(session.session_id(), Arc::clone(&gate));
-    let worker = tokio::spawn(run_compaction(session.clone(), first));
+    let worker = tokio::spawn(run_post_turn_worker(session.clone(), first));
     gate.wait_started().await;
     assert!(operation.cancel());
     gate.release();
@@ -229,7 +249,7 @@ async fn cancellation_during_post_turn_commit_allows_the_same_source_again() {
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     let retry = reservation(&session, &model, 1_000);
     session.lock_inner().compaction = Some(Arc::clone(&retry.operation));
-    run_compaction(session.clone(), retry).await;
+    run_post_turn_worker(session.clone(), retry).await;
     assert_eq!(
         session.context().last_result.unwrap().status,
         CompactionStatus::Compacted
@@ -296,7 +316,11 @@ async fn turn_wait_does_not_wait_for_projection_settlement() {
     assert!(session.shared.compaction.coverage().is_none());
     gate.release();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while session.context().current_operation.is_some() {
+        while session
+            .context()
+            .last_result
+            .is_none_or(|result| result.operation_id != format!("auto-{}", turn.loop_id))
+        {
             tokio::task::yield_now().await;
         }
     })

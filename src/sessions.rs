@@ -76,6 +76,8 @@ pub(crate) static PAUSE_BEFORE_JOIN: Registry<SessionId, Arc<Gate>> = Registry::
 #[cfg(test)]
 pub(crate) static PAUSE_AFTER_COMPACTION_RESULT: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
+pub(crate) static PAUSE_IN_POST_TURN_CHECK: Registry<SessionId, Arc<Gate>> = Registry::new();
+#[cfg(test)]
 pub(crate) static PAUSE_AFTER_RUNTIME_START: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
 pub(crate) static INSTALLED_LOOP_OPTIONS: Registry<LoopId, LoopOptions> = Registry::new();

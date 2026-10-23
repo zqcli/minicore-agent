@@ -254,11 +254,8 @@ async fn short_and_single_giant_loop_are_manual_noops_without_utility() {
 }
 
 #[tokio::test]
-async fn automatic_no_safe_prefix_fails_only_when_trigger_is_reached() {
-    for (window, expected) in [
-        (100_000, CompactionStatus::Noop),
-        (4_000, CompactionStatus::Failed),
-    ] {
+async fn a_single_huge_loop_gives_a_noop_below_and_above_the_trigger() {
+    for window in [100_000, 4_000] {
         let answer = Box::leak("answer ".repeat(1_800).into_boxed_str());
         let (data, _guard, id, model, mut agent) = auto_admission_fixture_with_window(
             &format!("compact-tail-auto-{window}"),
@@ -274,11 +271,7 @@ async fn automatic_no_safe_prefix_fails_only_when_trigger_is_reached() {
         wait_text(&agent, turn).await;
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                let context = agent.session_context(id).unwrap();
-                if let Some(result) = context
-                    .last_result
-                    .filter(|_| context.current_operation.is_none())
-                {
+                if let Some(result) = agent.session_context(id).unwrap().last_result {
                     break result;
                 }
                 tokio::task::yield_now().await;
@@ -286,10 +279,7 @@ async fn automatic_no_safe_prefix_fails_only_when_trigger_is_reached() {
         })
         .await
         .unwrap();
-        assert_eq!(result.status, expected, "{result:?}");
-        if expected == CompactionStatus::Failed {
-            assert_eq!(result.failure_kind.as_deref(), Some("no_progress"));
-        }
+        assert_eq!(result.status, CompactionStatus::Noop, "{result:?}");
         assert!(result.utility_usage.is_none());
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert_eq!(

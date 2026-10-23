@@ -94,12 +94,14 @@ returns Noop without a utility call. It has an exact operation ID and deferred r
 cancellation accepts an actual automatic ID.
 
 With automatic compaction enabled, only a Completed turn whose history was
-Persisted can reserve a post-turn operation. Failed/cancelled turns, failed
+Persisted can run a post-turn check. Failed/cancelled turns, failed
 persistence, blocked or closing Sessions do not start new automatic utility work.
-The operation is reserved before the next submit can enter, but the original
-turn completion is published without waiting for summary generation. An
-`auto-{completed_loop_id}` operation owns its own result, cancellation and utility
-usage and does not consume the manual operation-ID quota.
+The check belongs to the turn's task and only measures; it is not an operation,
+reports no progress and does not block a submit. The original turn completion is
+published without waiting for it or for summary generation. Once the threshold is
+crossed it becomes the `auto-{completed_loop_id}` operation, which owns its own
+result, cancellation and utility usage and does not consume the manual
+operation-ID quota.
 
 A turn whose uncovered history exceeds the loop limits is not rejected outright:
 `turn.send` first runs an automatic `auto-before-{id}` compaction and waits for
@@ -110,17 +112,20 @@ carries the reason.
 
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
-token trigger and both Runtime history triggers it finishes Noop without a
-utility call or scanning history anchors. At or above any trigger it uses the single-call summary engine
-only if a safe older prefix can advance. If the
-recent complete-loop tail leaves no progress or cannot fit with fixed request
+token trigger and both Runtime history triggers the check finishes Noop, silently
+and without a utility call or scanning history anchors. At or above any trigger
+the operation becomes visible (`preparing`, `summarizing`, `committing`) and uses
+the single-call summary engine only if a safe older prefix can advance. If the
+recent complete-loop tail leaves no older prefix to fold, such as a single huge
+loop, the operation ends Noop. If it cannot fit with fixed request
 content and a summary, the operation fails explicitly without dropping that tail.
 An existing fully covered emergency projection keeps its automatic refresh path;
 manual compaction of fully covered history remains Noop. An unchanged eligible prefix and request binding are not summarized again after
 an attempt; cancellation and timeout leave that source retryable. The configured
-target is advisory, not a reason to repeat a summary call. Even a check that becomes Noop may briefly return `session_busy` to a new submit. `turn.wait` does not wait for this
-operation, and submit does not secretly wait for a budget decision or queue an
-automatic resend. Clients retain drafts and reconcile state/context.
+target is advisory, not a reason to repeat a summary call. A submit that arrives during the check abandons it and proceeds; the next turn
+checks again. Once the operation is visible, a submit returns `session_busy`.
+`turn.wait` does not wait for either, and submit does not queue an automatic
+resend. Clients retain drafts and reconcile state/context.
 
 Close cancels all captured turn/compaction owners before joining them. Cancelling
 an independent operation does not change an already completed turn. Reload does
@@ -213,8 +218,8 @@ After source history is definitely persisted and turn completion has been
 published, existing in-turn threshold or emergency reductions can be promoted
 through the same atomic snapshot store without another utility call. `turn.wait`
 does not wait for promotion. The session-owned task still owns settlement, and
-close/next-submit cleanup joins it. A reserved post-turn operation adopts the
-promoted snapshot before starting, rather than restoring covered raw history.
+close/next-submit cleanup joins it. The post-turn check runs after settlement and
+measures the promoted snapshot, rather than restoring covered raw history.
 This encodes historical data, not a newly generated semantic summary. The
 64 KiB generated-summary limit still applies to every utility output. The full
 settled projection is a different object: snapshots larger than 64 KiB are valid

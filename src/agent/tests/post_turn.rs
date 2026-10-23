@@ -1,7 +1,16 @@
 use super::*;
 
-#[tokio::test]
-async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() {
+/// A session whose history crosses the runtime byte trigger at the next answer.
+async fn runtime_trigger_fixture(
+    label: &str,
+) -> (
+    PathBuf,
+    TempDir,
+    SessionId,
+    Arc<ScriptedModel>,
+    Agent,
+    &'static str,
+) {
     let items = (0..18)
         .flat_map(|_| {
             let mut record = synthetic_tool_loop_record(LoopId::new().unwrap());
@@ -12,8 +21,8 @@ async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() 
         })
         .collect::<Vec<_>>();
     let answer = Box::leak("a".repeat(160_000).into_boxed_str());
-    let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
-        "post-turn-runtime-trigger",
+    let (data_dir, guard, session_id, model, agent) = auto_admission_fixture_with_window(
+        label,
         true,
         1_000_000,
         items,
@@ -26,6 +35,13 @@ async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() 
         None,
     )
     .await;
+    (data_dir, guard, session_id, model, agent, answer)
+}
+
+#[tokio::test]
+async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() {
+    let (data_dir, _guard, session_id, model, mut agent, answer) =
+        runtime_trigger_fixture("post-turn-runtime-trigger").await;
     let state = agent.loaded_session(session_id).unwrap().compaction_state();
     state.note_prepare_failure("previous_attempt_failed");
     let turn = send_text(&mut agent, session_id, "answer").await;
@@ -38,17 +54,7 @@ async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() 
         state.prepare_failure().is_none(),
         "successful Noop preparation clears a stale failure"
     );
-    let compacted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let context = agent.session_context(session_id).unwrap();
-            if context.current_operation.is_none() {
-                break context.last_result.unwrap();
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let compacted = wait_post_turn_result(&agent, session_id, turn.loop_id).await;
     assert_eq!(
         compacted.status,
         crate::compaction::CompactionStatus::Compacted
@@ -315,4 +321,130 @@ async fn compaction_operation_ids_are_bounded_and_reset_on_reopen() {
         crate::compaction::CompactionStatus::Noop
     );
     agent.shutdown().await.unwrap();
+}
+
+/// The result of the post-turn check of `loop_id`, once it has one.
+async fn wait_post_turn_result(
+    agent: &Agent,
+    session_id: SessionId,
+    loop_id: LoopId,
+) -> crate::compaction::CompactionResult {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let context = agent.session_context(session_id).unwrap();
+            if let Some(result) = context
+                .last_result
+                .filter(|result| result.operation_id == format!("auto-{loop_id}"))
+            {
+                break result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// The compaction phases the session state events carried, in order.
+async fn compaction_phases(mut events: crate::AgentEventStream) -> Vec<crate::CompactionPhase> {
+    let mut phases = Vec::new();
+    while let Some(event) = events.recv().await {
+        if let AgentEvent::SessionState { state, .. } = event
+            && let Some(progress) = state.compaction
+            && phases.last() != Some(&progress.phase)
+        {
+            phases.push(progress.phase);
+        }
+    }
+    phases
+}
+
+#[tokio::test]
+async fn a_noop_post_turn_check_publishes_no_compaction_progress() {
+    let (_data_dir, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
+        "post-turn-silent-noop",
+        true,
+        100_000,
+        vec![],
+        [Step::Text("short answer")],
+        None,
+        None,
+    )
+    .await;
+    let events = agent.take_events().unwrap();
+    let gate = Arc::new(Gate::new());
+    PAUSE_IN_POST_TURN_CHECK.arm(session_id, Arc::clone(&gate));
+    let turn = send_text(&mut agent, session_id, "question").await;
+    wait_text(&agent, turn).await;
+    gate.wait_started().await;
+    assert!(
+        agent
+            .session_context(session_id)
+            .unwrap()
+            .current_operation
+            .is_none(),
+        "the check must not look like a compaction"
+    );
+    gate.release();
+    let result = wait_post_turn_result(&agent, session_id, turn.loop_id).await;
+    assert_eq!(result.status, crate::compaction::CompactionStatus::Noop);
+    agent.shutdown().await.unwrap();
+    assert!(compaction_phases(events).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_send_during_the_post_turn_check_is_not_refused() {
+    let (_data_dir, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
+        "post-turn-send",
+        true,
+        100_000,
+        vec![],
+        [Step::Text("first"), Step::Text("second")],
+        None,
+        None,
+    )
+    .await;
+    let gate = Arc::new(Gate::new());
+    PAUSE_IN_POST_TURN_CHECK.arm(session_id, Arc::clone(&gate));
+    let first = send_text(&mut agent, session_id, "one").await;
+    wait_text(&agent, first).await;
+    gate.wait_started().await;
+    let second = send_text(&mut agent, session_id, "two").await;
+    assert_completed(&*wait_text(&agent, second).await);
+    wait_post_turn_noop(&agent, session_id, second.loop_id).await;
+    agent.close_session(session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_post_turn_check_over_the_threshold_compacts_and_shows_its_phases() {
+    let (_data_dir, _guard, session_id, _model, mut agent, _answer) =
+        runtime_trigger_fixture("post-turn-phases").await;
+    let events = agent.take_events().unwrap();
+    let gate = Arc::new(Gate::new());
+    PAUSE_IN_POST_TURN_CHECK.arm(session_id, Arc::clone(&gate));
+    let turn = send_text(&mut agent, session_id, "answer").await;
+    wait_text(&agent, turn).await;
+    gate.wait_started().await;
+    assert!(
+        agent
+            .session_context(session_id)
+            .unwrap()
+            .current_operation
+            .is_none()
+    );
+    gate.release();
+    let result = wait_post_turn_result(&agent, session_id, turn.loop_id).await;
+    assert_eq!(
+        result.status,
+        crate::compaction::CompactionStatus::Compacted
+    );
+    agent.shutdown().await.unwrap();
+    assert_eq!(
+        compaction_phases(events).await,
+        [
+            crate::CompactionPhase::Preparing,
+            crate::CompactionPhase::Summarizing,
+            crate::CompactionPhase::Committing,
+        ]
+    );
 }

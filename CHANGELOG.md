@@ -13,6 +13,14 @@
   `minicore-bash-*` file in the OS temp directory holding the captured stream
   (the last 1 MiB). The tool record and `tool.output` are unchanged.
   `workspace.read` keeps its default `max_lines` of 400.
+- The post-turn budget check is silent until it compacts. It no longer shows
+  `compacting · preparing` in `session.state` or refuses `turn.send` with
+  `session_busy` while it measures: a send abandons the check and proceeds. The
+  `auto-{loop_id}` operation, with its `preparing`, `summarizing` and
+  `committing` phases, begins only once the threshold is crossed, and a check
+  below it leaves just a `noop` in `last_result`. A check above the threshold
+  with no older prefix to fold, such as a single huge loop, now ends `noop`
+  instead of `failed`/`no_progress`.
 
 ## 0.7.6 — 2026-10-23
 

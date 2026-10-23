@@ -96,11 +96,13 @@ The following orderings are not guaranteed:
 - any deferred response before responses to later requests. Wait for the response
   before sending a request that depends on that operation completing.
 
-A successful persisted turn can reserve an independent post-turn compaction
-before publishing completion. `turn.wait` does not wait for that operation;
-while it exists, new sends return `session_busy`, even during a short budget
-check that ultimately finishes Noop. Clients discover it through state/context,
-retain unsent drafts, and must not automatically resend them.
+A successful persisted turn is followed by a post-turn budget check. The check
+is not a compaction: it reports no `compaction` state, a `turn.send` during it is
+accepted and abandons it, and a check below its trigger only leaves a `noop` in
+`last_result`. Once the threshold is crossed it becomes an independent post-turn
+compaction. `turn.wait` does not wait for it, and while it exists new sends
+return `session_busy`. Clients discover it through state/context, retain unsent
+drafts, and must not automatically resend them.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -431,9 +433,9 @@ Manual and ordinary post-turn compaction retain approximately 20,000 recent
 tokens rounded to complete stored loops. Result coverage counts describe only
 the summarized prefix, and retained counts describe real remaining items.
 Manual operations with no newer eligible prefix return `noop`. Automatic checks
-below their trigger remain `noop`; above the trigger, no safe prefix yields
-`failed`/`no_progress`, and an unfit tail plus fixed content yields a budget
-failure. Neither case drops the tail or alters the previous snapshot. A fully
+return `noop` below their trigger and, above it, when no older prefix can be
+folded (for example a single huge loop); an unfit tail plus fixed content yields
+a budget failure. Neither case drops the tail or alters the previous snapshot. A fully
 covered emergency snapshot keeps its existing automatic refresh behavior.
 
 ### `session.context`
@@ -920,7 +922,8 @@ locally veto ordinary sends. A confirmed safe pre-output upstream capacity
 rejection can separately compact and retry the rejected logical request once. Recovery stays within the active turn,
 shares its cancellation/deadline, and never redispatches completed tools.
 An independent post-turn operation instead requires Completed + Persisted and
-automatic compaction enabled. `session.compact.cancel` cancels that operation,
+automatic compaction enabled, and exists only from the moment its threshold is
+crossed. `session.compact.cancel` cancels that operation,
 not the already completed turn; active threshold/recovery work is cancelled
 through the turn. Auto=false disables both automatic thresholds and capacity
 recovery; manual idle-only compaction remains available.

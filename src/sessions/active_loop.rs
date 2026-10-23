@@ -7,6 +7,8 @@ pub(super) struct ActiveLoop {
     pub(super) task: Arc<SessionTask>,
     pub(super) execution_summary: Option<BoundedText>,
     pub(super) execution_history: Arc<[HistoryItem]>,
+    /// Abandons the post-turn check of this loop once a send needs the session.
+    pub(super) abandon_check: CancellationToken,
 }
 
 pub(crate) struct ExecutionInput {
@@ -134,7 +136,7 @@ async fn run_active_loop(
         persistence,
         interrupted: stored.interrupted.clone(),
     });
-    publish_settle_and_start_compaction(&session, &result, &mut completion).await;
+    publish_and_settle(&session, &result, &mut completion).await;
     // Remain in the owned task so close/shutdown still join auxiliary writes.
     persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
 
@@ -145,6 +147,11 @@ async fn run_active_loop(
         meta: EventMeta::for_turn(turn),
     });
     session.emit_state();
+    if persistence == TurnPersistence::Persisted
+        && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)
+    {
+        check_post_turn(&session, turn).await;
+    }
 }
 
 async fn join_runtime_loop(
@@ -329,66 +336,60 @@ async fn settle_persisted_projection(session: &Session, turn: TurnRef, report: &
 }
 
 /// Publishes completion first: waiters never wait for emergency-projection
-/// settlement or post-turn summary work, which stay owned by this task.
-async fn publish_settle_and_start_compaction(
+/// settlement, which stays owned by this task.
+async fn publish_and_settle(
     session: &Session,
     result: &Arc<TurnResult>,
     completion: &mut CompletionGuard,
 ) {
-    let turn = result.turn;
-    let report = &result.report;
-    let persistence = result.persistence;
-    // Own the join slot before reserving. Reservation excludes the next
-    // submit and close captures its cancellation owner under the same lock.
-    // The active task owns settlement; a reserved operation also owns cancellation
-    // while completion waiters are released before its worker is installed.
+    completion.publish_finished(Arc::clone(result));
+    if result.persistence == TurnPersistence::Persisted {
+        settle_persisted_projection(session, result.turn, &result.report).await;
+    }
+}
+
+/// The owned task measures the settled history against the trigger without
+/// publishing anything; only a crossed threshold becomes a compaction operation.
+/// A send or a close abandons the check, which has no side effect to undo.
+async fn check_post_turn(session: &Session, turn: TurnRef) {
     let (operation, _) = CompactionOperation::new(
         format!("auto-{}", turn.loop_id),
         CompactionOrigin::Automatic,
     );
     let mut join_slot = operation.join.lock().await;
-    let reservation = if persistence == TurnPersistence::Persisted
-        && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)
-    {
-        session.reserve_post_turn(turn, Arc::clone(&operation))
-    } else {
-        None
-    };
-    let mut handoff = reservation
+    let Some(abandon) = session
+        .lock_inner()
+        .active
         .as_ref()
-        .map(|_| compact::CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation)));
-
-    // Authoritative completion precedes summary model work and best-effort events.
-    completion.publish_finished(Arc::clone(result));
-    if persistence == TurnPersistence::Persisted {
-        settle_persisted_projection(session, turn, report).await;
-    }
-    if let Some(mut reservation) = reservation {
-        // Settlement may have promoted the entire reserved history while waiters
-        // observed completion. Never let post-turn work restore its raw sources.
-        if let Some(projection) = session
-            .shared
-            .compaction
-            .project(&reservation.history)
-            .filter(|projection| projection.suffix.is_empty())
-        {
-            reservation.previous_summary = Some(projection.summary);
-            reservation.previous_covered_item_count = reservation.history.len();
-            reservation.history_triggered = false;
-            if let Some(progress) = session.lock_inner().compaction_progress.as_mut() {
-                progress.covered_item_count = reservation.history.len();
-                progress.retained_item_count = 0;
+        .map(|active| active.abandon_check.clone())
+    else {
+        return;
+    };
+    let Some(reservation) = session.reserve_post_turn(turn, Arc::clone(&operation)) else {
+        return;
+    };
+    let checked = tokio::select! {
+        biased;
+        () = abandon.cancelled() => return,
+        () = session.shared.close.cancelled() => return,
+        checked = compact::check_post_turn(session, &reservation) => checked,
+    };
+    match checked {
+        compact::PostTurnCheck::Settled(result) => {
+            session.publish_compaction_result(&operation, result);
+            #[cfg(test)]
+            tests::pause_worker(&PAUSE_AFTER_COMPACTION_RESULT, turn.session_id).await;
+        }
+        compact::PostTurnCheck::Compact(input) => {
+            if session.begin_post_turn(turn, &reservation) {
+                *join_slot = Some(tokio::spawn(compact::run_compaction(
+                    session.clone(),
+                    reservation,
+                    Some(input),
+                )));
             }
         }
-        *join_slot = Some(tokio::spawn(compact::run_compaction(
-            session.clone(),
-            reservation,
-        )));
-        if let Some(guard) = handoff.as_mut() {
-            guard.disarm();
-        }
     }
-    drop(join_slot);
 }
 
 async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loop_id: LoopId) {
@@ -625,6 +626,7 @@ impl Session {
                 task,
                 execution_summary: execution.summary,
                 execution_history,
+                abandon_check: CancellationToken::new(),
             });
             inner
                 .presentation
@@ -675,10 +677,11 @@ impl Session {
                     .completion
                     .borrow()
                     .is_some()
-                    .then(|| active.task.clone())
+                    .then(|| (active.task.clone(), active.abandon_check.clone()))
             })
         };
-        if let Some(task) = active_task {
+        if let Some((task, abandon_check)) = active_task {
+            abandon_check.cancel();
             if task.join().await.is_err() {
                 let mut inner = self.lock_inner();
                 Self::clear_active_task(&mut inner, &task);
