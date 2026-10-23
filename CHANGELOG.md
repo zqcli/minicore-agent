@@ -13,6 +13,12 @@
   `minicore-bash-*` file in the OS temp directory holding the captured stream
   (the last 1 MiB). The tool record and `tool.output` are unchanged.
   `workspace.read` keeps its default `max_lines` of 400.
+- Overflow recovery no longer gives up on large histories. A request whose
+  source exceeded 512 KiB used to get no recovery ticket, so a provider "context
+  too long" rejection failed the turn; it now compacts and retries once at any
+  size. The ticket holds a copy of the source and is dropped as soon as the
+  request starts, instead of lingering until the next request or the end of the
+  loop.
 - The post-turn budget check is silent until it compacts. It no longer shows
   `compacting · preparing` in `session.state` or refuses `turn.send` with
   `session_busy` while it measures: a send abandons the check and proceeds. The

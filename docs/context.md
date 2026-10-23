@@ -68,9 +68,8 @@ attempts, not a guarantee of reaching target or fitting arbitrary contexts.
 
 Threshold input is streamed from borrowed history through the existing 256 KiB
 source projection, with 2,000-character tool-result and serialized-argument projections. It does not clone
-raw history or apply the separate 512 KiB recovery-ticket retention limit to
-safely projectable tool history. A source over the cap is summarized in
-chunks, as described below. Failure preserves the old projection and the normal request
+raw history. A source over that projection is summarized in chunks, as described
+below. Failure preserves the old projection and the normal request
 can still be sent. In-turn utility work receives half the remaining preparation
 time. A utility timeout sends the unchanged projection only if its local estimate
 fits the hard limit and the parent deadline/cancellation still permits sending;
@@ -190,6 +189,15 @@ retry is allowed for that rejected logical model request, never for the whole
 turn. Completed tools are not redispatched. Partial output, unknown delivery,
 generic network errors, length endings, and generic HTTP 400/413 are not evidence
 of this condition.
+
+Every request keeps a recovery ticket whatever the size of its source: the system
+prompt, summary, history and tool schemas it was built from. The ticket holds
+copies, not shared references, so it costs about one more copy of the request
+history while the request starts. It is dropped as soon as the request has
+started, when recovery claims it, when a newer request replaces it, and when the
+loop ends. A reduction that is too large to persist as a snapshot (256 KiB)
+still serves the retried request and is reported as an explicit settlement
+failure.
 
 Local serialized-body bytes/4 is a conservative estimate, not an upstream
 rejection. It no longer refuses ordinary HTTP requests. Explicit utility handles

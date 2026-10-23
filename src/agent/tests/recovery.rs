@@ -70,6 +70,52 @@ async fn test_provider_overflow_recovery_success() {
 }
 
 #[tokio::test]
+async fn overflow_recovery_keeps_its_source_beyond_512_kib() {
+    // Nine loops of about 100 KB: over 512 KiB, under every history trigger.
+    let items = (0..9)
+        .flat_map(|_| {
+            let mut record = synthetic_tool_loop_record(LoopId::new().unwrap());
+            if let HistoryItem::ToolResult(result) = &mut record.items[2] {
+                result.output = ToolOutput::new("x".repeat(100_000)).unwrap();
+            }
+            record.items
+        })
+        .collect::<Vec<_>>();
+    assert!(serde_json::to_vec(&items).unwrap().len() > 512 * 1024);
+    let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
+        "recovery-large-source",
+        true,
+        1_000_000,
+        items,
+        [
+            Step::ContextOverflowNotStarted,
+            Step::Text("Summary of the older exchanges"),
+            Step::Text("recovered answer"),
+        ],
+        None,
+        None,
+    )
+    .await;
+
+    let turn = send_text(&mut agent, session_id, "continue").await;
+    assert_completed(&*wait_text(&agent, turn).await);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    // The retried request carries the answer. Persisting the projection of such
+    // a history is a separate step that may fail on the snapshot file limit.
+    let recovery = agent
+        .session_context(session_id)
+        .unwrap()
+        .recovery
+        .expect("recovery observation must be recorded");
+    assert_eq!(recovery.utility_usage.unwrap().call_count, 1);
+    assert!(
+        flatten_texts(&read_store_history(&data_dir, session_id).await)
+            .iter()
+            .any(|text| text == "recovered answer")
+    );
+}
+
+#[tokio::test]
 async fn test_provider_overflow_stops_on_second_failure() {
     let (data_dir, _guard) = fixture_dir("p3b2-second-overflow");
     let workspace = data_dir.join("workspace");

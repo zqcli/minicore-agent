@@ -515,8 +515,8 @@ provider `ContextOverflow + NotStarted` recovery observation (loop ID, request i
 before/after tokens, independent utility usage, outcome, and failure kind) when
 an in-flight recovery has been attempted; the field is omitted when the loaded
 Session has no such observation.
-The recovery source is retained only up to 512 KiB; a larger source does not
-receive a recovery ticket. Token counts are estimates, and recovery never
+The recovery source is retained for every request, whatever its size, until the
+request has started. Token counts are estimates, and recovery never
 re-runs tools or duplicates the current User/Steer messages. Successful reductions
 remain effective for subsequent requests in the active turn. Local serialized
 budget rejection is `InvalidRequest`, not confirmed upstream overflow; generic

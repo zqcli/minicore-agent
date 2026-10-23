@@ -1090,9 +1090,9 @@ fn estimate_request_bytes(request: &ModelRequest) -> Result<usize, UtilityError>
         .ok_or(UtilityError::TooLarge)
 }
 
-pub(super) struct CappedWriter {
-    pub(super) bytes: usize,
-    pub(super) cap: usize,
+struct CappedWriter {
+    bytes: usize,
+    cap: usize,
 }
 
 impl Write for CappedWriter {

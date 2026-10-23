@@ -24,7 +24,7 @@ use crate::models::ProviderBudget;
 mod ticket;
 pub(crate) use ticket::{
     ActiveRecoveryTicket, TicketClaimError, TicketFraming, compute_content_hash,
-    compute_ticket_hash, recovery_source_is_safe,
+    compute_ticket_hash,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -571,6 +571,8 @@ impl CompactingModel {
         };
 
         let Err(error) = first_result else {
+            // A started request is never recovered, so its source copy is not kept.
+            self.state.discard_recovery_ticket(loop_id, request_index);
             return first_result;
         };
 

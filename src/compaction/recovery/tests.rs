@@ -473,46 +473,30 @@ async fn settings_change_during_raw_start_blocks_recovery() {
     assert_eq!(utility_b.calls.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn recovery_source_cap_counts_structure_and_closes_over_cap() {
+#[tokio::test]
+async fn a_started_request_releases_its_recovery_source() {
     let loop_id = LoopId::new().unwrap();
-    let system = BoundedText::new("system").unwrap();
+    let raw = raw_model([Step::Text("answer")]);
+    let state = CompactionState::new();
+    let auto = recovery_auto(&state, summary_model("unused"));
+    let request = big_request();
     let (base, appended) = big_tool_exchange(loop_id, 2_000);
-    assert!(recovery_source_is_safe(
-        &system,
-        None,
-        &base,
-        &appended,
-        &[]
-    ));
+    register_recovery_test_ticket(&state, &raw, &auto, loop_id, &request, base, appended);
+    assert!(state.recovery.lock().unwrap().ticket.is_some());
 
-    // Thousands of empty-content items carry only structure and
-    // identifiers; a text-only estimate would score them near zero.
-    let empty: Vec<HistoryItem> = (0..20_000)
-        .map(|_| {
-            HistoryItem::Assistant(AssistantHistory {
-                provider_replay: None,
-                loop_id,
-                request_index: 0,
-                model: "main".parse().unwrap(),
-                reasoning: ReasoningPreference::Auto,
-                content: Vec::new(),
-                finish_reason: ModelFinishReason::Stop,
-                usage: Usage::default(),
-            })
-        })
-        .collect();
-    assert!(!recovery_source_is_safe(&system, None, &empty, &[], &[]));
-
-    // The retained system and durable summary count as well.
-    let large = BoundedText::new("s".repeat(BoundedText::MAX_BYTES)).unwrap();
-    assert!(!recovery_source_is_safe(
-        &large,
-        Some(&large),
-        &[],
-        &[],
-        &[]
-    ));
+    let compacting = CompactingModel::new(
+        Arc::clone(&raw) as Arc<dyn Model>,
+        Arc::new(DefaultProviderBudget),
+        Arc::clone(&state),
+    );
+    let context = ModelCallContext::new(
+        loop_id,
+        0,
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert!(compacting.start(request, context).await.is_ok());
+    assert!(state.recovery.lock().unwrap().ticket.is_none());
 }
 
 #[tokio::test]

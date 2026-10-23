@@ -199,13 +199,6 @@ async fn default_ninety_five_projects_large_tool_history_without_raw_ticket_cap(
         .collect::<Vec<_>>();
     let appended = vec![user(current, "new input exact ✓", false)];
     let cancellation = CancellationToken::new();
-    assert!(!super::super::recovery_source_is_safe(
-        &system,
-        None,
-        &base,
-        &appended,
-        &[]
-    ));
     let result = consolidate(
         input(
             &auto,

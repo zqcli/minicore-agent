@@ -188,17 +188,8 @@ impl ProjectPromptProvider {
             }
         };
         {
-            // Bound the retained recovery source before cloning any
-            // history item; an over-cap source is never copied.
-            let source_safe = crate::compaction::recovery_source_is_safe(
-                &system,
-                summary.as_ref(),
-                projected_base,
-                history.appended(),
-                tools,
-            );
             let settings = auto.state.request_settings();
-            let ticket = if source_safe {
+            let ticket =
                 crate::compaction::compute_content_hash(&crate::compaction::TicketFraming {
                     loop_id,
                     request_index,
@@ -229,10 +220,7 @@ impl ProjectPromptProvider {
                         // replaced by a later global settings read.
                         auto_binding: Some(auto.binding()),
                     }
-                })
-            } else {
-                None
-            };
+                });
             auto.state
                 .register_recovery_ticket(loop_id, request_index, ticket);
             Ok(minicore_runtime::prompt::PreparedPrompt { messages })

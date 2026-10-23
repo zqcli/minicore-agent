@@ -4,8 +4,6 @@ use minicore_runtime::model::{ModelLimits, ReasoningPreference};
 use minicore_runtime::tools::ToolSpec;
 use sha2::{Digest, Sha256};
 
-const MAX_RECOVERY_SOURCE_BYTES: usize = 512 * 1024;
-
 /// Immutable ticket metadata prepared during prompt preparation and strictly
 /// bound to one logical model request. `content_hash` is fixed when the prompt
 /// is prepared; `ticket_hash` is bound once the Runtime-built request (with
@@ -28,30 +26,6 @@ pub(crate) struct ActiveRecoveryTicket {
     /// recovery uses this binding, not the current settings, so a later
     /// settings update cannot re-pair the ticket with a newer utility model.
     pub(crate) auto_binding: Option<AutoContextBinding>,
-}
-
-/// Bounds the retained recovery source before any `HistoryItem` is cloned. The
-/// count is a capped serde write of exactly the fields the ticket retains
-/// (system, durable summary, history items, tool schemas), so structural
-/// framing, identifiers, model/usage/reasoning fields, and empty items all
-/// count. Serialization stops as soon as the cap is crossed and never builds
-/// an intermediate buffer.
-pub(crate) fn recovery_source_is_safe(
-    system: &BoundedText,
-    summary: Option<&BoundedText>,
-    base: &[HistoryItem],
-    appended: &[HistoryItem],
-    tools: &[ToolSpec],
-) -> bool {
-    let mut writer = super::super::utility::CappedWriter {
-        bytes: 0,
-        cap: MAX_RECOVERY_SOURCE_BYTES,
-    };
-    serde_json::to_writer(&mut writer, system).is_ok()
-        && serde_json::to_writer(&mut writer, &summary).is_ok()
-        && serde_json::to_writer(&mut writer, base).is_ok()
-        && serde_json::to_writer(&mut writer, appended).is_ok()
-        && serde_json::to_writer(&mut writer, tools).is_ok()
 }
 
 pub(crate) struct TicketFraming<'a> {

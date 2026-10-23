@@ -27,7 +27,6 @@ pub(crate) use projection::compose as auto_compose;
 pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
     ActiveRecoveryTicket, CompactingModel, TicketFraming, compute_content_hash,
-    recovery_source_is_safe,
 };
 pub(crate) use utility::{
     CompactionInput, UtilityError, generate_summary, generate_summary_with_tail, recent_tail_start,
