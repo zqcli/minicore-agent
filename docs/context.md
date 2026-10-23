@@ -32,21 +32,12 @@ The default trigger is `estimated_context >= 95% * effective_input_window`;
 existing explicit percentages are preserved. The denominator is physical context
 minus the configured output and safety allowances. This deliberately differs
 from Pi 1.0.1's strict `>` physical-window-minus-16384 condition and its recent-token
-cutoff. The same configured trigger percentage also applies to Runtime's
-`max_history_items` and `max_history_bytes` admission limits: reaching either
-effective-history threshold starts a reduction attempt even with a large model
-window. `max_history_bytes` is eight bytes per token of the model's effective
-input window (four bytes a token, doubled for provider replay), never below
-Runtime's 2 MiB default and at most its 32 MiB ceiling. Covered source ranges no longer count: emergency groups count as their
-replacement summary messages, while durable/consolidated summaries remain in
-the fixed prompt outside Runtime history admission. Post-turn checks likewise
-measure only the suffix not covered by the durable snapshot. First-request
-checks exclude newly accepted User/Steer items; later checks include accumulated
-uncovered history, so admission pressure can fall after a reduction and return
-as new exchanges grow. These are proactive attempts; a history
-already over Runtime's admission limits is compacted before the send instead,
-as described under independent operations below.
-Target percent remains advisory.
+cutoff. Only this token estimate starts an automatic reduction: the Runtime no
+longer limits the number or size of history items, so neither the Runtime nor the
+Agent compacts or refuses a send because a history has many items or bytes.
+Post-turn checks measure only the suffix not covered by the durable snapshot.
+First-request checks exclude newly accepted User/Steer items; later checks
+include accumulated uncovered history. Target percent remains advisory.
 
 First-request checks exclude the newly accepted Prompt and Steers. Later checks
 run only after complete assistant/tool exchanges, under the active turn's normal
@@ -102,18 +93,15 @@ crossed it becomes the `auto-{completed_loop_id}` operation, which owns its own
 result, cancellation and utility usage and does not consume the manual
 operation-ID quota.
 
-A turn whose uncovered history exceeds the loop limits is not rejected outright:
-`turn.send` first runs an automatic `auto-before-{id}` compaction and waits for
-it. It keeps the recent tail like a manual compaction, but covers every settled
-loop when that tail alone would still exceed the limits. When the history still
-does not fit, the send fails with `history_too_large` and the compaction result
-carries the reason.
+`turn.send` never compacts first and never refuses a send for the size of the
+history. A history that no longer fits the model is reduced by the request
+boundary threshold, by emergency recovery after a provider rejection, or by a
+manual compaction.
 
 The worker estimates the complete effective context, including the final answer,
 existing summary, remaining history, system/AGENTS and tools. Below the configured
-token trigger and both Runtime history triggers the check finishes Noop, silently
-and without a utility call or scanning history anchors. At or above any trigger
-the operation becomes visible (`preparing`, `summarizing`, `committing`) and uses
+token trigger the check finishes Noop, silently and without a utility call or
+scanning history anchors. At or above it the operation becomes visible (`preparing`, `summarizing`, `committing`) and uses
 the single-call summary engine only if a safe older prefix can advance. If the
 recent complete-loop tail leaves no older prefix to fold, such as a single huge
 loop, the operation ends Noop. If it cannot fit with fixed request
@@ -203,8 +191,8 @@ Local serialized-body bytes/4 is a conservative estimate, not an upstream
 rejection. It no longer refuses ordinary HTTP requests. Explicit utility handles
 share the same provider transport/serializer but enforce the exact emitted-body
 input estimate before sending. No local estimate is renamed ContextOverflow.
-The existing Runtime admission history bounds and per-request message/item
-bounds remain; there is no new aggregate HTTP-body quota. A long live turn can
+The Runtime's per-item bounds remain, and there is no history item or byte limit
+or aggregate HTTP-body quota. A long live turn can
 still accumulate a large serialized body/allocation, an existing resource limit
 that the former post-serialization token veto did not prevent.
 
@@ -251,9 +239,8 @@ cancelled turns can also promote their complete projection after their original
 history is persisted, while append failure and close-race rejection keep their
 existing behavior. Older builds that impose 64 KiB on every snapshot will reject
 a newer large projection and fall back to authoritative history. No history is
-lost, but that downgraded raw context can exceed Runtime history admission
-limits as well as model capacity. A compatible newer build may be needed;
-a larger model alone cannot relax Runtime history limits.
+lost, but that downgraded raw context can exceed model capacity. A compatible
+newer build may be needed.
 There is no guarantee that an arbitrarily long turn can always be recovered.
 
 ## Estimates, Accounting And Failure Outcomes

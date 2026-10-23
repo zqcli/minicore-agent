@@ -680,8 +680,8 @@ dependencies = [
 
 [[package]]
 name = "minicore-runtime"
-version = "0.7.4"
-source = "git+https://github.com/zqcli/minicore-runtime?tag=v0.7.4#d920218f7a2617536c89a885809aab7d20ea8e0a"
+version = "0.8.0"
+source = "git+https://github.com/zqcli/minicore-runtime?tag=v0.8.0#f3ef7b2eaad8568b5f03a4a9d4d69ce8bfd75f1f"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",

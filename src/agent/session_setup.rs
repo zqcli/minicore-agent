@@ -42,7 +42,7 @@ impl ExecutionConfigFactory<'_> {
             tool_owners,
             compaction,
         };
-        let (config, auto) = self.build(record, workspace, &parts, &options)?;
+        let (config, auto) = self.build(record, workspace, &parts)?;
         Ok(SessionSetup {
             parts,
             tool_data,
@@ -57,7 +57,6 @@ impl ExecutionConfigFactory<'_> {
         record: &SessionRecord,
         workspace: Arc<Workspace>,
         parts: &SessionParts,
-        options: &LoopOptions,
     ) -> Result<(ExecutionConfig, Option<AutoContext>), AgentError> {
         let model = self
             .models
@@ -76,7 +75,6 @@ impl ExecutionConfigFactory<'_> {
                 model: utility_model,
                 budget: Arc::clone(&budget),
                 policy: self.policy,
-                limits: options.limits,
             },
             state: Arc::clone(&parts.compaction),
         });

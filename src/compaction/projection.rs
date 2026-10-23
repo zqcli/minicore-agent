@@ -37,7 +37,6 @@ pub(crate) struct AutoContextBinding {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) budget: Arc<dyn crate::models::ProviderBudget>,
     pub(crate) policy: CompactionPolicy,
-    pub(crate) limits: minicore_runtime::LoopLimits,
 }
 
 impl AutoContext {
@@ -394,39 +393,6 @@ impl<'a> Projection<'a> {
                 .cloned(),
         );
         covered
-    }
-
-    /// Fixed durable/consolidated summaries are outside Runtime history admission.
-    /// Group summaries replace their source exchanges within the effective history.
-    pub(crate) fn history_size(&self, end: usize) -> (usize, usize) {
-        let (mut count, mut bytes, mut index) = (0, 0usize, 0);
-        let mut ranges = self.ranges.iter().peekable();
-        while index < end {
-            if let Some((key, _)) = ranges.next_if(|(key, _)| key.start == index) {
-                if self
-                    .consolidated
-                    .as_ref()
-                    .is_some_and(|value| value.covered.contains(key))
-                {
-                    index = key.end;
-                    continue;
-                }
-                if let Some(summary) = self.folded.get(key) {
-                    count += 1;
-                    bytes += super::SUMMARY_DATA_PREFIX.len()
-                        + summary.byte_len()
-                        + super::SUMMARY_DATA_SUFFIX.len();
-                    index = key.end;
-                    continue;
-                }
-            }
-            count += 1;
-            bytes += minicore_runtime::history::estimate_history_bytes(std::slice::from_ref(
-                self.items[index],
-            ));
-            index += 1;
-        }
-        (count, bytes)
     }
 }
 

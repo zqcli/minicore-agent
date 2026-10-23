@@ -22,7 +22,6 @@ async fn reopened_session_projects_external_summary_as_bounded_user_data() {
     assert_eq!(context.coverage.covered_item_count, 2);
     assert_eq!(context.coverage.retained_item_count, 2);
     assert_eq!(context.budget.estimated_history_items, 2);
-    assert_eq!(context.budget.within_runtime_limits, Some(true));
     // Loading and projecting a derived snapshot must not rewrite core history.
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     let candidate = agent.config().clone();

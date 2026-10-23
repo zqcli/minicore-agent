@@ -363,16 +363,7 @@ pub(crate) async fn consolidate(
             &*auto.budget,
         )
     };
-    let history_end = if input.request_index == 0 {
-        input.base.len()
-    } else {
-        projection.items.len()
-    };
-    let (history_items, history_bytes) = projection.history_size(history_end);
-    let history_triggered =
-        auto.policy
-            .history_triggered(history_items, history_bytes, &auto.limits);
-    if !recovery && trigger_before < budget.trigger_tokens && !history_triggered {
+    if !recovery && trigger_before < budget.trigger_tokens {
         return Ok(ProjectionResult::unchanged(before_request));
     }
 
@@ -441,12 +432,11 @@ pub(crate) async fn consolidate(
             )
             .map_err(super::auto::invalid)?,
         );
-        if !history_triggered
-            && auto
-                .budget
-                .estimate_request_tokens(&make(floor)?, None, None)
-                .map_err(|_| UtilityError::Serialization)?
-                >= budget.trigger_tokens
+        if auto
+            .budget
+            .estimate_request_tokens(&make(floor)?, None, None)
+            .map_err(|_| UtilityError::Serialization)?
+            >= budget.trigger_tokens
         {
             return Ok(ProjectionResult::unchanged(before_request));
         }
@@ -557,7 +547,6 @@ pub(crate) async fn consolidate(
                     || input
                         .rejected_body_bytes
                         .is_none_or(|original| after_bytes >= original)))
-            || request.messages().len() > auto.limits.max_prompt_messages
             || !super::recovery::validate_clean_tool_exchanges(request.messages())
         {
             return Err(UtilityError::NoProgress);

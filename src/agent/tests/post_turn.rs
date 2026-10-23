@@ -1,6 +1,6 @@
 use super::*;
 
-/// A session whose history crosses the runtime byte trigger at the next answer.
+/// A session whose history is just under the token trigger until the next answer.
 async fn runtime_trigger_fixture(
     label: &str,
 ) -> (
@@ -11,7 +11,7 @@ async fn runtime_trigger_fixture(
     Agent,
     &'static str,
 ) {
-    let items = (0..18)
+    let items = (0..8)
         .flat_map(|_| {
             let mut record = synthetic_tool_loop_record(LoopId::new().unwrap());
             if let HistoryItem::ToolResult(result) = &mut record.items[2] {
@@ -24,7 +24,7 @@ async fn runtime_trigger_fixture(
     let (data_dir, guard, session_id, model, agent) = auto_admission_fixture_with_window(
         label,
         true,
-        1_000_000,
+        250_000,
         items,
         [
             Step::Text(answer),
@@ -39,7 +39,7 @@ async fn runtime_trigger_fixture(
 }
 
 #[tokio::test]
-async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() {
+async fn post_turn_compacts_when_the_answer_crosses_the_token_trigger() {
     let (data_dir, _guard, session_id, model, mut agent, answer) =
         runtime_trigger_fixture("post-turn-runtime-trigger").await;
     let state = agent.loaded_session(session_id).unwrap().compaction_state();
@@ -68,7 +68,6 @@ async fn post_turn_compacts_at_runtime_byte_trigger_with_a_large_model_window() 
             .unwrap()
             .budget
             .estimated_history_bytes
-            .unwrap()
             < 200_000
     );
     assert!(

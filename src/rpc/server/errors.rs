@@ -141,12 +141,6 @@ pub(super) fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             "steer_queue_full",
             false,
         ),
-        AgentError::HistoryTooLarge => (
-            HISTORY_TOO_LARGE,
-            "history too large",
-            "history_too_large",
-            false,
-        ),
         AgentError::ReloadRequiresRestart => (
             RELOAD_REQUIRES_RESTART,
             "configuration reload requires restart",

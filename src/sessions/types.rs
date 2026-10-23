@@ -91,13 +91,12 @@ pub struct ContextBudget {
     /// It excludes the summary, system/AGENTS text, tool schemas, and current
     /// User/Steer input.
     pub estimated_history_items: usize,
-    /// Bounded estimate of that Runtime history input (the projected suffix,
-    /// or full history without a valid summary). `None` means the context
-    /// query stopped at its scan budget.
-    pub estimated_history_bytes: Option<usize>,
+    /// Estimate of that Runtime history input (the projected suffix, or full
+    /// history without a valid summary).
+    pub estimated_history_bytes: usize,
     /// `estimated_history_bytes / 4`; this is not a full request-context token
     /// estimate and does not represent provider-reported usage.
-    pub estimated_history_tokens: Option<u64>,
+    pub estimated_history_tokens: u64,
     /// The latest full prepared-request estimate observed by automatic
     /// preparation. While a request is preparing this is its current estimate;
     /// while idle it is the last completed estimate.
@@ -110,11 +109,6 @@ pub struct ContextBudget {
     /// effective input budget and the active `[compaction]` policy.
     pub trigger_tokens: Option<u64>,
     pub target_tokens: Option<u64>,
-    pub max_history_items: usize,
-    pub max_history_bytes: usize,
-    /// `None` means the byte estimate was not available; it never guesses that
-    /// an unscanned history is within the Runtime limits.
-    pub within_runtime_limits: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

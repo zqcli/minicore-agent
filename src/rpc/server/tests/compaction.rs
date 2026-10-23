@@ -303,10 +303,7 @@ async fn session_context_reports_manual_busy_state_and_last_result() {
     );
     assert!(context["result"]["last_result"].is_null());
     assert!(context["result"]["budget"]["estimated_history_items"].is_number());
-    assert_eq!(
-        context["result"]["budget"]["within_runtime_limits"],
-        json!(true)
-    );
+    assert!(context["result"]["budget"]["estimated_history_bytes"].is_number());
 
     harness
         .send(

@@ -12,7 +12,7 @@ also be embedded directly as a Rust library.
 |---|---|
 | Version | 0.7.6 |
 | Rust | edition 2024, current stable |
-| Runtime | `minicore-runtime` 0.7.4, pinned to tag `v0.7.4` |
+| Runtime | `minicore-runtime` 0.8.0, pinned to tag `v0.8.0` |
 | RPC protocol | 1 (33 methods) |
 | Provider | OpenAI Responses API and compatible endpoints |
 | License | MIT OR Apache-2.0 |
@@ -29,8 +29,8 @@ also be embedded directly as a Rust library.
   and per-turn change tracking with diffs. Paths are confined to the Workspace
   root.
 - **Context management.** Automatic and manual compaction into source-bound
-  summaries, plus a one-time compact-and-retry when the provider rejects a
-  request for context length.
+  summaries, triggered by token estimates only, plus a one-time
+  compact-and-retry when the provider rejects a request for context length.
 - **Provider support.** Streaming Responses with reasoning, retries honoring
   `Retry-After`, and durable provider replay across tool rounds and restarts.
 - **Bounded and redacted.** Queues, reads, tool output, and history scans have

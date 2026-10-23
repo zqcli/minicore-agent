@@ -22,7 +22,7 @@ verification evidence.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
 These guides describe the current source package **0.7.6**, Rust 2024 on
-current stable, Runtime `0.7.4` (tag `v0.7.4`), and RPC protocol version `1`.
+current stable, Runtime `0.8.0` (tag `v0.8.0`), and RPC protocol version `1`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 

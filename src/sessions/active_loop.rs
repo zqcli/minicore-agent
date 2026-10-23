@@ -558,9 +558,6 @@ impl Session {
             Some(projection) => (projection.suffix.to_vec().into(), Some(projection.summary)),
             None => (history, None),
         };
-        if !history_fits_runtime_limits(&history, &options.limits) {
-            return Err(AgentError::HistoryTooLarge);
-        }
         let config = self.bind_execution_config(config, summary.clone(), system_prompt, auto)?;
         Ok(ExecutionInput {
             request: LoopRequest::new(history, input, config),

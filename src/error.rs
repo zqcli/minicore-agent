@@ -48,8 +48,6 @@ pub enum AgentError {
     InvalidInteraction,
     #[error("user input is invalid")]
     InvalidInput,
-    #[error("session history exceeds the loop limits")]
-    HistoryTooLarge,
     #[error("profile not found")]
     ProfileNotFound,
     #[error("model not found")]

@@ -55,8 +55,8 @@ opaque-only response fails because it has neither usable replay nor canonical co
 
 The entire serialized Runtime replay envelope is limited to 256 KiB, depth 32,
 and 16,384 JSON nodes. Agent permits at most 256 output items per response.
-Replay bytes count toward the Runtime/Agent history byte limit (see
-[context.md](context.md));
+Replay bytes count in the history byte estimate but not in its token estimate
+(see [context.md](context.md));
 the existing 16 MiB JSONL record cap remains. No ciphertext is truncated. When
 capture exceeds a Runtime replay bound (including envelope framing), the adapter
 omits the entire replay attachment and keeps non-empty canonical text, reasoning,

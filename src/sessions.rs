@@ -59,7 +59,6 @@ use active_loop::{EphemeralSummaryCleanup, SessionTask};
 pub(crate) use active_loop::{
     LoopSubmission, TurnCompletion, await_compaction_completion, await_turn_completion,
 };
-use budget::history_fits_runtime_limits;
 pub(crate) use events::forward_loop_event;
 pub(crate) use registry::Sessions;
 use status_workers::StatusWorkers;
@@ -211,9 +210,6 @@ struct CompactionReservation {
     /// never gated by this estimate.
     automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
     trigger_tokens: Option<u64>,
-    history_triggered: bool,
-    /// Set when a turn waits on the operation: its history must fit these.
-    fit_limits: Option<minicore_runtime::LoopLimits>,
     deadline: Instant,
 }
 

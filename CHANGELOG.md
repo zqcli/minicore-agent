@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Requires Runtime 0.8.0, pinned by tag `v0.8.0`. The Runtime no longer limits
+  the number or size of history items, and the Agent drops its own limits with
+  it. Automatic compaction is triggered by token estimates only: a history with
+  many items or bytes is neither compacted early (the history-size trigger and
+  the eight-bytes-per-token limit are gone) nor compacted or refused at send.
+  `turn.send` no longer runs an `auto-before-…` compaction first and never fails
+  with `history_too_large`; the code `-32015` is retired. `session.context`
+  drops `max_history_items`, `max_history_bytes` and `within_runtime_limits`, and
+  `estimated_history_bytes` and `estimated_history_tokens` are always numbers.
 - `read` and `bash` cap model-facing output at 2000 lines or 50 KiB, whichever
   comes first, like pi. `read` returns whole numbered lines (default `limit`
   2000, was 400) and ends a cut result with

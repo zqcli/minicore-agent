@@ -145,10 +145,9 @@ impl From<super::UtilityError> for RecoveryReconstructionError {
 
 /// Folds the retained sources exactly as the provider will see them and
 /// measures the real normalized request. Returns `None` when the projection
-/// cannot be represented as a valid request within the message ceiling.
+/// cannot be represented as a valid request.
 fn measure_reconstruction(
     ticket: &ActiveRecoveryTicket,
-    auto: &AutoContext,
     budget: &dyn ProviderBudget,
     projection: &super::auto::Projection<'_>,
     folded: &BTreeMap<super::EphemeralGroupKey, BoundedText>,
@@ -163,8 +162,7 @@ fn measure_reconstruction(
     .ok()?;
     let loop_id = ticket.loop_id;
     let request_index = ticket.request_index;
-    if messages.len() > auto.limits.max_prompt_messages || !validate_clean_tool_exchanges(&messages)
-    {
+    if !validate_clean_tool_exchanges(&messages) {
         return None;
     }
     let request = ModelRequest::new(
@@ -364,7 +362,7 @@ async fn reconstruct_inner(
         folded.insert(key.clone(), generation.content);
 
         if let Some((request, tokens, bytes)) =
-            measure_reconstruction(ticket, auto, budget, &projection, &folded)
+            measure_reconstruction(ticket, budget, &projection, &folded)
             && tokens <= hard_tokens
             && bytes < ticket.original_body_bytes
             && folded.values().map(BoundedText::byte_len).sum::<usize>()

@@ -270,27 +270,6 @@ fn loop_options_applies_overrides_to_runtime_defaults() {
 }
 
 #[test]
-fn history_bytes_follow_the_model_input_budget_up_to_the_runtime_ceiling() {
-    let mut config = valid_config();
-    let default = config.loop_options().unwrap().limits.max_history_bytes;
-    for (window, expected) in [
-        (10_000, default),
-        (400_000, 0),
-        (10_000_000, 32 * 1024 * 1024),
-    ] {
-        let crate::models::ModelConfig::OpenAiResponses {
-            physical_context_window,
-            ..
-        } = config.models.get_mut("main").unwrap();
-        *physical_context_window = window;
-        let budget = config.models["main"].input_budget_tokens() as usize;
-        let options = config.loop_options_for_model("main").unwrap();
-        let expected = if expected == 0 { budget * 8 } else { expected };
-        assert_eq!(options.limits.max_history_bytes, expected);
-    }
-}
-
-#[test]
 fn automatic_options_give_prompt_preparation_a_model_timeout_floor() {
     let mut config = valid_config();
     config.compaction.enabled = true;

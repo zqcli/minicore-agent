@@ -322,7 +322,7 @@ impl Agent {
                 command_environment: &command_environment,
                 policy: candidate.compaction.policy(),
             };
-            let (config, auto) = factory.build(&record, workspace, &session.parts(), &options)?;
+            let (config, auto) = factory.build(&record, workspace, &session.parts())?;
             session_candidates.push((
                 session.clone(),
                 record.system_prompt,
@@ -823,7 +823,7 @@ impl Agent {
             command_environment: &self.command_environment,
             policy: session.policy(),
         }
-        .build(&candidate, workspace, &session.parts(), &options)?;
+        .build(&candidate, workspace, &session.parts())?;
         Ok(Box::pin(async move {
             let active_revision = session.update(candidate, config, auto, options).await?;
             Ok(SessionUpdateResult {
@@ -879,31 +879,7 @@ impl Agent {
         input: UserInput,
     ) -> Result<AgentFuture<crate::sessions::LoopSubmission>, AgentError> {
         let session = self.session(session_id)?.clone();
-        let compaction = match session.admit_compaction_before_turn()? {
-            Some(admission) => {
-                let model = self
-                    .models
-                    .get_utility(&session.record().model)
-                    .map_err(map_model_config_error)?;
-                Some((admission, model))
-            }
-            None => None,
-        };
-        Ok(Box::pin(async move {
-            // A failed compaction leaves the history too large, which the
-            // submission reports; the result event carries the reason.
-            if let Some((admission, model)) = compaction {
-                let descriptor = model.descriptor().clone();
-                let mut result = session
-                    .start_compaction(admission, model, descriptor)
-                    .await?;
-                result
-                    .wait_for(Option::is_some)
-                    .await
-                    .map_err(|_| AgentError::Internal)?;
-            }
-            session.submit(input).await
-        }))
+        Ok(Box::pin(async move { session.submit(input).await }))
     }
 
     pub(crate) async fn compact_session(

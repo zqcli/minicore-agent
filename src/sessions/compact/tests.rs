@@ -158,8 +158,6 @@ fn reservation(
         hard_tokens: model.descriptor.context_window,
         automatic_budget: Some(Arc::new(crate::models::tests::DefaultProviderBudget)),
         trigger_tokens: Some(trigger),
-        history_triggered: false,
-        fit_limits: None,
         deadline: Instant::now() + std::time::Duration::from_secs(5),
     }
 }

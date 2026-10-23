@@ -1,13 +1,5 @@
 use super::*;
 
-pub(super) fn history_fits_runtime_limits(
-    history: &[HistoryItem],
-    limits: &minicore_runtime::LoopLimits,
-) -> bool {
-    history.len() <= limits.max_history_items
-        && estimate_history_bytes(history) <= limits.max_history_bytes
-}
-
 /// Estimates history tokens at four bytes each, without provider replay.
 fn history_tokens(history: &[HistoryItem], bytes: usize) -> u64 {
     // Replay is opaque provider state that the provider mostly drops from
@@ -36,15 +28,7 @@ impl Session {
             .as_ref()
             .map_or(&inner.history[..], |projection| projection.suffix);
         let estimated_history_items = projected_history.len();
-        let estimated_history_bytes = (estimated_history_items
-            <= inner.options.limits.max_history_items)
-            .then(|| estimate_history_bytes(projected_history));
-        let within_runtime_limits =
-            if estimated_history_items > inner.options.limits.max_history_items {
-                Some(false)
-            } else {
-                estimated_history_bytes.map(|bytes| bytes <= inner.options.limits.max_history_bytes)
-            };
+        let estimated_history_bytes = estimate_history_bytes(projected_history);
         let automatic = self.shared.compaction.automatic_view();
         let estimated_request_context_tokens = self.shared.compaction.latest_request_tokens();
         let (input_budget_tokens, trigger_tokens, target_tokens) =
@@ -71,16 +55,15 @@ impl Session {
             last_prepare_failure: self.shared.compaction.prepare_failure(),
             budget: ContextBudget {
                 estimated_history_items,
-                estimated_history_tokens: estimated_history_bytes
-                    .map(|bytes| history_tokens(projected_history, bytes)),
+                estimated_history_tokens: history_tokens(
+                    projected_history,
+                    estimated_history_bytes,
+                ),
                 estimated_history_bytes,
                 estimated_request_context_tokens,
                 input_budget_tokens,
                 trigger_tokens,
                 target_tokens,
-                max_history_items: inner.options.limits.max_history_items,
-                max_history_bytes: inner.options.limits.max_history_bytes,
-                within_runtime_limits,
             },
             automatic,
             recovery: self.shared.compaction.recovery_observation(),

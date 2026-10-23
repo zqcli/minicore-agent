@@ -256,10 +256,6 @@ fn recovery_auto(state: &Arc<CompactionState>, model: Arc<ScriptedModel>) -> Aut
                 trigger_percent: 80,
                 target_percent: 50,
             },
-            limits: minicore_runtime::LoopLimits {
-                max_prompt_messages: usize::MAX,
-                ..Default::default()
-            },
         },
         state: Arc::clone(state),
     }
@@ -527,10 +523,6 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
                 enabled: true,
                 trigger_percent: 80,
                 target_percent: 50,
-            },
-            limits: minicore_runtime::LoopLimits {
-                max_prompt_messages: usize::MAX,
-                ..Default::default()
             },
         },
         state: CompactionState::new(),

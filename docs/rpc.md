@@ -353,7 +353,7 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   operation ID is non-empty printable ASCII and at most 128 bytes, must not
   start with reserved `auto-`, and cannot be reused during one loaded Session
   lifetime. At most 4096 manual IDs are retained per loaded Session; automatic
-  `auto-{completed_loop_id}` and `auto-before-{id}` IDs do not consume that quota. The bounded manual
+  `auto-{completed_loop_id}` IDs do not consume that quota. The bounded manual
   set resets on close/reopen, and a new manual ID at
   the cap is rejected as invalid input. Compaction is admitted only for a
   loaded, idle, settled, unblocked Session. Other active work yields retryable
@@ -463,10 +463,7 @@ The result is returned directly:
     "estimated_request_context_tokens": null,
     "input_budget_tokens": 16384,
     "trigger_tokens": 13107,
-    "target_tokens": 8192,
-    "max_history_items": 4096,
-    "max_history_bytes": 1048576,
-    "within_runtime_limits": true
+    "target_tokens": 8192
   },
   "automatic": {
     "current": null,
@@ -478,8 +475,7 @@ The result is returned directly:
 
 `current_operation`, when non-null, has the same safe progress shape exposed
 by `session.state` for independent manual or post-turn compaction. Automatic IDs
-are `auto-{completed_loop_id}`, or `auto-before-{id}` for the compaction a send
-runs first; manual creation rejects `auto-`, but cancellation
+are `auto-{completed_loop_id}`; manual creation rejects `auto-`, but cancellation
 accepts the actual automatic ID. `coverage` is
 non-zero only for a currently validated summary snapshot; `retained_item_count`
 is calculated against the complete loaded history. `estimated_history_items`,
@@ -488,10 +484,7 @@ current projected history-suffix snapshot: the suffix a next preparation would
 pass as `LoopRequest.history` (or full history when no valid summary is loaded).
 They exclude the summary, system/AGENTS text, tool schemas, current User/Steer
 input, framing, and provider tokenization; tokens also leave out provider
-replay bytes, which bytes include. The byte scan is bounded; bytes and
-tokens are `null` when the query cannot finish within that bound, and
-`within_runtime_limits` is then also `null` unless the item
-count already proves an over-limit history. `estimated_request_context_tokens`
+replay bytes, which bytes include. `estimated_request_context_tokens`
 is the latest serialized request estimate recorded before the wrapped model
 starts, or `null` before an estimate is available. It is not a live context
 measure or provider metering and may retain the original rejected attempt's
@@ -906,11 +899,9 @@ The successful result preserves the original `turn` member and may add
 The timestamp is when the Agent accepted the Prompt, not when the loop or
 provider request completes. It may be omitted if the clock was unavailable.
 
-When the uncovered history exceeds the Runtime loop limits, the send first runs
-an automatic `auto-before-{id}` compaction, visible through `session.state` and
-`session.context` like any other, and the response waits for it. If history
-still does not fit, the send fails with `history_too_large`; the compaction's
-`last_result` carries the reason. There is no `LoopSubmission::Preparing`. A successfully
+A send is never refused or delayed for the size of the history: automatic
+compaction is triggered by token estimates only, and there is no history item or
+byte limit. There is no `LoopSubmission::Preparing`. A successfully
 installed turn may later fail request preparation, utility cancellation, or a
 provider request; `turn.wait`/`turn.result` report that failure and its persistence,
 rather than pretending that the already accepted submit never started.
@@ -2038,7 +2029,7 @@ errors:
 | `-32012` | `provider_error` (reserved; Agent startup/provider build failures occur before the stdio service accepts requests, so there is currently no runtime RPC response path) |
 | `-32013` | `runtime_error` |
 | `-32014` | `invalid_session_settings` |
-| `-32015` | `history_too_large` |
+| `-32015` | `history_too_large` (retired; the Agent no longer returns it and the code is not reused) |
 | `-32016` | `steer_queue_full` |
 | `-32017` | `reload_requires_restart` |
 | `-32018` | `reload_unavailable` |

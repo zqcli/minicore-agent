@@ -58,9 +58,9 @@ Events use derived tagged serialization, and stored outcomes and public outcome
 views share the same redacted types. Byte-level event and history-record golden
 tests protect the existing wire and storage formats. Future non-exhaustive Runtime
 statuses, cancellation reasons, and outcomes map to explicit `unknown` values.
-Runtime's `history::estimate_history_bytes` is the single admission estimator for
-start checks, context queries, and compaction triggers. Context queries skip the
-byte scan above the item cap; otherwise they report the full estimate.
+Runtime's `history::estimate_history_bytes` is the single history size estimator,
+used for context queries and the history token estimate. Compaction is triggered
+by token estimates alone; there are no history item or byte limits.
 
 ## Core Modules
 

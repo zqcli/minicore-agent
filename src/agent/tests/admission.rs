@@ -1,104 +1,46 @@
 use super::*;
 
 #[tokio::test]
-async fn valid_summary_allows_history_over_runtime_item_limit_to_start() {
-    let loop_id = LoopId::new().unwrap();
-    let items = (0..4_097)
-        .map(|index| {
-            HistoryItem::User(UserHistory {
-                loop_id,
-                kind: UserMessageKind::Prompt,
-                input: minicore_runtime::execution::UserInput::text(format!("old-{index}"))
-                    .unwrap(),
-            })
+async fn a_history_over_the_old_byte_limit_is_neither_compacted_nor_refused() {
+    // 26 loops of about 100 KB: over 2 MiB counted by `estimate_history_bytes`,
+    // but about 650,000 tokens against a trigger of 950,000.
+    let items = (0..26)
+        .flat_map(|_| {
+            let mut record = synthetic_tool_loop_record(LoopId::new().unwrap());
+            if let HistoryItem::ToolResult(result) = &mut record.items[2] {
+                result.output = ToolOutput::new("x".repeat(100_000)).unwrap();
+            }
+            record.items
         })
-        .collect();
-    assert_runtime_limit_behavior(items, true).await;
-}
-
-#[tokio::test]
-async fn valid_summary_allows_history_over_runtime_byte_limit_to_start() {
-    let loop_id = LoopId::new().unwrap();
-    let limits = minicore_runtime::LoopOptions::default_checked()
-        .unwrap()
-        .limits;
-    let chunk_len = limits.max_model_text_bytes / 2;
-    let item_count = limits.max_history_bytes / chunk_len + 1;
-    let items = (0..item_count)
-        .map(|index| {
-            HistoryItem::Assistant(AssistantHistory {
-                provider_replay: None,
-                loop_id,
-                request_index: u32::try_from(index).unwrap(),
-                model: "main".parse::<ModelRef>().unwrap(),
-                reasoning: ReasoningPreference::Auto,
-                content: vec![AssistantPart::Text("x".repeat(chunk_len).into())],
-                finish_reason: ModelFinishReason::Stop,
-                usage: Usage::default(),
-            })
-        })
-        .collect();
-    assert_runtime_limit_behavior(items, true).await;
-}
-
-#[tokio::test]
-async fn over_runtime_history_without_a_summary_is_compacted_before_the_turn() {
-    let loop_id = LoopId::new().unwrap();
-    let items = (0..4_097)
-        .map(|index| {
-            HistoryItem::User(UserHistory {
-                loop_id,
-                kind: UserMessageKind::Prompt,
-                input: minicore_runtime::execution::UserInput::text(format!("old-{index}"))
-                    .unwrap(),
-            })
-        })
-        .collect();
-    assert_runtime_limit_behavior(items, false).await;
-}
-
-#[tokio::test]
-async fn a_send_over_the_runtime_limits_compacts_first_then_runs_the_turn() {
-    let (data_dir, _guard, session_id, model, mut agent) =
-        auto_history_fixture("auto-append-only", true).await;
-    let path = data_dir
-        .join("sessions")
-        .join(session_id.to_string())
-        .join("history.jsonl");
-    let original = std::fs::read(&path).unwrap();
-    let context = agent.session_context(session_id).unwrap();
-    assert_eq!(context.budget.within_runtime_limits, Some(false));
+        .collect::<Vec<_>>();
+    assert!(minicore_runtime::history::estimate_history_bytes(&items) > 2 * 1024 * 1024);
+    let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture(
+        "old-byte-limit",
+        true,
+        items,
+        [Step::Text("answer")],
+        None,
+        None,
+    )
+    .await;
     let turn = send_text(&mut agent, session_id, "next").await;
-    // Read before the turn ends, after which a post-turn compaction reports.
-    let context = agent.session_context(session_id).unwrap();
-    let compaction = context.last_result.unwrap();
-    assert_eq!(
-        compaction.origin,
-        crate::compaction::CompactionOrigin::Automatic
+    assert!(
+        agent
+            .session_context(session_id)
+            .unwrap()
+            .current_operation
+            .is_none()
     );
-    assert_eq!(
-        compaction.status,
-        crate::compaction::CompactionStatus::Compacted
+    assert_completed(&*wait_text(&agent, turn).await);
+    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !data_dir
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("summary.json")
+            .exists()
     );
-    assert_eq!(compaction.covered_item_count, 4_097);
-    let result = wait_text(&agent, turn).await;
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
-    let requests = model.requests();
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    let turn_request = requests[1]
-        .messages()
-        .iter()
-        .filter_map(|message| match message {
-            ModelMessage::User(text) => Some(text.as_ref()),
-            _ => None,
-        })
-        .collect::<String>();
-    assert!(turn_request.contains("folded summary") && turn_request.contains("next"));
-    assert!(std::fs::read(path).unwrap().starts_with(&original));
 }
 
 #[tokio::test]
@@ -189,72 +131,5 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
             .filter(|item| matches!(item, HistoryItem::ToolResult(_)))
             .count(),
         1
-    );
-}
-
-#[tokio::test]
-async fn a_failed_compaction_before_a_turn_rejects_the_send_and_keeps_history() {
-    let loop_id = LoopId::new().unwrap();
-    let items = (0..4_097)
-        .map(|_| {
-            HistoryItem::User(UserHistory {
-                loop_id,
-                kind: UserMessageKind::Prompt,
-                input: minicore_runtime::execution::UserInput::text("x").unwrap(),
-            })
-        })
-        .collect();
-    let failure = ModelError::permanent(
-        minicore_runtime::model::ModelErrorKind::InvalidRequest,
-        minicore_runtime::model::DeliveryState::NotStarted,
-        minicore_runtime::error::DiagnosticSummary::new(
-            minicore_runtime::error::DiagnosticCode::ModelUnavailable,
-            minicore_runtime::error::DiagnosticCategory::Model,
-            BoundedText::new("synthetic failure").unwrap(),
-            false,
-        )
-        .unwrap(),
-    );
-    let (data_dir, _guard, session_id, model, mut agent) = auto_admission_fixture(
-        "auto-disabled",
-        false,
-        items,
-        [Step::Fail(failure)],
-        None,
-        None,
-    )
-    .await;
-    let history_path = data_dir
-        .join("sessions")
-        .join(session_id.to_string())
-        .join("history.jsonl");
-    let before = std::fs::read(&history_path).unwrap();
-    assert!(matches!(
-        agent
-            .send(super::SendMessage {
-                session_id,
-                text: "should be rejected".to_owned(),
-            })
-            .await,
-        Err(AgentError::HistoryTooLarge)
-    ));
-    assert_eq!(model.requests().lock().unwrap().len(), 1);
-    assert_eq!(std::fs::read(&history_path).unwrap(), before);
-    let compaction = agent
-        .session_context(session_id)
-        .unwrap()
-        .last_result
-        .unwrap();
-    assert_eq!(
-        compaction.origin,
-        crate::compaction::CompactionOrigin::Automatic
-    );
-    assert_eq!(compaction.failure_kind.as_deref(), Some("model_failure"));
-    assert!(
-        !data_dir
-            .join("sessions")
-            .join(session_id.to_string())
-            .join("summary.json")
-            .exists()
     );
 }
