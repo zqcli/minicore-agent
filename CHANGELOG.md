@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.6 — 2026-10-23
+
+Runtime stays 0.7.4.
 
 - A turn cancelled while a model request is streaming keeps the reasoning and
   answer text streamed so far (each cut to 16 KiB) as a display-only
