@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-23
 
 - Requires Runtime 0.8.0, pinned by tag `v0.8.0`. The Runtime no longer limits
   the number or size of history items, and the Agent drops its own limits with
