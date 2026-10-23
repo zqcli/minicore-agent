@@ -47,6 +47,8 @@ impl Model for PresentationModel {
         // Synchronous; no lock is held across an await.
         self.observer.note_request_start(key);
         self.presentation.note_request_start(key);
+        self.presentation
+            .begin_streamed(key, self.descriptor().model_ref.as_str().to_owned());
         let context_generation = self.presentation.context_generation(self);
         let physical_window = self.physical_window;
         // This presentation belongs to a session, so replacing a model cannot

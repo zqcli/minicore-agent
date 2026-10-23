@@ -7,6 +7,7 @@ mod cold_read;
 mod compaction;
 mod display;
 mod events;
+mod interrupted;
 mod legacy;
 mod lifecycle;
 mod model_update;

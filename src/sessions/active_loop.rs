@@ -224,6 +224,10 @@ fn reconcile_report(
         .filter(|item| matches!(item, HistoryItem::User(_)))
         .count();
     let user_times = session.presentation().peek_user_times(user_item_count);
+    let interrupted = session
+        .presentation()
+        .take_interrupted(report.loop_id, sanitized)
+        .filter(|_| matches!(report.outcome, minicore_runtime::LoopOutcome::Cancelled(_)));
     StoredLoopRecord {
         loop_id: report.loop_id,
         outcome: StoredLoopOutcome::from_report(report),
@@ -234,7 +238,7 @@ fn reconcile_report(
         final_config_revision: report.final_config_revision,
         completed_at: utc_timestamp().unwrap_or_default(),
         user_times: (!user_times.is_empty()).then_some(user_times),
-        interrupted: None,
+        interrupted,
     }
 }
 

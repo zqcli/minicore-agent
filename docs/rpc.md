@@ -625,7 +625,9 @@ The response also includes bounded `records` summaries with outcome, usage,
 request/tool counts, final config revision, and completion time. It contains
 only summaries for turns represented by at least one item chunk in this
 response; a small byte budget therefore does not inherit summaries for items
-that were not emitted. `history_revision` is a SHA-256 of the
+that were not emitted. A record whose loop was cancelled while a model request was
+streaming may carry `interrupted`, described under [Interrupted
+replies](#interrupted-replies). `history_revision` is a SHA-256 of the
 captured complete prefix ending at `captured_end`. Continuation requests must
 send both values; a changed revision or a non-boundary prefix returns
 `invalid_state`. Revision bytes are identical across load/unload. The loaded
@@ -642,6 +644,49 @@ indexed reads for larger histories. Loaded queries retain per-query byte, line,
 deadline, and cancellation bounds on the selected lines, not the full prefix.
 The item chunks remain the continuation mechanism when one item itself is
 larger than the page.
+
+#### Interrupted replies
+
+When a loop ends `cancelled` (any reason) while a model request is streaming,
+the Agent keeps what that request had streamed as a display-only record. The
+`records` entry of that loop (and the `turn.result` page) then carries
+`interrupted`; the field is absent otherwise, and old Stores never have it.
+
+```json
+{
+  "loop_id": "lup_...",
+  "outcome": {"type": "cancelled", "reason": "user"},
+  "usage": {...}, "requests": 9, "tool_rounds": 8,
+  "final_config_revision": 0, "completed_at": "2026-10-23T08:00:00.000Z",
+  "interrupted": {
+    "stop_reason": "aborted",
+    "request_index": 9,
+    "model": "main",
+    "reasoning": "The user wants the test...",
+    "text": "I will start by readi"
+  }
+}
+```
+
+`stop_reason` is always `aborted`: this is not a completed reply. `request_index`
+and `model` identify the request as the assistant items of the loop do;
+`reasoning` and `text` are the visible reasoning and answer text streamed so far,
+each cut to its first 16 KiB. Partial tool-call arguments are never kept, and the
+field exists only when `reasoning` or `text` is non-empty. A client shows it as
+the assistant output of `(loop_id, request_index)` placed after the last item
+with that `loop_id`, marked aborted. The same record is repeated on each page
+that returns an item of the loop, so match it by `loop_id`.
+
+It is not a history item. It does not count in `total` or item cursors, and is
+never replayed to a model, budgeted, summarized, or loaded into a reopened
+Session's history. The next turn does not contain it. A cancel during tool
+execution, after the request completed, records nothing, since that request is
+already in `items`.
+
+The Store keeps it in the loop's `history.jsonl` line. If the line would exceed
+the loop record limit, the append drops `interrupted` (and `user_times`) rather
+than the loop. An Agent older than this field rejects such a line as corrupt, so
+a Store that has one must not be reopened by it.
 
 #### Display projection
 
@@ -920,6 +965,9 @@ when the exact old Turn is read from `history.jsonl`. A live report is preferred
 to Store, so an append failure still exposes the retained report with
 `persistence: failed`; a stored Turn reports `persistence: persisted`. Runtime
 outcome and usage are returned when known.
+A cancelled turn may also return `interrupted`, the same display-only object as
+in [Interrupted replies](#interrupted-replies), for both live and stored
+results; it is not part of `items` or `total`.
 
 ### `turn.cancel`
 

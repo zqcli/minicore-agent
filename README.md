@@ -144,6 +144,8 @@ Each Session lives under `<data_dir>/sessions/<session_id>/`: `session.json`
 for metadata, `history.jsonl` for the authoritative history, `summary.json` for
 the derived compaction snapshot, and `tools/` for auxiliary tool records.
 
+- A loop cancelled mid-request keeps the partial reply it had streamed in its
+  `history.jsonl` line as display-only `interrupted`; it is never history.
 - A turn result reports `persistence: persisted` only after its history append
   is synced to disk. A failed append leaves the Session usable unless the
   outcome is uncertain, in which case the Session is blocked until reopened.

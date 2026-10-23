@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- A turn cancelled while a model request is streaming keeps the reasoning and
+  answer text streamed so far (each cut to 16 KiB) as a display-only
+  `interrupted` object on the loop's `history.jsonl` record. `session.read`
+  `records` and `turn.result` return it with `stop_reason: "aborted"`, so a
+  reopened session still shows the partial reply. It is not a history item: it
+  is never sent to a model, replayed, budgeted, or summarized. A cancel after
+  the request completed, for example during a tool, records nothing.
+  Older Agents reject a loop line that has the field.
+
 ## 0.7.5 — 2026-10-22
 
 Runtime stays 0.7.4.

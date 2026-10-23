@@ -15,7 +15,9 @@ and tool rounds.
   later turns; a confirmed rollback preserves the old history and permits a retry.
   Reopen may truncate only a trailing incomplete line, not a malformed complete
   record. Provider-private fields excluded by sanitization are not promised to
-  survive across turns.
+  survive across turns. A partial reply interrupted by a cancel is stored on its
+  loop record as display-only `interrupted` data; it is not a history item and
+  no prompt, estimate, budget or summary source ever includes it.
 - `summary.json` is an independently validated, bounded derived snapshot of a
   settled prefix. Missing, stale, or corrupt summaries fall back to full history
   without relaxing Session/history validation.

@@ -76,13 +76,21 @@ impl Stream for PreviewStream {
         let next = this.inner.as_mut().poll_next(cx);
         match &next {
             Poll::Ready(Some(item)) => {
-                if let Ok(ModelEvent::Usage { usage }) = item {
-                    this.preview.presentation.note_request_usage(
-                        this.preview.key,
+                let (presentation, key) = (&this.preview.presentation, this.preview.key);
+                match item {
+                    Ok(ModelEvent::Usage { usage }) => presentation.note_request_usage(
+                        key,
                         *usage,
                         this.context_generation,
                         this.physical_window,
-                    );
+                    ),
+                    Ok(ModelEvent::TextDelta { delta }) => {
+                        presentation.note_streamed(key, false, delta.as_str());
+                    }
+                    Ok(ModelEvent::ReasoningDelta { delta }) => {
+                        presentation.note_streamed(key, true, delta.as_str());
+                    }
+                    _ => {}
                 }
                 this.preview
                     .protect(|preview| preview.observe(item, Instant::now()));

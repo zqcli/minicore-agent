@@ -29,6 +29,7 @@ use minicore_runtime::{LoopId, ToolCallId};
 
 use crate::event::{AgentEvent, AgentEventSink, EventMeta};
 use crate::ids::SessionId;
+use crate::read::{InterruptedRequest, PartialStopReason};
 use crate::sessions::TurnRef;
 use crate::tool_data::ToolRef;
 use crate::tools::observe::{RequestKey, ToolObserver};

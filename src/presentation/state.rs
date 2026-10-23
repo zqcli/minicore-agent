@@ -62,6 +62,23 @@ pub(super) struct ToolResultInfo {
     truncated: bool,
 }
 
+/// Bound of each streamed field kept for an interrupted reply; the record must
+/// fit one `session.read` page, so this stays well under the 256 KiB default.
+const MAX_STREAMED_FIELD_BYTES: usize = 16 * 1024;
+
+/// Head of the visible output the newest model request has streamed.
+struct StreamedRequest {
+    key: RequestKey,
+    model: String,
+    reasoning: String,
+    text: String,
+}
+
+fn push_head(buffer: &mut String, delta: &str) {
+    let room = MAX_STREAMED_FIELD_BYTES.saturating_sub(buffer.len());
+    buffer.push_str(crate::text::truncate(delta, room).0);
+}
+
 /// Bounded per-request usage cache for the current loop (spec 9.4/12.4).
 /// Keyed by `(loop_id, request_index)`; cleared when a new loop starts.
 type RequestUsageCache = HashMap<RequestKey, minicore_runtime::model::Usage>;
@@ -72,6 +89,7 @@ pub(super) struct PresentationInner {
     pub(super) live_tools: HashMap<(Option<RequestKey>, ToolCallId), LiveTool>,
     pub(super) tool_results: HashMap<(RequestKey, ToolCallId), ToolResultInfo>,
     request_usage: RequestUsageCache,
+    streamed: Option<StreamedRequest>,
     live_times: VecDeque<Option<String>>,
     last_loop: Option<LastLoopView>,
     branch: Option<String>,
@@ -244,6 +262,59 @@ impl Presentation {
         let _ = self.events.try_send(event);
     }
 
+    /// Starts capturing a request's output; a retry of the same request starts over.
+    pub(crate) fn begin_streamed(&self, key: RequestKey, model: String) {
+        self.lock().streamed = Some(StreamedRequest {
+            key,
+            model,
+            reasoning: String::new(),
+            text: String::new(),
+        });
+    }
+
+    pub(crate) fn note_streamed(&self, key: RequestKey, reasoning: bool, delta: &str) {
+        let mut inner = self.lock();
+        if let Some(streamed) = inner
+            .streamed
+            .as_mut()
+            .filter(|streamed| streamed.key == key)
+        {
+            push_head(
+                if reasoning {
+                    &mut streamed.reasoning
+                } else {
+                    &mut streamed.text
+                },
+                delta,
+            );
+        }
+    }
+
+    /// The output of a request that never became one of `completed`'s assistant
+    /// items, if it streamed any.
+    pub(crate) fn take_interrupted(
+        &self,
+        loop_id: LoopId,
+        completed: &[HistoryItem],
+    ) -> Option<InterruptedRequest> {
+        let streamed = self.lock().streamed.take()?;
+        let key = streamed.key;
+        let finished = completed.iter().any(|item| {
+            matches!(item, HistoryItem::Assistant(assistant)
+                if assistant.loop_id == key.loop_id && assistant.request_index == key.request_index)
+        });
+        (key.loop_id == loop_id
+            && !finished
+            && !(streamed.reasoning.is_empty() && streamed.text.is_empty()))
+        .then_some(InterruptedRequest {
+            stop_reason: PartialStopReason::Aborted,
+            request_index: key.request_index,
+            model: streamed.model,
+            reasoning: streamed.reasoning,
+            text: streamed.text,
+        })
+    }
+
     /// Clears observation state owned by the previous loop before the Runtime
     /// task is spawned. The next loop may begin synchronously from
     /// `AgentLoop::start`, so this must not run after that call.
@@ -252,6 +323,7 @@ impl Presentation {
         inner.live_tools.clear();
         inner.tool_results.clear();
         inner.request_usage.clear();
+        inner.streamed = None;
         inner.live_times.clear();
         inner.accepted_steers = 0;
         inner.prepared_steers = None;
