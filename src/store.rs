@@ -24,6 +24,7 @@ use crate::history::normalize_history;
 use crate::ids::SessionId;
 use crate::models::Models;
 use crate::profiles::ApprovalMode;
+use crate::read::InterruptedRequest;
 use crate::tool_data::{
     CommandResult, ToolExecutionState, ToolPersistenceSnapshot, ToolPhase, ToolRecord, ToolRef,
     ToolSubject,
@@ -282,6 +283,7 @@ pub(crate) struct StoredTurnSummary {
     pub(crate) tool_rounds: u64,
     pub(crate) final_config_revision: ConfigRevision,
     pub(crate) completed_at: String,
+    pub(crate) interrupted: Option<InterruptedRequest>,
 }
 
 const MAX_READ_TURN_SUMMARIES: usize = 64;
@@ -306,6 +308,10 @@ pub(crate) struct StoredLoopRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) user_times: Option<Vec<Option<String>>>,
+    /// Partial output of the request a cancel interrupted; display-only, never
+    /// part of `items`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interrupted: Option<InterruptedRequest>,
 }
 
 fn deserialize_user_times<'de, D>(deserializer: D) -> Result<Option<Vec<Option<String>>>, D::Error>

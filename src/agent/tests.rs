@@ -259,6 +259,7 @@ fn synthetic_loop_record(
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
         user_times: None,
+        interrupted: None,
     }
 }
 
@@ -305,6 +306,7 @@ fn synthetic_tool_loop_record(loop_id: minicore_runtime::LoopId) -> StoredLoopRe
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
         user_times: None,
+        interrupted: None,
     }
 }
 
@@ -482,6 +484,7 @@ async fn assert_runtime_limit_behavior(items: Vec<HistoryItem>, install_summary:
                 final_config_revision: ConfigRevision::INITIAL,
                 completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
                 user_times: None,
+                interrupted: None,
             },
         )
         .await
@@ -675,6 +678,7 @@ async fn auto_admission_fixture_with_window(
                     final_config_revision: ConfigRevision::INITIAL,
                     completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
                     user_times: None,
+                    interrupted: None,
                 },
             )
             .await

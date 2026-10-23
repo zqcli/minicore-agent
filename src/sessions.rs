@@ -38,6 +38,7 @@ use crate::history::{GetHistory, HistoryPage, normalize_history, page_history};
 use crate::ids::SessionId;
 use crate::presentation::SteerReceiptPrompt;
 use crate::prompt::ProjectPromptProvider;
+use crate::read::InterruptedRequest;
 use crate::store::{Store, StoredLoopOutcome, StoredLoopRecord, SummaryCommit, utc_timestamp};
 use crate::tool_data::ToolData;
 use crate::tools::command::ToolOwners;

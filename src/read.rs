@@ -132,6 +132,24 @@ impl fmt::Debug for ReadItemChunk {
     }
 }
 
+/// Why a partial reply stopped; the only value is a user or host abort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialStopReason {
+    Aborted,
+}
+
+/// Display-only output a cancelled model request had streamed; never history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptedRequest {
+    pub stop_reason: PartialStopReason,
+    pub request_index: u32,
+    pub model: String,
+    pub reasoning: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReadTurnSummary {
     pub loop_id: LoopId,
@@ -141,6 +159,8 @@ pub struct ReadTurnSummary {
     pub tool_rounds: u64,
     pub final_config_revision: minicore_runtime::execution::ConfigRevision,
     pub completed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<InterruptedRequest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -256,6 +276,8 @@ pub struct TurnResultPage {
     pub final_config_revision: Option<minicore_runtime::execution::ConfigRevision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<InterruptedRequest>,
     pub items: Vec<ReadItemChunk>,
     pub next_cursor: Option<ReadCursor>,
     pub total: usize,
@@ -682,6 +704,7 @@ fn pending_turn_page(turn: TurnRef, max_bytes: usize) -> Result<TurnResultPage, 
         tool_rounds: None,
         final_config_revision: None,
         completed_at: None,
+        interrupted: None,
         items: Vec::new(),
         next_cursor: None,
         total: 0,
@@ -850,6 +873,7 @@ async fn live_turn_page(
         tool_rounds: Some(tool_rounds),
         final_config_revision: Some(final_config_revision),
         completed_at: None,
+        interrupted: result.interrupted.clone(),
         items: Vec::new(),
         next_cursor: None,
         total,
@@ -887,6 +911,7 @@ async fn stored_turn_page(
         tool_rounds: Some(record.tool_rounds),
         final_config_revision: Some(record.final_config_revision),
         completed_at: Some(record.completed_at),
+        interrupted: record.interrupted,
         items: Vec::new(),
         next_cursor: None,
         total,
@@ -1299,6 +1324,7 @@ impl ReadTurnSummary {
             tool_rounds: summary.tool_rounds,
             final_config_revision: summary.final_config_revision,
             completed_at: summary.completed_at.clone(),
+            interrupted: summary.interrupted.clone(),
         }
     }
 }

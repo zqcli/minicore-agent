@@ -182,6 +182,7 @@ impl Store {
                     tool_rounds: record.tool_rounds,
                     final_config_revision: record.final_config_revision,
                     completed_at: record.completed_at,
+                    interrupted: record.interrupted,
                 });
             } else {
                 page.turns_truncated = true;
@@ -284,11 +285,14 @@ impl Store {
             serde_json::to_vec(&normalized)
         }
         .map_err(corrupt)?;
-        if bytes.len() > MAX_LOOP_RECORD_BYTES && record.user_times.is_some() {
+        if bytes.len() > MAX_LOOP_RECORD_BYTES
+            && (record.user_times.is_some() || record.interrupted.is_some())
+        {
             // Presentation metadata must not make an otherwise storable core
             // loop record cross the single-line limit.
             let mut without_metadata = record.clone();
             without_metadata.user_times = None;
+            without_metadata.interrupted = None;
             bytes = serde_json::to_vec(&without_metadata).map_err(corrupt)?;
         }
         if bytes.len() > MAX_LOOP_RECORD_BYTES {
@@ -555,6 +559,7 @@ impl Store {
                         tool_rounds: record.tool_rounds,
                         final_config_revision: record.final_config_revision,
                         completed_at: record.completed_at.clone(),
+                        interrupted: record.interrupted.clone(),
                     });
                 } else {
                     turns_truncated = true;

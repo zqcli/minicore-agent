@@ -106,6 +106,7 @@ fn loop_record(text: &str) -> StoredLoopRecord {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+        interrupted: None,
     }
 }
 
@@ -131,6 +132,7 @@ fn loop_record_with_users(texts: &[&str]) -> StoredLoopRecord {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+        interrupted: None,
     }
 }
 
@@ -392,6 +394,91 @@ async fn user_time_metadata_does_not_displace_core_at_line_limit() {
     assert!(loaded.user_times.is_empty());
 }
 
+fn interrupted_request(text: &str) -> InterruptedRequest {
+    InterruptedRequest {
+        stop_reason: crate::read::PartialStopReason::Aborted,
+        request_index: 3,
+        model: "main".to_owned(),
+        reasoning: "thinking".to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn interrupted_partial_round_trips_beside_items_and_old_records_still_load() {
+    let (directory, store, session_id) = fixture("interrupted-round-trip").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let old = loop_record("old");
+    let mut cancelled = loop_record("question");
+    cancelled.outcome = StoredLoopOutcome::Cancelled {
+        reason: crate::event::CancelReasonView::User,
+    };
+    cancelled.interrupted = Some(interrupted_request("half an ans"));
+    // A record written before the field existed has no such key at all.
+    let old_value = serde_json::to_value(&old).unwrap();
+    assert!(old_value.get("interrupted").is_none());
+    append_raw_history_json_line(&store, session_id, &old_value.to_string()).await;
+    store.append_loop(session_id, &cancelled).await.unwrap();
+
+    let line = fs::read_to_string(store.session_directory(session_id).join(HISTORY_FILE))
+        .await
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(line.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        stored["interrupted"],
+        json!({"stop_reason": "aborted", "request_index": 3, "model": "main",
+            "reasoning": "thinking", "text": "half an ans"})
+    );
+
+    drop(store);
+    let reopened = Store::open(directory.path().to_path_buf()).await.unwrap();
+    let loaded = reopened.load_session(session_id).await.unwrap();
+    // The partial is display-only: only the two User items are history.
+    assert_eq!(loaded.history.len(), 2);
+    let page = reopened
+        .read_history_page(
+            session_id,
+            0,
+            100,
+            None,
+            None,
+            None,
+            None,
+            &history_limits(1 << 30, 100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.total_items, 2);
+    assert_eq!(page.turns[0].interrupted, None);
+    assert_eq!(
+        page.turns[1].interrupted,
+        Some(interrupted_request("half an ans"))
+    );
+}
+
+#[tokio::test]
+async fn interrupted_partial_is_shed_before_it_can_displace_the_loop_record() {
+    let (_directory, store, session_id) = fixture("interrupted-line-limit").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let mut loop_record: StoredLoopRecord =
+        serde_json::from_slice(&loop_line_with_size(MAX_LOOP_RECORD_BYTES - 32)).unwrap();
+    loop_record.interrupted = Some(interrupted_request(&"p".repeat(1024)));
+
+    store.append_loop(session_id, &loop_record).await.unwrap();
+    let loaded = store.load_session(session_id).await.unwrap();
+    assert_eq!(loaded.history.len(), loop_record.items.len());
+    let stored = store
+        .read_loop_record(
+            session_id,
+            loop_record.loop_id,
+            &history_limits(1 << 30, 100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.interrupted, None);
+}
+
 #[tokio::test]
 async fn same_text_users_keep_occurrence_when_one_time_is_invalid() {
     let (_directory, store, session_id) = fixture("user-time-occurrence").await;
@@ -546,6 +633,7 @@ fn loop_line_with_size(target: usize) -> Vec<u8> {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+        interrupted: None,
     };
     let base = serde_json::to_vec(&record).unwrap();
     let final_text_len = target
@@ -638,6 +726,7 @@ async fn extended_reasoning_values_round_trip_in_record_and_history() {
                     final_config_revision: ConfigRevision::INITIAL,
                     completed_at: utc_timestamp().unwrap(),
                     user_times: None,
+                    interrupted: None,
                 },
             )
             .await
@@ -1035,6 +1124,7 @@ async fn record_too_large_append_is_rejected() {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+        interrupted: None,
     };
     assert!(matches!(
         store.append_loop(session_id, &big).await,
@@ -1164,6 +1254,7 @@ async fn loaded_history_is_sanitized_of_opaque_reasoning() {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+        interrupted: None,
     };
     store.append_loop(session_id, &record).await.unwrap();
 
@@ -1232,6 +1323,7 @@ async fn historical_subagent_history_items_remain_generic_and_readable() {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: utc_timestamp().unwrap(),
         user_times: None,
+        interrupted: None,
     };
     store
         .append_loop(session_id, &history_record)

@@ -37,8 +37,9 @@ use crate::tools::{BuildToolsError, CommandEnvironment};
 
 pub use crate::history::{GetHistory, HistoryPage};
 pub use crate::read::{
-    CoveredUsage, DisplayProjection, ReadCursor, ReadItemChunk, ReadSession, ReadSessionResult,
-    ReadTurnSummary, ReadView, TurnResultAvailability, TurnResultPage, TurnResultRequest,
+    CoveredUsage, DisplayProjection, InterruptedRequest, PartialStopReason, ReadCursor,
+    ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary, ReadView,
+    TurnResultAvailability, TurnResultPage, TurnResultRequest,
 };
 pub use crate::sessions::{
     SessionContext, SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult,

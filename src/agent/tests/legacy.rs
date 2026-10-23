@@ -80,6 +80,7 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: now.clone(),
         user_times: None,
+        interrupted: None,
     };
     store.append_loop(session_id, &legacy_loop).await.unwrap();
 
@@ -269,6 +270,7 @@ async fn s1_five_tool_subset_record_with_old_history_still_executes() {
         final_config_revision: ConfigRevision::INITIAL,
         completed_at: now,
         user_times: None,
+        interrupted: None,
     };
     store.append_loop(session_id, &legacy_loop).await.unwrap();
 

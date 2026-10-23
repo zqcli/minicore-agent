@@ -15,6 +15,7 @@ pub struct TurnResult {
     pub turn: TurnRef,
     pub report: Arc<LoopReport>,
     pub persistence: TurnPersistence,
+    pub interrupted: Option<InterruptedRequest>,
 }
 
 /// One accepted Prompt: the new turn plus the Agent acceptance time (may be

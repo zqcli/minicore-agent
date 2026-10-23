@@ -111,6 +111,7 @@ async fn append_source(session: &Session, items: Vec<HistoryItem>, loop_id: Loop
                 final_config_revision: ConfigRevision::INITIAL,
                 completed_at: "2026-01-01T00:00:00.000Z".into(),
                 user_times: None,
+                interrupted: None,
             },
         )
         .await

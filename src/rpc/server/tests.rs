@@ -651,6 +651,7 @@ async fn append_compaction_tail(harness: &mut RpcHarness, base: &Path, session_i
         final_config_revision: minicore_runtime::execution::ConfigRevision::INITIAL,
         completed_at: "2026-01-02T03:04:05.000Z".to_owned(),
         user_times: None,
+        interrupted: None,
     };
     store.append_loop(id, &record).await.unwrap();
     harness

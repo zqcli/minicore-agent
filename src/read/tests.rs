@@ -265,6 +265,103 @@ fn user_item(loop_id: LoopId, text: &str) -> HistoryItem {
 }
 
 #[tokio::test]
+async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summaries() {
+    let loop_id = LoopId::new().unwrap();
+    let turn = TurnRef {
+        session_id: SessionId::new().unwrap(),
+        loop_id,
+    };
+    let interrupted = InterruptedRequest {
+        stop_reason: PartialStopReason::Aborted,
+        request_index: 4,
+        model: "main".to_owned(),
+        reasoning: "hmm".to_owned(),
+        text: "half".to_owned(),
+    };
+    let outcome = StoredLoopOutcome::Cancelled {
+        reason: crate::event::CancelReasonView::User,
+    };
+    let stored = StoredLoopRecord {
+        loop_id,
+        outcome: outcome.clone(),
+        items: vec![user_item(loop_id, "question")],
+        usage: Usage::default(),
+        requests: 4,
+        tool_rounds: 3,
+        final_config_revision: ConfigRevision::INITIAL,
+        completed_at: "2026-10-03T00:00:00Z".to_owned(),
+        user_times: None,
+        interrupted: Some(interrupted.clone()),
+    };
+    let cancellation = CancellationToken::new();
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let stored_page = stored_turn_page(
+        turn,
+        stored,
+        ReadCursor::start(),
+        100,
+        4096,
+        &cancellation,
+        deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_page.interrupted.as_ref(), Some(&interrupted));
+    assert_eq!(
+        serde_json::to_value(&stored_page).unwrap()["interrupted"],
+        serde_json::json!({
+            "stop_reason": "aborted", "request_index": 4, "model": "main",
+            "reasoning": "hmm", "text": "half"
+        })
+    );
+
+    let live = Arc::new(crate::sessions::TurnResult {
+        turn,
+        report: Arc::new(minicore_runtime::LoopReport {
+            loop_id,
+            outcome: minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User),
+            appended: Arc::from([]),
+            usage: Usage::default(),
+            requests: 4,
+            tool_rounds: 3,
+            final_config_revision: ConfigRevision::INITIAL,
+        }),
+        persistence: TurnPersistence::Failed,
+        interrupted: Some(interrupted.clone()),
+    });
+    let live_page = live_turn_page(
+        turn,
+        live,
+        ReadCursor::start(),
+        100,
+        4096,
+        &cancellation,
+        deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(live_page.interrupted.as_ref(), Some(&interrupted));
+
+    let mut summary = StoredTurnSummary {
+        item_start: 0,
+        item_end: 1,
+        loop_id,
+        outcome,
+        usage: Usage::default(),
+        requests: 4,
+        tool_rounds: 3,
+        final_config_revision: ConfigRevision::INITIAL,
+        completed_at: "2026-10-03T00:00:00Z".to_owned(),
+        interrupted: Some(interrupted.clone()),
+    };
+    let value = serde_json::to_value(ReadTurnSummary::from_stored(&summary)).unwrap();
+    assert_eq!(value["interrupted"]["text"], "half");
+    summary.interrupted = None;
+    let value = serde_json::to_value(ReadTurnSummary::from_stored(&summary)).unwrap();
+    assert!(value.get("interrupted").is_none());
+}
+
+#[tokio::test]
 async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
     for tool_rounds in [65_535_u64, 65_536, 70_000] {
         let loop_id = LoopId::new().unwrap();
@@ -284,6 +381,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
                 final_config_revision: ConfigRevision::INITIAL,
             }),
             persistence: TurnPersistence::Persisted,
+            interrupted: None,
         });
         let event = crate::event::TurnResultView::from_turn_result(&live);
         assert_eq!(
@@ -300,6 +398,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: "2026-10-03T00:00:00Z".to_owned(),
             user_times: None,
+            interrupted: None,
         };
         let cancellation = CancellationToken::new();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -342,6 +441,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
             tool_rounds,
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: "2026-10-03T00:00:00Z".to_owned(),
+            interrupted: None,
         });
         assert_eq!(
             serde_json::to_value(summary).unwrap()["tool_rounds"].as_u64(),
@@ -395,6 +495,7 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
                 final_config_revision: ConfigRevision::INITIAL,
             }),
             persistence: crate::sessions::TurnPersistence::Failed,
+            interrupted: None,
         });
         let stored = StoredLoopRecord {
             loop_id,
@@ -406,6 +507,7 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
             final_config_revision: ConfigRevision::INITIAL,
             completed_at: COMPLETED_AT.to_owned(),
             user_times: None,
+            interrupted: None,
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
 

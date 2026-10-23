@@ -132,6 +132,7 @@ async fn run_active_loop(
         turn,
         report: Arc::clone(&report),
         persistence,
+        interrupted: stored.interrupted.clone(),
     });
     publish_settle_and_start_compaction(&session, &result, &mut completion).await;
     // Remain in the owned task so close/shutdown still join auxiliary writes.
@@ -233,6 +234,7 @@ fn reconcile_report(
         final_config_revision: report.final_config_revision,
         completed_at: utc_timestamp().unwrap_or_default(),
         user_times: (!user_times.is_empty()).then_some(user_times),
+        interrupted: None,
     }
 }
 
