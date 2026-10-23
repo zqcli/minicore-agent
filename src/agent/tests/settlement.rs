@@ -14,6 +14,17 @@ fn settled_projection_model_error() -> ModelError {
     )
 }
 
+/// One line that the `read` tool returns whole, within its 50 KiB limit.
+fn unread_tail() -> String {
+    "EXACT-UNREAD-TAIL ".repeat(2_500)
+}
+
+// The read tool returns at most 50 KiB, so the user text supplies the rest of
+// the projection that must exceed 64 KiB.
+fn padded(text: &str) -> String {
+    format!("{text} {}", "pad ".repeat(16_000))
+}
+
 async fn settled_projection_fixture(
     label: &str,
     window: u64,
@@ -37,11 +48,7 @@ async fn settled_projection_fixture(
     )
     .await;
     let (data, guard, id, model, mut agent) = fixture;
-    std::fs::write(
-        data.join("workspace/tail.txt"),
-        "EXACT-UNREAD-TAIL ".repeat(6_000),
-    )
-    .unwrap();
+    std::fs::write(data.join("workspace/tail.txt"), unread_tail()).unwrap();
     let mut config = agent.config.clone();
     config.compaction = CompactionConfig::default();
     agent
@@ -76,7 +83,7 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
 {
     let (data, _guard, id, model, mut agent) =
         settled_projection_fixture("wide-projection-cold", 50_000, Step::Text("done")).await;
-    let turn = send_text(&mut agent, id, "EXACT-CURRENT-USER").await;
+    let turn = send_text(&mut agent, id, &padded("EXACT-CURRENT-USER")).await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
     wait_post_turn_noop(&agent, id, turn.loop_id).await;
@@ -100,7 +107,7 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
     assert!(content.len() > 64 * 1024);
     assert!(content.contains("FOLDED-OLD-SOURCE"));
     assert!(content.contains("EXACT-CURRENT-USER"));
-    assert!(content.contains(&"EXACT-UNREAD-TAIL ".repeat(6_000)));
+    assert!(content.contains(&unread_tail()));
     assert!(!content.contains("old old old"));
     assert_eq!(complete_display_summary(&agent, id).await, content);
     agent.close_session(id).await.unwrap();
@@ -154,7 +161,7 @@ async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_proj
             terminal,
         )
         .await;
-        let turn = send_text(&mut agent, id, "EXACT-TERMINAL-USER").await;
+        let turn = send_text(&mut agent, id, &padded("EXACT-TERMINAL-USER")).await;
         if cancelled {
             gate.wait_started().await;
             assert!(agent.cancel(turn).unwrap());
@@ -213,7 +220,7 @@ async fn settled_projection_post_turn_summarizes_promoted_source_and_keeps_it_on
         } else {
             Step::Text("FINAL-SEMANTIC-SUMMARY")
         });
-        let turn = send_text(&mut agent, id, "current user").await;
+        let turn = send_text(&mut agent, id, &padded("current user")).await;
         let result = wait_text(&agent, turn).await;
         assert_completed(&result);
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -270,7 +277,7 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
         .lock()
         .unwrap()
         .push_back(Step::gated_text(gate.clone(), "not reached"));
-    let turn = send_text(&mut agent, id, "current user").await;
+    let turn = send_text(&mut agent, id, &padded("current user")).await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
     gate.wait_started().await;
@@ -304,7 +311,12 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
         .join("history.jsonl");
     let original = std::fs::read(&history).unwrap();
     crate::store::APPEND_FAILURES.arm(id, false);
-    let turn = send_text(&mut agent, id, "must not promote unpersisted input").await;
+    let turn = send_text(
+        &mut agent,
+        id,
+        &padded("must not promote unpersisted input"),
+    )
+    .await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
     assert_eq!(std::fs::read(history).unwrap(), original);

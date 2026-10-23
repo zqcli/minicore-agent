@@ -18,8 +18,11 @@ continues to use PowerShell with `-NoProfile`.
 
 Unix cancellation sends SIGTERM to the process group and allows a 500 ms grace
 while draining both output pipes, then sends SIGKILL and reaps it. Model-visible
-output keeps head and tail with an omitted-bytes marker; stdout and stderr share
-one output budget. If the Agent would be PID 1 in a container, run an init process
+output keeps the last 2000 lines or 50 KiB, and stdout and stderr share that
+budget. The captured output (the last 1 MiB of each stream) of a cut stream is
+saved to a `minicore-bash-*` file in the OS temp directory, readable only by its
+owner on Unix, which the Agent does not delete; it can hold anything the command
+printed. If the Agent would be PID 1 in a container, run an init process
 (`--init` or tini) to reap orphaned descendants. Otherwise orphaned children can
 remain zombies and prevent confirmation that the process group is gone.
 

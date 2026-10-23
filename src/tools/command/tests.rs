@@ -80,7 +80,7 @@ impl CommandStreamSink for RecordingSink {
 }
 
 #[tokio::test]
-async fn model_capture_keeps_both_ends_and_counts_omitted_raw_bytes() {
+async fn model_capture_keeps_the_tail_and_counts_omitted_raw_bytes() {
     let state = Arc::new(Mutex::new(StreamState::default()));
     let mut reader = b"abcdefghijklmnopqrstuvwxyz".as_slice();
     drain_stream(
@@ -93,8 +93,7 @@ async fn model_capture_keeps_both_ends_and_counts_omitted_raw_bytes() {
     )
     .await;
     assert!(state.lock().unwrap().complete);
-    assert!(state.lock().unwrap().truncated);
-    assert_eq!(take_capture(&state), (b"abcdefghstuvwxyz".to_vec(), 10));
+    assert_eq!(take_capture(&state), (b"klmnopqrstuvwxyz".to_vec(), 10));
 }
 
 fn session() -> SessionId {

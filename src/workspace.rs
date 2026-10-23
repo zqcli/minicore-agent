@@ -60,7 +60,6 @@ pub enum WorkspaceError {
 
 pub(crate) struct ReadPrefix {
     pub(crate) bytes: Vec<u8>,
-    pub(crate) visible_len: usize,
     pub(crate) has_more: bool,
 }
 
@@ -217,7 +216,6 @@ impl Workspace {
             .await
             .map_err(|_| WorkspaceError::Unavailable)?;
         Ok(ReadPrefix {
-            visible_len: bytes.len().min(max_bytes),
             has_more: bytes.len() > max_bytes,
             bytes,
         })

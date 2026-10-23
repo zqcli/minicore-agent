@@ -263,8 +263,8 @@ pub(crate) struct CommandRequest {
     pub(crate) deadline: Instant,
     pub(crate) cancellation: CancellationToken,
     pub(crate) environment: CommandEnvironment,
-    /// Retained head and tail per stream for the model-facing result. This is a
-    /// separate, smaller budget than the streaming window.
+    /// Retained tail per stream for the model-facing result, separate from the
+    /// streaming window.
     pub(crate) capture_limit: usize,
     pub(crate) streams: Option<Arc<dyn CommandStreamSink>>,
     /// Platform capture for this command; Windows command owners pass their
@@ -273,17 +273,14 @@ pub(crate) struct CommandRequest {
 }
 
 /// What one finished command leaves behind: the structured record plus the
-/// bounded model-facing head and tail of each stream.
+/// bounded model-facing tail of each stream.
 pub(crate) struct CommandOutcome {
     pub(crate) result: CommandResult,
-    /// Retained model-facing head and tail of each stream, kept separately from the
-    /// streaming window.
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    /// Bytes before the retained tail.
     pub(crate) stdout_omitted: u64,
     pub(crate) stderr_omitted: u64,
-    pub(crate) stdout_truncated: bool,
-    pub(crate) stderr_truncated: bool,
 }
 
 /// A running command as seen by its caller. Dropping it requests cancellation
@@ -310,8 +307,6 @@ impl CommandWorker {
                     stderr: Vec::new(),
                     stdout_omitted: 0,
                     stderr_omitted: 0,
-                    stdout_truncated: false,
-                    stderr_truncated: false,
                 });
             }
         }
@@ -507,15 +502,12 @@ impl ToolOwners {
     }
 }
 
-/// Per-stream accumulator for the model-facing head and tail. It is deliberately
-/// small: the streaming window lives in the sink and both budgets are counted
-/// separately.
+/// Per-stream accumulator for the model-facing tail. The streaming window lives
+/// in the sink and both budgets are counted separately.
 #[derive(Default)]
 struct StreamState {
-    prefix: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     bytes: u64,
-    truncated: bool,
     complete: bool,
     /// The owner stopped observing before a real end of output.
     cut: bool,
@@ -759,14 +751,6 @@ fn finish(
     stderr: &StreamHandle,
 ) -> CommandOutcome {
     record(request, &result);
-    let stdout_truncated = {
-        let state = stdout.lock().unwrap();
-        state.truncated || state.cut
-    };
-    let stderr_truncated = {
-        let state = stderr.lock().unwrap();
-        state.truncated || state.cut
-    };
     let (stdout, stdout_omitted) = take_capture(stdout);
     let (stderr, stderr_omitted) = take_capture(stderr);
     CommandOutcome {
@@ -775,8 +759,6 @@ fn finish(
         stderr,
         stdout_omitted,
         stderr_omitted,
-        stdout_truncated,
-        stderr_truncated,
     }
 }
 
@@ -880,20 +862,14 @@ async fn drain_stream<R>(
         }
         let mut state = state.lock().unwrap();
         state.bytes += read as u64;
-        let head_limit = limit / 2;
-        let keep = (head_limit - state.prefix.len()).min(chunk.len());
-        state.prefix.extend_from_slice(&chunk[..keep]);
-        let tail_limit = limit - head_limit;
-        let tail = &chunk[keep..];
-        if tail.len() >= tail_limit {
+        if chunk.len() >= limit {
             state.tail.clear();
-            state.tail.extend(&tail[tail.len() - tail_limit..]);
+            state.tail.extend(&chunk[chunk.len() - limit..]);
         } else {
-            let discard = (state.tail.len() + tail.len()).saturating_sub(tail_limit);
+            let discard = (state.tail.len() + chunk.len()).saturating_sub(limit);
             state.tail.drain(..discard);
-            state.tail.extend(tail);
+            state.tail.extend(chunk);
         }
-        state.truncated = state.bytes > limit as u64;
     }
     if ended {
         state.lock().unwrap().complete = true;
@@ -1075,8 +1051,7 @@ fn with_output_flags(
 
 fn take_capture(state: &StreamHandle) -> (Vec<u8>, u64) {
     let mut state = state.lock().unwrap();
-    let mut bytes = std::mem::take(&mut state.prefix);
-    bytes.extend(state.tail.drain(..));
+    let bytes = Vec::from(std::mem::take(&mut state.tail));
     let omitted = state.bytes - bytes.len() as u64;
     (bytes, omitted)
 }

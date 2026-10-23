@@ -6,22 +6,20 @@ use minicore_runtime::tools::{
     Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput,
     ToolSpec,
 };
-use minicore_runtime::value::MAX_TEXT_BYTES;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
-use crate::workspace::ReadPrefix;
 use crate::{Workspace, WorkspaceError};
 
+use super::truncate::format_size;
 use super::{
-    DEFAULT_READ_LIMIT, DEFAULT_READ_OFFSET, MAX_DIRECTORY_ENTRIES, MAX_READ_BYTES, MAX_READ_LINES,
-    emit_phase, map_workspace_error, run_controlled,
+    DEFAULT_READ_LIMIT, DEFAULT_READ_OFFSET, MAX_DIRECTORY_ENTRIES, MAX_OUTPUT_BYTES,
+    MAX_READ_LINES, emit_phase, map_workspace_error, run_controlled,
 };
 
 const TOOL_NAME: &str = "read";
-const TRUNCATED: &str = "[truncated]";
-const OUTPUT_CONTENT_BUDGET: usize = MAX_TEXT_BYTES - TRUNCATED.len() - 1;
+const BINARY: &str = "Cannot read binary or non-UTF-8 content as text.";
 
 pub(super) struct ReadTool {
     workspace: Arc<Workspace>,
@@ -42,7 +40,9 @@ impl ReadTool {
     pub(super) fn new(workspace: Arc<Workspace>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("read is a valid tool name"),
-            "Read a UTF-8 text file with numbered lines or list one workspace directory level.",
+            "Read a UTF-8 text file with numbered lines or list one workspace directory level. \
+             Output is cut to 2000 lines or 50KB, whichever is hit first; a notice then gives \
+             the offset to continue from.",
             json!({
                 "type": "object",
                 "properties": {
@@ -61,7 +61,7 @@ impl ReadTool {
                         "minimum": 1,
                         "maximum": MAX_READ_LINES,
                         "default": DEFAULT_READ_LIMIT,
-                        "description": "Maximum file lines to return."
+                        "description": "Maximum file lines to return (the 50KB output limit may cut sooner)."
                     }
                 },
                 "required": ["path"],
@@ -155,15 +155,25 @@ async fn list_directory(directory: PathBuf) -> Result<String, ToolError> {
         return Ok("[empty directory]".to_owned());
     }
     let mut output = String::new();
-    let mut truncated = count > MAX_DIRECTORY_ENTRIES;
-    for entry in entries {
-        if !push_bounded_line(&mut output, &entry) {
-            truncated = true;
+    let mut shown = 0;
+    for entry in &entries {
+        let separator = usize::from(shown > 0);
+        if output.len() + separator + entry.len() > MAX_OUTPUT_BYTES {
             break;
         }
+        if shown > 0 {
+            output.push('\n');
+        }
+        output.push_str(entry);
+        shown += 1;
     }
-    if truncated {
-        append_truncated(&mut output);
+    if shown < count {
+        let limit = if shown < entries.len() {
+            format!(" ({} limit)", format_size(MAX_OUTPUT_BYTES))
+        } else {
+            String::new()
+        };
+        output.push_str(&format!("\n\n[Showing {shown} of {count} entries{limit}.]"));
     }
     Ok(output)
 }
@@ -192,40 +202,41 @@ async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, T
         }
         reader.consume(consumed);
     }
+    // Rendered lines are never shorter than their source, so no more than the
+    // output budget can be shown; one extra byte tells whether the file goes on.
     let mut bytes = Vec::new();
-    reader
-        .take((MAX_READ_BYTES + 4) as u64)
+    (&mut reader)
+        .take(MAX_OUTPUT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| ToolError::Failed)?;
-    let prefix = ReadPrefix {
-        visible_len: bytes.len().min(MAX_READ_BYTES),
-        has_more: bytes.len() > MAX_READ_BYTES,
-        bytes,
+    let more = bytes.len() > MAX_OUTPUT_BYTES;
+    // Only whole lines are shown, so a read cut mid-line drops the partial one.
+    let rest = if more {
+        bytes.split_off(
+            bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |at| at + 1),
+        )
+    } else {
+        Vec::new()
     };
-    let byte_truncated = prefix.has_more;
-    let text = match decode_text_prefix(prefix) {
-        Ok(text) if !text.contains('\0') => text,
-        _ => return Ok("Cannot read binary or non-UTF-8 content as text.".to_owned()),
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) if !text.contains('\0') => text.replace("\r\n", "\n"),
+        _ => return Ok(BINARY.to_owned()),
     };
-    if text.is_empty() {
-        let mut output = "[empty file]".to_owned();
-        if byte_truncated {
-            append_truncated(&mut output);
-        }
-        return Ok(output);
+    if text.is_empty() && !more {
+        return Ok("[empty file]".to_owned());
     }
 
-    let mut lines = text.split_terminator('\n').enumerate();
+    let mut lines = text.split_terminator('\n').peekable();
     let mut output = String::new();
-    let mut selected = 0usize;
-    let mut output_truncated = false;
-    while selected < input.limit {
-        let Some((index, line)) = lines.next() else {
-            break;
-        };
-        selected += 1;
-        let mut rendered = format!("{}: ", index + input.offset);
+    let mut shown = 0;
+    while shown < input.limit
+        && let Some(line) = lines.peek()
+    {
+        let mut rendered = format!("{}: ", input.offset + shown);
         for character in line.chars() {
             if character.is_control() && character != '\t' {
                 rendered.extend(character.escape_default());
@@ -233,84 +244,67 @@ async fn read_file(workspace: &Workspace, input: &ReadInput) -> Result<String, T
                 rendered.push(character);
             }
         }
-        if !push_bounded_line(&mut output, &rendered) {
-            output_truncated = true;
+        let separator = usize::from(shown > 0);
+        if output.len() + separator + rendered.len() > MAX_OUTPUT_BYTES {
             break;
         }
+        if shown > 0 {
+            output.push('\n');
+        }
+        output.push_str(&rendered);
+        lines.next();
+        shown += 1;
     }
-    let line_truncated = lines.next().is_some();
-    let truncated = byte_truncated || line_truncated || output_truncated;
-    if output.is_empty() {
-        output = format!("[no lines at or after offset {}]", input.offset);
+    if shown == 0 {
+        let path = input.path.replace('\'', "'\\''");
+        return Ok(format!(
+            "[Line {} exceeds the {} limit. Use bash: sed -n '{}p' '{path}' | head -c {MAX_OUTPUT_BYTES}]",
+            input.offset,
+            format_size(MAX_OUTPUT_BYTES),
+            input.offset,
+        ));
     }
-    if truncated {
-        append_truncated(&mut output);
+    let after = lines.count()
+        + if more {
+            count_lines(&rest, &mut reader).await?
+        } else {
+            0
+        };
+    if after > 0 {
+        let end = input.offset + shown - 1;
+        let total = end + after;
+        let limit = if shown < input.limit {
+            format!(" ({} limit)", format_size(MAX_OUTPUT_BYTES))
+        } else {
+            String::new()
+        };
+        output.push_str(&format!(
+            "\n\n[Showing lines {}-{end} of {total}{limit}. Use offset={} to continue.]",
+            input.offset,
+            end + 1
+        ));
     }
     Ok(output)
 }
 
-fn decode_text_prefix(prefix: ReadPrefix) -> Result<String, ToolError> {
-    let visible = &prefix.bytes[..prefix.visible_len];
-    let visible_end = match std::str::from_utf8(visible) {
-        Ok(_) => prefix.visible_len,
-        Err(error) if error.error_len().is_none() => {
-            let start = error.valid_up_to();
-            let width = prefix
-                .bytes
-                .get(start)
-                .copied()
-                .and_then(utf8_sequence_width)
-                .ok_or(ToolError::Failed)?;
-            let end = start.checked_add(width).ok_or(ToolError::Failed)?;
-            if end > prefix.bytes.len()
-                || end <= prefix.visible_len
-                || std::str::from_utf8(&prefix.bytes[start..end]).is_err()
-            {
-                return Err(ToolError::Failed);
-            }
-            start
-        }
-        Err(_) => return Err(ToolError::Failed),
-    };
-
-    let mut text = std::str::from_utf8(&prefix.bytes[..visible_end])
-        .map_err(|_| ToolError::Failed)?
-        .replace("\r\n", "\n");
-    if text.ends_with('\r') && prefix.bytes.get(visible_end) == Some(&b'\n') {
-        text.pop();
+/// Counts the lines of `head` followed by the rest of the file.
+async fn count_lines(
+    head: &[u8],
+    reader: &mut BufReader<impl AsyncRead + Unpin>,
+) -> Result<usize, ToolError> {
+    let mut lines = head.iter().filter(|byte| **byte == b'\n').count();
+    let mut last = head.last().copied();
+    loop {
+        let chunk = reader.fill_buf().await.map_err(|_| ToolError::Failed)?;
+        let Some(&end) = chunk.last() else {
+            break;
+        };
+        lines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        last = Some(end);
+        let consumed = chunk.len();
+        reader.consume(consumed);
     }
-    Ok(text)
-}
-
-fn utf8_sequence_width(first: u8) -> Option<usize> {
-    match first {
-        0xc2..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf4 => Some(4),
-        _ => None,
-    }
-}
-
-fn push_bounded_line(output: &mut String, line: &str) -> bool {
-    let separator = usize::from(!output.is_empty());
-    let available = OUTPUT_CONTENT_BUDGET.saturating_sub(output.len() + separator);
-    if !output.is_empty() && available > 0 {
-        output.push('\n');
-    }
-    if line.len() <= available {
-        output.push_str(line);
-        return true;
-    }
-    let end = line.floor_char_boundary(available);
-    output.push_str(&line[..end]);
-    false
-}
-
-fn append_truncated(output: &mut String) {
-    if !output.is_empty() {
-        output.push('\n');
-    }
-    output.push_str(TRUNCATED);
+    Ok(lines + usize::from(last.is_some_and(|byte| byte != b'\n')))
 }
 
 const fn default_offset() -> usize {

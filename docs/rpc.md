@@ -800,6 +800,32 @@ an old Profile, `session.json`, or `history.jsonl` on its own. The current Agent
 has no executable delegated child-session Tool; `subagent` remains unsupported
 in current Profiles.
 
+Model-facing output of `read` and `bash` is limited to 2000 lines or 50 KiB,
+whichever is hit first, like pi. `read` returns numbered lines from `offset`
+(default 1) and `limit` (default and maximum 2000), always whole lines. When more
+of the file remains, it ends with
+`[Showing lines X-Y of N. Use offset=K to continue.]`, or
+`[Showing lines X-Y of N (50KB limit). Use offset=K to continue.]` when the byte
+limit came first. A first line over the byte limit gives
+`[Line N exceeds the 50KB limit. Use bash: sed -n 'Np' 'path' | head -c 51200]`
+instead of content. A directory listing is cut the same way and ends with
+`[Showing K of N entries.]` or `[Showing K of N entries (50KB limit).]`.
+
+`bash` keeps the end of each stream, with the `exit_code:`, `stdout:` and
+`stderr:` layout unchanged. The two streams share the limits: a stream that needs
+less than half keeps all of it and the other may use the rest. A cut stream ends
+with `[Showing lines X-Y of N. Full output: <path>]`, with ` (50KB limit)` after
+`N` when the byte limit came first, or, for one last line over the byte limit,
+`[Showing last 50KB of line N (line is S). Full output: <path>]`. The path is a
+new `minicore-bash-*` file in the OS temp directory (mode 0600 on Unix) that holds
+the captured bytes of that stream; the Agent does not delete it. The capture
+keeps the last 1 MiB of each stream. When more was printed, the notice says
+`Output beyond the last 1MB was not captured. Captured output: <path>`, and `N`
+counts the lines of that file. If the file cannot be written, the notice names no
+path. A command whose output was cut short by a stopped descendant or a bounded
+drain adds `[output may be incomplete]` to each stream. The tool record
+(`tool.output`, `stdout.bin`) is not affected by these limits.
+
 `apply_patch` changes one existing workspace file using unified diff or a Codex
 `*** Update File` envelope. Unified diffs may have `diff --git` and `index` lines
 before their `---`/`+++` headers. Trailing empty lines are accepted after the patch;
@@ -1233,9 +1259,8 @@ user.
 byte offset inside that line and defaults to `0`; it must be sent together with
 `start_line`, fall inside the line, land on a character boundary, and not
 exceed the 512 KiB whole-file bound. It exists to continue a line that a
-previous page cut. `max_lines` accepts `1..=2000` and defaults to `400`,
-matching the read Tool's line window. `max_bytes` is an
-encoded result budget like `session.read`'s: it accepts `1024..=262144`,
+previous page cut. `max_lines` accepts `1..=2000` and defaults to `400`.
+`max_bytes` is an encoded result budget like `session.read`'s: it accepts `1024..=262144`,
 defaults to 64 KiB, and covers this result's metadata and JSON escaping rather
 than the content length. A value outside these ranges, an offset outside the
 requested line, or a budget that cannot hold the metadata envelope plus one
@@ -1260,7 +1285,8 @@ character is rejected with `-32602`; the budget is never silently raised.
 
 One RPC read captures a bounded whole file (512 KiB), with metadata before and
 after. Unlike this RPC, the numbered `read` Tool streams past the requested line
-offset and returns a bounded window, so it can read later portions of large files.
+offset and returns at most 2000 lines or 50 KiB, so it can read later portions of
+large files.
 The Tool normalizes CRLF to LF and escapes control characters (except tabs);
 `edit` translates LF multiline inputs back to CRLF when editing a CRLF file.
 Binary/non-UTF-8 Tool reads and non-unique edits return explanatory text. Directory

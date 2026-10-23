@@ -198,7 +198,6 @@ async fn bounded_reads_reject_large_and_binary_text() {
         Err(WorkspaceError::TooLarge)
     );
     let prefix = workspace.read_prefix("lookahead.txt", 4).await.unwrap();
-    assert_eq!(prefix.visible_len, 4);
     assert!(prefix.has_more);
     assert_eq!(prefix.bytes, b"12345678");
     assert_eq!(

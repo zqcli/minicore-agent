@@ -8,12 +8,7 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 fn prefix(bytes: Vec<u8>, has_more: bool) -> ReadPrefix {
-    let visible_len = bytes.len().min(MAX_AGENTS_BYTES);
-    ReadPrefix {
-        bytes,
-        visible_len,
-        has_more,
-    }
+    ReadPrefix { bytes, has_more }
 }
 
 #[test]

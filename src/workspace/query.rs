@@ -19,13 +19,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
 use crate::ids::SessionId;
-use crate::tools::{DEFAULT_READ_LIMIT, MAX_READ_BYTES, MAX_READ_LINES};
+use crate::tools::{MAX_READ_BYTES, MAX_READ_LINES};
 use crate::workspace::Workspace;
 
 /// Wall-clock budget for one workspace read, matching the other read queries.
 pub(crate) const WORKSPACE_READ_DEADLINE: Duration = Duration::from_secs(10);
-/// Same line window as the read Tool.
-const DEFAULT_MAX_LINES: u32 = DEFAULT_READ_LIMIT as u32;
+const DEFAULT_MAX_LINES: u32 = 400;
 const MAX_MAX_LINES: u32 = MAX_READ_LINES as u32;
 /// One bounded read of a workspace file.
 ///

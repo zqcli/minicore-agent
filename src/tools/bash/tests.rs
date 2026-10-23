@@ -15,47 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 
-#[test]
-fn omission_counts_raw_bytes_even_when_invalid_utf8_expands() {
-    let capture = StreamCapture {
-        bytes: vec![0xff; 100],
-        truncated: false,
-        omitted: 0,
-    };
-    let output = format_stream(&capture, TRUNCATION_OVERHEAD + 12);
-    assert!(output.contains("96 bytes omitted"));
-    assert_eq!(output.matches('\u{fffd}').count(), 4);
-}
-
-#[test]
-fn model_output_shares_the_budget_and_keeps_head_and_tail() {
-    let empty = StreamCapture {
-        bytes: Vec::new(),
-        truncated: false,
-        omitted: 0,
-    };
-    let small = StreamCapture {
-        bytes: vec![b'x'; FORMATTED_OUTPUT_LIMIT * 3 / 4],
-        truncated: false,
-        omitted: 0,
-    };
-    let output = format_output(Some(0), &small, &empty);
-    assert!(!output.contains(TRUNCATED));
-    assert_eq!(
-        output.bytes().filter(|byte| *byte == b'x').count(),
-        small.bytes.len() + 1
-    );
-    let large = StreamCapture {
-        bytes: format!("HEAD{}TAIL", "x".repeat(FORMATTED_OUTPUT_LIMIT * 2)).into_bytes(),
-        truncated: false,
-        omitted: 0,
-    };
-    let output = format_output(Some(0), &large, &empty);
-    assert!(output.contains("HEAD"));
-    assert!(output.contains("TAIL"));
-    assert!(output.contains("bytes omitted"));
-    assert!(output.len() <= FORMATTED_OUTPUT_LIMIT);
-}
 #[cfg(unix)]
 use crate::tools::command::tests::TerminationFailure;
 
@@ -413,9 +372,157 @@ async fn simultaneous_large_streams_are_drained_bounded_and_marked() {
     .unwrap();
     assert!(output.starts_with("exit_code: 0\nstdout:\n"));
     assert!(output.contains("\nstderr:\n"));
-    assert_eq!(output.matches(TRUNCATED).count(), 2);
-    assert!(output.len() <= MAX_COMMAND_OUTPUT);
-    assert!(output.len() <= MAX_TEXT_BYTES);
+    // 70000 lines of 15 bytes are just over the 1 MiB each stream captures.
+    let notices = notices(&output);
+    assert_eq!(notices.len(), 2);
+    for (notice, last) in notices.iter().zip(["stdout-00069999", "stderr-00069999"]) {
+        assert!(notice.contains("Output beyond the last 1MB was not captured. Captured output: "));
+        let saved = std::fs::read(saved_path(notice)).unwrap();
+        assert_eq!(saved.len(), MAX_COMMAND_OUTPUT);
+        assert!(saved.ends_with(format!("{last}\n").as_bytes()));
+        std::fs::remove_file(saved_path(notice)).unwrap();
+    }
+    assert!(output.len() < MAX_OUTPUT_BYTES + 1024);
+    cleanup(&base).await;
+}
+
+/// The `[Showing ...]` notices of a Bash result, in order.
+#[cfg(unix)]
+fn notices(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("[Showing "))
+        .collect()
+}
+
+/// The saved-output path a notice names, checked against the naming rules.
+#[cfg(unix)]
+fn saved_path(notice: &str) -> PathBuf {
+    let path = PathBuf::from(notice.rsplit_once(": ").unwrap().1.trim_end_matches(']'));
+    assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+    assert!(
+        path.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("minicore-bash-")
+    );
+    path
+}
+
+#[cfg(unix)]
+const COUNT_TO_3000: &str = "i=1; while [ $i -le 3000 ]; do echo $i; i=$((i+1)); done";
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_over_2000_lines_keeps_the_tail_and_saves_everything() {
+    let (base, _, tool) = fixture("line-cap").await;
+    let output = execute(
+        &tool,
+        json!({"command": COUNT_TO_3000, "timeout_seconds": 30}),
+    )
+    .await
+    .unwrap();
+    let notices = notices(&output);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].starts_with("[Showing lines 1001-3000 of 3000. Full output: "));
+    assert!(output.starts_with("exit_code: 0\nstdout:\n1001\n1002\n"));
+    assert!(output.contains("\n3000\n\n[Showing"));
+    assert!(output.ends_with("]\nstderr:\n"));
+    let path = saved_path(notices[0]);
+    let expected: String = (1..=3000).map(|line| format!("{line}\n")).collect();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    std::fs::remove_file(path).unwrap();
+    cleanup(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_over_50_kib_keeps_the_last_whole_lines() {
+    let (base, _, tool) = fixture("byte-cap").await;
+    // 1000 lines of exactly 100 bytes: 512 of them fit in 50 KiB.
+    let command = "i=1; while [ $i -le 1000 ]; do printf '%099d\\n' $i; i=$((i+1)); done";
+    let output = execute(&tool, json!({"command": command, "timeout_seconds": 30}))
+        .await
+        .unwrap();
+    let notices = notices(&output);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].starts_with("[Showing lines 489-1000 of 1000 (50KB limit). Full output: "));
+    assert!(output.contains(&format!("stdout:\n{:099}\n", 489)));
+    assert!(!output.contains(&format!("{:099}", 488)));
+    assert_eq!(
+        std::fs::read(saved_path(notices[0])).unwrap().len(),
+        100_000
+    );
+    std::fs::remove_file(saved_path(notices[0])).unwrap();
+    cleanup(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn one_over_long_last_line_keeps_its_end() {
+    let (base, _, tool) = fixture("long-line").await;
+    let output = execute(
+        &tool,
+        json!({"command": "head -c 60000 /dev/zero | tr '\\0' x"}),
+    )
+    .await
+    .unwrap();
+    let notices = notices(&output);
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].starts_with("[Showing last 50KB of line 1 (line is 58.6KB). Full output: "));
+    assert!(output.contains(&"x".repeat(MAX_OUTPUT_BYTES)));
+    assert!(!output.contains(&"x".repeat(MAX_OUTPUT_BYTES + 1)));
+    assert_eq!(std::fs::read(saved_path(notices[0])).unwrap().len(), 60_000);
+    std::fs::remove_file(saved_path(notices[0])).unwrap();
+    cleanup(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdout_and_stderr_share_the_limit_and_are_saved_separately() {
+    let (base, _, tool) = fixture("shared").await;
+    let command = "i=1; while [ $i -le 1500 ]; do echo out$i; echo err$i >&2; i=$((i+1)); done";
+    let output = execute(&tool, json!({"command": command, "timeout_seconds": 30}))
+        .await
+        .unwrap();
+    let notices = notices(&output);
+    assert_eq!(notices.len(), 2);
+    assert!(notices[0].starts_with("[Showing lines 501-1500 of 1500. Full output: "));
+    assert!(notices[1].starts_with("[Showing lines 501-1500 of 1500. Full output: "));
+    let (stdout_path, stderr_path) = (saved_path(notices[0]), saved_path(notices[1]));
+    assert_ne!(stdout_path, stderr_path);
+    assert!(
+        std::fs::read_to_string(&stdout_path)
+            .unwrap()
+            .starts_with("out1\nout2\n")
+    );
+    assert!(
+        std::fs::read_to_string(&stderr_path)
+            .unwrap()
+            .starts_with("err1\nerr2\n")
+    );
+    std::fs::remove_file(stdout_path).unwrap();
+    std::fs::remove_file(stderr_path).unwrap();
+    cleanup(&base).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_within_the_limits_has_no_notice() {
+    let (base, _, tool) = fixture("within").await;
+    let command = "i=1; while [ $i -le 2000 ]; do echo $i; i=$((i+1)); done";
+    let output = execute(&tool, json!({"command": command, "timeout_seconds": 30}))
+        .await
+        .unwrap();
+    assert!(output.starts_with("exit_code: 0\nstdout:\n1\n2\n"));
+    assert!(output.ends_with("\n2000\nstderr:\n"));
+    assert!(!output.contains("[Showing"));
     cleanup(&base).await;
 }
 
@@ -792,7 +899,7 @@ async fn assert_grandchild_held_pipe_drain_is_bounded(
             // The leader really exited; only its descendant's output is
             // missing, so the result is completed and explicitly truncated.
             assert!(output.content().as_str().starts_with("exit_code: 0\n"));
-            assert!(output.content().as_str().contains(TRUNCATED));
+            assert!(output.content().as_str().contains(INCOMPLETE));
         }
         Ok(ToolExecutionOutcome::RequestInput(_)) => {
             panic!("bash must not request input")
@@ -1061,6 +1168,59 @@ async fn execute_bound_records_under_the_captured_identity() {
     );
     let owned = sink.first_owned();
     assert_eq!(owned.as_ref(), Some(&tool_ref));
+    owners.join_all().await;
+    cleanup(&base).await;
+}
+
+/// The cut applies to the model-facing text only: the tool record, which the
+/// session stores as `stdout.bin`, keeps everything the command printed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cut_result_leaves_the_tool_record_with_the_full_output() {
+    let (base, workspace, _) = fixture("record-full").await;
+    let owners = crate::tools::command::ToolOwners::new();
+    let data = Arc::new(crate::tool_data::ToolData::new());
+    let sink = IdentitySink::new(Arc::clone(&data));
+    let streams: Arc<dyn crate::tools::command::CommandStreamSink> =
+        Arc::clone(&sink) as Arc<dyn crate::tools::command::CommandStreamSink>;
+    let binding = crate::tools::command::CommandBinding::new(Arc::clone(&owners), streams);
+    let bound = BashTool::with_binding(workspace, empty_command_environment(), Some(binding));
+    let tool_ref = crate::tool_data::ToolRef {
+        session_id: crate::ids::SessionId::new().unwrap(),
+        loop_id: minicore_runtime::LoopId::new().unwrap(),
+        request_index: 1,
+        tool_call_id: ToolCallId::new("record-full-call").unwrap(),
+    };
+    data.note_requested(&tool_ref, "bash");
+    let Ok(ToolExecutionOutcome::Completed(output)) = bound
+        .execute_bound(
+            invocation(json!({"command": COUNT_TO_3000, "timeout_seconds": 30})),
+            context(
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(30),
+            ),
+            Some(tool_ref.clone()),
+        )
+        .await
+    else {
+        panic!("bash must complete");
+    };
+    let notices = notices(output.content().as_str());
+    assert_eq!(notices.len(), 1);
+    std::fs::remove_file(saved_path(notices[0])).unwrap();
+    data.finish_and_snapshot(
+        &tool_ref,
+        minicore_runtime::tools::ToolResultOutcome::Success,
+    )
+    .unwrap();
+    let expected: String = (1..=3000).map(|line| format!("{line}\n")).collect();
+    assert_eq!(
+        data.snapshot_for_persistence(&tool_ref)
+            .unwrap()
+            .stdout_bytes
+            .as_deref(),
+        Some(expected.as_bytes())
+    );
     owners.join_all().await;
     cleanup(&base).await;
 }

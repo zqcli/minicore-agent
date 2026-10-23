@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::tools::IO_GATES;
+use crate::tools::{IO_GATES, MAX_READ_BYTES};
 
 async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, ReadTool) {
     let base = std::env::temp_dir().join(format!(
@@ -83,7 +83,7 @@ async fn schema_is_strict_and_file_lines_support_defaults_offset_and_limit() {
         execute(&tool, json!({"path": "lines.txt", "offset": 2, "limit": 1}))
             .await
             .unwrap(),
-        "2: beta\n[truncated]"
+        "2: beta\n\n[Showing lines 2-2 of 3. Use offset=3 to continue.]"
     );
     assert_eq!(
         execute(&tool, json!({"path": "empty.txt"})).await.unwrap(),
@@ -128,72 +128,152 @@ async fn schema_is_strict_and_file_lines_support_defaults_offset_and_limit() {
 }
 
 #[tokio::test]
-async fn file_reads_enforce_line_and_byte_truncation_with_utf8_boundaries() {
-    let (base, _, tool) = fixture("truncation").await;
-    let root = base.join("root");
+async fn a_limit_below_the_file_length_names_the_next_offset() {
+    let (base, _, tool) = fixture("limit").await;
     let lines = (1..=5)
         .map(|line| format!("line-{line}"))
         .collect::<Vec<_>>()
         .join("\n");
-    tokio::fs::write(root.join("many.txt"), lines)
+    tokio::fs::write(base.join("root/many.txt"), lines)
         .await
         .unwrap();
     assert_eq!(
         execute(&tool, json!({"path": "many.txt", "limit": 2}))
             .await
             .unwrap(),
-        "1: line-1\n2: line-2\n[truncated]"
+        "1: line-1\n2: line-2\n\n[Showing lines 1-2 of 5. Use offset=3 to continue.]"
     );
-
-    let mut long = vec![b'a'; MAX_READ_BYTES - 1];
-    long.extend_from_slice("€".as_bytes());
-    tokio::fs::write(root.join("boundary.txt"), long)
-        .await
-        .unwrap();
-    let output = execute(&tool, json!({"path": "boundary.txt"}))
-        .await
-        .unwrap();
-    assert!(output.ends_with(TRUNCATED));
-    assert!(output.len() <= MAX_TEXT_BYTES);
+    assert_eq!(
+        execute(&tool, json!({"path": "many.txt", "offset": 4, "limit": 2}))
+            .await
+            .unwrap(),
+        "4: line-4\n5: line-5"
+    );
     cleanup(&base).await;
 }
 
 #[tokio::test]
-async fn byte_cap_lookahead_validates_utf8_crlf_and_true_eof() {
-    let (base, _, tool) = fixture("lookahead").await;
+async fn a_file_longer_than_2000_lines_is_cut_with_the_next_offset() {
+    let (base, _, tool) = fixture("line-cap").await;
     let root = base.join("root");
+    tokio::fs::write(root.join("long.txt"), "x\n".repeat(2500))
+        .await
+        .unwrap();
+    let output = execute(&tool, json!({"path": "long.txt"})).await.unwrap();
+    assert!(output.contains("\n2000: x\n\n"));
+    assert!(!output.contains("2001: x"));
+    assert!(output.ends_with("\n\n[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]"));
+    assert_eq!(
+        execute(&tool, json!({"path": "long.txt", "offset": 2001}))
+            .await
+            .unwrap()
+            .lines()
+            .count(),
+        500
+    );
+    cleanup(&base).await;
+}
 
-    for (name, character) in [("two", "¢"), ("three", "€"), ("four", "😀")] {
-        let encoded = character.as_bytes();
-        let mut content = vec![b'a'; MAX_READ_BYTES - (encoded.len() - 1)];
-        content.extend_from_slice(encoded);
-        tokio::fs::write(root.join(name), content).await.unwrap();
-        let output = execute(&tool, json!({"path": name})).await.unwrap();
-        assert!(output.ends_with(TRUNCATED));
-        assert!(!output.contains('�'));
-    }
+#[tokio::test]
+async fn a_file_larger_than_50_kib_is_cut_at_a_line_with_the_next_offset() {
+    let (base, _, tool) = fixture("byte-cap").await;
+    let root = base.join("root");
+    // 1000 lines of 100 bytes, the last one without a newline.
+    let text = (1..=1000)
+        .map(|line| format!("{line:0>99}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tokio::fs::write(root.join("wide.txt"), text).await.unwrap();
+    let output = execute(&tool, json!({"path": "wide.txt"})).await.unwrap();
+    let (body, notice) = output.split_once("\n\n[").unwrap();
+    assert!(body.len() <= MAX_OUTPUT_BYTES);
+    let shown = body.lines().count();
+    assert!(shown < 2000 && shown > 400);
+    assert_eq!(
+        notice,
+        format!(
+            "Showing lines 1-{shown} of 1000 (50KB limit). Use offset={} to continue.]",
+            shown + 1
+        )
+    );
+    let next = execute(&tool, json!({"path": "wide.txt", "offset": shown + 1}))
+        .await
+        .unwrap();
+    assert!(next.starts_with(&format!("{}: ", shown + 1)));
+    cleanup(&base).await;
+}
 
-    let mut invalid = vec![b'a'; MAX_READ_BYTES - 1];
-    invalid.extend_from_slice(&[0xe2, b'X']);
-    tokio::fs::write(root.join("invalid-continuation"), invalid)
+#[tokio::test]
+async fn a_character_split_at_the_byte_cut_is_never_shown_half() {
+    let (base, _, tool) = fixture("utf8-cut").await;
+    let root = base.join("root");
+    let line = "€".repeat(10_000);
+    tokio::fs::write(root.join("euro.txt"), format!("{line}\r\n{line}\r\n"))
+        .await
+        .unwrap();
+    let output = execute(&tool, json!({"path": "euro.txt"})).await.unwrap();
+    assert_eq!(
+        output,
+        format!("1: {line}\n\n[Showing lines 1-1 of 2 (50KB limit). Use offset=2 to continue.]")
+    );
+    cleanup(&base).await;
+}
+
+#[tokio::test]
+async fn a_first_line_over_the_limit_points_to_bash() {
+    let (base, _, tool) = fixture("long-line").await;
+    let root = base.join("root");
+    tokio::fs::write(
+        root.join("it's.txt"),
+        format!("short\n{}\nafter\n", "a".repeat(60_000)),
+    )
+    .await
+    .unwrap();
+    let hint =
+        "[Line 2 exceeds the 50KB limit. Use bash: sed -n '2p' 'it'\\''s.txt' | head -c 51200]";
+    assert_eq!(
+        execute(&tool, json!({"path": "it's.txt", "offset": 2}))
+            .await
+            .unwrap(),
+        hint
+    );
+    tokio::fs::write(root.join("one.txt"), "b".repeat(MAX_OUTPUT_BYTES + 5))
         .await
         .unwrap();
     assert_eq!(
-        execute(&tool, json!({"path": "invalid-continuation"}))
+        execute(&tool, json!({"path": "one.txt"})).await.unwrap(),
+        "[Line 1 exceeds the 50KB limit. Use bash: sed -n '1p' 'one.txt' | head -c 51200]"
+    );
+    assert_eq!(
+        execute(&tool, json!({"path": "it's.txt", "offset": 3}))
             .await
             .unwrap(),
-        "Cannot read binary or non-UTF-8 content as text."
+        "3: after"
     );
+    cleanup(&base).await;
+}
 
-    let mut crlf = vec![b'a'; MAX_READ_BYTES - 1];
-    crlf.extend_from_slice(b"\r\nmore");
-    tokio::fs::write(root.join("crlf-split"), crlf)
+#[tokio::test]
+async fn a_read_that_cuts_nothing_has_no_notice() {
+    let (base, _, tool) = fixture("no-notice").await;
+    let root = base.join("root");
+    tokio::fs::write(root.join("exact.txt"), "x\n".repeat(2000))
         .await
         .unwrap();
-    let output = execute(&tool, json!({"path": "crlf-split"})).await.unwrap();
-    assert!(output.ends_with(TRUNCATED));
-    assert!(!output.contains('\r'));
+    let output = execute(&tool, json!({"path": "exact.txt"})).await.unwrap();
+    assert!(output.ends_with("\n2000: x"));
+    // Just under the byte limit, with a CRLF that is normalized.
+    let text = format!("{}\r\n", "y".repeat(MAX_OUTPUT_BYTES - 4));
+    tokio::fs::write(root.join("fits.txt"), text).await.unwrap();
+    let output = execute(&tool, json!({"path": "fits.txt"})).await.unwrap();
+    assert_eq!(output, format!("1: {}", "y".repeat(MAX_OUTPUT_BYTES - 4)));
+    cleanup(&base).await;
+}
 
+#[tokio::test]
+async fn binary_and_incomplete_utf8_are_explained() {
+    let (base, _, tool) = fixture("invalid").await;
+    let root = base.join("root");
     tokio::fs::write(root.join("eof-incomplete"), b"text\xe2\x82")
         .await
         .unwrap();
@@ -201,9 +281,8 @@ async fn byte_cap_lookahead_validates_utf8_crlf_and_true_eof() {
         execute(&tool, json!({"path": "eof-incomplete"}))
             .await
             .unwrap(),
-        "Cannot read binary or non-UTF-8 content as text."
+        BINARY
     );
-
     tokio::fs::write(root.join("bare-cr"), b"before\rafter")
         .await
         .unwrap();
@@ -230,36 +309,6 @@ async fn read_streams_to_lines_beyond_the_window_and_escapes_controls() {
         .unwrap();
     assert_eq!(output, format!("{offset}: late\\u{{c}}\\u{{1b}}\\rend"));
     cleanup(&base).await;
-}
-
-#[test]
-fn decoder_excludes_lookahead_and_strips_split_crlf() {
-    for (bytes, visible_len, expected) in [
-        (b"aaa\xc2\xa2".as_slice(), 4, "aaa"),
-        (b"aa\xe2\x82\xac".as_slice(), 4, "aa"),
-        (b"a\xf0\x9f\x98\x80".as_slice(), 4, "a"),
-        (b"abc\r\n".as_slice(), 4, "abc"),
-    ] {
-        assert_eq!(
-            decode_text_prefix(ReadPrefix {
-                bytes: bytes.to_vec(),
-                visible_len,
-                has_more: true,
-            })
-            .unwrap(),
-            expected
-        );
-    }
-    for bytes in [b"abc\xe2X".as_slice(), b"abc\xe2".as_slice()] {
-        assert_eq!(
-            decode_text_prefix(ReadPrefix {
-                bytes: bytes.to_vec(),
-                visible_len: 4,
-                has_more: bytes.len() > 4,
-            }),
-            Err(ToolError::Failed)
-        );
-    }
 }
 
 #[tokio::test]
@@ -324,9 +373,27 @@ async fn directory_listing_is_sorted_marks_directories_and_truncates_at_1000() {
             .unwrap();
     }
     let output = execute(&tool, json!({"path": "large"})).await.unwrap();
-    assert!(output.ends_with(TRUNCATED));
-    assert_eq!(output.lines().count(), MAX_DIRECTORY_ENTRIES + 1);
+    assert!(output.ends_with("\n\n[Showing 1000 of 1001 entries.]"));
+    assert_eq!(output.lines().count(), MAX_DIRECTORY_ENTRIES + 2);
     assert!(output.starts_with("entry-0000\nentry-0001"));
+
+    let wide = root.join("wide");
+    tokio::fs::create_dir(&wide).await.unwrap();
+    for index in 0..600 {
+        tokio::fs::write(wide.join(format!("{index:0>100}")), b"")
+            .await
+            .unwrap();
+    }
+    let output = execute(&tool, json!({"path": "wide"})).await.unwrap();
+    let (body, notice) = output.split_once("\n\n[").unwrap();
+    assert!(body.len() <= MAX_OUTPUT_BYTES);
+    assert_eq!(
+        notice,
+        format!(
+            "Showing {} of 600 entries (50KB limit).]",
+            body.lines().count()
+        )
+    );
     cleanup(&base).await;
 }
 

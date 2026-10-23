@@ -5,6 +5,7 @@ mod edit;
 mod file_change;
 pub(crate) mod observe;
 mod read;
+mod truncate;
 mod write;
 
 use std::collections::BTreeSet;
@@ -33,12 +34,16 @@ pub(crate) use write::WriteTool as NativeWriteTool;
 pub(crate) const MAX_READ_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_WRITE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_PATCH_BYTES: usize = 512 * 1024;
+/// Bytes kept per Bash stream for the temp file of a cut result.
 pub(crate) const MAX_COMMAND_OUTPUT: usize = 1024 * 1024;
+/// Model-facing output of `bash` and `read`: whichever limit is hit first.
+pub(crate) const MAX_OUTPUT_LINES: usize = 2_000;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub(crate) const DEFAULT_COMMAND_TIMEOUT: u64 = 120;
 pub(crate) const MAX_COMMAND_TIMEOUT: u64 = 1_800;
 pub(crate) const DEFAULT_READ_OFFSET: usize = 1;
-pub(crate) const DEFAULT_READ_LIMIT: usize = 400;
-pub(crate) const MAX_READ_LINES: usize = 2_000;
+pub(crate) const DEFAULT_READ_LIMIT: usize = 2_000;
+pub(crate) const MAX_READ_LINES: usize = MAX_OUTPUT_LINES;
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 1_000;
 pub(crate) const KNOWN_TOOL_NAMES: &[&str] = &["read", "write", "edit", "apply_patch", "bash"];
 

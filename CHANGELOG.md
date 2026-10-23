@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- `read` and `bash` cap model-facing output at 2000 lines or 50 KiB, whichever
+  comes first, like pi. `read` returns whole numbered lines (default `limit`
+  2000, was 400) and ends a cut result with
+  `[Showing lines X-Y of N. Use offset=K to continue.]`, with ` (50KB limit)` when
+  the byte limit came first; a first line over the limit gives a `sed -n` hint
+  instead. Directory listings honor the same limit. `bash` keeps the tail of
+  each stream instead of head and tail, and a cut stream ends with
+  `[Showing lines X-Y of N. Full output: <path>]`, where the path is a
+  `minicore-bash-*` file in the OS temp directory holding the captured stream
+  (the last 1 MiB). The tool record and `tool.output` are unchanged.
+  `workspace.read` keeps its default `max_lines` of 400.
+
 ## 0.7.6 — 2026-10-23
 
 Runtime stays 0.7.4.

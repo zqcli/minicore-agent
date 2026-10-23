@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,35 +7,23 @@ use minicore_runtime::tools::{
     Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolFuture, ToolInvocation, ToolOutput,
     ToolSpec,
 };
-use minicore_runtime::value::MAX_TEXT_BYTES;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::Workspace;
 use crate::tool_data::{CommandStatus, ToolRef};
 
 use super::command::{Capture, CommandBinding, CommandOutcome, CommandRequest, ToolOwners};
-use super::{DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT};
-
-/// Bounded model-facing head and tail of one stream, kept separately from the
-/// streaming window in `tool_data`.
-struct StreamCapture {
-    bytes: Vec<u8>,
-    truncated: bool,
-    omitted: u64,
-}
+use super::truncate::{Tail, format_size, share, truncate_tail};
+use super::{
+    DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT, MAX_OUTPUT_BYTES,
+    MAX_OUTPUT_LINES,
+};
 
 const TOOL_NAME: &str = "bash";
-const STREAM_CAPTURE_LIMIT: usize = FORMATTED_OUTPUT_LIMIT;
-const TRUNCATED: &str = "[truncated]";
-const TRUNCATION_OVERHEAD: usize =
-    "\n[... ".len() + 20 + " bytes omitted ...]\n\n".len() + TRUNCATED.len();
-const FORMATTED_OUTPUT_LIMIT: usize = if MAX_COMMAND_OUTPUT < MAX_TEXT_BYTES {
-    MAX_COMMAND_OUTPUT
-} else {
-    MAX_TEXT_BYTES
-};
+const INCOMPLETE: &str = "[output may be incomplete]";
 
 #[derive(Clone)]
 pub(crate) struct CommandEnvironment {
@@ -100,7 +89,10 @@ impl BashTool {
             .map_or_else(ToolOwners::new, |binding| Arc::clone(binding.owners()));
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("bash is a valid tool name"),
-            "Run one bounded shell command in a workspace directory.",
+            "Run one bounded shell command in a workspace directory. Returns the exit code, \
+             stdout and stderr. Together the streams are cut to their last 2000 lines or \
+             50KB, whichever is hit first; the full output of a cut stream is saved to a \
+             temp file named in the notice.",
             json!({
                 "type": "object",
                 "properties": {
@@ -181,7 +173,7 @@ impl BashTool {
                 deadline,
                 cancellation: context.cancellation.clone(),
                 environment: self.environment.clone(),
-                capture_limit: STREAM_CAPTURE_LIMIT,
+                capture_limit: MAX_COMMAND_OUTPUT,
                 streams: self.binding.as_ref().map(|binding| binding.sink()),
                 capture,
             };
@@ -193,7 +185,7 @@ impl BashTool {
                 .map_err(|_| ToolError::Internal)?;
             super::emit_phase(&context, "running");
             let outcome = worker.completion().await;
-            outcome_to_result(&outcome)
+            outcome_to_result(&outcome).await
         })
     }
 }
@@ -218,7 +210,7 @@ async fn command_capture(invocation: &ToolInvocation) -> Result<Capture, ToolErr
 /// after the owner really joined the process. The process record is the single
 /// source of truth here: a command that really exited is reported as completed
 /// even when a cancellation happened to arrive while the pipes were closing.
-fn outcome_to_result(outcome: &CommandOutcome) -> Result<ToolExecutionOutcome, ToolError> {
+async fn outcome_to_result(outcome: &CommandOutcome) -> Result<ToolExecutionOutcome, ToolError> {
     match outcome.result.status {
         CommandStatus::SpawnFailed => return Err(ToolError::Failed),
         CommandStatus::Failed => return Err(ToolError::Internal),
@@ -227,20 +219,15 @@ fn outcome_to_result(outcome: &CommandOutcome) -> Result<ToolExecutionOutcome, T
         CommandStatus::Running | CommandStatus::Cancelling => return Err(ToolError::Internal),
         CommandStatus::Exited => {}
     }
-    // A completed result whose output was cut short (a stopped descendant, a
-    // bounded drain, or an evicted window) is still marked truncated for the
-    // model: otherwise the tool text would look like a clean, complete output.
+    let stdout = Stream::new("stdout", &outcome.stdout, outcome.stdout_omitted);
+    let stderr = Stream::new("stderr", &outcome.stderr, outcome.stderr_omitted);
+    let lines = share(stdout.lines(), stderr.lines(), MAX_OUTPUT_LINES);
+    let bytes = share(stdout.text.len(), stderr.text.len(), MAX_OUTPUT_BYTES);
+    // A completed result whose output was cut short (a stopped descendant or a
+    // bounded drain) must not look like a clean, complete output.
     let incomplete = !outcome.result.output_complete;
-    let stdout = StreamCapture {
-        bytes: outcome.stdout.clone(),
-        truncated: outcome.stdout_truncated || incomplete,
-        omitted: outcome.stdout_omitted,
-    };
-    let stderr = StreamCapture {
-        bytes: outcome.stderr.clone(),
-        truncated: outcome.stderr_truncated || incomplete,
-        omitted: outcome.stderr_omitted,
-    };
+    let stdout = stdout.render((lines.0, bytes.0), incomplete).await;
+    let stderr = stderr.render((lines.1, bytes.1), incomplete).await;
     let output = format_output(outcome.result.exit_code, &stdout, &stderr);
     let output = ToolOutput::new(output).map_err(|_| ToolError::Internal)?;
     Ok(ToolExecutionOutcome::Completed(output))
@@ -264,126 +251,131 @@ async fn resolve_cwd(
     }
 }
 
-fn format_output(exit_code: Option<i32>, stdout: &StreamCapture, stderr: &StreamCapture) -> String {
+/// One captured stream and the sanitized text the model sees of it.
+struct Stream<'a> {
+    name: &'static str,
+    captured: &'a [u8],
+    /// Bytes the capture dropped before `captured`.
+    omitted: u64,
+    text: String,
+}
+
+impl<'a> Stream<'a> {
+    fn new(name: &'static str, captured: &'a [u8], omitted: u64) -> Self {
+        Self {
+            name,
+            captured,
+            omitted,
+            text: sanitized(captured),
+        }
+    }
+
+    fn lines(&self) -> usize {
+        self.text.split_terminator('\n').count()
+    }
+
+    /// The text, or its tail followed by a notice that names the saved output.
+    async fn render(&self, (max_lines, max_bytes): (usize, usize), incomplete: bool) -> String {
+        let mut section = match truncate_tail(&self.text, max_lines, max_bytes) {
+            None => self.text.clone(),
+            Some(tail) => {
+                let path = save_output(self.captured, self.name).await;
+                let notice = notice(&tail, path.as_deref(), self.omitted > 0);
+                format!("{}\n\n{notice}", tail.text)
+            }
+        };
+        if incomplete {
+            if !section.is_empty() && !section.ends_with('\n') {
+                section.push('\n');
+            }
+            section.push_str(INCOMPLETE);
+        }
+        section
+    }
+}
+
+fn format_output(exit_code: Option<i32>, stdout: &str, stderr: &str) -> String {
     let exit_code = exit_code.map_or_else(|| "unavailable".to_owned(), |code| code.to_string());
-    let prefix = format!("exit_code: {exit_code}\nstdout:\n");
-    let stderr_label = "stderr:\n";
-    let fixed = prefix
-        .len()
-        .saturating_add(stderr_label.len())
-        .saturating_add(1);
-    let available = FORMATTED_OUTPUT_LIMIT.saturating_sub(fixed);
-    let stdout_size = stream_size(stdout);
-    let stderr_size = stream_size(stderr);
-    let stdout_budget = if stdout_size <= available / 2 {
-        stdout_size
-    } else {
-        available - stderr_size.min(available / 2)
-    };
-    let stderr_budget = available - stdout_budget;
-    let stdout = format_stream(stdout, stdout_budget);
-    let stderr = format_stream(stderr, stderr_budget);
-    let mut output = String::with_capacity(
-        FORMATTED_OUTPUT_LIMIT
-            .min(prefix.len() + stdout.len() + stderr_label.len() + stderr.len() + 1),
-    );
-    output.push_str(&prefix);
-    output.push_str(&stdout);
+    let mut output = format!("exit_code: {exit_code}\nstdout:\n{stdout}");
     if !output.ends_with('\n') {
         output.push('\n');
     }
-    output.push_str(stderr_label);
-    output.push_str(&stderr);
-    debug_assert!(output.len() <= FORMATTED_OUTPUT_LIMIT);
+    output.push_str("stderr:\n");
+    output.push_str(stderr);
     output
 }
 
-fn decoded_characters(bytes: &[u8]) -> impl Iterator<Item = (char, usize)> + '_ {
-    bytes.utf8_chunks().flat_map(|chunk| {
-        chunk
-            .valid()
-            .chars()
-            .map(|character| (character, character.len_utf8()))
-            .chain((!chunk.invalid().is_empty()).then_some(('\u{fffd}', chunk.invalid().len())))
-    })
+fn notice(tail: &Tail, path: Option<&Path>, capture_lost: bool) -> String {
+    let end = tail.total_lines;
+    let start = end - tail.kept_lines + 1;
+    let mut notice = if tail.partial {
+        format!(
+            "[Showing last {} of line {end} (line is {})",
+            format_size(tail.text.len()),
+            format_size(tail.last_line_bytes)
+        )
+    } else if tail.by_bytes {
+        format!(
+            "[Showing lines {start}-{end} of {end} ({} limit)",
+            format_size(MAX_OUTPUT_BYTES)
+        )
+    } else {
+        format!("[Showing lines {start}-{end} of {end}")
+    };
+    notice.push('.');
+    let label = if capture_lost {
+        notice.push_str(&format!(
+            " Output beyond the last {} was not captured.",
+            format_size(MAX_COMMAND_OUTPUT)
+        ));
+        "Captured output"
+    } else {
+        "Full output"
+    };
+    if let Some(path) = path {
+        notice.push_str(&format!(" {label}: {}", path.display()));
+    }
+    notice.push(']');
+    notice
 }
 
-fn stream_size(capture: &StreamCapture) -> usize {
-    decoded_characters(&capture.bytes)
-        .map(|(character, _)| sanitized_character_len(character))
-        .sum::<usize>()
-        + if capture.truncated {
-            TRUNCATION_OVERHEAD
-        } else {
-            0
-        }
+/// Writes the captured bytes to a new private file in the OS temp directory.
+/// `None` when that fails, so a notice never names a file that does not exist.
+async fn save_output(bytes: &[u8], stream: &str) -> Option<PathBuf> {
+    let mut id = [0; 8];
+    getrandom::fill(&mut id).ok()?;
+    let path = std::env::temp_dir().join(format!(
+        "minicore-bash-{:016x}-{stream}.log",
+        u64::from_le_bytes(id)
+    ));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).await.ok()?;
+    if file.write_all(bytes).await.is_err() || file.flush().await.is_err() {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return None;
+    }
+    Some(path)
 }
 
-fn format_stream(capture: &StreamCapture, budget: usize) -> String {
-    let sanitized_len: usize = decoded_characters(&capture.bytes)
-        .map(|(character, _)| sanitized_character_len(character))
-        .sum();
-    let truncated = capture.truncated || sanitized_len > budget;
-    let mut output = String::with_capacity(budget.min(sanitized_len + TRUNCATION_OVERHEAD));
-    if !truncated {
-        for (character, _) in decoded_characters(&capture.bytes) {
-            push_sanitized_character(&mut output, character);
+fn sanitized(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            if !character.is_control() || matches!(character, '\n' | '\t') {
+                output.push(character);
+            } else {
+                output.extend(character.escape_default());
+            }
         }
-        return output;
-    }
-    // Reserve enough for the widest byte count, delimiters and the cut marker.
-    let content_budget = budget.saturating_sub(TRUNCATION_OVERHEAD);
-    let mut head_bytes = 0;
-    for (character, bytes) in decoded_characters(&capture.bytes) {
-        if output.len() + sanitized_character_len(character) > content_budget / 2 {
-            break;
-        }
-        push_sanitized_character(&mut output, character);
-        head_bytes += bytes;
-    }
-    let tail_budget = content_budget - output.len();
-    let mut remaining = sanitized_len - output.len();
-    let mut offset = 0;
-    let mut tail_bytes = 0;
-    let mut tail = String::new();
-    for (character, bytes) in decoded_characters(&capture.bytes) {
-        offset += bytes;
-        if offset <= head_bytes {
-            continue;
-        }
-        if remaining > tail_budget {
-            remaining -= sanitized_character_len(character);
-        } else {
-            push_sanitized_character(&mut tail, character);
-            tail_bytes += bytes;
+        if !chunk.invalid().is_empty() {
+            output.push('\u{fffd}');
         }
     }
-    let omitted = capture.omitted + (capture.bytes.len() - head_bytes - tail_bytes) as u64;
-    output.push_str(&format!("\n[... {omitted} bytes omitted ...]\n"));
-    output.push_str(&tail);
-    output.push('\n');
-    output.push_str(TRUNCATED);
-    debug_assert!(output.len() <= budget);
     output
-}
-
-fn sanitized_character_len(character: char) -> usize {
-    if !character.is_control() || matches!(character, '\n' | '\t') {
-        character.len_utf8()
-    } else {
-        character
-            .escape_default()
-            .map(|escaped| escaped.len_utf8())
-            .sum()
-    }
-}
-
-fn push_sanitized_character(output: &mut String, character: char) {
-    if !character.is_control() || matches!(character, '\n' | '\t') {
-        output.push(character);
-    } else {
-        output.extend(character.escape_default());
-    }
 }
 
 fn default_cwd() -> String {
