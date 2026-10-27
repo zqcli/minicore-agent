@@ -24,6 +24,7 @@ use minicore_runtime::value::{BoundedText, MAX_JSON_BYTES};
 use minicore_runtime::{LoopId, ToolCallId};
 
 use super::{ModelConfigError, ProviderBudget};
+use crate::event::ProviderErrorView;
 
 const USER_AGENT: &str = concat!("minicore-agent/", env!("CARGO_PKG_VERSION"));
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -45,7 +46,9 @@ mod stream;
 mod terminal;
 mod tools;
 
-use errors::{local_error, retryable_error, started_error, stream_error, unknown_error};
+use errors::{
+    local_error, retryable_error, started_error, stream_error, unknown_error, with_provider,
+};
 use http_error::{
     classify_http_error, classify_send_error, http_status_class, log_provider_request_failure,
     model_error_retryable,

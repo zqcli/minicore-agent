@@ -258,17 +258,89 @@ fn provider_diagnostics_and_lookalike_numbers_are_not_exposed() {
 }
 #[test]
 fn legacy_and_nullable_stored_errors_keep_optional_field_absent() {
-    for suffix in ["", ",\"local_context_budget\":null"] {
+    for suffix in ["", ",\"local_context_budget\":null", ",\"provider\":null"] {
         let old = format!(
             "{{\"kind\":\"invalid_request\",\"delivery\":\"not_started\",\"retryable\":false,\"retry_after_millis\":null{suffix}}}"
         );
         let stored: ModelErrorView = serde_json::from_str(&old).unwrap();
         assert!(stored.local_context_budget.is_none());
-        assert!(
-            serde_json::to_value(stored)
-                .unwrap()
-                .get("local_context_budget")
-                .is_none()
-        );
+        assert!(stored.provider.is_none());
+        let value = serde_json::to_value(stored).unwrap();
+        assert!(value.get("local_context_budget").is_none() && value.get("provider").is_none());
     }
+}
+
+fn provider_failure(provider: &ProviderErrorView) -> ModelError {
+    ModelError::permanent(
+        ModelErrorKind::ProviderUnavailable,
+        DeliveryState::Unknown,
+        DiagnosticSummary::new(
+            DiagnosticCode::ModelUnavailable,
+            DiagnosticCategory::Model,
+            BoundedText::new(provider.to_diagnostic_text()).unwrap(),
+            false,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn provider_text_over_the_limit_is_cut_on_a_char_boundary_and_marked() {
+    let message = "é".repeat(9_000);
+    let view = ProviderErrorView::new(None, None, None, Some(&message)).unwrap();
+    let cut = view.message.unwrap();
+    assert_eq!(cut.len(), 16 * 1024 - 1);
+    assert_eq!(cut.strip_suffix('…').unwrap(), "é".repeat(8_190));
+
+    let view = ProviderErrorView::new(None, Some(&"c".repeat(300)), Some("t"), None).unwrap();
+    let code = view.code.unwrap();
+    assert_eq!(code.len(), 256);
+    assert!(code.ends_with('…'));
+    assert_eq!(view.error_type.as_deref(), Some("t"));
+}
+
+#[test]
+fn provider_text_drops_control_characters_except_newline_and_tab() {
+    let view = ProviderErrorView::new(
+        None,
+        Some("co\u{0}de"),
+        None,
+        Some("a\u{1b}[31mb\r\n\tc\u{7f}\u{85}d"),
+    )
+    .unwrap();
+    assert_eq!(view.code.as_deref(), Some("code"));
+    assert_eq!(view.message.as_deref(), Some("a[31mb\n\tcd"));
+}
+
+#[test]
+fn blank_provider_text_is_absent_and_absent_fields_are_not_serialized() {
+    assert_eq!(
+        ProviderErrorView::new(None, Some(" "), Some(""), Some("\u{0}\n")),
+        None
+    );
+    let view = ProviderErrorView::new(Some(502), None, None, Some("bad gateway")).unwrap();
+    assert_eq!(
+        serde_json::to_string(&view).unwrap(),
+        r#"{"status":502,"message":"bad gateway"}"#
+    );
+}
+
+#[test]
+fn provider_text_round_trips_through_the_model_error_diagnostic() {
+    // The worst case for JSON escaping must still fit the Runtime's diagnostic bound.
+    let quotes = "\"".repeat(20_000);
+    for message in ["quote \" and \\ and\nnewline é 🦀", quotes.as_str()] {
+        let provider =
+            ProviderErrorView::new(Some(429), Some("c"), Some("t"), Some(message)).unwrap();
+        let error = provider_failure(&provider);
+        let view = ModelErrorView::from_model(&error);
+        assert_eq!(view.provider, Some(provider));
+        assert!(!format!("{error:?}").contains("quote"));
+    }
+    let none = ModelErrorView::from_model(&error(
+        ModelErrorKind::Timeout,
+        DeliveryState::Unknown,
+        "provider error: not json",
+    ));
+    assert_eq!(none.provider, None);
 }

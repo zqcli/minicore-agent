@@ -907,7 +907,6 @@ fn assert_error(
         matches!(error.retry_hint(), RetryHint::Retryable { .. }),
         retryable
     );
-    assert!(!error.diagnostic().message().as_str().contains("SECRET"));
 }
 
 #[tokio::test]
@@ -2473,7 +2472,7 @@ async fn cancellation_before_send_and_during_stream_drop_owned_http_work() {
 }
 
 #[tokio::test]
-async fn in_stream_rejections_classify_codes_delivery_and_redact_messages() {
+async fn in_stream_rejections_classify_codes_delivery_and_keep_provider_text() {
     for (code, kind) in [
         ("context_length_exceeded", ModelErrorKind::ContextOverflow),
         ("insufficient_quota", ModelErrorKind::QuotaExceeded),
@@ -2529,6 +2528,10 @@ async fn in_stream_rejections_classify_codes_delivery_and_redact_messages() {
                     !started && kind == ModelErrorKind::RateLimited,
                 );
                 assert!(!format!("{error:?}").contains("RAW-SECRET"));
+                assert_eq!(
+                    crate::event::ModelErrorView::from_model(&error).provider,
+                    ProviderErrorView::new(None, Some(code), None, Some("RAW-SECRET"))
+                );
                 server.finish().await;
             }
         }
@@ -3298,6 +3301,7 @@ async fn reasoning_summary_part_lifecycle_separates_parts_within_one_item() {
     );
 }
 
+mod provider_error_tests;
 mod replay_tests;
 
 #[tokio::test]

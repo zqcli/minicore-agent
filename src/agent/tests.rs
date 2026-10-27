@@ -16,6 +16,7 @@ mod openai_recovery;
 mod persistence;
 mod post_turn;
 mod preview;
+mod provider_error;
 mod recovery;
 mod reload;
 mod running_update;

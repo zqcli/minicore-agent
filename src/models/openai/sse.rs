@@ -168,13 +168,21 @@ pub(super) fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), 
         }
         "response.failed" | "error" => {
             state.terminal_seen = true;
-            let error = value
+            let envelope = value
                 .pointer("/response/error")
-                .or_else(|| value.get("error"))
-                .unwrap_or(&value);
+                .or_else(|| value.get("error"));
+            let error = envelope.unwrap_or(&value);
+            let text = |name: &str| error.get(name).and_then(Value::as_str);
+            // Without an envelope `type` is the event name, not the provider's.
+            let provider = ProviderErrorView::new(
+                None,
+                text("code"),
+                envelope.and(text("type")),
+                text("message"),
+            );
             let kind = ["code", "type"]
                 .into_iter()
-                .filter_map(|field| error.get(field).and_then(Value::as_str))
+                .filter_map(text)
                 .find_map(|code| match code {
                     "context_length_exceeded" | "context_window_exceeded" | "context_overflow" => {
                         Some(ModelErrorKind::ContextOverflow)
@@ -188,13 +196,14 @@ pub(super) fn handle_frame(state: &mut StreamState, frame: &[u8]) -> Result<(), 
                 .pointer("/response/output")
                 .and_then(Value::as_array)
                 .is_some_and(|output| !output.is_empty());
-            state.fail(if state.output_seen || failed_output {
+            let error = if state.output_seen || failed_output {
                 started_error(kind)
             } else if kind == ModelErrorKind::RateLimited {
                 retryable_error(kind, None)
             } else {
                 local_error(kind)
-            });
+            };
+            state.fail(with_provider(error, provider));
         }
         _ => {}
     }

@@ -2,14 +2,15 @@ use super::*;
 
 #[derive(Deserialize)]
 struct ErrorEnvelope {
-    error: Option<ProviderErrorCode>,
+    error: Option<ProviderErrorBody>,
 }
 
 #[derive(Deserialize)]
-struct ProviderErrorCode {
+struct ProviderErrorBody {
     code: Option<String>,
     #[serde(rename = "type")]
     error_type: Option<String>,
+    message: Option<String>,
 }
 
 pub(super) async fn classify_http_error(
@@ -36,6 +37,18 @@ pub(super) async fn classify_http_error(
         .and_then(|envelope| envelope.error);
     let code = error.as_ref().and_then(|error| error.code.as_deref());
     let error_type = error.as_ref().and_then(|error| error.error_type.as_deref());
+    // Relays often answer with plain text or HTML instead of an envelope.
+    let message = error
+        .as_ref()
+        .and_then(|error| error.message.as_deref())
+        .filter(|message| !message.trim().is_empty());
+    let body_text = String::from_utf8_lossy(&body);
+    let provider = ProviderErrorView::new(
+        Some(status.as_u16()),
+        code,
+        error_type,
+        Some(message.unwrap_or(&body_text)),
+    );
     let context_overflow = [code, error_type].into_iter().flatten().any(|value| {
         matches!(
             value,
@@ -44,7 +57,7 @@ pub(super) async fn classify_http_error(
     });
     let quota_exceeded = [code, error_type].into_iter().flatten().any(is_quota_code);
 
-    match status.as_u16() {
+    let error = match status.as_u16() {
         400 | 422 if context_overflow => local_error(ModelErrorKind::ContextOverflow),
         400 | 422 => local_error(ModelErrorKind::InvalidRequest),
         401 | 403 => local_error(ModelErrorKind::AuthRejected),
@@ -61,7 +74,8 @@ pub(super) async fn classify_http_error(
         ),
         400..=499 => local_error(ModelErrorKind::InvalidRequest),
         _ => unknown_error(ModelErrorKind::ProviderUnavailable),
-    }
+    };
+    with_provider(error, provider)
 }
 
 pub(super) fn http_status_class(status: reqwest::StatusCode) -> &'static str {

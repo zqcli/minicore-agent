@@ -34,8 +34,9 @@ also be embedded directly as a Rust library.
 - **Provider support.** Streaming Responses with reasoning, retries honoring
   `Retry-After`, and durable provider replay across tool rounds and restarts.
 - **Bounded and redacted.** Queues, reads, tool output, and history scans have
-  explicit limits. Keys, prompts, and provider bodies stay out of logs and
-  errors.
+  explicit limits. Keys, prompts, and provider bodies stay out of logs; the only
+  provider text a client sees is the error `code`, `type`, and `message` of a failed
+  request.
 
 ## How It Fits Together
 

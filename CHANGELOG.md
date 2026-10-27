@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- A failed model request now keeps what the provider said. The model error of a
+  turn outcome (`turn.wait`, `turn_finished`, `turn.result`, `session.read`, and
+  stored history) may carry `provider` with the HTTP `status`, the error `code`
+  and `type`, and the full `message` (up to 16 KiB, control characters removed).
+  A relay that answers with plain text or HTML shows that text as the message.
+  Errors reported inside a response stream have no `status`, and local or
+  transport failures have no `provider`. The classification fields are
+  unchanged, and older history records still load. The provider's text is passed
+  through as received and is not redacted; it never reaches the logs.
+
 ## 0.8.0 — 2026-10-23
 
 - Requires Runtime 0.8.0, pinned by tag `v0.8.0`. The Runtime no longer limits

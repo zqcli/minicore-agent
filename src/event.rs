@@ -481,6 +481,74 @@ impl LocalContextBudgetFailure {
     }
 }
 
+/// What the provider said about a failed request, passed through as received.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, serde::Deserialize)]
+pub struct ProviderErrorView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+const MAX_PROVIDER_CODE_BYTES: usize = 256;
+const MAX_PROVIDER_MESSAGE_BYTES: usize = 16 * 1024;
+// The diagnostic message is the only free-form field a Runtime `ModelError`
+// carries, so the adapter stores the view there as JSON behind this prefix.
+const PROVIDER_DIAGNOSTIC_PREFIX: &str = "provider error: ";
+
+impl ProviderErrorView {
+    /// Returns `None` when the provider said nothing usable.
+    pub(crate) fn new(
+        status: Option<u16>,
+        code: Option<&str>,
+        error_type: Option<&str>,
+        message: Option<&str>,
+    ) -> Option<Self> {
+        let view = Self {
+            status,
+            code: clean_provider_text(code, MAX_PROVIDER_CODE_BYTES),
+            error_type: clean_provider_text(error_type, MAX_PROVIDER_CODE_BYTES),
+            message: clean_provider_text(message, MAX_PROVIDER_MESSAGE_BYTES),
+        };
+        (view != Self::default()).then_some(view)
+    }
+
+    pub(crate) fn to_diagnostic_text(&self) -> String {
+        let json = serde_json::to_string(self).expect("provider error view serializes");
+        format!("{PROVIDER_DIAGNOSTIC_PREFIX}{json}")
+    }
+
+    fn from_model(error: &ModelError) -> Option<Self> {
+        let json = error
+            .diagnostic()
+            .message()
+            .as_str()
+            .strip_prefix(PROVIDER_DIAGNOSTIC_PREFIX)?;
+        serde_json::from_str(json).ok()
+    }
+}
+
+/// Drops control characters except `\n` and `\t`, trims, and cuts to `maximum` bytes.
+fn clean_provider_text(text: Option<&str>, maximum: usize) -> Option<String> {
+    let text: String = text?
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect();
+    let text = text.trim();
+    if text.len() <= maximum {
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    let mut end = maximum - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}…", &text[..end]))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct ModelErrorView {
     pub kind: String,
@@ -489,6 +557,8 @@ pub struct ModelErrorView {
     pub retry_after_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_context_budget: Option<LocalContextBudgetFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderErrorView>,
 }
 
 impl ModelErrorView {
@@ -505,6 +575,7 @@ impl ModelErrorView {
             retryable: error.diagnostic().retryable,
             retry_after_millis,
             local_context_budget: LocalContextBudgetFailure::from_model(error),
+            provider: ProviderErrorView::from_model(error),
         }
     }
 }

@@ -241,6 +241,7 @@ fn history_lines_round_trip() {
         r#"{"type":"failed","kind":"internal","model_error":null}"#,
         r#"{"type":"failed","kind":"model","model_error":{"kind":"timeout","delivery":"not_started","retryable":true,"retry_after_millis":12}}"#,
         r#"{"type":"failed","kind":"model","model_error":{"kind":"invalid_request","delivery":"not_started","retryable":false,"retry_after_millis":null,"local_context_budget":{"estimated_tokens":100,"input_budget_tokens":90}}}"#,
+        r#"{"type":"failed","kind":"model","model_error":{"kind":"rate_limited","delivery":"not_started","retryable":true,"retry_after_millis":12000,"provider":{"status":429,"code":"rate_limit_exceeded","type":"requests","message":"Rate limit reached"}}}"#,
     ];
     for outcome in outcomes {
         let line = format!(

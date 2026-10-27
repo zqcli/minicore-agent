@@ -24,6 +24,27 @@ pub(super) fn stream_error(kind: ModelErrorKind, provider_event_seen: bool) -> M
     }
 }
 
+/// Keeps the classification of `error` and carries the provider's text in its diagnostic.
+pub(super) fn with_provider(error: ModelError, provider: Option<ProviderErrorView>) -> ModelError {
+    let Some(provider) = provider else {
+        return error;
+    };
+    let base = error.diagnostic();
+    let diagnostic = DiagnosticSummary::new(
+        base.code,
+        base.category,
+        BoundedText::new(provider.to_diagnostic_text()).expect("provider text is bounded"),
+        base.retryable,
+    )
+    .expect("provider text has no control characters");
+    match *error.retry_hint() {
+        RetryHint::Retryable { retry_after } => {
+            ModelError::not_started(error.kind(), retry_after, diagnostic)
+        }
+        RetryHint::Never => ModelError::permanent(error.kind(), error.delivery(), diagnostic),
+    }
+}
+
 fn diagnostic(kind: ModelErrorKind, retryable: bool) -> DiagnosticSummary {
     let (code, message) = match kind {
         ModelErrorKind::Cancelled => (DiagnosticCode::RuntimeTerminated, "model request cancelled"),

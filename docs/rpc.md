@@ -950,6 +950,9 @@ response arrives:
 `kind` and optionally `model_error`), or `unknown` for a future Runtime outcome.
 Cancellation reasons are `user`, `owner_dropped`, `shutdown`, `deadline`, or
 `unknown` for a future Runtime reason. `persistence` is `persisted` or `failed`.
+`model_error` carries `kind`, `delivery`, `retryable`, `retry_after_millis`, and
+`provider` (see "0.8.1 Additive Metadata"). The same object appears in
+`turn.wait`, `turn_finished`, `turn.result`, and `session.read` records.
 `persistence: persisted` means the Agent's history append and `sync_data`
 completed. Metadata/summary replacements sync the parent directory after rename;
 creating a Session and repairing a partial history tail are also synced. A valid
@@ -2174,8 +2177,9 @@ A safe model-error view may include `local_context_budget` with unsigned
 `estimated_tokens` and `input_budget_tokens`. Missing/null means no verified
 local numeric estimate. Only the exact locally generated InvalidRequest /
 NotStarted preflight diagnostic in legacy errors supplies this field; new ordinary
-requests are no longer vetoed by that estimate. Provider response bodies
-and free-form diagnostics are never exposed. Stored legacy errors remain valid.
+requests are no longer vetoed by that estimate. Stored legacy errors remain valid.
+Provider-authored text is exposed only through `provider` (0.8.1); the Agent adds
+no free-form diagnostics of its own.
 
 Compaction results include `origin`, either `manual` or `automatic`, from the
 operation that produced the result. Clients must not infer origin from IDs.
@@ -2186,3 +2190,36 @@ read when that is reported; without input details it stays unknown. Cached read,
 ordinary output, reasoning, and provider total remain available when reported
 and arithmetically valid.
 RPC protocol version remains 1; these are additive fields and optional usage.
+
+## 0.8.1 Additive Metadata
+
+A model-error view may include `provider`, what the provider said about the
+failed request. It is omitted when the provider said nothing, and each field in
+it is omitted when unknown or empty:
+
+```json
+"model_error": {"kind":"rate_limited","delivery":"not_started","retryable":true,"retry_after_millis":12000,
+  "provider": {"status":429, "code":"rate_limit_exceeded", "type":"requests", "message":"Rate limit reached for ..."}}
+```
+
+- `status` is the HTTP status of an error response. Errors reported inside a
+  response stream (`error` and `response.failed` events) have no status.
+- `code`, `type`, and `message` come from the provider's JSON error envelope
+  (`error.code`, `error.type`, `error.message`, as OpenAI and Anthropic send
+  them) or from the stream event. When an HTTP error response has no envelope
+  message, `message` is the response body as text (trimmed), so a relay that
+  answers with plain text or HTML still shows something. The Agent reads at
+  most 64 KiB of an error body.
+- `code` and `type` are at most 256 bytes; `message` is at most 16 KiB. Longer
+  text is cut on a character boundary and ends with `…`. Control characters
+  other than `\n` and `\t` are removed, so clients can render the text as is.
+- The text is otherwise exactly what the provider sent. The Agent adds nothing
+  of its own: no URL, header, or key. Errors that did not come from a provider
+  (local preflight, timeouts, transport failures, cancellation) have no
+  `provider`.
+- When the Runtime retries a request, the final attempt's `provider` is the one
+  reported. Stored history keeps it, and records written before 0.8.1 have none.
+
+`kind`, `delivery`, `retryable`, and `retry_after_millis` keep their meaning and
+still drive client behavior; `provider` is for display. RPC protocol version
+remains 1.

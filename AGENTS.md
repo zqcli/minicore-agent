@@ -83,7 +83,9 @@ then the full checks.
   close barriers (see `ToolOwners` in `src/tools/command.rs`). Do not detach it.
 - Stdout carries RPC frames only; diagnostics go through `tracing` to stderr.
   Never log or return API keys, prompts, provider bodies, tool arguments, Bash
-  commands, or filesystem paths in errors. Secrets come only from the
+  commands, or filesystem paths in errors. The one exception is the provider's
+  error `status`, `code`, `type`, and `message` in `model_error.provider`; it is
+  never logged. Secrets come only from the
   environment variable named by `api_key_env`, and are scrubbed from tool
   processes.
 

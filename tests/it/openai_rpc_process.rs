@@ -1227,7 +1227,7 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
+async fn provider_error_message_reaches_the_outcome_but_not_stderr_or_unlisted_body_fields() {
     const KEY_ENV: &str = "MINICORE_PROCESS_ERROR_KEY";
     const KEY: &str = "PROCESS-ERROR-API-KEY-SECRET";
     const RAW_BODY_SECRET: &str = "PROCESS-RAW-PROVIDER-BODY-SECRET";
@@ -1272,6 +1272,10 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
         waited["result"]["outcome"]["model_error"]["kind"],
         "provider_unavailable"
     );
+    assert_eq!(
+        waited["result"]["outcome"]["model_error"]["provider"],
+        json!({"status": 500, "type": "server_error", "message": PROVIDER_MESSAGE})
+    );
     process
         .send(
             "history",
@@ -1297,10 +1301,13 @@ async fn provider_error_body_secret_never_reaches_process_rpc_or_stderr() {
     let output = serde_json::to_string(&observed).unwrap();
     server.finish().await;
 
-    for private in [KEY, RAW_BODY_SECRET, PROVIDER_MESSAGE, base_url.as_str()] {
+    // The provider's own message is part of the outcome; only logs stay clean.
+    assert!(output.contains(PROVIDER_MESSAGE));
+    for private in [KEY, RAW_BODY_SECRET, base_url.as_str()] {
         assert!(!output.contains(private));
         assert!(!stderr.contains(private));
     }
+    assert!(!stderr.contains(PROVIDER_MESSAGE));
     assert!(!stderr.to_ascii_lowercase().contains("authorization"));
     let provider_error_lines = stderr
         .lines()

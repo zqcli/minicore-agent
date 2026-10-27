@@ -66,10 +66,18 @@ API key values are read from the process environment variable named by `api_key_
 rotating them requires restarting the Agent. Unreferenced models may lack keys,
 but profile models and models selected by loaded sessions must have valid credentials;
 the value is not part of the TOML contract. Tracing is stderr-only and excludes
-keys, authorization headers, provider URLs/bodies, prompts, reasoning text,
-Tool arguments, and Bash commands/paths/content. Agent errors and redacted
-`Debug` values expose stable classifications and bounded metadata, not secret
-payloads.
+keys, authorization headers, provider URLs/bodies and error text, prompts,
+reasoning text, Tool arguments, and Bash commands/paths/content. Agent errors and
+redacted `Debug` values expose stable classifications and bounded metadata, not
+secret payloads.
+
+The one exception is the provider's own error text. A failed model request
+reports the provider's HTTP status, error `code`, `type`, and `message` in the
+turn outcome (`model_error.provider`, see [RPC](rpc.md)), and the same text is
+stored in `history.jsonl`. It is passed through as received, bounded and without
+control characters, but not redacted: a provider or relay may echo fragments of
+the request, such as prompt text or a model name. Clients should show it only to
+the session owner and not forward it to other parties.
 
 A non-loopback `http://` model `base_url` sends the bearer token and request/response
 content in plaintext. It remains allowed for trusted LAN gateways, but the Agent
