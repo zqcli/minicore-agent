@@ -1,6 +1,6 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.8.0 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.8.1 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
 ## Transport And Framing
@@ -47,7 +47,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.8.0","protocol_version":1,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.8.1","protocol_version":1,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
 ```
 
 An error response has exactly one `error`:
@@ -145,7 +145,7 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.8.0",
+  "version": "0.8.1",
   "protocol_version": 1,
   "capabilities": [
     "session.read",

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1 — 2026-10-27
 
 - A failed model request now keeps what the provider said. The model error of a
   turn outcome (`turn.wait`, `turn_finished`, `turn.result`, `session.read`, and
