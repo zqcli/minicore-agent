@@ -399,7 +399,10 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
                 name: "read",
                 arguments: json!({"path":"old.txt"}),
             }]),
-            Step::Text("seed done"),
+            usage_events(
+                "seed done",
+                &[Usage::default().with_provider_total_tokens(Some(8_000))],
+            ),
         ],
     );
     let mut seed = Agent::open_with_models(config.clone(), test_models(seed_model))

@@ -130,11 +130,24 @@ async fn append_text(session: &Session, bytes: usize) {
     let loop_id = LoopId::new().unwrap();
     append_source(
         session,
-        vec![HistoryItem::User(UserHistory {
-            loop_id,
-            kind: UserMessageKind::Prompt,
-            input: UserInput::text("x".repeat(bytes)).unwrap(),
-        })],
+        vec![
+            HistoryItem::User(UserHistory {
+                loop_id,
+                kind: UserMessageKind::Prompt,
+                input: UserInput::text("x".repeat(bytes)).unwrap(),
+            }),
+            HistoryItem::Assistant(minicore_runtime::history::AssistantHistory {
+                loop_id,
+                request_index: 0,
+                model: "main".parse().unwrap(),
+                reasoning: ReasoningPreference::Auto,
+                content: vec![AssistantPart::Text("answer".into())],
+                provider_replay: None,
+                finish_reason: ModelFinishReason::Stop,
+                usage: minicore_runtime::model::Usage::default()
+                    .with_provider_total_tokens(Some(4_000)),
+            }),
+        ],
         loop_id,
     )
     .await;
@@ -156,7 +169,6 @@ fn reservation(
         previous_summary: None,
         previous_covered_item_count: 0,
         hard_tokens: model.descriptor.context_window,
-        automatic_budget: Some(Arc::new(crate::models::tests::DefaultProviderBudget)),
         trigger_tokens: Some(trigger),
         deadline: Instant::now() + std::time::Duration::from_secs(5),
     }
@@ -180,6 +192,39 @@ async fn run_post_turn_worker(session: Session, reservation: CompactionReservati
             run_compaction(session, reservation, Some(input)).await;
         }
     }
+}
+
+#[tokio::test]
+async fn post_turn_uses_latest_report_and_never_substitutes_older_usage() {
+    let (_temp, agent, session, model) = fixture("summary", 8_000).await;
+    append_text(&session, 12_000).await;
+    append_text(&session, 12_000).await;
+    for (usage, reason) in [
+        (Some(3_999), None),
+        (None, Some("reported_context_unavailable")),
+    ] {
+        let mut check = reservation(&session, &model, 4_000);
+        let history = Arc::make_mut(&mut check.history);
+        let HistoryItem::Assistant(assistant) = history.last_mut().unwrap() else {
+            unreachable!()
+        };
+        assistant.usage =
+            minicore_runtime::model::Usage::default().with_provider_total_tokens(usage);
+        let result = run_post_turn(&session, check).await;
+        assert_eq!(result.status, CompactionStatus::Noop);
+        assert_eq!(result.before_tokens, usage);
+        assert_eq!(result.failure_kind.as_deref(), reason);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    }
+    let check = reservation(&session, &model, 4_000);
+    session.lock_inner().compaction = Some(Arc::clone(&check.operation));
+    run_post_turn_worker(session.clone(), check).await;
+    assert_eq!(
+        session.context().last_result.unwrap().status,
+        CompactionStatus::Compacted
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -280,7 +325,8 @@ async fn turn_wait_does_not_wait_for_projection_settlement() {
                 )],
                 provider_replay: None,
                 finish_reason: ModelFinishReason::ToolCalls,
-                usage: Default::default(),
+                usage: minicore_runtime::model::Usage::default()
+                    .with_provider_total_tokens(Some(8_000)),
             }),
             HistoryItem::ToolResult(minicore_runtime::history::ToolResultHistory {
                 loop_id: old,

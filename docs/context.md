@@ -28,23 +28,23 @@ and tool rounds.
 
 ## Pi-Style Request Boundaries
 
-The default trigger is `estimated_context >= 95% * effective_input_window`;
+The default trigger is `reported_context >= 95% * effective_input_window`;
 existing explicit percentages are preserved. The denominator is physical context
-minus the configured output and safety allowances. This deliberately differs
-from Pi 1.0.1's strict `>` physical-window-minus-16384 condition and its recent-token
-cutoff. Only this token estimate starts an automatic reduction: the Runtime no
-longer limits the number or size of history items, so neither the Runtime nor the
-Agent compacts or refuses a send because a history has many items or bytes.
-Post-turn checks measure only the suffix not covered by the durable snapshot.
-First-request checks exclude newly accepted User/Steer items; later checks
-include accumulated uncovered history. Target percent remains advisory.
+minus the configured output and safety allowances. Reported context is the
+latest Assistant item's provider total, or the sum of all five disjoint usage
+components when all are known, in the effective history. It already includes
+that response's output. No estimate or allowance for later prompts, steers or
+tool results is added. Missing usage on that latest Assistant means no threshold
+compaction; an older report is never substituted. History size alone neither
+compacts nor refuses a send. Target percent remains advisory.
 
 First-request checks exclude the newly accepted Prompt and Steers. Later checks
 run only after complete assistant/tool exchanges, under the active turn's normal
 cancellation and deadline. A single no-tools utility consolidates the effective
 old summary and all eligible old groups. Current User/Steer text and the newest
 unread complete tool exchange stay verbatim; incomplete exchanges are never cut.
-A previous fully covered summary may be refreshed after reopen/model change.
+A fully covered summary without a subsequent Assistant report does not trigger
+threshold compaction.
 
 Source range/hash coverage and the original summary hash bind each turn-local
 projection. Only a strictly smaller, well-paired complete provider request is
@@ -66,10 +66,16 @@ time. A utility timeout sends the unchanged projection only if its local estimat
 fits the hard limit and the parent deadline/cancellation still permits sending;
 otherwise preparation fails. Emergency recovery keeps its original deadline.
 
-A provider/binding/framing and summary-generation anchor proves when actual
-assistant usage may be combined with estimates for later content. Otherwise
-current provider-body bytes/4 is used. Compaction, changed normalization, reload
-or changed framing invalidate old usage; no missing usage component becomes zero.
+Reported usage comes from persisted history: restart, reopen, configuration
+reload, provider changes and model changes do not invalidate it. A model change
+changes only the trigger denominator. Successful compaction supersedes the latest
+Assistant report, including reports in a retained tail, until a new Assistant
+response with usage arrives. `summary.json` persists that Assistant's identity as
+the optional `superseded_usage` pair `[loop_id, request_index]`; it is validated
+against loaded history. Legacy snapshots without this field use their validated
+source coverage as the cutoff: only Assistant items in the retained suffix are
+eligible. In-turn reductions apply the same supersession rule before settlement.
+Emergency overflow recovery remains the safety net for unmeasured growth.
 
 ## Independent Manual And Post-Turn Operations
 
@@ -98,16 +104,18 @@ history. A history that no longer fits the model is reduced by the request
 boundary threshold, by emergency recovery after a provider rejection, or by a
 manual compaction.
 
-The worker estimates the complete effective context, including the final answer,
-existing summary, remaining history, system/AGENTS and tools. Below the configured
-token trigger the check finishes Noop, silently and without a utility call or
-scanning history anchors. At or above it the operation becomes visible (`preparing`, `summarizing`, `committing`) and uses
+The worker compares the latest eligible provider-reported context with the
+configured trigger, just like request preparation. Below the trigger it finishes
+Noop, silently and without a utility call or scanning history anchors. Unknown
+or superseded usage finishes Noop with `reported_context_unavailable`; no local
+estimate substitutes for it. At or above the trigger the operation becomes
+visible (`preparing`, `summarizing`, `committing`) and uses
 the single-call summary engine only if a safe older prefix can advance. If the
 recent complete-loop tail leaves no older prefix to fold, such as a single huge
 loop, the operation ends Noop. If it cannot fit with fixed request
 content and a summary, the operation fails explicitly without dropping that tail.
-An existing fully covered emergency projection keeps its automatic refresh path;
-manual compaction of fully covered history remains Noop. An unchanged eligible prefix and request binding are not summarized again after
+A fully covered projection has no eligible report and does not automatically
+refresh; manual compaction of fully covered history remains Noop. An unchanged eligible prefix and request binding are not summarized again after
 an attempt; cancellation and timeout leave that source retryable. The configured
 target is advisory, not a reason to repeat a summary call. A submit that arrives during the check abandons it and proceeds; the next turn
 checks again. Once the operation is visible, a submit returns `session_busy`.
@@ -215,7 +223,8 @@ published, existing in-turn threshold or emergency reductions can be promoted
 through the same atomic snapshot store without another utility call. `turn.wait`
 does not wait for promotion. The session-owned task still owns settlement, and
 close/next-submit cleanup joins it. The post-turn check runs after settlement and
-measures the promoted snapshot, rather than restoring covered raw history.
+respects the promoted snapshot's supersession point, rather than restoring
+covered raw history or estimating its size.
 This encodes historical data, not a newly generated semantic summary. The
 64 KiB generated-summary limit still applies to every utility output. The full
 settled projection is a different object: snapshots larger than 64 KiB are valid

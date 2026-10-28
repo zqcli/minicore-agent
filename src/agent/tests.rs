@@ -19,6 +19,7 @@ mod preview;
 mod provider_error;
 mod recovery;
 mod reload;
+mod reported_trigger;
 mod running_update;
 mod settlement;
 mod steering;

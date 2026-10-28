@@ -210,12 +210,6 @@ fn reconcile_report(
     report: &LoopReport,
     sanitized: &[HistoryItem],
 ) -> StoredLoopRecord {
-    // Durable normalization preserves validated replay but may remove legacy
-    // opaque reasoning. Usage from the prior raw projection is then stale.
-    session
-        .shared
-        .compaction
-        .note_normalized_projection(report.appended.as_ref(), sanitized);
     // The runtime loop is complete regardless of whether the later JSONL
     // append succeeds.
     session.presentation().note_loop_finished();

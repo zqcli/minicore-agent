@@ -207,7 +207,7 @@ async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_proj
 }
 
 #[tokio::test]
-async fn settled_projection_post_turn_summarizes_promoted_source_and_keeps_it_on_utility_failure() {
+async fn settled_projection_post_turn_does_not_call_utility_without_a_new_report() {
     for fail in [false, true] {
         let (data, _guard, id, model, mut agent) = settled_projection_fixture(
             &format!("wide-projection-post-{fail}"),
@@ -238,37 +238,20 @@ async fn settled_projection_post_turn_summarizes_promoted_source_and_keeps_it_on
         let history = read_store_history(&data, id).await;
         assert_eq!(context.coverage.covered_item_count, history.len());
         let post = context.last_result.unwrap();
+        assert_eq!(post.status, crate::compaction::CompactionStatus::Noop);
         assert_eq!(
-            post.status,
-            if fail {
-                crate::compaction::CompactionStatus::Failed
-            } else {
-                crate::compaction::CompactionStatus::Compacted
-            },
-            "{post:?}"
+            post.failure_kind.as_deref(),
+            Some("reported_context_unavailable")
         );
-        assert_eq!(model.calls.load(Ordering::SeqCst), 4);
-        {
-            let requests = model.requests.lock().unwrap();
-            let utility = serde_json::to_string(&requests[3]).unwrap();
-            assert!(utility.contains("FOLDED-OLD-SOURCE"));
-            assert!(
-                !utility.contains("old old old"),
-                "covered raw source cannot resurrect"
-            );
-        }
+        assert_eq!(model.calls.load(Ordering::SeqCst), 3);
         agent.close_session(id).await.unwrap();
         let saved = complete_display_summary(&agent, id).await;
-        if fail {
-            assert!(saved.len() > 64 * 1024 && saved.contains("EXACT-UNREAD-TAIL"));
-        } else {
-            assert_eq!(saved, "FINAL-SEMANTIC-SUMMARY");
-        }
+        assert!(saved.len() > 64 * 1024 && saved.contains("EXACT-UNREAD-TAIL"));
     }
 }
 
 #[tokio::test]
-async fn settled_projection_post_cancel_and_append_failure_preserve_their_committed_boundaries() {
+async fn settled_projection_post_noop_and_append_failure_preserve_their_committed_boundaries() {
     let gate = Arc::new(Gate::new());
     let (data, _guard, id, model, mut agent) =
         settled_projection_fixture("wide-projection-post-cancel", 28_500, Step::Text("done")).await;
@@ -280,7 +263,7 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
     let turn = send_text(&mut agent, id, &padded("current user")).await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    gate.wait_started().await;
+    wait_post_turn_noop(&agent, id, turn.loop_id).await;
     let path = data
         .join("sessions")
         .join(id.to_string())
@@ -288,7 +271,7 @@ async fn settled_projection_post_cancel_and_append_failure_preserve_their_commit
     let promoted = std::fs::read(&path).unwrap();
     assert!(promoted.len() > 64 * 1024);
     assert!(
-        agent
+        !agent
             .cancel_compaction(CompactSession {
                 session_id: id,
                 operation_id: format!("auto-{}", turn.loop_id)

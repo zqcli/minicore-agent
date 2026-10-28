@@ -1,5 +1,24 @@
 use super::*;
 
+fn reported_tool(tokens: u64) -> Step {
+    let id = ToolCallId::new("reported-read").unwrap();
+    Step::Events(vec![
+        ModelEvent::ToolCallStart {
+            tool_call_id: id.clone(),
+            tool_name: "read".parse().unwrap(),
+        },
+        ModelEvent::tool_call_arguments_delta(id.clone(), json!({"path":"a.txt"}).to_string())
+            .unwrap(),
+        ModelEvent::ToolCallEnd { tool_call_id: id },
+        ModelEvent::Usage {
+            usage: Usage::default().with_provider_total_tokens(Some(tokens)),
+        },
+        ModelEvent::Finish {
+            reason: ModelFinishReason::ToolCalls,
+        },
+    ])
+}
+
 pub(super) fn pi_history_exchange(loop_id: LoopId, index: u32, bytes: usize) -> Vec<HistoryItem> {
     let call_id = ToolCallId::new(format!("pi-read-{index}")).unwrap();
     vec![
@@ -19,7 +38,7 @@ pub(super) fn pi_history_exchange(loop_id: LoopId, index: u32, bytes: usize) -> 
             )],
             provider_replay: None,
             finish_reason: ModelFinishReason::ToolCalls,
-            usage: Usage::default(),
+            usage: Usage::default().with_provider_total_tokens(Some(200_000)),
         }),
         HistoryItem::ToolResult(ToolResultHistory {
             loop_id,
@@ -44,7 +63,7 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
         5_000,
         [
             Step::gated_tool(gate.clone(), "read", json!({"path":"a.txt"})),
-            Step::ToolCall("read", json!({"path":"a.txt"})),
+            reported_tool(5_000),
             Step::Text("First read was completed; keep its findings."),
             Step::Text("done"),
         ],
@@ -173,7 +192,7 @@ async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
 }
 
 #[tokio::test]
-async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_input() {
+async fn legacy_fully_covered_summary_does_not_trigger_after_reopen_with_smaller_model() {
     let large_summary: &str = Box::leak("old summary ".repeat(3_000).into_boxed_str());
     let (data, _guard, session_id, _model, mut agent) = auto_admission_fixture_with_window(
         "pi-summary-reopen",
@@ -185,9 +204,8 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
         None,
     )
     .await;
-    // Seed an old-format, fully covered v1 snapshot directly. Ordinary
-    // compact now retains a recent tail; reopening legacy full coverage must
-    // still exercise the original threshold refresh behavior.
+    // Legacy snapshots have no supersession identity, so source coverage
+    // determines which reports remain eligible.
     let history = read_store_history(&data, session_id).await;
     let source = agent
         .store
@@ -201,6 +219,7 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
         &record,
         &source,
         &BoundedText::new(large_summary).unwrap(),
+        None,
     )
     .unwrap();
     assert!(matches!(
@@ -241,18 +260,13 @@ async fn pi_reopen_smaller_model_refreshes_fully_covered_summary_then_sends_new_
     wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
     {
         let requests = smaller.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].tools().is_empty());
-        assert!(requests[1].messages().iter().any(
-        |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "new after reopening exact")
-    ));
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].tools().is_empty());
+        assert!(requests[0].messages().iter().any(
+            |message| matches!(message, ModelMessage::User(text) if text.as_ref() == "new after reopening exact")
+        ));
         assert!(
-            serde_json::to_string(requests[1].messages())
-                .unwrap()
-                .contains("Refreshed historical facts.")
-        );
-        assert!(
-            !serde_json::to_string(requests[1].messages())
+            serde_json::to_string(requests[0].messages())
                 .unwrap()
                 .contains("old summary old summary")
         );
@@ -356,7 +370,7 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
         5_000,
         [
             Step::ToolCall("read", json!({"path":"a.txt"})),
-            Step::ToolCall("read", json!({"path":"a.txt"})),
+            reported_tool(5_000),
             Step::Text(first_summary),
             Step::ContextOverflowNotStarted,
             Step::Text("Recovered historical facts"),

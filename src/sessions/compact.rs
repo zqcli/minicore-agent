@@ -199,8 +199,16 @@ impl Session {
         .map_err(|_| "emergency_settlement_timeout")?
         .map_err(|_| "emergency_settlement_store")?
         .ok_or("emergency_settlement_history_changed")?;
-        let bytes = crate::compaction::encode_snapshot(turn.session_id, &record, &source, &content)
-            .ok_or("emergency_settlement_snapshot_too_large")?;
+        let superseded_usage = crate::compaction::latest_assistant(history.iter())
+            .map(|assistant| (assistant.loop_id, assistant.request_index));
+        let bytes = crate::compaction::encode_snapshot(
+            turn.session_id,
+            &record,
+            &source,
+            &content,
+            superseded_usage,
+        )
+        .ok_or("emergency_settlement_snapshot_too_large")?;
         let _io = tokio::time::timeout_at(deadline.into(), self.shared.io.lock())
             .await
             .map_err(|_| "emergency_settlement_timeout")?;
@@ -237,9 +245,12 @@ impl Session {
                 {
                     return Err("emergency_settlement_history_changed");
                 }
-                self.shared
-                    .compaction
-                    .publish(content, source.covered_loop_count, history.len());
+                self.shared.compaction.publish(
+                    content,
+                    source.covered_loop_count,
+                    history.len(),
+                    superseded_usage,
+                );
                 Ok(())
             }
             // Unknown/rejected writes keep the old projection. The current
@@ -289,7 +300,6 @@ impl Session {
             previous_summary,
             previous_covered_item_count,
             hard_tokens: budget.hard_tokens,
-            automatic_budget: Some(Arc::clone(&auto.budget)),
             trigger_tokens: Some(budget.trigger_tokens),
             deadline: Instant::now()
                 .checked_add(inner.options.model_timeout)
@@ -437,7 +447,6 @@ impl Session {
                 previous_summary,
                 previous_covered_item_count,
                 hard_tokens: descriptor.context_window,
-                automatic_budget: None,
                 trigger_tokens: None,
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
@@ -676,6 +685,8 @@ impl Session {
                         summary.clone(),
                         source.covered_loop_count,
                         source.covered_item_count as usize,
+                        crate::compaction::latest_assistant(reservation.history.iter())
+                            .map(|assistant| (assistant.loop_id, assistant.request_index)),
                     );
                 }
                 Ok(CompactionCommit::Store(SummaryCommit::Committed))
@@ -725,10 +736,19 @@ pub(super) async fn check_post_turn(
     reservation: &CompactionReservation,
 ) -> PostTurnCheck {
     let history_len = reservation.history.len();
-    let (Some(budget), Some(trigger)) = (&reservation.automatic_budget, reservation.trigger_tokens)
-    else {
-        unreachable!("a post-turn reservation carries its budget and trigger");
+    let trigger = reservation.trigger_tokens.expect("post-turn trigger");
+    let suffix = &reservation.history[reservation.previous_covered_item_count..];
+    let before = session.shared.compaction.reported_context(suffix.iter());
+    #[cfg(test)]
+    super::tests::pause_worker(&PAUSE_IN_POST_TURN_CHECK, session.session_id()).await;
+    let Some(before) = before else {
+        let mut result = noop_compaction(reservation, 0, None);
+        result.failure_kind = Some("reported_context_unavailable".into());
+        return PostTurnCheck::Settled(result);
     };
+    if before < trigger {
+        return PostTurnCheck::Settled(noop_compaction(reservation, 0, Some(before)));
+    }
     let input = match prepare_compaction_input(reservation).await {
         Ok(input) => input,
         Err(kind) => {
@@ -739,46 +759,6 @@ pub(super) async fn check_post_turn(
             ));
         }
     };
-    let suffix = &reservation.history[reservation.previous_covered_item_count..];
-    let before = crate::compaction::auto_compose(
-        &input.project_instructions,
-        reservation.previous_summary.as_ref(),
-        suffix,
-        &[],
-    )
-    .ok()
-    .and_then(|(mut fixed, history)| {
-        fixed.extend(history);
-        minicore_runtime::model::ModelRequest::new(
-            fixed,
-            reservation.tool_schemas.clone(),
-            minicore_runtime::model::ModelLimits::default(),
-            reservation.record.reasoning,
-        )
-        .ok()
-    })
-    .and_then(|request| {
-        let fallback = budget.estimate_request_tokens(&request, None, None).ok()?;
-        Some(session.shared.compaction.threshold_estimate(
-            reservation.model.descriptor(),
-            &request,
-            &suffix.iter().collect::<Vec<_>>(),
-            fallback,
-            &**budget,
-        ))
-    });
-    let Some(before) = before else {
-        return PostTurnCheck::Settled(failed_compaction(
-            &reservation.operation,
-            "context_estimate_unavailable",
-            history_len,
-        ));
-    };
-    #[cfg(test)]
-    super::tests::pause_worker(&PAUSE_IN_POST_TURN_CHECK, session.session_id()).await;
-    if before < trigger {
-        return PostTurnCheck::Settled(noop_compaction(reservation, 0, Some(before)));
-    }
     PostTurnCheck::Compact(input)
 }
 
@@ -793,11 +773,7 @@ pub(super) async fn run_compaction_inner(
     if reservation.operation.cancellation_requested() {
         return failed_compaction(&reservation.operation, "cancelled", history_len);
     }
-    // A promoted emergency projection covers every raw item, but its final
-    // answer/retained tail can still approach the budget. Automatic operations
-    // must estimate that effective summary and may refresh it. Manual's
-    // established fully-covered Noop semantics remain unchanged.
-    if history_len == 0 || (retained_item_count == 0 && reservation.trigger_tokens.is_none()) {
+    if retained_item_count == 0 {
         return noop_compaction(reservation, 0, None);
     }
 
@@ -860,12 +836,7 @@ pub(super) async fn run_compaction_inner(
             Err(kind) => return failed_compaction(&reservation.operation, kind, history_len),
         },
     };
-    // A fully-covered promoted emergency snapshot retains its original
-    // automatic refresh path. It cannot recover raw covered items into a tail.
-    let refresh_full = retained_item_count == 0 && reservation.trigger_tokens.is_some();
-    let source = if refresh_full {
-        &anchors.full
-    } else if let Some(prefix) = eligible_prefix {
+    let source = if let Some(prefix) = eligible_prefix {
         prefix
     } else {
         // Only a post-turn operation reaches here, at or above its trigger with
@@ -904,16 +875,12 @@ pub(super) async fn run_compaction_inner(
     };
     let covered_item_count = source.covered_item_count as usize;
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
-    let generation = if refresh_full {
-        generate_summary(&input, &reservation.operation.cancellation).await
-    } else {
-        crate::compaction::generate_summary_with_tail(
-            &input,
-            covered_item_count,
-            &reservation.operation.cancellation,
-        )
-        .await
-    };
+    let generation = crate::compaction::generate_summary_with_tail(
+        &input,
+        covered_item_count,
+        &reservation.operation.cancellation,
+    )
+    .await;
     if !reservation.operation.cancellation_requested()
         && !matches!(&generation, Err(error) if matches!(error.error, crate::compaction::UtilityError::Cancelled | crate::compaction::UtilityError::Timeout))
         && let Some(fingerprint) = fingerprint
@@ -953,6 +920,8 @@ pub(super) async fn run_compaction_inner(
         &reservation.record,
         source,
         &generated.content,
+        crate::compaction::latest_assistant(reservation.history.iter())
+            .map(|assistant| (assistant.loop_id, assistant.request_index)),
     ) else {
         return failed_compaction_with_usage(
             &reservation.operation,

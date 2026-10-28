@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Automatic compaction now decides only from the latest Assistant's
+  provider-reported context usage, which survives restart, reopen, configuration
+  reload and model/provider changes. A restart does not cause compaction unless
+  that report reached the trigger; model changes only change the denominator.
+  New prompts, steers and tool results do not add estimated tokens to the trigger.
+- After successful compaction, automatic threshold checks wait for a new
+  Assistant response with usage. Missing usage on the latest response also
+  prevents threshold compaction, without using an older report or estimating.
+  The optional `summary.json` supersession identity preserves this across reopen;
+  legacy summaries use their source coverage as the cutoff. Provider-overflow
+  recovery and utility sizing/retention are unchanged.
+- `session.context.automatic.*.before_tokens` now means provider-reported
+  context, not a request estimate. Its `after_tokens` and budget estimate fields
+  are unchanged. Post-turn checks with no eligible usage return `noop` with
+  `reported_context_unavailable` and no token figures.
+
 ## 0.8.1 — 2026-10-27
 
 - A failed model request now keeps what the provider said. The model error of a

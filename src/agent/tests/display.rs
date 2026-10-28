@@ -203,7 +203,7 @@ async fn display_history_chunks_unicode_summary_and_rejects_summary_only_replace
     agent.open_session(session_id).await.unwrap();
     let state = agent.loaded_session(session_id).unwrap().compaction_state();
     let body = "中文🙂\\\"\n".repeat(1_000);
-    state.publish(BoundedText::new(&body).unwrap(), 1, 2);
+    state.publish(BoundedText::new(&body).unwrap(), 1, 2, None);
     let mut request = display_read(session_id);
     request.limit = 1;
     request.max_bytes = Some(2048);
@@ -230,6 +230,7 @@ async fn display_history_chunks_unicode_summary_and_rejects_summary_only_replace
         BoundedText::new("new summary, unchanged history").unwrap(),
         1,
         2,
+        None,
     );
     assert!(matches!(
         agent.read_session(request).await,
@@ -266,7 +267,7 @@ async fn display_history_invalid_summary_falls_back_and_never_crosses_valid_boun
     assert_eq!(page.projection.as_ref().unwrap().covered_item_count, 0);
     assert_eq!(page.items[0].index, 0);
     let state = agent.loaded_session(session_id).unwrap().compaction_state();
-    state.publish(BoundedText::new("all loops covered").unwrap(), 2, 4);
+    state.publish(BoundedText::new("all loops covered").unwrap(), 2, 4, None);
     let page = agent.read_session(display_read(session_id)).await.unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].index, 3);

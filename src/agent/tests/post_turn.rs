@@ -27,7 +27,23 @@ async fn runtime_trigger_fixture(
         250_000,
         items,
         [
-            Step::Text(answer),
+            Step::Events(
+                answer
+                    .as_bytes()
+                    .chunks(4_000)
+                    .map(|chunk| {
+                        ModelEvent::text_delta(std::str::from_utf8(chunk).unwrap()).unwrap()
+                    })
+                    .chain([
+                        ModelEvent::Usage {
+                            usage: Usage::default().with_provider_total_tokens(Some(237_500)),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ])
+                    .collect(),
+            ),
             Step::Text("historical reads summarized"),
             Step::Text("next answer"),
         ],
@@ -323,7 +339,7 @@ async fn compaction_operation_ids_are_bounded_and_reset_on_reopen() {
 }
 
 /// The result of the post-turn check of `loop_id`, once it has one.
-async fn wait_post_turn_result(
+pub(super) async fn wait_post_turn_result(
     agent: &Agent,
     session_id: SessionId,
     loop_id: LoopId,

@@ -5,9 +5,7 @@ use std::time::Instant;
 
 use minicore_runtime::LoopId;
 use minicore_runtime::history::HistoryItem;
-use minicore_runtime::model::{
-    ModelDescriptor, ModelLimits, ModelMessage, ModelRequest, ReasoningPreference,
-};
+use minicore_runtime::model::{ModelLimits, ModelMessage, ModelRequest, ReasoningPreference};
 use minicore_runtime::tools::ToolSpec;
 use minicore_runtime::value::BoundedText;
 use serde::Serialize;
@@ -29,21 +27,11 @@ pub(crate) struct ConsolidatedSummary {
     pub(crate) content: BoundedText,
 }
 
-#[derive(Clone)]
-struct IssuedProjection {
-    loop_id: LoopId,
-    request_index: u32,
-    summary_generation: u64,
-    framing: [u8; 32],
-    provider_identity: usize,
-}
-
 #[derive(Default)]
 pub(super) struct ThresholdState {
     consolidated: Option<ConsolidatedSummary>,
     attempted: Option<(LoopId, u32)>,
     source: Option<[u8; 32]>,
-    issued: Option<IssuedProjection>,
     observation: AutomaticCompactionView,
 }
 
@@ -62,28 +50,6 @@ pub(crate) fn source_hash(value: &impl Serialize) -> Result<[u8; 32], UtilityErr
     let mut writer = HashWriter(Sha256::new());
     serde_json::to_writer(&mut writer, value).map_err(|_| UtilityError::Serialization)?;
     Ok(writer.0.finalize().into())
-}
-
-fn framing_hash(
-    descriptor: &ModelDescriptor,
-    request: &ModelRequest,
-    config_generation: u64,
-) -> Result<[u8; 32], UtilityError> {
-    let system = request
-        .messages()
-        .iter()
-        .filter(|item| matches!(item, ModelMessage::System(_)))
-        .collect::<Vec<_>>();
-    source_hash(&(
-        descriptor.model_ref.as_str(),
-        descriptor.context_window,
-        descriptor.supports_tools,
-        &descriptor.supported_reasoning,
-        request.reasoning(),
-        system,
-        request.tools(),
-        config_generation,
-    ))
 }
 
 impl CompactionState {
@@ -136,95 +102,6 @@ impl CompactionState {
             state.attempted = None;
         }
         removed
-    }
-
-    pub(crate) fn note_normalized_projection(
-        &self,
-        raw: &[HistoryItem],
-        normalized: &[HistoryItem],
-    ) {
-        if raw != normalized {
-            self.threshold.lock().unwrap().issued = None;
-        }
-    }
-
-    pub(crate) fn note_issued_projection(
-        &self,
-        loop_id: LoopId,
-        request_index: u32,
-        descriptor: &ModelDescriptor,
-        request: &ModelRequest,
-        budget: &dyn crate::models::ProviderBudget,
-    ) {
-        let settings = self.request_settings();
-        let issued = framing_hash(descriptor, request, settings.config_generation)
-            .ok()
-            .map(|framing| IssuedProjection {
-                loop_id,
-                request_index,
-                summary_generation: settings.summary_generation,
-                framing,
-                provider_identity: budget as *const dyn crate::models::ProviderBudget as *const ()
-                    as usize,
-            });
-        self.threshold.lock().unwrap().issued = issued;
-    }
-
-    pub(crate) fn threshold_estimate(
-        &self,
-        descriptor: &ModelDescriptor,
-        request: &ModelRequest,
-        history: &[&HistoryItem],
-        fallback: u64,
-        budget: &dyn crate::models::ProviderBudget,
-    ) -> u64 {
-        let settings = self.request_settings();
-        let issued = self.threshold.lock().unwrap().issued.clone();
-        let Some(issued) = issued.filter(|anchor| {
-            anchor.summary_generation == settings.summary_generation
-                && anchor.provider_identity
-                    == budget as *const dyn crate::models::ProviderBudget as *const () as usize
-        }) else {
-            return fallback;
-        };
-        if framing_hash(descriptor, request, settings.config_generation).ok()
-            != Some(issued.framing)
-        {
-            return fallback;
-        }
-        let Some((index, usage)) =
-            history
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(index, item)| match item {
-                    HistoryItem::Assistant(assistant)
-                        if assistant.loop_id == issued.loop_id
-                            && assistant.request_index == issued.request_index =>
-                    {
-                        crate::presentation::context_tokens(assistant.usage)
-                            .filter(|value| *value > 0)
-                            .map(|usage| (index, usage))
-                    }
-                    _ => None,
-                })
-        else {
-            return fallback;
-        };
-        let mut tokens = usage;
-        for item in &history[index + 1..] {
-            let Ok(message) = utility::history_message(item) else {
-                return fallback;
-            };
-            let Ok(bytes) = serde_json::to_vec(&message) else {
-                return fallback;
-            };
-            let Some(next) = tokens.checked_add(bytes.len().div_ceil(4) as u64) else {
-                return fallback;
-            };
-            tokens = next;
-        }
-        tokens
     }
 
     /// Qualify durability without erasing the original attempt or its usage.
@@ -335,37 +212,22 @@ pub(crate) async fn consolidate(
     if !recovery && input.request_index == 0 && input.base.is_empty() && input.summary.is_none() {
         return Ok(ProjectionResult::unchanged(before_request));
     }
-    let trigger_before = if input.request_index == 0 && !recovery {
-        // The first Runtime boundary contains only new User/Steer items.
-        // They stay raw but do not participate in the pre-user threshold.
-        let old_len = before_request
-            .messages()
-            .len()
-            .saturating_sub(input.appended.len());
-        let first = make(before_request.messages()[..old_len].to_vec())?;
-        let fallback = auto
-            .budget
-            .estimate_request_tokens(&first, None, None)
-            .map_err(|_| UtilityError::Serialization)?;
-        state.threshold_estimate(
-            auto.model.descriptor(),
-            &first,
-            &input.base.iter().collect::<Vec<_>>(),
-            fallback,
-            &*auto.budget,
-        )
+    let trigger_before = if recovery {
+        before
     } else {
-        state.threshold_estimate(
-            auto.model.descriptor(),
-            &before_request,
-            &projection.items,
-            before,
-            &*auto.budget,
-        )
+        let history = if input.request_index == 0 {
+            &projection.items[..input.base.len()]
+        } else {
+            &projection.items
+        };
+        let Some(reported) = state.reported_context(history.iter().copied()) else {
+            return Ok(ProjectionResult::unchanged(before_request));
+        };
+        if reported < budget.trigger_tokens {
+            return Ok(ProjectionResult::unchanged(before_request));
+        }
+        reported
     };
-    if !recovery && trigger_before < budget.trigger_tokens {
-        return Ok(ProjectionResult::unchanged(before_request));
-    }
 
     let covered = projection.coverage(input.base.len(), !recovery && input.request_index > 0);
     let super::auto::Projection {
@@ -555,6 +417,8 @@ pub(crate) async fn consolidate(
         if !state.install_consolidated(consolidated) {
             return Err(UtilityError::TooLarge);
         }
+        *state.superseded_usage.lock().unwrap() = super::latest_assistant(items.iter().copied())
+            .map(|assistant| (assistant.loop_id, assistant.request_index));
         Ok((request, after))
     })();
     let (request, after) = match validated {

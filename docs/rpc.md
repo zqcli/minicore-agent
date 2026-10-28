@@ -376,7 +376,12 @@ Manual and independent post-turn compaction, loading of validated existing
 summaries, and bounded confirmed provider-overflow recovery are implemented.
 Prepare may run a bounded threshold summary before the first request or between
 assistant/tool rounds. Submit returns without awaiting utility; context reads are
-read-only. The default trigger is 95% of the effective input window.
+read-only. The default trigger is provider-reported context at or above 95% of
+the effective input window. Only the latest Assistant's usage is considered;
+missing or superseded usage never falls back to an estimate. Reports survive
+restart, reload and model/provider changes; a model change changes only the
+trigger denominator. Successful compaction supersedes the latest report until
+a new Assistant response with usage arrives, including after reopen.
 This document describes their wire behavior; recorded acceptance evidence and
 installation status are grouped in the [verification index](verification/README.md).
 
@@ -404,9 +409,12 @@ The deferred compact result has this shape:
 ```
 
 `status` is one of `compacted`, `noop`, `failed`, or `unknown_write`.
-`before_tokens` and `after_tokens` are bounded estimates and may be omitted
-when no model call was made. A failed result contains a safe `failure_kind`
-but never the generated summary body. `unknown_write` means the atomic
+`before_tokens` and `after_tokens` are bounded utility estimates for compaction
+attempts and may be omitted when no model call was made. A below-trigger
+post-turn `noop` instead carries the provider-reported context in both fields.
+Unknown or superseded usage produces `noop` with
+`failure_kind: "reported_context_unavailable"` and no token figures. A failed
+result contains a safe `failure_kind` but never the generated summary body. `unknown_write` means the atomic
 replacement outcome could not be established: the disk may have changed after
 the write or rename, while the old in-memory projection remains unpublished.
 Clients may reread state/context to confirm operation termination before deciding
@@ -435,8 +443,11 @@ the summarized prefix, and retained counts describe real remaining items.
 Manual operations with no newer eligible prefix return `noop`. Automatic checks
 return `noop` below their trigger and, above it, when no older prefix can be
 folded (for example a single huge loop); an unfit tail plus fixed content yields
-a budget failure. Neither case drops the tail or alters the previous snapshot. A fully
-covered emergency snapshot keeps its existing automatic refresh behavior.
+a budget failure. Neither case drops the tail or alters the previous snapshot.
+A fully covered snapshot without a subsequent report does not automatically
+refresh. The optional `superseded_usage` identity in `summary.json` also excludes
+pre-compaction usage in retained history. Legacy snapshots without it use their
+validated source coverage as the cutoff.
 
 ### `session.context`
 
@@ -490,8 +501,9 @@ starts, or `null` before an estimate is available. It is not a live context
 measure or provider metering and may retain the original rejected attempt's
 estimate after recovery; the reduced value is in `recovery.after_tokens`. The mandatory
 `automatic` object contains active/latest request-boundary threshold observations
-in `current` and `last`: operation ID, loop/request identity, before/after estimates,
-threshold/hard/target values, utility usage and outcome. Current is cleared before
+in `current` and `last`: operation ID, loop/request identity, provider-reported
+`before_tokens` and estimated `after_tokens`, threshold/hard/target values,
+utility usage and outcome. Current is cleared before
 request start or terminal events, including on dropped preparation. These latest
 slots are not a cumulative usage ledger. Settlement failures qualify the existing
 outcome string with `_settlement_failed` or `_settlement_unknown`, preserving
@@ -900,8 +912,8 @@ The timestamp is when the Agent accepted the Prompt, not when the loop or
 provider request completes. It may be omitted if the clock was unavailable.
 
 A send is never refused or delayed for the size of the history: automatic
-compaction is triggered by token estimates only, and there is no history item or
-byte limit. There is no `LoopSubmission::Preparing`. A successfully
+threshold compaction is triggered by provider-reported usage only, and there is
+no history item or byte limit. There is no `LoopSubmission::Preparing`. A successfully
 installed turn may later fail request preparation, utility cancellation, or a
 provider request; `turn.wait`/`turn.result` report that failure and its persistence,
 rather than pretending that the already accepted submit never started.

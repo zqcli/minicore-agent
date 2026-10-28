@@ -863,6 +863,7 @@ fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
         minicore_runtime::value::BoundedText::new("summary").unwrap(),
         1,
         0,
+        None,
     );
     key.request_index += 1;
     assert_eq!(presentation.snapshot().context.kind, ContextKind::Unknown);
@@ -919,6 +920,7 @@ fn reported_context_restores_only_last_valid_active_matching_model_usage() {
         minicore_runtime::value::BoundedText::new("summary").unwrap(),
         1,
         0,
+        None,
     );
     // A fully compacted history has no active suffix to restore.
     presentation.restore_context(&history[history.len()..], "main", 10_000);

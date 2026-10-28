@@ -381,7 +381,7 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
 }
 
 #[tokio::test]
-async fn post_turn_estimates_and_refreshes_a_fully_covered_emergency_projection() {
+async fn post_turn_skips_superseded_usage_in_a_fully_covered_emergency_projection() {
     let (data_dir, _guard) = fixture_dir("post-turn-refresh-emergency");
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -396,7 +396,23 @@ async fn post_turn_estimates_and_refreshes_a_fully_covered_emergency_projection(
             Step::ToolCall("read", json!({"path":"a.txt"})),
             Step::ContextOverflowNotStarted,
             Step::Text("summary of read tool"),
-            Step::Text(answer),
+            Step::Events(
+                answer
+                    .as_bytes()
+                    .chunks(4_000)
+                    .map(|chunk| {
+                        ModelEvent::text_delta(std::str::from_utf8(chunk).unwrap()).unwrap()
+                    })
+                    .chain([
+                        ModelEvent::Usage {
+                            usage: Usage::default().with_provider_total_tokens(Some(16_000)),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ])
+                    .collect(),
+            ),
             Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "post-turn summary"),
         ],
     )
@@ -416,18 +432,25 @@ async fn post_turn_estimates_and_refreshes_a_fully_covered_emergency_projection(
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_started())
-        .await
-        .expect("full emergency coverage still needs a near-budget post-turn check");
+    wait_post_turn_noop(&agent, info.session_id, turn.loop_id).await;
     let context = agent.session_context(info.session_id).unwrap();
     assert_eq!(context.coverage.retained_item_count, 0);
+    assert!(context.current_operation.is_none());
     assert_eq!(
-        context.current_operation.unwrap().operation_id,
-        format!("auto-{}", turn.loop_id)
+        context.last_result.unwrap().failure_kind.as_deref(),
+        Some("reported_context_unavailable")
     );
     agent.close_session(info.session_id).await.unwrap();
-    assert!(dropped.load(Ordering::SeqCst));
-    assert_eq!(model.calls.load(Ordering::SeqCst), 5);
+    agent.open_session(info.session_id).await.unwrap();
+    let session = agent.loaded_session(info.session_id).unwrap();
+    assert_eq!(
+        session
+            .compaction_state()
+            .reported_context(read_store_history(&data_dir, info.session_id).await.iter()),
+        None
+    );
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]

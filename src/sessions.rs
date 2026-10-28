@@ -26,7 +26,7 @@ use minicore_runtime::{InteractionId, LoopId};
 use crate::agent::SessionInfo;
 use crate::compaction::{
     AutoContext, AutomaticCompactionView, CompactionInput, CompactionOrigin, CompactionPolicy,
-    CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage, generate_summary,
+    CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage,
 };
 use crate::config::map_loop_start_error;
 use crate::error::AgentError;
@@ -208,7 +208,6 @@ struct CompactionReservation {
     hard_tokens: u64,
     /// Only post-turn operations use a soft trigger. Manual compaction is
     /// never gated by this estimate.
-    automatic_budget: Option<Arc<dyn crate::models::ProviderBudget>>,
     trigger_tokens: Option<u64>,
     deadline: Instant,
 }

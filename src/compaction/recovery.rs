@@ -382,6 +382,9 @@ async fn reconstruct_inner(
     super::utility::check_active(cancellation, deadline)?;
     if let Some((request, _, groups)) = best {
         if auto.state.install_emergency_groups(loop_id, groups) {
+            *auto.state.superseded_usage.lock().unwrap() =
+                super::latest_assistant(ticket.base.iter().chain(ticket.appended.iter()))
+                    .map(|assistant| (assistant.loop_id, assistant.request_index));
             return Ok(request);
         }
         return Err(RecoveryReconstructionError::Uncompressible);
@@ -464,13 +467,6 @@ impl CompactingModel {
             check_start(&context)?;
             let cancellation = context.cancellation.clone();
             let deadline = tokio::time::Instant::from_std(context.deadline);
-            self.state.note_issued_projection(
-                loop_id,
-                request_index,
-                self.inner.descriptor(),
-                &reduced,
-                &*self.budget,
-            );
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => Err(unknown_model_error(ModelErrorKind::Cancelled)),
@@ -550,13 +546,6 @@ impl CompactingModel {
         // only report `Unknown`.
         check_start(&context)?;
 
-        self.state.note_issued_projection(
-            loop_id,
-            request_index,
-            self.inner.descriptor(),
-            &request,
-            &*self.budget,
-        );
         let first_result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
@@ -673,13 +662,6 @@ impl CompactingModel {
         // Second start call. The pre-start checks above already covered the
         // not-yet-sent case; once this future exists an interruption can only
         // report `Unknown` delivery.
-        self.state.note_issued_projection(
-            loop_id,
-            request_index,
-            self.inner.descriptor(),
-            &reduced_request,
-            &*self.budget,
-        );
         let second_result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(unknown_model_error(ModelErrorKind::Cancelled)),

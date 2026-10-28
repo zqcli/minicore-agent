@@ -120,7 +120,7 @@ fn text(loop_id: LoopId, request_index: u32, value: &str) -> HistoryItem {
         content: vec![AssistantPart::Text(value.into())],
         provider_replay: None,
         finish_reason: ModelFinishReason::Stop,
-        usage: Usage::default(),
+        usage: Usage::default().with_provider_total_tokens(Some(200_000)),
     })
 }
 fn exchange(loop_id: LoopId, index: u32, bytes: usize) -> Vec<HistoryItem> {
@@ -142,7 +142,7 @@ fn exchange(loop_id: LoopId, index: u32, bytes: usize) -> Vec<HistoryItem> {
             )],
             provider_replay: None,
             finish_reason: ModelFinishReason::ToolCalls,
-            usage: Usage::default(),
+            usage: Usage::default().with_provider_total_tokens(Some(200_000)),
         }),
         HistoryItem::ToolResult(ToolResultHistory {
             loop_id,
@@ -180,6 +180,54 @@ fn input<'a>(
         limits: ModelLimits::default(),
         rejected_body_bytes: None,
     }
+}
+
+#[tokio::test]
+async fn low_reported_usage_does_not_compact_large_history_without_an_in_memory_anchor() {
+    let model = summary_model(8_000, "summary", None);
+    let auto = context(&model);
+    let mut base = exchange(LoopId::new().unwrap(), 0, 80_000);
+    if let HistoryItem::Assistant(assistant) = &mut base[0] {
+        assistant.usage = Usage::default().with_provider_total_tokens(Some(100));
+    }
+    let current = LoopId::new().unwrap();
+    let appended = vec![user(current, "continue", false)];
+    let system = BoundedText::new("system").unwrap();
+    let cancel = CancellationToken::new();
+    let result = consolidate(
+        input(&auto, &system, None, &base, &appended, current, 0, &cancel),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !result.compacted,
+        "reported usage below trigger must not compact"
+    );
+    assert_eq!(model.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_large_unmeasured_tool_result_does_not_trigger_a_mid_turn_compaction() {
+    let model = summary_model(8_000, "unused", None);
+    let auto = context(&model);
+    let current = LoopId::new().unwrap();
+    let mut appended = vec![user(current, "read", false)];
+    appended.extend(exchange(current, 0, 80_000));
+    if let HistoryItem::Assistant(assistant) = &mut appended[1] {
+        assistant.usage = Usage::default().with_provider_total_tokens(Some(100));
+    }
+    let system = BoundedText::new("system").unwrap();
+    let cancel = CancellationToken::new();
+    let result = consolidate(
+        input(&auto, &system, None, &[], &appended, current, 1, &cancel),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(!result.compacted);
+    assert_eq!(model.calls(), 0);
+    assert!(result.request.messages().iter().any(|message| matches!(message, ModelMessage::Tool { output, .. } if output.content().byte_len() == 80_000)));
 }
 
 #[tokio::test]
@@ -238,7 +286,7 @@ async fn default_ninety_five_projects_large_tool_history_without_raw_ticket_cap(
 }
 
 #[tokio::test]
-async fn many_small_sources_use_one_summary_and_generated_output_does_not_change_source_identity() {
+async fn successful_reduction_waits_for_a_new_report_even_when_its_estimate_stays_high() {
     let model = summary_model(8_000, &"s".repeat(30_600), None);
     let auto = context(&model);
     let system = BoundedText::new("s").unwrap();
@@ -268,10 +316,9 @@ async fn many_small_sources_use_one_summary_and_generated_output_does_not_change
                 .policy
                 .budget(model.descriptor().context_window)
                 .trigger_tokens,
-        "fixture must remain over the unchanged threshold to test source deduplication"
+        "an over-trigger estimate must not substitute for superseded usage"
     );
     let again = input(&auto, &system, None, &base, &appended, current, 1, &cancel);
-    again.auto.state.threshold.lock().unwrap().issued = None;
     assert!(
         consolidate(again, false)
             .await
@@ -325,7 +372,7 @@ async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
 }
 
 #[tokio::test]
-async fn summary_only_projection_can_refresh_after_reopen_or_smaller_model() {
+async fn summary_only_projection_does_not_trigger_without_reported_usage() {
     let model = summary_model(12_000, "Refreshed old summary", None);
     let mut auto = context(&model);
     auto.binding.policy.trigger_percent = 60;
@@ -348,22 +395,14 @@ async fn summary_only_projection_can_refresh_after_reopen_or_smaller_model() {
         false,
     )
     .await
-    .unwrap()
-    .into_compacted()
     .unwrap();
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(!result.compacted);
+    assert_eq!(model.calls(), 0);
     assert!(
         serde_json::to_string(result.request.messages())
             .unwrap()
-            .contains("Refreshed old summary")
+            .contains("old summary old summary")
     );
-    let settled = auto
-        .state
-        .settled_emergency_summary(current, &[], &appended, Some(&summary))
-        .unwrap()
-        .unwrap();
-    assert!(settled.as_str().contains("Refreshed old summary"));
-    assert!(!settled.as_str().contains("old summary old summary"));
 }
 
 #[tokio::test]
@@ -469,81 +508,25 @@ async fn no_progress_preserves_projection_and_accounts_single_call() {
 }
 
 #[test]
-fn usage_anchor_requires_matching_framing_and_projection_generation() {
-    let model = summary_model(8_000, "summary", None);
-    let auto = context(&model);
-    let current = LoopId::new().unwrap();
-    let request = ModelRequest::new(
-        vec![
-            ModelMessage::system("s").unwrap(),
-            ModelMessage::user("u").unwrap(),
-        ],
-        vec![],
-        ModelLimits::default(),
-        ReasoningPreference::Auto,
-    )
-    .unwrap();
-    auto.state
-        .note_issued_projection(current, 0, model.descriptor(), &request, &*auto.budget);
-    let mut assistant = text(current, 0, "answer");
-    if let HistoryItem::Assistant(value) = &mut assistant {
-        value.usage = Usage::default().with_provider_total_tokens(Some(7_999));
+fn latest_usage_is_unknown_when_missing_or_superseded_but_zero_is_known() {
+    let state = CompactionState::new();
+    let owner = LoopId::new().unwrap();
+    let mut history = vec![text(owner, 0, "old")];
+    assert_eq!(state.reported_context(history.iter()), Some(200_000));
+    let mut latest = text(owner, 1, "new");
+    if let HistoryItem::Assistant(assistant) = &mut latest {
+        assistant.usage = Usage::default();
     }
-    assert_eq!(
-        auto.state.threshold_estimate(
-            model.descriptor(),
-            &request,
-            &[&assistant],
-            123,
-            &*auto.budget
-        ),
-        7_999
-    );
-    let other_binding = Arc::new(crate::models::tests::DefaultProviderBudget);
-    assert_eq!(
-        auto.state.threshold_estimate(
-            model.descriptor(),
-            &request,
-            &[&assistant],
-            123,
-            &*other_binding
-        ),
-        123,
-        "same model label from a different provider binding must not reuse usage"
-    );
-    auto.state.settings.lock().unwrap().summary_generation += 1;
-    assert_eq!(
-        auto.state.threshold_estimate(
-            model.descriptor(),
-            &request,
-            &[&assistant],
-            123,
-            &*auto.budget
-        ),
-        123
-    );
-    auto.state
-        .note_issued_projection(current, 0, model.descriptor(), &request, &*auto.budget);
-    let changed = ModelRequest::new(
-        vec![
-            ModelMessage::system("changed AGENTS").unwrap(),
-            ModelMessage::user("u").unwrap(),
-        ],
-        vec![],
-        ModelLimits::default(),
-        ReasoningPreference::Auto,
-    )
-    .unwrap();
-    assert_eq!(
-        auto.state.threshold_estimate(
-            model.descriptor(),
-            &changed,
-            &[&assistant],
-            123,
-            &*auto.budget
-        ),
-        123
-    );
+    history.push(latest);
+    assert_eq!(state.reported_context(history.iter()), None);
+    if let HistoryItem::Assistant(assistant) = &mut history[1] {
+        assistant.usage = Usage::default().with_provider_total_tokens(Some(0));
+    }
+    assert_eq!(state.reported_context(history.iter()), Some(0));
+    *state.superseded_usage.lock().unwrap() = Some((owner, 1));
+    assert_eq!(state.reported_context(history.iter()), None);
+    history.push(text(owner, 2, "fresh"));
+    assert_eq!(state.reported_context(history.iter()), Some(200_000));
 }
 
 #[tokio::test]

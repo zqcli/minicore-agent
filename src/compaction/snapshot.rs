@@ -12,6 +12,8 @@ struct SummarySnapshot {
     reasoning: ReasoningPreference,
     source: SummarySource,
     summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_usage: Option<(LoopId, u32)>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -64,6 +66,7 @@ pub(crate) fn encode_snapshot(
     record: &SessionRecord,
     source: &HistoryPrefix,
     summary: &BoundedText,
+    superseded_usage: Option<(LoopId, u32)>,
 ) -> Option<Vec<u8>> {
     validate_snapshot_content(summary.as_str())?;
     let snapshot = SummarySnapshot {
@@ -79,6 +82,7 @@ pub(crate) fn encode_snapshot(
             sha256: source.sha256.clone(),
         },
         summary: summary.as_str().to_owned(),
+        superseded_usage,
     };
     let bytes = serde_json::to_vec(&snapshot).ok()?;
     (bytes.len() <= MAX_SUMMARY_FILE_BYTES).then_some(bytes)
@@ -119,6 +123,14 @@ pub(crate) async fn load_state(
     let Some(summary) = validate_snapshot_shape(&snapshot, session_id, history.len()) else {
         return state;
     };
+    if let Some(identity) = snapshot.superseded_usage
+        && !history.iter().any(|item| {
+            matches!(item, HistoryItem::Assistant(assistant)
+            if (assistant.loop_id, assistant.request_index) == identity)
+        })
+    {
+        return state;
+    }
     let Some(prefix) = store
         .read_history_prefix(session_id, snapshot.source.prefix_bytes, history)
         .await
@@ -173,6 +185,7 @@ fn validate_snapshot_shape(
         content,
         covered_loop_count: snapshot.source.covered_loop_count,
         covered_item_count,
+        superseded_usage: snapshot.superseded_usage,
     })
 }
 

@@ -267,7 +267,23 @@ async fn post_turn_wait_is_independent_and_compaction_cancel_does_not_change_tur
         )
         .items,
         [
-            Step::Text(answer),
+            Step::Events(
+                answer
+                    .as_bytes()
+                    .chunks(4_000)
+                    .map(|chunk| {
+                        ModelEvent::text_delta(std::str::from_utf8(chunk).unwrap()).unwrap()
+                    })
+                    .chain([
+                        ModelEvent::Usage {
+                            usage: Usage::default().with_provider_total_tokens(Some(38_000)),
+                        },
+                        ModelEvent::Finish {
+                            reason: ModelFinishReason::Stop,
+                        },
+                    ])
+                    .collect(),
+            ),
             Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "summary"),
         ],
         None,

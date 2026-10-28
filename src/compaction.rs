@@ -23,13 +23,14 @@ pub(crate) use snapshot::{
 };
 
 pub(crate) use projection::AutoContext;
+#[cfg(test)]
 pub(crate) use projection::compose as auto_compose;
 pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
     ActiveRecoveryTicket, CompactingModel, TicketFraming, compute_content_hash,
 };
 pub(crate) use utility::{
-    CompactionInput, UtilityError, generate_summary, generate_summary_with_tail, recent_tail_start,
+    CompactionInput, UtilityError, generate_summary_with_tail, recent_tail_start,
 };
 /// Failure kind recorded when request preparation cannot reduce a context
 /// without dropping user constraints or replaying tools.
@@ -129,12 +130,23 @@ pub(crate) struct LoadedSummary {
     pub(crate) content: BoundedText,
     pub(crate) covered_loop_count: u64,
     pub(crate) covered_item_count: usize,
+    pub(crate) superseded_usage: Option<(LoopId, u32)>,
+}
+
+pub(crate) fn latest_assistant<'a>(
+    history: impl DoubleEndedIterator<Item = &'a HistoryItem>,
+) -> Option<&'a minicore_runtime::history::AssistantHistory> {
+    history.rev().find_map(|item| match item {
+        HistoryItem::Assistant(assistant) => Some(assistant),
+        _ => None,
+    })
 }
 
 /// Session-local derived prompt state. It is deliberately separate from the
 /// session presentation and the global model catalog.
 pub(crate) struct CompactionState {
     snapshot: Mutex<Option<LoadedSummary>>,
+    superseded_usage: Mutex<Option<(LoopId, u32)>>,
     ephemeral: Mutex<Option<EphemeralSummary>>,
     /// Latest bounded full-request estimate. This is a scalar for
     /// `session.context`; it is intentionally not an unbounded observation
@@ -232,6 +244,7 @@ impl CompactionState {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             snapshot: Mutex::new(None),
+            superseded_usage: Mutex::new(None),
             ephemeral: Mutex::new(None),
             latest_request_tokens: Mutex::new(None),
             prepare_failure: Mutex::new(None),
@@ -244,6 +257,7 @@ impl CompactionState {
     }
 
     fn install(&self, summary: LoadedSummary) {
+        *self.superseded_usage.lock().unwrap() = summary.superseded_usage;
         *self.snapshot.lock().unwrap() = Some(summary);
         let mut settings = self.settings.lock().unwrap();
         settings.summary_generation = settings.summary_generation.wrapping_add(1);
@@ -254,12 +268,27 @@ impl CompactionState {
         content: BoundedText,
         covered_loop_count: u64,
         covered_item_count: usize,
+        superseded_usage: Option<(LoopId, u32)>,
     ) {
         self.install(LoadedSummary {
             content,
             covered_loop_count,
             covered_item_count,
+            superseded_usage,
         });
+    }
+
+    pub(crate) fn reported_context<'a>(
+        &self,
+        history: impl DoubleEndedIterator<Item = &'a HistoryItem>,
+    ) -> Option<u64> {
+        let assistant = latest_assistant(history)?;
+        if *self.superseded_usage.lock().unwrap()
+            == Some((assistant.loop_id, assistant.request_index))
+        {
+            return None;
+        }
+        crate::presentation::context_tokens(assistant.usage)
     }
 
     pub(crate) fn display_snapshot(&self) -> Option<LoadedSummary> {
