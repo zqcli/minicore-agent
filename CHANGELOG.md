@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.2 — 2026-10-28
 
 - Automatic compaction checks only before the first model request of a turn,
   using the latest Assistant's
