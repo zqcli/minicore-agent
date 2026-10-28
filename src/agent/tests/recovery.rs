@@ -381,8 +381,8 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
 }
 
 #[tokio::test]
-async fn post_turn_skips_superseded_usage_in_a_fully_covered_emergency_projection() {
-    let (data_dir, _guard) = fixture_dir("post-turn-refresh-emergency");
+async fn emergency_projection_supersedes_high_usage_without_an_independent_operation() {
+    let (data_dir, _guard) = fixture_dir("settled-emergency");
     let workspace = data_dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("a.txt"), "large raw tool ".repeat(500)).unwrap();
@@ -413,7 +413,7 @@ async fn post_turn_skips_superseded_usage_in_a_fully_covered_emergency_projectio
                     ])
                     .collect(),
             ),
-            Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "post-turn summary"),
+            Step::BlockUntilDrop(gate.clone(), Arc::clone(&dropped), "unexpected summary"),
         ],
     )
     .with_pacing(std::time::Duration::from_millis(2));
@@ -426,20 +426,17 @@ async fn post_turn_skips_superseded_usage_in_a_fully_covered_emergency_projectio
     let turn = send_text(&mut agent, info.session_id, "read a").await;
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), agent.wait_turn(turn))
         .await
-        .expect("turn.wait cannot wait for post-turn utility")
+        .expect("turn.wait must complete")
         .unwrap();
     assert!(matches!(
         result.report.outcome,
         minicore_runtime::LoopOutcome::Completed
     ));
-    wait_post_turn_noop(&agent, info.session_id, turn.loop_id).await;
+    settle_turn(&agent, info.session_id).await;
     let context = agent.session_context(info.session_id).unwrap();
     assert_eq!(context.coverage.retained_item_count, 0);
     assert!(context.current_operation.is_none());
-    assert_eq!(
-        context.last_result.unwrap().failure_kind.as_deref(),
-        Some("reported_context_unavailable")
-    );
+    assert!(context.last_result.is_none());
     agent.close_session(info.session_id).await.unwrap();
     agent.open_session(info.session_id).await.unwrap();
     let session = agent.loaded_session(info.session_id).unwrap();

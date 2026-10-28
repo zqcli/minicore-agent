@@ -254,7 +254,7 @@ async fn short_and_single_giant_loop_are_manual_noops_without_utility() {
 }
 
 #[tokio::test]
-async fn a_single_huge_loop_gives_a_noop_below_and_above_the_trigger() {
+async fn a_single_huge_loop_does_not_start_an_independent_compaction() {
     for window in [100_000, 4_000] {
         let answer = Box::leak("answer ".repeat(1_800).into_boxed_str());
         let (data, _guard, id, model, mut agent) = auto_admission_fixture_with_window(
@@ -269,18 +269,8 @@ async fn a_single_huge_loop_gives_a_noop_below_and_above_the_trigger() {
         .await;
         let turn = send_text(&mut agent, id, "question").await;
         wait_text(&agent, turn).await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                if let Some(result) = agent.session_context(id).unwrap().last_result {
-                    break result;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(result.status, CompactionStatus::Noop, "{result:?}");
-        assert!(result.utility_usage.is_none());
+        settle_turn(&agent, id).await;
+        assert!(agent.session_context(id).unwrap().last_result.is_none());
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             agent

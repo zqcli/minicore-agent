@@ -74,8 +74,8 @@ pub use changes::{
     ChangesListResult,
 };
 pub use compaction::{
-    AutomaticCompactionObservation, AutomaticCompactionView, CompactionOrigin, CompactionResult,
-    CompactionStatus, CompactionUtilityUsage, RecoveryObservation,
+    AutomaticCompactionObservation, AutomaticCompactionView, CompactionResult, CompactionStatus,
+    CompactionUtilityUsage, RecoveryObservation,
 };
 pub use config::{
     AgentConfig, ApprovalMode, CompactionConfig, ConfigError, LoopOverrides, Profile,

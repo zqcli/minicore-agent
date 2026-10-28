@@ -384,7 +384,7 @@ async fn f2_05_sealed_race_persists_future_options_without_active_revision() {
 
     gate.release();
     wait_text(&agent, turn).await;
-    wait_post_turn_noop(&agent, info.session_id, turn.loop_id).await;
+    settle_turn(&agent, info.session_id).await;
     let next = send_text(&mut agent, info.session_id, "next").await;
     wait_text(&agent, next).await;
     assert_eq!(model_b.requests().lock().unwrap().len(), 1);
@@ -465,7 +465,7 @@ async fn f2_06_sealed_update_installs_the_new_model_context_budget() {
 
     gate.release();
     wait_text(&agent, turn).await;
-    wait_post_turn_noop(&agent, info.session_id, turn.loop_id).await;
+    settle_turn(&agent, info.session_id).await;
     let next = send_text(&mut agent, info.session_id, "next").await;
     wait_text(&agent, next).await;
     assert_eq!(model_b.requests().lock().unwrap().len(), 1);

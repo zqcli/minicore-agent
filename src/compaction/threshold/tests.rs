@@ -318,7 +318,7 @@ async fn successful_reduction_waits_for_a_new_report_even_when_its_estimate_stay
                 .trigger_tokens,
         "an over-trigger estimate must not substitute for superseded usage"
     );
-    let again = input(&auto, &system, None, &base, &appended, current, 1, &cancel);
+    let again = input(&auto, &system, None, &base, &appended, current, 0, &cancel);
     assert!(
         consolidate(again, false)
             .await
@@ -330,7 +330,7 @@ async fn successful_reduction_waits_for_a_new_report_even_when_its_estimate_stay
 }
 
 #[tokio::test]
-async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
+async fn later_boundaries_preserve_all_exchanges_even_with_high_reported_usage() {
     let model = summary_model(9_000, "Older tool results summarized.", None);
     let auto = context(&model);
     let system = BoundedText::new("system").unwrap();
@@ -345,10 +345,10 @@ async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
         false,
     )
     .await
-    .unwrap()
-    .into_compacted()
     .unwrap();
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(!result.compacted);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert!(auto.state.automatic_view().last.is_none());
     assert!(super::super::recovery::validate_clean_tool_exchanges(
         result.request.messages()
     ));
@@ -366,9 +366,7 @@ async fn in_run_preserves_newest_exchange_and_every_current_user_verbatim() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(outputs, vec!["x".repeat(15_000)]);
-    let source = serde_json::to_string(model.requests.lock().unwrap()[0].messages()).unwrap();
-    assert!(!source.contains("keep exact A") && !source.contains("steer exact B"));
+    assert_eq!(outputs, vec!["x".repeat(25_000), "x".repeat(15_000)]);
 }
 
 #[tokio::test]
@@ -409,15 +407,14 @@ async fn summary_only_projection_does_not_trigger_without_reported_usage() {
 async fn irreducible_floor_and_empty_source_do_not_spend_utility() {
     let model = summary_model(4_000, "summary", None);
     let auto = context(&model);
-    let system = BoundedText::new("s").unwrap();
+    let system = BoundedText::new("s".repeat(17_000)).unwrap();
     let current = LoopId::new().unwrap();
     let cancel = CancellationToken::new();
-    let mut appended = vec![user(current, &"u".repeat(17_000), false)];
-    appended.extend(exchange(current, 0, 4_000));
-    appended.extend(exchange(current, 1, 4_000));
+    let appended = vec![user(current, "new", false)];
+    let base = exchange(LoopId::new().unwrap(), 0, 4_000);
     assert!(
         consolidate(
-            input(&auto, &system, None, &[], &appended, current, 2, &cancel),
+            input(&auto, &system, None, &base, &appended, current, 0, &cancel),
             false
         )
         .await
@@ -496,7 +493,7 @@ async fn no_progress_preserves_projection_and_accounts_single_call() {
     assert!(auto.state.automatic_view().current.is_none());
     assert!(
         consolidate(
-            input(&auto, &system, None, &base, &appended, current, 1, &cancel),
+            input(&auto, &system, None, &base, &appended, current, 0, &cancel),
             false
         )
         .await
@@ -685,9 +682,7 @@ async fn cancellation_releases_source_for_retry_and_usage_accumulates_per_turn()
     for index in 0..2 {
         let cancel = CancellationToken::new();
         let future = consolidate(
-            input(
-                &auto, &system, None, &base, &appended, current, index, &cancel,
-            ),
+            input(&auto, &system, None, &base, &appended, current, 0, &cancel),
             false,
         );
         tokio::pin!(future);

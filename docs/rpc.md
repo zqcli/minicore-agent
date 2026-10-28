@@ -96,13 +96,10 @@ The following orderings are not guaranteed:
 - any deferred response before responses to later requests. Wait for the response
   before sending a request that depends on that operation completing.
 
-A successful persisted turn is followed by a post-turn budget check. The check
-is not a compaction: it reports no `compaction` state, a `turn.send` during it is
-accepted and abandons it, and a check below its trigger only leaves a `noop` in
-`last_result`. Once the threshold is crossed it becomes an independent post-turn
-compaction. `turn.wait` does not wait for it, and while it exists new sends
-return `session_busy`. Clients discover it through state/context, retain unsent
-drafts, and must not automatically resend them.
+Automatic threshold compaction runs only before the first model request of a
+turn. Turn completion starts no compaction operation and publishes no automatic
+result in `last_result`. Settling an existing turn-start or emergency projection
+still belongs to the turn's owned worker; close and the next send join it.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -328,7 +325,7 @@ Sessions, ping, cancellation, and shutdown remain responsive.
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
   member containing SessionInfo (with `loaded: true`) after loading the persistent
   record and history from disk. It never starts a loop.
-- `session.close` cancels any active loop and manual/post-turn compaction, joins all
+- `session.close` cancels any active loop and manual compaction, joins all
   Session-owned workers, and returns `{"ok":true}`. Active loops receive Runtime
   shutdown cancellation, preserving reason `shutdown` rather than `user`.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`. The Store
@@ -339,21 +336,20 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   temp files; new temp names contain a random component rather than a restartable
   counter.
 - `session.state` takes a loaded Session ID and returns the current Session
-  state projection. While manual or post-turn compaction is in progress, the optional
+  state projection. While manual compaction is in progress, the optional
   `compaction` member reports only its safe operation ID, phase, and item counts;
   clients use its presence, rather than the ordinary loop `status`, to observe
   compaction busy. Future Runtime statuses map to `unknown` in both Session and
   active-loop status views.
-- `session.context` takes a loaded Session ID and returns the current manual or
-  post-turn compaction operation, validated-summary coverage, latest operation
+- `session.context` takes a loaded Session ID and returns the current manual
+  compaction operation, validated-summary coverage, latest operation
   result, and the estimated Runtime history budget. It is read-only and responds
   immediately, including while compaction is busy.
 - `session.compact` takes `{"session_id":"ses_...","operation_id":"..."}`
   and returns one deferred result after manual compaction finishes. The
   operation ID is non-empty printable ASCII and at most 128 bytes, must not
   start with reserved `auto-`, and cannot be reused during one loaded Session
-  lifetime. At most 4096 manual IDs are retained per loaded Session; automatic
-  `auto-{completed_loop_id}` IDs do not consume that quota. The bounded manual
+  lifetime. At most 4096 manual IDs are retained per loaded Session. The bounded
   set resets on close/reopen, and a new manual ID at
   the cap is rejected as invalid input. Compaction is admitted only for a
   loaded, idle, settled, unblocked Session. Other active work yields retryable
@@ -372,10 +368,10 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   for a local UI footer and tool cards. It performs no Store mutation, tool
   execution, or loop control.
 
-Manual and independent post-turn compaction, loading of validated existing
-summaries, and bounded confirmed provider-overflow recovery are implemented.
-Prepare may run a bounded threshold summary before the first request or between
-assistant/tool rounds. Submit returns without awaiting utility; context reads are
+Manual compaction, loading of validated existing summaries, and bounded
+confirmed provider-overflow recovery are implemented. Prepare may run a bounded
+threshold summary only before the first request of a turn (`request_index == 0`),
+never between assistant/tool rounds or after turn completion. Submit returns without awaiting utility; context reads are
 read-only. The default trigger is provider-reported context at or above 95% of
 the effective input window. Only the latest Assistant's usage is considered;
 missing or superseded usage never falls back to an estimate. Reports survive
@@ -410,10 +406,7 @@ The deferred compact result has this shape:
 
 `status` is one of `compacted`, `noop`, `failed`, or `unknown_write`.
 `before_tokens` and `after_tokens` are bounded utility estimates for compaction
-attempts and may be omitted when no model call was made. A below-trigger
-post-turn `noop` instead carries the provider-reported context in both fields.
-Unknown or superseded usage produces `noop` with
-`failure_kind: "reported_context_unavailable"` and no token figures. A failed
+attempts and may be omitted when no model call was made. A failed
 result contains a safe `failure_kind` but never the generated summary body. `unknown_write` means the atomic
 replacement outcome could not be established: the disk may have changed after
 the write or rename, while the old in-memory projection remains unpublished.
@@ -437,13 +430,14 @@ preference. History is sent as explicitly labeled data. The complete
 `summary.json` is a separately validated derived snapshot. On reopen, the
 summary is consumed as a non-system historical-data message, followed by its
 retained raw tail; the next current User message remains a separate input.
-Manual and ordinary post-turn compaction retain approximately 20,000 recent
+Manual compaction retains approximately 20,000 recent
 tokens rounded to complete stored loops. Result coverage counts describe only
 the summarized prefix, and retained counts describe real remaining items.
-Manual operations with no newer eligible prefix return `noop`. Automatic checks
-return `noop` below their trigger and, above it, when no older prefix can be
-folded (for example a single huge loop); an unfit tail plus fixed content yields
-a budget failure. Neither case drops the tail or alters the previous snapshot.
+Manual operations with no newer eligible prefix return `noop`; an unfit retained
+tail plus fixed content yields a budget failure. Neither case drops the tail or
+alters the previous snapshot. Turn-start checks skip compaction below their
+trigger or when the latest report is missing or superseded; they do not publish
+an independent result.
 A fully covered snapshot without a subsequent report does not automatically
 refresh. The optional `superseded_usage` identity in `summary.json` also excludes
 pre-compaction usage in retained history. Legacy snapshots without it use their
@@ -485,9 +479,9 @@ The result is returned directly:
 ```
 
 `current_operation`, when non-null, has the same safe progress shape exposed
-by `session.state` for independent manual or post-turn compaction. Automatic IDs
-are `auto-{completed_loop_id}`; manual creation rejects `auto-`, but cancellation
-accepts the actual automatic ID. `coverage` is
+by `session.state` for manual compaction. Manual creation still rejects `auto-`;
+turn-start threshold work is cancelled through `turn.cancel`, not
+`session.compact.cancel`. `coverage` is
 non-zero only for a currently validated summary snapshot; `retained_item_count`
 is calculated against the complete loaded history. `estimated_history_items`,
 `estimated_history_bytes`, and `estimated_history_tokens` describe only the
@@ -500,15 +494,15 @@ is the latest serialized request estimate recorded before the wrapped model
 starts, or `null` before an estimate is available. It is not a live context
 measure or provider metering and may retain the original rejected attempt's
 estimate after recovery; the reduced value is in `recovery.after_tokens`. The mandatory
-`automatic` object contains active/latest request-boundary threshold observations
-in `current` and `last`: operation ID, loop/request identity, provider-reported
+`automatic` object contains active/latest turn-start threshold observations
+in `current` and `last`: operation ID, loop/request identity (request index zero), provider-reported
 `before_tokens` and estimated `after_tokens`, threshold/hard/target values,
 utility usage and outcome. Current is cleared before
 request start or terminal events, including on dropped preparation. These latest
 slots are not a cumulative usage ledger. Settlement failures qualify the existing
 outcome string with `_settlement_failed` or `_settlement_unknown`, preserving
 before/after and utility usage; qualified outcomes are not exactly `compacted`
-and must not be counted as unqualified durable success. Independent operations remain represented
+and must not be counted as unqualified durable success. Manual operations remain represented
 by `current_operation`/`last_result`.
 When automatic compaction is enabled, `input_budget_tokens`,
 `trigger_tokens`, and `target_tokens` describe the model's already-reduced
@@ -526,7 +520,7 @@ re-runs tools or duplicates the current User/Steer messages. Successful reductio
 remain effective for subsequent requests in the active turn. Local serialized
 budget rejection is `InvalidRequest`, not confirmed upstream overflow; generic
 HTTP 413, partial output and unknown delivery do not trigger compaction.
-`last_result` is the latest manual or post-turn compaction result retained by
+`last_result` is the latest manual compaction result retained by
 this loaded Session process, not a durable history record. Failure to promote an
 emergency reduction after source persistence is observed separately as
 `recovery_failed` with `emergency_settlement_*`, preserving the original turn
@@ -918,17 +912,15 @@ installed turn may later fail request preparation, utility cancellation, or a
 provider request; `turn.wait`/`turn.result` report that failure and its persistence,
 rather than pretending that the already accepted submit never started.
 
-Request preparation may consolidate safe projected history once per logical
-request when the soft threshold is reached, preserving the new User/Steer and
-newest unread tool exchange. Failed/no-useful-source threshold attempts do not
+Request preparation may consolidate safe projected history before the first
+request of a turn when the reported context reaches the soft threshold,
+preserving the new User/Steer. Later requests do not check the threshold. Failed/no-useful-source threshold attempts do not
 locally veto ordinary sends. A confirmed safe pre-output upstream capacity
 rejection can separately compact and retry the rejected logical request once. Recovery stays within the active turn,
 shares its cancellation/deadline, and never redispatches completed tools.
-An independent post-turn operation instead requires Completed + Persisted and
-automatic compaction enabled, and exists only from the moment its threshold is
-crossed. `session.compact.cancel` cancels that operation,
-not the already completed turn; active threshold/recovery work is cancelled
-through the turn. Auto=false disables both automatic thresholds and capacity
+There are no independent automatic compaction operations. Active turn-start
+threshold work and recovery are cancelled through the turn; `session.compact.cancel`
+cancels only manual operations. Auto=false disables both automatic thresholds and capacity
 recovery; manual idle-only compaction remains available.
 
 `tool_rounds` in turn results and history/read summaries is an unsigned `u64`
@@ -2193,8 +2185,9 @@ requests are no longer vetoed by that estimate. Stored legacy errors remain vali
 Provider-authored text is exposed only through `provider` (0.8.1); the Agent adds
 no free-form diagnostics of its own.
 
-Compaction results include `origin`, either `manual` or `automatic`, from the
-operation that produced the result. Clients must not infer origin from IDs.
+Compaction results describe only manual operations and no longer include
+`origin`. Turn-start threshold work is observed through `automatic.current` and
+`automatic.last`, and overflow recovery through `recovery`.
 
 Responses providers may omit `cache_write_tokens`, as OpenAI does. Cache-write
 usage then stays unknown, and ordinary input is the input tokens less the cached

@@ -6,8 +6,9 @@ and tool rounds.
 
 ## Ordinary Turns And Durable History
 
-- Request preparation checks existing settled context before first user input,
-  then checks the effective projection before each subsequent assistant request.
+- Request preparation checks existing settled context only before the first
+  model request of a turn (`request_index == 0`). Later requests do not check
+  the automatic threshold, and turn completion starts no compaction.
   Runtime has already accepted the turn, so utility work never blocks RPC submit.
   Create/open, context reads and reload do not themselves invoke a model.
 - `history.jsonl` retains the complete sanitized turn and tool results. The Agent
@@ -26,7 +27,7 @@ and tool rounds.
   by an active emergency reduction. Workspace `AGENTS.md` is reread at each
   preparation, with its existing 64 KiB prefix and UTF-8/control validation.
 
-## Pi-Style Request Boundaries
+## Turn-Start Automatic Compaction
 
 The default trigger is `reported_context >= 95% * effective_input_window`;
 existing explicit percentages are preserved. The denominator is physical context
@@ -38,17 +39,18 @@ tool results is added. Missing usage on that latest Assistant means no threshold
 compaction; an older report is never substituted. History size alone neither
 compacts nor refuses a send. Target percent remains advisory.
 
-First-request checks exclude the newly accepted Prompt and Steers. Later checks
-run only after complete assistant/tool exchanges, under the active turn's normal
-cancellation and deadline. A single no-tools utility consolidates the effective
-old summary and all eligible old groups. Current User/Steer text and the newest
-unread complete tool exchange stay verbatim; incomplete exchanges are never cut.
+The turn-start check excludes the newly accepted Prompt and Steers and runs
+under the active turn's cancellation and preparation deadline. A single no-tools
+utility consolidates the effective old summary and eligible old groups. Current
+User/Steer text stays verbatim; incomplete exchanges are never cut. Growth inside
+the turn, even newly reported usage above the trigger, waits for the next turn's
+check unless a provider overflow rejection invokes emergency recovery.
 A fully covered summary without a subsequent Assistant report does not trigger
 threshold compaction.
 
 Source range/hash coverage and the original summary hash bind each turn-local
 projection. Only a strictly smaller, well-paired complete provider request is
-installed. One logical request permits at most one threshold utility; a stable
+installed. One turn permits at most one threshold utility; a stable
 raw-source/binding fingerprint prevents another attempt for unchanged sources,
 including after a failed attempt, but cancellation releases the fingerprint for
 a later retry. Generated summary text/generations are not new source. The retained
@@ -61,7 +63,7 @@ Threshold input is streamed from borrowed history through the existing 256 KiB
 source projection, with 2,000-character tool-result and serialized-argument projections. It does not clone
 raw history. A source over that projection is summarized in chunks, as described
 below. Failure preserves the old projection and the normal request
-can still be sent. In-turn utility work receives half the remaining preparation
+can still be sent. Turn-start utility work receives half the remaining preparation
 time. A utility timeout sends the unchanged projection only if its local estimate
 fits the hard limit and the parent deadline/cancellation still permits sending;
 otherwise preparation fails. Emergency recovery keeps its original deadline.
@@ -77,7 +79,7 @@ source coverage as the cutoff: only Assistant items in the retained suffix are
 eligible. In-turn reductions apply the same supersession rule before settlement.
 Emergency overflow recovery remains the safety net for unmeasured growth.
 
-## Independent Manual And Post-Turn Operations
+## Independent Manual Operations
 
 Manual `session.compact` is available only while idle. By default it retains
 approximately `min(20,000, effective_input_window / 4)` recent tokens, rounded toward older history to complete
@@ -86,41 +88,20 @@ The summary covers only the older prefix; display history and the next model
 request both retain the real recent answers. No raw history bytes are rewritten.
 Already summarized items never return to the retained tail. Empty/short history,
 an indivisible large loop, or repeating compact without a newer eligible prefix
-returns Noop without a utility call. It has an exact operation ID and deferred result. Manual creation rejects the reserved `auto-` prefix;
-cancellation accepts an actual automatic ID.
-
-With automatic compaction enabled, only a Completed turn whose history was
-Persisted can run a post-turn check. Failed/cancelled turns, failed
-persistence, blocked or closing Sessions do not start new automatic utility work.
-The check belongs to the turn's task and only measures; it is not an operation,
-reports no progress and does not block a submit. The original turn completion is
-published without waiting for it or for summary generation. Once the threshold is
-crossed it becomes the `auto-{completed_loop_id}` operation, which owns its own
-result, cancellation and utility usage and does not consume the manual
-operation-ID quota.
+returns Noop without a utility call. It has an exact operation ID and deferred
+result. Manual creation still rejects the reserved `auto-` prefix.
+`session.compact.cancel` cancels only a manual operation; automatic turn-start
+work and emergency recovery are cancelled through `turn.cancel`.
 
 `turn.send` never compacts first and never refuses a send for the size of the
 history. A history that no longer fits the model is reduced by the request
-boundary threshold, by emergency recovery after a provider rejection, or by a
+boundary threshold at turn start, by emergency recovery after a provider rejection, or by a
 manual compaction.
 
-The worker compares the latest eligible provider-reported context with the
-configured trigger, just like request preparation. Below the trigger it finishes
-Noop, silently and without a utility call or scanning history anchors. Unknown
-or superseded usage finishes Noop with `reported_context_unavailable`; no local
-estimate substitutes for it. At or above the trigger the operation becomes
-visible (`preparing`, `summarizing`, `committing`) and uses
-the single-call summary engine only if a safe older prefix can advance. If the
-recent complete-loop tail leaves no older prefix to fold, such as a single huge
-loop, the operation ends Noop. If it cannot fit with fixed request
-content and a summary, the operation fails explicitly without dropping that tail.
-A fully covered projection has no eligible report and does not automatically
-refresh; manual compaction of fully covered history remains Noop. An unchanged eligible prefix and request binding are not summarized again after
-an attempt; cancellation and timeout leave that source retryable. The configured
-target is advisory, not a reason to repeat a summary call. A submit that arrives during the check abandons it and proceeds; the next turn
-checks again. Once the operation is visible, a submit returns `session_busy`.
-`turn.wait` does not wait for either, and submit does not queue an automatic
-resend. Clients retain drafts and reconcile state/context.
+Manual work reports `preparing`, `summarizing`, and `committing` through Session
+state. While it is active, a submit returns `session_busy`. There is no independent
+automatic operation after a turn and no automatic result or Noop reason in
+`last_result`. Unknown or superseded usage simply skips the turn-start threshold.
 
 Close cancels all captured turn/compaction owners before joining them. Cancelling
 an independent operation does not change an already completed turn. Reload does
@@ -139,7 +120,7 @@ character count. This can omit important details at the end of a long result;
 the authoritative stored result is unchanged. This summary-only limit is separate
 from tool execution output limits.
 
-For manual/post-turn retention, an existing summary is supplied once alongside
+For manual retention, an existing summary is supplied once alongside
 only the newly covered prefix. The before estimate includes the old summary and
 all uncovered history; the after estimate includes the new summary and the
 complete retained tail. Both include fixed instructions and tool schemas. Tail
@@ -164,7 +145,7 @@ explicitly; nothing is silently trimmed.
 
 One successful generation must be nonempty, finish normally without tool calls,
 fit the existing 64 KiB summary limit, and produce a strictly smaller ordinary
-request. Manual/post-turn and recovery acceptance additionally require the
+request. Manual and recovery acceptance additionally require the
 reduced request to fit the hard budget; a threshold reduction does not promise
 that the complete ordinary request fits that heuristic ceiling. Utility input
 always retains its own hard budget. A result is not repeatedly summarized merely
@@ -219,12 +200,12 @@ and ordinary delivery retries; later genuine context growth in a new logical
 request can have a new recovery opportunity, without imposing a tool-round cap.
 
 After source history is definitely persisted and turn completion has been
-published, existing in-turn threshold or emergency reductions can be promoted
+published, existing turn-start or emergency reductions can be promoted
 through the same atomic snapshot store without another utility call. `turn.wait`
 does not wait for promotion. The session-owned task still owns settlement, and
-close/next-submit cleanup joins it. The post-turn check runs after settlement and
-respects the promoted snapshot's supersession point, rather than restoring
-covered raw history or estimating its size.
+close/next-submit cleanup joins it. Settlement does not start another threshold
+check or utility call. The next turn respects the promoted snapshot's
+supersession point rather than restoring covered raw history.
 This encodes historical data, not a newly generated semantic summary. The
 64 KiB generated-summary limit still applies to every utility output. The full
 settled projection is a different object: snapshots larger than 64 KiB are valid
@@ -242,7 +223,7 @@ outcome. Thus `compacted_settlement_unknown` is not an unqualified durable
 success or a confirmed rollback. They do not change the original turn result or
 erase its history. The previous durable
 in-memory projection remains, so a later turn may again encounter capacity limits.
-A successfully promoted snapshot survives post-turn Noop, utility failure or
+A successfully promoted snapshot survives later manual utility failure or
 cancellation; those operations do not restore its covered raw history. Failed or
 cancelled turns can also promote their complete projection after their original
 history is persisted, while append failure and close-race rejection keep their
@@ -264,18 +245,18 @@ There is no guarantee that an arbitrarily long turn can always be recovered.
   estimate after successful recovery; the reduced value is in `recovery.after_tokens`.
 - Budget/trigger/target use the already-reduced effective model input window;
   output reserve and safety margin are not subtracted a second time.
-- `automatic.current` / `last` describe the active/latest request-boundary
-  threshold attempt, keyed by loop and request index. A drop-safe guard clears
+- `automatic.current` / `last` describe the active/latest turn-start
+  threshold attempt, keyed by loop and request index (always zero). A drop-safe guard clears
   current before request/terminal events, retaining observed utility usage.
   The latest observation accumulates utility usage across attempts in the same
   turn; a new turn starts a new total. Unknown usage remains unknown.
-  Independent operations use `current_operation` and `last_result`; overflow
+  Manual operations use `current_operation` and `last_result`; overflow
   recovery uses `recovery`. Active threshold work is cancelled through the turn.
 - Utility usage is separate from ordinary turn usage; unknown fields are not
   filled with fabricated zeros. `tool_rounds` statistics are `u64`; the legacy
   configuration field remains `u16`, with zero meaning unlimited.
 
-Manual/post-turn results are `compacted`, `noop`, `failed`, or `unknown_write`.
+Manual results are `compacted`, `noop`, `failed`, or `unknown_write`.
 UnknownWrite means disk may have changed while the old in-memory projection
 remains. It does not set a permanent Session block or pretend a successful
 compaction. Clients may reread state/context to confirm operation termination;

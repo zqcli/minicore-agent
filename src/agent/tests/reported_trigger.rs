@@ -52,7 +52,7 @@ async fn reopened_first_boundary_uses_only_latest_report_even_with_large_tool_re
         );
         let turn = send_text(&mut agent, id, "continue").await;
         assert_completed(&*wait_text(&agent, turn).await);
-        wait_post_turn_noop(&agent, id, turn.loop_id).await;
+        settle_turn(&agent, id).await;
         assert_eq!(model.calls(), if should_compact { 2 } else { 1 });
         let context = agent.session_context(id).unwrap();
         assert_eq!(context.automatic.last.is_some(), should_compact);
@@ -80,14 +80,15 @@ async fn reopened_first_boundary_uses_only_latest_report_even_with_large_tool_re
 }
 
 #[tokio::test]
-async fn manual_post_turn_and_boundary_compaction_supersede_usage_across_reopen() {
-    for origin in ["manual", "post-turn", "boundary"] {
+async fn manual_turn_start_and_emergency_compaction_supersede_usage_across_reopen() {
+    for origin in ["manual", "emergency", "boundary"] {
         let gate = Arc::new(Gate::new());
         let scripts = match origin {
             "manual" => vec![Step::Text("summary"), Step::TextWithUsage("fresh", 100, 1)],
-            "post-turn" => vec![
-                Step::TextWithUsage("answer", 6_399, 1),
+            "emergency" => vec![
+                Step::ContextOverflowNotStarted,
                 Step::Text("summary"),
+                Step::gated_text(Arc::clone(&gate), "not returned"),
                 Step::TextWithUsage("fresh", 100, 1),
             ],
             _ => vec![
@@ -96,16 +97,13 @@ async fn manual_post_turn_and_boundary_compaction_supersede_usage_across_reopen(
                 Step::TextWithUsage("fresh", 100, 1),
             ],
         };
-        let (data, _guard, id, model, mut agent) = auto_admission_fixture_with_window(
-            origin,
-            true,
-            8_000,
-            history(Some(if origin == "post-turn" { 100 } else { 6_400 })),
-            scripts,
-            None,
-            None,
-        )
-        .await;
+        let mut items = history(Some(if origin == "emergency" { 100 } else { 6_400 }));
+        if origin == "emergency" {
+            items.truncate(2);
+        }
+        let (data, _guard, id, model, mut agent) =
+            auto_admission_fixture_with_window(origin, true, 8_000, items, scripts, None, None)
+                .await;
         if origin == "manual" {
             let result = agent
                 .compact(CompactSession {
@@ -120,8 +118,8 @@ async fn manual_post_turn_and_boundary_compaction_supersede_usage_across_reopen(
             );
         } else {
             let turn = send_text(&mut agent, id, "continue").await;
+            gate.wait_started().await;
             if origin == "boundary" {
-                gate.wait_started().await;
                 assert_eq!(
                     agent
                         .session_context(id)
@@ -132,17 +130,13 @@ async fn manual_post_turn_and_boundary_compaction_supersede_usage_across_reopen(
                         .outcome,
                     "compacted"
                 );
-                assert!(agent.cancel(turn).unwrap());
-                wait_text(&agent, turn).await;
             } else {
-                assert_completed(&*wait_text(&agent, turn).await);
-                let result =
-                    super::post_turn::wait_post_turn_result(&agent, id, turn.loop_id).await;
-                assert_eq!(
-                    result.status,
-                    crate::compaction::CompactionStatus::Compacted
-                );
+                let context = agent.session_context(id).unwrap();
+                assert!(context.automatic.last.is_none());
+                assert!(context.recovery.is_some());
             }
+            assert!(agent.cancel(turn).unwrap());
+            wait_text(&agent, turn).await;
         }
         agent.close_session(id).await.unwrap();
         let snapshot: serde_json::Value = serde_json::from_slice(
@@ -164,7 +158,7 @@ async fn manual_post_turn_and_boundary_compaction_supersede_usage_across_reopen(
         let calls = model.calls();
         let turn = send_text(&mut agent, id, "fresh response").await;
         assert_completed(&*wait_text(&agent, turn).await);
-        wait_post_turn_noop(&agent, id, turn.loop_id).await;
+        settle_turn(&agent, id).await;
         assert_eq!(model.calls(), calls + 1, "{origin}");
         assert!(agent.session_context(id).unwrap().automatic.last.is_none());
         assert_eq!(
@@ -288,7 +282,7 @@ async fn switching_model_keeps_the_report_from_the_previous_model() {
     );
     let turn = send_text(&mut agent, id, "continue").await;
     assert_completed(&*wait_text(&agent, turn).await);
-    wait_post_turn_noop(&agent, id, turn.loop_id).await;
+    settle_turn(&agent, id).await;
     assert_eq!(smaller.calls(), 2);
     assert_eq!(
         agent
@@ -335,7 +329,7 @@ async fn model_and_provider_reload_change_only_the_trigger_denominator() {
     );
     let turn = send_text(&mut agent, id, "continue").await;
     assert_completed(&*wait_text(&agent, turn).await);
-    wait_post_turn_noop(&agent, id, turn.loop_id).await;
+    settle_turn(&agent, id).await;
     assert_eq!(smaller.calls(), 2);
     assert_eq!(
         agent

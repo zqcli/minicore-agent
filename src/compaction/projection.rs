@@ -364,36 +364,6 @@ impl<'a> Projection<'a> {
             self.consolidated.as_ref(),
         )
     }
-
-    pub(crate) fn coverage(
-        &self,
-        base_len: usize,
-        retain_newest: bool,
-    ) -> BTreeSet<EphemeralGroupKey> {
-        // The newest exchange must reach the assistant before threshold compaction covers it.
-        let newest = retain_newest
-            .then(|| {
-                self.ranges.iter().rev().find(|(key, _)| {
-                    key.start >= base_len
-                        && matches!(self.items[key.start], HistoryItem::Assistant(_))
-                })
-            })
-            .flatten()
-            .map(|(key, _)| key);
-        let mut covered = self
-            .consolidated
-            .as_ref()
-            .map(|old| old.covered.clone())
-            .unwrap_or_default();
-        covered.extend(
-            self.ranges
-                .iter()
-                .map(|(key, _)| key)
-                .filter(|key| Some(*key) != newest)
-                .cloned(),
-        );
-        covered
-    }
 }
 
 pub(crate) fn merge_utility_usage(

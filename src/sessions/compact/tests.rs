@@ -21,6 +21,10 @@ impl Model for SummaryModel {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let events = vec![
             Ok(ModelEvent::text_delta(self.output.clone()).unwrap()),
+            Ok(ModelEvent::Usage {
+                usage: minicore_runtime::model::Usage::default()
+                    .with_provider_total_tokens(Some(8_000)),
+            }),
             Ok(ModelEvent::Finish {
                 reason: ModelFinishReason::Stop,
             }),
@@ -153,151 +157,56 @@ async fn append_text(session: &Session, bytes: usize) {
     .await;
 }
 
-fn reservation(
-    session: &Session,
-    model: &Arc<SummaryModel>,
-    trigger: u64,
-) -> CompactionReservation {
-    let inner = session.lock_inner();
-    CompactionReservation {
-        operation: CompactionOperation::new("auto-test".into(), CompactionOrigin::Automatic).0,
-        model: model.clone(),
-        record: inner.record.clone(),
-        history: Arc::clone(&inner.history),
-        workspace: Arc::clone(&inner.workspace),
-        tool_schemas: vec![],
-        previous_summary: None,
-        previous_covered_item_count: 0,
-        hard_tokens: model.descriptor.context_window,
-        trigger_tokens: Some(trigger),
-        deadline: Instant::now() + std::time::Duration::from_secs(5),
-    }
-}
-
-async fn run_post_turn(session: &Session, reservation: CompactionReservation) -> CompactionResult {
-    match check_post_turn(session, &reservation).await {
-        PostTurnCheck::Settled(result) => result,
-        PostTurnCheck::Compact(input) => {
-            run_compaction_inner(session, &reservation, Some(input)).await
-        }
-    }
-}
-
-async fn run_post_turn_worker(session: Session, reservation: CompactionReservation) {
-    match check_post_turn(&session, &reservation).await {
-        PostTurnCheck::Settled(result) => {
-            session.publish_compaction_result(&reservation.operation, result);
-        }
-        PostTurnCheck::Compact(input) => {
-            run_compaction(session, reservation, Some(input)).await;
-        }
-    }
-}
-
 #[tokio::test]
-async fn post_turn_uses_latest_report_and_never_substitutes_older_usage() {
-    let (_temp, agent, session, model) = fixture("summary", 8_000).await;
-    append_text(&session, 12_000).await;
-    append_text(&session, 12_000).await;
-    for (usage, reason) in [
-        (Some(3_999), None),
-        (None, Some("reported_context_unavailable")),
-    ] {
-        let mut check = reservation(&session, &model, 4_000);
-        let history = Arc::make_mut(&mut check.history);
-        let HistoryItem::Assistant(assistant) = history.last_mut().unwrap() else {
-            unreachable!()
-        };
-        assistant.usage =
-            minicore_runtime::model::Usage::default().with_provider_total_tokens(usage);
-        let result = run_post_turn(&session, check).await;
-        assert_eq!(result.status, CompactionStatus::Noop);
-        assert_eq!(result.before_tokens, usage);
-        assert_eq!(result.failure_kind.as_deref(), reason);
-        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+async fn high_final_usage_waits_until_the_next_turn_to_compact() {
+    let (_temp, mut agent, session, model) = fixture("answer", 8_000).await;
+    for _ in 0..3 {
+        append_text(&session, 6_000).await;
     }
-    let check = reservation(&session, &model, 4_000);
-    session.lock_inner().compaction = Some(Arc::clone(&check.operation));
-    run_post_turn_worker(session.clone(), check).await;
+    let first = agent
+        .send(crate::SendMessage {
+            session_id: session.session_id(),
+            text: "continue".into(),
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        session.context().last_result.unwrap().status,
-        CompactionStatus::Compacted
+        agent.wait_turn(first).await.unwrap().report.outcome,
+        minicore_runtime::LoopOutcome::Completed
     );
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    agent.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn below_trigger_does_not_scan_history_anchors() {
-    let (temp, agent, session, model) = fixture("summary", 100_000).await;
-    append_text(&session, 100).await;
-    std::fs::write(
-        temp.path()
-            .join("data/sessions")
-            .join(session.session_id().to_string())
-            .join("history.jsonl"),
-        "not history\n",
-    )
-    .unwrap();
-    let result = run_post_turn(&session, reservation(&session, &model, 95_000)).await;
-    assert_eq!(result.status, CompactionStatus::Noop);
-    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
-    agent.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn post_turn_retries_only_when_a_new_complete_prefix_is_available() {
-    let (_temp, agent, session, model) = fixture(&"s".repeat(8_000), 4_000).await;
-    append_text(&session, 6_000).await;
-    append_text(&session, 4_000).await;
-    let first = run_post_turn(&session, reservation(&session, &model, 1_000)).await;
-    assert_eq!(first.failure_kind.as_deref(), Some("no_progress"));
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    append_text(&session, 100).await;
-    let same = run_post_turn(&session, reservation(&session, &model, 1_000)).await;
-    assert_eq!(same.status, CompactionStatus::Noop);
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    append_text(&session, 4_000).await;
-    run_post_turn(&session, reservation(&session, &model, 1_000)).await;
-    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
-    agent.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn cancellation_during_post_turn_commit_allows_the_same_source_again() {
-    let (_temp, agent, session, model) = fixture("summary", 4_000).await;
-    append_text(&session, 6_000).await;
-    append_text(&session, 4_000).await;
-    let first = reservation(&session, &model, 1_000);
-    let operation = Arc::clone(&first.operation);
-    session.lock_inner().compaction = Some(Arc::clone(&operation));
-    let gate = Arc::new(Gate::new());
-    crate::store::SUMMARY_COMMIT_GATES.arm(session.session_id(), Arc::clone(&gate));
-    let worker = tokio::spawn(run_post_turn_worker(session.clone(), first));
-    gate.wait_started().await;
-    assert!(operation.cancel());
-    gate.release();
-    worker.await.unwrap();
+    let task = session.lock_inner().active.as_ref().unwrap().task.clone();
+    task.join().await.unwrap();
+    let operation = session.lock_inner().compaction.clone();
+    if let Some(operation) = operation {
+        operation.join().await.unwrap();
+    }
     assert_eq!(
-        operation
-            .result
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .failure_kind
-            .as_deref(),
-        Some("cancelled")
+        model.calls.load(Ordering::SeqCst),
+        1,
+        "turn completion must not call the summary model"
     );
-    assert!(session.shared.compaction.post_turn_source().is_none());
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    let retry = reservation(&session, &model, 1_000);
-    session.lock_inner().compaction = Some(Arc::clone(&retry.operation));
-    run_post_turn_worker(session.clone(), retry).await;
+    assert!(session.context().last_result.is_none());
+    assert!(session.shared.compaction.coverage().is_none());
+    let second = agent
+        .send(crate::SendMessage {
+            session_id: session.session_id(),
+            text: "next turn".into(),
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        session.context().last_result.unwrap().status,
-        CompactionStatus::Compacted
+        agent.wait_turn(second).await.unwrap().report.outcome,
+        minicore_runtime::LoopOutcome::Completed
     );
-    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    let task = session.lock_inner().active.as_ref().unwrap().task.clone();
+    task.join().await.unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    let automatic = session.context().automatic.last.unwrap();
+    assert_eq!(automatic.loop_id, Some(second.loop_id));
+    assert_eq!(automatic.request_index, Some(0));
+    assert_eq!(automatic.before_tokens, Some(8_000));
+    assert_eq!(automatic.outcome, "compacted");
+    assert!(session.context().last_result.is_none());
     agent.shutdown().await.unwrap();
 }
 
@@ -359,33 +268,11 @@ async fn turn_wait_does_not_wait_for_projection_settlement() {
     assert_eq!(result.persistence, TurnPersistence::Persisted);
     assert!(session.shared.compaction.coverage().is_none());
     gate.release();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while session
-            .context()
-            .last_result
-            .is_none_or(|result| result.operation_id != format!("auto-{}", turn.loop_id))
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    session.cleanup_finished().await.unwrap();
     assert_eq!(
         session.shared.compaction.coverage().unwrap().1,
         session.lock_inner().history.len()
     );
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     agent.shutdown().await.unwrap();
-}
-#[test]
-fn origin_is_owned_by_operation_not_inferred_from_identifier() {
-    for (id, origin) in [
-        ("auto-looking-manual", CompactionOrigin::Manual),
-        ("opaque-id", CompactionOrigin::Automatic),
-    ] {
-        let (operation, _) = CompactionOperation::new(id.into(), origin);
-        assert_eq!(operation.failed_result("cancelled", None).origin, origin);
-        assert_eq!(operation.unknown_write_result().origin, origin);
-        assert_eq!(failed_compaction(&operation, "timeout", 0).origin, origin);
-    }
 }

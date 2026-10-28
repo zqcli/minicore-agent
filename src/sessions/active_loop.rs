@@ -7,8 +7,6 @@ pub(super) struct ActiveLoop {
     pub(super) task: Arc<SessionTask>,
     pub(super) execution_summary: Option<BoundedText>,
     pub(super) execution_history: Arc<[HistoryItem]>,
-    /// Abandons the post-turn check of this loop once a send needs the session.
-    pub(super) abandon_check: CancellationToken,
 }
 
 pub(crate) struct ExecutionInput {
@@ -147,11 +145,6 @@ async fn run_active_loop(
         meta: EventMeta::for_turn(turn),
     });
     session.emit_state();
-    if persistence == TurnPersistence::Persisted
-        && matches!(report.outcome, minicore_runtime::LoopOutcome::Completed)
-    {
-        check_post_turn(&session, turn).await;
-    }
 }
 
 async fn join_runtime_loop(
@@ -339,50 +332,6 @@ async fn publish_and_settle(
     completion.publish_finished(Arc::clone(result));
     if result.persistence == TurnPersistence::Persisted {
         settle_persisted_projection(session, result.turn, &result.report).await;
-    }
-}
-
-/// The owned task measures the settled history against the trigger without
-/// publishing anything; only a crossed threshold becomes a compaction operation.
-/// A send or a close abandons the check, which has no side effect to undo.
-async fn check_post_turn(session: &Session, turn: TurnRef) {
-    let (operation, _) = CompactionOperation::new(
-        format!("auto-{}", turn.loop_id),
-        CompactionOrigin::Automatic,
-    );
-    let mut join_slot = operation.join.lock().await;
-    let Some(abandon) = session
-        .lock_inner()
-        .active
-        .as_ref()
-        .map(|active| active.abandon_check.clone())
-    else {
-        return;
-    };
-    let Some(reservation) = session.reserve_post_turn(turn, Arc::clone(&operation)) else {
-        return;
-    };
-    let checked = tokio::select! {
-        biased;
-        () = abandon.cancelled() => return,
-        () = session.shared.close.cancelled() => return,
-        checked = compact::check_post_turn(session, &reservation) => checked,
-    };
-    match checked {
-        compact::PostTurnCheck::Settled(result) => {
-            session.publish_compaction_result(&operation, result);
-            #[cfg(test)]
-            tests::pause_worker(&PAUSE_AFTER_COMPACTION_RESULT, turn.session_id).await;
-        }
-        compact::PostTurnCheck::Compact(input) => {
-            if session.begin_post_turn(turn, &reservation) {
-                *join_slot = Some(tokio::spawn(compact::run_compaction(
-                    session.clone(),
-                    reservation,
-                    Some(input),
-                )));
-            }
-        }
     }
 }
 
@@ -617,7 +566,6 @@ impl Session {
                 task,
                 execution_summary: execution.summary,
                 execution_history,
-                abandon_check: CancellationToken::new(),
             });
             inner
                 .presentation
@@ -668,11 +616,10 @@ impl Session {
                     .completion
                     .borrow()
                     .is_some()
-                    .then(|| (active.task.clone(), active.abandon_check.clone()))
+                    .then(|| active.task.clone())
             })
         };
-        if let Some((task, abandon_check)) = active_task {
-            abandon_check.cancel();
+        if let Some(task) = active_task {
             if task.join().await.is_err() {
                 let mut inner = self.lock_inner();
                 Self::clear_active_task(&mut inner, &task);

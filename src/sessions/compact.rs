@@ -1,4 +1,4 @@
-//! Manual and independent post-turn compaction share ownership and commit helpers.
+//! Session-owned manual compaction and durable projection settlement.
 use super::*;
 use crate::error::StoreError;
 
@@ -9,20 +9,15 @@ pub(super) struct CompactionCompletionGuard {
 }
 
 impl CompactionOperation {
-    pub(super) fn new(
-        operation_id: String,
-        origin: CompactionOrigin,
-    ) -> (Arc<Self>, watch::Receiver<Option<CompactionResult>>) {
-        let (result, receiver) = watch::channel(None);
-        let operation = Arc::new(Self {
+    pub(super) fn new(operation_id: String) -> Arc<Self> {
+        let (result, _) = watch::channel(None);
+        Arc::new(Self {
             operation_id,
-            origin,
             cancellation: CancellationToken::new(),
             result,
             join: tokio::sync::Mutex::new(None),
             state: AtomicU8::new(COMPACTION_RUNNING),
-        });
-        (operation, receiver)
+        })
     }
 
     pub(super) fn cancel(&self) -> bool {
@@ -69,7 +64,6 @@ impl CompactionOperation {
     ) -> CompactionResult {
         CompactionResult {
             operation_id: self.operation_id.clone(),
-            origin: self.origin,
             status: CompactionStatus::Failed,
             before_tokens: None,
             after_tokens: None,
@@ -260,85 +254,6 @@ impl Session {
         }
     }
 
-    /// Captures what the post-turn check of a completed turn needs. The operation
-    /// stays invisible, and a send stays admissible, until `begin_post_turn`.
-    pub(super) fn reserve_post_turn(
-        &self,
-        turn: TurnRef,
-        operation: Arc<CompactionOperation>,
-    ) -> Option<CompactionReservation> {
-        let inner = self.lock_inner();
-        let auto = inner.auto.clone()?;
-        if !auto.policy.enabled
-            || inner.closing
-            || inner.blocked.is_some()
-            || inner.compaction.is_some()
-            || inner
-                .active
-                .as_ref()
-                .is_none_or(|active| active.turn != turn)
-        {
-            return None;
-        }
-        let previous = self.shared.compaction.project(&inner.history);
-        let (previous_summary, previous_covered_item_count) = previous
-            .map(|projection| {
-                (
-                    Some(projection.summary),
-                    inner.history.len() - projection.suffix.len(),
-                )
-            })
-            .unwrap_or((None, 0));
-        let budget = auto.policy.budget(auto.model.descriptor().context_window);
-        Some(CompactionReservation {
-            operation,
-            model: Arc::clone(&auto.model),
-            record: inner.record.clone(),
-            history: Arc::clone(&inner.history),
-            workspace: Arc::clone(&inner.workspace),
-            tool_schemas: frozen_tool_specs(&inner.config, &inner.record),
-            previous_summary,
-            previous_covered_item_count,
-            hard_tokens: budget.hard_tokens,
-            trigger_tokens: Some(budget.trigger_tokens),
-            deadline: Instant::now()
-                .checked_add(inner.options.model_timeout)
-                .unwrap_or_else(Instant::now),
-        })
-    }
-
-    /// Makes a post-turn check that crossed its threshold a visible operation.
-    /// `false` when a send, a close or a block got in first.
-    pub(super) fn begin_post_turn(
-        &self,
-        turn: TurnRef,
-        reservation: &CompactionReservation,
-    ) -> bool {
-        let mut inner = self.lock_inner();
-        if inner.closing
-            || inner.blocked.is_some()
-            || inner.compaction.is_some()
-            || inner
-                .active
-                .as_ref()
-                .is_none_or(|active| active.turn != turn)
-            || !Arc::ptr_eq(&inner.history, &reservation.history)
-        {
-            return false;
-        }
-        inner.compaction_progress = Some(CompactionProgress {
-            operation_id: reservation.operation.operation_id.clone(),
-            phase: CompactionPhase::Preparing,
-            covered_item_count: reservation.previous_covered_item_count,
-            retained_item_count: reservation.history.len()
-                - reservation.previous_covered_item_count,
-        });
-        inner.compaction = Some(Arc::clone(&reservation.operation));
-        drop(inner);
-        self.emit_state();
-        true
-    }
-
     pub(crate) fn admit_compaction(
         &self,
         operation_id: String,
@@ -352,7 +267,7 @@ impl Session {
             return Err(AgentError::InvalidInput);
         }
         inner.used_compaction_ids.insert(operation_id.clone());
-        Ok(self.install_admission(&mut inner, operation_id, CompactionOrigin::Manual))
+        Ok(self.install_admission(&mut inner, operation_id))
     }
 
     fn check_compaction_admissible(inner: &SessionInner) -> Result<(), AgentError> {
@@ -379,9 +294,8 @@ impl Session {
         &self,
         inner: &mut SessionInner,
         operation_id: String,
-        origin: CompactionOrigin,
     ) -> CompactionAdmission {
-        let (operation, _) = CompactionOperation::new(operation_id, origin);
+        let operation = CompactionOperation::new(operation_id);
         inner.pending_compaction = Some(Arc::clone(&operation));
         CompactionAdmission {
             session: self.clone(),
@@ -447,14 +361,13 @@ impl Session {
                 previous_summary,
                 previous_covered_item_count,
                 hard_tokens: descriptor.context_window,
-                trigger_tokens: None,
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
                     .unwrap_or_else(Instant::now),
             }
         };
         drop(_io);
-        let task = tokio::spawn(run_compaction(self.clone(), reservation, None));
+        let task = tokio::spawn(run_compaction(self.clone(), reservation));
         *join_slot = Some(task);
         drop(join_slot);
         self.emit_state();
@@ -464,8 +377,8 @@ impl Session {
 
 impl Session {
     pub(crate) fn cancel_compaction(&self, operation_id: &str) -> Result<bool, AgentError> {
-        // Manual and post-turn operations share ownership; emergency recovery
-        // stays inside the active turn and is cancelled through turn.cancel.
+        // Turn-start compaction and emergency recovery are cancelled through
+        // turn.cancel, not through independent manual operation IDs.
         let operation = {
             let inner = self.lock_inner();
             inner
@@ -552,14 +465,6 @@ impl Session {
                 .is_some_and(|candidate| std::ptr::eq(candidate.as_ref(), operation));
             let should_emit = should_clear && inner.compaction_progress.take().is_some();
             let result = operation.publish(result);
-            if result.origin == CompactionOrigin::Automatic
-                && matches!(
-                    result.failure_kind.as_deref(),
-                    Some("cancelled" | "timeout")
-                )
-            {
-                self.shared.compaction.clear_post_turn_source();
-            }
             inner.last_compaction_result = Some(result);
             should_emit
         };
@@ -710,63 +615,18 @@ enum CompactionCommit {
     Store(SummaryCommit),
 }
 
-pub(super) async fn run_compaction(
-    session: Session,
-    reservation: CompactionReservation,
-    checked: Option<CompactionInput>,
-) {
+pub(super) async fn run_compaction(session: Session, reservation: CompactionReservation) {
     let operation = Arc::clone(&reservation.operation);
     let mut completion = CompactionCompletionGuard::new(session.clone(), Arc::clone(&operation));
-    let result = run_compaction_inner(&session, &reservation, checked).await;
+    let result = run_compaction_inner(&session, &reservation).await;
     completion.publish(result);
     #[cfg(test)]
     super::tests::pause_worker(&PAUSE_AFTER_COMPACTION_RESULT, session.session_id()).await;
 }
 
-/// The outcome of the threshold check that precedes a post-turn compaction.
-pub(super) enum PostTurnCheck {
-    Settled(CompactionResult),
-    Compact(CompactionInput),
-}
-
-/// Measures a post-turn reservation against its trigger. It only reads, so it
-/// runs before the operation is visible and can be abandoned at any await.
-pub(super) async fn check_post_turn(
-    session: &Session,
-    reservation: &CompactionReservation,
-) -> PostTurnCheck {
-    let history_len = reservation.history.len();
-    let trigger = reservation.trigger_tokens.expect("post-turn trigger");
-    let suffix = &reservation.history[reservation.previous_covered_item_count..];
-    let before = session.shared.compaction.reported_context(suffix.iter());
-    #[cfg(test)]
-    super::tests::pause_worker(&PAUSE_IN_POST_TURN_CHECK, session.session_id()).await;
-    let Some(before) = before else {
-        let mut result = noop_compaction(reservation, 0, None);
-        result.failure_kind = Some("reported_context_unavailable".into());
-        return PostTurnCheck::Settled(result);
-    };
-    if before < trigger {
-        return PostTurnCheck::Settled(noop_compaction(reservation, 0, Some(before)));
-    }
-    let input = match prepare_compaction_input(reservation).await {
-        Ok(input) => input,
-        Err(kind) => {
-            return PostTurnCheck::Settled(failed_compaction(
-                &reservation.operation,
-                kind,
-                history_len,
-            ));
-        }
-    };
-    PostTurnCheck::Compact(input)
-}
-
-/// `checked` is the input a post-turn check already prepared.
 pub(super) async fn run_compaction_inner(
     session: &Session,
     reservation: &CompactionReservation,
-    checked: Option<CompactionInput>,
 ) -> CompactionResult {
     let history_len = reservation.history.len();
     let retained_item_count = history_len.saturating_sub(reservation.previous_covered_item_count);
@@ -774,7 +634,7 @@ pub(super) async fn run_compaction_inner(
         return failed_compaction(&reservation.operation, "cancelled", history_len);
     }
     if retained_item_count == 0 {
-        return noop_compaction(reservation, 0, None);
+        return noop_compaction(reservation, 0);
     }
 
     let max_prefix_items = match crate::compaction::recent_tail_start(
@@ -816,62 +676,18 @@ pub(super) async fn run_compaction_inner(
     if reservation.operation.cancellation_requested() {
         return failed_compaction(&reservation.operation, "cancelled", history_len);
     }
-    let eligible_prefix = anchors.prefix.as_ref().filter(|prefix| {
+    // No-progress must not become a workspace failure from unrelated AGENTS.md.
+    let Some(source) = anchors.prefix.as_ref().filter(|prefix| {
         prefix.covered_item_count > reservation.previous_covered_item_count as u64
-    });
-    // Manual no-progress needs neither project instructions nor a utility
-    // budget. In particular, an unrelated invalid AGENTS.md cannot turn a
-    // short-history or repeated-compaction Noop into a workspace failure.
-    if reservation.trigger_tokens.is_none() && eligible_prefix.is_none() {
+    }) else {
         return noop_compaction(
             reservation,
             session.shared.compaction.coverage().map_or(0, |c| c.0),
-            None,
-        );
-    }
-    let input = match checked {
-        Some(input) => input,
-        None => match prepare_compaction_input(reservation).await {
-            Ok(input) => input,
-            Err(kind) => return failed_compaction(&reservation.operation, kind, history_len),
-        },
-    };
-    let source = if let Some(prefix) = eligible_prefix {
-        prefix
-    } else {
-        // Only a post-turn operation reaches here, at or above its trigger with
-        // nothing older to fold, such as a single huge loop.
-        return noop_compaction(
-            reservation,
-            session.shared.compaction.coverage().map_or(0, |c| c.0),
-            None,
         );
     };
-    let fingerprint = if reservation.trigger_tokens.is_some() {
-        let fingerprint = match crate::compaction::threshold::source_hash(&(
-            &source.sha256,
-            reservation.model.descriptor().model_ref.as_str(),
-            reservation.hard_tokens,
-            reservation.record.reasoning,
-            &input.project_instructions,
-            &reservation.tool_schemas,
-            Arc::as_ptr(&reservation.model) as *const () as usize,
-        )) {
-            Ok(value) => value,
-            Err(error) => {
-                return failed_compaction(&reservation.operation, error.kind(), history_len);
-            }
-        };
-        if session.shared.compaction.post_turn_source() == Some(fingerprint) {
-            return noop_compaction(
-                reservation,
-                session.shared.compaction.coverage().map_or(0, |c| c.0),
-                None,
-            );
-        }
-        Some(fingerprint)
-    } else {
-        None
+    let input = match prepare_compaction_input(reservation).await {
+        Ok(input) => input,
+        Err(kind) => return failed_compaction(&reservation.operation, kind, history_len),
     };
     let covered_item_count = source.covered_item_count as usize;
     session.set_compaction_phase(&reservation.operation, CompactionPhase::Summarizing);
@@ -881,12 +697,6 @@ pub(super) async fn run_compaction_inner(
         &reservation.operation.cancellation,
     )
     .await;
-    if !reservation.operation.cancellation_requested()
-        && !matches!(&generation, Err(error) if matches!(error.error, crate::compaction::UtilityError::Cancelled | crate::compaction::UtilityError::Timeout))
-        && let Some(fingerprint) = fingerprint
-    {
-        session.shared.compaction.note_post_turn_source(fingerprint);
-    }
     let generated = match generation {
         Ok(generated) => generated,
         Err(error) => {
@@ -953,7 +763,6 @@ pub(super) async fn run_compaction_inner(
     match commit {
         CompactionCommit::Store(SummaryCommit::Committed) => CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
-            origin: reservation.operation.origin,
             status: CompactionStatus::Compacted,
             before_tokens: Some(generated.before_tokens),
             after_tokens: Some(generated.after_tokens),
@@ -985,7 +794,6 @@ pub(super) async fn run_compaction_inner(
         }
         CompactionCommit::Store(SummaryCommit::Unknown) => CompactionResult {
             operation_id: reservation.operation.operation_id.clone(),
-            origin: reservation.operation.origin,
             status: CompactionStatus::UnknownWrite,
             before_tokens: Some(generated.before_tokens),
             after_tokens: Some(generated.after_tokens),
@@ -1001,14 +809,12 @@ pub(super) async fn run_compaction_inner(
 fn noop_compaction(
     reservation: &CompactionReservation,
     covered_loop_count: u64,
-    before_tokens: Option<u64>,
 ) -> CompactionResult {
     CompactionResult {
         operation_id: reservation.operation.operation_id.clone(),
-        origin: reservation.operation.origin,
         status: CompactionStatus::Noop,
-        before_tokens,
-        after_tokens: before_tokens,
+        before_tokens: None,
+        after_tokens: None,
         covered_loop_count,
         covered_item_count: reservation.previous_covered_item_count,
         retained_item_count: reservation.history.len() - reservation.previous_covered_item_count,

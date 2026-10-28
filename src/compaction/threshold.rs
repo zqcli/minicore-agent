@@ -30,7 +30,7 @@ pub(crate) struct ConsolidatedSummary {
 #[derive(Default)]
 pub(super) struct ThresholdState {
     consolidated: Option<ConsolidatedSummary>,
-    attempted: Option<(LoopId, u32)>,
+    attempted: Option<LoopId>,
     source: Option<[u8; 32]>,
     observation: AutomaticCompactionView,
 }
@@ -98,7 +98,7 @@ impl CompactionState {
         if removed {
             state.consolidated = None;
         }
-        if state.attempted.is_some_and(|(owner, _)| owner == loop_id) {
+        if state.attempted == Some(loop_id) {
             state.attempted = None;
         }
         removed
@@ -172,8 +172,7 @@ impl From<UtilityError> for ProjectionFailure {
     }
 }
 
-/// `recovery` is used only after the existing explicit upstream/ticket gate.
-/// Threshold may retain the newest exchange; recovery can compress that exchange.
+/// Recovery uses the existing upstream rejection gate; threshold work is turn-start only.
 pub(crate) async fn consolidate(
     input: ProjectionInput<'_>,
     recovery: bool,
@@ -199,6 +198,9 @@ pub(crate) async fn consolidate(
         .map_err(super::auto::invalid)
     };
     let before_request = make(messages)?;
+    if !recovery && input.request_index > 0 {
+        return Ok(ProjectionResult::unchanged(before_request));
+    }
     let before_bytes = auto
         .budget
         .estimate_request_bytes(
@@ -209,18 +211,10 @@ pub(crate) async fn consolidate(
         .map_err(|_| UtilityError::Serialization)?;
     let before = before_bytes.div_ceil(4) as u64;
     let budget = auto.policy.budget(auto.model.descriptor().context_window);
-    if !recovery && input.request_index == 0 && input.base.is_empty() && input.summary.is_none() {
-        return Ok(ProjectionResult::unchanged(before_request));
-    }
     let trigger_before = if recovery {
         before
     } else {
-        let history = if input.request_index == 0 {
-            &projection.items[..input.base.len()]
-        } else {
-            &projection.items
-        };
-        let Some(reported) = state.reported_context(history.iter().copied()) else {
+        let Some(reported) = state.reported_context(input.base.iter()) else {
             return Ok(ProjectionResult::unchanged(before_request));
         };
         if reported < budget.trigger_tokens {
@@ -229,7 +223,11 @@ pub(crate) async fn consolidate(
         reported
     };
 
-    let covered = projection.coverage(input.base.len(), !recovery && input.request_index > 0);
+    let covered = projection
+        .ranges
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
     let super::auto::Projection {
         items,
         ranges,
@@ -263,11 +261,7 @@ pub(crate) async fn consolidate(
     ))?;
     if !recovery {
         let threshold = state.threshold.lock().unwrap();
-        if threshold
-            .attempted
-            .is_some_and(|(owner, index)| owner == input.loop_id && input.request_index <= index)
-            || threshold.source == Some(source)
-        {
+        if threshold.attempted == Some(input.loop_id) || threshold.source == Some(source) {
             return Ok(ProjectionResult::unchanged(before_request));
         }
         drop(threshold);
@@ -282,7 +276,7 @@ pub(crate) async fn consolidate(
             if !covered
                 .iter()
                 .any(|key| key.start <= index && index < key.end)
-                && !(input.request_index == 0 && index >= input.base.len())
+                && index < input.base.len()
             {
                 floor.push(message.clone());
             }
@@ -308,7 +302,7 @@ pub(crate) async fn consolidate(
     // so a cancelled attempt always releases its source for retry.
     if !recovery {
         let mut threshold = state.threshold.lock().unwrap();
-        threshold.attempted = Some((input.loop_id, input.request_index));
+        threshold.attempted = Some(input.loop_id);
         threshold.source = Some(source);
     }
     let live_usage = Arc::new(std::sync::Mutex::new(None));

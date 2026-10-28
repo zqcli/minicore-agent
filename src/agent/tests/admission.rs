@@ -32,7 +32,7 @@ async fn a_history_over_the_old_byte_limit_is_neither_compacted_nor_refused() {
             .is_none()
     );
     assert_completed(&*wait_text(&agent, turn).await);
-    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    settle_turn(&agent, session_id).await;
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     assert!(
         !data_dir

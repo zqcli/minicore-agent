@@ -425,7 +425,7 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     let session_before = std::fs::read(session_dir.join("session.json")).unwrap();
     let history_before = std::fs::read(session_dir.join("history.jsonl")).unwrap();
 
-    let (first_turn, first_wait) = process
+    let (_, first_wait) = process
         .send_turn_and_register_wait("old", &first_session, "first turn")
         .await;
     old_server.wait_for_requests(1).await;
@@ -455,10 +455,6 @@ async fn process_reload_uses_startup_alias_path_and_only_changes_future_turns() 
     old_gate.release();
     let first_result = process.response(&first_wait).await;
     assert_eq!(first_result["result"]["outcome"]["type"], "completed");
-
-    process
-        .wait_post_turn_noop("old-settled", &first_session, &first_turn)
-        .await;
 
     let (_, second_wait) = process
         .send_turn_and_register_wait("new", &first_session, "second turn")
@@ -886,7 +882,7 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
         .expect("created session ID must be text")
         .to_owned();
     let user_prompt = format!("read the phase4 process fixture {USER_MARKER}");
-    let (first_turn, wait_id) = process
+    let (_, wait_id) = process
         .send_turn_and_register_wait("reasoning", &session_id, &user_prompt)
         .await;
     process.event("tool_started").await;
@@ -918,9 +914,6 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     assert!(!history_text.contains(OPAQUE_MARKER));
     // Reasoning text/summary stays visible, but never opaque fields.
     assert!(history_text.contains("inspect the process fixture"));
-    process
-        .wait_post_turn_noop("after-first", &session_id, &first_turn)
-        .await;
     let (_, next_wait) = process
         .send_turn_and_register_wait("next-turn", &session_id, "continue the same session")
         .await;

@@ -86,7 +86,7 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
     let turn = send_text(&mut agent, id, &padded("EXACT-CURRENT-USER")).await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    wait_post_turn_noop(&agent, id, turn.loop_id).await;
+    settle_turn(&agent, id).await;
     let history = read_store_history(&data, id).await;
     let context = agent.session_context(id).unwrap();
     assert_eq!(context.coverage.covered_item_count, history.len());
@@ -128,7 +128,7 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
     let resumed = wait_text(&agent, next).await;
     assert_completed(&resumed);
     assert_eq!(resumed.report.requests, 1);
-    wait_post_turn_noop(&agent, id, next.loop_id).await;
+    settle_turn(&agent, id).await;
     assert_eq!(model.calls.load(Ordering::SeqCst), 4);
     let requests = model.requests.lock().unwrap();
     assert!(
@@ -207,7 +207,7 @@ async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_proj
 }
 
 #[tokio::test]
-async fn settled_projection_post_turn_does_not_call_utility_without_a_new_report() {
+async fn settled_projection_does_not_start_an_independent_utility() {
     for fail in [false, true] {
         let (data, _guard, id, model, mut agent) = settled_projection_fixture(
             &format!("wide-projection-post-{fail}"),
@@ -223,26 +223,12 @@ async fn settled_projection_post_turn_does_not_call_utility_without_a_new_report
         let turn = send_text(&mut agent, id, &padded("current user")).await;
         let result = wait_text(&agent, turn).await;
         assert_completed(&result);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                let context = agent.session_context(id).unwrap();
-                if context.current_operation.is_none() && context.last_result.is_some() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        settle_turn(&agent, id).await;
         let context = agent.session_context(id).unwrap();
         let history = read_store_history(&data, id).await;
         assert_eq!(context.coverage.covered_item_count, history.len());
-        let post = context.last_result.unwrap();
-        assert_eq!(post.status, crate::compaction::CompactionStatus::Noop);
-        assert_eq!(
-            post.failure_kind.as_deref(),
-            Some("reported_context_unavailable")
-        );
+        assert!(context.last_result.is_none());
+        assert!(context.current_operation.is_none());
         assert_eq!(model.calls.load(Ordering::SeqCst), 3);
         agent.close_session(id).await.unwrap();
         let saved = complete_display_summary(&agent, id).await;
@@ -251,7 +237,7 @@ async fn settled_projection_post_turn_does_not_call_utility_without_a_new_report
 }
 
 #[tokio::test]
-async fn settled_projection_post_noop_and_append_failure_preserve_their_committed_boundaries() {
+async fn settled_projection_and_append_failure_preserve_their_committed_boundaries() {
     let gate = Arc::new(Gate::new());
     let (data, _guard, id, model, mut agent) =
         settled_projection_fixture("wide-projection-post-cancel", 28_500, Step::Text("done")).await;
@@ -263,7 +249,7 @@ async fn settled_projection_post_noop_and_append_failure_preserve_their_committe
     let turn = send_text(&mut agent, id, &padded("current user")).await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    wait_post_turn_noop(&agent, id, turn.loop_id).await;
+    settle_turn(&agent, id).await;
     let path = data
         .join("sessions")
         .join(id.to_string())
@@ -274,7 +260,7 @@ async fn settled_projection_post_noop_and_append_failure_preserve_their_committe
         !agent
             .cancel_compaction(CompactSession {
                 session_id: id,
-                operation_id: format!("auto-{}", turn.loop_id)
+                operation_id: "unowned-operation".into()
             })
             .unwrap()
     );

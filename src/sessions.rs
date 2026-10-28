@@ -25,8 +25,8 @@ use minicore_runtime::{InteractionId, LoopId};
 
 use crate::agent::SessionInfo;
 use crate::compaction::{
-    AutoContext, AutomaticCompactionView, CompactionInput, CompactionOrigin, CompactionPolicy,
-    CompactionResult, CompactionState, CompactionStatus, CompactionUtilityUsage,
+    AutoContext, AutomaticCompactionView, CompactionInput, CompactionPolicy, CompactionResult,
+    CompactionState, CompactionStatus, CompactionUtilityUsage,
 };
 use crate::config::map_loop_start_error;
 use crate::error::AgentError;
@@ -74,8 +74,6 @@ pub(crate) static PANIC_WORKERS: Registry<SessionId> = Registry::new();
 pub(crate) static PAUSE_BEFORE_JOIN: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
 pub(crate) static PAUSE_AFTER_COMPACTION_RESULT: Registry<SessionId, Arc<Gate>> = Registry::new();
-#[cfg(test)]
-pub(crate) static PAUSE_IN_POST_TURN_CHECK: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
 pub(crate) static PAUSE_AFTER_RUNTIME_START: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
@@ -181,7 +179,6 @@ impl Drop for CompactionAdmission {
 }
 
 struct CompactionOperation {
-    origin: CompactionOrigin,
     operation_id: String,
     cancellation: CancellationToken,
     result: watch::Sender<Option<CompactionResult>>,
@@ -206,9 +203,6 @@ struct CompactionReservation {
     previous_covered_item_count: usize,
     /// Effective model input ceiling for utility and reduced normal requests.
     hard_tokens: u64,
-    /// Only post-turn operations use a soft trigger. Manual compaction is
-    /// never gated by this estimate.
-    trigger_tokens: Option<u64>,
     deadline: Instant,
 }
 

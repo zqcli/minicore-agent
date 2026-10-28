@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Automatic compaction now decides only from the latest Assistant's
+- Automatic compaction checks only before the first model request of a turn,
+  using the latest Assistant's
   provider-reported context usage, which survives restart, reopen, configuration
   reload and model/provider changes. A restart does not cause compaction unless
   that report reached the trigger; model changes only change the denominator.
@@ -15,8 +16,15 @@
   recovery and utility sizing/retention are unchanged.
 - `session.context.automatic.*.before_tokens` now means provider-reported
   context, not a request estimate. Its `after_tokens` and budget estimate fields
-  are unchanged. Post-turn checks with no eligible usage return `noop` with
-  `reported_context_unavailable` and no token figures.
+  are unchanged. `automatic.current` / `last` now describe only turn-start
+  attempts, with request index zero.
+- Remove post-turn automatic compaction and threshold checks between model
+  requests inside a turn. A final response above the trigger waits for the next
+  turn; growth inside a turn is handled by unchanged provider-overflow recovery.
+  There are no independent automatic operations, their Session progress/results,
+  or automatic Noop reasons. `current_operation` and `last_result` describe only
+  manual compaction; results no longer carry the redundant `origin` field.
+  Manual compaction behavior, retention and cancellation are unchanged.
 
 ## 0.8.1 — 2026-10-27
 

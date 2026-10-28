@@ -27,9 +27,11 @@ minicore-agent --config ./example.agent.toml --stdio
   retain their meaning. Trigger comparison is `>=` against the effective input
   window (physical window minus configured output and safety allowances), not
   Pi's physical-window-minus-16384 formula. Target is advisory, not a guaranteed
-  output size or permission to repeatedly summarize. Automatic compaction is
-  triggered by this token estimate only; there are no history item or byte
-  limits.
+  output size or permission to repeatedly summarize. Automatic threshold
+  compaction checks only before the first request of a turn, using the latest
+  non-superseded Assistant's reported context without estimation. Unknown usage
+  skips the check. There are no history item or byte limits; in-turn growth is
+  handled only by confirmed provider-overflow recovery.
 
 ## Profiles
 

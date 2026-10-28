@@ -5,6 +5,7 @@ mod cancellation;
 mod changes;
 mod cold_read;
 mod compaction;
+mod compaction_lifecycle;
 mod display;
 mod events;
 mod interrupted;
@@ -14,7 +15,6 @@ mod model_update;
 mod open;
 mod openai_recovery;
 mod persistence;
-mod post_turn;
 mod preview;
 mod provider_error;
 mod recovery;
@@ -81,10 +81,7 @@ use crate::profiles::{ApprovalMode, Profile};
 use crate::read::ReadSession;
 #[cfg(unix)]
 use crate::sessions::PAUSE_AFTER_RUNTIME_START;
-use crate::sessions::{
-    LoopSubmission, PANIC_WORKERS, PAUSE_AFTER_COMPACTION_RESULT, PAUSE_BEFORE_JOIN,
-    PAUSE_IN_POST_TURN_CHECK,
-};
+use crate::sessions::{PANIC_WORKERS, PAUSE_AFTER_COMPACTION_RESULT, PAUSE_BEFORE_JOIN};
 use crate::store::{
     SESSION_FORMAT_VERSION, SessionRecord, Store, StoredLoopOutcome, StoredLoopRecord,
 };
@@ -93,7 +90,7 @@ use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
 
 use super::{
-    Agent, CompactSession, CreateSession, RenameSession, SendMessage, SessionUpdateResult, TurnRef,
+    Agent, CompactSession, CreateSession, RenameSession, SessionUpdateResult, TurnRef,
     UpdateSession,
 };
 
@@ -635,32 +632,13 @@ async fn wait_text(agent: &Agent, turn: TurnRef) -> Arc<crate::sessions::TurnRes
     agent.wait_turn(turn).await.unwrap()
 }
 
-async fn wait_post_turn_noop(agent: &Agent, session_id: SessionId, loop_id: LoopId) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let context = agent.session_context(session_id).unwrap();
-            // The check is silent until it compacts, so only its result tells
-            // that it has finished.
-            if let Some(result) = context
-                .last_result
-                .filter(|result| result.operation_id == format!("auto-{loop_id}"))
-            {
-                assert!(context.current_operation.is_none());
-                assert_eq!(result.status, crate::compaction::CompactionStatus::Noop);
-                assert!(result.utility_usage.is_none());
-                agent
-                    .loaded_session(session_id)
-                    .unwrap()
-                    .cleanup_finished()
-                    .await
-                    .unwrap();
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("post-turn Noop must settle without model work");
+async fn settle_turn(agent: &Agent, session_id: SessionId) {
+    agent
+        .loaded_session(session_id)
+        .unwrap()
+        .cleanup_finished()
+        .await
+        .unwrap();
 }
 
 async fn read_store_history(

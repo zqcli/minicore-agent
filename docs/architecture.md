@@ -59,8 +59,10 @@ views share the same redacted types. Byte-level event and history-record golden
 tests protect the existing wire and storage formats. Future non-exhaustive Runtime
 statuses, cancellation reasons, and outcomes map to explicit `unknown` values.
 Runtime's `history::estimate_history_bytes` is the single history size estimator,
-used for context queries and the history token estimate. Compaction is triggered
-by token estimates alone; there are no history item or byte limits.
+used for context queries and the history token estimate. Automatic threshold
+compaction checks provider-reported usage only before the first request of a
+turn; there are no history item or byte limits. Later requests rely on confirmed
+provider-overflow recovery.
 
 ## Core Modules
 
@@ -69,7 +71,7 @@ by token estimates alone; there are no history item or byte limits.
   execution, event mapping, and context-budget views. `compact.rs` retains
   compaction ownership and commits.
 - The active-loop task names its join/drain, reconciliation, persistence,
-  projection settlement, and completion/compaction-handoff phases. Publication
+  projection settlement, and completion phases. Publication
   still precedes auxiliary persistence; the owned task remains the close/join
   barrier for those writes.
 - `rpc/server.rs` owns deferred tasks and shutdown. `server/dispatch.rs` separates

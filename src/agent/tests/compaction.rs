@@ -52,7 +52,7 @@ pub(super) fn pi_history_exchange(loop_id: LoopId, index: u32, bytes: usize) -> 
 }
 
 #[tokio::test]
-async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer() {
+async fn high_mid_turn_usage_keeps_all_exchanges_and_steers_without_threshold_compaction() {
     let (data_dir, _guard) = fixture_dir("pi-in-run");
     let content = "read-result ".repeat(900);
     let (workspace, _workspace_guard) =
@@ -64,7 +64,6 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
         [
             Step::gated_tool(gate.clone(), "read", json!({"path":"a.txt"})),
             reported_tool(5_000),
-            Step::Text("First read was completed; keep its findings."),
             Step::Text("done"),
         ],
     )
@@ -95,45 +94,33 @@ async fn pi_in_run_consolidates_older_exchange_once_and_keeps_newest_and_steer()
         result.report.requests, 3,
         "utility is not an ordinary request"
     );
-    wait_post_turn_noop(&agent, info.session_id, turn.loop_id).await;
+    settle_turn(&agent, info.session_id).await;
     {
         let requests = model.requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
-        assert!(
-            requests[2].tools().is_empty(),
-            "summary precedes the third assistant request"
-        );
-        assert!(!requests[3].tools().is_empty());
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| !request.tools().is_empty()));
         for value in [
             "read twice; preserve original input",
             "preserve this steer exactly",
         ] {
-            assert!(requests[3].messages().iter().any(
+            assert!(requests[2].messages().iter().any(
                 |message| matches!(message, ModelMessage::User(text) if text.as_ref() == value)
             ));
         }
         assert_eq!(
-            requests[3]
+            requests[2]
                 .messages()
                 .iter()
                 .filter(|message| matches!(message, ModelMessage::Tool { .. }))
                 .count(),
-            1
+            2
         );
-        assert!(requests[3].messages().iter().any(|message| matches!(message, ModelMessage::Tool { output, .. } if output.content().as_str().contains(&content))));
+        assert!(requests[2].messages().iter().any(|message| matches!(message, ModelMessage::Tool { output, .. } if output.content().as_str().contains(&content))));
     }
     let context = agent.session_context(info.session_id).unwrap();
     assert!(context.automatic.current.is_none());
-    assert_eq!(
-        context
-            .automatic
-            .last
-            .unwrap()
-            .utility_usage
-            .unwrap()
-            .call_count,
-        1
-    );
+    assert!(context.automatic.last.is_none());
+    assert!(context.last_result.is_none());
     let history = read_store_history(&data_dir, info.session_id).await;
     assert_eq!(
         history
@@ -257,7 +244,7 @@ async fn legacy_fully_covered_summary_does_not_trigger_after_reopen_with_smaller
     let turn = send_text(&mut agent, session_id, "new after reopening exact").await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    settle_turn(&agent, session_id).await;
     {
         let requests = smaller.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -319,7 +306,7 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
     assert_eq!(result.report.requests, 1);
-    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    settle_turn(&agent, session_id).await;
     let requests = model.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
@@ -347,12 +334,6 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
 
 #[tokio::test]
 async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_without_tools_replay() {
-    let (data, _guard) = fixture_dir("pi-consolidated-retry");
-    let (workspace, _workspace_guard) = workspace_file(
-        "pi-consolidated-retry-ws",
-        "a.txt",
-        "read-result ".repeat(900).as_bytes(),
-    );
     let first_summary = Box::leak("prior read facts retained. ".repeat(90).into_boxed_str());
     let retryable = ModelError::not_started(
         minicore_runtime::model::ModelErrorKind::RateLimited,
@@ -365,44 +346,48 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
         )
         .unwrap(),
     );
-    let model = ScriptedModel::with_window(
-        "main",
+    let (data, _guard, session_id, model, mut agent) = auto_admission_fixture_with_window(
+        "pi-consolidated-retry",
+        true,
         5_000,
+        pi_history_exchange(LoopId::new().unwrap(), 0, 40_000),
         [
+            Step::Text(first_summary),
             Step::ToolCall("read", json!({"path":"a.txt"})),
             reported_tool(5_000),
-            Step::Text(first_summary),
             Step::ContextOverflowNotStarted,
             Step::Text("Recovered historical facts"),
             Step::Fail(retryable),
             Step::Text("completed"),
         ],
+        None,
+        None,
     )
-    .with_pacing(std::time::Duration::from_millis(2));
-    let mut agent = AgentFixture::at(&data)
-        .models(BTreeMap::from([("main".into(), Arc::clone(&model))]))
-        .auto()
-        .open()
-        .await;
-    let session_id = create_session(&mut agent, &workspace).await.session_id;
+    .await;
+    std::fs::write(data.join("workspace/a.txt"), "read-result ".repeat(900)).unwrap();
     let turn = send_text(&mut agent, session_id, "new user exact").await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
     assert_eq!(result.report.requests, 3);
     assert_eq!(result.report.tool_rounds, 2);
-    wait_post_turn_noop(&agent, session_id, turn.loop_id).await;
+    settle_turn(&agent, session_id).await;
     {
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 7);
-        assert!(requests[2].tools().is_empty() && requests[4].tools().is_empty());
+        assert!(requests[0].tools().is_empty() && requests[4].tools().is_empty());
+        assert!(
+            requests[1..4]
+                .iter()
+                .all(|request| !request.tools().is_empty())
+        );
         assert_eq!(
             requests[3]
                 .messages()
                 .iter()
                 .filter(|message| matches!(message, ModelMessage::Tool { .. }))
                 .count(),
-            1,
-            "threshold keeps the newest exchange before the real capacity rejection"
+            2,
+            "high mid-turn usage must not reduce either exchange before the rejection"
         );
         assert_eq!(
             serde_json::to_vec(&requests[5]).unwrap(),
@@ -444,6 +429,6 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
             .iter()
             .filter(|item| matches!(item, HistoryItem::ToolResult(_)))
             .count(),
-        2
+        3
     );
 }

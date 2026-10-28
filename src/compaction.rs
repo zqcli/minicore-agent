@@ -38,7 +38,7 @@ pub(crate) const CONTEXT_UNCOMPRESSIBLE: &str = "context_uncompressible";
 const MAX_EPHEMERAL_GROUPS: usize = 64;
 const MAX_EPHEMERAL_BYTES: usize = 512 * 1024;
 
-/// Agent-global policy for request-boundary/post-turn compaction and bounded
+/// Agent-global policy for turn-start compaction and bounded
 /// upstream capacity recovery. Manual compaction remains available regardless.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompactionPolicy {
@@ -93,16 +93,8 @@ pub struct CompactionUtilityUsage {
     pub usage: Option<Usage>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactionOrigin {
-    Manual,
-    Automatic,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompactionResult {
-    pub origin: CompactionOrigin,
     pub operation_id: String,
     pub status: CompactionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,7 +151,6 @@ pub(crate) struct CompactionState {
     recovery: Mutex<RecoveryState>,
     recovery_observation: Mutex<Option<RecoveryObservation>>,
     threshold: Mutex<threshold::ThresholdState>,
-    post_turn_source: Mutex<Option<[u8; 32]>>,
     /// One immutable snapshot of the settings a request boundary binds:
     /// generations plus the utility binding they describe. Binding and
     /// generation change together under this lock so a request can never pair
@@ -251,7 +242,6 @@ impl CompactionState {
             recovery: Mutex::new(RecoveryState::default()),
             recovery_observation: Mutex::new(None),
             threshold: Mutex::new(threshold::ThresholdState::default()),
-            post_turn_source: Mutex::new(None),
             settings: Mutex::new(RequestSettings::default()),
         })
     }
@@ -690,18 +680,6 @@ impl CompactionState {
 
     pub(crate) fn latest_request_tokens(&self) -> Option<u64> {
         *self.latest_request_tokens.lock().unwrap()
-    }
-
-    pub(crate) fn post_turn_source(&self) -> Option<[u8; 32]> {
-        *self.post_turn_source.lock().unwrap()
-    }
-
-    pub(crate) fn note_post_turn_source(&self, source: [u8; 32]) {
-        *self.post_turn_source.lock().unwrap() = Some(source);
-    }
-
-    pub(crate) fn clear_post_turn_source(&self) {
-        *self.post_turn_source.lock().unwrap() = None;
     }
 
     pub(crate) fn automatic_view(&self) -> AutomaticCompactionView {

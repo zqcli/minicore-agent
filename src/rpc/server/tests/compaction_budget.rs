@@ -164,6 +164,7 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
         .await;
     let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("compacted"));
+    assert!(result["result"].get("origin").is_none());
     assert!(result["result"]["before_tokens"].is_number());
     assert!(result["result"]["after_tokens"].is_number());
     assert!(
@@ -376,10 +377,8 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
     let wait = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(wait["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(wait["result"]["persistence"], json!("persisted"));
-    // The only call before completion is the ordinary model request. The
-    // completed near-budget turn may independently start post-turn compaction.
-    assert!(model.calls.load(Ordering::SeqCst) >= 1);
     harness.shutdown().await;
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     remove_base(&base).await;
 }
 
