@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Breaking: the RPC methods `turn.send` and `turn.steer` are replaced by a
+per-session input queue. Requires Runtime 0.9.0.
+
+- Each loaded Session owns an ordered queue of user inputs (at most 32) in memory.
+  New methods `input.push` (`mode` `steer` or `follow_up`), `input.remove`,
+  `input.recall`, `input.resume` and `input.list`. A running turn takes every
+  queued steer before each request and records it as a steering message; a
+  model answer without tool calls always ends the turn. After a completed turn
+  the oldest steer, else the oldest follow-up, starts the next turn, installed
+  before `turn.wait` (or the deferred `session.compact`) answers with the new
+  `next` turn. A cancelled or failed turn, or failed persistence, pauses a
+  non-empty queue until `input.resume`, a push, or `input.recall`.
+- `turn.wait` results and `turn_finished` events carry `next` and `queue`. New
+  events `input_queue` and `input_delivered`. New errors `-32024`
+  (`input_queue_full`) and `-32025` (`input_not_queued`).
+- `session.close` of a Session with queued inputs fails with `session_busy`.
+- Removed: `turn.send`, `turn.steer`, the `steer_progress` event and
+  presentation member, error `-32016` (not reused), and the `max_pending_steers`
+  configuration key. Rust API: `Agent::send`, `Agent::steer`, `SendMessage` and
+  `SteerMessage` give way to `push_input`, `remove_input`, `recall_inputs`,
+  `resume_inputs` and `list_inputs`.
+- A delivered input's acceptance time is its persisted user timestamp.
+
 ## 0.8.2 — 2026-10-28
 
 - Automatic compaction checks only before the first model request of a turn,

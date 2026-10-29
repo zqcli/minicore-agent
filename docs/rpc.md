@@ -74,9 +74,11 @@ stdout line is complete and frames are never byte-interleaved. The writer encode
 successful responses once and flushes each bounded batch of queued frames. Ordinary
 requests are admitted sequentially, but disk work and worker joins run in bounded
 owned tasks. This includes `agent.reload`, `session.list/create/open/close/delete`,
-`session.update/rename/compact`, `turn.send/wait`, and all read queries. Completed
+`session.update/rename/compact`, `turn.wait`, an `input.push` or `input.resume`
+that starts a turn, and all read queries. Completed
 operations apply their results to the Agent on the dispatcher before replying.
-`turn.send` still returns an installed Turn without a startup summary worker.
+A push that starts a turn still returns an installed Turn without a startup
+summary worker.
 A read-query waiter observes a result
 but is not the worker owner. Workspace scan queries own one retained blocking worker and normally join
 it before returning; their Drop guard signals cooperative stop when the query
@@ -90,7 +92,7 @@ with `-32020`, but does not transfer or remove worker ownership.
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
 
-- a `turn.send` response before the corresponding `turn_started` event;
+- an `input.push` response before the corresponding `turn_started` event;
 - a `turn_finished` event before the corresponding `turn.wait` response;
 - the final `output_delta` or Tool event before `turn_finished`;
 - any deferred response before responses to later requests. Wait for the response
@@ -99,7 +101,7 @@ The following orderings are not guaranteed:
 Automatic threshold compaction runs only before the first model request of a
 turn. Turn completion starts no compaction operation and publishes no automatic
 result in `last_result`. Settling an existing turn-start or emergency projection
-still belongs to the turn's owned worker; close and the next send join it.
+still belongs to the turn's owned worker; close and the next turn start join it.
 
 Output deltas and other live events are best effort and may be dropped under
 pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
@@ -119,7 +121,7 @@ outcome is not overwritten; `turn.cancel` still requests reason `user`.
 
 ## Method Index
 
-The current source dispatches exactly 33 methods. This is a navigation index;
+The current source dispatches exactly 36 methods. This is a navigation index;
 the sections below define the wire contract.
 
 ```text
@@ -131,7 +133,8 @@ session.update, session.rename, session.history, session.read, session.presentat
 workspace.read, workspace.files, workspace.search, workspace.status
 changes.list, changes.diff
 tool.read, tool.output
-turn.send, turn.steer, turn.cancel, turn.wait, turn.result
+input.push, input.remove, input.recall, input.resume, input.list
+turn.cancel, turn.wait, turn.result
 interaction.answer
 ```
 
@@ -327,7 +330,10 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   record and history from disk. It never starts a loop.
 - `session.close` cancels any active loop and manual compaction, joins all
   Session-owned workers, and returns `{"ok":true}`. Active loops receive Runtime
-  shutdown cancellation, preserving reason `shutdown` rather than `user`.
+  shutdown cancellation, preserving reason `shutdown` rather than `user`. A
+  Session with queued inputs is refused with `-32003` (`session_busy`) before
+  anything is cancelled; `input.recall` them first. `session.delete` only
+  accepts closed Sessions, whose queue is gone with the close.
 - `session.delete` takes a closed Session ID and returns `{"ok":true}`. The Store
   atomically renames the directory to `.deleting-<session_id>` and syncs its parent
   before reclaiming its files. After that rename it is no longer listable/openable;
@@ -353,9 +359,12 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   set resets on close/reopen, and a new manual ID at
   the cap is rejected as invalid input. Compaction is admitted only for a
   loaded, idle, settled, unblocked Session. Other active work yields retryable
-  `session_busy`; reusing an operation ID yields non-retryable `invalid_state`. `turn.send` and `session.update` are also
+  `session_busy`; reusing an operation ID yields non-retryable `invalid_state`. `session.update` is also
   rejected while it is owned by the Session, while metadata-only
-  `session.rename` remains allowed.
+  `session.rename` remains allowed. Inputs pushed meanwhile queue; when the
+  compaction ends, whatever its outcome, the queue head starts a turn. The
+  result carries that turn as `next` (a `StartedTurn`, or `null`; see
+  "0.9.0 input queue"), installed before the result is delivered.
 - `session.compact.cancel` takes the same full identity and returns
   `{"cancelled":true}` only when that exact operation is still owned. The identity
   and cancellation token are registered at admission, before deferred preparation;
@@ -878,55 +887,84 @@ tool arguments and opaque provider content never appear.
 
 ## Turns
 
-### `turn.send`
+### Inputs
+
+Each loaded Session has one ordered queue of user inputs owned by the Agent;
+"0.9.0 input queue" describes its rules. Four result shapes recur:
 
 ```json
-{"session_id":"ses_...","text":"Fix the parser"}
+QueueItem   {"id":"inp_...","mode":"steer","text":"Fix the parser","accepted_at":"2026-01-02T03:04:05.006Z"}
+Queue       {"items":[QueueItem],"paused":false}
+StartedTurn {"turn":{"session_id":"ses_...","loop_id":"lup_..."},"input":QueueItem}
 ```
 
-Starts one runtime `AgentLoop` for the user message and returns its exact Turn
-identity:
+`id` is an opaque string (`inp_` plus 32 hex digits today) assigned by the
+Agent; `mode` is `steer` or `follow_up`; `accepted_at` is the Agent acceptance
+time and is omitted when the clock was unavailable. `Queue.items` lists the
+entries in the order they run: steers first, then follow-ups, each group in
+acceptance order. `StartedTurn` is a turn the Agent started from the queue
+together with the entry that became its initial input.
+
+#### `input.push`
 
 ```json
-{"turn":{"session_id":"ses_...","loop_id":"lup_..."}}
+{"session_id":"ses_...","mode":"steer","text":"Fix the parser"}
 ```
 
-A Session runs at most one active loop. Additional sends while one is active
-fail with `-32003` (session_busy); a Session blocked by a persistence failure
-fails with `-32004`.
-
-The successful result preserves the original `turn` member and may add
-`accepted_at`:
+Accepts one input and returns:
 
 ```json
-{"turn":{"session_id":"ses_...","loop_id":"lup_..."},"accepted_at":"2026-01-02T03:04:05.006Z"}
+{"id":"inp_...","accepted_at":"2026-01-02T03:04:05.006Z","started":StartedTurn|null,"queue":Queue}
 ```
 
-The timestamp is when the Agent accepted the Prompt, not when the loop or
-provider request completes. It may be omitted if the clock was unavailable.
+`started` is the turn this push started, if any: an idle Session (not paused,
+not blocked, no manual compaction running, no turn active or starting) starts a
+turn at once with the queue head, which is the pushed entry unless older
+entries wait. Otherwise the entry stays queued and `started` is `null`. The
+text must be non-empty and within the user-input byte limit, otherwise
+`-32602`. A Session with 32 queued entries refuses the push with `-32024`
+(`input_queue_full`); a blocked Session with `-32004`; a closing one with
+`-32003`. A push while the queue is paused also clears the pause.
 
-A send is never refused or delayed for the size of the history: automatic
-threshold compaction is triggered by provider-reported usage only, and there is
-no history item or byte limit. There is no `LoopSubmission::Preparing`. A successfully
-installed turn may later fail request preparation, utility cancellation, or a
-provider request; `turn.wait`/`turn.result` report that failure and its persistence,
-rather than pretending that the already accepted submit never started.
+A push that starts a turn is deferred like other operations that start work and
+cannot overlap `agent.reload`. A push that only queues is answered at once.
 
-Request preparation may consolidate safe projected history before the first
-request of a turn when the reported context reaches the soft threshold,
-preserving the new User/Steer. Later requests do not check the threshold. Failed/no-useful-source threshold attempts do not
-locally veto ordinary sends. A confirmed safe pre-output upstream capacity
-rejection can separately compact and retry the rejected logical request once. Recovery stays within the active turn,
-shares its cancellation/deadline, and never redispatches completed tools.
-There are no independent automatic compaction operations. Active turn-start
-threshold work and recovery are cancelled through the turn; `session.compact.cancel`
-cancels only manual operations. Auto=false disables both automatic thresholds and capacity
-recovery; manual idle-only compaction remains available.
+#### `input.remove`
 
-`tool_rounds` in turn results and history/read summaries is an unsigned `u64`
-JSON integer. Old small integer records remain readable, but clients that decode
-it as `u16` cannot read values above 65,535. The legacy `max_tool_rounds`
-configuration field remains `u16` with zero meaning unlimited.
+```json
+{"session_id":"ses_...","id":"inp_..."}
+```
+
+Removes one queued entry and returns `{"text":"...","queue":Queue}`. An entry
+that was already handed to a running turn or started a turn, or never existed,
+fails with `-32025` (`input_not_queued`).
+
+#### `input.recall`
+
+```json
+{"session_id":"ses_..."}
+```
+
+Removes every queued entry and returns `{"texts":["..."],"queue":Queue}` with
+the texts in run order. It also clears the pause.
+
+#### `input.resume`
+
+```json
+{"session_id":"ses_..."}
+```
+
+Clears the pause and starts the queue head if the Session can start. Returns
+`{"started":StartedTurn|null,"queue":Queue}`. A blocked Session fails with
+`-32004`.
+
+#### `input.list`
+
+```json
+{"session_id":"ses_..."}
+```
+
+Returns the current `Queue`.
 
 ### `turn.wait`
 
@@ -946,9 +984,19 @@ response arrives:
   "requests": 2,
   "tool_rounds": 1,
   "final_config_revision": 0,
-  "persistence": "persisted"
+  "persistence": "persisted",
+  "next": null,
+  "queue": {"items": [], "paused": false}
 }
 ```
+
+`next` is the successor turn the Agent started from the queue when this turn
+ended (a `StartedTurn`, see "Inputs"), or `null`. The successor is installed
+before this response is sent, so a client waits on `next.turn` without any race.
+`queue` is the Session's queue when the response is prepared. A turn that ended
+`cancelled` or `failed`, or whose persistence failed, starts no successor and
+leaves a non-empty queue paused. A turn that a successor replaced can still be
+waited on while at most four newer turns of the same busy period exist.
 
 `outcome.type` is `completed`, `cancelled` (with `reason`), `failed` (with
 `kind` and optionally `model_error`), or `unknown` for a future Runtime outcome.
@@ -1004,17 +1052,6 @@ results; it is not part of `items` or `total`.
 
 Cancels the active loop and returns `{"cancelled":true}`. The corresponding
 `turn.wait` then resolves with a `cancelled` outcome.
-
-### `turn.steer`
-
-```json
-{"session_id":"ses_...","loop_id":"lup_...","text":"Do not modify config files"}
-```
-
-Appends a steering instruction to the active loop and returns `{"ok":true}`
-with optional `accepted_at`. The timestamp is the Agent acceptance time for
-that Steer, not its later application to a model request. A full steer queue is
-reported with `-32016`.
 
 ## Tool Data
 
@@ -1977,10 +2014,16 @@ Session lifecycle events:
 - `session_opened` (`session`, `meta`)
 - `session_closed` (`session_id`, `meta`)
 - `session_state` (`state`, `meta`)
+- `input_queue` (`queue`, `meta`); the complete `Queue` whenever it changes.
+  `meta.loop_id` is null.
 
 Loop-scoped events:
 
 - `turn_started` (`turn`, `meta`)
+- `input_delivered` (`turn`, `items`, `meta`); a running turn took these queued
+  steers at a request boundary, in order. Each item is
+  `{"id","text","accepted_at"}`; the inputs are in the turn's history from then
+  on, whatever its outcome.
 - `request_started` (`turn`, `request_index`, `config_revision`, `model`, `reasoning`)
 - `output_delta` (`turn`, `request_index`, `channel` `text`/`reasoning`, `delta`, `meta`)
 - `tool_started` (`turn`, `request_index`, `tool_call_id`, `tool_name`, `meta`)
@@ -2012,7 +2055,7 @@ Loop-scoped events:
   plus optional `content_truncated`.
 - `interaction_requested` (`turn`, `interaction`, `meta`)
 - `interaction_resolved` (`turn`, `interaction_id`, `meta`)
-- `turn_finished` (`turn`, `outcome`, `persistence`, `meta`)
+- `turn_finished` (`turn`, `outcome`, `persistence`, `next`, `queue`, `meta`)
 
 ## Errors
 
@@ -2037,7 +2080,7 @@ errors:
 | `-32013` | `runtime_error` |
 | `-32014` | `invalid_session_settings` |
 | `-32015` | `history_too_large` (retired; the Agent no longer returns it and the code is not reused) |
-| `-32016` | `steer_queue_full` |
+| `-32016` | `steer_queue_full` (retired in 0.9.0; the code is not reused) |
 | `-32017` | `reload_requires_restart` |
 | `-32018` | `reload_unavailable` |
 | `-32019` | `resource_exhausted` |
@@ -2045,12 +2088,14 @@ errors:
 | `-32021` | `tool_not_found` |
 | `-32022` | `context_uncompressible` |
 | `-32023` | `config_error` |
+| `-32024` | `input_queue_full` |
+| `-32025` | `input_not_queued` |
 
 Error data contains only `{kind,retryable}` and stable short messages; it never
 serializes an error source, raw provider response, Tool arguments, API key, or
 panic payload. `store_error` is retryable for temporary Store unavailability,
 not corrupt or invalid stored data. An `interaction.answer` after its turn ended
-returns `turn_not_found`, matching `turn.steer`. Duplicate compaction IDs and
+returns `turn_not_found`. Duplicate compaction IDs and
 configuration errors are non-retryable. Query cancellation/deadlines return
 `query_limit`; closure of the owning Session returns `session_not_loaded`.
 Caller/RPC cancellation wins when both cancellation sources are signalled.
@@ -2228,3 +2273,51 @@ it is omitted when unknown or empty:
 `kind`, `delivery`, `retryable`, and `retry_after_millis` keep their meaning and
 still drive client behavior; `provider` is for display. RPC protocol version
 remains 1.
+
+## 0.9.0 input queue
+
+Agent 0.9.0 replaces `turn.send` and `turn.steer` with a per-session input
+queue (`input.push`, `input.remove`, `input.recall`, `input.resume`,
+`input.list`). RPC protocol version remains 1. Removed: `turn.send`,
+`turn.steer`, the `steer_progress` event and the
+`session.presentation` `steer_progress` member, steer receipts,
+error `-32016`, and the `max_pending_steers` configuration key.
+
+- An entry is `{id, mode, text, accepted_at}`. `steer` reaches the Session as
+  soon as possible: the running turn's next request, or a new turn.
+  `follow_up` waits until the running turn has ended, then starts a new turn.
+  Plain "send" is a `steer` pushed to an idle Session. Steers overtake
+  follow-ups; within a mode, acceptance order holds.
+- **During a turn**, before every model request (the first included) the Agent
+  hands the Runtime every queued steer, in acceptance order and as separate
+  user messages, and removes them from the queue. Handing over is final: the
+  input is part of the turn's history from that moment, recorded as a
+  `steering` user item and announced by `input_delivered`; it is persisted
+  even when the turn is cancelled. Follow-ups are never handed to a running
+  turn. A model answer without tool calls always ends the turn, so inputs that
+  arrive during the final request wait for the successor.
+- **After a turn** whose outcome is `completed` and whose history was
+  persisted, the Agent starts the queue head (the oldest steer, else the
+  oldest follow-up) as a new turn whose initial input is that entry (a
+  `prompt` item); the remaining steers join its first request. Nothing waits on
+  a timer. The turn is installed before the finished turn's `turn.wait` (or the
+  compaction's `session.compact`) response is produced, so a client learns every
+  turn from RPC responses (`input.push`, `input.resume`, `turn.wait.next`,
+  `session.compact.next`) and never only from best-effort events.
+- **Pause.** A turn that ends `cancelled` or `failed`, or whose persistence
+  failed, pauses a non-empty queue and leaves every entry in place. While
+  paused nothing starts by itself. `input.resume` clears the pause and starts
+  the head; a push clears it too and starts the head (so older entries run
+  first). `input.recall` clears it as well. An empty queue is never paused.
+- **Approval waiting and manual compaction.** Pushes are accepted as usual.
+  No request boundary happens while a tool waits for an answer, so steers reach
+  the request after it; inputs are never interaction answers. A manual
+  compaction starts the head when it ends.
+- **Bounds.** At most 32 entries per Session (`-32024` beyond); each text obeys
+  the user-input byte limit. The queue lives in memory only and is lost with
+  the process. `session.close` of a Session with queued entries fails with
+  `-32003` until they are recalled.
+- A delivered or started input's `accepted_at` is its user timestamp in the
+  history views. `mode` is not persisted.
+- `session.state` is unchanged: a paused Session with no turn is `idle`; its
+  `paused` flag is part of the `Queue` (`input.list`, `input_queue`).

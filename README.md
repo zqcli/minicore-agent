@@ -21,7 +21,8 @@ also be embedded directly as a Rust library.
 
 - **Sessions.** Several Sessions can be loaded at once, each with one active
   turn at a time. History is an append-only JSONL file and survives restarts.
-  Turns can be steered, cancelled, waited on, and inspected after the fact.
+  Inputs queue per Session, and turns can be cancelled, waited on, and
+  inspected after the fact.
 - **Tools.** `read`, `write`, `edit`, `apply_patch`, and `bash`, with approval
   modes `ask`, `auto`, and `read_only`. Interactive approvals are answered
   over RPC.
@@ -91,7 +92,8 @@ reload, and custom TLS roots (`SSL_CERT_FILE`).
 | Agent | `agent.ping`, `agent.reload`, `agent.shutdown` |
 | Discovery | `profile.list`, `model.list` |
 | Sessions | `session.create`, `session.open`, `session.close`, `session.delete`, `session.list`, `session.state`, `session.update`, `session.rename`, `session.context`, `session.compact`, `session.compact.cancel` |
-| Turns | `turn.send`, `turn.steer`, `turn.cancel`, `turn.wait`, `turn.result` |
+| Inputs | `input.push`, `input.remove`, `input.recall`, `input.resume`, `input.list` |
+| Turns | `turn.cancel`, `turn.wait`, `turn.result` |
 | Interaction | `interaction.answer` |
 | Read and review | `session.history`, `session.read`, `session.presentation`, `tool.read`, `tool.output`, `workspace.files`, `workspace.search`, `workspace.read`, `workspace.status`, `changes.list`, `changes.diff` |
 
@@ -107,7 +109,7 @@ minicore-agent = { git = "https://github.com/zqcli/minicore-agent", branch = "de
 ```
 
 ```rust
-use minicore_agent::{Agent, CreateSession, SendMessage};
+use minicore_agent::{Agent, CreateSession, InputMode, PushInput};
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::open_file("agent.toml").await?;
@@ -120,12 +122,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             title: None,
         })
         .await?;
-    let turn = agent
-        .send(SendMessage {
+    // An idle Session starts a turn with the pushed input at once.
+    let pushed = agent
+        .push_input(PushInput {
             session_id: session.session_id,
+            mode: InputMode::Steer,
             text: "Summarize this repository.".into(),
         })
         .await?;
+    let turn = pushed.started.expect("an idle Session starts a turn").turn;
     let result = agent.wait_turn(turn).await?;
     println!("{:?} ({:?})", result.report.outcome, result.persistence);
     agent.shutdown().await?;

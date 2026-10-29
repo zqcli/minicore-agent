@@ -93,7 +93,7 @@ result. Manual creation still rejects the reserved `auto-` prefix.
 `session.compact.cancel` cancels only a manual operation; automatic turn-start
 work and emergency recovery are cancelled through `turn.cancel`.
 
-`turn.send` never compacts first and never refuses a send for the size of the
+`input.push` never compacts first and never refuses a push for the size of the
 history. A history that no longer fits the model is reduced by the request
 boundary threshold at turn start, by emergency recovery after a provider rejection, or by a
 manual compaction.

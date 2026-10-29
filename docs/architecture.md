@@ -27,13 +27,22 @@ RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
   model/profile catalogs, and Agent-level shutdown.
 - A loaded `Session` owns its canonical Workspace, persisted record and in-memory
   history, execution configuration, compaction state, `ToolData`,
-  `ToolOwners`, `ToolObserver`, Presentation state, and Session-owned query
-  workers. Close cancels and joins those workers before unloading the Session.
-- Runtime 0.7.0 owns the `AgentLoop` semantics, model-text normalization, and
+  `ToolOwners`, `ToolObserver`, Presentation state, the input queue, and
+  Session-owned query workers. Close cancels and joins those workers before
+  unloading the Session.
+- Runtime owns the `AgentLoop` semantics, model-text normalization, and
   model/tool scheduling. Immutable text, arguments, replay, and request payloads
   share storage across clones. The
   Agent's Session task observes the loop, persists the durably normalized result (including validated private replay), merges
   settled history, and publishes Agent-level completion.
+- The input queue (`sessions/inputs.rs`) is the only way a turn starts. It sits
+  behind its own `std::sync::Mutex`, taken after `inner` when both are needed
+  and never held across an await. Each loop gets a `LoopInputs` implementation
+  bound to its generation: the Runtime calls `take` synchronously at request
+  boundaries, `take` locks only the queue, and it hands out every queued steer
+  once; a loop of an older generation takes nothing. An idle push, `input.resume`,
+  or the end of a manual compaction claims the queue head under the queue lock
+  (`running` marks the claim) so exactly one start proceeds.
 - `ToolObserver` captures the real request/Tool identity at Runtime boundaries.
   `ToolData` retains bounded invocation, execution, stream, and change facts.
   `ToolOwners` owns Bash child cleanup and started workspace commits even if the
@@ -70,12 +79,20 @@ provider-overflow recovery.
   separate public types, the loaded registry, status-worker ownership, active-loop
   execution, event mapping, and context-budget views. `compact.rs` retains
   compaction ownership and commits.
-- The active-loop task names its join/drain, reconciliation, persistence,
-  projection settlement, and completion phases. Publication
-  still precedes auxiliary persistence; the owned task remains the close/join
-  barrier for those writes.
+- One driver task per busy period runs the turns back to back. After a turn's
+  report is persisted it decides under the Session locks: a completed, persisted
+  turn with a queue head installs the successor loop (after settling its own
+  projection, which the successor would project) and only then publishes the
+  finished turn's completion with `next`; any other outcome ends the busy period,
+  pausing a non-empty queue after a turn that did not complete. The driver never
+  joins itself: the next start, compaction, or close joins the one task, which
+  covers every turn of the period. Replaced turns stay waitable through a ring
+  of the last four completions. Otherwise the task names its join/drain,
+  reconciliation, persistence, projection settlement, and completion phases;
+  publication still precedes auxiliary persistence when no successor starts, and
+  the owned task remains the close/join barrier for those writes.
 - `rpc/server.rs` owns deferred tasks and shutdown. `server/dispatch.rs` separates
-  agent, session, query, and turn admission; `errors.rs` owns error mapping and
+  agent, session, query, input, and turn admission; `errors.rs` owns error mapping and
   response construction; `io.rs` owns signals, framing, event pumping, and batched
   output. Success responses carry pre-encoded JSON rather than an intermediate
   `Value` tree.

@@ -17,7 +17,7 @@ verification evidence.
   context estimates/errors.
 - [Security](security.md): local trust assumptions, Workspace limits, redaction,
   stdout, and Store scope.
-- [RPC contract](rpc.md): the normative NDJSON wire contract and all 33 methods.
+- [RPC contract](rpc.md): the normative NDJSON wire contract and all 36 methods.
 - [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 

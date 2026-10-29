@@ -18,9 +18,10 @@ minicore-agent --config ./example.agent.toml --stdio
 - `default_profile` is required and must name an entry in `profiles`.
 - `profiles` and `models` are required non-empty tables.
 - `[loop]` is optional. Its fields are Runtime option overrides:
-  `event_capacity`, `max_pending_steers`, `prompt_timeout_seconds`,
-  `model_timeout_seconds`, `policy_timeout_seconds`, `tool_timeout_seconds`,
-  `model_retry_attempts`, and `model_retry_base_delay_millis`.
+  `event_capacity`, `prompt_timeout_seconds`, `model_timeout_seconds`,
+  `policy_timeout_seconds`, `tool_timeout_seconds`, `model_retry_attempts`, and
+  `model_retry_base_delay_millis`. The removed `max_pending_steers` key is
+  rejected like any unknown key; the input queue holds at most 32 entries.
 - `[compaction]` is optional. It defaults to enabled with a `95` percent
   trigger and `50` percent target. The valid relationship is
   `0 < target_percent < trigger_percent <= 100`. Explicit existing percentages
