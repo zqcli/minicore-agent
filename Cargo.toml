@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The Runtime release this Agent is built and tested against.
-minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", tag = "v0.8.0", version = "0.8.0" }
+minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", tag = "v0.9.0", version = "0.9.0" }
 # Owned process groups/jobs for the Bash command worker. `tracing` is left off
 # on purpose: a wrapped command must never be logged with its script text.
 process-wrap = { version = "8.2", default-features = false, features = [

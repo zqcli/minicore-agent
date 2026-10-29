@@ -12,7 +12,7 @@ also be embedded directly as a Rust library.
 |---|---|
 | Version | 0.8.2 |
 | Rust | edition 2024, current stable |
-| Runtime | `minicore-runtime` 0.8.0, pinned to tag `v0.8.0` |
+| Runtime | `minicore-runtime` 0.9.0, pinned to tag `v0.9.0` |
 | RPC protocol | 1 (33 methods) |
 | Provider | OpenAI Responses API and compatible endpoints |
 | License | MIT OR Apache-2.0 |
