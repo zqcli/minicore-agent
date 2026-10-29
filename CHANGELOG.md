@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-10-30
 
 Breaking: the RPC methods `turn.send` and `turn.steer` are replaced by a
 per-session input queue. Requires Runtime 0.9.0.
