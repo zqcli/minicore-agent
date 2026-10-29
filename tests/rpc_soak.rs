@@ -106,11 +106,11 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
             process
                 .send(
                     &send_id,
-                    "turn.send",
-                    json!({"session_id": session_id, "text": format!("turn {index}")}),
+                    "input.push",
+                    json!({"session_id": session_id, "mode": "steer", "text": format!("turn {index}")}),
                 )
                 .await;
-            let turn = process.response(&send_id).await["result"]["turn"].clone();
+            let turn = process.response(&send_id).await["result"]["started"]["turn"].clone();
             process
                 .send(&wait_id, "turn.wait", turn_params(&turn))
                 .await;
@@ -186,11 +186,11 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
     process
         .send(
             "send1",
-            "turn.send",
-            json!({"session_id": session_id, "text": "one"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "one"}),
         )
         .await;
-    let turn1 = process.response("send1").await["result"]["turn"].clone();
+    let turn1 = process.response("send1").await["result"]["started"]["turn"].clone();
     process
         .send("wait1", "turn.wait", turn_params(&turn1))
         .await;
@@ -203,11 +203,11 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
     process
         .send(
             "send2",
-            "turn.send",
-            json!({"session_id": session_id, "text": "two"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "two"}),
         )
         .await;
-    let turn2 = process.response("send2").await["result"]["turn"].clone();
+    let turn2 = process.response("send2").await["result"]["started"]["turn"].clone();
     process
         .send("wait2", "turn.wait", turn_params(&turn2))
         .await;
@@ -230,11 +230,11 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
     process
         .send(
             "send3",
-            "turn.send",
-            json!({"session_id": session_id, "text": "three"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "three"}),
         )
         .await;
-    let turn3 = process.response("send3").await["result"]["turn"].clone();
+    let turn3 = process.response("send3").await["result"]["started"]["turn"].clone();
     assert_ne!(turn3["loop_id"], turn2["loop_id"]);
     process
         .send("wait3", "turn.wait", turn_params(&turn3))

@@ -8,6 +8,7 @@ mod compaction;
 mod compaction_lifecycle;
 mod display;
 mod events;
+mod inputs;
 mod interrupted;
 mod legacy;
 mod lifecycle;
@@ -22,7 +23,6 @@ mod reload;
 mod reported_trigger;
 mod running_update;
 mod settlement;
-mod steering;
 mod summary;
 mod tool_data;
 mod tool_loop;
@@ -46,7 +46,8 @@ mod core;
 mod wait;
 use wait::wait_until;
 
-use super::{ReloadResult, SteerMessage};
+use super::ReloadResult;
+use crate::agent::InputMode;
 use crate::test_support::model::supported_reasoning;
 use crate::test_support::{Gate, ScriptedModel, Step, TempDir};
 mod fixture;
@@ -593,8 +594,21 @@ async fn create_session(agent: &mut Agent, workspace: &Path) -> crate::agent::Se
 
 async fn send_text(agent: &mut Agent, session_id: crate::ids::SessionId, text: &str) -> TurnRef {
     agent
-        .send(crate::agent::SendMessage {
+        .send_for_test(session_id, text.to_owned())
+        .await
+        .unwrap()
+}
+
+async fn push(
+    agent: &Agent,
+    session_id: crate::ids::SessionId,
+    mode: crate::agent::InputMode,
+    text: &str,
+) -> crate::agent::InputPushed {
+    agent
+        .push_input(crate::agent::PushInput {
             session_id,
+            mode,
             text: text.to_owned(),
         })
         .await
@@ -657,6 +671,31 @@ async fn read_store_history(
 mod recent_tail;
 
 impl Agent {
+    /// Pushes a steer; `SessionBusy` when it did not start a turn.
+    pub(crate) async fn send_for_test(
+        &self,
+        session_id: crate::ids::SessionId,
+        text: String,
+    ) -> Result<TurnRef, AgentError> {
+        self.push_input(crate::agent::PushInput {
+            session_id,
+            mode: crate::agent::InputMode::Steer,
+            text,
+        })
+        .await?
+        .started
+        .map(|started| started.turn)
+        .ok_or(AgentError::SessionBusy)
+    }
+
+    pub(crate) fn wait_turn_receiver(
+        &self,
+        turn: TurnRef,
+    ) -> Result<tokio::sync::watch::Receiver<Option<crate::sessions::TurnCompletion>>, AgentError>
+    {
+        self.session(turn.session_id)?.wait_receiver(turn)
+    }
+
     pub(crate) async fn open_file_with_models(
         path: PathBuf,
         models: Models,

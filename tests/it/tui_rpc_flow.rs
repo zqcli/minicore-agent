@@ -174,11 +174,11 @@ async fn tui_discovery_create_history_and_reopen_flow() {
         process
             .send(
                 "send1",
-                "turn.send",
-                json!({"session_id": session_id, "text": "first prompt"}),
+                "input.push",
+                json!({"session_id": session_id, "mode": "steer", "text": "first prompt"}),
             )
             .await;
-        let turn = process.response("send1").await["result"]["turn"].clone();
+        let turn = process.response("send1").await["result"]["started"]["turn"].clone();
         process.send("wait1", "turn.wait", turn_params(&turn)).await;
         (turn, "wait1")
     };
@@ -202,11 +202,11 @@ async fn tui_discovery_create_history_and_reopen_flow() {
     process
         .send(
             "send2",
-            "turn.send",
-            json!({"session_id": session_id, "text": "second prompt"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "second prompt"}),
         )
         .await;
-    let second_turn = process.response("send2").await["result"]["turn"].clone();
+    let second_turn = process.response("send2").await["result"]["started"]["turn"].clone();
     assert_ne!(second_turn["loop_id"], first_turn["loop_id"]);
     process
         .send("wait2", "turn.wait", turn_params(&second_turn))
@@ -238,7 +238,7 @@ async fn tui_discovery_create_history_and_reopen_flow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tui_steer_update_cancel_while_wait_is_pending() {
+async fn tui_push_update_cancel_while_wait_is_pending() {
     let gate_events = vec![
         json!({"type": "response.output_text.delta", "delta": "steered"}),
         completed(),
@@ -258,30 +258,35 @@ async fn tui_steer_update_cancel_while_wait_is_pending() {
     process
         .send(
             "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": "do the thing"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "do the thing"}),
         )
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
+    let turn = process.response("send").await["result"]["started"]["turn"].clone();
     process.send("wait", "turn.wait", turn_params(&turn)).await;
 
     // The loop is running; the reader stays responsive.
     process.send("ping", "agent.ping", json!({})).await;
     process.response("ping").await;
 
-    // Steer while wait is pending.
+    // Push a steer while wait is pending: it queues behind the running turn.
     process
         .send(
             "steer",
-            "turn.steer",
+            "input.push",
             json!({
                 "session_id": session_id,
-                "loop_id": turn["loop_id"],
+                "mode": "steer",
                 "text": "do not touch config files"
             }),
         )
         .await;
-    assert_eq!(process.response("steer").await["result"]["ok"], true);
+    let steered = process.response("steer").await;
+    assert!(steered["result"]["started"].is_null());
+    assert_eq!(
+        steered["result"]["queue"]["items"][0]["text"],
+        "do not touch config files"
+    );
 
     // Session model/reasoning update while wait is pending.
     process
@@ -311,15 +316,18 @@ async fn tui_steer_update_cancel_while_wait_is_pending() {
     assert_eq!(waited["result"]["persistence"], "persisted");
     gate.release();
 
-    // A further turn succeeds after the cancel.
+    // The cancel paused the queue; a push clears the pause and starts the
+    // older entry.
     process
         .send(
             "send2",
-            "turn.send",
-            json!({"session_id": session_id, "text": "next task"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "next task"}),
         )
         .await;
-    let turn2 = process.response("send2").await["result"]["turn"].clone();
+    let started2 = process.response("send2").await["result"]["started"].clone();
+    assert_eq!(started2["input"]["text"], "do not touch config files");
+    let turn2 = started2["turn"].clone();
     process
         .send("wait2", "turn.wait", turn_params(&turn2))
         .await;
@@ -329,6 +337,61 @@ async fn tui_steer_update_cancel_while_wait_is_pending() {
     let (observed, stderr) = process.shutdown().await;
     assert!(!serde_json::to_string(&observed).unwrap().contains(KEY));
     assert!(!stderr.contains(KEY));
+    server.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_queued_follow_up_starts_as_the_wait_results_next_turn() {
+    let (gated, gate) = gated_sse(vec![
+        json!({"type": "response.output_text.delta", "delta": "first answer"}),
+        completed(),
+    ]);
+    let server = MockServer::spawn([gated, text_response("second answer")]).await;
+    let base_url = server.base_url().to_owned();
+    let fixture = Fixture::new("queue");
+    let base = fixture.path().to_owned();
+    let workspace = base.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = write_config(&base, &base_url, 256, &[], "deep", "medium");
+    let mut process = RpcProcess::spawn(&config, KEY_ENV, KEY).await;
+
+    let session = create_session(&mut process, "create", &workspace, "deep", "medium").await;
+    let session_id = session["session_id"].clone();
+    process
+        .send(
+            "first",
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "start"}),
+        )
+        .await;
+    let turn = process.response("first").await["result"]["started"]["turn"].clone();
+    process.send("wait", "turn.wait", turn_params(&turn)).await;
+
+    process
+        .send(
+            "later",
+            "input.push",
+            json!({"session_id": session_id, "mode": "follow_up", "text": "then this"}),
+        )
+        .await;
+    let queued = process.response("later").await;
+    assert!(queued["result"]["started"].is_null());
+    assert_eq!(queued["result"]["queue"]["items"][0]["text"], "then this");
+    gate.release();
+
+    let waited = process.response("wait").await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    let next = waited["result"]["next"].clone();
+    assert_eq!(next["input"]["id"], queued["result"]["id"]);
+    assert_eq!(waited["result"]["queue"]["items"], json!([]));
+    process
+        .send("wait2", "turn.wait", turn_params(&next["turn"]))
+        .await;
+    let second = process.response("wait2").await;
+    assert_eq!(second["result"]["outcome"]["type"], "completed");
+    assert!(second["result"]["next"].is_null());
+
+    process.shutdown().await;
     server.finish().await;
 }
 
@@ -353,11 +416,11 @@ async fn tui_streams_reasoning_and_text_channels() {
     process
         .send(
             "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": "reason out loud"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "reason out loud"}),
         )
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
+    let turn = process.response("send").await["result"]["started"]["turn"].clone();
     process.send("wait", "turn.wait", turn_params(&turn)).await;
 
     // Streaming deltas are best-effort; the exact text is asserted via the
@@ -411,11 +474,11 @@ async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
     process
         .send(
             "send",
-            "turn.send",
-            json!({"session_id": session_id, "text": "read the file"}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": "read the file"}),
         )
         .await;
-    let turn = process.response("send").await["result"]["turn"].clone();
+    let turn = process.response("send").await["result"]["started"]["turn"].clone();
     process.send("wait", "turn.wait", turn_params(&turn)).await;
     let tool_started = process.event("tool_started").await;
     assert_eq!(tool_started["params"]["data"]["tool_name"], "read");
@@ -471,11 +534,12 @@ async fn tui_two_sessions_run_independently() {
         process
             .send(
                 &format!("send-{id}"),
-                "turn.send",
-                json!({"session_id": session["session_id"], "text": prompt}),
+                "input.push",
+                json!({"session_id": session["session_id"], "mode": "steer", "text": prompt}),
             )
             .await;
-        let turn = process.response(&format!("send-{id}")).await["result"]["turn"].clone();
+        let turn =
+            process.response(&format!("send-{id}")).await["result"]["started"]["turn"].clone();
         let wait_id = format!("wait-{id}");
         process
             .send(&wait_id, "turn.wait", turn_params(&turn))

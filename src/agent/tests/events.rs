@@ -67,10 +67,7 @@ async fn send_is_rejected_for_unloaded_session() {
     agent.close_session(info.session_id).await.unwrap();
 
     let error = agent
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "hello".to_owned(),
-        })
+        .send_for_test(info.session_id, "hello".to_owned())
         .await;
     assert!(matches!(error, Err(AgentError::SessionNotLoaded)));
 }
@@ -256,6 +253,8 @@ async fn queued_finished_drops_are_accounted_without_runtime_completion_mapping(
         turn,
         outcome: crate::event::LoopOutcomeView::Completed,
         persistence: crate::sessions::TurnPersistence::Persisted,
+        next: None,
+        queue: crate::sessions::Queue::default(),
         meta: crate::event::EventMeta {
             session_id: turn.session_id,
             loop_id: Some(turn.loop_id),

@@ -38,6 +38,8 @@ async fn streaming_pressure_cannot_displace_lifecycle_and_drops_follow_delivery(
             turn,
             outcome: LoopOutcomeView::Completed,
             persistence: TurnPersistence::Persisted,
+            next: None,
+            queue: crate::sessions::Queue::default(),
             meta: EventMeta::for_turn(turn)
         }),
         AgentSendResult::Sent

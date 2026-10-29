@@ -37,19 +37,6 @@ pub struct PresentationView {
     pub cost_usd: Option<f64>,
     pub using_subscription: Option<bool>,
     pub last_loop: Option<LastLoopView>,
-    /// Latest steering receipt committed at a real `Model::start`, used for
-    /// lost-event reconciliation (read-only; no dedicated RPC method).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub steer_progress: Option<SteerProgressView>,
-}
-
-/// Read-only steering receipt snapshot: the request at which `applied_count`
-/// Steering items were first observed in the PREPARED prompt history.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SteerProgressView {
-    pub loop_id: LoopId,
-    pub request_index: u32,
-    pub applied_count: u64,
 }
 
 pub(super) struct LiveTool {
@@ -97,48 +84,6 @@ pub(super) struct PresentationInner {
     context: ContextUsageView,
     context_settings: (u64, u64),
     installed_model: Option<Weak<dyn Model>>,
-    /// 1-based FIFO count of Accepted Steers in this loop (from
-    /// `Session::steer`, serialized by the same session lock).
-    accepted_steers: u64,
-    /// The last request whose prompt prepare succeeded and the steering count
-    /// observed in its history. Committed to `applied_steer` only at the real
-    /// `Model::start`; preparing/rebuilding alone never releases the queue.
-    prepared_steers: Option<(RequestKey, u64)>,
-    /// First request at which each steering count was applied, keyed by count.
-    applied_steer: Option<(u64, RequestKey)>,
-}
-
-impl PresentationInner {
-    /// Commits a newly applied steering count at its first observing request
-    /// and returns the best-effort `steer_progress` event. Later requests that
-    /// observe the same count keep the original boundary. `count` is the
-    /// authoritative history count; it may be lower than the accepted counter
-    /// while a steer is queued but not yet in the prompt history.
-    fn commit_steer_applied(
-        &mut self,
-        session_id: SessionId,
-        key: RequestKey,
-        applied_count: u64,
-    ) -> Option<AgentEvent> {
-        if self
-            .applied_steer
-            .as_ref()
-            .is_some_and(|(previous, _)| *previous >= applied_count)
-        {
-            return None;
-        }
-        self.applied_steer = Some((applied_count, key));
-        let turn = TurnRef {
-            session_id,
-            loop_id: key.loop_id,
-        };
-        Some(AgentEvent::SteerProgress {
-            turn,
-            request_index: key.request_index,
-            applied_count,
-            meta: EventMeta::for_turn(turn),
-        })
-    }
 }
 
 /// Per-session presentation state shared by the Model/Tool wrappers, the RPC
@@ -185,41 +130,6 @@ impl Presentation {
 
     pub(crate) fn set_branch(&self, branch: Option<String>) {
         self.lock().branch = branch;
-    }
-
-    /// Records the real model-start boundary for display-only steering
-    /// receipts. The execution request key lives in `ToolObserver`; this cache
-    /// only commits a prepared steering count and emits its read-only event.
-    /// The user-facing label is set from the session profile, never from the
-    /// provider descriptor.
-    pub(crate) fn note_request_start(&self, key: RequestKey) {
-        let event = {
-            let mut inner = self.lock();
-            inner
-                .prepared_steers
-                .take()
-                .filter(|(prepared_key, _)| *prepared_key == key)
-                .and_then(|(_, count)| inner.commit_steer_applied(self.session_id, key, count))
-        };
-        if let Some(event) = event {
-            let _ = self.events.try_send(event);
-        }
-    }
-
-    /// Records the steering User count observed for a request whose prompt
-    /// prepare succeeded. The queue is only ever released when that count is
-    /// committed at `Model::start`; this call alone never releases it.
-    pub(crate) fn commit_prepared_request(&self, key: RequestKey, applied_count: u64) {
-        self.lock().prepared_steers = Some((key, applied_count));
-    }
-
-    /// 1-based FIFO acceptance index for the just-accepted steer, or `None`
-    /// when the per-loop counter overflowed (practically impossible).
-    pub(crate) fn note_steer_accepted(&self, accepted_at: Option<String>) -> Option<u64> {
-        let mut inner = self.lock();
-        inner.live_times.push_back(accepted_at);
-        inner.accepted_steers = inner.accepted_steers.checked_add(1)?;
-        Some(inner.accepted_steers)
     }
 
     /// Records real per-request usage observed on the model stream and emits
@@ -325,9 +235,6 @@ impl Presentation {
         inner.request_usage.clear();
         inner.streamed = None;
         inner.live_times.clear();
-        inner.accepted_steers = 0;
-        inner.prepared_steers = None;
-        inner.applied_steer = None;
     }
 
     /// Binds metadata for the loop that was successfully started. This is
@@ -413,8 +320,7 @@ impl Presentation {
         self.lock().live_times.iter().take(count).cloned().collect()
     }
 
-    /// Drops all acceptance metadata for the completed current loop. Extra
-    /// entries are accepted Steers that did not enter the persisted report.
+    /// Drops all acceptance metadata for the completed current loop.
     pub(crate) fn clear_user_times(&self) {
         self.lock().live_times.clear();
     }
@@ -515,14 +421,6 @@ impl Presentation {
             cost_usd: None,
             using_subscription: None,
             last_loop: inner.last_loop.clone(),
-            steer_progress: inner
-                .applied_steer
-                .as_ref()
-                .map(|(count, key)| SteerProgressView {
-                    loop_id: key.loop_id,
-                    request_index: key.request_index,
-                    applied_count: *count,
-                }),
         }
     }
 

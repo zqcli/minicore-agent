@@ -238,10 +238,6 @@ fn loop_overrides_are_validated() {
     assert_eq!(config.validate(), Err(ConfigError::InvalidLoopOptions));
 
     let mut config = valid_config();
-    config.loop_options.max_pending_steers = Some(0);
-    assert_eq!(config.validate(), Err(ConfigError::InvalidLoopOptions));
-
-    let mut config = valid_config();
     config.loop_options.model_timeout_seconds = Some(0);
     assert_eq!(config.validate(), Err(ConfigError::InvalidLoopOptions));
 
@@ -255,16 +251,20 @@ fn loop_overrides_are_validated() {
 }
 
 #[test]
+fn the_removed_max_pending_steers_key_is_rejected() {
+    assert!(toml::from_str::<LoopOverrides>("event_capacity = 8").is_ok());
+    assert!(toml::from_str::<LoopOverrides>("max_pending_steers = 4").is_err());
+}
+
+#[test]
 fn loop_options_applies_overrides_to_runtime_defaults() {
     let mut config = valid_config();
     config.loop_options.event_capacity = Some(16);
-    config.loop_options.max_pending_steers = Some(8);
     config.loop_options.model_retry_attempts = Some(3);
     config.loop_options.model_retry_base_delay_millis = Some(250);
     let options = config.loop_options().unwrap();
     assert_eq!(options.max_tool_rounds, 0);
     assert_eq!(options.event_capacity, 16);
-    assert_eq!(options.max_pending_steers, 8);
     assert_eq!(options.model_retry_attempts, 3);
     assert_eq!(options.model_retry_base_delay, Duration::from_millis(250));
 }

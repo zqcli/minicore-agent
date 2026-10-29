@@ -23,10 +23,7 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
     assert!(state.active_loop.is_none());
 
     let error = agent
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "after panic".to_owned(),
-        })
+        .send_for_test(info.session_id, "after panic".to_owned())
         .await;
     assert!(matches!(error, Err(AgentError::SessionBlocked)));
     let state = agent.session_state(info.session_id).unwrap();
@@ -182,10 +179,7 @@ async fn append_failure_blocks_session_and_returns_failed_persistence() {
         Some(crate::sessions::SessionBlockReason::Persistence)
     );
     let busy = agent
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "after".to_owned(),
-        })
+        .send_for_test(info.session_id, "after".to_owned())
         .await;
     assert!(matches!(busy, Err(AgentError::SessionBlocked)));
 }
@@ -218,10 +212,7 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
 
     // A second send fails with SessionBlocked.
     let second_send = agent
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "second turn".to_owned(),
-        })
+        .send_for_test(info.session_id, "second turn".to_owned())
         .await;
     assert!(matches!(second_send, Err(AgentError::SessionBlocked)));
 

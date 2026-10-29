@@ -4,9 +4,8 @@ use super::*;
 // Model / Tool wrappers (thin; identity + best-effort display only)
 // ---------------------------------------------------------------------------
 
-/// Records the real request key in `ToolObserver` at the model boundary and
-/// mirrors that boundary into the display-only steering cache, then delegates
-/// unchanged.
+/// Records the real request key in `ToolObserver` at the model boundary, then
+/// delegates unchanged.
 pub(crate) struct PresentationModel {
     physical_window: u64,
     inner: Arc<dyn Model>,
@@ -46,7 +45,6 @@ impl Model for PresentationModel {
         };
         // Synchronous; no lock is held across an await.
         self.observer.note_request_start(key);
-        self.presentation.note_request_start(key);
         self.presentation
             .begin_streamed(key, self.descriptor().model_ref.as_str().to_owned());
         let context_generation = self.presentation.context_generation(self);
@@ -70,56 +68,6 @@ impl Model for PresentationModel {
                 context_generation,
                 physical_window,
             )) as minicore_runtime::model::ModelStream)
-        })
-    }
-}
-
-/// Thin pass-through prompt wrapper that counts Steering User items present in
-/// the PREPARED prompt history (same runtime `PromptProvider` seam the Agent
-/// already plugs into), retains the count only after a successful prepare,
-/// and lets `PresentationModel::start` commit it at the real `Model::start`
-/// boundary. Read-only: no prompt messages, model requests, or tool semantics
-/// are ever rewritten, and the queue is never released by preparing alone.
-pub(crate) struct SteerReceiptPrompt {
-    inner: Arc<dyn PromptProvider>,
-    presentation: Arc<Presentation>,
-}
-
-impl SteerReceiptPrompt {
-    pub(crate) fn new(
-        inner: Arc<dyn PromptProvider>,
-        presentation: Arc<Presentation>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            presentation,
-        })
-    }
-}
-
-impl PromptProvider for SteerReceiptPrompt {
-    fn prepare<'a>(&'a self, request: PromptRequest<'a>) -> PromptFuture<'a> {
-        let key = RequestKey {
-            loop_id: request.loop_id,
-            request_index: request.request_index,
-        };
-        let applied_count = request
-            .history
-            .iter()
-            .filter(|item| {
-                matches!(item,
-                    HistoryItem::User(user)
-                        if user.kind == UserMessageKind::Steering && user.loop_id == request.loop_id)
-            })
-            .count() as u64;
-        let presentation = Arc::clone(&self.presentation);
-        let inner = self.inner.prepare(request);
-        Box::pin(async move {
-            // Only a SUCCESSFUL prepare retains the count; a cancelled or
-            // failed prompt must never release the steering queue.
-            let prepared = inner.await?;
-            presentation.commit_prepared_request(key, applied_count);
-            Ok(prepared)
         })
     }
 }

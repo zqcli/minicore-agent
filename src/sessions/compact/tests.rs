@@ -159,15 +159,12 @@ async fn append_text(session: &Session, bytes: usize) {
 
 #[tokio::test]
 async fn high_final_usage_waits_until_the_next_turn_to_compact() {
-    let (_temp, mut agent, session, model) = fixture("answer", 8_000).await;
+    let (_temp, agent, session, model) = fixture("answer", 8_000).await;
     for _ in 0..3 {
         append_text(&session, 6_000).await;
     }
     let first = agent
-        .send(crate::SendMessage {
-            session_id: session.session_id(),
-            text: "continue".into(),
-        })
+        .send_for_test(session.session_id(), "continue".into())
         .await
         .unwrap();
     assert_eq!(
@@ -188,10 +185,7 @@ async fn high_final_usage_waits_until_the_next_turn_to_compact() {
     assert!(session.context().last_result.is_none());
     assert!(session.shared.compaction.coverage().is_none());
     let second = agent
-        .send(crate::SendMessage {
-            session_id: session.session_id(),
-            text: "next turn".into(),
-        })
+        .send_for_test(session.session_id(), "next turn".into())
         .await
         .unwrap();
     assert_eq!(
@@ -212,7 +206,7 @@ async fn high_final_usage_waits_until_the_next_turn_to_compact() {
 
 #[tokio::test]
 async fn turn_wait_does_not_wait_for_projection_settlement() {
-    let (_temp, mut agent, session, model) = fixture("summary", 8_000).await;
+    let (_temp, agent, session, model) = fixture("summary", 8_000).await;
     let old = LoopId::new().unwrap();
     let call_id = "read-old".parse().unwrap();
     append_source(
@@ -252,10 +246,7 @@ async fn turn_wait_does_not_wait_for_projection_settlement() {
     let gate = Arc::new(Gate::new());
     crate::store::SUMMARY_COMMIT_GATES.arm(session.session_id(), Arc::clone(&gate));
     let turn = agent
-        .send(crate::SendMessage {
-            session_id: session.session_id(),
-            text: "continue".into(),
-        })
+        .send_for_test(session.session_id(), "continue".into())
         .await
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())

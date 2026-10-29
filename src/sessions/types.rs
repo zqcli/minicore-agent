@@ -16,24 +16,9 @@ pub struct TurnResult {
     pub report: Arc<LoopReport>,
     pub persistence: TurnPersistence,
     pub interrupted: Option<InterruptedRequest>,
-}
-
-/// One accepted Prompt: the new turn plus the Agent acceptance time (may be
-/// `None` when the clock is unavailable; the TUI shows pending until then).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LoopAccepted {
-    pub turn: TurnRef,
-    pub accepted_at: Option<String>,
-}
-
-/// One accepted Steer: the runtime accepted it into the loop queue; the field
-/// carries the Agent acceptance time, not the applied/persisted time, and the
-/// 1-based FIFO acceptance index within the loop (absent on older semantics
-/// where the index is unavailable).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SteerAccepted {
-    pub accepted_at: Option<String>,
-    pub steer_index: Option<u64>,
+    /// The successor turn the Agent started from the input queue, installed
+    /// before this result was published.
+    pub next: Option<StartedTurn>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

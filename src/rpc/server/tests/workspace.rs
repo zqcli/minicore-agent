@@ -137,11 +137,11 @@ async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "blocked turn"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "blocked turn"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     tokio::time::timeout(TIMEOUT, turn_started.notified())
         .await
         .expect("blocked model request did not start");

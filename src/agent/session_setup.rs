@@ -117,17 +117,14 @@ impl ExecutionConfigFactory<'_> {
                 Arc::clone(&parts.observer),
             ))
         };
-        let prompt: Arc<dyn PromptProvider> = crate::presentation::SteerReceiptPrompt::new(
-            Arc::new(
-                ProjectPromptProvider::with_auto(
-                    workspace,
-                    record.system_prompt.clone(),
-                    Arc::clone(&parts.compaction),
-                    auto.clone(),
-                )
-                .map_err(|_| AgentError::InvalidSessionSettings)?,
-            ),
-            Arc::clone(&parts.presentation),
+        let prompt: Arc<dyn PromptProvider> = Arc::new(
+            ProjectPromptProvider::with_auto(
+                workspace,
+                record.system_prompt.clone(),
+                Arc::clone(&parts.compaction),
+                auto.clone(),
+            )
+            .map_err(|_| AgentError::InvalidSessionSettings)?,
         );
         let config = ExecutionConfig::new(model, record.reasoning, tools, policy, prompt)
             .map_err(|_| AgentError::InvalidSessionSettings)?;

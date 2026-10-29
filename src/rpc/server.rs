@@ -13,7 +13,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    Agent, AnswerInteraction, CompactSession, CreateSession, RenameSession, SendMessage,
+    Agent, AnswerInteraction, CompactSession, CreateSession, PushInput, RemoveInput, RenameSession,
     UpdateSession,
 };
 use crate::changes::{ChangesListRequest, change_deadline};
@@ -29,16 +29,16 @@ use crate::workspace::search::WorkspaceSearchRequest;
 use crate::workspace::status::WorkspaceStatusRequest;
 
 use super::protocol::{
-    AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, EmptyParams,
-    INTERACTION_NOT_FOUND, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
-    INVALID_SESSION_SETTINGS, INVALID_STATE, InteractionAnswerParams, METHOD_NOT_FOUND,
-    MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR, PROFILE_NOT_FOUND, ProfilesResult,
-    QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE, RESOURCE_EXHAUSTED, RUNTIME_ERROR,
-    RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND,
-    SESSION_NOT_LOADED, STEER_QUEUE_FULL, STORE_ERROR, SessionHistoryParams, SessionParams,
-    SessionResult, SessionUpdateResult, SessionsResult, SteerResult, TOOL_NOT_FOUND,
-    TURN_NOT_FOUND, ToolOutputParams, ToolReadParams, TurnParams, TurnResult, TurnResultParams,
-    TurnSteerParams, WORKSPACE_ERROR, decode_params, parse_request, request_id,
+    AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, CompactResult, EmptyParams,
+    INPUT_NOT_QUEUED, INPUT_QUEUE_FULL, INTERACTION_NOT_FOUND, INTERNAL_ERROR, INVALID_PARAMS,
+    INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE, InteractionAnswerParams,
+    METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR, PROFILE_NOT_FOUND,
+    ProfilesResult, QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE, RESOURCE_EXHAUSTED,
+    RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY,
+    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STORE_ERROR, SessionHistoryParams, SessionParams,
+    SessionResult, SessionUpdateResult, SessionsResult, TOOL_NOT_FOUND, TURN_NOT_FOUND,
+    ToolOutputParams, ToolReadParams, TurnParams, TurnResultParams, TurnWaitResult,
+    WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 mod dispatch;
 mod errors;

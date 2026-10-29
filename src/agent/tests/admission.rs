@@ -68,12 +68,13 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
     let info = create_session(&mut agent, &workspace).await;
     let turn = send_text(&mut agent, info.session_id, "read then steer").await;
     gate.wait_started().await;
-    agent
-        .steer(super::SteerMessage {
-            turn,
-            text: "keep the answer concise".to_owned(),
-        })
-        .unwrap();
+    push(
+        &agent,
+        info.session_id,
+        crate::agent::InputMode::Steer,
+        "keep the answer concise",
+    )
+    .await;
     assert!(
         agent
             .session_context(info.session_id)

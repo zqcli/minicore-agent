@@ -664,27 +664,30 @@ fn rename_request_debug_does_not_include_the_title() {
 }
 
 #[tokio::test]
-async fn single_active_loop_busy() {
+async fn a_push_during_a_running_turn_is_queued_and_never_starts_a_second_loop() {
     let fixture = AgentFixture::new("busy").file("a.txt", b"hello");
     let gate = Arc::new(Gate::new());
 
-    let fixture = fixture.script([Step::gated_text(gate.clone(), "first")]);
+    let fixture = fixture.script([
+        Step::gated_text(gate.clone(), "first"),
+        Step::Text("second"),
+    ]);
     let (mut agent, info) = fixture.start().await;
 
     let first = send_text(&mut agent, info.session_id, "first").await;
-    let busy = agent
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "second".to_owned(),
-        })
-        .await;
-    assert!(matches!(busy, Err(AgentError::SessionBusy)));
+    let queued = push(&agent, info.session_id, InputMode::FollowUp, "second").await;
+    assert!(queued.started.is_none());
+    assert_eq!(queued.queue.items.len(), 1);
 
     gate.wait_started().await;
     gate.release();
     let result = wait_text(&agent, first).await;
     assert_persisted(&result);
-    agent.wait_turn(first).await.unwrap(); // already completed: no error
+    // The follow-up became the successor turn, installed before the wait resolved.
+    let next = result.next.as_ref().expect("the follow-up starts a turn");
+    assert_eq!(next.input.id, queued.id);
+    assert_eq!(next.input.text, "second");
+    assert_eq!(wait_text(&agent, next.turn).await.next, None);
 }
 
 #[tokio::test]

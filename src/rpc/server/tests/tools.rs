@@ -23,11 +23,11 @@ async fn tool_read_and_output_query_recorded_facts_by_full_identity() {
     let session_id = create_and_open(&mut harness, &workspace).await;
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "read a"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "read a"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -141,11 +141,11 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
     let session_id = create_and_open(&mut harness, &workspace).await;
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "write it"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "write it"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
     let interaction = harness.event("interaction_requested").await;
     let tool_call_id = interaction["params"]["data"]["interaction"]["tool_call_id"].clone();
 

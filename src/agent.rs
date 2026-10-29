@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use minicore_runtime::InteractionId;
 use minicore_runtime::LoopOptions;
-use minicore_runtime::execution::{ConfigRevision, ExecutionConfig, UserInput};
+use minicore_runtime::execution::{ConfigRevision, ExecutionConfig};
 use minicore_runtime::interaction::InteractionAnswer;
 use minicore_runtime::model::ReasoningPreference;
 use minicore_runtime::prompt::PromptProvider;
@@ -28,7 +28,7 @@ use crate::models::{ModelConfig, ModelConfigError, ModelInfo, Models};
 use crate::policy::Policy;
 use crate::profiles::{Profile, ProfileInfo, Profiles};
 use crate::prompt::ProjectPromptProvider;
-use crate::sessions::{Sessions, TurnCompletion, await_compaction_completion};
+use crate::sessions::{CompactionCompletion, Sessions, await_compaction_completion};
 use crate::store::{SESSION_FORMAT_VERSION, SessionRecord, Store};
 use crate::tool_data::ToolData;
 use crate::tools::command::ToolOwners;
@@ -42,7 +42,9 @@ pub use crate::read::{
     TurnResultAvailability, TurnResultPage, TurnResultRequest,
 };
 pub use crate::sessions::{
-    SessionContext, SessionState, SessionStatus, TurnPersistence, TurnRef, TurnResult,
+    DeliveredInput, InputMode, InputPushed, InputRemoved, InputsRecalled, InputsResumed, PushInput,
+    Queue, QueueItem, RemoveInput, SessionContext, SessionState, SessionStatus, StartedTurn,
+    TurnPersistence, TurnRef, TurnResult,
 };
 
 mod session_setup;
@@ -106,23 +108,9 @@ pub struct CreateSession {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SendMessage {
-    pub session_id: crate::ids::SessionId,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CompactSession {
     pub session_id: crate::ids::SessionId,
     pub operation_id: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SteerMessage {
-    pub turn: TurnRef,
-    pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -726,8 +714,9 @@ impl Agent {
 
     /// Closes and unloads a loaded Session by ID.
     ///
-    /// If the Session has active work, its Agent-owned loop or manual-compaction task
-    /// is cancelled and joined before unloading. MiniCore Agent v0.3 uses the Runtime
+    /// A Session with queued inputs is refused with `SessionBusy`; recall them
+    /// first. If the Session has active work, its Agent-owned loop or
+    /// manual-compaction task is cancelled and joined before unloading. MiniCore Agent v0.3 uses the Runtime
     /// user-cancellation path when closing or shutting down an active Session;
     /// it does not currently preserve a distinct shutdown cancellation reason.
     pub async fn close_session(
@@ -735,6 +724,9 @@ impl Agent {
         session_id: crate::ids::SessionId,
     ) -> Result<(), AgentError> {
         let session = self.session(session_id)?.clone();
+        if session.has_queued_inputs() {
+            return Err(AgentError::SessionBusy);
+        }
         let result = session.shutdown().await;
         self.finish_close(session_id);
         result
@@ -865,34 +857,50 @@ impl Agent {
         }))
     }
 
-    /// Starts an ordinary user turn without pre-turn summarization.
-    pub async fn send(&mut self, request: SendMessage) -> Result<TurnRef, AgentError> {
-        let input = UserInput::text(request.text).map_err(|_| AgentError::InvalidInput)?;
-        match self.prepare_submit(request.session_id, input)?.await? {
-            crate::sessions::LoopSubmission::Accepted(accepted) => Ok(accepted.turn),
-        }
+    /// Queues one input. An idle Session starts a turn with the queue head at
+    /// once, which is reported in `started`.
+    pub async fn push_input(&self, request: PushInput) -> Result<InputPushed, AgentError> {
+        self.session(request.session_id)?
+            .accept_input(request.mode, request.text)?
+            .start()
+            .await
     }
 
-    pub(crate) fn prepare_submit(
+    pub fn remove_input(&self, request: RemoveInput) -> Result<InputRemoved, AgentError> {
+        self.session(request.session_id)?.remove_input(&request.id)
+    }
+
+    /// Removes every queued input, in run order, and clears the pause.
+    pub fn recall_inputs(
         &self,
         session_id: crate::ids::SessionId,
-        input: UserInput,
-    ) -> Result<AgentFuture<crate::sessions::LoopSubmission>, AgentError> {
-        let session = self.session(session_id)?.clone();
-        Ok(Box::pin(async move { session.submit(input).await }))
+    ) -> Result<InputsRecalled, AgentError> {
+        Ok(self.session(session_id)?.recall_inputs())
+    }
+
+    /// Clears the pause and starts the queue head when the Session is idle.
+    pub async fn resume_inputs(
+        &self,
+        session_id: crate::ids::SessionId,
+    ) -> Result<InputsResumed, AgentError> {
+        self.session(session_id)?.accept_resume()?.start().await
+    }
+
+    pub fn list_inputs(&self, session_id: crate::ids::SessionId) -> Result<Queue, AgentError> {
+        Ok(self.session(session_id)?.queue())
     }
 
     pub(crate) async fn compact_session(
         &mut self,
         request: CompactSession,
-    ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
+    ) -> Result<watch::Receiver<Option<CompactionCompletion>>, AgentError> {
         self.prepare_compact(request)?.await
     }
 
     pub(crate) fn prepare_compact(
         &self,
         request: CompactSession,
-    ) -> Result<AgentFuture<watch::Receiver<Option<CompactionResult>>>, AgentError> {
+    ) -> Result<AgentFuture<watch::Receiver<Option<CompactionCompletion>>>, AgentError> {
         if !valid_operation_id(&request.operation_id) || request.operation_id.starts_with("auto-") {
             return Err(AgentError::InvalidInput);
         }
@@ -919,27 +927,15 @@ impl Agent {
 
     /// Runs one manual compaction and resolves after its Session-owned worker
     /// has published the final result. The RPC server uses the crate-private
-    /// start method above so the request itself remains deferred.
+    /// start method above so the request itself remains deferred. A queued
+    /// input may start a turn when the compaction ends; it is not reported
+    /// here.
     pub async fn compact(
         &mut self,
         request: CompactSession,
     ) -> Result<CompactionResult, AgentError> {
         let receiver = self.compact_session(request).await?;
-        await_compaction_completion(receiver).await
-    }
-
-    /// Steers the active turn and preserves the original public return type.
-    /// RPC uses `steer_accepted` when it also needs the optional timestamp.
-    pub fn steer(&self, request: SteerMessage) -> Result<(), AgentError> {
-        self.steer_accepted(request).map(|_| ())
-    }
-
-    pub(crate) fn steer_accepted(
-        &self,
-        request: SteerMessage,
-    ) -> Result<crate::sessions::SteerAccepted, AgentError> {
-        let session = self.session(request.turn.session_id)?;
-        session.steer(request.turn, request.text)
+        Ok(await_compaction_completion(receiver).await?.result)
     }
 
     /// Read-only footer/detail data for one loaded session (never drives
@@ -963,14 +959,6 @@ impl Agent {
     ) -> Result<Arc<crate::sessions::TurnResult>, AgentError> {
         let session = self.session(turn.session_id)?;
         session.wait(turn).await
-    }
-
-    pub(crate) fn wait_turn_receiver(
-        &self,
-        turn: TurnRef,
-    ) -> Result<watch::Receiver<Option<TurnCompletion>>, AgentError> {
-        let session = self.session(turn.session_id)?;
-        session.wait_receiver(turn)
     }
 
     pub async fn answer(&self, request: AnswerInteraction) -> Result<(), AgentError> {

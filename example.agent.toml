@@ -21,7 +21,6 @@ approval = "auto"
 # Optional per-loop overrides on top of the Runtime safe defaults.
 # [loop]
 # event_capacity = 256
-# max_pending_steers = 16
 # prompt_timeout_seconds = 30
 # model_timeout_seconds = 600
 # policy_timeout_seconds = 30

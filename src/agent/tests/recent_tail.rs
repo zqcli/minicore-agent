@@ -11,8 +11,8 @@ async fn compact(agent: &mut Agent, id: SessionId, operation: &str) -> Compactio
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if let Some(result) = receiver.borrow().clone() {
-                return result;
+            if let Some(completion) = receiver.borrow().clone() {
+                return completion.result;
             }
             receiver.changed().await.unwrap();
         }

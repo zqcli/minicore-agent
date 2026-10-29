@@ -135,10 +135,16 @@ pub(super) fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
         AgentError::Workspace => (WORKSPACE_ERROR, "workspace error", "workspace_error", false),
         AgentError::StoreUnavailable => (STORE_ERROR, "store error", "store_error", true),
         AgentError::Store => (STORE_ERROR, "store error", "store_error", false),
-        AgentError::SteerQueueFull => (
-            STEER_QUEUE_FULL,
-            "steer queue is full",
-            "steer_queue_full",
+        AgentError::InputQueueFull => (
+            INPUT_QUEUE_FULL,
+            "input queue is full",
+            "input_queue_full",
+            false,
+        ),
+        AgentError::InputNotQueued => (
+            INPUT_NOT_QUEUED,
+            "input is not queued",
+            "input_not_queued",
             false,
         ),
         AgentError::ReloadRequiresRestart => (

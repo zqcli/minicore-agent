@@ -29,6 +29,7 @@ impl RpcServer {
             name if name.starts_with("turn.") || name.starts_with("interaction.") => {
                 self.dispatch_turn(id, name, params)
             }
+            name if name.starts_with("input.") => self.dispatch_input(id, name, params),
             _ => Err(method_not_found(id)),
         }
     }
@@ -172,6 +173,9 @@ impl RpcServer {
                     .agent()
                     .loaded_session(session_id)
                     .ok_or_else(|| agent_error(id.clone(), &AgentError::SessionNotLoaded))?;
+                if session.has_queued_inputs() {
+                    return Err(agent_error(id, &AgentError::SessionBusy));
+                }
                 session.begin_shutdown();
                 self.defer_operation(Some(Reservation::Session(session_id)), async move {
                     let result = session.join_shutdown().await;
@@ -224,7 +228,15 @@ impl RpcServer {
                     let result = future.await;
                     Box::new(move |_: &mut Agent| match result {
                         Ok(receiver) => OperationReply::Waiter(Box::pin(async move {
-                            agent_result(&id, await_compaction_completion(receiver).await)
+                            agent_result(
+                                &id,
+                                await_compaction_completion(receiver)
+                                    .await
+                                    .map(|completion| CompactResult {
+                                        result: completion.result,
+                                        next: completion.next,
+                                    }),
+                            )
                         })),
                         Err(error) => agent_error(id, &error).into(),
                     }) as ApplyOperation
@@ -470,36 +482,6 @@ impl RpcServer {
         params: Option<Value>,
     ) -> Result<Dispatch, RpcResponse> {
         Ok(match method {
-            "turn.send" => {
-                let request: SendMessage = params_or_error(&id, params)?;
-                let session_id = request.session_id;
-                let input = minicore_runtime::execution::UserInput::text(request.text)
-                    .map_err(|_| invalid_params(Some(id.clone())))?;
-                self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
-                let future = self
-                    .agent()
-                    .prepare_submit(session_id, input)
-                    .map_err(|error| agent_error(id.clone(), &error))?;
-                self.defer_response(id, Some(Reservation::Session(session_id)), async move {
-                    let crate::sessions::LoopSubmission::Accepted(accepted) = future.await?;
-                    Ok(TurnResult {
-                        turn: accepted.turn,
-                        accepted_at: accepted.accepted_at,
-                    })
-                })
-            }
-            "turn.steer" => {
-                let params: TurnSteerParams = params_or_error(&id, params)?;
-                let result =
-                    self.agent()
-                        .steer_accepted(params.into())
-                        .map(|accepted| SteerResult {
-                            ok: true,
-                            accepted_at: accepted.accepted_at,
-                            steer_index: accepted.steer_index,
-                        });
-                Dispatch::Response(agent_result(&id, result))
-            }
             "turn.cancel" => {
                 let params: TurnParams = params_or_error(&id, params)?;
                 let result = self
@@ -510,15 +492,22 @@ impl RpcServer {
             }
             "turn.wait" => {
                 let params: TurnParams = params_or_error(&id, params)?;
-                match self.agent().wait_turn_receiver(params.into()) {
+                let turn = TurnRef::from(params);
+                let Some(session) = self.agent().loaded_session(turn.session_id) else {
+                    return Err(agent_error(id, &AgentError::SessionNotLoaded));
+                };
+                match session.wait_receiver(turn) {
                     Ok(receiver) => {
                         if self.deferred_count() >= MAX_DEFERRED_WAITERS {
                             return Err(resource_exhausted(id));
                         }
                         self.defer_waiter(id, async move {
-                            await_turn_completion(receiver)
-                                .await
-                                .map(|result| TurnResultView::from_turn_result(&result))
+                            let result = await_turn_completion(receiver).await?;
+                            Ok(TurnWaitResult {
+                                turn: TurnResultView::from_turn_result(&result),
+                                next: result.next.clone(),
+                                queue: session.queue(),
+                            })
                         })
                     }
                     Err(error) => Dispatch::Response(agent_error(id, &error)),
@@ -546,6 +535,75 @@ impl RpcServer {
             }
             _ => return Err(method_not_found(id)),
         })
+    }
+}
+
+impl RpcServer {
+    fn dispatch_input(
+        &mut self,
+        id: RpcId,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Dispatch, RpcResponse> {
+        Ok(match method {
+            "input.push" => {
+                let request: PushInput = params_or_error(&id, params)?;
+                // A push that starts a turn is deferred and must not overlap a
+                // reload, so admit it before the input is accepted.
+                self.admit_operation(&id, None)?;
+                let session = self.loaded_session(&id, request.session_id)?;
+                let pending = session
+                    .accept_input(request.mode, request.text)
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                if pending.needs_start() {
+                    self.defer_response(id, None, pending.start())
+                } else {
+                    Dispatch::Response(success(&id, pending.finish(None)))
+                }
+            }
+            "input.remove" => {
+                let request: RemoveInput = params_or_error(&id, params)?;
+                Dispatch::Response(agent_result(&id, self.agent().remove_input(request)))
+            }
+            "input.recall" => {
+                let params: SessionParams = params_or_error(&id, params)?;
+                Dispatch::Response(agent_result(
+                    &id,
+                    self.agent().recall_inputs(params.session_id),
+                ))
+            }
+            "input.resume" => {
+                let params: SessionParams = params_or_error(&id, params)?;
+                self.admit_operation(&id, None)?;
+                let session = self.loaded_session(&id, params.session_id)?;
+                let pending = session
+                    .accept_resume()
+                    .map_err(|error| agent_error(id.clone(), &error))?;
+                if pending.needs_start() {
+                    self.defer_response(id, None, pending.start())
+                } else {
+                    Dispatch::Response(success(&id, pending.finish(None)))
+                }
+            }
+            "input.list" => {
+                let params: SessionParams = params_or_error(&id, params)?;
+                Dispatch::Response(agent_result(
+                    &id,
+                    self.agent().list_inputs(params.session_id),
+                ))
+            }
+            _ => return Err(method_not_found(id)),
+        })
+    }
+
+    fn loaded_session(
+        &self,
+        id: &RpcId,
+        session_id: crate::ids::SessionId,
+    ) -> Result<crate::sessions::Session, RpcResponse> {
+        self.agent()
+            .loaded_session(session_id)
+            .ok_or_else(|| agent_error(id.clone(), &AgentError::SessionNotLoaded))
     }
 }
 
@@ -577,8 +635,11 @@ pub(super) const METHODS: &[&str] = &[
     "changes.diff",
     "tool.read",
     "tool.output",
-    "turn.send",
-    "turn.steer",
+    "input.push",
+    "input.remove",
+    "input.recall",
+    "input.resume",
+    "input.list",
     "turn.cancel",
     "turn.wait",
     "turn.result",

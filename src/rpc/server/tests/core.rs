@@ -140,13 +140,13 @@ async fn slow_close_allows_other_turn_cancellation_and_shutdown_waits_for_it() {
         harness
             .send(
                 json!(id),
-                "turn.send",
-                Some(json!({"session_id": session, "text": "wait"})),
+                "input.push",
+                Some(json!({"session_id": session, "mode": "steer", "text": "wait"})),
             )
             .await;
     }
     let _ = harness.response(json!("first")).await;
-    let second_turn = harness.response(json!("second")).await["result"]["turn"].clone();
+    let second_turn = harness.response(json!("second")).await["result"]["started"]["turn"].clone();
     tokio::time::timeout(TIMEOUT, gate.wait_started())
         .await
         .unwrap();
@@ -204,11 +204,11 @@ async fn answers_after_completion_report_turn_not_found() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id":session,"text":"finish"})),
+            "input.push",
+            Some(json!({"session_id":session,"mode": "steer", "text":"finish"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -386,7 +386,9 @@ fn transient_store_and_configuration_errors_have_stable_retryability() {
 
 #[test]
 fn public_request_defaults_and_strict_shapes_match_the_wire() {
-    use crate::agent::{CompactSession, CreateSession, RenameSession, SendMessage, UpdateSession};
+    use crate::agent::{
+        CompactSession, CreateSession, PushInput, RemoveInput, RenameSession, UpdateSession,
+    };
     use crate::read::ReadSession;
     fn defaults<T: serde::de::DeserializeOwned + serde::Serialize>(input: Value, expected: Value) {
         let value: T = super::super::decode_params(Some(input.clone())).unwrap();
@@ -411,12 +413,17 @@ fn public_request_defaults_and_strict_shapes_match_the_wire() {
     for (input, which) in [
         (json!({"session_id":session,"operation_id":"compact-1"}), 0),
         (json!({"session_id":session,"title":"title"}), 1),
-        (json!({"session_id":session,"text":"hello"}), 2),
+        (
+            json!({"session_id":session,"mode":"follow_up","text":"hello"}),
+            2,
+        ),
+        (json!({"session_id":session,"id":"inp_1"}), 3),
     ] {
         match which {
             0 => defaults::<CompactSession>(input.clone(), input),
             1 => defaults::<RenameSession>(input.clone(), input),
-            _ => defaults::<SendMessage>(input.clone(), input),
+            2 => defaults::<PushInput>(input.clone(), input),
+            _ => defaults::<RemoveInput>(input.clone(), input),
         }
     }
 }

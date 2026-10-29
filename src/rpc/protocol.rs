@@ -7,8 +7,9 @@ use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer};
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{InteractionId, LoopId};
 
-use crate::agent::{SessionInfo, SteerMessage, TurnRef};
-use crate::event::AgentEvent;
+use crate::agent::{Queue, SessionInfo, StartedTurn, TurnRef};
+use crate::compaction::CompactionResult;
+use crate::event::{AgentEvent, TurnResultView};
 use crate::history::GetHistory;
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
@@ -34,7 +35,6 @@ pub(crate) const WORKSPACE_ERROR: i32 = -32_010;
 pub(crate) const STORE_ERROR: i32 = -32_011;
 pub(crate) const RUNTIME_ERROR: i32 = -32_013;
 pub(crate) const INVALID_SESSION_SETTINGS: i32 = -32_014;
-pub(crate) const STEER_QUEUE_FULL: i32 = -32_016;
 pub(crate) const RELOAD_REQUIRES_RESTART: i32 = -32_017;
 pub(crate) const RELOAD_UNAVAILABLE: i32 = -32_018;
 pub(crate) const RESOURCE_EXHAUSTED: i32 = -32_019;
@@ -42,6 +42,8 @@ pub(crate) const QUERY_LIMIT: i32 = -32_020;
 pub(crate) const TOOL_NOT_FOUND: i32 = -32_021;
 pub(crate) const CONTEXT_UNCOMPRESSIBLE: i32 = -32_022;
 pub(crate) const CONFIG_ERROR: i32 = -32_023;
+pub(crate) const INPUT_QUEUE_FULL: i32 = -32_024;
+pub(crate) const INPUT_NOT_QUEUED: i32 = -32_025;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -257,26 +259,6 @@ impl From<TurnParams> for TurnRef {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TurnSteerParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    pub(crate) loop_id: LoopId,
-    pub(crate) text: String,
-}
-
-impl From<TurnSteerParams> for SteerMessage {
-    fn from(value: TurnSteerParams) -> Self {
-        Self {
-            turn: TurnRef {
-                session_id: value.session_id,
-                loop_id: value.loop_id,
-            },
-            text: value.text,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct InteractionAnswerParams {
     pub(crate) session_id: crate::ids::SessionId,
     pub(crate) loop_id: LoopId,
@@ -356,25 +338,23 @@ impl From<crate::agent::SessionUpdateResult> for SessionUpdateResult {
     }
 }
 
+/// The `turn.wait` result: the turn's outcome, the successor the Agent started
+/// from the queue, and the queue after the turn ended.
 #[derive(Serialize)]
-pub(crate) struct TurnResult {
-    pub(crate) turn: TurnRef,
-    /// Agent acceptance time for this Prompt (optional; absent when the
-    /// system clock was unavailable).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) accepted_at: Option<String>,
+pub(crate) struct TurnWaitResult {
+    #[serde(flatten)]
+    pub(crate) turn: TurnResultView,
+    pub(crate) next: Option<StartedTurn>,
+    pub(crate) queue: Queue,
 }
 
+/// The deferred `session.compact` result plus the turn the Agent started from
+/// the queue when the compaction ended.
 #[derive(Serialize)]
-pub(crate) struct SteerResult {
-    pub(crate) ok: bool,
-    /// Agent acceptance time for this Steer (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) accepted_at: Option<String>,
-    /// 1-based FIFO acceptance index within the loop; absent when the Agent
-    /// predates steer receipts. Used by the TUI only as read-only progress.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) steer_index: Option<u64>,
+pub(crate) struct CompactResult {
+    #[serde(flatten)]
+    pub(crate) result: CompactionResult,
+    pub(crate) next: Option<StartedTurn>,
 }
 
 #[derive(Serialize)]

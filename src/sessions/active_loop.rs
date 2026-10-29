@@ -15,23 +15,24 @@ pub(crate) struct ExecutionInput {
     pub(crate) summary: Option<BoundedText>,
 }
 
-/// An accepted submission always starts the ordinary execution path.
-pub(crate) enum LoopSubmission {
-    Accepted(LoopAccepted),
-}
-
 /// Owns one Agent worker without taking its JoinHandle into a local across an
 /// await. If a join future is cancelled, the handle remains in this object so
-/// a later close or cleanup call can join the same worker.
+/// a later close or cleanup call can join the same worker. One worker runs
+/// every turn of a busy period.
 pub(super) struct SessionTask {
     pub(super) join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SessionTask {
-    fn new(handle: JoinHandle<()>) -> Self {
+    fn empty() -> Self {
         Self {
-            join: tokio::sync::Mutex::new(Some(handle)),
+            join: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Stores the worker's handle; nothing else has seen this task yet.
+    fn set(&self, handle: JoinHandle<()>) {
+        *self.join.try_lock().expect("a fresh task is unshared") = Some(handle);
     }
 
     pub(super) async fn join(&self) -> Result<(), AgentError> {
@@ -39,7 +40,7 @@ impl SessionTask {
     }
 }
 
-struct CompletionGuard {
+pub(super) struct CompletionGuard {
     session: Session,
     sender: watch::Sender<Option<TurnCompletion>>,
     armed: bool,
@@ -59,12 +60,13 @@ impl CompletionGuard {
             return;
         }
         mark_internal(&self.session);
+        self.session.end_period_blocked();
         self.sender.send_replace(Some(TurnCompletion::Internal));
         self.session.emit_state();
         self.armed = false;
     }
 
-    fn publish_finished(&mut self, result: Arc<TurnResult>) {
+    pub(super) fn publish_finished(&mut self, result: Arc<TurnResult>) {
         self.sender
             .send_replace(Some(TurnCompletion::Finished(result)));
         self.armed = false;
@@ -94,16 +96,32 @@ pub(crate) enum TurnCompletion {
     Internal,
 }
 
-/// The single Agent-owned task per active loop: forwards runtime events, joins
-/// the loop, persists the report, merges sanitized history, and publishes the
-/// Agent-level completion.
-async fn run_active_loop(
-    session: Session,
+/// One started loop with everything its worker needs to run it.
+pub(super) struct LoopRun {
     turn: TurnRef,
     agent_loop: AgentLoop,
     events: minicore_runtime::LoopEventStream,
-    mut completion: CompletionGuard,
-) {
+    completion: CompletionGuard,
+}
+
+/// The single Agent-owned task per busy period: runs one turn after another
+/// while the input queue supplies successors.
+async fn run_driver(session: Session, task: Arc<SessionTask>, mut run: LoopRun) {
+    while let Some(next) = run_turn(&session, &task, run).await {
+        run = next;
+    }
+}
+
+/// Forwards runtime events, joins the loop, persists the report, merges
+/// sanitized history, and publishes the Agent-level completion. Returns the
+/// successor turn the queue started, already installed.
+async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> Option<LoopRun> {
+    let LoopRun {
+        turn,
+        agent_loop,
+        events,
+        mut completion,
+    } = run;
     let _ephemeral_cleanup = EphemeralSummaryCleanup {
         state: Arc::clone(&session.shared.compaction),
         loop_id: turn.loop_id,
@@ -112,39 +130,72 @@ async fn run_active_loop(
     tests::panic_worker(turn.session_id);
     #[cfg(test)]
     tests::pause_worker(&PAUSE_BEFORE_JOIN, turn.session_id).await;
-    let report = match join_runtime_loop(&session, turn, agent_loop, events).await {
+    let report = match join_runtime_loop(session, turn, agent_loop, events).await {
         Ok(report) => report,
         Err(_) => {
             completion.publish_internal();
-            return;
+            return None;
         }
     };
     let sanitized = match normalize_history(report.appended.as_ref()) {
         Ok(items) => items,
         Err(_) => {
             completion.publish_internal();
-            return;
+            return None;
         }
     };
-    let stored = reconcile_report(&session, turn, &report, &sanitized);
-    let persistence = persist_report(&session, turn, &stored, &sanitized).await;
-    let result = Arc::new(TurnResult {
-        turn,
-        report: Arc::clone(&report),
-        persistence,
-        interrupted: stored.interrupted.clone(),
-    });
-    publish_and_settle(&session, &result, &mut completion).await;
+    let stored = reconcile_report(session, turn, &report, &sanitized);
+    let persistence = persist_report(session, turn, &stored, &sanitized).await;
+    let eligible = persistence == TurnPersistence::Persisted
+        && report.outcome == minicore_runtime::LoopOutcome::Completed;
+    let result = |next| {
+        Arc::new(TurnResult {
+            turn,
+            report: Arc::clone(&report),
+            persistence,
+            interrupted: stored.interrupted.clone(),
+            next,
+        })
+    };
+    // A successor projects the history, so the finished turn settles first;
+    // otherwise waiters are released before settlement.
+    let mut settled = false;
+    let (result, next) = loop {
+        match session.close_turn(turn, task, &mut completion, eligible, settled, &result) {
+            Close::Settle => {
+                finish_tail(session, turn, persistence, &report).await;
+                settled = true;
+            }
+            Close::Done { result, run } => break (result, run),
+        }
+    };
     // Remain in the owned task so close/shutdown still join auxiliary writes.
-    persist_loop_tool_records(&session, turn.session_id, turn.loop_id).await;
+    if !settled {
+        finish_tail(session, turn, persistence, &report).await;
+    }
 
     session.shared.events.try_send(AgentEvent::TurnFinished {
         turn,
         outcome: LoopOutcomeView::from_report(&report),
         persistence,
+        next: result.next.clone(),
+        queue: session.queue(),
         meta: EventMeta::for_turn(turn),
     });
     session.emit_state();
+    next
+}
+
+async fn finish_tail(
+    session: &Session,
+    turn: TurnRef,
+    persistence: TurnPersistence,
+    report: &LoopReport,
+) {
+    if persistence == TurnPersistence::Persisted {
+        settle_persisted_projection(session, turn, report).await;
+    }
+    persist_loop_tool_records(session, turn.session_id, turn.loop_id).await;
 }
 
 async fn join_runtime_loop(
@@ -322,19 +373,6 @@ async fn settle_persisted_projection(session: &Session, turn: TurnRef, report: &
     }
 }
 
-/// Publishes completion first: waiters never wait for emergency-projection
-/// settlement, which stays owned by this task.
-async fn publish_and_settle(
-    session: &Session,
-    result: &Arc<TurnResult>,
-    completion: &mut CompletionGuard,
-) {
-    completion.publish_finished(Arc::clone(result));
-    if result.persistence == TurnPersistence::Persisted {
-        settle_persisted_projection(session, result.turn, &result.report).await;
-    }
-}
-
 async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loop_id: LoopId) {
     let tool_refs = session.shared.tool_data.loop_tool_refs(session_id, loop_id);
     if tool_refs.is_empty() {
@@ -413,8 +451,8 @@ pub(crate) async fn await_turn_completion(
 }
 
 pub(crate) async fn await_compaction_completion(
-    receiver: watch::Receiver<Option<CompactionResult>>,
-) -> Result<CompactionResult, AgentError> {
+    receiver: watch::Receiver<Option<CompactionCompletion>>,
+) -> Result<CompactionCompletion, AgentError> {
     await_completion(receiver).await
 }
 
@@ -426,16 +464,6 @@ async fn await_completion<T: Clone>(
         .await
         .map_err(|_| AgentError::Internal)?;
     Ok(value.as_ref().expect("waited for completion").clone())
-}
-
-fn map_steer_error(error: SteerError) -> AgentError {
-    match error {
-        SteerError::QueueFull => AgentError::SteerQueueFull,
-        SteerError::WaitingForInput => AgentError::InvalidState,
-        SteerError::NotActive => AgentError::TurnNotFound,
-        SteerError::InvalidInput => AgentError::InvalidInput,
-        _ => AgentError::Internal,
-    }
 }
 
 fn map_answer_error(error: AnswerError) -> AgentError {
@@ -474,13 +502,12 @@ impl Session {
             ),
         }
         .map_err(|_| AgentError::InvalidSessionSettings)?;
-        let prompt = SteerReceiptPrompt::new(Arc::new(prompt), self.presentation());
         ExecutionConfig::new(
             Arc::clone(config.model()),
             config.reasoning(),
             config.tools().clone(),
             config.policy().cloned(),
-            prompt,
+            Arc::new(prompt),
         )
         .map_err(|_| AgentError::InvalidSessionSettings)
     }
@@ -488,7 +515,6 @@ impl Session {
     pub(crate) fn execution_input(&self, input: UserInput) -> Result<ExecutionInput, AgentError> {
         let (history, config, options, system_prompt, auto) = {
             let inner = self.lock_inner();
-            Self::validate_install_state(&inner)?;
             (
                 Arc::clone(&inner.history),
                 inner.config.clone(),
@@ -509,36 +535,41 @@ impl Session {
         })
     }
 
-    /// Starts a new `AgentLoop` for one user message. A session runs at most
-    /// one active loop; no queueing or auto-cancellation.
-    pub(crate) async fn start_loop(&self, input: UserInput) -> Result<LoopAccepted, AgentError> {
-        self.cleanup_finished().await?;
-        let execution = self.execution_input(input)?;
-        self.install_loop(execution)
-    }
-
-    /// Submission never starts a summary worker or a pre-turn handoff.
-    pub(crate) async fn submit(&self, input: UserInput) -> Result<LoopSubmission, AgentError> {
-        Ok(LoopSubmission::Accepted(self.start_loop(input).await?))
-    }
-
-    fn install_loop(&self, execution: ExecutionInput) -> Result<LoopAccepted, AgentError> {
-        let accepted_at = crate::store::utc_timestamp().ok();
-        let turn = {
+    /// Starts the loop for a queue head. A busy period's first turn gets a
+    /// new worker; a successor runs on the worker of the turn it follows and
+    /// is returned for it to continue with.
+    pub(super) fn install_loop(
+        &self,
+        execution: ExecutionInput,
+        entry: &Entry,
+        generation: u64,
+        successor_of: Option<(TurnRef, &Arc<SessionTask>)>,
+    ) -> Result<(StartedTurn, Option<LoopRun>), AgentError> {
+        let (turn, run) = {
             let mut inner = self.lock_inner();
-            Self::validate_install_state(&inner)?;
+            Self::validate_install_state(&inner, successor_of.map(|(turn, _)| turn))?;
             // Initialize current-loop observation before spawning the Runtime
             // task: the runner may reach Model::start synchronously.
             inner.presentation.reset_before_loop_start();
             self.shared.tool_observer.reset_before_loop_start();
+            inner.presentation.record_prompt_time(entry.accepted_at());
             // AgentLoop::start only validates and spawns the Runtime task; it
             // does not await model work. Keeping this short lock held closes
             // the cancellation/close race between validation and ownership.
             #[cfg(test)]
             let captured_options = execution.options.clone();
             let execution_history = Arc::clone(&execution.request.history);
-            let mut agent_loop = AgentLoop::start(execution.request, execution.options)
-                .map_err(map_loop_start_error)?;
+            let inputs = Arc::new(SessionInputs::new(
+                self.clone(),
+                Arc::clone(&inner.presentation),
+                generation,
+            ));
+            let mut agent_loop = AgentLoop::start(
+                execution.request,
+                execution.options,
+                Arc::clone(&inputs) as Arc<dyn LoopInputs>,
+            )
+            .map_err(map_loop_start_error)?;
             #[cfg(test)]
             {
                 inner = tests::pause_runtime_start(self, inner);
@@ -548,18 +579,30 @@ impl Session {
                 session_id: inner.record.session_id,
                 loop_id: handle.id(),
             };
+            inputs.bind(turn);
             #[cfg(test)]
             INSTALLED_LOOP_OPTIONS.arm(turn.loop_id, captured_options);
             let events = agent_loop.take_events().map_err(|_| AgentError::Internal)?;
             let (completion_tx, completion_rx) = watch::channel(None);
-            let task = Arc::new(SessionTask::new(tokio::spawn(run_active_loop(
-                self.clone(),
+            let run = LoopRun {
                 turn,
                 agent_loop,
                 events,
-                CompletionGuard::new(self.clone(), completion_tx),
-            ))));
-            inner.active = Some(ActiveLoop {
+                completion: CompletionGuard::new(self.clone(), completion_tx),
+            };
+            let (task, run) = match successor_of {
+                Some((_, task)) => (Arc::clone(task), Some(run)),
+                None => {
+                    let task = Arc::new(SessionTask::empty());
+                    task.set(tokio::spawn(run_driver(
+                        self.clone(),
+                        Arc::clone(&task),
+                        run,
+                    )));
+                    (task, None)
+                }
+            };
+            let previous = inner.active.replace(ActiveLoop {
                 turn,
                 handle: handle.clone(),
                 completion: completion_rx,
@@ -567,28 +610,52 @@ impl Session {
                 execution_summary: execution.summary,
                 execution_history,
             });
+            if let Some(previous) = previous {
+                inner
+                    .finished
+                    .push_back((previous.turn, previous.completion));
+                if inner.finished.len() > FINISHED_TURNS_KEPT {
+                    inner.finished.pop_front();
+                }
+            }
             inner
                 .presentation
-                .bind_started_loop(turn.loop_id, accepted_at.clone());
-            inner.presentation.record_prompt_time(accepted_at.clone());
-            turn
+                .bind_started_loop(turn.loop_id, entry.accepted_at());
+            (turn, run)
         };
         tracing::info!(
             session_id = %turn.session_id,
             loop_id = %turn.loop_id,
             "turn submitted"
         );
-        Ok(LoopAccepted { turn, accepted_at })
+        Ok((
+            StartedTurn {
+                turn,
+                input: entry.item(),
+            },
+            run,
+        ))
     }
 
-    fn validate_install_state(inner: &SessionInner) -> Result<(), AgentError> {
+    fn validate_install_state(
+        inner: &SessionInner,
+        successor_of: Option<TurnRef>,
+    ) -> Result<(), AgentError> {
         if inner.blocked.is_some() {
             return Err(AgentError::SessionBlocked);
         }
+        let active_matches = match (&inner.active, successor_of) {
+            (None, None) => true,
+            (Some(active), Some(turn)) => active.turn == turn,
+            _ => false,
+        };
         if inner.closing
-            || inner.active.is_some()
-            || inner.compaction.is_some()
+            || !active_matches
             || inner.pending_compaction.is_some()
+            || inner
+                .compaction
+                .as_ref()
+                .is_some_and(|operation| !operation.is_completed())
         {
             return Err(AgentError::SessionBusy);
         }
@@ -662,6 +729,13 @@ impl Session {
             .as_ref()
             .filter(|active| active.turn == turn)
             .map(|active| active.completion.clone())
+            .or_else(|| {
+                inner
+                    .finished
+                    .iter()
+                    .find(|(finished, _)| *finished == turn)
+                    .map(|(_, completion)| completion.clone())
+            })
             .ok_or(AgentError::TurnNotFound)
     }
 
@@ -683,23 +757,6 @@ impl Session {
     pub(crate) async fn wait(&self, turn: TurnRef) -> Result<Arc<TurnResult>, AgentError> {
         let receiver = self.wait_receiver(turn)?;
         await_turn_completion(receiver).await
-    }
-
-    pub(crate) fn steer(&self, turn: TurnRef, text: String) -> Result<SteerAccepted, AgentError> {
-        let input = UserInput::text(text).map_err(|_| AgentError::InvalidInput)?;
-        let inner = self.lock_inner();
-        let active = inner
-            .active
-            .as_ref()
-            .filter(|active| active.turn == turn)
-            .ok_or(AgentError::TurnNotFound)?;
-        active.handle.steer(input).map_err(map_steer_error)?;
-        let accepted_at = crate::store::utc_timestamp().ok();
-        let steer_index = inner.presentation.note_steer_accepted(accepted_at.clone());
-        Ok(SteerAccepted {
-            accepted_at,
-            steer_index,
-        })
     }
 
     pub(crate) fn cancel(&self, turn: TurnRef) -> Result<bool, AgentError> {

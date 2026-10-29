@@ -30,11 +30,11 @@ async fn session_read_pages_are_bounded_lossless_and_do_not_need_workspace() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -195,14 +195,14 @@ async fn unloaded_session_read_pages_short_turns_under_small_budget() {
         harness
             .send(
                 send_id.clone(),
-                "turn.send",
+                "input.push",
                 Some(json!({
                     "session_id": session_id,
-                    "text": format!("short prompt {index}"),
+                    "mode": "steer", "text": format!("short prompt {index}"),
                 })),
             )
             .await;
-        let turn = harness.response(send_id).await["result"]["turn"].clone();
+        let turn = harness.response(send_id).await["result"]["started"]["turn"].clone();
         let wait_id = json!(format!("short-wait-{index}"));
         harness
             .send(wait_id.clone(), "turn.wait", Some(turn_params(&turn)))
@@ -285,11 +285,11 @@ async fn session_read_rejects_same_length_prefix_replacement() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -361,11 +361,11 @@ async fn loaded_session_read_does_not_expose_a_disk_tail() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "committed"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "committed"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
 
     let history_path = base
@@ -409,11 +409,12 @@ async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
     harness
         .send(
             json!("send-first"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "first"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "first"})),
         )
         .await;
-    let first_turn = harness.response(json!("send-first")).await["result"]["turn"].clone();
+    let first_turn =
+        harness.response(json!("send-first")).await["result"]["started"]["turn"].clone();
     harness
         .send(
             json!("wait-first"),
@@ -443,11 +444,12 @@ async fn loaded_session_read_keeps_a_captured_prefix_across_append() {
     harness
         .send(
             json!("send-second"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "second"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "second"})),
         )
         .await;
-    let second_turn = harness.response(json!("send-second")).await["result"]["turn"].clone();
+    let second_turn =
+        harness.response(json!("send-second")).await["result"]["started"]["turn"].clone();
     harness
         .send(
             json!("wait-second"),
@@ -514,11 +516,11 @@ async fn session_read_reports_incomplete_tail_and_corrupt_middle_without_repair(
         harness
             .send(
                 send_id.clone(),
-                "turn.send",
-                Some(json!({"session_id": session_id, "text": text})),
+                "input.push",
+                Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
             )
             .await;
-        let turn = harness.response(send_id).await["result"]["turn"].clone();
+        let turn = harness.response(send_id).await["result"]["started"]["turn"].clone();
         let wait_id = json!(format!("wait-{index}"));
         harness
             .send(wait_id.clone(), "turn.wait", Some(turn_params(&turn)))

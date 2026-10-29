@@ -210,7 +210,7 @@ async fn reload_does_not_change_a_running_compaction_binding() {
         result.changed().await.unwrap();
     };
     assert_eq!(
-        compacted.status,
+        compacted.result.status,
         crate::compaction::CompactionStatus::Compacted
     );
 
@@ -691,10 +691,7 @@ async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     assert!(matches!(
         agent
-            .send(crate::agent::SendMessage {
-                session_id: info.session_id,
-                text: "still blocked".to_owned(),
-            })
+            .send_for_test(info.session_id, "still blocked".to_owned())
             .await,
         Err(AgentError::SessionBlocked)
     ));

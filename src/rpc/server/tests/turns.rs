@@ -17,11 +17,11 @@ async fn history_view_is_safe_and_pages() {
     let session_id = create_and_open(&mut harness, &workspace).await;
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "read file"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "read file"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
     let presentation_event = harness.event("tool_presentation").await;
@@ -76,11 +76,11 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
 
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "hello"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(waited["result"]["persistence"], json!("failed"));
@@ -94,8 +94,8 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
     // Blocked sessions refuse further sends.
     let send2 = harness
         .call(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "again"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "again"})),
         )
         .await;
     assert_eq!(send2["error"]["code"], json!(-32004));
@@ -120,11 +120,11 @@ async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
     // 1. send first turn
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "hello"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
 
     // 2. Deterministically wait for session to reach blocked state before waiting turn.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -149,8 +149,8 @@ async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
     // 3. Second send fails with -32004 session_blocked
     let send2 = harness
         .call(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "again"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "again"})),
         )
         .await;
     assert_eq!(send2["error"]["code"], json!(-32004));
@@ -188,11 +188,11 @@ async fn interaction_answer_resolves_an_approval() {
     let session_id = create_and_open(&mut harness, &workspace).await;
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "write the file"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "write the file"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
 
     let interaction = harness.event("interaction_requested").await;
     let interaction_id = interaction["params"]["data"]["interaction"]["interaction_id"].clone();
@@ -235,8 +235,8 @@ async fn shutdown_cancels_and_awaits_an_active_loop() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "hello"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
     harness.response(json!("send")).await;

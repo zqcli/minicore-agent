@@ -152,7 +152,7 @@ fn token_estimate_handles_ascii_cjk_and_mixed_utf8_without_zeroing_small_inputs(
 
 #[tokio::test]
 async fn in_stream_context_rejection_recovers_through_real_compaction() {
-    use crate::agent::{Agent, CreateSession, SendMessage};
+    use crate::agent::{Agent, CreateSession};
     use crate::openai_mock::{MockResponse, MockServer};
     use serde_json::json;
     let reply = |text| {
@@ -198,10 +198,7 @@ async fn in_stream_context_rejection_recovers_through_real_compaction() {
         .await
         .unwrap();
     let turn = agent
-        .send(SendMessage {
-            session_id: session.session_id,
-            text: "read note.txt".into(),
-        })
+        .send_for_test(session.session_id, "read note.txt".into())
         .await
         .unwrap();
     let result = agent.wait_turn(turn).await.unwrap();

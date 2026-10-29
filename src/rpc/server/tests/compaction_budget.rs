@@ -20,11 +20,11 @@ async fn manual_compaction_rejects_fixed_schema_budget_before_model_call() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "settled"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -78,11 +78,11 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -142,11 +142,11 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": large_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": large_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -295,12 +295,12 @@ async fn oversized_current_input_server_acceptance(enabled: bool) {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": oversized})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": oversized})),
         )
         .await;
     let response = harness.response(json!("send")).await;
-    let turn = response["result"]["turn"].clone();
+    let turn = response["result"]["started"]["turn"].clone();
     assert!(
         turn["loop_id"].is_string(),
         "ordinary submit must accept without admission summary"
@@ -368,12 +368,12 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
     let session_id = create_and_open(&mut harness, &workspace).await;
     let response = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
         )
         .await;
-    assert!(response["result"]["turn"]["loop_id"].is_string());
-    let turn = response["result"]["turn"].clone();
+    assert!(response["result"]["started"]["turn"]["loop_id"].is_string());
+    let turn = response["result"]["started"]["turn"].clone();
     let wait = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(wait["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(wait["result"]["persistence"], json!("persisted"));
@@ -418,10 +418,7 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
         .await
         .unwrap();
     let turn = seed
-        .send(crate::agent::SendMessage {
-            session_id: info.session_id,
-            text: "seed old history".into(),
-        })
+        .send_for_test(info.session_id, "seed old history".into())
         .await
         .unwrap();
     assert_eq!(
@@ -446,14 +443,14 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
     harness
         .send(
             json!("new"),
-            "turn.send",
-            Some(json!({"session_id": info.session_id,"text":"new input exact"})),
+            "input.push",
+            Some(json!({"session_id": info.session_id,"mode": "steer", "text":"new input exact"})),
         )
         .await;
     let accepted = tokio::time::timeout(Duration::from_secs(2), harness.response(json!("new")))
         .await
         .unwrap();
-    let turn = accepted["result"]["turn"].clone();
+    let turn = accepted["result"]["started"]["turn"].clone();
     assert!(turn["loop_id"].is_string());
     entered.notified().await;
     for (id, method, params) in [

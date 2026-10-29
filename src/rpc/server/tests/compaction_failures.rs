@@ -10,11 +10,11 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "busy"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "busy"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
 
     harness
         .send(
@@ -56,11 +56,11 @@ async fn manual_compaction_rejects_busy_and_blocked_sessions() {
     blocked
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": blocked_id, "text": "block"})),
+            "input.push",
+            Some(json!({"session_id": blocked_id, "mode": "steer", "text": "block"})),
         )
         .await;
-    let blocked_turn = blocked.response(json!("send")).await["result"]["turn"].clone();
+    let blocked_turn = blocked.response(json!("send")).await["result"]["started"]["turn"].clone();
     blocked
         .send(json!("wait"), "turn.wait", Some(turn_params(&blocked_turn)))
         .await;
@@ -100,11 +100,11 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": settled_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
@@ -152,16 +152,17 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
         json!({"kind": "invalid_state", "retryable": false})
     );
 
-    harness
-        .send(
-            json!("busy-send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "not admitted"})),
+    // A push during the compaction queues behind it instead of starting.
+    let queued = harness
+        .call_ok(
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "after compaction"})),
         )
         .await;
+    assert!(queued["result"]["started"].is_null());
     assert_eq!(
-        harness.response(json!("busy-send")).await["error"]["data"]["kind"],
-        json!("session_busy")
+        queued["result"]["queue"]["items"][0]["text"],
+        "after compaction"
     );
     harness
         .send(
@@ -206,6 +207,13 @@ async fn manual_compaction_cancel_is_exact_and_keeps_ping_responsive() {
     let result = harness.response(json!("compact")).await;
     assert_eq!(result["result"]["status"], json!("failed"));
     assert_eq!(result["result"]["failure_kind"], json!("cancelled"));
+    // Any end of the compaction starts the queued head, reported in `next`.
+    assert_eq!(
+        result["result"]["next"]["input"]["text"],
+        "after compaction"
+    );
+    // The started turn is known to the client; shutdown cancels it.
+    assert!(result["result"]["next"]["turn"]["loop_id"].is_string());
 
     harness.shutdown().await;
 }
@@ -228,11 +236,11 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": settled_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -265,8 +273,8 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
     harness
         .send(
             json!("send-busy"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "must wait"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "must wait"})),
         )
         .await;
     let pending = tokio::time::timeout(
@@ -279,7 +287,7 @@ async fn manual_compaction_keeps_owned_handle_until_delayed_worker_drain() {
         "next work must wait for the owned worker join"
     );
     gate.release();
-    assert!(harness.response(json!("send-busy")).await["result"]["turn"].is_object());
+    assert!(harness.response(json!("send-busy")).await["result"]["started"]["turn"].is_object());
     harness
         .send(
             json!("close"),
@@ -318,11 +326,11 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": settled_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     let session_dir = base
@@ -351,11 +359,11 @@ async fn manual_compaction_write_failure_preserves_history_and_old_snapshot() {
     harness
         .send(
             json!("next-send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": new_turn_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": new_turn_text})),
         )
         .await;
-    let next_turn = harness.response(json!("next-send")).await["result"]["turn"].clone();
+    let next_turn = harness.response(json!("next-send")).await["result"]["started"]["turn"].clone();
     let _ = harness
         .call("turn.wait", Some(turn_params(&next_turn)))
         .await;
@@ -408,11 +416,11 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "settled"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -454,11 +462,11 @@ async fn manual_compaction_rejects_model_failures_and_tool_events() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "settled"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -501,11 +509,11 @@ async fn manual_compaction_reports_unknown_write_without_publishing_state() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": settled_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     crate::store::SUMMARY_UNKNOWN_WRITES.arm(session_id.as_str().unwrap().parse().unwrap(), ());
@@ -556,11 +564,11 @@ async fn manual_compaction_revalidates_history_before_commit() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": settled_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 
@@ -634,11 +642,11 @@ async fn manual_compaction_deadline_covers_commit_wait() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": settled_text})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": settled_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
 

@@ -393,117 +393,15 @@ fn hidden_counts_follow_the_fixed_tool_execution_estimator() {
 }
 
 #[test]
-fn steer_receipt_commits_only_at_real_start_and_emits_once_per_count() {
-    let (sink, mut receiver) = AgentEventSink::channel(8);
-    let presentation = Presentation::new(
-        SessionId::new().unwrap(),
-        sink,
-        crate::compaction::CompactionState::new(),
-    );
-    let loop_r0 = LoopId::new().unwrap();
-    let key_a = RequestKey {
-        loop_id: loop_r0,
-        request_index: 0,
-    };
-    let key_b = RequestKey {
-        loop_id: loop_r0,
-        request_index: 1,
-    };
-    let drain = |receiver: &mut crate::event::AgentEventStream| -> Vec<AgentEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = receiver.try_recv() {
-            events.push(event);
-        }
-        events
-    };
-
-    // Preparing alone must never release the queue: no event before start.
-    presentation.commit_prepared_request(key_a, 0);
-    assert_eq!(presentation.snapshot().steer_progress, None);
-
-    // Real Model::start commits the prepared count and emits the receipt.
-    presentation.note_request_start(key_a);
-    let events = drain(&mut receiver);
-    assert!(
-        matches!(
-            events
-                .iter()
-                .find(|event| matches!(event, AgentEvent::SteerProgress { .. })),
-            Some(AgentEvent::SteerProgress {
-                request_index: 0,
-                applied_count: 0,
-                ..
-            })
-        ),
-        "first request applies count 0: {events:?}"
-    );
-    assert_eq!(
-        presentation
-            .snapshot()
-            .steer_progress
-            .as_ref()
-            .map(|view| view.applied_count),
-        Some(0)
-    );
-
-    // Two accepted steers before the next boundary: history then shows 2.
-    assert_eq!(presentation.note_steer_accepted(Some("t0".into())), Some(1));
-    assert_eq!(presentation.note_steer_accepted(Some("t1".into())), Some(2));
-    presentation.commit_prepared_request(key_b, 2);
-    presentation.note_request_start(key_b);
-    let events = drain(&mut receiver);
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AgentEvent::SteerProgress {
-                request_index: 1,
-                applied_count: 2,
-                ..
-            }
-        )),
-        "second request applies count 2: {events:?}"
-    );
-    assert_eq!(
-        presentation
-            .snapshot()
-            .steer_progress
-            .as_ref()
-            .map(|view| view.applied_count),
-        Some(2)
-    );
-
-    // A later request observing the same count must not re-emit or rewrite.
-    let key_c = RequestKey {
-        loop_id: loop_r0,
-        request_index: 2,
-    };
-    presentation.commit_prepared_request(key_c, 2);
-    presentation.note_request_start(key_c);
-    let events = drain(&mut receiver);
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, AgentEvent::SteerProgress { .. })),
-        "same count must not re-emit: {events:?}"
-    );
-
-    // Loop reset clears accepted count and progress.
-    presentation.reset_before_loop_start();
-    presentation.bind_started_loop(LoopId::new().unwrap(), None);
-    assert_eq!(presentation.note_steer_accepted(Some("t2".into())), Some(1));
-    assert_eq!(presentation.snapshot().steer_progress, None);
-}
-
-#[test]
-fn steer_times_still_feed_the_same_live_times_queue() {
+fn recorded_input_times_keep_their_order_in_the_live_times_queue() {
     let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
         sink,
         crate::compaction::CompactionState::new(),
     );
-    presentation.note_steer_accepted(Some("t0".into()));
-    presentation.note_steer_accepted(None);
+    presentation.record_prompt_time(Some("t0".into()));
+    presentation.record_prompt_time(None);
     assert_eq!(
         presentation.peek_user_times(3),
         vec![Some("t0".to_owned()), None]
@@ -547,7 +445,6 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
         loop_id: LoopId::new().unwrap(),
         request_index: 0,
     };
-    presentation.note_request_start(first_key);
     presentation.begin_tool(Some(first_key), &invocation, display.clone());
     let first_ref = ToolRef {
         session_id: presentation.session_id,
@@ -564,7 +461,6 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
     };
     presentation.reset_before_loop_start();
     presentation.bind_started_loop(second_key.loop_id, None);
-    presentation.note_request_start(second_key);
     presentation.begin_tool(Some(second_key), &invocation, display);
     let second_ref = ToolRef {
         session_id: presentation.session_id,
@@ -601,7 +497,6 @@ fn finishing_a_call_removes_its_live_entry() {
         tool_name: "bash".parse().unwrap(),
         arguments: serde_json::json!({"command": "true"}),
     };
-    presentation.note_request_start(key);
     presentation.begin_tool(
         Some(key),
         &invocation,

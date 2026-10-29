@@ -1,5 +1,6 @@
 use super::*;
 use crate::presentation::{ToolArgumentsPreviewState, ToolDisplay};
+use crate::sessions::{InputMode, QueueItem};
 use crate::tool_data::*;
 
 pub(super) fn events() -> Vec<AgentEvent> {
@@ -29,6 +30,18 @@ pub(super) fn events() -> Vec<AgentEvent> {
         hidden_line_count: Some(1),
         truncated: false,
         body_truncated: false,
+    };
+    let steer = QueueItem {
+        id: "inp_00000000000000000000000000000004".into(),
+        mode: InputMode::Steer,
+        text: "also the tests".into(),
+        accepted_at: Some("2026-10-28T10:00:00.000Z".into()),
+    };
+    let follow_up = QueueItem {
+        id: "inp_00000000000000000000000000000005".into(),
+        mode: InputMode::FollowUp,
+        text: "then the docs".into(),
+        accepted_at: None,
     };
     vec![
         AgentEvent::SessionOpened {
@@ -186,10 +199,20 @@ pub(super) fn events() -> Vec<AgentEvent> {
             },
             meta,
         },
-        AgentEvent::SteerProgress {
+        AgentEvent::InputQueue {
+            queue: Queue {
+                items: vec![steer.clone(), follow_up],
+                paused: false,
+            },
+            meta,
+        },
+        AgentEvent::InputDelivered {
             turn,
-            request_index: 1,
-            applied_count: 2,
+            items: vec![DeliveredInput {
+                id: steer.id.clone(),
+                text: steer.text.clone(),
+                accepted_at: steer.accepted_at.clone(),
+            }],
             meta,
         },
         AgentEvent::InteractionRequested {
@@ -214,6 +237,8 @@ pub(super) fn events() -> Vec<AgentEvent> {
             turn,
             outcome: LoopOutcomeView::Completed,
             persistence: TurnPersistence::Persisted,
+            next: Some(StartedTurn { turn, input: steer }),
+            queue: Queue::default(),
             meta,
         },
     ]

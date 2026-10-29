@@ -14,7 +14,8 @@ use minicore_runtime::{InteractionId, LoopId, ToolCallId};
 use crate::agent::SessionInfo;
 use crate::ids::SessionId;
 use crate::sessions::{
-    CompactionProgress, SessionBlockReason, SessionState, SessionStatus, TurnPersistence, TurnRef,
+    CompactionProgress, DeliveredInput, Queue, SessionBlockReason, SessionState, SessionStatus,
+    StartedTurn, TurnPersistence, TurnRef,
 };
 use crate::tool_data::{ToolExecutionData, ToolInvocationData, ToolProcessData};
 
@@ -159,14 +160,15 @@ pub enum AgentEvent {
         result: ToolResultView,
         meta: EventMeta,
     },
-    /// Read-only steering receipt: the number of Steering User items that were
-    /// present in the PREPARED prompt history at this request boundary,
-    /// emitted at the real `Model::start`. Best-effort and metadata-only; it
-    /// never drives execution and never carries steer text.
-    SteerProgress {
+    /// The Session's input queue after it changed.
+    InputQueue {
+        queue: Queue,
+        meta: EventMeta,
+    },
+    /// Inputs a running turn took at a request boundary, in order.
+    InputDelivered {
         turn: TurnRef,
-        request_index: u32,
-        applied_count: u64,
+        items: Vec<DeliveredInput>,
         meta: EventMeta,
     },
     InteractionRequested {
@@ -183,6 +185,9 @@ pub enum AgentEvent {
         turn: TurnRef,
         outcome: LoopOutcomeView,
         persistence: TurnPersistence,
+        /// The successor turn the Agent started from the input queue.
+        next: Option<StartedTurn>,
+        queue: Queue,
         meta: EventMeta,
     },
 }
@@ -238,7 +243,8 @@ impl AgentEvent {
         ToolFinished,
         InteractionRequested,
         InteractionResolved,
-        SteerProgress,
+        InputQueue,
+        InputDelivered,
         TurnFinished
     );
 }

@@ -206,7 +206,6 @@ impl AgentConfig {
         }
         apply_overrides! {
             event_capacity = overrides.event_capacity,
-            max_pending_steers = overrides.max_pending_steers,
             prompt_timeout = overrides.prompt_timeout_seconds.map(Duration::from_secs),
             model_timeout = overrides.model_timeout_seconds.map(Duration::from_secs),
             policy_timeout = overrides.policy_timeout_seconds.map(Duration::from_secs),
@@ -332,7 +331,6 @@ fn default_event_capacity() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct LoopOverrides {
     pub event_capacity: Option<usize>,
-    pub max_pending_steers: Option<usize>,
 
     pub prompt_timeout_seconds: Option<u64>,
     pub model_timeout_seconds: Option<u64>,

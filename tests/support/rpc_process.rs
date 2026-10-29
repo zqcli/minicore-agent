@@ -177,11 +177,11 @@ impl RpcProcess {
         let send_id = format!("{prefix}-send");
         self.send(
             &send_id,
-            "turn.send",
-            json!({"session_id": session_id, "text": text}),
+            "input.push",
+            json!({"session_id": session_id, "mode": "steer", "text": text}),
         )
         .await;
-        let turn = self.response(&send_id).await["result"]["turn"].clone();
+        let turn = self.response(&send_id).await["result"]["started"]["turn"].clone();
         let wait_id = format!("{prefix}-wait");
         self.send(
             &wait_id,

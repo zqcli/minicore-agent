@@ -5,6 +5,7 @@ mod compaction_failures;
 mod core;
 mod discovery;
 mod framing;
+mod inputs;
 mod review;
 mod session_read;
 mod sessions;
@@ -680,11 +681,11 @@ async fn assert_manual_failure_case(label: &str, script: Step, expected: &str) -
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "settled"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "settled"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     let result = harness

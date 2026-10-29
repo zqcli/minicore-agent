@@ -266,11 +266,11 @@ async fn session_rename_is_allowed_while_a_loop_is_busy() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "busy"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "busy"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
 
     harness
         .send(
@@ -331,11 +331,11 @@ async fn session_rename_is_allowed_for_a_blocked_session() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "block"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "block"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(
             json!("wait"),
@@ -408,13 +408,14 @@ async fn create_open_history_and_send_wait_deferred() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "hello rpc"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "hello rpc"})),
         )
         .await;
     let sent = harness.response(json!("send")).await;
     assert!(sent["result"]["accepted_at"].is_string());
-    let turn = sent["result"]["turn"].clone();
+    assert!(sent["result"]["started"]["input"]["accepted_at"].is_string());
+    let turn = sent["result"]["started"]["turn"].clone();
     assert_eq!(turn["session_id"], session_id);
     assert!(turn["loop_id"].as_str().unwrap().starts_with("lup_"));
 
@@ -456,7 +457,7 @@ async fn create_open_history_and_send_wait_deferred() {
 }
 
 #[tokio::test]
-async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
+async fn push_update_and_cancel_work_while_wait_is_pending() {
     let mut fixture = RpcFixture::new(
         "wait-concurrent",
         [Step::Pending],
@@ -469,29 +470,33 @@ async fn steer_and_update_and_cancel_work_while_wait_is_pending() {
     let session_id = create_and_open(&mut harness, &workspace).await;
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "hello"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
 
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
 
-    // steer while wait pending
-    let steer = harness
+    // push while wait pending
+    let pushed = harness
         .call_ok(
-            "turn.steer",
+            "input.push",
             Some(json!({
                 "session_id": session_id,
-                "loop_id": turn["loop_id"],
+                "mode": "steer",
                 "text": "stay on track"
             })),
         )
         .await;
-    assert_eq!(steer["result"]["ok"], json!(true));
-    assert!(steer["result"]["accepted_at"].is_string());
+    assert!(pushed["result"]["started"].is_null());
+    assert!(pushed["result"]["accepted_at"].is_string());
+    assert_eq!(
+        pushed["result"]["queue"]["items"][0]["text"],
+        "stay on track"
+    );
 
     // session.update while wait pending
     let update = harness

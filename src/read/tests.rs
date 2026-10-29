@@ -328,6 +328,7 @@ async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summa
         }),
         persistence: TurnPersistence::Failed,
         interrupted: Some(interrupted.clone()),
+        next: None,
     });
     let live_page = live_turn_page(
         turn,
@@ -382,6 +383,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
             }),
             persistence: TurnPersistence::Persisted,
             interrupted: None,
+            next: None,
         });
         let event = crate::event::TurnResultView::from_turn_result(&live);
         assert_eq!(
@@ -496,6 +498,7 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
             }),
             persistence: crate::sessions::TurnPersistence::Failed,
             interrupted: None,
+            next: None,
         });
         let stored = StoredLoopRecord {
             loop_id,

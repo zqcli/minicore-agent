@@ -139,11 +139,11 @@ async fn compaction_cancel_before_preparation_prevents_the_summary_call() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id":session,"text":"settled history ".repeat(4000)})),
+            "input.push",
+            Some(json!({"session_id":session,"mode": "steer", "text":"settled history ".repeat(4000)})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -290,7 +290,7 @@ async fn failed_reload_application_preserves_loaded_snapshots_and_releases_reser
 
 #[tokio::test]
 async fn reload_excludes_open_create_and_send_in_both_directions() {
-    for method in ["session.open", "session.create", "turn.send"] {
+    for method in ["session.open", "session.create", "input.push"] {
         let (mut agent, base, workspace) = reload_agent().await;
         let session = create(&mut agent, &workspace).await;
         if method == "session.open" {
@@ -298,7 +298,9 @@ async fn reload_excludes_open_create_and_send_in_both_directions() {
         }
         let params = match method {
             "session.create" => json!({"workspace":workspace,"profile":"test"}),
-            "turn.send" => json!({"session_id":session.session_id,"text":"hello"}),
+            "input.push" => {
+                json!({"session_id":session.session_id,"mode": "steer", "text":"hello"})
+            }
             _ => json!({"session_id":session.session_id}),
         };
         let (mut server, mut output) = server(agent);
@@ -429,10 +431,7 @@ async fn deferred_open_publishes_its_index_only_when_installed() {
         let store = agent.store_handle();
         assert!(store.has_history_index(id));
         let turn = agent
-            .send(crate::SendMessage {
-                session_id: id,
-                text: "saved history".into(),
-            })
+            .send_for_test(id, "saved history".into())
             .await
             .unwrap();
         agent.wait_turn(turn).await.unwrap();

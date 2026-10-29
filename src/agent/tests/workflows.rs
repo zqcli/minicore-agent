@@ -522,10 +522,7 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
         // Session is Blocked; a new send is rejected without discarding the
         // result.
         let rejected = agent
-            .send(crate::agent::SendMessage {
-                session_id: info.session_id,
-                text: "after".to_owned(),
-            })
+            .send_for_test(info.session_id, "after".to_owned())
             .await;
         assert!(matches!(rejected, Err(AgentError::SessionBlocked)));
         let again = agent.wait_turn(turn).await.unwrap();

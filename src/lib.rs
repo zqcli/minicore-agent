@@ -61,12 +61,14 @@ mod workspace;
 pub(crate) mod openai_mock;
 
 pub use agent::{
-    Agent, AnswerInteraction, CompactSession, CoveredUsage, CreateSession, DisplayProjection,
-    GetHistory, HistoryPage, InterruptedRequest, PartialStopReason, PingResponse, RPC_CAPABILITIES,
-    RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk, ReadSession, ReadSessionResult,
-    ReadTurnSummary, ReadView, ReloadResult, RenameSession, SendMessage, SessionInfo, SessionState,
-    SessionStatus, SessionUpdateResult, SteerMessage, TurnPersistence, TurnRef, TurnResult,
-    TurnResultAvailability, TurnResultPage, TurnResultRequest, UpdateSession, agent_version,
+    Agent, AnswerInteraction, CompactSession, CoveredUsage, CreateSession, DeliveredInput,
+    DisplayProjection, GetHistory, HistoryPage, InputMode, InputPushed, InputRemoved,
+    InputsRecalled, InputsResumed, InterruptedRequest, PartialStopReason, PingResponse, PushInput,
+    Queue, QueueItem, RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk,
+    ReadSession, ReadSessionResult, ReadTurnSummary, ReadView, ReloadResult, RemoveInput,
+    RenameSession, SessionInfo, SessionState, SessionStatus, SessionUpdateResult, StartedTurn,
+    TurnPersistence, TurnRef, TurnResult, TurnResultAvailability, TurnResultPage,
+    TurnResultRequest, UpdateSession, agent_version,
 };
 pub use changes::{
     ChangeCommitState, ChangeCoverage, ChangeCursor, ChangeKind, ChangeListConsistency,
@@ -97,8 +99,8 @@ pub use presentation::{
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use sessions::{
-    CompactionPhase, CompactionProgress, ContextBudget, LoopAccepted, SessionBlockReason,
-    SessionContext, SteerAccepted, SummaryCoverage,
+    CompactionPhase, CompactionProgress, ContextBudget, SessionBlockReason, SessionContext,
+    SummaryCoverage,
 };
 pub use tool_data::{
     CommandResult, CommandStatus, ToolDataAvailability, ToolDataStream, ToolExecutionData,

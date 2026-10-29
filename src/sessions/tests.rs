@@ -55,6 +55,8 @@ async fn ignored_finished_drops_accumulate_into_subsequent_agent_event() {
         turn,
         outcome: LoopOutcomeView::Completed,
         persistence: TurnPersistence::Persisted,
+        next: None,
+        queue: crate::sessions::Queue::default(),
         meta: EventMeta::for_turn(turn),
     });
     let received = receiver

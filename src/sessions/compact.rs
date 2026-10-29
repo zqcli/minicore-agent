@@ -82,8 +82,13 @@ impl CompactionOperation {
         }
     }
 
-    fn publish(&self, result: CompactionResult) -> CompactionResult {
-        let result = match self.state.compare_exchange(
+    pub(super) fn is_completed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == COMPACTION_COMPLETED
+    }
+
+    /// Settles the final result: a cancellation that won the race overrides.
+    fn complete(&self, result: CompactionResult) -> CompactionResult {
+        match self.state.compare_exchange(
             COMPACTION_RUNNING,
             COMPACTION_COMPLETED,
             Ordering::AcqRel,
@@ -99,9 +104,12 @@ impl CompactionOperation {
                 result
             }
             Err(_) => result,
-        };
-        self.result.send_replace(Some(result.clone()));
-        result
+        }
+    }
+
+    fn publish(&self, result: CompactionResult, next: Option<StartedTurn>) {
+        self.result
+            .send_replace(Some(CompactionCompletion { result, next }));
     }
 
     pub(super) async fn join(&self) -> Result<(), AgentError> {
@@ -308,10 +316,12 @@ impl Session {
         admission: CompactionAdmission,
         model: Arc<dyn Model>,
         descriptor: ModelDescriptor,
-    ) -> Result<watch::Receiver<Option<CompactionResult>>, AgentError> {
+    ) -> Result<watch::Receiver<Option<CompactionCompletion>>, AgentError> {
         let operation = &admission.operation;
         let receiver = operation.result.subscribe();
         if operation.cancellation_requested() {
+            // Nothing runs, so queued inputs may start with this result.
+            self.lock_inner().pending_compaction = None;
             self.publish_compaction_result(operation, operation.failed_result("cancelled", None));
             return Ok(receiver);
         }
@@ -345,6 +355,7 @@ impl Session {
                 .len()
                 .saturating_sub(previous_covered_item_count);
             inner.compaction = Some(Arc::clone(operation));
+            inner.pending_compaction = None;
             inner.compaction_progress = Some(CompactionProgress {
                 operation_id: operation.operation_id.clone(),
                 phase: CompactionPhase::Preparing,
@@ -457,17 +468,20 @@ impl Session {
     ) {
         // Clear wire-visible progress before waking result waiters. The
         // operation handle remains Session-owned until a later join.
-        let should_emit = {
+        let (result, should_emit) = {
             let mut inner = self.lock_inner();
             let should_clear = inner
                 .compaction
                 .as_ref()
                 .is_some_and(|candidate| std::ptr::eq(candidate.as_ref(), operation));
             let should_emit = should_clear && inner.compaction_progress.take().is_some();
-            let result = operation.publish(result);
-            inner.last_compaction_result = Some(result);
-            should_emit
+            let result = operation.complete(result);
+            inner.last_compaction_result = Some(result.clone());
+            (result, should_emit)
         };
+        // The head starts before any waiter learns that the compaction ended.
+        let next = self.start_after_compaction();
+        operation.publish(result, next);
         if should_emit {
             self.emit_state();
         }

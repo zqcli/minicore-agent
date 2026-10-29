@@ -16,7 +16,15 @@ use minicore_runtime::model::{
 use minicore_runtime::tools::{ToolOutput, ToolResultOutcome, ToolSpec};
 use minicore_runtime::{LoopId, ToolCallId};
 
-use crate::agent::{Agent, CreateSession, SendMessage};
+use crate::agent::{Agent, CreateSession};
+
+struct NoInputs;
+
+impl minicore_runtime::LoopInputs for NoInputs {
+    fn take(&self) -> Vec<minicore_runtime::execution::UserInput> {
+        Vec::new()
+    }
+}
 use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::event::{AgentEvent, OutputChannel};
 use crate::history::{GetHistory, HistoryItemView};
@@ -153,6 +161,7 @@ async fn runtime_normalizes_provider_text_and_ignores_empty_deltas() {
     let mut runner = minicore_runtime::AgentLoop::start(
         request,
         minicore_runtime::LoopOptions::default_checked().unwrap(),
+        Arc::new(NoInputs),
     )
     .unwrap();
     let mut events = runner.take_events().unwrap();
@@ -449,10 +458,7 @@ async fn runtime_completes_before_deadline_when_terminal_http_body_never_ends() 
         .await
         .unwrap();
     let turn = agent
-        .send(SendMessage {
-            session_id: session.session_id,
-            text: "answer".into(),
-        })
+        .send_for_test(session.session_id, "answer".into())
         .await
         .unwrap();
     let result = tokio::time::timeout(Duration::from_millis(800), agent.wait_turn(turn)).await;
@@ -2628,10 +2634,7 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
         .await
         .unwrap();
     let turn = agent
-        .send(SendMessage {
-            session_id: session.session_id,
-            text: "read input".to_owned(),
-        })
+        .send_for_test(session.session_id, "read input".to_owned())
         .await
         .unwrap();
     let result = agent.wait_turn(turn).await.unwrap();
@@ -2817,11 +2820,11 @@ async fn run_live_reasoning_tool(
         .await
         .map_err(|_| "live Session creation failed")?;
     let turn = agent
-        .send(SendMessage {
-            session_id: session.session_id,
-            text: "Use the read tool to read SMOKE.txt.\nAfter reading it, reply with the exact token."
+        .send_for_test(
+            session.session_id,
+            "Use the read tool to read SMOKE.txt.\nAfter reading it, reply with the exact token."
                 .to_owned(),
-        })
+        )
         .await
         .map_err(|_| "live Turn send failed")?;
     let result = tokio::time::timeout(Duration::from_secs(300), agent.wait_turn(turn))

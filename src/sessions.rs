@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::test_support::{Gate, Registry};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -18,7 +18,7 @@ use minicore_runtime::model::{Model, ModelDescriptor};
 use minicore_runtime::tools::{ToolName, ToolSpec};
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{
-    AgentLoop, AnswerError, LoopHandle, LoopOptions, LoopReport, LoopRequest, SteerError,
+    AgentLoop, AnswerError, LoopHandle, LoopInputs, LoopOptions, LoopReport, LoopRequest,
     UpdateError,
 };
 use minicore_runtime::{InteractionId, LoopId};
@@ -36,7 +36,6 @@ use crate::event::{
 };
 use crate::history::{GetHistory, HistoryPage, normalize_history, page_history};
 use crate::ids::SessionId;
-use crate::presentation::SteerReceiptPrompt;
 use crate::prompt::ProjectPromptProvider;
 use crate::read::InterruptedRequest;
 use crate::store::{Store, StoredLoopOutcome, StoredLoopRecord, SummaryCommit, utc_timestamp};
@@ -49,23 +48,28 @@ mod active_loop;
 mod budget;
 mod compact;
 mod events;
+mod inputs;
 mod registry;
 mod status_workers;
 mod types;
 
-use active_loop::ActiveLoop;
 #[cfg(test)]
-use active_loop::{EphemeralSummaryCleanup, SessionTask};
-pub(crate) use active_loop::{
-    LoopSubmission, TurnCompletion, await_compaction_completion, await_turn_completion,
-};
+use active_loop::EphemeralSummaryCleanup;
+use active_loop::{ActiveLoop, CompletionGuard, LoopRun, SessionTask};
+pub(crate) use active_loop::{TurnCompletion, await_compaction_completion, await_turn_completion};
 pub(crate) use events::forward_loop_event;
+#[cfg(test)]
+pub(crate) use inputs::MAX_QUEUED_INPUTS;
+use inputs::{Close, Entry, QueueState, SessionInputs};
+pub use inputs::{
+    DeliveredInput, InputMode, InputPushed, InputRemoved, InputsRecalled, InputsResumed, PushInput,
+    Queue, QueueItem, RemoveInput, StartedTurn,
+};
 pub(crate) use registry::Sessions;
 use status_workers::StatusWorkers;
 pub use types::{
-    CompactionPhase, CompactionProgress, ContextBudget, LoopAccepted, SessionBlockReason,
-    SessionContext, SessionState, SessionStatus, SteerAccepted, SummaryCoverage, TurnPersistence,
-    TurnRef, TurnResult,
+    CompactionPhase, CompactionProgress, ContextBudget, SessionBlockReason, SessionContext,
+    SessionState, SessionStatus, SummaryCoverage, TurnPersistence, TurnRef, TurnResult,
 };
 
 #[cfg(test)]
@@ -95,6 +99,11 @@ pub(crate) struct ReadSnapshot {
 struct SessionShared {
     /// Short critical sections; never holds across an await, I/O, or join.
     inner: Mutex<SessionInner>,
+    session_id: SessionId,
+    /// The queued user inputs. Lock order is `inner` before `queue`; `take`
+    /// (called by the runner task) locks only `queue`. Never held across an
+    /// await.
+    queue: Mutex<QueueState>,
     /// Serializes history appends and session.json updates for one session.
     io: tokio::sync::Mutex<()>,
     /// Cancelled when the loaded Session is closed or dropped. In-flight
@@ -130,6 +139,9 @@ struct SessionInner {
     auto: Option<AutoContext>,
     options: LoopOptions,
     active: Option<ActiveLoop>,
+    /// Completions of the turns of this busy period that a successor replaced,
+    /// so a late `turn.wait` still finds them.
+    finished: VecDeque<(TurnRef, watch::Receiver<Option<TurnCompletion>>)>,
     blocked: Option<SessionBlockReason>,
     closing: bool,
     compaction: Option<Arc<CompactionOperation>>,
@@ -142,6 +154,10 @@ struct SessionInner {
     // requests cannot target a later operation with the same identity.
     used_compaction_ids: BTreeSet<String>,
 }
+
+/// Turns of one busy period whose completion stays waitable after a successor
+/// replaced them.
+const FINISHED_TURNS_KEPT: usize = 4;
 
 /// Frozen tool schemas for the current execution config, derived only from the
 /// record's enabled tools and the live `ToolSet`.
@@ -174,16 +190,38 @@ pub(crate) struct CompactionAdmission {
 
 impl Drop for CompactionAdmission {
     fn drop(&mut self) {
-        self.session.lock_inner().pending_compaction = None;
+        let cleared = {
+            let mut inner = self.session.lock_inner();
+            let ours = inner
+                .pending_compaction
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(pending, &self.operation));
+            if ours {
+                inner.pending_compaction = None;
+            }
+            ours
+        };
+        // An admission that never started leaves inputs queued during it.
+        if cleared {
+            self.session.start_after_compaction();
+        }
     }
 }
 
 struct CompactionOperation {
     operation_id: String,
     cancellation: CancellationToken,
-    result: watch::Sender<Option<CompactionResult>>,
+    result: watch::Sender<Option<CompactionCompletion>>,
     join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     state: AtomicU8,
+}
+
+/// A manual compaction's final result and the turn the Agent started from the
+/// input queue when it ended.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactionCompletion {
+    pub(crate) result: CompactionResult,
+    pub(crate) next: Option<StartedTurn>,
 }
 
 const COMPACTION_RUNNING: u8 = 0;
@@ -253,6 +291,7 @@ impl Session {
             auto,
             options,
             active: None,
+            finished: VecDeque::new(),
             blocked: None,
             closing: false,
             compaction: None,
@@ -264,6 +303,8 @@ impl Session {
         };
         Self {
             shared: Arc::new(SessionShared {
+                session_id: inner.record.session_id,
+                queue: Mutex::new(QueueState::default()),
                 inner: Mutex::new(inner),
                 io: tokio::sync::Mutex::new(()),
                 close: CancellationToken::new(),
@@ -279,8 +320,7 @@ impl Session {
     }
 
     pub(crate) fn session_id(&self) -> SessionId {
-        let inner = self.lock_inner();
-        inner.record.session_id
+        self.shared.session_id
     }
 
     pub(crate) fn record(&self) -> crate::store::SessionRecord {

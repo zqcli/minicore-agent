@@ -66,8 +66,10 @@ pub enum AgentError {
     ReloadRequiresRestart,
     #[error("configuration reload is unavailable")]
     ReloadUnavailable,
-    #[error("the steer queue is full")]
-    SteerQueueFull,
+    #[error("the input queue is full")]
+    InputQueueFull,
+    #[error("the input is not queued")]
+    InputNotQueued,
     #[error("runtime error: {0}")]
     Runtime(RuntimeErrorView),
     #[error("internal error")]

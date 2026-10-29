@@ -19,11 +19,11 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
 
     let sent = harness
         .call_ok(
-            "turn.send",
-            Some(json!({"session_id": session, "text": "update file"})),
+            "input.push",
+            Some(json!({"session_id": session, "mode": "steer", "text": "update file"})),
         )
         .await;
-    let turn = sent["result"]["turn"].clone();
+    let turn = sent["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -143,11 +143,11 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session, "text": "update files"})),
+            "input.push",
+            Some(json!({"session_id": session, "mode": "steer", "text": "update files"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -253,11 +253,11 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session, "text": "update file"})),
+            "input.push",
+            Some(json!({"session_id": session, "mode": "steer", "text": "update file"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -337,11 +337,11 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session, "text": "update file"})),
+            "input.push",
+            Some(json!({"session_id": session, "mode": "steer", "text": "update file"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -638,11 +638,11 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session, "text": "gated turn"})),
+            "input.push",
+            Some(json!({"session_id": session, "mode": "steer", "text": "gated turn"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     tokio::time::timeout(TIMEOUT, async {
         while probe.started.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;

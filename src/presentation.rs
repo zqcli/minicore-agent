@@ -21,9 +21,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use serde::Serialize;
 
-use minicore_runtime::history::{HistoryItem, UserMessageKind};
+use minicore_runtime::history::HistoryItem;
 use minicore_runtime::model::{Model, ModelCallContext, ModelDescriptor, ModelRequest, Usage};
-use minicore_runtime::prompt::{PromptFuture, PromptProvider, PromptRequest};
 use minicore_runtime::tools::{Tool, ToolContext, ToolExecutionOutcome, ToolInvocation, ToolSpec};
 use minicore_runtime::{LoopId, ToolCallId};
 
@@ -59,6 +58,6 @@ use state::reported_context;
 #[cfg(test)]
 pub(crate) use state::{ContextKind, ContextUsageView};
 pub(crate) use state::{Presentation, context_tokens};
-pub(crate) use wrappers::{PresentationModel, PresentationTool, SteerReceiptPrompt};
+pub(crate) use wrappers::{PresentationModel, PresentationTool};
 #[cfg(test)]
 mod tests;

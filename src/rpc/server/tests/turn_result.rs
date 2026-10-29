@@ -19,11 +19,12 @@ async fn turn_result_reports_pending_and_stored_availability() {
     harness
         .send(
             json!("send-blocked"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "wait"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "wait"})),
         )
         .await;
-    let blocked_turn = harness.response(json!("send-blocked")).await["result"]["turn"].clone();
+    let blocked_turn =
+        harness.response(json!("send-blocked")).await["result"]["started"]["turn"].clone();
     tokio::time::timeout(TIMEOUT, model_started.notified())
         .await
         .expect("blocked model request must be started before querying its result");
@@ -61,11 +62,12 @@ async fn turn_result_reports_pending_and_stored_availability() {
     harness
         .send(
             json!("send-stored"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "persist"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "persist"})),
         )
         .await;
-    let stored_turn = harness.response(json!("send-stored")).await["result"]["turn"].clone();
+    let stored_turn =
+        harness.response(json!("send-stored")).await["result"]["started"]["turn"].clone();
     harness
         .send(
             json!("wait-stored"),
@@ -114,11 +116,11 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "live"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "live"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
 
     let first = harness
@@ -206,11 +208,11 @@ async fn turn_result_reads_failed_live_report_without_history() {
     harness
         .send(
             json!("send"),
-            "turn.send",
-            Some(json!({"session_id": session_id, "text": "failed persistence"})),
+            "input.push",
+            Some(json!({"session_id": session_id, "mode": "steer", "text": "failed persistence"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["turn"].clone();
+    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["persistence"], json!("failed"));
 

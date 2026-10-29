@@ -52,6 +52,10 @@ impl AgentFixture {
         self
     }
 
+    pub(super) fn model(&self, id: &str) -> Arc<ScriptedModel> {
+        Arc::clone(&self.models[id])
+    }
+
     pub(super) fn profile(mut self, profile: Profile) -> Self {
         self.config.profiles.insert("test".to_owned(), profile);
         self

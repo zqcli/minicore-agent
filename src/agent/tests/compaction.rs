@@ -81,12 +81,13 @@ async fn high_mid_turn_usage_keeps_all_exchanges_and_steers_without_threshold_co
     )
     .await;
     gate.wait_started().await;
-    agent
-        .steer(super::SteerMessage {
-            turn,
-            text: "preserve this steer exactly".into(),
-        })
-        .unwrap();
+    push(
+        &agent,
+        info.session_id,
+        crate::agent::InputMode::Steer,
+        "preserve this steer exactly",
+    )
+    .await;
     gate.release();
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
@@ -288,12 +289,13 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
     .await;
     let turn = send_text(&mut agent, session_id, "original prompt exact").await;
     gate.wait_started().await;
-    agent
-        .steer(super::SteerMessage {
-            turn,
-            text: "steer while summary blocked".into(),
-        })
-        .unwrap();
+    push(
+        &agent,
+        session_id,
+        crate::agent::InputMode::Steer,
+        "steer while summary blocked",
+    )
+    .await;
     agent
         .update_session(UpdateSession {
             session_id,
