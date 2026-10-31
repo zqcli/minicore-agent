@@ -290,6 +290,11 @@ async fn shutdown_signal_is_observed_while_a_close_is_pending() {
         .loaded_session(second.session_id)
         .unwrap()
         .query_cancellation();
+    let load = agent
+        .loaded_session(info.session_id)
+        .unwrap()
+        .load()
+        .to_string();
     let gate = Arc::new(Gate::new());
     OPERATION_GATES.arm(base.join("data"), gate.clone());
     let (mut input, reader) = tokio::io::duplex(8192);
@@ -299,7 +304,7 @@ async fn shutdown_signal_is_observed_while_a_close_is_pending() {
         received.await.unwrap();
         Ok(())
     }));
-    let request = json!({"jsonrpc":"2.0","id":"close","method":"session.close","params":{"session_id":info.session_id}});
+    let request = json!({"jsonrpc":"2.0","id":"close","method":"session.close","params":{"session_id":info.session_id,"load":load}});
     input
         .write_all(format!("{request}\n").as_bytes())
         .await

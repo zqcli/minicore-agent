@@ -48,7 +48,12 @@ async fn direct_observer_records_bash_streams_and_native_file_changes() {
     drop(event_stream);
     let data = Arc::new(ToolData::new());
     let owners = crate::tools::command::ToolOwners::new();
-    let observer = ToolObserver::new(session_id, Arc::clone(&data), events);
+    let observer = ToolObserver::new(
+        session_id,
+        crate::test_support::load_id(),
+        Arc::clone(&data),
+        events,
+    );
     let bash = Arc::new(OwnedBashTool::with_binding(
         Arc::clone(&workspace),
         CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),

@@ -167,6 +167,83 @@ async fn event_stream_delivers_lifecycle_events() {
 }
 
 #[tokio::test]
+async fn every_runtime_tool_and_control_event_keeps_its_exact_load_across_reopen() {
+    let fixture = AgentFixture::new("event-loads")
+        .file("file.txt", b"content")
+        .script([
+            Step::ToolCall("read", json!({"path":"file.txt"})),
+            Step::Text("first"),
+            Step::ToolCall("read", json!({"path":"file.txt"})),
+            Step::Text("second"),
+        ]);
+    let (mut agent, info) = fixture.start().await;
+    let mut events = agent.take_events().unwrap();
+    let drain = tokio::spawn(async move {
+        let mut received = Vec::new();
+        while let Some(event) = events.recv().await {
+            assert!(received.len() < 512);
+            received.push(event);
+        }
+        received
+    });
+    let first_load = agent.loaded_session(info.session_id).unwrap().load();
+    let first = send_text(&mut agent, info.session_id, "read first").await;
+    wait_text(&agent, first).await;
+    agent.close_session(info.session_id).await.unwrap();
+    agent.open_session(info.session_id).await.unwrap();
+    let second_load = agent.loaded_session(info.session_id).unwrap().load();
+    assert_ne!(first_load, second_load);
+    let second = send_text(&mut agent, info.session_id, "read second").await;
+    wait_text(&agent, second).await;
+    agent.close_session(info.session_id).await.unwrap();
+    agent.shutdown().await.unwrap();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tool_loads = BTreeSet::new();
+    let mut completed = BTreeSet::new();
+    for event in events {
+        let meta = *event.meta();
+        assert_eq!(meta.session_id, info.session_id);
+        assert!(meta.load == first_load || meta.load == second_load);
+        if let Some(loop_id) = meta.loop_id {
+            assert_eq!(
+                meta.load,
+                if loop_id == first.loop_id {
+                    first_load
+                } else {
+                    assert_eq!(loop_id, second.loop_id);
+                    second_load
+                }
+            );
+        }
+        let value = serde_json::to_value(&event).unwrap();
+        if let Some(turn) = value.pointer("/data/turn") {
+            assert_eq!(turn["session_id"], json!(meta.session_id));
+            assert_eq!(turn["loop_id"], json!(meta.loop_id.unwrap()));
+        }
+        match event {
+            AgentEvent::SessionSnapshot { snapshot, .. } => {
+                assert_eq!(snapshot.load, meta.load);
+                assert_eq!(snapshot.session_id, meta.session_id);
+            }
+            AgentEvent::ToolInvocation { .. }
+            | AgentEvent::ToolExecution { .. }
+            | AgentEvent::ToolPresentation { .. } => {
+                tool_loads.insert(meta.load);
+            }
+            AgentEvent::TurnFinished { turn, .. } => {
+                completed.insert(turn.loop_id);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(tool_loads, BTreeSet::from([first_load, second_load]));
+    assert_eq!(completed, BTreeSet::from([first.loop_id, second.loop_id]));
+}
+
+#[tokio::test]
 async fn join_first_drains_queued_finished_without_duplicate_agent_completion() {
     let fixture = AgentFixture::new("join-first").file("a.txt", b"hello");
     let workspace = fixture.workspace.clone();
@@ -224,7 +301,22 @@ async fn queued_finished_drops_are_accounted_without_runtime_completion_mapping(
     let mut agent = fixture.open().await;
     let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &workspace).await;
-    let _ = events.recv().await;
+    // Control snapshots are published on their own reliable lane; this test
+    // asserts only that a dropped Runtime `Finished` maps to no Agent event.
+    while let Ok(event) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await
+    {
+        if let Some(event) = event
+            && !matches!(
+                event,
+                AgentEvent::SessionSnapshot { .. }
+                    | AgentEvent::SessionOpened { .. }
+                    | AgentEvent::SessionState { .. }
+            )
+        {
+            panic!("unexpected event before the assertion: {event:?}");
+        }
+    }
     let loop_id = minicore_runtime::LoopId::new().unwrap();
 
     agent
@@ -257,6 +349,7 @@ async fn queued_finished_drops_are_accounted_without_runtime_completion_mapping(
         queue: crate::sessions::Queue::default(),
         meta: crate::event::EventMeta {
             session_id: turn.session_id,
+            load: crate::test_support::load_id(),
             loop_id: Some(turn.loop_id),
             dropped_before: 0,
         },

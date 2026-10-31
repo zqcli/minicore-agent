@@ -1,7 +1,12 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.9.0 exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.9.1 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
+
+Agent protocol version 2 requires load-scoped mutations and supplies reliable,
+versioned `session_snapshot` controls plus bounded completion discovery and
+result reads. JSON-RPC still uses envelope version `2.0`. Clients must check
+`agent.ping` before issuing mutations; protocol-v1 clients are not supported.
 
 ## Transport And Framing
 
@@ -12,11 +17,11 @@ minicore-agent --config ./agent.toml --stdio
 ```
 
 Each stdin line is one UTF-8 JSON-RPC request and each stdout line is one
-complete JSON object. Requests must fit within 1 MiB including the terminating
-newline. Stdout is reserved for RPC responses and `agent.event` notifications;
+complete JSON object. Requests must fit within 8 MiB and outbound frames within
+64 MiB, including the terminating newline. Stdout is reserved for RPC responses and `agent.event` notifications;
 logs are written to stderr.
 
-The 1 MiB limit covers the whole accumulated request, including bytes received
+The 8 MiB inbound limit covers the whole accumulated request, including bytes received
 before an earlier cancellation. The reader retains a partially received frame
 across deferred-waiter, signal, and writer-status wakeups, so a request may
 arrive in arbitrarily fragmented reads without losing its prefix. A frame's
@@ -25,13 +30,44 @@ the frame is rejected as oversized, which discards the accumulated bytes and
 reports a parse error, then stops the process through orderly shutdown. It does
 not discard just that line and resume accepting requests.
 
+### Control Memory And Legal Maximum
+
+Control staging has a 320 MiB Agent-wide ownership budget. A publisher waits
+for capacity; a query/open/create reserves or returns `resource_exhausted`
+before sampling. Each reservation covers two 64 MiB frame allowances plus
+12 KiB for DTO structure and the explicitly bounded 8 KiB writer buffer.
+This permits a maximum publisher and a maximum query reservation concurrently,
+with room for an already encoded legal frame; publication alone cannot make a
+normal small state query fail during sampling. Additional pressure can still
+exhaust the budget. After sampling it shrinks to a conservative raw-plus-encoded size; after exact
+encoding and DTO release it shrinks to encoded capacity, newline, and writer
+buffer allowance. It travels through the reliable mailbox and outbound queue
+until flush. Descriptor copies in snapshots count here, in addition to the
+catalog's 8 MiB owned-allocation bound. Ordinary compatibility/body lanes and
+legacy command responses retain their existing count bounds; this is not a
+process RSS limit or a bound on Rust clients retaining returned DTOs.
+
+A legal maximum snapshot contains 32 queued inputs and one execution input,
+each 256 KiB. Worst-case JSON control-character escaping costs six bytes per
+input byte: `33 * 262144 * 6 = 51,904,512` bytes. Add at most 8 MiB for the
+encoded request ID, 512 KiB for 256 complete descriptors, two copies of the
+largest actionable tool-input interaction (8 KiB prompt and 32 1 KiB choices,
+with escaping), and 64 KiB for identities, keys, and envelope. This remains
+below 64 MiB including newline; approvals are smaller. The maximum-combination
+test encodes the complete state response, counts the notification envelope,
+and encodes the legacy push receipt with its full queue and started input.
+Commands do not duplicate a snapshot alongside legacy queue fields. Accepted
+text, prompts, choices, and identities are never truncated to fit.
+
 ## Deferred Waiter Capacity
 
 At most 4 read queries may run at once, and at most 32 deferred operations,
-waiters, and read queries may be registered in total. When either limit is reached, further
-deferred requests fail immediately with `-32019` (`resource_exhausted`,
-retryable). The reader remains serviceable, so a client can still use ping,
-cancel, and shutdown to drain or cancel its work.
+waiters, and read queries may be registered in total. When either limit is
+reached, further deferred requests fail immediately with `-32019`
+(`resource_exhausted`, retryable). Control-only `session.state` sampling shares
+the 4-query ceiling but remains available when the 32 waiters are full, as do
+ping, cancel, and shutdown. Snapshot queries and open/create responses can also
+fail with `resource_exhausted` before sampling when control staging is full.
 
 A request has this shape:
 
@@ -47,7 +83,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.0","protocol_version":1,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.1","protocol_version":2,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
 ```
 
 An error response has exactly one `error`:
@@ -71,7 +107,9 @@ be recovered.
 
 All output passes through one bounded channel and one writer task, so every
 stdout line is complete and frames are never byte-interleaved. The writer encodes
-successful responses once and flushes each bounded batch of queued frames. Ordinary
+ordinary successful responses once and flushes each bounded batch. Charged
+snapshot frames use exact-capacity encoding and retain their budget charge
+until the writer has flushed its buffered tail. Ordinary
 requests are admitted sequentially, but disk work and worker joins run in bounded
 owned tasks. This includes `agent.reload`, `session.list/create/open/close/delete`,
 `session.update/rename/compact`, `turn.wait`, an `input.push` or `input.resume`
@@ -103,9 +141,19 @@ turn. Turn completion starts no compaction operation and publishes no automatic
 result in `last_result`. Settling an existing turn-start or emergency projection
 still belongs to the turn's owned worker; close and the next turn start join it.
 
-Output deltas and other live events are best effort and may be dropped under
-pressure. The authoritative sources are `turn.wait`, `turn.result`, and the
-history query results, not the event stream.
+Output deltas and compatibility notifications are best effort and may be
+dropped under pressure. `session_snapshot` is the reliable control exception:
+one dirty mark per loaded instance coalesces changes, and publication rotates
+in batches of at most 16 loads. Runtime observers sample their initial value,
+observe final completion independently of sender lifetime, and are joined by
+the owning loop/close barrier. Control publication can wait for transport
+capacity without blocking model/tool execution. Close queues its final joined
+control state before unregistering the instance; writer failure ends the
+connection rather than silently discarding a final control.
+
+`turn.wait`, `turn.result`, and history queries supply terminal/body facts.
+Snapshots may skip intermediate control states, but include the entire retained
+completion suffix, not just the most recent active loop.
 
 `agent.shutdown` first marks every loaded Session closing and broadcasts
 cancellation to its active loop, compaction, and queries. It then drains deferred
@@ -145,8 +193,8 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.9.0",
-  "protocol_version": 1,
+  "version": "0.9.1",
+  "protocol_version": 2,
   "capabilities": [
     "session.read",
     "session.read.display",
@@ -314,7 +362,8 @@ are validated as one combination with the Profile's Tools before any Session is
 created; unsupported combinations fail with `-32014` and are never silently
 downgraded. Creating a Session never starts a loop.
 
-The result has a `session` member containing the created SessionInfo.
+The result has `session`, `load` and `snapshot` members. `load` is an opaque
+identity for this resident instance; closing and reopening creates another one.
 
 ### Other Session Methods
 
@@ -326,7 +375,7 @@ it only on completion; close replies only after joining owned work. Other
 Sessions, ping, cancellation, and shutdown remain responsive.
 
 - `session.open` takes `{"session_id":"ses_..."}` and returns a `session`
-  member containing SessionInfo (with `loaded: true`) after loading the persistent
+  member containing SessionInfo (with `loaded: true`), `load` and `snapshot` after loading the persistent
   record and history from disk. It never starts a loop.
 - `session.close` cancels any active loop and manual compaction, joins all
   Session-owned workers, and returns `{"ok":true}`. Active loops receive Runtime
@@ -346,12 +395,24 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   `compaction` member reports only its safe operation ID, phase, and item counts;
   clients use its presence, rather than the ordinary loop `status`, to observe
   compaction busy. Future Runtime statuses map to `unknown` in both Session and
-  active-loop status views.
+  active-loop status views. The same observation also carries `snapshot` with
+  `session_id`, `load`, monotonic `revision`, `execution`,
+  `pending_interaction`, `queue`, `compaction`, `block_reason` and
+  `completions`. Execution is `none`, `starting`, `running`, or `finishing`.
+  The completion directory is a contiguous retained suffix with `through_seq`,
+  `retained_from_seq`, `entries` and `truncated`; it is not persisted.
+
+Every mutation targeting a loaded instance includes its `load`: `input.push`,
+`input.remove`, `input.recall`, `input.resume`, `turn.cancel`,
+`interaction.answer`, `session.close`, `session.compact`,
+`session.compact.cancel`, `session.update`, and loaded `session.rename`.
+Missing or stale loads fail before the side effect. Cold `session.rename`
+continues to address the stored Session without a load.
 - `session.context` takes a loaded Session ID and returns the current manual
   compaction operation, validated-summary coverage, latest operation
   result, and the estimated Runtime history budget. It is read-only and responds
   immediately, including while compaction is busy.
-- `session.compact` takes `{"session_id":"ses_...","operation_id":"..."}`
+- `session.compact` takes `{"session_id":"ses_...","load":"load_...","operation_id":"..."}`
   and returns one deferred result after manual compaction finishes. The
   operation ID is non-empty printable ASCII and at most 128 bytes, must not
   start with reserved `auto-`, and cannot be reused during one loaded Session
@@ -752,7 +813,7 @@ This preserves cumulative usage independently of hidden old transcript bodies.
 ### `session.update`
 
 ```json
-{"session_id":"ses_...","model":"fast","reasoning":"low"}
+{"session_id":"ses_...","load":"load_...","model":"fast","reasoning":"low"}
 ```
 
 `model` and `reasoning` are optional but at least one must be present; otherwise
@@ -777,7 +838,7 @@ turn, but no revision is applied to the sealed loop.
 ### `session.rename`
 
 ```json
-{"session_id":"ses_...","title":"New title"}
+{"session_id":"ses_...","load":"load_...","title":"New title"}
 ```
 
 `title` is required and must be a string. The Agent trims leading and trailing
@@ -908,13 +969,13 @@ together with the entry that became its initial input.
 #### `input.push`
 
 ```json
-{"session_id":"ses_...","mode":"steer","text":"Fix the parser"}
+{"session_id":"ses_...","load":"load_...","mode":"steer","text":"Fix the parser"}
 ```
 
 Accepts one input and returns:
 
 ```json
-{"id":"inp_...","accepted_at":"2026-01-02T03:04:05.006Z","started":StartedTurn|null,"queue":Queue}
+{"session_id":"ses_...","load":"load_...","accepted":true,"id":"inp_...","accepted_at":"2026-01-02T03:04:05.006Z","started":StartedTurn|null,"start_error":null,"queue":Queue}
 ```
 
 `started` is the turn this push started, if any: an idle Session (not paused,
@@ -928,11 +989,16 @@ text must be non-empty and within the user-input byte limit, otherwise
 
 A push that starts a turn is deferred like other operations that start work and
 cannot overlap `agent.reload`. A push that only queues is answered at once.
+An accepted push whose claimed head fails to start remains a successful receipt;
+`start_error` contains that head's `input_id`, safe `kind` and `message`. The
+head may be older than the newly accepted input. Push errors carry
+`data.acceptance` as `rejected` or `unknown`; an unknown transport outcome
+must not be automatically resent.
 
 #### `input.remove`
 
 ```json
-{"session_id":"ses_...","id":"inp_..."}
+{"session_id":"ses_...","load":"load_...","id":"inp_..."}
 ```
 
 Removes one queued entry and returns `{"text":"...","queue":Queue}`. An entry
@@ -942,7 +1008,7 @@ fails with `-32025` (`input_not_queued`).
 #### `input.recall`
 
 ```json
-{"session_id":"ses_..."}
+{"session_id":"ses_...","load":"load_..."}
 ```
 
 Removes every queued entry and returns `{"texts":["..."],"queue":Queue}` with
@@ -951,11 +1017,11 @@ the texts in run order. It also clears the pause.
 #### `input.resume`
 
 ```json
-{"session_id":"ses_..."}
+{"session_id":"ses_...","load":"load_..."}
 ```
 
 Clears the pause and starts the queue head if the Session can start. Returns
-`{"started":StartedTurn|null,"queue":Queue}`. A blocked Session fails with
+`{"started":StartedTurn|null,"start_error":null|object,"queue":Queue}`. A blocked Session fails with
 `-32004`.
 
 #### `input.list`
@@ -1024,6 +1090,7 @@ An uncertain failed turn may be present on disk after reopening.
 {
   "session_id": "ses_...",
   "loop_id": "lup_...",
+  "load": "load_...",
   "cursor": {"item": 0, "offset": 0},
   "limit": 100,
   "max_bytes": 262144
@@ -1034,12 +1101,59 @@ An uncertain failed turn may be present on disk after reopening.
 and `1..=100`/`1..=1 MiB` budget rules as `session.read`. Its item envelope
 intentionally omits the session User timestamp, so a page sequence remains
 stable if a retained live result later falls back to its stored record.
-`availability` is `pending` while the current Runtime loop has not published a
-report, `live` while its retained completion report is available, and `stored`
-when the exact old Turn is read from `history.jsonl`. A live report is preferred
-to Store, so an append failure still exposes the retained report with
-`persistence: failed`; a stored Turn reports `persistence: persisted`. Runtime
-outcome and usage are returned when known.
+`availability` is `pending` until Agent completion, `live` for a readable
+in-memory result, `stored` for an exact durable record, or `unavailable` with
+`unavailable_reason` (`expired`, `too_large`, `resource_limit`, `internal_error`,
+or `not_retained`). `persistence_uncertain` identifies an uncertain append in
+the current load; it is not inferred from bytes on disk. Pending and unavailable
+are not complete empty results.
+
+An available page has `result_id` (`r1:` plus a SHA-256 digest). Every
+continuation request supplies that identity and the returned `next_cursor`;
+a different identity returns `stale_result`. The digest covers the
+length-prefixed normalized item sequence and interrupted display copy, not
+timestamps or provider replay. A persisted result uses the actual on-disk
+interrupted projection, including metadata shed at the Store line limit.
+Loaded-instance reads carry `load`; purely durable historical reads may omit it.
+Unsaved results are retained independently of active execution, within 64 MiB
+and 32 sources per load and 256 MiB and 128 sources globally; eviction makes
+later pages unavailable and no retention time is promised. Completed metadata
+is bounded to 256 entries per load and 4096 entries / 8 MiB of catalog-owned
+allocations globally. Deque capacity and input identity strings count toward
+that allocation bound; snapshots' descriptor copies are separately charged to
+the control staging budget below. Every affected load is refreshed after
+global source or metadata eviction. Entries retain a continuous suffix even
+when their bodies expire. A source still held by a page or preparation keeps
+both its byte and count charge after catalog eviction; if those references
+prevent admission, the new unsaved source is `unavailable/resource_limit`,
+without changing its outcome or persistence. A single source over 64 MiB is
+`unavailable/too_large`. Neither an active completion nor the late-wait index
+resurrects an expired source. An uncertain current-load append is never promoted
+to persisted from disk bytes, even after its descriptor is evicted.
+
+These budgets do not bound Runtime execution, committed history, existing wait
+references or Arcs held by Rust callers. An active completion retains its full
+report until cleanup/close or replacement. Up to four replaced completions keep
+the late-wait API working; eviction drops their receiver outside the business
+locks. Registered waiters and the driver may also hold reports through delivery
+and settlement. External Rust callers own their returned Arcs and event DTOs;
+Agent cannot reclaim those references. Embedded callers that take the event
+stream must drain it concurrently with close/shutdown: a reliable final control
+can wait for transport capacity. If no event stream is taken, Agent keeps only
+dirty marks and does not start snapshot publication or wait for a consumer.
+Unregistration seals sampling before removing the catalog; late sampling of the
+old instance fails with `stale_load` rather than resetting its completion
+watermark.
+Unsaved pages reuse their immutable prepared item strings without renormalizing
+the turn. Live/durable fallback reads use a borrowed canonical projection,
+stream the full identity hash on a blocking worker, and encode only a page-sized
+item prefix (plus the item that crosses that bound). They do not rebuild a full
+normalized history copy on every page or retain a second saved body cache.
+Durable reads still verify the exact record on each RPC; scanning and identity
+work remain bounded by 64 MiB, 100,000 items, the query deadline, and the four
+query slots. Clients should use the 1 MiB page maximum for long results and
+must still validate every page before installing a complete body.
+
 A cancelled turn may also return `interrupted`, the same display-only object as
 in [Interrupted replies](#interrupted-replies), for both live and stored
 results; it is not part of `items` or `total`.
@@ -1047,7 +1161,7 @@ results; it is not part of `items` or `total`.
 ### `turn.cancel`
 
 ```json
-{"session_id":"ses_...","loop_id":"lup_..."}
+{"session_id":"ses_...","load":"load_...","loop_id":"lup_..."}
 ```
 
 Cancels the active loop and returns `{"cancelled":true}`. The corresponding
@@ -1950,6 +2064,7 @@ Give one answer to a pending interaction surfaced through `session.state` or an
 ```json
 {
   "session_id": "ses_...",
+  "load": "load_...",
   "loop_id": "lup_...",
   "interaction_id": "int_...",
   "answer": {"type":"approval","decision":"allow_once"}
@@ -1972,38 +2087,126 @@ it under `params.data.state`.
 }
 ```
 
-`status` is `idle`, `running`, `waiting_for_input`, `finishing`, or `blocked`.
+`status` is `idle`, `running`, `waiting_for_input`, `finishing`, `blocked`, or
+`unknown` for a future Runtime status.
 `active_loop` is null when idle or after a turn completes; otherwise it carries
 `loop_id`, `status`, `request_index`, `config_revision`, `model`, and
 `pending_interaction`. `block_reason` is `persistence` or `internal` when the
-Session is blocked, else null.
+Session is blocked, else null. `session.state` additionally contains `snapshot`;
+the best-effort `session_state` event retains its existing shape.
 
 Mapping: no active loop and not blocked is `idle`; a blocked Session is
 `blocked`; a running loop maps to `running`; a loop awaiting input maps to
 `waiting_for_input`; runtime-finishing but agent-persistence-incomplete maps to
 `finishing`; once agent completion is published the Session is `idle` again.
 
+### Versioned Control Snapshot
+
+`session.create/open`, `session.state`, and `session_snapshot` use the same
+`SessionSnapshot` DTO and sampling function. For an idle newly loaded Session:
+
+```json
+{
+  "session_id": "ses_00000000000000000000000000000001",
+  "load": "load_0000000000000000000000000000000a",
+  "revision": 1,
+  "execution": {"type": "none"},
+  "pending_interaction": null,
+  "queue": {"items": [], "paused": false},
+  "compaction": null,
+  "block_reason": null,
+  "completions": {
+    "through_seq": 0,
+    "retained_from_seq": 1,
+    "entries": [],
+    "truncated": false
+  }
+}
+```
+
+`load` is an opaque, non-reused loaded-instance identity. Close/reopen changes
+it; `agent.reload` does not. Within one session/load, every controlled sample
+gets a strictly increasing `u64` revision. One revision never describes two
+different observations. Revision and completion sequence are non-negative JSON
+integers decoded as `u64`, not JavaScript Number control counters. Clients reject
+old/duplicate revisions and must not install an unfamiliar load from an event;
+an open/create response selects the instance.
+
+`execution` is tagged by `type`:
+
+- `none` has no additional fields.
+- `starting` carries the actual claimed `input` (`QueueItem`), no longer in
+  `queue.items`. Failed/dropped claims restore it under the existing pause rules.
+- `running` carries `loop_id`, `input`, `request_index`, and `phase` (the Runtime
+  status spelling, such as `running_model`, `running_tools`, or
+  `waiting_for_input`).
+- `finishing` carries `loop_id`, `input`, and `request_index`, and remains until
+  Agent normalization/persistence and completion publication finish, even if
+  Runtime has already finished.
+
+`pending_interaction` is null or contains `loop_id`, `request_index`,
+`interaction_id`, `tool_call_id`, `tool_name`, and `kind`. The kind retains the
+existing tagged `approval` or `tool_input` actionable content (prompt/risk or
+prompt/choices/answer_kind). It comes from the same single Runtime observation
+as execution, so answering does not depend on receiving a Tool card. Existing
+`compaction` and `block_reason` shapes remain unchanged. `queue.paused` is the
+only pause fact. Legacy labels and command queues are not independent control
+writers; new clients replace the complete control projection from a snapshot.
+
+`completions.entries` contains the whole retained continuous suffix in
+ascending `seq` order, not a last-event sample. Sequences start at 1.
+`through_seq` is the highest Agent terminal sequence, while
+`retained_from_seq` is the first entry or `through_seq + 1` if empty.
+`truncated` reports an evicted prefix. Each descriptor has all these fields:
+
+| Field | Meaning |
+|---|---|
+| `seq`, `loop_id`, `input_id` | Completion order and exact turn/input identity; input may be null |
+| `completion_kind` | `reported` or `internal_error` |
+| `outcome_kind` | `completed`, `cancelled`, `failed`, `unknown`, or null without a report |
+| `persistence` | `persisted`, `failed`, or null without a report |
+| `persistence_uncertain` | Current-load append uncertainty, not inferred from disk bytes |
+| `availability` | `live`, `stored`, or `unavailable` |
+| `unavailable_reason` | `expired`, `too_large`, `resource_limit`, `internal_error`, or null when available |
+| `next_loop_id` | The direct successor actually installed at this completion boundary, or null |
+| `after_saved_loop_id` | Last committed predecessor anchor, or null |
+
+Descriptors contain no input/body/error text. `turn.result` and `turn.wait`
+supply full retained details. Body expiry changes availability without advancing
+`through_seq`. Metadata expiry removes only an oldest prefix and removes any
+otherwise-undiscoverable retained body. Outside the suffix, an absent durable
+record is `unavailable/not_retained`, not proof that the turn never existed.
+A snapshot showing B running already includes A's completion and decided
+availability when A installed B; a waiter cannot resolve before registration.
+The Agent never waits for a frontend ACK before executing an eligible successor.
+
 ## Events
 
 All events are notifications `{"jsonrpc":"2.0","method":"agent.event",...}`.
-Every event carries `params.data.meta` with `session_id`, an optional
+Every event carries `params.data.meta` with `session_id`, `load`, a nullable
 `loop_id`, and `dropped_before` counting best-effort drops preceding that
 event. This is one counter for the combined consumer-visible stream: Runtime
 reports and drops from either queue accumulate until the next event is dequeued,
 then are attached exactly once. Drops after the last delivered event cannot be
 reported without a subsequent event.
 
-Lifecycle events have a separate 64-entry queue, drained before streaming events.
-The configured `event_capacity` bounds the streaming queue. Output deltas, Tool
-progress, process output chunks, and intermediate argument-preview
-revisions use streaming capacity. Preview start/first-input snapshots (revisions
-1–2) and generated/discarded transitions use lifecycle capacity; all other events (including Session/compaction state,
-turn/interaction transitions, and terminal Tool facts) use lifecycle capacity.
-Streaming floods cannot exhaust lifecycle capacity, but a lifecycle-only flood
-can still drop events. Both queues are bounded and non-blocking; authoritative
-queries remain necessary for recovery. Order is FIFO within a queue, not across
-queues: a terminal event can precede older queued deltas. Consumers must not
-infer execution order from that cross-queue delivery order.
+Reliable `session_snapshot` controls use a separate 64-entry lane, serviced
+before compatibility lifecycle and streaming events. Its producers wait or
+coalesce dirty marks rather than dropping controls, within the control byte
+budget. Lifecycle events use another 64-entry queue. The configured
+`event_capacity` bounds the streaming queue. Output deltas, Tool progress,
+process output chunks, and intermediate argument-preview revisions use
+streaming capacity. Preview start/first-input snapshots (revisions 1–2) and
+generated/discarded transitions use lifecycle capacity; other compatibility
+Session/compaction, turn/interaction, and terminal Tool notifications use that
+same best-effort lifecycle lane. Streaming floods cannot exhaust lifecycle
+capacity, but a lifecycle-only flood can still drop those notifications.
+
+Only the reliable control lane can wait for capacity; execution tasks merely
+mark dirty, and legacy/body sends remain non-blocking. Order is FIFO within a
+lane, not across lanes: a terminal event can precede older queued deltas.
+Consumers must not infer execution order from cross-lane delivery or treat a
+zero drop count as proof that a completed body is complete.
 
 Session lifecycle events do not carry `data.turn`; loop-scoped events
 carry the exact `{session_id, loop_id}` reference in `data.turn` plus
@@ -2013,7 +2216,9 @@ Session lifecycle events:
 
 - `session_opened` (`session`, `meta`)
 - `session_closed` (`session_id`, `meta`)
-- `session_state` (`state`, `meta`)
+- `session_state` (`state`, `meta`); compatibility notification, not a control writer.
+- `session_snapshot` (`snapshot`, `meta`); reliable load/revision control, with
+  `meta.loop_id: null` even when its execution carries a loop.
 - `input_queue` (`queue`, `meta`); the complete `Queue` whenever it changes.
   `meta.loop_id` is null.
 
@@ -2022,8 +2227,13 @@ Loop-scoped events:
 - `turn_started` (`turn`, `meta`)
 - `input_delivered` (`turn`, `items`, `meta`); a running turn took these queued
   steers at a request boundary, in order. Each item is
-  `{"id","text","accepted_at"}`; the inputs are in the turn's history from then
-  on, whatever its outcome.
+  `{"id","text","accepted_at","request_index"}`. The index is the request
+  preparation joined, not the last request whose output happened to arrive.
+  Pre-prompt post-tool takes belong to the next request; a stale-prompt rebuild
+  keeps its index, including after model/reasoning/prompt config replacements.
+  A cancelled or failed preparation can leave that candidate index unissued.
+  Accepted inputs are in the turn's working history from then on, whatever its
+  outcome; only a successful append commits them.
 - `request_started` (`turn`, `request_index`, `config_revision`, `model`, `reasoning`)
 - `output_delta` (`turn`, `request_index`, `channel` `text`/`reasoning`, `delta`, `meta`)
 - `tool_started` (`turn`, `request_index`, `tool_call_id`, `tool_name`, `meta`)
@@ -2090,8 +2300,12 @@ errors:
 | `-32023` | `config_error` |
 | `-32024` | `input_queue_full` |
 | `-32025` | `input_not_queued` |
+| `-32026` | `missing_load` |
+| `-32027` | `stale_load` |
+| `-32028` | `stale_result` |
 
-Error data contains only `{kind,retryable}` and stable short messages; it never
+Error data contains `{kind,retryable}` and, for input pushes, `acceptance`;
+messages are stable and short. It never
 serializes an error source, raw provider response, Tool arguments, API key, or
 panic payload. `store_error` is retryable for temporary Store unavailability,
 not corrupt or invalid stored data. An `interaction.answer` after its turn ended
@@ -2111,7 +2325,7 @@ fields and unknown read-only event types.
 The additive `tool.arguments.preview` capability advertises
 `tool_arguments_preview` events. Clients must not require it: older Agents
 remain usable, and older clients can ignore the unknown event. Protocol
-version remains 1. Every event is a complete replacement snapshot, identified
+version is 2. Every event is a complete replacement snapshot, identified
 by `(session_id, loop_id, request_index, tool_call_id)` plus `attempt` and
 `revision`. An attempt increases at every real `Model::start` within a loaded
 session, including retries and model replacement. A new attempt invalidates
@@ -2239,7 +2453,7 @@ usage then stays unknown, and ordinary input is the input tokens less the cached
 read when that is reported; without input details it stays unknown. Cached read,
 ordinary output, reasoning, and provider total remain available when reported
 and arithmetically valid.
-RPC protocol version remains 1; these are additive fields and optional usage.
+These fields were additive to protocol 1; the current development protocol is 2.
 
 ## 0.8.1 Additive Metadata
 
@@ -2271,14 +2485,13 @@ it is omitted when unknown or empty:
   reported. Stored history keeps it, and records written before 0.8.1 have none.
 
 `kind`, `delivery`, `retryable`, and `retry_after_millis` keep their meaning and
-still drive client behavior; `provider` is for display. RPC protocol version
-remains 1.
+still drive client behavior; `provider` is for display.
 
 ## 0.9.0 input queue
 
 Agent 0.9.0 replaces `turn.send` and `turn.steer` with a per-session input
 queue (`input.push`, `input.remove`, `input.recall`, `input.resume`,
-`input.list`). RPC protocol version remains 1. Removed: `turn.send`,
+`input.list`). This queue first shipped in RPC protocol 1. Removed: `turn.send`,
 `turn.steer`, the `steer_progress` event and the
 `session.presentation` `steer_progress` member, steer receipts,
 error `-32016`, and the `max_pending_steers` configuration key.
@@ -2319,5 +2532,5 @@ error `-32016`, and the `max_pending_steers` configuration key.
   `-32003` until they are recalled.
 - A delivered or started input's `accepted_at` is its user timestamp in the
   history views. `mode` is not persisted.
-- `session.state` is unchanged: a paused Session with no turn is `idle`; its
-  `paused` flag is part of the `Queue` (`input.list`, `input_queue`).
+- A paused Session with no turn is `idle`; its `paused` flag is part of the
+  `Queue` (`input.list`, `input_queue`, and `session.state.snapshot`).

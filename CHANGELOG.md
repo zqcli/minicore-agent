@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- The 0.9.1 development Agent reports RPC protocol 2 and requires a load identity for
+  loaded-instance mutations. Input receipts distinguish acceptance from a
+  queued head's startup failure.
+- Session queries include load-scoped snapshots and bounded completion
+  descriptors. Unsaved normalized results survive a later resume within their
+  retention budget; result pages carry a stable content identity and explicit
+  availability. Runtime watch initial/final observations and a fair dirty
+  publisher reliably deliver `session_snapshot` controls independently of
+  best-effort body events. Completion registration and installed successors
+  share one publication boundary.
+- Preserve full accepted inputs with 8 MiB inbound / 64 MiB outbound frames and
+  a 320 MiB control staging budget. Reserve before sampling, account for
+  descriptor copies and encoding, and retain charges through writer flush.
+  Global result eviction refreshes every affected load; uncertain persistence
+  cannot become saved merely because bytes or an old active report remain.
+  Result pages preserve actual outcomes and use borrowed canonical ranges,
+  with blocking-worker identity verification and bounded page preparation,
+  rather than rebuilding the entire normalized turn on every page.
+- Delivered steer identities include the preparation they join, including the
+  post-tool handoff and model/reasoning configuration replacements. Store
+  formats and formal Runtime release tags are unchanged.
+
 ## 0.9.0 — 2026-10-30
 
 Breaking: the RPC methods `turn.send` and `turn.steer` are replaced by a

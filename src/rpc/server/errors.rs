@@ -33,6 +33,18 @@ where
     }
 }
 
+pub(super) fn accepted_input_response<T: Serialize>(
+    id: &RpcId,
+    result: Result<T, AgentError>,
+) -> RpcResponse {
+    let response = agent_result(id, result);
+    if response.is_error() {
+        response.unknown_input()
+    } else {
+        response
+    }
+}
+
 pub(super) fn method_not_found(id: RpcId) -> RpcResponse {
     RpcResponse::error(
         Some(id),
@@ -42,6 +54,9 @@ pub(super) fn method_not_found(id: RpcId) -> RpcResponse {
         false,
     )
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn invalid_params(id: Option<RpcId>) -> RpcResponse {
     tracing::debug!(kind = "invalid_params", "rpc request rejected");
@@ -147,6 +162,9 @@ pub(super) fn agent_error(id: RpcId, error: &AgentError) -> RpcResponse {
             "input_not_queued",
             false,
         ),
+        AgentError::MissingLoad => (MISSING_LOAD, "load is required", "missing_load", false),
+        AgentError::StaleLoad => (STALE_LOAD, "load is stale", "stale_load", false),
+        AgentError::StaleResult => (STALE_RESULT, "result is stale", "stale_result", false),
         AgentError::ReloadRequiresRestart => (
             RELOAD_REQUIRES_RESTART,
             "configuration reload requires restart",

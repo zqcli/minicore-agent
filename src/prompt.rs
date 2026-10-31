@@ -16,7 +16,7 @@ const PROJECT_ENVELOPE: &str = "[minicore-project-instructions source=AGENTS.md]
 const TRUNCATED: &str = "[truncated]";
 
 #[cfg(test)]
-static READ_GATE: crate::test_support::Registry<
+pub(crate) static READ_GATE: crate::test_support::Registry<
     std::path::PathBuf,
     Arc<crate::test_support::Gate>,
 > = crate::test_support::Registry::new();

@@ -104,3 +104,87 @@ async fn serialization_failure_is_a_complete_error_frame() {
     assert_eq!(value["id"], "failed");
     assert!(!String::from_utf8_lossy(&written.bytes).contains("private details"));
 }
+
+#[tokio::test]
+async fn snapshot_encoding_keeps_its_charge_until_the_writer_flushes() {
+    struct FlushGate {
+        writer: Writer,
+        started: Arc<tokio::sync::Notify>,
+        release: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    }
+    impl AsyncWrite for FlushGate {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.writer).poll_write(cx, bytes)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.started.notify_one();
+            self.release.as_mut().poll(cx).map(Ok)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    let (sink, mut events) = crate::event::AgentEventSink::channel(1);
+    let hub = crate::sessions::SnapshotHub::new(sink.clone());
+    let session_id = crate::ids::SessionId::new().unwrap();
+    let load = crate::test_support::load_id();
+    let event = crate::AgentEvent::SessionSnapshot {
+        snapshot: crate::SessionSnapshot {
+            session_id,
+            load,
+            revision: 1,
+            execution: crate::SessionExecution::None,
+            pending_interaction: None,
+            queue: crate::Queue::default(),
+            compaction: None,
+            block_reason: None,
+            completions: crate::CompletionWindow {
+                through_seq: 0,
+                retained_from_seq: 1,
+                entries: Vec::new(),
+                truncated: false,
+            },
+        },
+        meta: crate::event::EventMeta::session(session_id, load),
+    };
+    let stopped = tokio_util::sync::CancellationToken::new();
+    assert!(
+        sink.send_snapshot(event, hub.try_reserve().unwrap(), &stopped)
+            .await
+    );
+    let (event, charge) = events.recv_owned().await.unwrap();
+    assert!(hub.used_for_test() > 0);
+    let response = RpcResponse::notification(
+        AgentEventNotification::new(event),
+        charge.expect("owned control charge"),
+    )
+    .unwrap();
+    let bytes = response.encoded().len() + 1 + crate::rpc::WRITER_BUFFER_BYTES;
+    assert_eq!(hub.used_for_test(), bytes);
+    let (sender, receiver) = mpsc::channel(1);
+    sender.send(RpcOutbound::Response(response)).await.unwrap();
+    drop(sender);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = tokio_util::sync::CancellationToken::new();
+    let writer = FlushGate {
+        writer: Writer(Arc::new(Mutex::new(Written::default()))),
+        started: Arc::clone(&started),
+        release: Box::pin(release.clone().cancelled_owned()),
+    };
+    let task = tokio::spawn(write_outbound(writer, receiver));
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert_eq!(hub.used_for_test(), bytes);
+    release.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(hub.used_for_test(), 0);
+}

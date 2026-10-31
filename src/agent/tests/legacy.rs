@@ -152,6 +152,8 @@ async fn s1_legacy_history_and_aux_are_readable_through_public_queries() {
                 session_id,
                 loop_id,
             },
+            load: None,
+            result_id: None,
             cursor: None,
             limit: 100,
             max_bytes: None,

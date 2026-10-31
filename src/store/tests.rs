@@ -464,7 +464,8 @@ async fn interrupted_partial_is_shed_before_it_can_displace_the_loop_record() {
         serde_json::from_slice(&loop_line_with_size(MAX_LOOP_RECORD_BYTES - 32)).unwrap();
     loop_record.interrupted = Some(interrupted_request(&"p".repeat(1024)));
 
-    store.append_loop(session_id, &loop_record).await.unwrap();
+    let kept_metadata = store.append_loop(session_id, &loop_record).await.unwrap();
+    assert!(!kept_metadata);
     let loaded = store.load_session(session_id).await.unwrap();
     assert_eq!(loaded.history.len(), loop_record.items.len());
     let stored = store
@@ -477,6 +478,22 @@ async fn interrupted_partial_is_shed_before_it_can_displace_the_loop_record() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.interrupted, None);
+    let live_id = crate::read::prepare_result_source(
+        &loop_record.items,
+        kept_metadata
+            .then(|| loop_record.interrupted.clone())
+            .flatten(),
+    )
+    .unwrap()
+    .result_id;
+    let stored_id = crate::read::prepare_result_source(&stored.items, stored.interrupted)
+        .unwrap()
+        .result_id;
+    let unshed_id = crate::read::prepare_result_source(&loop_record.items, loop_record.interrupted)
+        .unwrap()
+        .result_id;
+    assert_eq!(live_id, stored_id);
+    assert_ne!(live_id, unshed_id);
 }
 
 #[tokio::test]

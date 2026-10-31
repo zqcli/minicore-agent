@@ -70,6 +70,12 @@ pub enum AgentError {
     InputQueueFull,
     #[error("the input is not queued")]
     InputNotQueued,
+    #[error("load identity is required")]
+    MissingLoad,
+    #[error("load identity is stale")]
+    StaleLoad,
+    #[error("result identity is stale")]
+    StaleResult,
     #[error("runtime error: {0}")]
     Runtime(RuntimeErrorView),
     #[error("internal error")]

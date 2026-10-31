@@ -1,7 +1,65 @@
 use super::*;
+use crate::ids::LoadId;
 use crate::presentation::{ToolArgumentsPreviewState, ToolDisplay};
 use crate::sessions::{InputMode, QueueItem};
 use crate::tool_data::*;
+
+fn snapshot(
+    session_id: SessionId,
+    load: LoadId,
+    loop_id: LoopId,
+    input: QueueItem,
+    interaction_id: InteractionId,
+) -> SessionSnapshot {
+    SessionSnapshot {
+        session_id,
+        load,
+        revision: 3,
+        execution: crate::sessions::SessionExecution::Running {
+            loop_id,
+            input: input.clone(),
+            request_index: 1,
+            phase: LoopStatusView::RunningModel,
+        },
+        pending_interaction: Some(crate::sessions::SnapshotInteraction {
+            loop_id,
+            request_index: 1,
+            interaction: PendingInteractionView {
+                interaction_id,
+                tool_call_id: ToolCallId::new("call_1").unwrap(),
+                tool_name: "read".into(),
+                kind: InteractionKindView::Approval {
+                    prompt: "Allow read?".into(),
+                    risk: ApprovalRiskView::Low,
+                },
+            },
+        }),
+        queue: Queue {
+            items: vec![input],
+            paused: false,
+        },
+        compaction: None,
+        block_reason: None,
+        completions: crate::sessions::CompletionWindow {
+            through_seq: 2,
+            retained_from_seq: 2,
+            entries: vec![crate::sessions::CompletionEntry {
+                seq: 2,
+                loop_id,
+                input_id: Some("inp_00000000000000000000000000000004".into()),
+                completion_kind: crate::sessions::CompletionKind::Reported,
+                outcome_kind: Some(crate::sessions::CompletionOutcome::Completed),
+                persistence: Some(TurnPersistence::Persisted),
+                persistence_uncertain: false,
+                availability: crate::sessions::ResultAvailability::Stored,
+                unavailable_reason: None,
+                next_loop_id: Some(loop_id),
+                after_saved_loop_id: None,
+            }],
+            truncated: true,
+        },
+    }
+}
 
 pub(super) fn events() -> Vec<AgentEvent> {
     let session_id = "ses_00000000000000000000000000000001".parse().unwrap();
@@ -12,8 +70,10 @@ pub(super) fn events() -> Vec<AgentEvent> {
         session_id,
         loop_id,
     };
+    let load = crate::test_support::snapshot_load_id();
     let meta = EventMeta {
         session_id,
+        load,
         loop_id: Some(loop_id),
         dropped_before: 7,
     };
@@ -212,6 +272,7 @@ pub(super) fn events() -> Vec<AgentEvent> {
                 id: steer.id.clone(),
                 text: steer.text.clone(),
                 accepted_at: steer.accepted_at.clone(),
+                request_index: 1,
             }],
             meta,
         },
@@ -231,6 +292,10 @@ pub(super) fn events() -> Vec<AgentEvent> {
         AgentEvent::InteractionResolved {
             turn,
             interaction_id,
+            meta,
+        },
+        AgentEvent::SessionSnapshot {
+            snapshot: snapshot(session_id, load, loop_id, steer.clone(), interaction_id),
             meta,
         },
         AgentEvent::TurnFinished {

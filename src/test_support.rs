@@ -141,3 +141,13 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// A fresh load identity for fixtures that build a `Presentation` directly.
+pub(crate) fn load_id() -> crate::ids::LoadId {
+    crate::ids::LoadId::new().expect("load identity")
+}
+
+/// The fixed load identity used by byte-exact event snapshots.
+pub(crate) fn snapshot_load_id() -> crate::ids::LoadId {
+    "load_0000000000000000000000000000000a".parse().unwrap()
+}

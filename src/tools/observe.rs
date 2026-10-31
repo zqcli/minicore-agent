@@ -27,6 +27,7 @@ pub(crate) struct RequestKey {
 /// registry. Command ownership remains explicitly Session-owned.
 pub(crate) struct ToolObserver {
     session_id: SessionId,
+    load: crate::ids::LoadId,
     tool_data: Arc<ToolData>,
     events: AgentEventSink,
     inner: Mutex<Option<RequestKey>>,
@@ -42,6 +43,7 @@ impl ToolObserver {
     fn meta(&self, loop_id: LoopId) -> EventMeta {
         EventMeta {
             session_id: self.session_id,
+            load: self.load,
             loop_id: Some(loop_id),
             dropped_before: 0,
         }
@@ -49,11 +51,13 @@ impl ToolObserver {
 
     pub(crate) fn new(
         session_id: SessionId,
+        load: crate::ids::LoadId,
         tool_data: Arc<ToolData>,
         events: AgentEventSink,
     ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
+            load,
             tool_data,
             events,
             inner: Mutex::new(None),

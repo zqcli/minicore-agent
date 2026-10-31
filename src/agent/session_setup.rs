@@ -27,15 +27,22 @@ impl ExecutionConfigFactory<'_> {
         compaction: Arc<CompactionState>,
         events: &AgentEventSink,
     ) -> Result<SessionSetup, AgentError> {
+        let load = crate::ids::LoadId::new().map_err(|_| AgentError::Internal)?;
         let presentation = crate::presentation::Presentation::new(
             record.session_id,
+            load,
             events.clone(),
             Arc::clone(&compaction),
         );
         presentation.set_model_label(record.model.clone());
         let tool_data = Arc::new(ToolData::new());
         let tool_owners = ToolOwners::new();
-        let observer = ToolObserver::new(record.session_id, Arc::clone(&tool_data), events.clone());
+        let observer = ToolObserver::new(
+            record.session_id,
+            load,
+            Arc::clone(&tool_data),
+            events.clone(),
+        );
         let parts = SessionParts {
             presentation,
             observer,
@@ -44,6 +51,7 @@ impl ExecutionConfigFactory<'_> {
         };
         let (config, auto) = self.build(record, workspace, &parts)?;
         Ok(SessionSetup {
+            load,
             parts,
             tool_data,
             config,
@@ -140,6 +148,7 @@ pub(crate) struct SessionParts {
 }
 
 pub(crate) struct SessionSetup {
+    pub(crate) load: crate::ids::LoadId,
     pub(crate) parts: SessionParts,
     pub(crate) tool_data: Arc<ToolData>,
     pub(crate) config: ExecutionConfig,

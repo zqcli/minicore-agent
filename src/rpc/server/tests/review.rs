@@ -53,10 +53,12 @@ fn assert_busy(dispatch: Dispatch) {
     let Dispatch::Response(response) = dispatch else {
         panic!("conflicting operation was admitted");
     };
-    assert_eq!(
-        response.json()["error"]["data"],
-        json!({"kind":"session_busy", "retryable":true})
-    );
+    let response = response.json();
+    assert_eq!(response["error"]["data"]["kind"], "session_busy");
+    assert_eq!(response["error"]["data"]["retryable"], true);
+    if let Some(acceptance) = response["error"]["data"].get("acceptance") {
+        assert_eq!(acceptance, "rejected");
+    }
 }
 
 fn write_config(base: &Path, revision: u64) {
@@ -293,13 +295,18 @@ async fn reload_excludes_open_create_and_send_in_both_directions() {
     for method in ["session.open", "session.create", "input.push"] {
         let (mut agent, base, workspace) = reload_agent().await;
         let session = create(&mut agent, &workspace).await;
+        let load = agent
+            .loaded_session(session.session_id)
+            .unwrap()
+            .load()
+            .to_string();
         if method == "session.open" {
             agent.close_session(session.session_id).await.unwrap();
         }
         let params = match method {
             "session.create" => json!({"workspace":workspace,"profile":"test"}),
             "input.push" => {
-                json!({"session_id":session.session_id,"mode": "steer", "text":"hello"})
+                json!({"session_id":session.session_id,"load":load,"mode": "steer", "text":"hello"})
             }
             _ => json!({"session_id":session.session_id}),
         };
@@ -468,8 +475,17 @@ async fn deferred_open_publishes_its_index_only_when_installed() {
                 let response = output.recv().await.unwrap().json();
                 assert_eq!(response["result"]["session"]["loaded"], true);
                 assert!(store.has_history_index(id));
+                let load = server
+                    .agent()
+                    .loaded_session(id)
+                    .unwrap()
+                    .load()
+                    .to_string();
                 assert!(matches!(
-                    server.dispatch(request("session.close", json!({"session_id":id}))),
+                    server.dispatch(request(
+                        "session.close",
+                        json!({"session_id":id,"load":load})
+                    )),
                     Dispatch::Deferred
                 ));
                 assert_eq!(
@@ -546,6 +562,69 @@ async fn shutdown_drains_pending_open_create_and_reload_before_its_response() {
             assert!(!store.has_history_index(id.as_str().unwrap().parse().unwrap()));
         }
     }
+}
+
+#[tokio::test]
+async fn an_admitted_snapshot_is_sampled_before_close_can_seal_and_reopen_its_load() {
+    let mut fixture = RpcFixture::new(
+        "snapshot-admission",
+        [Step::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
+    let mut harness = RpcHarness::spawn(agent);
+    let (session, load) = w0_create_session(&mut harness, &workspace).await;
+    let pushed = harness
+        .call_ok(
+            "input.push",
+            w0_params(
+                json!({"session_id":session,"mode":"steer","text":"first"}),
+                load.as_ref(),
+            ),
+        )
+        .await;
+    harness
+        .call_ok(
+            "turn.wait",
+            Some(turn_params(&pushed["result"]["started"]["turn"])),
+        )
+        .await;
+    let gate = Arc::new(Gate::new());
+    let _release = ReleaseGate(gate.clone());
+    super::super::SNAPSHOT_REPLY_GATES
+        .arm(session.as_str().unwrap().parse().unwrap(), gate.clone());
+    harness
+        .send(
+            json!("held-snapshot"),
+            "session.state",
+            Some(json!({"session_id":session})),
+        )
+        .await;
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .unwrap();
+    harness
+        .call_ok(
+            "session.close",
+            w0_params(json!({"session_id":session}), load.as_ref()),
+        )
+        .await;
+    let reopened = harness
+        .call_ok("session.open", Some(json!({"session_id":session})))
+        .await;
+    assert_ne!(reopened["result"]["load"], load.clone().unwrap());
+    gate.release();
+    let held = harness.response(json!("held-snapshot")).await;
+    assert!(held.get("error").is_none(), "{held}");
+    assert_eq!(held["result"]["snapshot"]["load"], load.unwrap());
+    assert_eq!(held["result"]["snapshot"]["completions"]["through_seq"], 1);
+    assert_eq!(
+        reopened["result"]["snapshot"]["completions"]["through_seq"],
+        0
+    );
+    harness.shutdown().await;
 }
 
 #[tokio::test]

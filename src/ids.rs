@@ -7,7 +7,7 @@ use thiserror::Error;
 
 const SESSION_ID_PREFIX: &str = "ses_";
 
-/// Errors creating or parsing an agent-owned [`SessionId`].
+/// Errors creating or parsing an agent-owned [`SessionId`] or [`LoadId`].
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SessionIdError {
     #[error("session ID has an invalid prefix")]
@@ -109,6 +109,91 @@ impl Serialize for SessionId {
 }
 
 impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(D::Error::custom)
+    }
+}
+
+const LOAD_ID_PREFIX: &str = "load_";
+
+/// Identity of one loaded Session instance; never reused after a reopen.
+///
+/// Rendered as `load_<32 lower-case hex>`. Only equality and display matter:
+/// clients carry it opaquely and never derive control order from it.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LoadId([u8; 16]);
+
+impl LoadId {
+    pub fn new() -> Result<Self, SessionIdError> {
+        loop {
+            let mut bytes = [0; 16];
+            getrandom::fill(&mut bytes).map_err(|_| SessionIdError::EntropyUnavailable)?;
+            if bytes.iter().any(|byte| *byte != 0) {
+                return Ok(Self(bytes));
+            }
+        }
+    }
+}
+
+impl FromStr for LoadId {
+    type Err = SessionIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let payload = value
+            .strip_prefix(LOAD_ID_PREFIX)
+            .ok_or(SessionIdError::InvalidPrefix)?;
+        if payload.len() != 32 {
+            return Err(SessionIdError::InvalidLength);
+        }
+        let mut bytes = [0; 16];
+        for (index, [high, low]) in payload.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let high = decode_lower_hex(*high).ok_or(SessionIdError::InvalidHex)?;
+            let low = decode_lower_hex(*low).ok_or(SessionIdError::InvalidHex)?;
+            bytes[index] = (high << 4) | low;
+        }
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(SessionIdError::ZeroPayload);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+fn encode_load_id(bytes: &[u8; 16]) -> String {
+    let mut value = String::with_capacity(LOAD_ID_PREFIX.len() + 32);
+    value.push_str(LOAD_ID_PREFIX);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    value
+}
+
+impl fmt::Display for LoadId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&encode_load_id(&self.0))
+    }
+}
+
+impl fmt::Debug for LoadId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl Serialize for LoadId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&encode_load_id(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for LoadId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,

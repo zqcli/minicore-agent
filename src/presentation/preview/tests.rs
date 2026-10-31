@@ -87,6 +87,7 @@ fn fixture(capacity: usize) -> (PreviewObserver, AgentEventStream) {
     let (sink, receiver) = AgentEventSink::channel(capacity);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
+        crate::test_support::load_id(),
         sink,
         crate::compaction::CompactionState::new(),
     );

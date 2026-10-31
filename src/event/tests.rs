@@ -28,7 +28,7 @@ async fn streaming_pressure_cannot_displace_lifecycle_and_drops_follow_delivery(
         request_index: 1,
         channel: OutputChannel::Text,
         delta: "text".into(),
-        meta: EventMeta::for_turn(turn),
+        meta: EventMeta::for_turn(turn, crate::test_support::load_id()),
     };
     assert_eq!(sink.try_send(delta()), AgentSendResult::Sent);
     assert_eq!(sink.try_send(delta()), AgentSendResult::Dropped);
@@ -40,7 +40,7 @@ async fn streaming_pressure_cannot_displace_lifecycle_and_drops_follow_delivery(
             persistence: TurnPersistence::Persisted,
             next: None,
             queue: crate::sessions::Queue::default(),
-            meta: EventMeta::for_turn(turn)
+            meta: EventMeta::for_turn(turn, crate::test_support::load_id())
         }),
         AgentSendResult::Sent
     );
@@ -82,7 +82,7 @@ fn process_output_chunks_stream_while_command_state_stays_lifecycle() {
             }),
             command: None,
         },
-        meta: EventMeta::session(session_id),
+        meta: EventMeta::session(session_id, crate::test_support::load_id()),
     };
     assert!(process(false).is_lifecycle());
     assert!(!process(true).is_lifecycle());
@@ -94,7 +94,7 @@ async fn lifecycle_capacity_is_bounded_and_both_lanes_drain_on_close() {
     let session_id = SessionId::new().unwrap();
     let event = || AgentEvent::SessionClosed {
         session_id,
-        meta: EventMeta::session(session_id),
+        meta: EventMeta::session(session_id, crate::test_support::load_id()),
     };
     for _ in 0..64 {
         assert_eq!(sink.try_send(event()), AgentSendResult::Sent);

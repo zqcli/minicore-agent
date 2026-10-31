@@ -21,6 +21,38 @@ processes. Keep it small: bounded memory over long sessions, little CPU while
 waiting, and nothing per core that a single client does not need (the binary
 runs Tokio on two workers).
 
+## Control And Result Ownership
+
+The current source is the 0.9.1 development package and serves Agent RPC v2
+inside JSON-RPC 2.0. Formal dependency tags are unchanged until a real release
+is authorized; isolated development builds may link the approved Runtime source.
+
+- `Session::sample` is the only control sampler: load/revision, execution,
+  interaction, queue, compaction, block reason, and the complete retained
+  completion suffix form one observation. Its lock order is publication gate,
+  `inner`, `queue`, then catalog. Runtime state is read once.
+- `sessions/hub.rs` owns one dirty mark per registered load and fair batches of
+  at most 16. Execution paths only mark; snapshots use a reliable event lane,
+  not lifecycle `try_send`. Reserve capacity before sampling and retain the
+  charge through encoding, outbound queues, and writer flush. Close publishes
+  its final joined state before unregistering the load.
+- `sessions/results.rs` owns both completion suffixes and immutable unsaved
+  sources. Eviction dirties affected loads without acquiring their business
+  locks. A held page keeps source bytes/counts charged until its last reference
+  is released; removing a catalog entry is not memory release.
+- `sessions/boundary.rs` observes prompt preparations and issued model requests.
+  Rewrap every active config replacement; a take before the next prompt after
+  tools belongs to the next request, not the last prepared request.
+- RPC loaded-instance mutations validate and capture the exact Session/load
+  before any side effect. A push accepted before startup failure still succeeds
+  with `accepted` and `start_error`; transport ambiguity is not rejection.
+- Pending/unavailable result pages are not empty completed results. Unknown
+  append status remains blocked/uncertain until reopen, including after catalog
+  eviction. Keep existing wait/report APIs and on-disk formats.
+
+Budget defaults and the legal maximum combination are documented in
+`docs/rpc.md`; small-budget and gate regressions accompany changes to them.
+
 ## Repository Map
 
 | Path | Responsibility |

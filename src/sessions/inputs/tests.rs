@@ -1,4 +1,5 @@
 use super::*;
+use crate::sessions::boundary::RequestBoundary;
 use crate::test_support::TempDir;
 
 /// A loaded Session whose queue pretends a turn runs, so pushes only queue.
@@ -48,7 +49,12 @@ fn texts(queue: &Queue) -> Vec<&str> {
 }
 
 fn inputs(session: &Session, generation: u64) -> SessionInputs {
-    SessionInputs::new(session.clone(), session.presentation(), generation)
+    SessionInputs::new(
+        session.clone(),
+        session.presentation(),
+        generation,
+        RequestBoundary::new(),
+    )
 }
 
 fn taken(inputs: &[UserInput]) -> Vec<&str> {

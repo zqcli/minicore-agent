@@ -44,6 +44,9 @@ pub(crate) const CONTEXT_UNCOMPRESSIBLE: i32 = -32_022;
 pub(crate) const CONFIG_ERROR: i32 = -32_023;
 pub(crate) const INPUT_QUEUE_FULL: i32 = -32_024;
 pub(crate) const INPUT_NOT_QUEUED: i32 = -32_025;
+pub(crate) const MISSING_LOAD: i32 = -32_026;
+pub(crate) const STALE_LOAD: i32 = -32_027;
+pub(crate) const STALE_RESULT: i32 = -32_028;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RpcRequest {
@@ -162,6 +165,10 @@ pub(crate) struct TurnResultParams {
     pub(crate) session_id: crate::ids::SessionId,
     pub(crate) loop_id: LoopId,
     #[serde(default)]
+    pub(crate) load: Option<String>,
+    #[serde(default)]
+    pub(crate) result_id: Option<String>,
+    #[serde(default)]
     pub(crate) cursor: Option<ReadCursor>,
     #[serde(default = "default_history_limit")]
     pub(crate) limit: usize,
@@ -176,6 +183,8 @@ impl From<TurnResultParams> for TurnResultRequest {
                 session_id: value.session_id,
                 loop_id: value.loop_id,
             },
+            load: value.load,
+            result_id: value.result_id,
             cursor: value.cursor,
             limit: value.limit,
             max_bytes: value.max_bytes,
@@ -321,6 +330,17 @@ pub(crate) struct SessionsResult {
 #[derive(Serialize)]
 pub(crate) struct SessionResult {
     pub(crate) session: SessionInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot: Option<crate::sessions::SessionSnapshot>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SessionStateResult {
+    #[serde(flatten)]
+    pub(crate) state: crate::event::SessionStateView,
+    pub(crate) snapshot: crate::sessions::SessionSnapshot,
 }
 
 #[derive(Serialize)]
@@ -372,7 +392,7 @@ impl OkResult {
 }
 
 /// A complete pre-encoded JSON-RPC response frame, serialized exactly once.
-pub(crate) struct RpcResponse(Vec<u8>);
+pub(crate) struct RpcResponse(Vec<u8>, Option<crate::sessions::hub::SnapshotCharge>, bool);
 
 #[derive(Serialize)]
 pub(crate) struct RpcError {
@@ -388,6 +408,19 @@ pub(crate) struct RpcErrorData {
 }
 
 impl RpcResponse {
+    pub(crate) fn notification(
+        event: AgentEventNotification,
+        charge: crate::sessions::hub::SnapshotCharge,
+    ) -> Result<Self, crate::AgentError> {
+        let bytes =
+            crate::budget::encode_json(&event).map_err(|_| crate::AgentError::RpcSerialization)?;
+        if bytes.len() + 1 > crate::rpc::MAX_RPC_FRAME_BYTES {
+            return Err(crate::AgentError::Internal);
+        }
+        drop(event);
+        Ok(Self(bytes, None, false).charged(charge))
+    }
+
     pub(crate) fn success<T: Serialize>(id: RpcId, result: T) -> Result<Self, serde_json::Error> {
         #[derive(Serialize)]
         struct Success<T> {
@@ -400,11 +433,61 @@ impl RpcResponse {
             id,
             result,
         })
-        .map(Self)
+        .map(|bytes| Self(bytes, None, false))
+    }
+
+    pub(crate) fn charged(mut self, mut charge: crate::sessions::hub::SnapshotCharge) -> Self {
+        charge.shrink(self.0.capacity() + 1 + crate::rpc::WRITER_BUFFER_BYTES);
+        self.1 = Some(charge);
+        self
+    }
+
+    pub(crate) fn snapshot_success<T: Serialize>(
+        id: RpcId,
+        result: T,
+    ) -> Result<Self, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Success<T> {
+            jsonrpc: &'static str,
+            id: RpcId,
+            result: T,
+        }
+        crate::budget::encode_json(&Success {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result,
+        })
+        .map(|bytes| Self(bytes, None, false))
+    }
+
+    pub(crate) fn is_charged(&self) -> bool {
+        self.1.is_some()
     }
 
     pub(crate) fn encoded(&self) -> &[u8] {
         &self.0
+    }
+
+    pub(crate) fn is_error(&self) -> bool {
+        self.2
+    }
+
+    pub(crate) fn rejected_input(self) -> Self {
+        self.classify_input_error("rejected")
+    }
+
+    pub(crate) fn unknown_input(self) -> Self {
+        self.classify_input_error("unknown")
+    }
+
+    fn classify_input_error(self, acceptance: &'static str) -> Self {
+        let mut value: Value = serde_json::from_slice(&self.0).expect("encoded RPC error");
+        value["error"]["data"]["acceptance"] = Value::String(acceptance.to_owned());
+        Self(
+            serde_json::to_vec(&value).expect("RPC error is serializable"),
+            self.1,
+            true,
+        )
     }
 
     pub(crate) fn error(
@@ -431,6 +514,8 @@ impl RpcResponse {
                 },
             })
             .expect("RPC errors contain only JSON scalars"),
+            None,
+            true,
         )
     }
 }
@@ -438,6 +523,7 @@ impl RpcResponse {
 pub(crate) enum RpcOutbound {
     Response(RpcResponse),
     Event(Box<AgentEventNotification>),
+    Failed,
 }
 
 #[cfg(test)]
@@ -446,6 +532,7 @@ impl RpcOutbound {
         match self {
             Self::Response(response) => response.json(),
             Self::Event(event) => serde_json::to_value(event).unwrap(),
+            Self::Failed => panic!("control publication failed"),
         }
     }
 }

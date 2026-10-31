@@ -92,6 +92,7 @@ pub(super) struct PresentationInner {
 pub(crate) struct Presentation {
     pub(super) preview_attempt: AtomicU64,
     pub(super) session_id: SessionId,
+    pub(super) load: crate::ids::LoadId,
     pub(super) events: AgentEventSink,
     pub(super) compaction: Arc<crate::compaction::CompactionState>,
     inner: Mutex<PresentationInner>,
@@ -100,12 +101,14 @@ pub(crate) struct Presentation {
 impl Presentation {
     pub(crate) fn new(
         session_id: SessionId,
+        load: crate::ids::LoadId,
         events: AgentEventSink,
         compaction: Arc<crate::compaction::CompactionState>,
     ) -> Arc<Self> {
         Arc::new(Self {
             preview_attempt: AtomicU64::new(0),
             session_id,
+            load,
             events,
             compaction,
             inner: Mutex::new(PresentationInner::default()),
@@ -166,7 +169,7 @@ impl Presentation {
                 turn,
                 request_index: key.request_index,
                 usage,
-                meta: EventMeta::for_turn(turn),
+                meta: EventMeta::for_turn(turn, self.load),
             }
         };
         let _ = self.events.try_send(event);
@@ -385,7 +388,7 @@ impl Presentation {
             tool_call_id: tool_call_id.clone(),
             tool_name,
             display,
-            meta: EventMeta::for_turn(turn),
+            meta: EventMeta::for_turn(turn, self.load),
         });
     }
 

@@ -298,6 +298,8 @@ async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summa
     let stored_page = stored_turn_page(
         turn,
         stored,
+        None,
+        None,
         ReadCursor::start(),
         100,
         4096,
@@ -333,6 +335,8 @@ async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summa
     let live_page = live_turn_page(
         turn,
         live,
+        None,
+        None,
         ReadCursor::start(),
         100,
         4096,
@@ -407,6 +411,8 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
         let live_page = live_turn_page(
             turn,
             live,
+            None,
+            None,
             ReadCursor::start(),
             100,
             4096,
@@ -418,6 +424,8 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
         let stored_page = stored_turn_page(
             turn,
             stored,
+            None,
+            None,
             ReadCursor::start(),
             100,
             4096,
@@ -454,7 +462,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
 
 #[tokio::test]
 async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
-    const MAX_BYTES: usize = 512;
+    const MAX_BYTES: usize = 1024;
     const COMPLETED_AT: &str = "2026-01-02T03:04:05.000Z";
 
     let loop_id = LoopId::new().unwrap();
@@ -537,6 +545,8 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
                     live_turn_page(
                         turn,
                         Arc::clone(&live),
+                        None,
+                        None,
                         cursor,
                         100,
                         MAX_BYTES,
@@ -549,6 +559,8 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
                     stored_turn_page(
                         turn,
                         stored.clone(),
+                        None,
+                        None,
                         cursor,
                         100,
                         MAX_BYTES,
@@ -619,4 +631,315 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn stored_pages_preserve_failed_cancelled_and_unknown_outcomes_even_when_empty() {
+    let loop_id = LoopId::new().unwrap();
+    let turn = TurnRef {
+        session_id: SessionId::new().unwrap(),
+        loop_id,
+    };
+    let cancellation = CancellationToken::new();
+    for outcome in [
+        LoopOutcomeView::Unknown,
+        LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User,
+        },
+        LoopOutcomeView::Failed {
+            kind: "test_failure".into(),
+            model_error: None,
+        },
+    ] {
+        let record = StoredLoopRecord {
+            loop_id,
+            outcome: outcome.clone(),
+            items: Vec::new(),
+            usage: Usage::default(),
+            requests: 0,
+            tool_rounds: 0,
+            final_config_revision: ConfigRevision::INITIAL,
+            completed_at: "2026-10-31T00:00:00Z".into(),
+            user_times: None,
+            interrupted: None,
+        };
+        let page = stored_turn_page(
+            turn,
+            record,
+            None,
+            None,
+            ReadCursor::start(),
+            100,
+            4096,
+            &cancellation,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.outcome, Some(outcome));
+        assert_eq!(page.persistence, Some(TurnPersistence::Persisted));
+        assert_eq!(page.availability, TurnResultAvailability::Stored);
+        assert!(page.result_id.is_some());
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, 0);
+        assert_eq!(page.next_cursor, None);
+    }
+}
+
+#[test]
+fn exact_source_reservation_admits_a_result_at_the_small_byte_limit() {
+    let loop_id = LoopId::new().unwrap();
+    let turn = TurnRef {
+        session_id: SessionId::new().unwrap(),
+        loop_id,
+    };
+    let items = vec![user_item(loop_id, &"\u{1}".repeat(8192))];
+    let metadata = crate::event::TurnResultView {
+        turn,
+        outcome: LoopOutcomeView::Completed,
+        usage: Usage::default(),
+        requests: 1,
+        tool_rounds: 0,
+        final_config_revision: ConfigRevision::INITIAL,
+        persistence: TurnPersistence::Failed,
+    };
+    let bytes = result_source_upper_bound(&items, None, &metadata).unwrap();
+    let catalog = crate::sessions::ResultCatalog::new();
+    catalog.set_limits_for_test(crate::sessions::results::ResultLimits {
+        source_bytes_per_load: bytes,
+        all_source_bytes: bytes,
+        ..Default::default()
+    });
+    let load = crate::test_support::load_id();
+    catalog.register(load);
+    let charge = catalog.reserve(load, bytes).unwrap();
+    let source = prepare_bounded_result_source(&items, None, metadata, &catalog)
+        .unwrap()
+        .unwrap();
+    let canonical = prepare_result_source(&items, None).unwrap();
+    assert_eq!(source.result_id, canonical.result_id);
+    assert_eq!(source.items, canonical.items);
+    let reservation = catalog.finish_reservation(source, charge).unwrap();
+    assert!(matches!(
+        catalog.reserve(load, 1),
+        Err(crate::sessions::UnavailableReason::ResourceLimit)
+    ));
+    drop(reservation);
+    assert!(catalog.reserve(load, bytes).is_ok());
+}
+
+#[test]
+fn source_admission_counts_metadata_string_capacity_not_just_encoded_length() {
+    let loop_id = LoopId::new().unwrap();
+    let items = vec![user_item(loop_id, "question")];
+    let mut metadata = crate::event::TurnResultView {
+        turn: TurnRef {
+            session_id: SessionId::new().unwrap(),
+            loop_id,
+        },
+        outcome: LoopOutcomeView::Completed,
+        usage: Usage::default(),
+        requests: 1,
+        tool_rounds: 0,
+        final_config_revision: ConfigRevision::INITIAL,
+        persistence: TurnPersistence::Failed,
+    };
+    let base = result_source_upper_bound(&items, None, &metadata).unwrap();
+    let mut kind = String::with_capacity(4096);
+    kind.push_str("failed");
+    metadata.outcome = LoopOutcomeView::Failed {
+        kind,
+        model_error: None,
+    };
+    let catalog = crate::sessions::ResultCatalog::new();
+    catalog.set_limits_for_test(crate::sessions::results::ResultLimits {
+        source_bytes_per_load: base + 1024,
+        ..Default::default()
+    });
+    assert!(matches!(
+        prepare_bounded_result_source(&items, None, metadata, &catalog).unwrap(),
+        Err(crate::sessions::UnavailableReason::TooLarge)
+    ));
+}
+
+#[tokio::test]
+async fn borrowed_result_ranges_match_canonical_cleanup_including_opaque_reasoning() {
+    use minicore_runtime::history::{AssistantHistory, ToolResultHistory};
+    use minicore_runtime::model::{
+        AssistantPart, ModelFinishReason, ReasoningContent, ReasoningPreference, ToolCall,
+    };
+    let loop_id = LoopId::new().unwrap();
+    let call_id = minicore_runtime::ToolCallId::new("result-call").unwrap();
+    let opaque = ReasoningContent::new(None, None, Some("private".into()), None).unwrap();
+    let assistant = AssistantHistory {
+        loop_id,
+        request_index: 0,
+        model: "main".parse().unwrap(),
+        reasoning: ReasoningPreference::Auto,
+        content: vec![
+            AssistantPart::Reasoning(opaque.clone()),
+            AssistantPart::Text("answer".into()),
+            AssistantPart::Reasoning(
+                ReasoningContent::new(
+                    Some("visible".into()),
+                    Some("summary".into()),
+                    Some("private".into()),
+                    Some("signature".into()),
+                )
+                .unwrap(),
+            ),
+            AssistantPart::ToolCall(
+                ToolCall::new(
+                    call_id.clone(),
+                    "read".parse().unwrap(),
+                    serde_json::json!({"path":"file.txt"}),
+                    0,
+                )
+                .unwrap(),
+            ),
+        ],
+        provider_replay: None,
+        finish_reason: ModelFinishReason::ToolCalls,
+        usage: Usage::new(1, 2, 0),
+    };
+    let items = vec![
+        user_item(loop_id, "question"),
+        HistoryItem::Assistant(assistant.clone()),
+        HistoryItem::ToolResult(ToolResultHistory {
+            loop_id,
+            request_index: 0,
+            call_id,
+            tool_name: "read".parse().unwrap(),
+            outcome: minicore_runtime::tools::ToolResultOutcome::Success,
+            output: minicore_runtime::tools::ToolOutput::new("result").unwrap(),
+        }),
+        HistoryItem::Assistant(AssistantHistory {
+            content: vec![AssistantPart::Reasoning(opaque)],
+            ..assistant
+        }),
+    ];
+    let expected = prepare_result_source(&items, None).unwrap();
+    assert_eq!(expected.items.len(), 3);
+    let items: Arc<[HistoryItem]> = items.into();
+    for index in 0..expected.items.len() {
+        let page = prepare_turn_items(
+            Arc::clone(&items),
+            None,
+            ReadCursor {
+                item: index,
+                offset: 0,
+            },
+            1,
+            4096,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.total, expected.items.len());
+        assert_eq!(page.result_id, expected.result_id);
+        assert_eq!(page.encoded, [(index, expected.items[index].clone())]);
+        assert!(!page.encoded[0].1.contains("private"));
+        assert!(!page.encoded[0].1.contains("signature\":\""));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_long_result_readers_verify_every_page_and_stable_identity() {
+    async fn read(record: StoredLoopRecord, turn: TurnRef) -> (usize, u128, u128) {
+        let started = Instant::now();
+        let expected = prepare_result_source(&record.items, None).unwrap();
+        let mut reconstructed = vec![String::new(); expected.items.len()];
+        let mut cursor = ReadCursor::start();
+        let mut pages = 0;
+        let mut max_ms = 0;
+        loop {
+            let start = Instant::now();
+            let page = stored_turn_page(
+                turn,
+                record.clone(),
+                None,
+                Some(&expected.result_id),
+                cursor,
+                4,
+                MAX_READ_MAX_BYTES,
+                &CancellationToken::new(),
+                Instant::now() + READ_DEADLINE,
+            )
+            .await
+            .unwrap();
+            max_ms = max_ms.max(start.elapsed().as_millis());
+            assert_eq!(page.total, expected.items.len());
+            assert_eq!(page.result_id.as_deref(), Some(expected.result_id.as_str()));
+            assert!(encoded_len(&page) <= MAX_READ_MAX_BYTES);
+            for chunk in page.items {
+                assert_eq!(chunk.offset, reconstructed[chunk.index].len());
+                reconstructed[chunk.index].push_str(&chunk.data);
+                if chunk.complete {
+                    assert_eq!(reconstructed[chunk.index].len(), chunk.total_bytes);
+                }
+            }
+            pages += 1;
+            assert!(pages < 64);
+            match page.next_cursor {
+                Some(next) => {
+                    assert!((next.item, next.offset) > (cursor.item, cursor.offset));
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(reconstructed, expected.items);
+        (pages, started.elapsed().as_millis(), max_ms)
+    }
+    let loop_id = LoopId::new().unwrap();
+    let turn = TurnRef {
+        session_id: SessionId::new().unwrap(),
+        loop_id,
+    };
+    let record = StoredLoopRecord {
+        loop_id,
+        outcome: StoredLoopOutcome::Completed,
+        items: (0..32)
+            .map(|_| user_item(loop_id, &"x".repeat(256 * 1024)))
+            .collect(),
+        usage: Usage::default(),
+        requests: 1,
+        tool_rounds: 0,
+        final_config_revision: ConfigRevision::INITIAL,
+        completed_at: "2026-10-31T00:00:00Z".into(),
+        user_times: None,
+        interrupted: None,
+    };
+    let prefix = prepare_turn_items(
+        record.items.clone().into(),
+        None,
+        ReadCursor::start(),
+        100,
+        MAX_READ_MAX_BYTES,
+        CancellationToken::new(),
+        Instant::now() + READ_DEADLINE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(prefix.total, 32);
+    assert!(!prefix.encoded.is_empty() && prefix.encoded.len() <= 4);
+    assert!(
+        prefix
+            .encoded
+            .iter()
+            .map(|(_, item)| item.capacity())
+            .sum::<usize>()
+            < 2 * MAX_READ_MAX_BYTES
+    );
+    drop(prefix);
+    let (a, b) = tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::join!(read(record.clone(), turn), read(record, turn))
+    })
+    .await
+    .unwrap();
+    println!(
+        "two_result_readers bytes_per_turn=8388608 pages={}/{} total_ms={}/{} max_page_ms={}/{}",
+        a.0, b.0, a.1, b.1, a.2, b.2
+    );
 }

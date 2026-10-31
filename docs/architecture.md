@@ -99,18 +99,52 @@ provider-overflow recovery.
 - `agent/session_setup.rs` builds the Session's execution resources and persisted
   settings. Installation and index publication remain on the Agent.
 
-Lifecycle and streaming events have separate bounded queues. The event stream
-prioritizes lifecycle delivery and accounts for drops when dequeuing, so queue
-priority cannot duplicate or misplace drop counts. Loaded read snapshots share
+Reliable control, compatibility lifecycle, and streaming events have separate
+bounded lanes. Control is serviced before lifecycle and streaming data, while
+drop counts are attached only at dequeue. One publisher rotates dirty loads in
+batches of at most 16, removing a mark before sampling so a concurrent change
+remains pending. A reservation precedes every RPC/publisher snapshot sample;
+DTO copies, exact-capacity encoding, queued bytes, and the buffered writer tail
+stay charged until release. An impossible frame or a failed reliable lane ends
+the connection, rather than silently losing a control. Loaded read snapshots share
 immutable timestamp maps; writers copy only when a reader still holds a snapshot.
 
 ## Warm, Live, And Cold Data
 
 A loaded Session serves warm reads from its committed in-memory snapshots. A
-live `turn.result` may expose a retained completion report even when the Agent's
-history append failed; `persistence` tells the caller whether that append
-succeeded. Settled history is authoritative only after the Agent persistence
-step completes.
+live `turn.result` may expose a bounded normalized result after a failed append,
+independently of the current active loop. One Agent-wide catalog owns completion
+suffixes and these sources; in-flight page references keep their budget charge.
+Stored results use the actual durable interrupted projection. Result paging
+uses borrowed canonical serialization, streaming identity verification on
+blocking workers, and a page-sized encoded prefix, rather than cloning a whole
+normalized turn per page. Unsaved sources reuse already encoded immutable
+items; persisted sources are not kept as an additional long-lived body cache. Completion
+registration and successor installation share an observation boundary, while
+registered waiters retain their existing full-report API. Settled history is
+authoritative only after the Agent persistence step completes.
+
+Session create/open, `session.state`, and `session_snapshot` publication use
+one sampler and DTO, identified by session/load/revision. The publication gate
+precedes `inner`, queue, and catalog locks; Runtime state is read once for the
+execution and actionable interaction. Encoding, budget waits, filesystem work,
+and large result destruction occur outside those locks. Claim ownership is
+visible as `starting`, never as a missing queued input.
+
+Each installed loop owns a weak-Session Runtime watch observer. It marks the
+initial state immediately and stops on Agent completion/close, not sender
+closure. The driver and close barrier join it even if Runtime handles remain.
+Prompt and model wrappers track the preparation joined by delivered steers;
+active config replacements reinstall both wrappers. After tools, the take
+before the next prompt belongs to the next request index.
+
+Global catalog eviction marks every affected load without taking its business
+locks. Source charges include container/string capacities, metadata, and Arc
+ownership overhead; held page references prevent early budget reuse. Catalog
+allocation charges cover deque slack, and snapshot descriptor copies use the
+separate control budget. An expired source cannot be reconstructed from a
+late-wait/active report. An uncertain append remains uncertain until reopen,
+including after descriptor eviction and even if a complete record is readable.
 
 Cold Tool reads use the durable auxiliary record when the Session is unloaded or
 memory has evicted stream bytes. Missing or corrupt bytes make details unavailable
@@ -118,8 +152,18 @@ rather than substituting a nearby Tool call. Workspace queries require a loaded
 Session because their source is the Session's canonical Workspace. Workspace
 change diffs read fresh Git/worktree sides under their bounded worker contract.
 
-Events are notifications and may be dropped. `turn.wait`, `turn.result`,
-history queries, and explicit query results are the authoritative read paths.
+Body and compatibility events are disposable notifications; `session_snapshot`
+is the reliable current-control exception. `turn.wait`, `turn.result`, history
+queries, and explicit query results are the authoritative terminal/body paths.
+The result catalog, not the four-entry late-wait index, defines completion
+discovery and unsaved retention. Close publishes its joined final control before
+unregistering the load. Unregistration seals sampling under the publication
+gate before removing the catalog, so a late reader cannot publish a higher
+revision with a reset completion watermark. Dirty batches hold weak Session
+references, and samplers release Session resources before encoding. The event
+pump preserves charges through outbound
+encoding and writer flush; dropping an embedded Rust Agent stops its publisher,
+while orderly shutdown joins it.
 Explicit queries select warm or durable sources, register any Session/Store
 worker synchronously, and apply the same cancellation and absolute-deadline
 contract for the Rust API and RPC dispatcher.

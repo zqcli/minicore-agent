@@ -381,7 +381,7 @@ impl Session {
         let task = tokio::spawn(run_compaction(self.clone(), reservation));
         *join_slot = Some(task);
         drop(join_slot);
-        self.emit_state();
+        self.mark_dirty();
         Ok(receiver)
     }
 }
@@ -439,7 +439,7 @@ impl Session {
             }
             inner.blocked = Some(SessionBlockReason::Internal);
             drop(inner);
-            self.emit_state();
+            self.mark_dirty();
             return Err(AgentError::SessionBlocked);
         }
         let cleared = {
@@ -454,7 +454,7 @@ impl Session {
             same && inner.compaction_progress.take().is_some()
         };
         if cleared {
-            self.emit_state();
+            self.mark_dirty();
         }
         Ok(true)
     }
@@ -483,7 +483,7 @@ impl Session {
         let next = self.start_after_compaction();
         operation.publish(result, next);
         if should_emit {
-            self.emit_state();
+            self.mark_dirty();
         }
     }
 }
@@ -506,7 +506,7 @@ impl Session {
             }
         };
         if changed {
-            self.emit_state();
+            self.mark_dirty();
         }
     }
 }

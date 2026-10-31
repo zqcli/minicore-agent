@@ -9,6 +9,12 @@ pub(crate) struct HistoryLine {
     usage: crate::read::CoveredUsage,
 }
 
+impl HistoryLine {
+    pub(crate) fn last_loop_id(&self) -> Option<LoopId> {
+        self.usage.last_loop_id
+    }
+}
+
 fn index_line(
     index: &mut Vec<HistoryLine>,
     bytes: &[u8],
@@ -261,7 +267,7 @@ impl Store {
         &self,
         session_id: SessionId,
         record: &StoredLoopRecord,
-    ) -> Result<(), AppendError> {
+    ) -> Result<bool, AppendError> {
         let (path, previous_len) = self.require_history_file(session_id).await?;
         // Keep legacy raw record bytes unchanged. New replay-bearing records
         // must pass durable admission before any append is attempted.
@@ -285,9 +291,9 @@ impl Store {
             serde_json::to_vec(&normalized)
         }
         .map_err(corrupt)?;
-        if bytes.len() > MAX_LOOP_RECORD_BYTES
-            && (record.user_times.is_some() || record.interrupted.is_some())
-        {
+        let shed_metadata = bytes.len() > MAX_LOOP_RECORD_BYTES
+            && (record.user_times.is_some() || record.interrupted.is_some());
+        if shed_metadata {
             // Presentation metadata must not make an otherwise storable core
             // loop record cross the single-line limit.
             let mut without_metadata = record.clone();
@@ -306,7 +312,8 @@ impl Store {
             .map_err(unavailable)?;
         #[cfg(test)]
         if let Some(rollback_fails) = APPEND_FAILURES.take(&session_id) {
-            return tests::fail_append(file, &path, &bytes, previous_len, rollback_fails).await;
+            tests::fail_append(file, &path, &bytes, previous_len, rollback_fails).await?;
+            unreachable!("injected append always fails");
         }
         let written = async {
             file.write_all(&bytes).await?;
@@ -321,7 +328,7 @@ impl Store {
         if let Some(index) = self.history_indexes.lock().unwrap().get_mut(&session_id) {
             index_line(index, &bytes, record, normalized_items.len());
         }
-        Ok(())
+        Ok(!shed_metadata)
     }
 
     #[allow(clippy::too_many_arguments)]

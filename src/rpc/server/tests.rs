@@ -9,6 +9,7 @@ mod inputs;
 mod review;
 mod session_read;
 mod sessions;
+mod snapshot_limits;
 #[cfg(unix)]
 mod status;
 mod tools;
@@ -23,7 +24,7 @@ pub(super) async fn pause_operation(key: PathBuf) {
 }
 
 use crate::test_support::{Gate, ScriptedModel, Step};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::pending;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -369,6 +370,9 @@ struct RpcHarness {
     events: Vec<Value>,
     observed: Vec<Value>,
     next_id: u64,
+    loads: HashMap<String, String>,
+    closes: HashMap<String, String>,
+    results: HashMap<(String, String), String>,
 }
 
 impl RpcHarness {
@@ -383,6 +387,7 @@ impl RpcHarness {
     where
         R: AsyncBufRead + Send + Unpin + 'static,
     {
+        let loads = agent.loaded_identities_for_test().into_iter().collect();
         let (server_output, client_output) = tokio::io::duplex(2 * 1024 * 1024);
         let task = tokio::spawn(run_with_io(
             agent,
@@ -398,6 +403,9 @@ impl RpcHarness {
             events: Vec::new(),
             observed: Vec::new(),
             next_id: 0,
+            loads,
+            closes: HashMap::new(),
+            results: HashMap::new(),
         }
     }
 
@@ -428,6 +436,63 @@ impl RpcHarness {
     }
 
     async fn send(&mut self, id: Value, method: &str, params: Option<Value>) {
+        self.send_inner(id, method, params, true).await;
+    }
+
+    async fn call_unmodified(&mut self, method: &str, params: Option<Value>) -> Value {
+        self.next_id += 1;
+        let id = json!(format!("rpc-call-{}", self.next_id));
+        self.send_inner(id.clone(), method, params, false).await;
+        self.response(id).await
+    }
+
+    async fn send_inner(
+        &mut self,
+        id: Value,
+        method: &str,
+        mut params: Option<Value>,
+        attach_load: bool,
+    ) {
+        let instance_mutation = matches!(
+            method,
+            "input.push"
+                | "input.remove"
+                | "input.recall"
+                | "input.resume"
+                | "turn.cancel"
+                | "interaction.answer"
+                | "session.close"
+                | "session.compact"
+                | "session.compact.cancel"
+                | "session.update"
+                | "session.rename"
+        );
+        if let Some(object) = params.as_mut().and_then(Value::as_object_mut)
+            && let Some(session) = object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        {
+            if attach_load
+                && (instance_mutation || method == "turn.result")
+                && !object.contains_key("load")
+                && let Some(load) = self.loads.get(&session)
+            {
+                object.insert("load".to_owned(), json!(load));
+            }
+            if attach_load
+                && method == "turn.result"
+                && object.get("cursor").is_some_and(|cursor| !cursor.is_null())
+                && !object.contains_key("result_id")
+                && let Some(loop_id) = object.get("loop_id").and_then(Value::as_str)
+                && let Some(result_id) = self.results.get(&(session.clone(), loop_id.to_owned()))
+            {
+                object.insert("result_id".to_owned(), json!(result_id));
+            }
+            if method == "session.close" {
+                self.closes.insert(id.to_string(), session);
+            }
+        }
         let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method});
         if let Some(params) = params {
             request["params"] = params;
@@ -492,6 +557,34 @@ impl RpcHarness {
         }
         assert!(line.ends_with('\n'));
         let value: Value = serde_json::from_str(&line).unwrap();
+        if let (Some(session), Some(load)) = (
+            value
+                .pointer("/result/session/session_id")
+                .and_then(Value::as_str),
+            value.pointer("/result/load").and_then(Value::as_str),
+        ) {
+            self.loads.insert(session.to_owned(), load.to_owned());
+        }
+        if let (Some(session), Some(loop_id), Some(result_id)) = (
+            value
+                .pointer("/result/turn/session_id")
+                .and_then(Value::as_str),
+            value
+                .pointer("/result/turn/loop_id")
+                .and_then(Value::as_str),
+            value.pointer("/result/result_id").and_then(Value::as_str),
+        ) {
+            self.results.insert(
+                (session.to_owned(), loop_id.to_owned()),
+                result_id.to_owned(),
+            );
+        }
+        if let Some(id) = value.get("id")
+            && let Some(session) = self.closes.remove(&id.to_string())
+            && value.pointer("/result/ok") == Some(&json!(true))
+        {
+            self.loads.remove(&session);
+        }
         self.observed.push(value.clone());
         Some(value)
     }
@@ -532,6 +625,39 @@ fn session_id(response: &Value) -> Value {
         .pointer("/result/session/session_id")
         .unwrap()
         .clone()
+}
+
+fn w0_load(response: &Value) -> Option<Value> {
+    response
+        .pointer("/result/snapshot/load")
+        .or_else(|| response.pointer("/result/load"))
+        .filter(|load| load.is_string())
+        .cloned()
+}
+
+fn w0_params(mut params: Value, load: Option<&Value>) -> Option<Value> {
+    if let Some(load) = load {
+        params["load"] = load.clone();
+    }
+    Some(params)
+}
+
+async fn w0_create_session(harness: &mut RpcHarness, workspace: &Path) -> (Value, Option<Value>) {
+    let response = harness
+        .call_ok(
+            "session.create",
+            Some(json!({"workspace": workspace, "title": "rpc session"})),
+        )
+        .await;
+    (session_id(&response), w0_load(&response))
+}
+
+struct ReleaseGate(Arc<Gate>);
+
+impl Drop for ReleaseGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 /// The complete `resource_exhausted` error object, so a regression that only

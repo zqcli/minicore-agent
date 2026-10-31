@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -24,6 +24,9 @@ pub struct RpcProcess {
     events: Vec<Value>,
     observed: Vec<Value>,
     next_id: u64,
+    loads: HashMap<String, String>,
+    closes: HashMap<String, String>,
+    results: HashMap<(String, String), String>,
 }
 
 impl RpcProcess {
@@ -112,6 +115,9 @@ impl RpcProcess {
             events: Vec::new(),
             observed: Vec::new(),
             next_id: 0,
+            loads: HashMap::new(),
+            closes: HashMap::new(),
+            results: HashMap::new(),
         }
     }
 
@@ -135,7 +141,45 @@ impl RpcProcess {
         self.child.as_ref().expect("process already shut down").id()
     }
 
-    pub async fn send(&mut self, id: &str, method: &str, params: Value) {
+    pub async fn send(&mut self, id: &str, method: &str, mut params: Value) {
+        let instance_mutation = matches!(
+            method,
+            "input.push"
+                | "input.remove"
+                | "input.recall"
+                | "input.resume"
+                | "turn.cancel"
+                | "interaction.answer"
+                | "session.close"
+                | "session.compact"
+                | "session.compact.cancel"
+                | "session.update"
+                | "session.rename"
+        );
+        if let Some(object) = params.as_object_mut()
+            && let Some(session) = object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        {
+            if (instance_mutation || method == "turn.result")
+                && !object.contains_key("load")
+                && let Some(load) = self.loads.get(&session)
+            {
+                object.insert("load".to_owned(), json!(load));
+            }
+            if method == "turn.result"
+                && object.get("cursor").is_some_and(|cursor| !cursor.is_null())
+                && !object.contains_key("result_id")
+                && let Some(loop_id) = object.get("loop_id").and_then(Value::as_str)
+                && let Some(result_id) = self.results.get(&(session.clone(), loop_id.to_owned()))
+            {
+                object.insert("result_id".to_owned(), json!(result_id));
+            }
+            if method == "session.close" {
+                self.closes.insert(id.to_owned(), session);
+            }
+        }
         let mut frame = serde_json::to_vec(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -284,6 +328,34 @@ impl RpcProcess {
     fn store_line(&mut self, line: String) -> Value {
         assert!(line.ends_with('\n'), "line must be newline terminated");
         let frame: Value = serde_json::from_str(&line).unwrap();
+        if let (Some(session), Some(load)) = (
+            frame
+                .pointer("/result/session/session_id")
+                .and_then(Value::as_str),
+            frame.pointer("/result/load").and_then(Value::as_str),
+        ) {
+            self.loads.insert(session.to_owned(), load.to_owned());
+        }
+        if let (Some(session), Some(loop_id), Some(result_id)) = (
+            frame
+                .pointer("/result/turn/session_id")
+                .and_then(Value::as_str),
+            frame
+                .pointer("/result/turn/loop_id")
+                .and_then(Value::as_str),
+            frame.pointer("/result/result_id").and_then(Value::as_str),
+        ) {
+            self.results.insert(
+                (session.to_owned(), loop_id.to_owned()),
+                result_id.to_owned(),
+            );
+        }
+        if let Some(id) = frame.get("id").and_then(Value::as_str)
+            && let Some(session) = self.closes.remove(id)
+            && frame.pointer("/result/ok") == Some(&json!(true))
+        {
+            self.loads.remove(&session);
+        }
         self.observed.push(frame.clone());
         frame
     }

@@ -1,18 +1,33 @@
+use super::observer::StateObserver;
 use super::*;
 
 pub(super) struct ActiveLoop {
     pub(super) turn: TurnRef,
+    pub(super) input: QueueItem,
     pub(super) handle: LoopHandle,
     pub(super) completion: watch::Receiver<Option<TurnCompletion>>,
     pub(super) task: Arc<SessionTask>,
     pub(super) execution_summary: Option<BoundedText>,
     pub(super) execution_history: Arc<[HistoryItem]>,
+    pub(super) boundary: Arc<RequestBoundary>,
+    pub(super) generation: u64,
+    pub(super) _observer: StateObserver,
 }
 
 pub(crate) struct ExecutionInput {
     pub(crate) request: LoopRequest,
     pub(crate) options: LoopOptions,
     pub(crate) summary: Option<BoundedText>,
+}
+
+/// Everything a successor installation needs from the finished turn it
+/// replaces, so that installing the successor and publishing its predecessor's
+/// completion happen in one protected transition.
+pub(super) struct Successor<'a> {
+    pub(super) turn: TurnRef,
+    pub(super) task: &'a Arc<SessionTask>,
+    pub(super) completion: &'a mut CompletionGuard,
+    pub(super) publish: &'a mut dyn FnMut(&mut SessionInner, StartedTurn) -> Arc<TurnResult>,
 }
 
 /// Owns one Agent worker without taking its JoinHandle into a local across an
@@ -24,14 +39,14 @@ pub(super) struct SessionTask {
 }
 
 impl SessionTask {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             join: tokio::sync::Mutex::new(None),
         }
     }
 
     /// Stores the worker's handle; nothing else has seen this task yet.
-    fn set(&self, handle: JoinHandle<()>) {
+    pub(super) fn set(&self, handle: JoinHandle<()>) {
         *self.join.try_lock().expect("a fresh task is unshared") = Some(handle);
     }
 
@@ -42,14 +57,16 @@ impl SessionTask {
 
 pub(super) struct CompletionGuard {
     session: Session,
+    turn: TurnRef,
     sender: watch::Sender<Option<TurnCompletion>>,
     armed: bool,
 }
 
 impl CompletionGuard {
-    fn new(session: Session, sender: watch::Sender<Option<TurnCompletion>>) -> Self {
+    fn new(session: Session, turn: TurnRef, sender: watch::Sender<Option<TurnCompletion>>) -> Self {
         Self {
             session,
+            turn,
             sender,
             armed: true,
         }
@@ -59,16 +76,52 @@ impl CompletionGuard {
         if !self.armed {
             return;
         }
-        mark_internal(&self.session);
-        self.session.end_period_blocked();
-        self.sender.send_replace(Some(TurnCompletion::Internal));
-        self.session.emit_state();
+        let publication = self.session.shared.results.publication();
+        let (released, queue) = {
+            let mut inner = self.session.lock_inner();
+            inner.blocked = Some(SessionBlockReason::Internal);
+            let mut queue = self.session.lock_queue();
+            queue.paused |= !queue.items.is_empty();
+            queue.end_period();
+            let entry = CompletionEntry {
+                seq: 0,
+                loop_id: self.turn.loop_id,
+                input_id: inner
+                    .active
+                    .as_ref()
+                    .filter(|active| active.turn == self.turn)
+                    .map(|active| active.input.id.clone()),
+                completion_kind: CompletionKind::InternalError,
+                outcome_kind: None,
+                persistence: None,
+                persistence_uncertain: false,
+                availability: ResultAvailability::Unavailable,
+                unavailable_reason: Some(UnavailableReason::InternalError),
+                next_loop_id: None,
+                after_saved_loop_id: inner.last_saved,
+            };
+            let released = self
+                .session
+                .shared
+                .results
+                .insert(self.session.load(), entry, None);
+            self.sender.send_replace(Some(TurnCompletion::Internal));
+            (released, queue.view())
+        };
+        drop(publication);
+        drop(released);
+        self.session.shared.events.try_send(AgentEvent::InputQueue {
+            queue,
+            meta: EventMeta::session(self.session.session_id(), self.session.load()),
+        });
+        self.session.mark_dirty();
         self.armed = false;
     }
 
     pub(super) fn publish_finished(&mut self, result: Arc<TurnResult>) {
         self.sender
             .send_replace(Some(TurnCompletion::Finished(result)));
+        self.session.mark_dirty();
         self.armed = false;
     }
 }
@@ -122,6 +175,17 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
         events,
         mut completion,
     } = run;
+    let observer = {
+        let inner = session.lock_inner();
+        Arc::clone(
+            &inner
+                .active
+                .as_ref()
+                .expect("installed loop")
+                ._observer
+                .task,
+        )
+    };
     let _ephemeral_cleanup = EphemeralSummaryCleanup {
         state: Arc::clone(&session.shared.compaction),
         loop_id: turn.loop_id,
@@ -145,7 +209,8 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
         }
     };
     let stored = reconcile_report(session, turn, &report, &sanitized);
-    let persistence = persist_report(session, turn, &stored, &sanitized).await;
+    let (persistence, uncertain, persisted_interrupted) =
+        persist_report(session, turn, &stored, &sanitized).await;
     let eligible = persistence == TurnPersistence::Persisted
         && report.outcome == minicore_runtime::LoopOutcome::Completed;
     let result = |next| {
@@ -153,15 +218,71 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
             turn,
             report: Arc::clone(&report),
             persistence,
-            interrupted: stored.interrupted.clone(),
+            interrupted: persisted_interrupted.clone(),
             next,
         })
     };
     // A successor projects the history, so the finished turn settles first;
     // otherwise waiters are released before settlement.
+    let (source, unavailable) = if persistence == TurnPersistence::Failed {
+        let catalog = Arc::clone(&session.shared.results);
+        let items = Arc::clone(&sanitized);
+        let interrupted = stored.interrupted;
+        let metadata = crate::event::TurnResultView {
+            turn,
+            outcome: LoopOutcomeView::from_report(&report),
+            usage: report.usage,
+            requests: report.requests,
+            tool_rounds: report.tool_rounds,
+            final_config_revision: report.final_config_revision,
+            persistence,
+        };
+        let load = session.load();
+        match tokio::task::spawn_blocking(
+            move || -> Result<Result<ReservedSource, UnavailableReason>, AgentError> {
+                let bytes = crate::read::result_source_upper_bound(
+                    &items,
+                    interrupted.as_ref(),
+                    &metadata,
+                )?;
+                let charge = match catalog.reserve(load, bytes) {
+                    Ok(charge) => charge,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                match crate::read::prepare_bounded_result_source(
+                    &items,
+                    interrupted,
+                    metadata,
+                    &catalog,
+                )? {
+                    Ok(source) => Ok(catalog.finish_reservation(source, charge)),
+                    Err(reason) => Ok(Err(reason)),
+                }
+            },
+        )
+        .await
+        {
+            Ok(Ok(Ok(source))) => (Some(source), None),
+            Ok(Ok(Err(reason))) => (None, Some(reason)),
+            Ok(Err(_)) | Err(_) => (None, Some(UnavailableReason::InternalError)),
+        }
+    } else {
+        (None, None)
+    };
+    let mut source = source;
     let mut settled = false;
     let (result, next) = loop {
-        match session.close_turn(turn, task, &mut completion, eligible, settled, &result) {
+        match session.close_turn(
+            turn,
+            task,
+            &mut completion,
+            eligible,
+            settled,
+            &result,
+            &mut source,
+            unavailable,
+            uncertain,
+        ) {
             Close::Settle => {
                 finish_tail(session, turn, persistence, &report).await;
                 settled = true;
@@ -169,6 +290,7 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
             Close::Done { result, run } => break (result, run),
         }
     };
+    let _ = observer.join().await;
     // Remain in the owned task so close/shutdown still join auxiliary writes.
     if !settled {
         finish_tail(session, turn, persistence, &report).await;
@@ -180,9 +302,9 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
         persistence,
         next: result.next.clone(),
         queue: session.queue(),
-        meta: EventMeta::for_turn(turn),
+        meta: EventMeta::for_turn(turn, session.load()),
     });
-    session.emit_state();
+    session.mark_dirty();
     next
 }
 
@@ -292,7 +414,7 @@ async fn persist_report(
     turn: TurnRef,
     stored: &StoredLoopRecord,
     sanitized: &[HistoryItem],
-) -> TurnPersistence {
+) -> (TurnPersistence, bool, Option<InterruptedRequest>) {
     // The same per-session IO lock serializes this metadata touch with
     // rename and settings updates; each write starts from current record state.
     let _io = session.shared.io.lock().await;
@@ -302,7 +424,7 @@ async fn persist_report(
         .append_loop(turn.session_id, stored)
         .await
     {
-        Ok(()) => {
+        Ok(kept_metadata) => {
             let history = Arc::clone(&session.shared.inner.lock().unwrap().history);
             let mut merged = Vec::with_capacity(history.len() + sanitized.len());
             merged.extend(history.iter().cloned());
@@ -330,7 +452,11 @@ async fn persist_report(
             }
             session.presentation().clear_user_times();
             touch_updated_at_best_effort(session).await;
-            TurnPersistence::Persisted
+            (
+                TurnPersistence::Persisted,
+                false,
+                kept_metadata.then(|| stored.interrupted.clone()).flatten(),
+            )
         }
         Err(error) => {
             tracing::warn!(
@@ -339,11 +465,17 @@ async fn persist_report(
                 error_kind = error.kind(),
                 "history.jsonl append failed"
             );
-            if matches!(error, crate::store::AppendError::Unknown) {
-                session.shared.inner.lock().unwrap().blocked =
-                    Some(SessionBlockReason::Persistence);
+            let uncertain = matches!(error, crate::store::AppendError::Unknown);
+            if uncertain {
+                let mut inner = session.lock_inner();
+                inner.blocked = Some(SessionBlockReason::Persistence);
+                inner.uncertain_loop = Some(turn.loop_id);
             }
-            TurnPersistence::Failed
+            (
+                TurnPersistence::Failed,
+                uncertain,
+                stored.interrupted.clone(),
+            )
         }
     }
 }
@@ -413,11 +545,6 @@ async fn persist_loop_tool_records(session: &Session, session_id: SessionId, loo
             }
         }
     }
-}
-
-fn mark_internal(session: &Session) {
-    let mut inner = session.lock_inner();
-    inner.blocked = Some(SessionBlockReason::Internal);
 }
 
 async fn touch_updated_at_best_effort(session: &Session) {
@@ -512,6 +639,20 @@ impl Session {
         .map_err(|_| AgentError::InvalidSessionSettings)
     }
 
+    /// Builds the config this loop serves, with the input-boundary observation
+    /// installed on its prompt provider.
+    pub(super) fn execution_config(
+        &self,
+        input: UserInput,
+        generation: u64,
+        boundary: &Arc<RequestBoundary>,
+    ) -> Result<ExecutionInput, AgentError> {
+        let mut execution = self.execution_input(input)?;
+        execution.request.config =
+            boundary::observe_config(&execution.request.config, boundary, generation)?;
+        Ok(execution)
+    }
+
     pub(crate) fn execution_input(&self, input: UserInput) -> Result<ExecutionInput, AgentError> {
         let (history, config, options, system_prompt, auto) = {
             let inner = self.lock_inner();
@@ -538,16 +679,25 @@ impl Session {
     /// Starts the loop for a queue head. A busy period's first turn gets a
     /// new worker; a successor runs on the worker of the turn it follows and
     /// is returned for it to continue with.
-    pub(super) fn install_loop(
+    pub(super) fn install_loop_with_boundary(
         &self,
         execution: ExecutionInput,
+        boundary: Arc<RequestBoundary>,
         entry: &Entry,
         generation: u64,
-        successor_of: Option<(TurnRef, &Arc<SessionTask>)>,
+        successor: Option<Successor<'_>>,
     ) -> Result<(StartedTurn, Option<LoopRun>), AgentError> {
-        let (turn, run) = {
+        let mut successor = successor;
+        let publication = successor
+            .as_ref()
+            .map(|_| self.shared.results.publication());
+        let (started, run, evicted_waiter) = {
             let mut inner = self.lock_inner();
-            Self::validate_install_state(&inner, successor_of.map(|(turn, _)| turn))?;
+            Self::validate_install_state(&inner, successor.as_ref().map(|item| item.turn))?;
+            #[cfg(test)]
+            if FAIL_RUNTIME_START.hit(&inner.record.session_id) {
+                return Err(AgentError::Internal);
+            }
             // Initialize current-loop observation before spawning the Runtime
             // task: the runner may reach Model::start synchronously.
             inner.presentation.reset_before_loop_start();
@@ -563,6 +713,7 @@ impl Session {
                 self.clone(),
                 Arc::clone(&inner.presentation),
                 generation,
+                Arc::clone(&boundary),
             ));
             let mut agent_loop = AgentLoop::start(
                 execution.request,
@@ -579,6 +730,10 @@ impl Session {
                 session_id: inner.record.session_id,
                 loop_id: handle.id(),
             };
+            let started = StartedTurn {
+                turn,
+                input: entry.item(),
+            };
             inputs.bind(turn);
             #[cfg(test)]
             INSTALLED_LOOP_OPTIONS.arm(turn.loop_id, captured_options);
@@ -588,10 +743,10 @@ impl Session {
                 turn,
                 agent_loop,
                 events,
-                completion: CompletionGuard::new(self.clone(), completion_tx),
+                completion: CompletionGuard::new(self.clone(), turn, completion_tx),
             };
-            let (task, run) = match successor_of {
-                Some((_, task)) => (Arc::clone(task), Some(run)),
+            let (task, run) = match successor.as_ref() {
+                Some(item) => (Arc::clone(item.task), Some(run)),
                 None => {
                     let task = Arc::new(SessionTask::empty());
                     task.set(tokio::spawn(run_driver(
@@ -602,39 +757,50 @@ impl Session {
                     (task, None)
                 }
             };
+            let predecessor_result = successor
+                .as_mut()
+                .map(|item| (item.publish)(&mut inner, started.clone()));
+            self.lock_queue().starting = None;
+            let state_rx = handle.watch_state();
             let previous = inner.active.replace(ActiveLoop {
                 turn,
+                input: entry.item(),
                 handle: handle.clone(),
-                completion: completion_rx,
+                completion: completion_rx.clone(),
                 task,
                 execution_summary: execution.summary,
                 execution_history,
+                boundary,
+                generation,
+                _observer: StateObserver::spawn(self, turn.loop_id, state_rx, completion_rx),
             });
+            let mut evicted_waiter = None;
             if let Some(previous) = previous {
                 inner
                     .finished
                     .push_back((previous.turn, previous.completion));
                 if inner.finished.len() > FINISHED_TURNS_KEPT {
-                    inner.finished.pop_front();
+                    evicted_waiter = inner.finished.pop_front();
                 }
+            }
+            if let (Some(item), Some(result)) = (successor.as_mut(), predecessor_result) {
+                item.completion.publish_finished(result);
             }
             inner
                 .presentation
                 .bind_started_loop(turn.loop_id, entry.accepted_at());
-            (turn, run)
+            self.mark_dirty();
+            (started, run, evicted_waiter)
         };
+        drop(publication);
+        drop(evicted_waiter);
+        let turn = started.turn;
         tracing::info!(
             session_id = %turn.session_id,
             loop_id = %turn.loop_id,
             "turn submitted"
         );
-        Ok((
-            StartedTurn {
-                turn,
-                input: entry.item(),
-            },
-            run,
-        ))
+        Ok((started, run))
     }
 
     fn validate_install_state(
@@ -692,7 +858,7 @@ impl Session {
                 Self::clear_active_task(&mut inner, &task);
                 inner.blocked = Some(SessionBlockReason::Internal);
                 drop(inner);
-                self.emit_state();
+                self.mark_dirty();
                 return Err(AgentError::SessionBlocked);
             }
             let mut inner = self.lock_inner();

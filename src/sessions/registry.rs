@@ -29,6 +29,7 @@ impl Sessions {
         // Workspace queries are owned by the loaded Session; closing it stops
         // them instead of reading a Workspace whose Session is gone.
         session.cancel_queries();
+        session.unregister();
         Some(session)
     }
 

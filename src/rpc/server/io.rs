@@ -1,7 +1,22 @@
 use super::*;
 use std::io;
 
-pub(super) const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
+/// Largest legal inbound request frame, including the trailing newline.
+///
+/// A legal input push carries at most `BoundedText::MAX_BYTES` of text, which
+/// stays far below this even when every byte is a JSON-escaped control
+/// character. Responses are bounded separately by the control-frame ceiling.
+pub(super) const MAX_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest legal outbound frame, including the trailing newline.
+///
+/// The legal maximum is a control snapshot or an `input.push` receipt carrying
+/// 32 queued inputs plus one claimed input at `BoundedText::MAX_BYTES` each.
+/// JSON escaping of one-byte control characters costs six bytes per byte, so
+/// the text alone needs 33 * 262144 * 6 = 51,904,512 bytes; the largest
+/// actionable interaction, 256 completion descriptors, identities, keys and
+/// the envelope stay below the remainder. Nothing is truncated to fit.
+pub(crate) const MAX_RPC_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) enum Frame {
     Eof,
@@ -24,16 +39,26 @@ pub(super) async fn shutdown_signal() -> io::Result<()> {
 }
 
 pub(super) async fn pump_events(mut events: AgentEventStream, outbound: mpsc::Sender<RpcOutbound>) {
-    while let Some(event) = events.recv().await {
-        if outbound
-            .send(RpcOutbound::Event(Box::new(AgentEventNotification::new(
-                event,
-            ))))
+    while let Some((event, charge)) = events.recv_owned().await {
+        let notification = AgentEventNotification::new(event);
+        let frame = if let Some(charge) = charge {
+            match tokio::task::spawn_blocking(move || {
+                RpcResponse::notification(notification, charge)
+            })
             .await
-            .is_err()
-        {
+            {
+                Ok(Ok(response)) => RpcOutbound::Response(response),
+                _ => RpcOutbound::Failed,
+            }
+        } else {
+            RpcOutbound::Event(Box::new(notification))
+        };
+        if outbound.send(frame).await.is_err() {
             break;
         }
+    }
+    if events.control_failed() {
+        let _ = outbound.send(RpcOutbound::Failed).await;
     }
 }
 
@@ -61,15 +86,27 @@ where
     let mut batch = Vec::with_capacity(OUTBOUND_CAPACITY);
     while outbound.recv_many(&mut batch, OUTBOUND_CAPACITY).await != 0 {
         for frame in batch.drain(..) {
-            match frame {
-                RpcOutbound::Response(response) => writer.write_all(response.encoded()).await?,
+            let event_bytes;
+            let encoded = match &frame {
+                RpcOutbound::Response(response) => response.encoded(),
                 RpcOutbound::Event(event) => {
-                    let encoded =
-                        serde_json::to_vec(&event).map_err(|_| AgentError::RpcSerialization)?;
-                    writer.write_all(&encoded).await?;
+                    event_bytes = crate::budget::encode_json(event)
+                        .map_err(|_| AgentError::RpcSerialization)?;
+                    &event_bytes
                 }
+                RpcOutbound::Failed => return Err(AgentError::Internal),
+            };
+            if encoded.len() + 1 > MAX_RPC_FRAME_BYTES {
+                // A frame beyond the legal maximum is a producer bug; emitting
+                // a truncated or substitute message would corrupt the contract.
+                return Err(AgentError::Internal);
             }
+            writer.write_all(encoded).await?;
             writer.write_all(b"\n").await?;
+            if matches!(&frame, RpcOutbound::Response(response) if response.is_charged()) {
+                // A buffered writer can retain a tail after write_all completes.
+                writer.flush().await?;
+            }
         }
         writer.flush().await?;
     }

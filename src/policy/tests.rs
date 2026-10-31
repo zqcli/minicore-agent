@@ -115,6 +115,7 @@ fn serialized_approval_event(name: &str, request: ApprovalRequest) -> serde_json
         interaction: (&interaction).into(),
         meta: EventMeta {
             session_id,
+            load: crate::test_support::load_id(),
             loop_id: Some(loop_id),
             dropped_before: 0,
         },

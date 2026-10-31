@@ -15,6 +15,7 @@ use crate::agent::SessionInfo;
 use crate::budget::{check_budget, encoded_len};
 use crate::error::AgentError;
 use crate::event::LoopOutcomeView;
+#[cfg(test)]
 use crate::history::sanitize_history;
 use crate::ids::SessionId;
 use crate::sessions::{Session, TurnPersistence, TurnRef};
@@ -235,12 +236,17 @@ pub enum TurnResultAvailability {
     Pending,
     Live,
     Stored,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnResultRequest {
     pub turn: TurnRef,
+    #[serde(default)]
+    pub load: Option<String>,
+    #[serde(default)]
+    pub result_id: Option<String>,
     #[serde(default)]
     pub cursor: Option<ReadCursor>,
     #[serde(default = "default_read_limit")]
@@ -254,6 +260,23 @@ impl TurnResultRequest {
         if !(1..=MAX_READ_ITEMS).contains(&self.limit) {
             return Err(AgentError::InvalidArguments);
         }
+        if self
+            .cursor
+            .is_some_and(|cursor| cursor != ReadCursor::start())
+            && self.result_id.is_none()
+        {
+            return Err(AgentError::InvalidArguments);
+        }
+        if self.result_id.as_ref().is_some_and(|id| {
+            id.strip_prefix("r1:").is_none_or(|digest| {
+                digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        }) {
+            return Err(AgentError::InvalidArguments);
+        }
         validate_max_bytes(self.max_bytes)
     }
 }
@@ -261,6 +284,10 @@ impl TurnResultRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TurnResultPage {
     pub turn: TurnRef,
+    pub load: Option<String>,
+    pub result_id: Option<String>,
+    pub persistence_uncertain: bool,
+    pub unavailable_reason: Option<crate::sessions::UnavailableReason>,
     pub availability: TurnResultAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<LoopOutcomeView>,
@@ -654,36 +681,142 @@ pub(crate) async fn turn_result(
         return Err(AgentError::QueryLimit);
     }
 
-    if let Some(session) = loaded {
+    let continuation = request
+        .cursor
+        .is_some_and(|cursor| cursor != ReadCursor::start());
+
+    if let Some(session) = loaded.as_ref() {
+        let publication = session.result_catalog().publication();
+        if let Some(load) = &request.load {
+            if load != &session.load().to_string() {
+                return Err(AgentError::StaleLoad);
+            }
+            if let Some((entry, source)) = session
+                .result_catalog()
+                .lookup(session.load(), request.turn.loop_id)
+            {
+                if let Some(source) = source {
+                    drop(publication);
+                    return retained_turn_page(
+                        request,
+                        entry,
+                        source,
+                        cursor,
+                        max_bytes,
+                        &limits.cancellation,
+                        limits.deadline,
+                    )
+                    .await;
+                }
+                if entry.availability == crate::sessions::results::ResultAvailability::Unavailable {
+                    return unavailable_turn_page(
+                        request.turn,
+                        Some(load.clone()),
+                        entry
+                            .unavailable_reason
+                            .expect("unavailable results have a reason"),
+                        if entry.completion_kind == crate::sessions::CompletionKind::InternalError {
+                            None
+                        } else {
+                            session
+                                .turn_result_snapshot(request.turn)?
+                                .flatten()
+                                .map(|result| LoopOutcomeView::from_report(&result.report))
+                                .or_else(|| completion_outcome(entry.outcome_kind))
+                        },
+                        entry.persistence,
+                        entry.persistence_uncertain,
+                        max_bytes,
+                    );
+                }
+            }
+        } else if session
+            .result_catalog()
+            .lookup(session.load(), request.turn.loop_id)
+            .is_some_and(|(entry, _)| entry.persistence != Some(TurnPersistence::Persisted))
+        {
+            return Err(AgentError::MissingLoad);
+        }
         match session.turn_result_snapshot(request.turn)? {
             Some(None) => {
+                if request.load.is_none() {
+                    return Err(AgentError::MissingLoad);
+                }
                 validate_cursor(cursor, 0)?;
-                return pending_turn_page(request.turn, max_bytes);
+                return pending_turn_page(request.turn, request.load, max_bytes);
             }
             Some(Some(result)) => {
-                return live_turn_page(
-                    request.turn,
-                    result,
-                    cursor,
-                    request.limit,
-                    max_bytes,
-                    &limits.cancellation,
-                    limits.deadline,
-                )
-                .await;
+                if result.persistence == TurnPersistence::Failed {
+                    if request.load.is_none() {
+                        return Err(AgentError::MissingLoad);
+                    }
+                    return unavailable_turn_page(
+                        request.turn,
+                        request.load,
+                        crate::sessions::UnavailableReason::Expired,
+                        Some(LoopOutcomeView::from_report(&result.report)),
+                        Some(TurnPersistence::Failed),
+                        session.uncertain_loop() == Some(request.turn.loop_id),
+                        max_bytes,
+                    );
+                }
+                if request.load.is_some() && !continuation {
+                    drop(publication);
+                    return live_turn_page(
+                        request.turn,
+                        result,
+                        request.load,
+                        request.result_id.as_deref(),
+                        cursor,
+                        request.limit,
+                        max_bytes,
+                        &limits.cancellation,
+                        limits.deadline,
+                    )
+                    .await;
+                }
             }
             None => {}
         }
+        if session.uncertain_loop() == Some(request.turn.loop_id) {
+            if request.load.is_none() {
+                return Err(AgentError::MissingLoad);
+            }
+            return unavailable_turn_page(
+                request.turn,
+                request.load,
+                crate::sessions::UnavailableReason::Expired,
+                None,
+                Some(TurnPersistence::Failed),
+                true,
+                max_bytes,
+            );
+        }
+        drop(publication);
+    } else if request.load.is_some() {
+        return Err(AgentError::StaleLoad);
     }
 
     let record = store
         .read_loop_record(request.turn.session_id, request.turn.loop_id, &limits)
         .await
-        .map_err(AgentError::from)?
-        .ok_or(AgentError::TurnNotFound)?;
+        .map_err(AgentError::from)?;
+    let Some(record) = record else {
+        return unavailable_turn_page(
+            request.turn,
+            request.load,
+            crate::sessions::UnavailableReason::NotRetained,
+            None,
+            None,
+            false,
+            max_bytes,
+        );
+    };
     stored_turn_page(
         request.turn,
         record,
+        request.load,
+        request.result_id.as_deref(),
         cursor,
         request.limit,
         max_bytes,
@@ -693,9 +826,34 @@ pub(crate) async fn turn_result(
     .await
 }
 
-fn pending_turn_page(turn: TurnRef, max_bytes: usize) -> Result<TurnResultPage, AgentError> {
+fn completion_outcome(
+    outcome: Option<crate::sessions::CompletionOutcome>,
+) -> Option<LoopOutcomeView> {
+    use crate::sessions::CompletionOutcome;
+    outcome.map(|outcome| match outcome {
+        CompletionOutcome::Completed => LoopOutcomeView::Completed,
+        CompletionOutcome::Cancelled => LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::Unknown,
+        },
+        CompletionOutcome::Failed => LoopOutcomeView::Failed {
+            kind: "unavailable_details".into(),
+            model_error: None,
+        },
+        CompletionOutcome::Unknown => LoopOutcomeView::Unknown,
+    })
+}
+
+fn pending_turn_page(
+    turn: TurnRef,
+    load: Option<String>,
+    max_bytes: usize,
+) -> Result<TurnResultPage, AgentError> {
     let page = TurnResultPage {
         turn,
+        load,
+        result_id: None,
+        persistence_uncertain: false,
+        unavailable_reason: None,
         availability: TurnResultAvailability::Pending,
         outcome: None,
         persistence: None,
@@ -713,6 +871,304 @@ fn pending_turn_page(turn: TurnRef, max_bytes: usize) -> Result<TurnResultPage, 
         return Err(AgentError::InvalidArguments);
     }
     Ok(page)
+}
+
+fn unavailable_turn_page(
+    turn: TurnRef,
+    load: Option<String>,
+    reason: crate::sessions::UnavailableReason,
+    outcome: Option<LoopOutcomeView>,
+    persistence: Option<TurnPersistence>,
+    uncertain: bool,
+    max_bytes: usize,
+) -> Result<TurnResultPage, AgentError> {
+    let mut page = pending_turn_page(turn, load, max_bytes)?;
+    page.availability = TurnResultAvailability::Unavailable;
+    page.unavailable_reason = Some(reason);
+    page.outcome = outcome;
+    page.persistence = persistence;
+    page.persistence_uncertain = uncertain;
+    if encoded_len(&page) > max_bytes {
+        return Err(AgentError::InvalidArguments);
+    }
+    Ok(page)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_result_source(
+    items: &[HistoryItem],
+    interrupted: Option<InterruptedRequest>,
+) -> Result<crate::sessions::PreparedSource, AgentError> {
+    let sanitized = sanitize_history(items)?;
+    let times = vec![None; sanitized.len()];
+    let encoded = encoded_items(0, &sanitized, &times)?
+        .map(|item| item.map(|(_, value)| value))
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::sessions::PreparedSource::new(encoded, interrupted)
+}
+
+#[derive(Serialize)]
+struct SourceEnvelope<'a> {
+    item: SourceItem<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SourceItem<'a> {
+    User(&'a minicore_runtime::history::UserHistory),
+    Assistant(SourceAssistant<'a>),
+    ToolResult(&'a minicore_runtime::history::ToolResultHistory),
+    Summary(&'a minicore_runtime::history::SummaryHistory),
+}
+
+#[derive(Serialize)]
+struct SourceAssistant<'a> {
+    loop_id: LoopId,
+    request_index: u32,
+    model: &'a minicore_runtime::model::ModelRef,
+    reasoning: minicore_runtime::model::ReasoningPreference,
+    content: SourceParts<'a>,
+    finish_reason: minicore_runtime::model::ModelFinishReason,
+    usage: Usage,
+}
+
+impl<'a> SourceItem<'a> {
+    fn from_history(item: &'a HistoryItem) -> Option<Self> {
+        Some(match item {
+            HistoryItem::User(item) => Self::User(item),
+            HistoryItem::ToolResult(item) => Self::ToolResult(item),
+            HistoryItem::Summary(item) => Self::Summary(item),
+            HistoryItem::Assistant(item) if !item.content.iter().any(SourceParts::visible) => {
+                return None;
+            }
+            HistoryItem::Assistant(item) => Self::Assistant(SourceAssistant {
+                loop_id: item.loop_id,
+                request_index: item.request_index,
+                model: &item.model,
+                reasoning: item.reasoning,
+                content: SourceParts(&item.content),
+                finish_reason: item.finish_reason,
+                usage: item.usage,
+            }),
+        })
+    }
+}
+
+struct SourceParts<'a>(&'a [minicore_runtime::model::AssistantPart]);
+
+impl SourceParts<'_> {
+    fn visible(part: &minicore_runtime::model::AssistantPart) -> bool {
+        match part {
+            minicore_runtime::model::AssistantPart::Reasoning(value) => {
+                value.text().is_some() || value.summary().is_some()
+            }
+            _ => true,
+        }
+    }
+}
+
+impl Serialize for SourceParts<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use minicore_runtime::model::AssistantPart;
+        use serde::ser::SerializeSeq as _;
+        #[derive(Serialize)]
+        #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+        enum Part<'a> {
+            Text(&'a str),
+            Reasoning(Reasoning<'a>),
+            ToolCall(&'a minicore_runtime::model::ToolCall),
+        }
+        #[derive(Serialize)]
+        struct Reasoning<'a> {
+            text: Option<&'a str>,
+            summary: Option<&'a str>,
+            encrypted: Option<&'a str>,
+            signature: Option<&'a str>,
+        }
+        let mut sequence = serializer.serialize_seq(None)?;
+        for part in self.0.iter().filter(|part| Self::visible(part)) {
+            let part = match part {
+                AssistantPart::Text(text) => Part::Text(text),
+                AssistantPart::ToolCall(call) => Part::ToolCall(call),
+                AssistantPart::Reasoning(value) => Part::Reasoning(Reasoning {
+                    text: value.text(),
+                    summary: value.summary(),
+                    encrypted: None,
+                    signature: None,
+                }),
+            };
+            sequence.serialize_element(&part)?;
+        }
+        sequence.end()
+    }
+}
+
+struct PreparedTurnItems {
+    result_id: String,
+    total: usize,
+    encoded: Vec<(usize, String)>,
+}
+
+#[cfg(test)]
+pub(crate) static RESULT_PREPARE_GATES: crate::test_support::Registry<
+    LoopId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
+async fn prepare_turn_items(
+    items: Arc<[HistoryItem]>,
+    interrupted: Option<InterruptedRequest>,
+    cursor: ReadCursor,
+    limit: usize,
+    max_bytes: usize,
+    cancellation: CancellationToken,
+    deadline: Instant,
+) -> Result<PreparedTurnItems, AgentError> {
+    tokio::task::spawn_blocking(move || {
+        check_budget(&cancellation, deadline)?;
+        #[cfg(test)]
+        if let Some(gate) = items.first().and_then(|item| match item {
+            HistoryItem::User(user) => RESULT_PREPARE_GATES.take(&user.loop_id),
+            _ => None,
+        }) {
+            gate.pass_blocking();
+        }
+        if items.len() > MAX_HISTORY_SCAN_LINES {
+            return Err(AgentError::QueryLimit);
+        }
+        let total = items.iter().filter_map(SourceItem::from_history).count();
+        validate_cursor(cursor, total)?;
+        let end = cursor.item.saturating_add(limit).min(total);
+        let mut hash = Sha256::new();
+        hash.update(b"minicore-turn-result-r1\0");
+        hash.update((total as u64).to_be_bytes());
+        let mut source_bytes = 0usize;
+        let mut encoded = Vec::with_capacity(end.saturating_sub(cursor.item));
+        let mut prepared_bytes = 0usize;
+        struct HashWriter<'a>(&'a mut Sha256);
+        impl std::io::Write for HashWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (index, item) in items
+            .iter()
+            .filter_map(SourceItem::from_history)
+            .enumerate()
+        {
+            check_budget(&cancellation, deadline)?;
+            let envelope = SourceEnvelope {
+                item,
+                timestamp: None,
+            };
+            let bytes =
+                crate::budget::json_len(&envelope).map_err(|_| AgentError::RpcSerialization)?;
+            source_bytes = source_bytes
+                .checked_add(bytes)
+                .ok_or(AgentError::QueryLimit)?;
+            if source_bytes as u64 > MAX_HISTORY_SCAN_BYTES {
+                return Err(AgentError::QueryLimit);
+            }
+            hash.update((bytes as u64).to_be_bytes());
+            if (cursor.item..end).contains(&index) && prepared_bytes < max_bytes {
+                let mut bytes = Vec::with_capacity(bytes);
+                serde_json::to_writer(&mut bytes, &envelope)
+                    .map_err(|_| AgentError::RpcSerialization)?;
+                hash.update(&bytes);
+                prepared_bytes += bytes.len().saturating_sub(if index == cursor.item {
+                    cursor.offset
+                } else {
+                    0
+                });
+                encoded.push((
+                    index,
+                    String::from_utf8(bytes).map_err(|_| AgentError::RpcSerialization)?,
+                ));
+            } else {
+                serde_json::to_writer(HashWriter(&mut hash), &envelope)
+                    .map_err(|_| AgentError::RpcSerialization)?;
+            }
+        }
+        let partial_len =
+            crate::budget::json_len(&interrupted).map_err(|_| AgentError::RpcSerialization)?;
+        hash.update((partial_len as u64).to_be_bytes());
+        serde_json::to_writer(HashWriter(&mut hash), &interrupted)
+            .map_err(|_| AgentError::RpcSerialization)?;
+        check_budget(&cancellation, deadline)?;
+        Ok(PreparedTurnItems {
+            result_id: format!("r1:{:x}", hash.finalize()),
+            total,
+            encoded,
+        })
+    })
+    .await
+    .map_err(|_| AgentError::Internal)?
+}
+
+pub(crate) fn prepare_bounded_result_source(
+    items: &[HistoryItem],
+    interrupted: Option<InterruptedRequest>,
+    metadata: crate::event::TurnResultView,
+    catalog: &crate::sessions::ResultCatalog,
+) -> Result<Result<crate::sessions::PreparedSource, crate::sessions::UnavailableReason>, AgentError>
+{
+    let bytes = result_source_upper_bound(items, interrupted.as_ref(), &metadata)?;
+    if !catalog.accepts_source(bytes) {
+        return Ok(Err(crate::sessions::UnavailableReason::TooLarge));
+    }
+    let mut encoded = Vec::with_capacity(items.len());
+    for item in items.iter().filter_map(SourceItem::from_history) {
+        let envelope = SourceEnvelope {
+            item,
+            timestamp: None,
+        };
+        let bytes =
+            crate::budget::encode_json(&envelope).map_err(|_| AgentError::RpcSerialization)?;
+        encoded.push(String::from_utf8(bytes).map_err(|_| AgentError::RpcSerialization)?);
+    }
+    let source =
+        crate::sessions::PreparedSource::new(encoded, interrupted)?.with_metadata(metadata)?;
+    Ok(Ok(source))
+}
+
+pub(crate) fn result_source_upper_bound(
+    items: &[HistoryItem],
+    interrupted: Option<&InterruptedRequest>,
+    metadata: &crate::event::TurnResultView,
+) -> Result<usize, AgentError> {
+    let mut bytes = std::mem::size_of::<crate::sessions::results::ResultSource>()
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .ok_or(AgentError::Internal)?
+        .checked_add(items.len().saturating_mul(std::mem::size_of::<String>()))
+        .ok_or(AgentError::Internal)?;
+    for item in items.iter().filter_map(SourceItem::from_history) {
+        bytes = bytes
+            .checked_add(crate::budget::encoded_len(&SourceEnvelope {
+                item,
+                timestamp: None,
+            }))
+            .ok_or(AgentError::Internal)?;
+    }
+    let interrupted_bytes = interrupted.map_or(0, |value| {
+        value
+            .model
+            .capacity()
+            .saturating_add(value.reasoning.capacity())
+            .saturating_add(value.text.capacity())
+    });
+    bytes
+        .checked_add(interrupted_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(crate::sessions::results::metadata_heap_bytes(metadata))
+        })
+        .and_then(|bytes| bytes.checked_add(67))
+        .ok_or(AgentError::Internal)
 }
 
 #[cfg(test)]
@@ -845,26 +1301,47 @@ pub(crate) async fn tool_output(
     record.project_output(&request, max_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_turn_page(
     turn: TurnRef,
     result: Arc<crate::sessions::TurnResult>,
+    load: Option<String>,
+    expected_result_id: Option<&str>,
     cursor: ReadCursor,
     limit: usize,
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<TurnResultPage, AgentError> {
-    let sanitized =
-        sanitized_live_history(result.report.appended.as_ref(), cancellation, deadline).await?;
+    let PreparedTurnItems {
+        result_id,
+        total,
+        encoded,
+    } = prepare_turn_items(
+        Arc::clone(&result.report.appended),
+        result.interrupted.clone(),
+        cursor,
+        limit,
+        max_bytes,
+        cancellation.clone(),
+        deadline,
+    )
+    .await?;
+    if expected_result_id.is_some_and(|id| id != result_id) {
+        return Err(AgentError::StaleResult);
+    }
     let outcome = LoopOutcomeView::from_report(&result.report);
     let persistence = result.persistence;
     let usage = result.report.usage;
     let requests = result.report.requests;
     let tool_rounds = result.report.tool_rounds;
     let final_config_revision = result.report.final_config_revision;
-    let total = sanitized.len();
     let base = TurnResultPage {
         turn,
+        load,
+        result_id: Some(result_id),
+        persistence_uncertain: false,
+        unavailable_reason: None,
         availability: TurnResultAvailability::Live,
         outcome: Some(outcome),
         persistence: Some(persistence),
@@ -878,31 +1355,106 @@ async fn live_turn_page(
         next_cursor: None,
         total,
     };
-    assemble_turn_page(
-        base,
-        &sanitized,
+    assemble_turn_page(base, encoded, cursor, max_bytes, cancellation, deadline).await
+}
+
+async fn retained_turn_page(
+    request: TurnResultRequest,
+    entry: crate::sessions::results::CompletionEntry,
+    source: Arc<crate::sessions::results::ResultSource>,
+    cursor: ReadCursor,
+    max_bytes: usize,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<TurnResultPage, AgentError> {
+    if request
+        .result_id
+        .as_deref()
+        .is_some_and(|id| id != source.result_id)
+    {
+        return Err(AgentError::StaleResult);
+    }
+    let total = source.items.len();
+    validate_cursor(cursor, total)?;
+    let metadata = source.metadata.as_ref().expect("retained result metadata");
+    let base = TurnResultPage {
+        turn: request.turn,
+        load: request.load,
+        result_id: Some(source.result_id.clone()),
+        persistence_uncertain: entry.persistence_uncertain,
+        unavailable_reason: None,
+        availability: TurnResultAvailability::Live,
+        outcome: Some(metadata.outcome.clone()),
+        persistence: entry.persistence,
+        usage: Some(metadata.usage),
+        requests: Some(metadata.requests),
+        tool_rounds: Some(metadata.tool_rounds),
+        final_config_revision: Some(metadata.final_config_revision),
+        completed_at: None,
+        interrupted: source.interrupted.clone(),
+        items: Vec::new(),
+        next_cursor: None,
+        total,
+    };
+    let end = cursor.item.saturating_add(request.limit).min(total);
+    let encoded = source.items[cursor.item..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, item)| Ok((cursor.item + offset, item.as_str())))
+        .collect::<Vec<_>>();
+    let base_bytes = encoded_len(&base);
+    let (items, next_cursor) = pack_items(
+        encoded,
         cursor,
-        limit,
+        total,
         max_bytes,
         cancellation,
         deadline,
+        |_, _, next| Ok(base_bytes + encoded_len(&next) - 4),
     )
-    .await
+    .await?;
+    Ok(TurnResultPage {
+        items,
+        next_cursor,
+        ..base
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stored_turn_page(
     turn: TurnRef,
-    record: StoredLoopRecord,
+    mut record: StoredLoopRecord,
+    load: Option<String>,
+    expected_result_id: Option<&str>,
     cursor: ReadCursor,
     limit: usize,
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<TurnResultPage, AgentError> {
-    let sanitized = sanitized_record_items(&record, cancellation, deadline).await?;
-    let total = sanitized.len();
+    let PreparedTurnItems {
+        result_id,
+        total,
+        encoded,
+    } = prepare_turn_items(
+        std::mem::take(&mut record.items).into(),
+        record.interrupted.clone(),
+        cursor,
+        limit,
+        max_bytes,
+        cancellation.clone(),
+        deadline,
+    )
+    .await?;
+    if expected_result_id.is_some_and(|id| id != result_id) {
+        return Err(AgentError::StaleResult);
+    }
     let base = TurnResultPage {
         turn,
+        load,
+        result_id: Some(result_id),
+        persistence_uncertain: false,
+        unavailable_reason: None,
         availability: TurnResultAvailability::Stored,
         outcome: Some(record.outcome.clone()),
         persistence: Some(TurnPersistence::Persisted),
@@ -916,41 +1468,22 @@ async fn stored_turn_page(
         next_cursor: None,
         total,
     };
-    assemble_turn_page(
-        base,
-        &sanitized,
-        cursor,
-        limit,
-        max_bytes,
-        cancellation,
-        deadline,
-    )
-    .await
+    assemble_turn_page(base, encoded, cursor, max_bytes, cancellation, deadline).await
 }
 
-/// Shared page assembly for Live and Stored turns: cursor validation, slicing,
-/// the timestamp array, JSON encoding, and the byte-budget pack.
-///
-/// The caller cleans its own source and builds the metadata-only base page; the
-/// source differences (availability, persistence, `completed_at`, outcome,
-/// usage, revision) stay in that base. Pending never reaches this helper.
+/// Packs the prepared range without normalizing the entire turn again.
 async fn assemble_turn_page(
     base: TurnResultPage,
-    sanitized: &[HistoryItem],
+    encoded: Vec<(usize, String)>,
     cursor: ReadCursor,
-    limit: usize,
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<TurnResultPage, AgentError> {
-    validate_cursor(cursor, sanitized.len())?;
-    let end = cursor.item.saturating_add(limit).min(sanitized.len());
-    let timestamps = vec![None; end.saturating_sub(cursor.item)];
-    let encoded = encoded_items(cursor.item, &sanitized[cursor.item..end], &timestamps)?;
-    let total = sanitized.len();
+    let total = base.total;
     let base_bytes = encoded_len(&base);
     let (items, next_cursor) = pack_items(
-        encoded,
+        encoded.into_iter().map(Ok::<_, AgentError>),
         cursor,
         total,
         max_bytes,
@@ -997,7 +1530,7 @@ struct ReadItemEnvelope<'a> {
     timestamp: Option<&'a str>,
 }
 
-async fn pack_items<I, F>(
+async fn pack_items<I, F, S>(
     encoded: I,
     start: ReadCursor,
     total: usize,
@@ -1007,7 +1540,8 @@ async fn pack_items<I, F>(
     mut header_bytes: F,
 ) -> Result<(Vec<ReadItemChunk>, Option<ReadCursor>), AgentError>
 where
-    I: IntoIterator<Item = Result<(usize, String), AgentError>>,
+    I: IntoIterator<Item = Result<(usize, S), AgentError>>,
+    S: AsRef<str>,
     F: FnMut(
         &[ReadItemChunk],
         Option<&ReadItemChunk>,
@@ -1025,6 +1559,7 @@ where
             break;
         };
         let (index, json) = encoded_item?;
+        let json = json.as_ref();
         check_budget(cancellation, deadline)?;
         if index < position.item {
             continue;
@@ -1044,7 +1579,7 @@ where
 
         let complete_cursor = next_position(index, total);
         if remaining.len() <= max_bytes {
-            let full = make_chunk(index, offset, &json, remaining.len());
+            let full = make_chunk(index, offset, json, remaining.len());
             if let Some(bytes) = fitting_chunk_bytes(
                 &chunks,
                 chunk_bytes,
@@ -1069,7 +1604,7 @@ where
             chunk_bytes,
             index,
             offset,
-            &json,
+            json,
             total,
             max_bytes,
             cancellation,
@@ -1092,7 +1627,7 @@ where
                 offset: offset.saturating_add(length),
             })
         };
-        let chunk = make_chunk(index, offset, &json, length);
+        let chunk = make_chunk(index, offset, json, length);
         chunk_bytes += encoded_len(&chunk) + usize::from(!chunks.is_empty());
         chunks.push(chunk);
         position = next_cursor.unwrap_or(ReadCursor {
@@ -1258,60 +1793,6 @@ fn timestamps_for_range(
             _ => None,
         })
         .collect()
-}
-
-async fn sanitized_record_items(
-    record: &StoredLoopRecord,
-    cancellation: &CancellationToken,
-    deadline: Instant,
-) -> Result<Vec<HistoryItem>, AgentError> {
-    if record.items.len() > MAX_HISTORY_SCAN_LINES {
-        return Err(AgentError::QueryLimit);
-    }
-    let mut items = Vec::new();
-    for raw in &record.items {
-        check_budget(cancellation, deadline)?;
-        let cleaned = sanitize_history(std::slice::from_ref(raw))?;
-        if let Some(item) = cleaned.first() {
-            items.push(item.clone());
-        }
-        tokio::task::yield_now().await;
-    }
-    check_budget(cancellation, deadline)?;
-    Ok(items)
-}
-
-async fn sanitized_live_history(
-    items: &[HistoryItem],
-    cancellation: &CancellationToken,
-    deadline: Instant,
-) -> Result<Vec<HistoryItem>, AgentError> {
-    if items.len() > MAX_HISTORY_SCAN_LINES {
-        return Err(AgentError::QueryLimit);
-    }
-    let mut sanitized = Vec::new();
-    let mut source_bytes = 0_u64;
-    for raw in items {
-        check_budget(cancellation, deadline)?;
-        let cleaned = sanitize_history(std::slice::from_ref(raw))?;
-        for item in cleaned.iter() {
-            let item_bytes =
-                u64::try_from(encoded_len(item)).map_err(|_| AgentError::QueryLimit)?;
-            source_bytes = source_bytes
-                .checked_add(item_bytes)
-                .ok_or(AgentError::QueryLimit)?;
-            if source_bytes > MAX_HISTORY_SCAN_BYTES {
-                return Err(AgentError::QueryLimit);
-            }
-            sanitized.push(item.clone());
-            if sanitized.len() > MAX_HISTORY_SCAN_LINES {
-                return Err(AgentError::QueryLimit);
-            }
-        }
-        tokio::task::yield_now().await;
-    }
-    check_budget(cancellation, deadline)?;
-    Ok(sanitized)
 }
 
 impl ReadTurnSummary {

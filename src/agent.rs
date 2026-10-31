@@ -42,9 +42,9 @@ pub use crate::read::{
     TurnResultAvailability, TurnResultPage, TurnResultRequest,
 };
 pub use crate::sessions::{
-    DeliveredInput, InputMode, InputPushed, InputRemoved, InputsRecalled, InputsResumed, PushInput,
-    Queue, QueueItem, RemoveInput, SessionContext, SessionState, SessionStatus, StartedTurn,
-    TurnPersistence, TurnRef, TurnResult,
+    DeliveredInput, InputMode, InputPushed, InputRemoved, InputStartError, InputsRecalled,
+    InputsResumed, PushInput, Queue, QueueItem, RemoveInput, SessionContext, SessionState,
+    SessionStatus, StartedTurn, TurnPersistence, TurnRef, TurnResult,
 };
 
 mod session_setup;
@@ -57,7 +57,7 @@ pub(crate) use session_setup::{SessionParts, SessionSetup};
 type AgentFuture<T> = futures_util::future::BoxFuture<'static, Result<T, AgentError>>;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const RPC_PROTOCOL_VERSION: u32 = 1;
+pub const RPC_PROTOCOL_VERSION: u32 = 2;
 pub const RPC_CAPABILITIES: &[&str] = &[
     "session.read",
     "session.read.display",
@@ -203,6 +203,9 @@ pub struct Agent {
     store: Store,
     profiles: Profiles,
     models: Models,
+    results: Arc<crate::sessions::ResultCatalog>,
+    hub: Arc<crate::sessions::SnapshotHub>,
+    hub_task: Option<tokio::task::JoinHandle<()>>,
     command_environment: CommandEnvironment,
     sessions: Sessions,
     event_sink: AgentEventSink,
@@ -242,12 +245,19 @@ impl Agent {
         let profiles = config.profiles();
         let store = Store::open(config.data_dir.clone()).await?;
         let (event_sink, events_rx) = AgentEventSink::channel(config.event_capacity);
+        let hub = crate::sessions::SnapshotHub::new(event_sink.clone());
+        let hub_task = Some(tokio::spawn(Arc::clone(&hub).run()));
+        let results = crate::sessions::ResultCatalog::new();
+        results.bind_hub(&hub);
         let agent = Self {
             config,
             config_path,
             store,
             profiles,
             models,
+            results,
+            hub,
+            hub_task,
             command_environment,
             sessions: Sessions::new(),
             event_sink,
@@ -259,6 +269,10 @@ impl Agent {
 
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    pub(crate) fn reserve_snapshot(&self) -> Option<crate::sessions::hub::SnapshotCharge> {
+        self.hub.try_reserve()
     }
 
     /// Reloads the retained startup file into future-turn state. The
@@ -332,8 +346,11 @@ impl Agent {
         Ok(ReloadResult { ok: true })
     }
 
+    /// Takes the event stream, which must be drained concurrently with close and shutdown.
     pub fn take_events(&mut self) -> Result<AgentEventStream, AgentError> {
-        self.events_rx.take().ok_or(AgentError::EventStreamTaken)
+        let stream = self.events_rx.take().ok_or(AgentError::EventStreamTaken)?;
+        self.hub.listen();
+        Ok(stream)
     }
 
     pub const fn ping(&self) -> PingResponse {
@@ -349,6 +366,14 @@ impl Agent {
         session_id: crate::ids::SessionId,
     ) -> Option<crate::sessions::Session> {
         self.sessions.get(session_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loaded_identities_for_test(&self) -> Vec<(String, String)> {
+        self.sessions
+            .iter()
+            .map(|session| (session.session_id().to_string(), session.load().to_string()))
+            .collect()
     }
 
     pub(crate) fn store_handle(&self) -> Store {
@@ -724,10 +749,8 @@ impl Agent {
         session_id: crate::ids::SessionId,
     ) -> Result<(), AgentError> {
         let session = self.session(session_id)?.clone();
-        if session.has_queued_inputs() {
-            return Err(AgentError::SessionBusy);
-        }
-        let result = session.shutdown().await;
+        session.begin_close()?;
+        let result = session.join_shutdown().await;
         self.finish_close(session_id);
         result
     }
@@ -736,10 +759,15 @@ impl Agent {
         // The map retains the Session until its complete shutdown barrier has
         // joined every owned task. This prevents a dropped local owner from
         // detaching a manual-compaction worker during close.
+        let load = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.load())
+            .unwrap_or_else(|| crate::ids::LoadId::new().expect("load identity"));
         self.sessions.remove(session_id);
         self.event_sink.try_send(AgentEvent::SessionClosed {
             session_id,
-            meta: EventMeta::session(session_id),
+            meta: EventMeta::session(session_id, load),
         });
         tracing::info!(session_id = %session_id, "session closed");
     }
@@ -793,11 +821,18 @@ impl Agent {
         &self,
         request: UpdateSession,
     ) -> Result<AgentFuture<SessionUpdateResult>, AgentError> {
+        let session = self.session(request.session_id)?.clone();
+        self.prepare_update_for(request, session)
+    }
+
+    pub(crate) fn prepare_update_for(
+        &self,
+        request: UpdateSession,
+        session: crate::sessions::Session,
+    ) -> Result<AgentFuture<SessionUpdateResult>, AgentError> {
         if !request.has_field() {
             return Err(AgentError::InvalidArguments);
         }
-        let session_id = request.session_id;
-        let session = self.session(session_id)?.clone();
         let workspace = session.workspace();
         let mut candidate = session.record();
         if let Some(model) = &request.model {
@@ -840,9 +875,17 @@ impl Agent {
         &self,
         request: RenameSession,
     ) -> Result<AgentFuture<SessionInfo>, AgentError> {
+        let session = self.loaded_session(request.session_id);
+        self.prepare_rename_for(request, session)
+    }
+
+    pub(crate) fn prepare_rename_for(
+        &self,
+        request: RenameSession,
+        session: Option<crate::sessions::Session>,
+    ) -> Result<AgentFuture<SessionInfo>, AgentError> {
         let title =
             crate::store::normalize_title(&request.title).map_err(|_| AgentError::InvalidInput)?;
-        let session = self.loaded_session(request.session_id);
         let store = self.store.clone();
         Ok(Box::pin(async move {
             if let Some(session) = session {
@@ -901,10 +944,18 @@ impl Agent {
         &self,
         request: CompactSession,
     ) -> Result<AgentFuture<watch::Receiver<Option<CompactionCompletion>>>, AgentError> {
+        let session = self.session(request.session_id)?.clone();
+        self.prepare_compact_for(request, session)
+    }
+
+    pub(crate) fn prepare_compact_for(
+        &self,
+        request: CompactSession,
+        session: crate::sessions::Session,
+    ) -> Result<AgentFuture<watch::Receiver<Option<CompactionCompletion>>>, AgentError> {
         if !valid_operation_id(&request.operation_id) || request.operation_id.starts_with("auto-") {
             return Err(AgentError::InvalidInput);
         }
-        let session = self.session(request.session_id)?.clone();
         let record = session.record();
         let model = self
             .models
@@ -995,11 +1046,16 @@ impl Agent {
 
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
+        drop(self.events_rx.take());
         self.store.cancel_diff_workers();
         let result = self.sessions.shutdown_all().await;
+        // The publisher stops before the event stream is dropped so no control
+        // snapshot is lost for a still-loaded Session.
+        self.hub.shutdown_now();
+        if let Some(task) = self.hub_task.take() {
+            let _ = task.await;
+        }
         self.store.shutdown_diff_workers().await;
-        drop(self.event_sink);
-        drop(self.events_rx.take());
         tracing::info!(success = result.is_ok(), "agent shutdown end");
         result
     }
@@ -1021,6 +1077,8 @@ impl Agent {
             .physical_context_window(&record.model)
             .expect("validated model");
         let history_index = std::mem::take(&mut stored.history_index);
+        let last_saved = history_index.last().and_then(|line| line.last_loop_id());
+        let load = setup.load;
         let session = crate::sessions::Session::new(
             stored,
             workspace,
@@ -1028,6 +1086,9 @@ impl Agent {
             self.config.compaction.policy(),
             self.store.clone(),
             self.event_sink.clone(),
+            Arc::clone(&self.hub),
+            Arc::clone(&self.results),
+            last_saved,
         );
         let active_history = compaction.project(&context_history);
         presentation.restore_context(
@@ -1042,7 +1103,7 @@ impl Agent {
         self.sessions.insert(session_id, session);
         self.event_sink.try_send(AgentEvent::SessionOpened {
             session: info.clone(),
-            meta: EventMeta::session(session_id),
+            meta: EventMeta::session(session_id, load),
         });
         info
     }
@@ -1050,6 +1111,12 @@ impl Agent {
 
 pub const fn agent_version() -> &'static str {
     VERSION
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.hub.shutdown_now();
+    }
 }
 
 /// The Session takes its profile's current system prompt, replacing the stored

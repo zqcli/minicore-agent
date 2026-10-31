@@ -57,7 +57,7 @@ async fn ignored_finished_drops_accumulate_into_subsequent_agent_event() {
         persistence: TurnPersistence::Persisted,
         next: None,
         queue: crate::sessions::Queue::default(),
-        meta: EventMeta::for_turn(turn),
+        meta: EventMeta::for_turn(turn, crate::test_support::load_id()),
     });
     let received = receiver
         .recv()
@@ -101,6 +101,28 @@ fn an_old_loop_cleanup_cannot_clear_a_new_loop_summary() {
     assert!(state.ephemeral(new_loop).is_some());
 }
 impl Session {
+    pub(crate) fn runtime_handle_for_test(&self) -> LoopHandle {
+        self.lock_inner().active.as_ref().unwrap().handle.clone()
+    }
+
+    pub(crate) async fn join_observer_for_test(&self) {
+        let task = Arc::clone(&self.lock_inner().active.as_ref().unwrap()._observer.task);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
+            .await
+            .expect("observer must stop on Agent completion while handles remain")
+            .unwrap();
+    }
+
+    pub(crate) async fn await_control_idle_for_test(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !self.shared.hub.idle_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publisher must become idle");
+    }
+
     pub(crate) fn options_for_test(&self) -> LoopOptions {
         let inner = self.lock_inner();
         inner.options.clone()

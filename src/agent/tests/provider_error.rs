@@ -91,6 +91,8 @@ async fn the_last_attempts_provider_text_reaches_wait_event_and_reloaded_history
     let stored = agent
         .turn_result(TurnResultRequest {
             turn,
+            load: None,
+            result_id: None,
             cursor: None,
             limit: 100,
             max_bytes: None,

@@ -16,7 +16,7 @@
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), AgentError> {
 //! let mut agent = Agent::open_file("agent.toml").await?;
-//! assert_eq!(agent.ping().protocol_version, 1);
+//! assert_eq!(agent.ping().protocol_version, 2);
 //! let _events = agent.take_events()?;
 //! agent.shutdown().await?;
 //! # Ok(())
@@ -63,11 +63,11 @@ pub(crate) mod openai_mock;
 pub use agent::{
     Agent, AnswerInteraction, CompactSession, CoveredUsage, CreateSession, DeliveredInput,
     DisplayProjection, GetHistory, HistoryPage, InputMode, InputPushed, InputRemoved,
-    InputsRecalled, InputsResumed, InterruptedRequest, PartialStopReason, PingResponse, PushInput,
-    Queue, QueueItem, RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk,
-    ReadSession, ReadSessionResult, ReadTurnSummary, ReadView, ReloadResult, RemoveInput,
-    RenameSession, SessionInfo, SessionState, SessionStatus, SessionUpdateResult, StartedTurn,
-    TurnPersistence, TurnRef, TurnResult, TurnResultAvailability, TurnResultPage,
+    InputStartError, InputsRecalled, InputsResumed, InterruptedRequest, PartialStopReason,
+    PingResponse, PushInput, Queue, QueueItem, RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor,
+    ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary, ReadView, ReloadResult,
+    RemoveInput, RenameSession, SessionInfo, SessionState, SessionStatus, SessionUpdateResult,
+    StartedTurn, TurnPersistence, TurnRef, TurnResult, TurnResultAvailability, TurnResultPage,
     TurnResultRequest, UpdateSession, agent_version,
 };
 pub use changes::{
@@ -91,7 +91,7 @@ pub use event::{
     AgentEvent, AgentEventStream, EventMeta, LocalContextBudgetFailure, OutputChannel,
     ToolProgressView, ToolResultView,
 };
-pub use ids::{SessionId, SessionIdError};
+pub use ids::{LoadId, SessionId, SessionIdError};
 pub use models::{ModelConfig, ModelInfo};
 pub use presentation::{
     AssistantDisplayPart, PresentationView, ToolArgumentsPreviewState, ToolDisplay,
@@ -99,8 +99,9 @@ pub use presentation::{
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use sessions::{
-    CompactionPhase, CompactionProgress, ContextBudget, SessionBlockReason, SessionContext,
-    SummaryCoverage,
+    CompactionPhase, CompactionProgress, CompletionEntry, CompletionKind, CompletionOutcome,
+    CompletionWindow, ContextBudget, ResultAvailability, SessionBlockReason, SessionContext,
+    SessionExecution, SessionSnapshot, SnapshotInteraction, SummaryCoverage, UnavailableReason,
 };
 pub use tool_data::{
     CommandResult, CommandStatus, ToolDataAvailability, ToolDataStream, ToolExecutionData,

@@ -123,3 +123,44 @@ pub struct SessionState {
     pub block_reason: Option<SessionBlockReason>,
     pub compaction: Option<CompactionProgress>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionExecution {
+    None,
+    Starting {
+        input: QueueItem,
+    },
+    Running {
+        loop_id: LoopId,
+        input: QueueItem,
+        request_index: u32,
+        phase: crate::event::LoopStatusView,
+    },
+    Finishing {
+        loop_id: LoopId,
+        input: QueueItem,
+        request_index: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SnapshotInteraction {
+    pub loop_id: LoopId,
+    pub request_index: u32,
+    #[serde(flatten)]
+    pub interaction: crate::event::PendingInteractionView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionSnapshot {
+    pub session_id: SessionId,
+    pub load: LoadId,
+    pub revision: u64,
+    pub execution: SessionExecution,
+    pub pending_interaction: Option<SnapshotInteraction>,
+    pub queue: Queue,
+    pub compaction: Option<CompactionProgress>,
+    pub block_reason: Option<SessionBlockReason>,
+    pub completions: CompletionWindow,
+}

@@ -271,7 +271,7 @@ impl PreviewObserver {
                 state,
                 partial,
                 display,
-                meta: EventMeta::for_turn(turn),
+                meta: EventMeta::for_turn(turn, self.presentation.load),
             });
         self.last_update = Some(now);
     }

@@ -2,9 +2,14 @@ use super::*;
 
 impl RpcServer {
     pub(super) fn dispatch(&mut self, request: RpcRequest) -> Dispatch {
+        let is_push = request.method == "input.push";
         match self.dispatch_inner(request) {
             Ok(dispatch) => dispatch,
-            Err(response) => Dispatch::Response(response),
+            Err(response) => Dispatch::Response(if is_push {
+                response.rejected_input()
+            } else {
+                response
+            }),
         }
     }
 
@@ -119,6 +124,10 @@ impl RpcServer {
             "session.create" => {
                 let request: CreateSession = params_or_error(&id, params)?;
                 self.admit_operation(&id, None)?;
+                let charge = self
+                    .agent()
+                    .reserve_snapshot()
+                    .ok_or_else(|| resource_exhausted(id.clone()))?;
                 let session_id = crate::ids::SessionId::new()
                     .map_err(|_| agent_error(id.clone(), &AgentError::Internal))?;
                 let future = self
@@ -127,14 +136,15 @@ impl RpcServer {
                     .map_err(|error| agent_error(id.clone(), &error))?;
                 self.defer_operation(Some(Reservation::Session(session_id)), async move {
                     let result = future.await;
-                    Box::new(move |agent: &mut Agent| {
-                        agent_result(
-                            &id,
-                            result.map(|(stored, workspace, setup)| SessionResult {
-                                session: agent.install_session(stored, workspace, setup),
-                            }),
-                        )
-                        .into()
+                    Box::new(move |agent: &mut Agent| match result {
+                        Ok((stored, workspace, setup)) => {
+                            let info = agent.install_session(stored, workspace, setup);
+                            let session = agent
+                                .loaded_session(info.session_id)
+                                .expect("installed session");
+                            snapshot_reply(id, session, Some(info), charge)
+                        }
+                        Err(error) => agent_error(id, &error).into(),
                     }) as ApplyOperation
                 })
             }
@@ -142,41 +152,42 @@ impl RpcServer {
                 let params: SessionParams = params_or_error(&id, params)?;
                 let session_id = params.session_id;
                 self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                let charge = self
+                    .agent()
+                    .reserve_snapshot()
+                    .ok_or_else(|| resource_exhausted(id.clone()))?;
                 if let Some(session) = self.agent().loaded_session(session_id) {
-                    Dispatch::Response(success(
-                        &id,
-                        SessionResult {
-                            session: session.info(true),
-                        },
-                    ))
+                    if self.queries.len() >= MAX_DEFERRED_QUERIES {
+                        return Err(resource_exhausted(id));
+                    }
+                    let info = session.info(true);
+                    self.spawn_snapshot_reply(snapshot_reply(id, session, Some(info), charge))
                 } else {
                     let store = self.agent().store_handle();
                     self.defer_operation(Some(Reservation::Session(session_id)), async move {
                         let result = Agent::prepare_open(store, session_id).await;
                         Box::new(move |agent: &mut Agent| {
-                            agent_result(
-                                &id,
-                                result
-                                    .and_then(|prepared| agent.install_open(prepared))
-                                    .map(|session| SessionResult { session }),
-                            )
-                            .into()
+                            match result.and_then(|prepared| agent.install_open(prepared)) {
+                                Ok(info) => {
+                                    let session = agent
+                                        .loaded_session(info.session_id)
+                                        .expect("installed session");
+                                    snapshot_reply(id, session, Some(info), charge)
+                                }
+                                Err(error) => agent_error(id, &error).into(),
+                            }
                         }) as ApplyOperation
                     })
                 }
             }
             "session.close" => {
-                let params: SessionParams = params_or_error(&id, params)?;
+                let (params, load): (SessionParams, _) = params_with_load(&id, params)?;
                 let session_id = params.session_id;
                 self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
-                let session = self
-                    .agent()
-                    .loaded_session(session_id)
-                    .ok_or_else(|| agent_error(id.clone(), &AgentError::SessionNotLoaded))?;
-                if session.has_queued_inputs() {
-                    return Err(agent_error(id, &AgentError::SessionBusy));
-                }
-                session.begin_shutdown();
+                let session = self.loaded_session_with_load(&id, session_id, load)?;
+                session
+                    .begin_close()
+                    .map_err(|error| agent_error(id.clone(), &error))?;
                 self.defer_operation(Some(Reservation::Session(session_id)), async move {
                     let result = session.join_shutdown().await;
                     Box::new(move |agent: &mut Agent| {
@@ -205,11 +216,18 @@ impl RpcServer {
             }
             "session.state" => {
                 let params: SessionParams = params_or_error(&id, params)?;
-                let result = self
+                let session = self
                     .agent()
-                    .session_state(params.session_id)
-                    .map(|state| SessionStateView::from(&state));
-                Dispatch::Response(agent_result(&id, result))
+                    .loaded_session(params.session_id)
+                    .ok_or_else(|| agent_error(id.clone(), &AgentError::SessionNotLoaded))?;
+                if self.queries.len() >= MAX_DEFERRED_QUERIES {
+                    return Err(resource_exhausted(id));
+                }
+                let charge = self
+                    .agent()
+                    .reserve_snapshot()
+                    .ok_or_else(|| resource_exhausted(id.clone()))?;
+                self.spawn_snapshot_reply(snapshot_reply(id, session, None, charge))
             }
             "session.context" => {
                 let params: SessionParams = params_or_error(&id, params)?;
@@ -217,12 +235,13 @@ impl RpcServer {
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.compact" => {
-                let request: CompactSession = params_or_error(&id, params)?;
+                let (request, load): (CompactSession, _) = params_with_load(&id, params)?;
                 let reservation = Some(Reservation::Session(request.session_id));
                 self.admit_operation(&id, reservation)?;
+                let session = self.loaded_session_with_load(&id, request.session_id, load)?;
                 let future = self
                     .agent()
-                    .prepare_compact(request)
+                    .prepare_compact_for(request, session)
                     .map_err(|error| agent_error(id.clone(), &error))?;
                 self.defer_operation(reservation, async move {
                     let result = future.await;
@@ -243,38 +262,52 @@ impl RpcServer {
                 })
             }
             "session.compact.cancel" => {
-                let params: CompactSession = params_or_error(&id, params)?;
-                let result = self
-                    .agent()
-                    .cancel_compaction(params)
+                let (params, load): (CompactSession, _) = params_with_load(&id, params)?;
+                let session = self.loaded_session_with_load(&id, params.session_id, load)?;
+                if !crate::compaction::valid_operation_id(&params.operation_id) {
+                    return Err(invalid_params(Some(id)));
+                }
+                let result = session
+                    .cancel_compaction(&params.operation_id)
                     .map(|cancelled| CancelledResult { cancelled });
                 Dispatch::Response(agent_result(&id, result))
             }
             "session.update" => {
-                let request: UpdateSession = params_or_error(&id, params)?;
+                let (request, load): (UpdateSession, _) = params_with_load(&id, params)?;
                 if !request.has_field() {
                     return Err(invalid_params(Some(id)));
                 }
                 self.admit_operation(&id, Some(Reservation::Session(request.session_id)))?;
                 let session_id = request.session_id;
+                let session = self.loaded_session_with_load(&id, session_id, load)?;
                 let future = self
                     .agent()
-                    .prepare_update(request)
+                    .prepare_update_for(request, session)
                     .map_err(|error| agent_error(id.clone(), &error))?;
                 self.defer_response(id, Some(Reservation::Session(session_id)), async move {
                     future.await.map(SessionUpdateResult::from)
                 })
             }
             "session.rename" => {
-                let request: RenameSession = params_or_error(&id, params)?;
+                let (request, load): (RenameSession, _) = params_with_load(&id, params)?;
                 let session_id = request.session_id;
                 self.admit_operation(&id, Some(Reservation::Session(session_id)))?;
+                let session = self.agent().loaded_session(session_id);
+                match &session {
+                    Some(session) => validate_load(&id, session, load.as_deref())?,
+                    None if load.is_some() => return Err(agent_error(id, &AgentError::StaleLoad)),
+                    None => {}
+                }
                 let future = self
                     .agent()
-                    .prepare_rename(request)
+                    .prepare_rename_for(request, session)
                     .map_err(|error| agent_error(id.clone(), &error))?;
                 self.defer_response(id, Some(Reservation::Session(session_id)), async move {
-                    future.await.map(|session| SessionResult { session })
+                    future.await.map(|session| SessionResult {
+                        session,
+                        load: None,
+                        snapshot: None,
+                    })
                 })
             }
             "session.history" => {
@@ -483,9 +516,9 @@ impl RpcServer {
     ) -> Result<Dispatch, RpcResponse> {
         Ok(match method {
             "turn.cancel" => {
-                let params: TurnParams = params_or_error(&id, params)?;
-                let result = self
-                    .agent()
+                let (params, load): (TurnParams, _) = params_with_load(&id, params)?;
+                let session = self.loaded_session_with_load(&id, params.session_id, load)?;
+                let result = session
                     .cancel(params.into())
                     .map(|cancelled| CancelledResult { cancelled });
                 Dispatch::Response(agent_result(&id, result))
@@ -514,7 +547,7 @@ impl RpcServer {
                 }
             }
             "interaction.answer" => {
-                let params: InteractionAnswerParams = params_or_error(&id, params)?;
+                let (params, load): (InteractionAnswerParams, _) = params_with_load(&id, params)?;
                 let answer = match params.answer.into_runtime() {
                     Ok(answer) => answer,
                     Err(_) => return Err(invalid_params(Some(id))),
@@ -523,13 +556,9 @@ impl RpcServer {
                     session_id: params.session_id,
                     loop_id: params.loop_id,
                 };
-                let result = self
-                    .agent()
-                    .answer_interaction(AnswerInteraction {
-                        turn,
-                        interaction_id: params.interaction_id,
-                        answer,
-                    })
+                let session = self.loaded_session_with_load(&id, params.session_id, load)?;
+                let result = session
+                    .answer(turn, params.interaction_id, answer)
                     .map(|()| OkResult::TRUE);
                 Dispatch::Response(agent_result(&id, result))
             }
@@ -547,35 +576,38 @@ impl RpcServer {
     ) -> Result<Dispatch, RpcResponse> {
         Ok(match method {
             "input.push" => {
-                let request: PushInput = params_or_error(&id, params)?;
+                let (request, load): (PushInput, _) = params_with_load(&id, params)?;
                 // A push that starts a turn is deferred and must not overlap a
                 // reload, so admit it before the input is accepted.
                 self.admit_operation(&id, None)?;
-                let session = self.loaded_session(&id, request.session_id)?;
+                let session = self.loaded_session_with_load(&id, request.session_id, load)?;
                 let pending = session
                     .accept_input(request.mode, request.text)
                     .map_err(|error| agent_error(id.clone(), &error))?;
                 if pending.needs_start() {
-                    self.defer_response(id, None, pending.start())
+                    self.defer_operation(None, async move {
+                        let result = pending.start().await;
+                        Box::new(move |_: &mut Agent| accepted_input_response(&id, result).into())
+                            as ApplyOperation
+                    })
                 } else {
-                    Dispatch::Response(success(&id, pending.finish(None)))
+                    Dispatch::Response(accepted_input_response(&id, Ok(pending.finish(None))))
                 }
             }
             "input.remove" => {
-                let request: RemoveInput = params_or_error(&id, params)?;
-                Dispatch::Response(agent_result(&id, self.agent().remove_input(request)))
+                let (request, load): (RemoveInput, _) = params_with_load(&id, params)?;
+                let session = self.loaded_session_with_load(&id, request.session_id, load)?;
+                Dispatch::Response(agent_result(&id, session.remove_input(&request.id)))
             }
             "input.recall" => {
-                let params: SessionParams = params_or_error(&id, params)?;
-                Dispatch::Response(agent_result(
-                    &id,
-                    self.agent().recall_inputs(params.session_id),
-                ))
+                let (params, load): (SessionParams, _) = params_with_load(&id, params)?;
+                let session = self.loaded_session_with_load(&id, params.session_id, load)?;
+                Dispatch::Response(success(&id, session.recall_inputs()))
             }
             "input.resume" => {
-                let params: SessionParams = params_or_error(&id, params)?;
+                let (params, load): (SessionParams, _) = params_with_load(&id, params)?;
                 self.admit_operation(&id, None)?;
-                let session = self.loaded_session(&id, params.session_id)?;
+                let session = self.loaded_session_with_load(&id, params.session_id, load)?;
                 let pending = session
                     .accept_resume()
                     .map_err(|error| agent_error(id.clone(), &error))?;
@@ -596,15 +628,110 @@ impl RpcServer {
         })
     }
 
-    fn loaded_session(
+    fn loaded_session_with_load(
         &self,
         id: &RpcId,
         session_id: crate::ids::SessionId,
+        load: Option<String>,
     ) -> Result<crate::sessions::Session, RpcResponse> {
-        self.agent()
+        if load.is_none() {
+            return Err(agent_error(id.clone(), &AgentError::MissingLoad));
+        }
+        let session = self
+            .agent()
             .loaded_session(session_id)
-            .ok_or_else(|| agent_error(id.clone(), &AgentError::SessionNotLoaded))
+            .ok_or_else(|| agent_error(id.clone(), &AgentError::StaleLoad))?;
+        validate_load(id, &session, load.as_deref())?;
+        Ok(session)
     }
+}
+
+fn params_with_load<T: serde::de::DeserializeOwned>(
+    id: &RpcId,
+    params: Option<Value>,
+) -> Result<(T, Option<String>), RpcResponse> {
+    let mut object = match params.unwrap_or_else(|| Value::Object(Default::default())) {
+        Value::Object(object) => object,
+        _ => return Err(invalid_params(Some(id.clone()))),
+    };
+    let load = match object.remove("load") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(load)) => Some(load),
+        _ => return Err(invalid_params(Some(id.clone()))),
+    };
+    Ok((params_or_error(id, Some(Value::Object(object)))?, load))
+}
+
+fn validate_load(
+    id: &RpcId,
+    session: &crate::sessions::Session,
+    load: Option<&str>,
+) -> Result<(), RpcResponse> {
+    match load {
+        None => Err(agent_error(id.clone(), &AgentError::MissingLoad)),
+        // Comparing the wire token keeps a well-formed but unissued load a
+        // stale-load error instead of a parameter-shape error.
+        Some(load) if load != session.load().to_string() => {
+            Err(agent_error(id.clone(), &AgentError::StaleLoad))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn snapshot_reply(
+    id: RpcId,
+    session: crate::sessions::Session,
+    info: Option<crate::agent::SessionInfo>,
+    charge: crate::sessions::hub::SnapshotCharge,
+) -> OperationReply {
+    #[cfg(test)]
+    let gate_key = session.session_id();
+    // Capture the admitted observation before shutdown can unregister this load.
+    let result = session.sample();
+    let load = session.load().to_string();
+    drop(session);
+    OperationReply::Waiter(Box::pin(async move {
+        #[cfg(test)]
+        if let Some(gate) = super::SNAPSHOT_REPLY_GATES.take(&gate_key) {
+            gate.pass().await;
+        }
+        let error_id = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            let response = match result {
+                Ok((state, snapshot)) => {
+                    let response = if let Some(info) = info {
+                        RpcResponse::snapshot_success(
+                            id.clone(),
+                            SessionResult {
+                                session: info,
+                                load: Some(load),
+                                snapshot: Some(snapshot),
+                            },
+                        )
+                    } else {
+                        RpcResponse::snapshot_success(
+                            id.clone(),
+                            SessionStateResult {
+                                state: SessionStateView::from(&state),
+                                snapshot,
+                            },
+                        )
+                    };
+                    response.unwrap_or_else(|_| agent_error(id, &AgentError::RpcSerialization))
+                }
+                Err(error) => agent_error(id, &error),
+            };
+            (response, charge)
+        })
+        .await
+        {
+            Ok((response, charge)) => {
+                drop(error_id);
+                response.charged(charge)
+            }
+            Err(_) => agent_error(error_id, &AgentError::Internal),
+        }
+    }))
 }
 
 pub(super) const METHODS: &[&str] = &[

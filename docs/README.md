@@ -21,8 +21,9 @@ verification evidence.
 - [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
-These guides describe the current source package **0.9.0**, Rust 2024 on
-current stable, Runtime `0.9.0` (tag `v0.9.0`), and RPC protocol version `1`.
+These guides describe the current source package **0.9.1** (development), Rust
+2024 on current stable, the formal Runtime `0.9.0` dependency (tag `v0.9.0`), and
+RPC protocol version `2`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 

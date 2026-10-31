@@ -387,6 +387,14 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
         let page = agent
             .turn_result(crate::TurnResultRequest {
                 turn,
+                load: Some(
+                    agent
+                        .loaded_session(turn.session_id)
+                        .unwrap()
+                        .load()
+                        .to_string(),
+                ),
+                result_id: None,
                 cursor: None,
                 limit: 100,
                 max_bytes: None,
@@ -532,6 +540,14 @@ async fn e2e_b_lost_events_failed_append_and_clean_close_workflow() {
         let page = agent
             .turn_result(crate::TurnResultRequest {
                 turn,
+                load: Some(
+                    agent
+                        .loaded_session(turn.session_id)
+                        .unwrap()
+                        .load()
+                        .to_string(),
+                ),
+                result_id: None,
                 cursor: None,
                 limit: 100,
                 max_bytes: None,

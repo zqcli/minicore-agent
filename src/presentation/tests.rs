@@ -397,6 +397,7 @@ fn recorded_input_times_keep_their_order_in_the_live_times_queue() {
     let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
+        crate::test_support::load_id(),
         sink,
         crate::compaction::CompactionState::new(),
     );
@@ -416,11 +417,13 @@ fn a_reused_call_id_in_a_new_loop_gets_its_own_identity() {
     let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
+        crate::test_support::load_id(),
         sink,
         crate::compaction::CompactionState::new(),
     );
     let observer = ToolObserver::new(
         presentation.session_id,
+        presentation.load,
         Arc::new(ToolData::new()),
         AgentEventSink::channel(8).0,
     );
@@ -484,6 +487,7 @@ fn finishing_a_call_removes_its_live_entry() {
     let (sink, _receiver) = AgentEventSink::channel(8);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
+        crate::test_support::load_id(),
         sink,
         crate::compaction::CompactionState::new(),
     );
@@ -529,10 +533,19 @@ async fn presentation_tool_variants_share_binding_and_finish() {
     let workspace = Arc::new(crate::Workspace::open(root).await.unwrap());
 
     let (sink, mut presentation_events) = crate::event::AgentEventSink::channel(16);
-    let presentation =
-        Presentation::new(session_id, sink, crate::compaction::CompactionState::new());
+    let presentation = Presentation::new(
+        session_id,
+        crate::test_support::load_id(),
+        sink,
+        crate::compaction::CompactionState::new(),
+    );
     let (sink, mut observer_events) = crate::event::AgentEventSink::channel(16);
-    let observer = ToolObserver::new(session_id, Arc::new(ToolData::new()), sink);
+    let observer = ToolObserver::new(
+        session_id,
+        crate::test_support::load_id(),
+        Arc::new(ToolData::new()),
+        sink,
+    );
     let owners = ToolOwners::new();
     let plain = crate::tools::tests::build_tools(
         &["read".to_owned()],
@@ -719,6 +732,7 @@ fn reported_context_survives_loop_reset_but_invalidates_stale_streams() {
     let (sink, mut receiver) = AgentEventSink::channel(16);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
+        crate::test_support::load_id(),
         sink,
         crate::compaction::CompactionState::new(),
     );
@@ -788,6 +802,7 @@ fn reported_context_restores_only_last_valid_active_matching_model_usage() {
     let (sink, _) = AgentEventSink::channel(1);
     let presentation = Presentation::new(
         SessionId::new().unwrap(),
+        crate::test_support::load_id(),
         sink,
         crate::compaction::CompactionState::new(),
     );
@@ -833,7 +848,12 @@ fn reported_context_guards_same_label_config_and_emergency_summary_generations()
     let model = || -> Arc<dyn Model> { crate::test_support::ScriptedModel::inert("main", 10_000) };
     let (sink, mut events) = AgentEventSink::channel(8);
     let compaction = crate::compaction::CompactionState::new();
-    let presentation = Presentation::new(SessionId::new().unwrap(), sink, Arc::clone(&compaction));
+    let presentation = Presentation::new(
+        SessionId::new().unwrap(),
+        crate::test_support::load_id(),
+        sink,
+        Arc::clone(&compaction),
+    );
     presentation.set_model_label("main".to_owned());
     let old = model();
     presentation.install_model(&old);

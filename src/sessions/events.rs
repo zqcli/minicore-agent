@@ -57,6 +57,7 @@ fn tool_execution_event(
         data,
         meta: EventMeta {
             session_id,
+            load: session.load(),
             loop_id: Some(*loop_id),
             dropped_before: 0,
         },
@@ -91,15 +92,15 @@ fn map_loop_event(
     };
     let meta = EventMeta {
         session_id,
+        load: session.load(),
         loop_id: Some(loop_id),
         dropped_before: 0,
     };
     match event {
         minicore_runtime::LoopEvent::Started { .. } => Some(AgentEvent::TurnStarted { turn, meta }),
-        minicore_runtime::LoopEvent::StateChanged { .. } => Some(AgentEvent::SessionState {
-            state: session.state(),
-            meta,
-        }),
+        // Runtime control changes are projected by the reliable snapshot; the
+        // best-effort compatibility notification carries no authority.
+        minicore_runtime::LoopEvent::StateChanged { .. } => None,
         minicore_runtime::LoopEvent::RequestStarted {
             config_revision,
             model,
@@ -272,23 +273,5 @@ fn loop_failure_kind(kind: &minicore_runtime::LoopFailureKind) -> &'static str {
         minicore_runtime::LoopFailureKind::MaxToolRounds => "max_tool_rounds",
         minicore_runtime::LoopFailureKind::Internal => "internal",
         _ => "internal",
-    }
-}
-
-impl Session {
-    pub(super) fn emit_state(&self) {
-        let state = self.state();
-        let loop_id = state
-            .active_loop
-            .as_ref()
-            .map(|loop_state| loop_state.loop_id);
-        self.shared.events.try_send(AgentEvent::SessionState {
-            meta: EventMeta {
-                session_id: state.session_id,
-                loop_id,
-                dropped_before: 0,
-            },
-            state,
-        });
     }
 }

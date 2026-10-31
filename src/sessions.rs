@@ -35,7 +35,7 @@ use crate::event::{
     OutputChannel, ToolProgressView, ToolResultView,
 };
 use crate::history::{GetHistory, HistoryPage, normalize_history, page_history};
-use crate::ids::SessionId;
+use crate::ids::{LoadId, SessionId};
 use crate::prompt::ProjectPromptProvider;
 use crate::read::InterruptedRequest;
 use crate::store::{Store, StoredLoopOutcome, StoredLoopRecord, SummaryCommit, utc_timestamp};
@@ -45,31 +45,45 @@ use crate::tools::observe::ToolObserver;
 use crate::workspace::{Workspace, WorkspaceError};
 
 mod active_loop;
+mod boundary;
 mod budget;
 mod compact;
 mod events;
+pub(crate) mod hub;
 mod inputs;
+mod observer;
 mod registry;
+pub(crate) mod results;
 mod status_workers;
 mod types;
 
 #[cfg(test)]
 use active_loop::EphemeralSummaryCleanup;
-use active_loop::{ActiveLoop, CompletionGuard, LoopRun, SessionTask};
+use active_loop::{ActiveLoop, CompletionGuard, LoopRun, SessionTask, Successor};
 pub(crate) use active_loop::{TurnCompletion, await_compaction_completion, await_turn_completion};
+pub(crate) use boundary::RequestBoundary;
 pub(crate) use events::forward_loop_event;
+pub(crate) use hub::SnapshotHub;
 #[cfg(test)]
 pub(crate) use inputs::MAX_QUEUED_INPUTS;
 use inputs::{Close, Entry, QueueState, SessionInputs};
 pub use inputs::{
-    DeliveredInput, InputMode, InputPushed, InputRemoved, InputsRecalled, InputsResumed, PushInput,
-    Queue, QueueItem, RemoveInput, StartedTurn,
+    DeliveredInput, InputMode, InputPushed, InputRemoved, InputStartError, InputsRecalled,
+    InputsResumed, PushInput, Queue, QueueItem, RemoveInput, StartedTurn,
 };
 pub(crate) use registry::Sessions;
+pub(crate) use results::PreparedSource;
+use results::ReservedSource;
+pub(crate) use results::ResultCatalog;
+pub use results::{
+    CompletionEntry, CompletionKind, CompletionOutcome, CompletionWindow, ResultAvailability,
+    UnavailableReason,
+};
 use status_workers::StatusWorkers;
 pub use types::{
     CompactionPhase, CompactionProgress, ContextBudget, SessionBlockReason, SessionContext,
-    SessionState, SessionStatus, SummaryCoverage, TurnPersistence, TurnRef, TurnResult,
+    SessionExecution, SessionSnapshot, SessionState, SessionStatus, SnapshotInteraction,
+    SummaryCoverage, TurnPersistence, TurnRef, TurnResult,
 };
 
 #[cfg(test)]
@@ -81,6 +95,12 @@ pub(crate) static PAUSE_AFTER_COMPACTION_RESULT: Registry<SessionId, Arc<Gate>> 
 #[cfg(test)]
 pub(crate) static PAUSE_AFTER_RUNTIME_START: Registry<SessionId, Arc<Gate>> = Registry::new();
 #[cfg(test)]
+pub(crate) static PAUSE_OBSERVER_INITIAL: Registry<SessionId, Arc<Gate>> = Registry::new();
+#[cfg(test)]
+pub(crate) static FAIL_RUNTIME_START: Registry<SessionId> = Registry::new();
+#[cfg(test)]
+pub(crate) static PAUSE_AFTER_SUCCESSOR_INSTALL: Registry<SessionId, Arc<Gate>> = Registry::new();
+#[cfg(test)]
 pub(crate) static INSTALLED_LOOP_OPTIONS: Registry<LoopId, LoopOptions> = Registry::new();
 
 /// A loaded product session. Cheap to clone and shared with the per-loop
@@ -88,6 +108,13 @@ pub(crate) static INSTALLED_LOOP_OPTIONS: Registry<LoopId, LoopOptions> = Regist
 #[derive(Clone)]
 pub(crate) struct Session {
     shared: Arc<SessionShared>,
+}
+
+impl Session {
+    /// Rebuilds a handle from the shared state a registration keeps weakly.
+    pub(in crate::sessions) fn from_shared(shared: Arc<SessionShared>) -> Self {
+        Self { shared }
+    }
 }
 
 pub(crate) struct ReadSnapshot {
@@ -100,6 +127,9 @@ struct SessionShared {
     /// Short critical sections; never holds across an await, I/O, or join.
     inner: Mutex<SessionInner>,
     session_id: SessionId,
+    load: LoadId,
+    hub: Arc<SnapshotHub>,
+    results: Arc<ResultCatalog>,
     /// The queued user inputs. Lock order is `inner` before `queue`; `take`
     /// (called by the runner task) locks only `queue`. Never held across an
     /// await.
@@ -123,6 +153,8 @@ struct SessionShared {
 impl Drop for SessionShared {
     fn drop(&mut self) {
         self.close.cancel();
+        self.results.remove(self.load);
+        self.hub.unregister(self.load);
     }
 }
 
@@ -144,6 +176,10 @@ struct SessionInner {
     finished: VecDeque<(TurnRef, watch::Receiver<Option<TurnCompletion>>)>,
     blocked: Option<SessionBlockReason>,
     closing: bool,
+    closed: bool,
+    last_saved: Option<LoopId>,
+    uncertain_loop: Option<LoopId>,
+    revision: u64,
     compaction: Option<Arc<CompactionOperation>>,
     // Cancellable admission while completed workers are still being reaped.
     pending_compaction: Option<Arc<CompactionOperation>>,
@@ -252,6 +288,7 @@ impl Session {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         stored: crate::store::StoredSession,
         workspace: Arc<Workspace>,
@@ -259,6 +296,9 @@ impl Session {
         policy: CompactionPolicy,
         store: Store,
         events: AgentEventSink,
+        hub: Arc<SnapshotHub>,
+        results: Arc<ResultCatalog>,
+        last_saved: Option<LoopId>,
     ) -> Self {
         let crate::store::StoredSession {
             record,
@@ -267,6 +307,7 @@ impl Session {
             history_index: _,
         } = stored;
         let crate::agent::SessionSetup {
+            load,
             parts,
             tool_data,
             config,
@@ -294,6 +335,10 @@ impl Session {
             finished: VecDeque::new(),
             blocked: None,
             closing: false,
+            closed: false,
+            last_saved,
+            uncertain_loop: None,
+            revision: 0,
             compaction: None,
             pending_compaction: None,
             compaction_progress: None,
@@ -301,9 +346,13 @@ impl Session {
             policy,
             used_compaction_ids: BTreeSet::new(),
         };
-        Self {
+        results.register(load);
+        let session = Self {
             shared: Arc::new(SessionShared {
                 session_id: inner.record.session_id,
+                load,
+                hub: Arc::clone(&hub),
+                results,
                 queue: Mutex::new(QueueState::default()),
                 inner: Mutex::new(inner),
                 io: tokio::sync::Mutex::new(()),
@@ -316,11 +365,44 @@ impl Session {
                 tool_owners,
                 tool_observer,
             }),
-        }
+        };
+        hub.register(load, &session);
+        session
     }
 
     pub(crate) fn session_id(&self) -> SessionId {
         self.shared.session_id
+    }
+
+    pub(crate) fn load(&self) -> LoadId {
+        self.shared.load
+    }
+
+    /// Marks the load for a reliable control snapshot.
+    pub(crate) fn mark_dirty(&self) {
+        self.shared.hub.mark(self.shared.load);
+    }
+
+    fn unregister(&self) {
+        {
+            let _publication = self.shared.results.publication();
+            self.lock_inner().closed = true;
+        }
+        self.shared.hub.unregister(self.load());
+        self.shared.results.remove(self.load());
+    }
+
+    pub(crate) fn result_catalog(&self) -> &ResultCatalog {
+        &self.shared.results
+    }
+
+    pub(crate) fn uncertain_loop(&self) -> Option<LoopId> {
+        self.lock_inner().uncertain_loop
+    }
+
+    #[cfg(test)]
+    pub(crate) fn result_catalog_for_test(&self) -> Arc<ResultCatalog> {
+        Arc::clone(&self.shared.results)
     }
 
     pub(crate) fn record(&self) -> crate::store::SessionRecord {
@@ -357,7 +439,16 @@ impl Session {
     }
 
     pub(crate) fn state(&self) -> SessionState {
-        let inner = self.lock_inner();
+        self.sample().expect("snapshot revision overflow").0
+    }
+
+    pub(crate) fn sample(&self) -> Result<(SessionState, SessionSnapshot), AgentError> {
+        let _publication = self.shared.results.publication();
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return Err(AgentError::StaleLoad);
+        }
+        let queue = self.lock_queue();
         let completion = inner
             .active
             .as_ref()
@@ -376,7 +467,7 @@ impl Session {
                 if active.completion.borrow().is_some() {
                     SessionStatus::Idle
                 } else {
-                    match active.handle.state().status {
+                    match active_loop.as_ref().expect("unfinished active loop").status {
                         minicore_runtime::LoopStatus::Starting
                         | minicore_runtime::LoopStatus::RunningModel
                         | minicore_runtime::LoopStatus::RunningTools => SessionStatus::Running,
@@ -390,13 +481,60 @@ impl Session {
                 }
             }
         };
-        SessionState {
+        let state = SessionState {
             session_id: inner.record.session_id,
             status,
             active_loop,
             block_reason: inner.blocked,
             compaction: inner.compaction_progress.clone(),
-        }
+        };
+        let execution = if let Some(entry) = &queue.starting {
+            SessionExecution::Starting {
+                input: entry.item(),
+            }
+        } else if let Some(active) = inner.active.as_ref().filter(|_| completion.is_none()) {
+            let runtime = state.active_loop.as_ref().expect("unfinished active loop");
+            match runtime.status {
+                minicore_runtime::LoopStatus::Finishing
+                | minicore_runtime::LoopStatus::Finished => SessionExecution::Finishing {
+                    loop_id: active.turn.loop_id,
+                    input: active.input.clone(),
+                    request_index: runtime.request_index,
+                },
+                _ => SessionExecution::Running {
+                    loop_id: active.turn.loop_id,
+                    input: active.input.clone(),
+                    request_index: runtime.request_index,
+                    phase: crate::event::LoopStateView::from_runtime(runtime).status,
+                },
+            }
+        } else {
+            SessionExecution::None
+        };
+        let pending_interaction = state.active_loop.as_ref().and_then(|runtime| {
+            runtime
+                .pending_interaction
+                .as_ref()
+                .map(|interaction| SnapshotInteraction {
+                    loop_id: runtime.loop_id,
+                    request_index: runtime.request_index,
+                    interaction: interaction.into(),
+                })
+        });
+        let completions = self.shared.results.window(self.load());
+        inner.revision = inner.revision.checked_add(1).ok_or(AgentError::Internal)?;
+        let snapshot = SessionSnapshot {
+            session_id: state.session_id,
+            load: self.load(),
+            revision: inner.revision,
+            execution,
+            pending_interaction,
+            queue: queue.view(),
+            compaction: state.compaction.clone(),
+            block_reason: state.block_reason,
+            completions,
+        };
+        Ok((state, snapshot))
     }
 
     pub(crate) fn read_snapshot(&self) -> ReadSnapshot {
@@ -465,6 +603,8 @@ impl Session {
         // A reload is a settings change: bumping the config generation in one
         // step invalidates tickets bound to the previous configuration.
         self.shared.compaction.note_settings_installed();
+        drop(inner);
+        self.mark_dirty();
     }
 
     /// Persists the new record and swaps the long-lived execution config.
@@ -506,7 +646,12 @@ impl Session {
             inner.presentation.set_model_label(record.model.clone());
             inner.presentation.install_model(config.model());
             inner.record = record;
-            let update_config = config.clone();
+            let update_config = match &inner.active {
+                Some(active) => {
+                    boundary::observe_config(&config, &active.boundary, active.generation)?
+                }
+                None => config.clone(),
+            };
             inner.config = config;
             inner.auto = auto;
             inner.options = options;
@@ -516,6 +661,7 @@ impl Session {
                 update_config,
             )
         };
+        self.mark_dirty();
         let Some(handle) = handle else {
             return Ok(None);
         };
@@ -558,18 +704,37 @@ impl Session {
         }
     }
 
-    pub(crate) async fn shutdown(self) -> Result<(), AgentError> {
-        self.begin_shutdown();
-        self.join_shutdown().await
+    pub(crate) fn begin_close(&self) -> Result<(), AgentError> {
+        let mut inner = self.lock_inner();
+        let queue = self.lock_queue();
+        if !queue.items.is_empty() || queue.starting.is_some() {
+            return Err(AgentError::SessionBusy);
+        }
+        inner.closing = true;
+        self.shared.close.cancel();
+        if let Some(active) = &inner.active {
+            active.handle.shutdown();
+        }
+        for operation in inner.compaction.iter().chain(&inner.pending_compaction) {
+            operation.cancel();
+        }
+        drop(queue);
+        drop(inner);
+        self.mark_dirty();
+        Ok(())
     }
 
     /// Joins all owned work after `begin_shutdown` has stopped new admission.
     pub(crate) async fn join_shutdown(self) -> Result<(), AgentError> {
         let session_id = self.session_id();
-        let (active_task, compaction) = {
+        let (active_task, observer, compaction) = {
             let inner = self.lock_inner();
             (
                 inner.active.as_ref().map(|active| active.task.clone()),
+                inner
+                    .active
+                    .as_ref()
+                    .map(|active| Arc::clone(&active._observer.task)),
                 inner.compaction.clone(),
             )
         };
@@ -580,6 +745,12 @@ impl Session {
             }
             let mut inner = self.lock_inner();
             Self::clear_active_task(&mut inner, &task);
+        }
+        if let Some(observer) = observer
+            && observer.join().await.is_err()
+            && first_error.is_none()
+        {
+            first_error = Some(AgentError::Internal);
         }
         if let Some(compaction) = compaction {
             if compaction.join().await.is_err() && first_error.is_none() {
@@ -607,6 +778,7 @@ impl Session {
         // before the Session reports closure: a command is only finished when
         // its owner really reaped it.
         self.shared.tool_owners.join_all().await;
+        self.shared.hub.publish_final(self.clone()).await;
         first_error.map_or(Ok(()), Err)
     }
 }

@@ -13,8 +13,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    Agent, AnswerInteraction, CompactSession, CreateSession, PushInput, RemoveInput, RenameSession,
-    UpdateSession,
+    Agent, CompactSession, CreateSession, PushInput, RemoveInput, RenameSession, UpdateSession,
 };
 use crate::changes::{ChangesListRequest, change_deadline};
 use crate::diff::{ChangesDiffRequest, diff_deadline};
@@ -32,13 +31,14 @@ use super::protocol::{
     AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, CompactResult, EmptyParams,
     INPUT_NOT_QUEUED, INPUT_QUEUE_FULL, INTERACTION_NOT_FOUND, INTERNAL_ERROR, INVALID_PARAMS,
     INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE, InteractionAnswerParams,
-    METHOD_NOT_FOUND, MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR, PROFILE_NOT_FOUND,
-    ProfilesResult, QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE, RESOURCE_EXHAUSTED,
-    RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY,
-    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STORE_ERROR, SessionHistoryParams, SessionParams,
-    SessionResult, SessionUpdateResult, SessionsResult, TOOL_NOT_FOUND, TURN_NOT_FOUND,
-    ToolOutputParams, ToolReadParams, TurnParams, TurnResultParams, TurnWaitResult,
-    WORKSPACE_ERROR, decode_params, parse_request, request_id,
+    METHOD_NOT_FOUND, MISSING_LOAD, MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR,
+    PROFILE_NOT_FOUND, ProfilesResult, QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE,
+    RESOURCE_EXHAUSTED, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse,
+    SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STALE_LOAD, STALE_RESULT,
+    STORE_ERROR, SessionHistoryParams, SessionParams, SessionResult, SessionStateResult,
+    SessionUpdateResult, SessionsResult, TOOL_NOT_FOUND, TURN_NOT_FOUND, ToolOutputParams,
+    ToolReadParams, TurnParams, TurnResultParams, TurnWaitResult, WORKSPACE_ERROR, decode_params,
+    parse_request, request_id,
 };
 mod dispatch;
 mod errors;
@@ -48,15 +48,17 @@ use dispatch::METHODS;
 #[cfg(test)]
 use dispatch::canonical_method;
 use errors::{
-    agent_error, agent_result, invalid_params, method_not_found, params_or_error, query_error,
-    resource_exhausted, success,
+    accepted_input_response, agent_error, agent_result, invalid_params, method_not_found,
+    params_or_error, query_error, resource_exhausted, success,
 };
+pub(crate) use io::MAX_RPC_FRAME_BYTES;
 #[cfg(test)]
 use io::MAX_RPC_LINE_BYTES;
+
 use io::{Frame, parse_frame, pump_events, read_frame, run_writer, shutdown_signal};
 const OUTBOUND_CAPACITY: usize = 128;
-/// Upper bound on concurrently registered deferred waiters and read queries.
-/// These tasks are client-driven, so an unbounded count is a resource leak.
+pub(crate) const WRITER_BUFFER_BYTES: usize = 8 * 1024;
+/// Shared admission ceiling, excluding control samples needed to drain full waiters.
 const MAX_DEFERRED_WAITERS: usize = 32;
 /// Read scans are heavier than wait notifications, so keep a smaller query
 /// subset while retaining the shared deferred admission ceiling above.
@@ -66,7 +68,7 @@ pub async fn run_stdio(agent: Agent) -> Result<(), AgentError> {
     run_with_io(
         agent,
         BufReader::new(tokio_io::stdin()),
-        BufWriter::new(tokio_io::stdout()),
+        BufWriter::with_capacity(WRITER_BUFFER_BYTES, tokio_io::stdout()),
         shutdown_signal(),
     )
     .await
@@ -143,6 +145,12 @@ static OPERATION_GATES: crate::test_support::Registry<
     std::sync::Arc<crate::test_support::Gate>,
 > = crate::test_support::Registry::new();
 
+#[cfg(test)]
+static SNAPSHOT_REPLY_GATES: crate::test_support::Registry<
+    crate::ids::SessionId,
+    std::sync::Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
 struct DeferredResult {
     reservation: Option<Reservation>,
     apply: ApplyOperation,
@@ -163,6 +171,17 @@ enum StopReason {
 }
 
 impl RpcServer {
+    fn spawn_snapshot_reply(&mut self, reply: OperationReply) -> Dispatch {
+        let OperationReply::Waiter(future) = reply else {
+            unreachable!("snapshot replies are deferred");
+        };
+        let outbound = self.outbound_tx.clone();
+        self.queries.spawn(async move {
+            let _ = outbound.send(RpcOutbound::Response(future.await)).await;
+        });
+        Dispatch::Deferred
+    }
+
     async fn run<R, S>(
         mut self,
         reader: &mut R,

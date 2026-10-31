@@ -1,5 +1,6 @@
 mod admission;
 mod bash;
+mod boundary;
 mod cancellation;
 #[cfg(unix)]
 mod changes;
@@ -13,6 +14,7 @@ mod interrupted;
 mod legacy;
 mod lifecycle;
 mod model_update;
+mod observer;
 mod open;
 mod openai_recovery;
 mod persistence;
@@ -54,7 +56,6 @@ mod fixture;
 use fixture::AgentFixture;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 

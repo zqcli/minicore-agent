@@ -12,10 +12,10 @@ use minicore_runtime::tools::{ApprovalRisk, ToolInputAnswerKind, ToolProgress, T
 use minicore_runtime::{InteractionId, LoopId, ToolCallId};
 
 use crate::agent::SessionInfo;
-use crate::ids::SessionId;
+use crate::ids::{LoadId, SessionId};
 use crate::sessions::{
-    CompactionProgress, DeliveredInput, Queue, SessionBlockReason, SessionState, SessionStatus,
-    StartedTurn, TurnPersistence, TurnRef,
+    CompactionProgress, DeliveredInput, Queue, SessionBlockReason, SessionSnapshot, SessionState,
+    SessionStatus, StartedTurn, TurnPersistence, TurnRef,
 };
 use crate::tool_data::{ToolExecutionData, ToolInvocationData, ToolProcessData};
 
@@ -23,29 +23,36 @@ use crate::tool_data::{ToolExecutionData, ToolInvocationData, ToolProcessData};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct EventMeta {
     pub session_id: SessionId,
+    /// The loaded instance the observation belongs to; a reopened Session has
+    /// a different load, so a late event can never be applied to the new one.
+    pub load: LoadId,
     pub loop_id: Option<LoopId>,
     pub dropped_before: u64,
 }
 
 impl EventMeta {
-    pub(crate) fn session(session_id: SessionId) -> Self {
+    pub(crate) fn session(session_id: SessionId, load: LoadId) -> Self {
         Self {
             session_id,
+            load,
             loop_id: None,
             dropped_before: 0,
         }
     }
 
-    pub(crate) fn for_turn(turn: TurnRef) -> Self {
+    pub(crate) fn for_turn(turn: TurnRef, load: LoadId) -> Self {
         Self {
             loop_id: Some(turn.loop_id),
-            ..Self::session(turn.session_id)
+            ..Self::session(turn.session_id, load)
         }
+    }
+
+    pub(crate) fn for_session(load: LoadId, session_id: SessionId) -> Self {
+        Self::session(session_id, load)
     }
 }
 
-/// Best-effort live events. Events never participate in correctness; the
-/// authoritative results are `turn.wait` and `session.history`.
+/// Load-scoped control observations and best-effort body notifications.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -60,6 +67,12 @@ pub enum AgentEvent {
     SessionState {
         #[serde(serialize_with = "serialize_session_state")]
         state: SessionState,
+        meta: EventMeta,
+    },
+    /// The reliable control observation for one loaded Session. Applying it
+    /// replaces the TUI's whole control projection for that load.
+    SessionSnapshot {
+        snapshot: SessionSnapshot,
         meta: EventMeta,
     },
     TurnStarted {
@@ -208,6 +221,8 @@ impl AgentEvent {
     fn is_lifecycle(&self) -> bool {
         match self {
             Self::OutputDelta { .. } | Self::ToolProgress { .. } => false,
+            // Control snapshots travel on their own reliable lane.
+            Self::SessionSnapshot { .. } => true,
             Self::ToolArgumentsPreview {
                 revision, state, ..
             } => {
@@ -229,6 +244,7 @@ impl AgentEvent {
         SessionOpened,
         SessionClosed,
         SessionState,
+        SessionSnapshot,
         TurnStarted,
         RequestStarted,
         RequestUsage,
@@ -262,28 +278,43 @@ pub(crate) enum AgentSendResult {
 pub(crate) struct AgentEventSink {
     sender: mpsc::Sender<AgentEvent>,
     lifecycle: mpsc::Sender<AgentEvent>,
+    control: mpsc::Sender<ChargedEvent>,
     drop_state: Arc<Mutex<DropState>>,
+    control_failed: tokio_util::sync::CancellationToken,
 }
 
 struct DropState {
     pending: u64,
 }
 
+/// A control frame whose budget charge lives until the frame is written.
+pub(crate) struct ChargedEvent {
+    pub(crate) event: AgentEvent,
+    /// Held until the frame and the writer's buffers are released.
+    pub(crate) charge: crate::sessions::hub::SnapshotCharge,
+}
+
 impl AgentEventSink {
     pub(crate) fn channel(capacity: usize) -> (Self, AgentEventStream) {
         let (sender, receiver) = mpsc::channel(capacity);
         let (lifecycle, lifecycle_rx) = mpsc::channel(64);
+        let (control, control_rx) = mpsc::channel(64);
         let drop_state = Arc::new(Mutex::new(DropState { pending: 0 }));
+        let control_failed = tokio_util::sync::CancellationToken::new();
         let stream = AgentEventStream {
             receiver,
             lifecycle: lifecycle_rx,
+            control: control_rx,
             drop_state: Arc::clone(&drop_state),
+            control_failed: control_failed.clone(),
         };
         (
             Self {
                 sender,
                 lifecycle,
+                control,
                 drop_state,
+                control_failed,
             },
             stream,
         )
@@ -303,6 +334,24 @@ impl AgentEventSink {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AgentSendResult::Closed,
         }
+    }
+
+    /// Publishes one control snapshot, waiting for control capacity instead of
+    /// dropping it. Returns `false` once the consumer is gone.
+    pub(crate) async fn send_snapshot(
+        &self,
+        event: AgentEvent,
+        charge: crate::sessions::hub::SnapshotCharge,
+        stopped: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            sent = self.control.send(ChargedEvent { event, charge }) => sent.is_ok(),
+            _ = stopped.cancelled() => false,
+        }
+    }
+
+    pub(crate) fn close_control(&self) {
+        self.control_failed.cancel();
     }
 
     pub(crate) fn record_core_drops(&self, dropped: u64) {
@@ -695,32 +744,36 @@ impl From<&SessionState> for SessionStateView {
         Self {
             session_id: state.session_id,
             status: state.status,
-            active_loop: state.active_loop.as_ref().map(|loop_state| LoopStateView {
-                loop_id: loop_state.loop_id,
-                status: match loop_state.status {
-                    minicore_runtime::LoopStatus::Starting => LoopStatusView::Starting,
-                    minicore_runtime::LoopStatus::RunningModel => LoopStatusView::RunningModel,
-                    minicore_runtime::LoopStatus::RunningTools => LoopStatusView::RunningTools,
-                    minicore_runtime::LoopStatus::WaitingForInput => {
-                        LoopStatusView::WaitingForInput
-                    }
-                    minicore_runtime::LoopStatus::Finishing => LoopStatusView::Finishing,
-                    minicore_runtime::LoopStatus::Finished => LoopStatusView::Finished,
-                    _ => LoopStatusView::Unknown,
-                },
-                request_index: loop_state.request_index,
-                config_revision: loop_state.config_revision,
-                model: loop_state
-                    .model
-                    .as_ref()
-                    .map(|model| model.as_str().to_owned()),
-                pending_interaction: loop_state
-                    .pending_interaction
-                    .as_ref()
-                    .map(PendingInteractionView::from),
-            }),
+            active_loop: state.active_loop.as_ref().map(LoopStateView::from_runtime),
             block_reason: state.block_reason,
             compaction: state.compaction.clone(),
+        }
+    }
+}
+
+impl LoopStateView {
+    pub(crate) fn from_runtime(loop_state: &minicore_runtime::LoopState) -> Self {
+        Self {
+            loop_id: loop_state.loop_id,
+            status: match loop_state.status {
+                minicore_runtime::LoopStatus::Starting => LoopStatusView::Starting,
+                minicore_runtime::LoopStatus::RunningModel => LoopStatusView::RunningModel,
+                minicore_runtime::LoopStatus::RunningTools => LoopStatusView::RunningTools,
+                minicore_runtime::LoopStatus::WaitingForInput => LoopStatusView::WaitingForInput,
+                minicore_runtime::LoopStatus::Finishing => LoopStatusView::Finishing,
+                minicore_runtime::LoopStatus::Finished => LoopStatusView::Finished,
+                _ => LoopStatusView::Unknown,
+            },
+            request_index: loop_state.request_index,
+            config_revision: loop_state.config_revision,
+            model: loop_state
+                .model
+                .as_ref()
+                .map(|model| model.as_str().to_owned()),
+            pending_interaction: loop_state
+                .pending_interaction
+                .as_ref()
+                .map(PendingInteractionView::from),
         }
     }
 }
@@ -736,22 +789,56 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Single-consumer event stream, prioritizing lifecycle over queued streaming data.
+pub(crate) fn snapshot_frame_len(event: &AgentEvent) -> usize {
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        jsonrpc: &'static str,
+        method: &'static str,
+        params: &'a AgentEvent,
+    }
+    crate::budget::encoded_len(&Envelope {
+        jsonrpc: "2.0",
+        method: "agent.event",
+        params: event,
+    })
+}
+
+/// Single-consumer control, lifecycle, and body observations with drop accounting.
 pub struct AgentEventStream {
     receiver: mpsc::Receiver<AgentEvent>,
     lifecycle: mpsc::Receiver<AgentEvent>,
+    control: mpsc::Receiver<ChargedEvent>,
     drop_state: Arc<Mutex<DropState>>,
+    control_failed: tokio_util::sync::CancellationToken,
 }
 
 impl AgentEventStream {
+    /// Receives reliable control before compatibility lifecycle and streaming data.
     pub async fn recv(&mut self) -> Option<AgentEvent> {
-        let event = tokio::select! {
-            biased;
-            Some(event) = self.lifecycle.recv() => event,
-            Some(event) = self.receiver.recv() => event,
-            else => return None,
+        self.recv_owned().await.map(|(event, _charge)| event)
+    }
+
+    pub(crate) async fn recv_owned(
+        &mut self,
+    ) -> Option<(AgentEvent, Option<crate::sessions::hub::SnapshotCharge>)> {
+        let received = tokio::select! {
+            _ = self.control_failed.cancelled() => None,
+            received = async {
+                tokio::select! {
+                    biased;
+                    Some(charged) = self.control.recv() => Some((charged.event, Some(charged.charge))),
+                    Some(event) = self.lifecycle.recv() => Some((event, None)),
+                    Some(event) = self.receiver.recv() => Some((event, None)),
+                    else => None,
+                }
+            } => received,
         };
-        Some(self.delivered(event))
+        let (event, charge) = received?;
+        Some((self.delivered(event), charge))
+    }
+
+    pub(crate) fn control_failed(&self) -> bool {
+        self.control_failed.is_cancelled()
     }
 
     /// Attaches every drop recorded since the previous delivery.

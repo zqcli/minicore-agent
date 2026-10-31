@@ -1,5 +1,33 @@
 use super::*;
 
+/// Returns the next event that is not a control observation.
+async fn next_non_control(events: &mut crate::AgentEventStream) -> AgentEvent {
+    loop {
+        let event = events.recv().await.expect("event stream ended");
+        if !matches!(
+            event,
+            AgentEvent::SessionSnapshot { .. } | AgentEvent::SessionState { .. }
+        ) {
+            return event;
+        }
+    }
+}
+
+/// Confirms only control observations are pending: the reliable snapshot lane
+/// plus its best-effort compatibility notification. Neither is part of what
+/// these lifecycle tests assert.
+fn only_control_pending(events: &mut crate::AgentEventStream) -> bool {
+    while let Some(event) = events.try_recv() {
+        if !matches!(
+            event,
+            AgentEvent::SessionSnapshot { .. } | AgentEvent::SessionState { .. }
+        ) {
+            panic!("unexpected non-control event: {event:?}");
+        }
+    }
+    true
+}
+
 #[tokio::test]
 async fn create_and_open_do_not_start_agent_loop() {
     let fixture = AgentFixture::new("open-no-loop").file("a.txt", b"hello");
@@ -35,11 +63,7 @@ async fn create_and_loaded_open_emit_session_opened_once() {
     let mut events = agent.take_events().unwrap();
 
     let info = create_session(&mut agent, &workspace).await;
-    match events
-        .recv()
-        .await
-        .expect("create must publish SessionOpened")
-    {
+    match next_non_control(&mut events).await {
         AgentEvent::SessionOpened { session, meta } => {
             assert_eq!(session, info);
             assert_eq!(meta.session_id, info.session_id);
@@ -59,14 +83,10 @@ async fn create_and_loaded_open_emit_session_opened_once() {
         &created_presentation,
         &loaded_session.presentation()
     ));
-    assert!(futures_util::poll!(pin!(events.recv())).is_pending());
+    assert!(only_control_pending(&mut events));
 
     agent.close_session(info.session_id).await.unwrap();
-    match events
-        .recv()
-        .await
-        .expect("close must publish SessionClosed")
-    {
+    match next_non_control(&mut events).await {
         AgentEvent::SessionClosed {
             session_id: closed_id,
             meta,
@@ -89,11 +109,7 @@ async fn create_and_loaded_open_emit_session_opened_once() {
         &created_session.presentation(),
         &reopened_session.presentation()
     ));
-    match events
-        .recv()
-        .await
-        .expect("reopen must publish SessionOpened")
-    {
+    match next_non_control(&mut events).await {
         AgentEvent::SessionOpened { session, meta } => {
             assert_eq!(session, info);
             assert_eq!(meta.session_id, info.session_id);
@@ -101,7 +117,6 @@ async fn create_and_loaded_open_emit_session_opened_once() {
         }
         event => panic!("unexpected reopen event: {event:?}"),
     }
-    assert!(futures_util::poll!(pin!(events.recv())).is_pending());
 }
 
 #[tokio::test]

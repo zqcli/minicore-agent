@@ -79,6 +79,8 @@ async fn a_cancelled_stream_is_readable_after_reopen_but_never_reaches_a_model()
     assert_eq!(result.interrupted.as_ref(), Some(&expected));
     let turn_request = TurnResultRequest {
         turn,
+        load: Some(agent.loaded_session(session_id).unwrap().load().to_string()),
+        result_id: None,
         cursor: None,
         limit: 100,
         max_bytes: None,
