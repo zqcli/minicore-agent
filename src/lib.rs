@@ -32,6 +32,8 @@ pub mod cli;
 mod compaction;
 mod config;
 mod diff;
+#[cfg(feature = "e2e-observe")]
+mod e2e_observe;
 mod error;
 mod event;
 mod history;
@@ -46,6 +48,8 @@ mod read;
 mod rpc;
 mod sessions;
 pub(crate) mod store;
+#[cfg(any(test, feature = "e2e-observe"))]
+mod test_gate;
 #[cfg(test)]
 mod test_support;
 mod text;

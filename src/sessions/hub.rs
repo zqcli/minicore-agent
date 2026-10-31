@@ -17,6 +17,12 @@ use crate::ids::LoadId;
 /// Most Sessions one publication round samples, so no Session starves another.
 const MAX_BATCH: usize = 16;
 
+#[cfg(test)]
+pub(crate) static SNAPSHOT_PUBLISH_GATES: crate::test_support::Registry<
+    LoadId,
+    Arc<crate::test_support::Gate>,
+> = crate::test_support::Registry::new();
+
 /// Ceiling for control snapshots held, encoded, or queued for the wire.
 pub(crate) const SNAPSHOT_BUDGET_BYTES: usize = 320 * 1024 * 1024;
 pub(crate) const SNAPSHOT_RESERVATION_BYTES: usize =
@@ -33,21 +39,44 @@ struct SnapshotBudget {
 pub(crate) struct SnapshotCharge {
     budget: Arc<SnapshotBudget>,
     bytes: usize,
+    #[cfg(feature = "e2e-observe")]
+    key: Option<crate::e2e_observe::SnapshotKey>,
 }
 
 impl SnapshotCharge {
     pub(crate) fn shrink(&mut self, bytes: usize) {
         assert!(bytes <= self.bytes);
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::sub(crate::e2e_observe::Gauge::ControlBytes, self.bytes - bytes);
         self.budget
             .used
             .fetch_sub(self.bytes - bytes, Ordering::SeqCst);
         self.bytes = bytes;
         self.budget.notify.notify_waiters();
     }
+
+    #[cfg(feature = "e2e-observe")]
+    pub(crate) fn observe(&mut self, snapshot: &crate::SessionSnapshot) {
+        self.key = Some(crate::e2e_observe::SnapshotKey {
+            session_id: snapshot.session_id,
+            load: snapshot.load,
+            revision: snapshot.revision,
+        });
+    }
+
+    #[cfg(feature = "e2e-observe")]
+    pub(crate) fn observed_key(&self) -> Option<crate::e2e_observe::SnapshotKey> {
+        self.key
+    }
 }
 
 impl Drop for SnapshotCharge {
     fn drop(&mut self) {
+        #[cfg(feature = "e2e-observe")]
+        {
+            crate::e2e_observe::sub(crate::e2e_observe::Gauge::ControlBytes, self.bytes);
+            crate::e2e_observe::sub(crate::e2e_observe::Gauge::Controls, 1);
+        }
         self.budget.used.fetch_sub(self.bytes, Ordering::SeqCst);
         self.budget.notify.notify_waiters();
     }
@@ -90,9 +119,16 @@ impl SnapshotBudget {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
+                    #[cfg(feature = "e2e-observe")]
+                    {
+                        crate::e2e_observe::add(crate::e2e_observe::Gauge::ControlBytes, bytes);
+                        crate::e2e_observe::add(crate::e2e_observe::Gauge::Controls, 1);
+                    }
                     return Some(SnapshotCharge {
                         budget: Arc::clone(self),
                         bytes,
+                        #[cfg(feature = "e2e-observe")]
+                        key: None,
                     });
                 }
                 Err(current) => used = current,
@@ -277,8 +313,14 @@ impl SnapshotHub {
         };
         let prepared = tokio::task::spawn_blocking(move || {
             let (state, snapshot) = session.sample()?;
+            #[cfg(feature = "e2e-observe")]
+            charge.observe(&snapshot);
             let session_id = session.session_id();
             drop(session);
+            #[cfg(test)]
+            if let Some(gate) = SNAPSHOT_PUBLISH_GATES.take(&load) {
+                gate.pass_blocking();
+            }
             let event = AgentEvent::SessionSnapshot {
                 snapshot,
                 meta: EventMeta::for_session(load, session_id),

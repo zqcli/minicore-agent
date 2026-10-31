@@ -59,7 +59,9 @@ mod types;
 
 #[cfg(test)]
 use active_loop::EphemeralSummaryCleanup;
-use active_loop::{ActiveLoop, CompletionGuard, LoopRun, SessionTask, Successor};
+#[cfg(test)]
+pub(crate) use active_loop::TurnWaitReceiver;
+use active_loop::{ActiveLoop, CompletionGuard, FinishedTurn, LoopRun, SessionTask, Successor};
 pub(crate) use active_loop::{TurnCompletion, await_compaction_completion, await_turn_completion};
 pub(crate) use boundary::RequestBoundary;
 pub(crate) use events::forward_loop_event;
@@ -173,7 +175,7 @@ struct SessionInner {
     active: Option<ActiveLoop>,
     /// Completions of the turns of this busy period that a successor replaced,
     /// so a late `turn.wait` still finds them.
-    finished: VecDeque<(TurnRef, watch::Receiver<Option<TurnCompletion>>)>,
+    finished: VecDeque<FinishedTurn>,
     blocked: Option<SessionBlockReason>,
     closing: bool,
     closed: bool,
@@ -206,6 +208,18 @@ fn frozen_tool_specs(
         .iter()
         .filter_map(|name| name.parse::<ToolName>().ok())
         .collect();
+    #[cfg(feature = "e2e-observe")]
+    let enabled = {
+        let mut enabled: BTreeSet<ToolName> = enabled;
+        if crate::e2e_observe::input_fixture_enabled() {
+            enabled.insert(
+                crate::e2e_observe::input_fixture::NAME
+                    .parse()
+                    .expect("fixed fixture name"),
+            );
+        }
+        enabled
+    };
     config.tools().specs_for(&enabled)
 }
 
@@ -367,6 +381,8 @@ impl Session {
             }),
         };
         hub.register(load, &session);
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::register(session.session_id(), load);
         session
     }
 
@@ -390,6 +406,8 @@ impl Session {
         }
         self.shared.hub.unregister(self.load());
         self.shared.results.remove(self.load());
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::unregister(self.session_id(), self.load());
     }
 
     pub(crate) fn result_catalog(&self) -> &ResultCatalog {
@@ -443,6 +461,8 @@ impl Session {
     }
 
     pub(crate) fn sample(&self) -> Result<(SessionState, SessionSnapshot), AgentError> {
+        #[cfg(feature = "e2e-observe")]
+        let observed_start = crate::e2e_observe::clock();
         let _publication = self.shared.results.publication();
         let mut inner = self.lock_inner();
         if inner.closed {
@@ -534,6 +554,13 @@ impl Session {
             block_reason: state.block_reason,
             completions,
         };
+        #[cfg(feature = "e2e-observe")]
+        {
+            drop(queue);
+            drop(inner);
+            drop(_publication);
+            crate::e2e_observe::sample(&snapshot, observed_start);
+        }
         Ok((state, snapshot))
     }
 

@@ -1149,10 +1149,20 @@ the turn. Live/durable fallback reads use a borrowed canonical projection,
 stream the full identity hash on a blocking worker, and encode only a page-sized
 item prefix (plus the item that crosses that bound). They do not rebuild a full
 normalized history copy on every page or retain a second saved body cache.
-Durable reads still verify the exact record on each RPC; scanning and identity
-work remain bounded by 64 MiB, 100,000 items, the query deadline, and the four
-query slots. Clients should use the 1 MiB page maximum for long results and
-must still validate every page before installing a complete body.
+For loaded committed history, a compact index reuses the verified identity,
+item range/count and body-free terminal metadata, keyed by exact load, turn and
+immutable committed-prefix digest. Later appends do not invalidate that prefix.
+Concurrent cold readers share preparation; later pages encode their requested
+range without decoding or hashing the whole record again. The index holds at
+most two entries and 256 KiB across the Agent, including evicted entries still
+held by a page; pressure falls back to uncached preparation. Interrupted text is
+never retained in this index. Close unregisters entries and prevents late
+preparation from reinserting them. Cold/unloaded reads still verify disk records.
+Scanning and identity work remain bounded by 64 MiB, 100,000 items, the query
+deadline, and the four query slots. Page sizing scans at most the requested page
+budget on a blocking worker, with at most `(max_bytes + 1) * size_of::<usize>()`
+prefix workspace per query. Clients must validate every page before installing
+a complete body.
 
 A cancelled turn may also return `interrupted`, the same display-only object as
 in [Interrupted replies](#interrupted-replies), for both live and stored
@@ -2191,9 +2201,11 @@ then are attached exactly once. Drops after the last delivered event cannot be
 reported without a subsequent event.
 
 Reliable `session_snapshot` controls use a separate 64-entry lane, serviced
-before compatibility lifecycle and streaming events. Its producers wait or
-coalesce dirty marks rather than dropping controls, within the control byte
-budget. Lifecycle events use another 64-entry queue. The configured
+before compatibility lifecycle and streaming events in bursts of at most eight.
+After a full burst, a ready lifecycle event gets one opportunity before control
+priority resumes; continuous traffic on either lane cannot starve the other.
+Its producers wait or coalesce dirty marks rather than dropping controls, within
+the control byte budget. Lifecycle events use another 64-entry queue. The configured
 `event_capacity` bounds the streaming queue. Output deltas, Tool progress,
 process output chunks, and intermediate argument-preview revisions use
 streaming capacity. Preview start/first-input snapshots (revisions 1–2) and

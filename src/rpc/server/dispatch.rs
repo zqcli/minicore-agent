@@ -47,6 +47,8 @@ impl RpcServer {
     ) -> Result<Dispatch, RpcResponse> {
         Ok(match method {
             "agent.ping" => {
+                #[cfg(feature = "e2e-observe")]
+                crate::e2e_observe::responsiveness_probe("ping");
                 let _: EmptyParams = params_or_error(&id, params)?;
                 let result = self.agent().ping();
                 Dispatch::Response(success(&id, result))
@@ -215,6 +217,8 @@ impl RpcServer {
                 })
             }
             "session.state" => {
+                #[cfg(feature = "e2e-observe")]
+                crate::e2e_observe::responsiveness_probe("state");
                 let params: SessionParams = params_or_error(&id, params)?;
                 let session = self
                     .agent()
@@ -344,6 +348,8 @@ impl RpcServer {
                 )
             }
             "workspace.read" => {
+                #[cfg(feature = "e2e-observe")]
+                crate::e2e_observe::responsiveness_probe("workspace");
                 let request: WorkspaceReadRequest = params_or_error(&id, params)?;
                 // Lexical path/range validation happens before a query slot is
                 // reserved; the offset itself is checked against the file.
@@ -688,6 +694,12 @@ fn snapshot_reply(
     let gate_key = session.session_id();
     // Capture the admitted observation before shutdown can unregister this load.
     let result = session.sample();
+    #[cfg(feature = "e2e-observe")]
+    let mut charge = charge;
+    #[cfg(feature = "e2e-observe")]
+    if let Ok((_, snapshot)) = &result {
+        charge.observe(snapshot);
+    }
     let load = session.load().to_string();
     drop(session);
     OperationReply::Waiter(Box::pin(async move {
@@ -697,6 +709,8 @@ fn snapshot_reply(
         }
         let error_id = id.clone();
         match tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "e2e-observe")]
+            let observed_start = crate::e2e_observe::clock();
             let response = match result {
                 Ok((state, snapshot)) => {
                     let response = if let Some(info) = info {
@@ -721,6 +735,10 @@ fn snapshot_reply(
                 }
                 Err(error) => agent_error(id, &error),
             };
+            #[cfg(feature = "e2e-observe")]
+            if let Some(key) = charge.observed_key() {
+                crate::e2e_observe::encoded(key, observed_start, response.encoded().len());
+            }
             (response, charge)
         })
         .await

@@ -692,8 +692,7 @@ impl Agent {
     pub(crate) fn wait_turn_receiver(
         &self,
         turn: TurnRef,
-    ) -> Result<tokio::sync::watch::Receiver<Option<crate::sessions::TurnCompletion>>, AgentError>
-    {
+    ) -> Result<crate::sessions::TurnWaitReceiver, AgentError> {
         self.session(turn.session_id)?.wait_receiver(turn)
     }
 

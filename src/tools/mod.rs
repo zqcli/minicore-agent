@@ -114,6 +114,17 @@ fn build_tools_with(
         };
         builder.register_arc(tool);
     }
+    #[cfg(feature = "e2e-observe")]
+    if crate::e2e_observe::input_fixture_enabled()
+        && let Some((presentation, observer, _)) = presentation
+    {
+        let fixture = crate::e2e_observe::input_fixture::InputFixture::new(Arc::clone(observer));
+        builder.register_arc(PresentationTool::new(
+            ToolImpl::Plain(Arc::new(fixture)),
+            Arc::clone(presentation),
+            Arc::clone(observer),
+        ));
+    }
     builder.build().map_err(|_| BuildToolsError::Internal)
 }
 

@@ -686,6 +686,7 @@ pub(crate) async fn turn_result(
         .is_some_and(|cursor| cursor != ReadCursor::start());
 
     if let Some(session) = loaded.as_ref() {
+        let mut active_saved = None;
         let publication = session.result_catalog().publication();
         if let Some(load) = &request.load {
             if load != &session.load().to_string() {
@@ -705,6 +706,8 @@ pub(crate) async fn turn_result(
                         max_bytes,
                         &limits.cancellation,
                         limits.deadline,
+                        #[cfg(feature = "e2e-observe")]
+                        session.query_cancellation(),
                     )
                     .await;
                 }
@@ -761,19 +764,7 @@ pub(crate) async fn turn_result(
                     );
                 }
                 if request.load.is_some() && !continuation {
-                    drop(publication);
-                    return live_turn_page(
-                        request.turn,
-                        result,
-                        request.load,
-                        request.result_id.as_deref(),
-                        cursor,
-                        request.limit,
-                        max_bytes,
-                        &limits.cancellation,
-                        limits.deadline,
-                    )
-                    .await;
+                    active_saved = Some(result);
                 }
             }
             None => {}
@@ -793,6 +784,45 @@ pub(crate) async fn turn_result(
             );
         }
         drop(publication);
+        let snapshot = session.read_snapshot();
+        if let Some((range, source_revision)) = store.loop_item_source(
+            request.turn.session_id,
+            request.turn.loop_id,
+            limits.max_lines,
+        ) && range.end <= snapshot.history.len()
+        {
+            let availability = if active_saved.is_some() {
+                TurnResultAvailability::Live
+            } else {
+                TurnResultAvailability::Stored
+            };
+            return resident_stored_turn_page(
+                &store,
+                session,
+                request,
+                snapshot,
+                range,
+                source_revision,
+                availability,
+                max_bytes,
+                &limits,
+            )
+            .await;
+        }
+        if let Some(result) = active_saved {
+            return live_turn_page(
+                request.turn,
+                result,
+                request.load,
+                request.result_id.as_deref(),
+                cursor,
+                request.limit,
+                max_bytes,
+                &limits.cancellation,
+                limits.deadline,
+            )
+            .await;
+        }
     } else if request.load.is_some() {
         return Err(AgentError::StaleLoad);
     }
@@ -819,6 +849,160 @@ pub(crate) async fn turn_result(
         request.result_id.as_deref(),
         cursor,
         request.limit,
+        max_bytes,
+        &limits.cancellation,
+        limits.deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resident_stored_turn_page(
+    store: &Store,
+    session: &Session,
+    request: TurnResultRequest,
+    snapshot: crate::sessions::ReadSnapshot,
+    range: std::ops::Range<usize>,
+    source_revision: [u8; 32],
+    availability: TurnResultAvailability,
+    max_bytes: usize,
+    limits: &HistoryScanLimits,
+) -> Result<TurnResultPage, AgentError> {
+    use crate::sessions::results::{StoredIdentity, StoredIdentityKey};
+    let key = StoredIdentityKey {
+        load: session.load(),
+        source_revision,
+        loop_id: request.turn.loop_id,
+    };
+    let catalog = session.result_catalog();
+    let cursor = request.cursor.unwrap_or_else(ReadCursor::start);
+    let mut prepared = None;
+    let identity = if let Some(identity) = catalog.stored_identity(key) {
+        identity
+    } else {
+        let _preparing = catalog.stored_preparation().await;
+        check_budget(&limits.cancellation, limits.deadline)?;
+        if let Some(identity) = catalog.stored_identity(key) {
+            identity
+        } else {
+            let record = store
+                .read_loop_record(request.turn.session_id, request.turn.loop_id, limits)
+                .await
+                .map_err(AgentError::from)?;
+            let Some(record) = record else {
+                return unavailable_turn_page(
+                    request.turn,
+                    request.load,
+                    crate::UnavailableReason::NotRetained,
+                    None,
+                    None,
+                    false,
+                    max_bytes,
+                );
+            };
+            if record.loop_id != request.turn.loop_id {
+                return Err(AgentError::InvalidState);
+            }
+            let metadata = tokio::task::spawn_blocking(move || {
+                let StoredLoopRecord {
+                    loop_id,
+                    outcome,
+                    items,
+                    usage,
+                    requests,
+                    tool_rounds,
+                    final_config_revision,
+                    completed_at,
+                    user_times: _,
+                    interrupted,
+                } = record;
+                drop(items);
+                ReadTurnSummary {
+                    loop_id,
+                    outcome,
+                    usage,
+                    requests,
+                    tool_rounds,
+                    final_config_revision,
+                    completed_at,
+                    interrupted,
+                }
+            })
+            .await
+            .map_err(|_| AgentError::Internal)?;
+            let first = prepare_turn_view(
+                Arc::clone(&snapshot.history),
+                range.clone(),
+                metadata.interrupted.clone(),
+                cursor,
+                request.limit,
+                max_bytes,
+                limits.cancellation.clone(),
+                limits.deadline,
+                None,
+            )
+            .await?;
+            check_budget(&limits.cancellation, limits.deadline)?;
+            let identity = catalog.retain_stored_identity(StoredIdentity::new(
+                key,
+                range,
+                first.result_id.clone(),
+                first.total,
+                metadata,
+            ));
+            prepared = Some(first);
+            identity
+        }
+    };
+    if request
+        .result_id
+        .as_deref()
+        .is_some_and(|expected| expected != identity.result_id)
+    {
+        return Err(AgentError::StaleResult);
+    }
+    let encoded = if let Some(prepared) = prepared {
+        prepared.encoded
+    } else {
+        prepare_turn_view(
+            Arc::clone(&snapshot.history),
+            identity.range.clone(),
+            None,
+            cursor,
+            request.limit,
+            max_bytes,
+            limits.cancellation.clone(),
+            limits.deadline,
+            Some((identity.result_id.clone(), identity.total)),
+        )
+        .await?
+        .encoded
+    };
+    let metadata = &identity.metadata;
+    let base = TurnResultPage {
+        turn: request.turn,
+        load: request.load,
+        result_id: Some(identity.result_id.clone()),
+        persistence_uncertain: false,
+        unavailable_reason: None,
+        availability,
+        outcome: Some(metadata.outcome.clone()),
+        persistence: Some(TurnPersistence::Persisted),
+        usage: Some(metadata.usage),
+        requests: Some(metadata.requests),
+        tool_rounds: Some(metadata.tool_rounds),
+        final_config_revision: Some(metadata.final_config_revision),
+        completed_at: (availability == TurnResultAvailability::Stored)
+            .then(|| metadata.completed_at.clone()),
+        interrupted: metadata.interrupted.clone(),
+        items: Vec::new(),
+        next_cursor: None,
+        total: identity.total,
+    };
+    assemble_turn_page(
+        base,
+        encoded,
+        cursor,
         max_bytes,
         &limits.cancellation,
         limits.deadline,
@@ -1026,7 +1210,41 @@ async fn prepare_turn_items(
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<PreparedTurnItems, AgentError> {
+    let range = 0..items.len();
+    prepare_turn_view(
+        items,
+        range,
+        interrupted,
+        cursor,
+        limit,
+        max_bytes,
+        cancellation,
+        deadline,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_turn_view(
+    items: Arc<[HistoryItem]>,
+    range: std::ops::Range<usize>,
+    interrupted: Option<InterruptedRequest>,
+    cursor: ReadCursor,
+    limit: usize,
+    max_bytes: usize,
+    cancellation: CancellationToken,
+    deadline: Instant,
+    identity: Option<(String, usize)>,
+) -> Result<PreparedTurnItems, AgentError> {
     tokio::task::spawn_blocking(move || {
+        let items = &items[range];
+        #[cfg(feature = "e2e-observe")]
+        let mut observed = crate::e2e_observe::Span::new(if identity.is_some() {
+            crate::e2e_observe::Work::ResultRangeEncode
+        } else {
+            crate::e2e_observe::Work::ResultProjectionHash
+        });
         check_budget(&cancellation, deadline)?;
         #[cfg(test)]
         if let Some(gate) = items.first().and_then(|item| match item {
@@ -1038,12 +1256,53 @@ async fn prepare_turn_items(
         if items.len() > MAX_HISTORY_SCAN_LINES {
             return Err(AgentError::QueryLimit);
         }
+        if let Some((result_id, total)) = identity {
+            validate_cursor(cursor, total)?;
+            let mut encoded = Vec::new();
+            let mut bytes = 0usize;
+            for (index, item) in items
+                .iter()
+                .filter_map(SourceItem::from_history)
+                .enumerate()
+                .skip(cursor.item)
+                .take(limit)
+            {
+                check_budget(&cancellation, deadline)?;
+                if bytes >= max_bytes {
+                    break;
+                }
+                let envelope = SourceEnvelope {
+                    item,
+                    timestamp: None,
+                };
+                let body = crate::budget::encode_json(&envelope)
+                    .map_err(|_| AgentError::RpcSerialization)?;
+                #[cfg(feature = "e2e-observe")]
+                observed.add(1, body.len());
+                bytes += body.len().saturating_sub(if index == cursor.item {
+                    cursor.offset
+                } else {
+                    0
+                });
+                encoded.push((
+                    index,
+                    String::from_utf8(body).map_err(|_| AgentError::RpcSerialization)?,
+                ));
+            }
+            return Ok(PreparedTurnItems {
+                result_id,
+                total,
+                encoded,
+            });
+        }
         let total = items.iter().filter_map(SourceItem::from_history).count();
         validate_cursor(cursor, total)?;
         let end = cursor.item.saturating_add(limit).min(total);
         let mut hash = Sha256::new();
         hash.update(b"minicore-turn-result-r1\0");
         hash.update((total as u64).to_be_bytes());
+        #[cfg(feature = "e2e-observe")]
+        observed.add(0, b"minicore-turn-result-r1\0".len() + 8);
         let mut source_bytes = 0usize;
         let mut encoded = Vec::with_capacity(end.saturating_sub(cursor.item));
         let mut prepared_bytes = 0usize;
@@ -1076,6 +1335,8 @@ async fn prepare_turn_items(
                 return Err(AgentError::QueryLimit);
             }
             hash.update((bytes as u64).to_be_bytes());
+            #[cfg(feature = "e2e-observe")]
+            observed.add(1, bytes + 8);
             if (cursor.item..end).contains(&index) && prepared_bytes < max_bytes {
                 let mut bytes = Vec::with_capacity(bytes);
                 serde_json::to_writer(&mut bytes, &envelope)
@@ -1098,6 +1359,8 @@ async fn prepare_turn_items(
         let partial_len =
             crate::budget::json_len(&interrupted).map_err(|_| AgentError::RpcSerialization)?;
         hash.update((partial_len as u64).to_be_bytes());
+        #[cfg(feature = "e2e-observe")]
+        observed.add(0, partial_len + 8);
         serde_json::to_writer(HashWriter(&mut hash), &interrupted)
             .map_err(|_| AgentError::RpcSerialization)?;
         check_budget(&cancellation, deadline)?;
@@ -1118,6 +1381,8 @@ pub(crate) fn prepare_bounded_result_source(
     catalog: &crate::sessions::ResultCatalog,
 ) -> Result<Result<crate::sessions::PreparedSource, crate::sessions::UnavailableReason>, AgentError>
 {
+    #[cfg(feature = "e2e-observe")]
+    let mut observed = crate::e2e_observe::Span::new(crate::e2e_observe::Work::SourcePrepare);
     let bytes = result_source_upper_bound(items, interrupted.as_ref(), &metadata)?;
     if !catalog.accepts_source(bytes) {
         return Ok(Err(crate::sessions::UnavailableReason::TooLarge));
@@ -1130,6 +1395,8 @@ pub(crate) fn prepare_bounded_result_source(
         };
         let bytes =
             crate::budget::encode_json(&envelope).map_err(|_| AgentError::RpcSerialization)?;
+        #[cfg(feature = "e2e-observe")]
+        observed.add(1, bytes.len());
         encoded.push(String::from_utf8(bytes).map_err(|_| AgentError::RpcSerialization)?);
     }
     let source =
@@ -1358,6 +1625,7 @@ async fn live_turn_page(
     assemble_turn_page(base, encoded, cursor, max_bytes, cancellation, deadline).await
 }
 
+#[cfg_attr(feature = "e2e-observe", allow(clippy::too_many_arguments))]
 async fn retained_turn_page(
     request: TurnResultRequest,
     entry: crate::sessions::results::CompletionEntry,
@@ -1366,7 +1634,23 @@ async fn retained_turn_page(
     max_bytes: usize,
     cancellation: &CancellationToken,
     deadline: Instant,
+    #[cfg(feature = "e2e-observe")] close: CancellationToken,
 ) -> Result<TurnResultPage, AgentError> {
+    #[cfg(feature = "e2e-observe")]
+    let _page_refs = crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::PageRefs, 1);
+    #[cfg(feature = "e2e-observe")]
+    let _page_bytes = crate::e2e_observe::Lease::new(
+        crate::e2e_observe::Gauge::PageRefBytes,
+        source.observed_bytes(),
+    );
+    #[cfg(feature = "e2e-observe")]
+    crate::e2e_observe::pause(
+        crate::e2e_observe::Point::ResultPage,
+        request.turn.session_id,
+        request.turn.loop_id,
+        close,
+    )
+    .await;
     if request
         .result_id
         .as_deref()
@@ -1697,6 +1981,11 @@ where
     // Keep the full length when it is possible so the final complete cursor is
     // still considered.
     let mut high = remaining.len().min(max_bytes);
+    let prefix = remaining[..remaining.floor_char_boundary(high)].to_owned();
+    let lengths = tokio::task::spawn_blocking(move || json_prefix_lengths(&prefix))
+        .await
+        .map_err(|_| AgentError::Internal)?;
+    high = high.min(lengths.bytes.len() - 1);
     while low < high {
         check_budget(cancellation, deadline)?;
         let mut middle = low + (high - low).div_ceil(2);
@@ -1717,16 +2006,19 @@ where
                 offset: offset.saturating_add(middle),
             })
         };
-        let candidate = make_chunk(index, offset, json, middle);
-        if fitting_chunk_bytes(
-            existing,
-            existing_bytes,
-            &candidate,
-            next_cursor,
-            max_bytes,
-            header_bytes,
-        )?
-        .is_some()
+        let candidate = ReadItemChunk {
+            index,
+            offset,
+            total_bytes: json.len(),
+            encoding: JSON_ENCODING,
+            data: String::new(),
+            complete: middle == remaining.len(),
+        };
+        // Header sizing uses identity and cursor; encoded data bytes are separate.
+        let bytes =
+            encoded_len(&candidate) + lengths.bytes[middle] + usize::from(!existing.is_empty());
+        if existing_bytes + bytes + header_bytes(existing, Some(&candidate), next_cursor)?
+            <= max_bytes
         {
             low = middle;
         } else {
@@ -1735,6 +2027,40 @@ where
         tokio::task::yield_now().await;
     }
     Ok(remaining.floor_char_boundary(low))
+}
+
+struct JsonPrefixLengths {
+    bytes: Vec<usize>,
+    #[cfg(feature = "e2e-observe")]
+    _observed: crate::e2e_observe::Lease,
+}
+
+fn json_prefix_lengths(value: &str) -> JsonPrefixLengths {
+    #[cfg(feature = "e2e-observe")]
+    let mut observed = crate::e2e_observe::Span::new(crate::e2e_observe::Work::PagePrefixScan);
+    let mut bytes = Vec::with_capacity(value.len() + 1);
+    #[cfg(feature = "e2e-observe")]
+    let allocation = crate::e2e_observe::Lease::new(
+        crate::e2e_observe::Gauge::PagePrefixBytes,
+        bytes.capacity() * std::mem::size_of::<usize>(),
+    );
+    bytes.push(0);
+    let mut size = 0;
+    for byte in value.bytes() {
+        size += match byte {
+            b'"' | b'\\' | 8 | 9 | 10 | 12 | 13 => 2,
+            0..=31 => 6,
+            _ => 1,
+        };
+        bytes.push(size);
+    }
+    #[cfg(feature = "e2e-observe")]
+    observed.add(1, value.len());
+    JsonPrefixLengths {
+        bytes,
+        #[cfg(feature = "e2e-observe")]
+        _observed: allocation,
+    }
 }
 
 fn make_chunk(index: usize, offset: usize, json: &str, length: usize) -> ReadItemChunk {

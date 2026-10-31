@@ -1,6 +1,26 @@
 use serde::Serialize;
 
 use super::*;
+
+#[test]
+fn prefix_escape_sizes_match_serde_for_controls_unicode_and_item_json() {
+    let text = (0u32..=255).filter_map(char::from_u32).collect::<String>() + "🙂\"\\\n";
+    let sizes = json_prefix_lengths(&text);
+    for offset in 0..=text.len() {
+        if text.is_char_boundary(offset) {
+            assert_eq!(
+                sizes.bytes[offset] + 2,
+                serde_json::to_vec(&text[..offset]).unwrap().len()
+            );
+        }
+    }
+    let json = serde_json::to_string(&serde_json::json!({"text":text})).unwrap();
+    let sizes = json_prefix_lengths(&json);
+    assert_eq!(
+        sizes.bytes[json.len()] + 2,
+        serde_json::to_vec(&json).unwrap().len()
+    );
+}
 use crate::store::StoredLoopOutcome;
 use minicore_runtime::execution::ConfigRevision;
 

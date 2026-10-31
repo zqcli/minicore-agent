@@ -1,7 +1,7 @@
 use super::*;
 
 impl AgentEventStream {
-    /// Synchronous `recv` for producer tests: same lane priority and drop accounting.
+    /// Probes compatibility/body producer queues without running the publisher.
     pub(crate) fn try_recv(&mut self) -> Option<AgentEvent> {
         let event = self
             .lifecycle
@@ -14,6 +14,97 @@ impl AgentEventStream {
     pub(crate) fn len(&self) -> usize {
         self.lifecycle.len() + self.receiver.len()
     }
+}
+
+fn control_fixture(revision: u64) -> AgentEvent {
+    let mut event = super::snapshots::events()
+        .into_iter()
+        .find(|event| matches!(event, AgentEvent::SessionSnapshot { .. }))
+        .unwrap();
+    if let AgentEvent::SessionSnapshot { snapshot, .. } = &mut event {
+        snapshot.revision = revision;
+    }
+    event
+}
+
+async fn queue_control(sink: &AgentEventSink, hub: &crate::sessions::SnapshotHub, revision: u64) {
+    let mut charge = hub.try_reserve().unwrap();
+    charge.shrink(1);
+    assert!(
+        sink.send_snapshot(
+            control_fixture(revision),
+            charge,
+            &tokio_util::sync::CancellationToken::new()
+        )
+        .await
+    );
+}
+
+fn lifecycle_fixture() -> AgentEvent {
+    let session_id = SessionId::new().unwrap();
+    AgentEvent::SessionClosed {
+        session_id,
+        meta: EventMeta::session(session_id, crate::test_support::load_id()),
+    }
+}
+
+#[tokio::test]
+async fn continuously_ready_control_and_lifecycle_lanes_both_make_bounded_progress() {
+    let (sink, mut stream) = AgentEventSink::channel(1);
+    let hub = crate::sessions::SnapshotHub::new(sink.clone());
+    let mut controls = 0u64;
+    let mut lifecycle = 0usize;
+    let mut run = 0u8;
+    for _ in 0..16 * (usize::from(MAX_CONTROL_BURST) + 1) {
+        if stream.control.is_empty() {
+            queue_control(&sink, &hub, controls + 1).await;
+        }
+        if stream.lifecycle.is_empty() {
+            assert_eq!(sink.try_send(lifecycle_fixture()), AgentSendResult::Sent);
+        }
+        assert_eq!((stream.control.len(), stream.lifecycle.len()), (1, 1));
+        let event = stream.recv().await.unwrap();
+        match event {
+            AgentEvent::SessionSnapshot { snapshot, .. } => {
+                controls += 1;
+                run += 1;
+                assert_eq!(snapshot.revision, controls);
+                assert!(run <= MAX_CONTROL_BURST);
+            }
+            AgentEvent::SessionClosed { .. } => {
+                assert_eq!(run, MAX_CONTROL_BURST);
+                run = 0;
+                lifecycle += 1;
+            }
+            _ => panic!("unexpected lane"),
+        }
+    }
+    assert_eq!(lifecycle, 16);
+    assert_eq!(controls, 16 * u64::from(MAX_CONTROL_BURST));
+}
+
+#[tokio::test]
+async fn lifecycle_opportunity_does_not_starve_the_last_control_snapshot() {
+    let (sink, mut stream) = AgentEventSink::channel(1);
+    let hub = crate::sessions::SnapshotHub::new(sink.clone());
+    for revision in 1..=u64::from(MAX_CONTROL_BURST) {
+        queue_control(&sink, &hub, revision).await;
+        assert!(matches!(
+            stream.recv().await,
+            Some(AgentEvent::SessionSnapshot { .. })
+        ));
+    }
+    queue_control(&sink, &hub, 999).await;
+    assert_eq!(sink.try_send(lifecycle_fixture()), AgentSendResult::Sent);
+    assert!(matches!(
+        stream.recv().await,
+        Some(AgentEvent::SessionClosed { .. })
+    ));
+    assert_eq!(sink.try_send(lifecycle_fixture()), AgentSendResult::Sent);
+    let Some(AgentEvent::SessionSnapshot { snapshot, .. }) = stream.recv().await else {
+        panic!("last snapshot starved")
+    };
+    assert_eq!(snapshot.revision, 999);
 }
 
 #[tokio::test]

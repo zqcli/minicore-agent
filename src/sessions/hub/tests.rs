@@ -194,16 +194,19 @@ async fn global_eviction_publishes_the_affected_load_without_another_local_chang
     let charge = catalog.reserve(a.load(), 4096).unwrap();
     let source = catalog.finish_reservation(source, charge).unwrap();
     drop(catalog.insert(a.load(), entry.clone(), Some(source)));
-    loop {
+    let before = loop {
         let snapshot = next_snapshot(&mut stream).await;
         if snapshot.load == a.load() && snapshot.completions.through_seq == 1 {
             assert_eq!(
                 snapshot.completions.entries[0].availability,
                 ResultAvailability::Live
             );
-            break;
+            break snapshot;
         }
-    }
+    };
+    a.await_control_idle_for_test().await;
+    assert_ne!(a.load(), b.load());
+    assert!(ResultLimits::default().sources_per_load > 1);
     let reservation = catalog.reserve(b.load(), 4096).unwrap();
     loop {
         let snapshot = next_snapshot(&mut stream).await;
@@ -214,9 +217,17 @@ async fn global_eviction_publishes_the_affected_load_without_another_local_chang
                 snapshot.completions.entries[0].unavailable_reason,
                 Some(UnavailableReason::Expired)
             );
+            assert!(snapshot.revision > before.revision);
+            assert_eq!(snapshot.execution, before.execution);
+            assert_eq!(snapshot.queue, before.queue);
+            assert_eq!(
+                snapshot.completions.through_seq,
+                before.completions.through_seq
+            );
             break;
         }
     }
+    a.await_control_idle_for_test().await;
     drop(reservation);
     let mut entry = entry;
     entry.availability = ResultAvailability::Stored;
@@ -238,7 +249,7 @@ async fn global_eviction_publishes_the_affected_load_without_another_local_chang
 async fn batches_rotate_after_sixteen_dirty_loads_and_keep_new_marks() {
     let (directory, mut agent, session, _stream) = fixture("hub-fair-batches").await;
     session.shared.hub.shutdown_now();
-    let (sink, _stream) = AgentEventSink::channel(1);
+    let (sink, mut stream) = AgentEventSink::channel(1);
     let hub = SnapshotHub::new(sink);
     let mut sessions = vec![session];
     for _ in 1..18 {
@@ -257,17 +268,27 @@ async fn batches_rotate_after_sixteen_dirty_loads_and_keep_new_marks() {
     for session in &sessions {
         hub.register(session.load(), session);
     }
-    let first = hub.take_batch();
-    assert_eq!(
-        first.iter().map(|(load, _)| *load).collect::<Vec<_>>(),
-        sessions[..16].iter().map(Session::load).collect::<Vec<_>>()
-    );
-    hub.mark(sessions[0].load());
-    let next = hub.take_batch();
-    assert_eq!(
-        next.iter().map(|(load, _)| *load).collect::<Vec<_>>(),
-        [sessions[16].load(), sessions[17].load(), sessions[0].load()]
-    );
+    let mut revisions = HashMap::new();
+    for round in 0..8 {
+        let batch = hub.take_batch();
+        assert_eq!(batch.len(), 16);
+        for (index, (load, session)) in batch.into_iter().enumerate() {
+            assert_eq!(
+                load,
+                sessions[(round * MAX_BATCH + index) % sessions.len()].load()
+            );
+            hub.mark(load);
+            assert!(hub.publish(load, session).await);
+            let snapshot = next_snapshot(&mut stream).await;
+            assert_eq!(snapshot.load, load);
+            assert!(snapshot.revision > *revisions.get(&load).unwrap_or(&0));
+            revisions.insert(load, snapshot.revision);
+        }
+    }
+    assert_eq!(revisions.len(), sessions.len());
+    let mut remaining = hub.take_batch();
+    remaining.extend(hub.take_batch());
+    assert_eq!(remaining.len(), sessions.len());
     assert!(hub.take_batch().is_empty());
     agent.shutdown().await.unwrap();
 }

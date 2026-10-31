@@ -2,6 +2,9 @@
 #[path = "../support/mod.rs"]
 pub mod support;
 
+#[cfg(feature = "e2e-observe")]
+mod e2e_input;
+mod e2e_observe;
 mod legacy_closeout;
 mod openai_rpc_process;
 mod rpc_stdio;

@@ -37,8 +37,16 @@ pub(crate) fn normalize_history(items: &[HistoryItem]) -> Result<Arc<[HistoryIte
 }
 
 fn normalize(items: &[HistoryItem], durable: bool) -> Result<Arc<[HistoryItem]>, AgentError> {
+    #[cfg(feature = "e2e-observe")]
+    let mut observation = crate::e2e_observe::Span::new(if durable {
+        crate::e2e_observe::Work::NormalizeDurable
+    } else {
+        crate::e2e_observe::Work::NormalizePublic
+    });
     let mut sanitized = Vec::with_capacity(items.len());
     for item in items {
+        #[cfg(feature = "e2e-observe")]
+        observation.add(1, 0);
         match item {
             HistoryItem::User(user) => sanitized.push(HistoryItem::User(user.clone())),
             HistoryItem::ToolResult(result) => {

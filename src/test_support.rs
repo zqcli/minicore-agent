@@ -5,11 +5,10 @@
 pub(crate) mod model;
 pub(crate) use model::{ScriptedModel, Step};
 
+pub(crate) use crate::test_gate::Gate;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
-
-use tokio::sync::Notify;
+use std::sync::{Mutex, MutexGuard};
 
 /// Values armed by a test under a key and consumed by production code.
 pub(crate) struct Registry<K, V = ()>(Mutex<Vec<(K, V)>>);
@@ -50,69 +49,6 @@ impl<K: PartialEq> Registry<K> {
     /// Consumes one armed occurrence for `key`.
     pub(crate) fn hit(&self, key: &K) -> bool {
         self.take(key).is_some()
-    }
-}
-
-/// A rendezvous that holds production code at a point until the test releases
-/// it. Production code calls [`Gate::pass`] (async) or [`Gate::pass_blocking`]
-/// (blocking worker threads); the test awaits [`Gate::wait_started`].
-#[derive(Default)]
-pub(crate) struct Gate {
-    state: Mutex<GateState>,
-    changed: Condvar,
-    notify: Notify,
-}
-
-#[derive(Default)]
-struct GateState {
-    started: bool,
-    released: bool,
-}
-
-impl Gate {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) async fn pass(&self) {
-        self.update(|state| state.started = true);
-        self.wait_until(|state| state.released).await;
-    }
-
-    pub(crate) fn pass_blocking(&self) {
-        self.update(|state| state.started = true);
-        let state = self.state.lock().unwrap();
-        drop(
-            self.changed
-                .wait_while(state, |state| !state.released)
-                .unwrap(),
-        );
-    }
-
-    pub(crate) async fn wait_started(&self) {
-        self.wait_until(|state| state.started).await;
-    }
-
-    pub(crate) fn release(&self) {
-        self.update(|state| state.released = true);
-    }
-
-    fn update(&self, change: impl FnOnce(&mut GateState)) {
-        change(&mut self.state.lock().unwrap());
-        self.changed.notify_all();
-        self.notify.notify_waiters();
-    }
-
-    async fn wait_until(&self, done: impl Fn(&GateState) -> bool) {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if done(&self.state.lock().unwrap()) {
-                return;
-            }
-            notified.await;
-        }
     }
 }
 

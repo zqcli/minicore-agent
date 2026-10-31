@@ -61,6 +61,12 @@ impl ToolPolicy for Policy {
 }
 
 fn classify(name: &str) -> Option<ToolClass> {
+    #[cfg(feature = "e2e-observe")]
+    if name == crate::e2e_observe::input_fixture::NAME
+        && crate::e2e_observe::input_fixture_enabled()
+    {
+        return Some(ToolClass::ReadOnly);
+    }
     match name {
         "read" => Some(ToolClass::ReadOnly),
         "write" | "edit" | "apply_patch" | "bash" => Some(ToolClass::Mutating),

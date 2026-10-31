@@ -2,6 +2,8 @@ use super::observer::StateObserver;
 use super::*;
 
 pub(super) struct ActiveLoop {
+    #[cfg(feature = "e2e-observe")]
+    pub(super) _observed: crate::e2e_observe::Lease,
     pub(super) turn: TurnRef,
     pub(super) input: QueueItem,
     pub(super) handle: LoopHandle,
@@ -12,6 +14,21 @@ pub(super) struct ActiveLoop {
     pub(super) boundary: Arc<RequestBoundary>,
     pub(super) generation: u64,
     pub(super) _observer: StateObserver,
+}
+
+pub(super) struct FinishedTurn {
+    pub(super) turn: TurnRef,
+    pub(super) completion: watch::Receiver<Option<TurnCompletion>>,
+    #[cfg(feature = "e2e-observe")]
+    pub(super) _observed: crate::e2e_observe::Lease,
+}
+
+#[cfg(not(feature = "e2e-observe"))]
+pub(crate) type TurnWaitReceiver = watch::Receiver<Option<TurnCompletion>>;
+#[cfg(feature = "e2e-observe")]
+pub(crate) struct TurnWaitReceiver {
+    receiver: watch::Receiver<Option<TurnCompletion>>,
+    _observed: crate::e2e_observe::Lease,
 }
 
 pub(crate) struct ExecutionInput {
@@ -119,8 +136,16 @@ impl CompletionGuard {
     }
 
     pub(super) fn publish_finished(&mut self, result: Arc<TurnResult>) {
-        self.sender
-            .send_replace(Some(TurnCompletion::Finished(result)));
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::report_refs(&result, "completion_publish");
+        self.sender.send_replace(Some(TurnCompletion::Finished {
+            result,
+            #[cfg(feature = "e2e-observe")]
+            _observed: Arc::new(crate::e2e_observe::Lease::new(
+                crate::e2e_observe::Gauge::Completions,
+                1,
+            )),
+        }));
         self.session.mark_dirty();
         self.armed = false;
     }
@@ -145,7 +170,11 @@ impl Drop for CompletionGuard {
 
 #[derive(Clone)]
 pub(crate) enum TurnCompletion {
-    Finished(Arc<TurnResult>),
+    Finished {
+        result: Arc<TurnResult>,
+        #[cfg(feature = "e2e-observe")]
+        _observed: Arc<crate::e2e_observe::Lease>,
+    },
     Internal,
 }
 
@@ -201,6 +230,8 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
             return None;
         }
     };
+    #[cfg(feature = "e2e-observe")]
+    let _report_owner = crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::DriverReports, 1);
     let sanitized = match normalize_history(report.appended.as_ref()) {
         Ok(items) => items,
         Err(_) => {
@@ -209,6 +240,14 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
         }
     };
     let stored = reconcile_report(session, turn, &report, &sanitized);
+    #[cfg(feature = "e2e-observe")]
+    crate::e2e_observe::pause(
+        crate::e2e_observe::Point::BeforePersist,
+        turn.session_id,
+        turn.loop_id,
+        session.query_cancellation(),
+    )
+    .await;
     let (persistence, uncertain, persisted_interrupted) =
         persist_report(session, turn, &stored, &sanitized).await;
     let eligible = persistence == TurnPersistence::Persisted
@@ -328,7 +367,20 @@ async fn join_runtime_loop(
 ) -> Result<Arc<LoopReport>, AgentError> {
     let join = agent_loop.join();
     tokio::pin!(join);
+    #[cfg(feature = "e2e-observe")]
+    let dropped_tail = crate::e2e_observe::take_fault(
+        crate::e2e_observe::Point::RuntimeEvents,
+        turn.session_id,
+        turn.loop_id,
+    );
+    #[cfg(feature = "e2e-observe")]
+    if let Some(fault) = &dropped_tail {
+        fault.applied("hold_until_runtime_join");
+    }
+    #[cfg(not(feature = "e2e-observe"))]
     let mut events_open = true;
+    #[cfg(feature = "e2e-observe")]
+    let mut events_open = dropped_tail.is_none();
     let result = loop {
         tokio::select! {
             biased;
@@ -345,8 +397,19 @@ async fn join_runtime_loop(
     // are already queued; waiting for channel closure here would add an
     // unnecessary completion dependency. This also accounts for a queued
     // `Finished` envelope without mapping it to Agent `TurnFinished`.
+    #[cfg(feature = "e2e-observe")]
+    let mut discarded_events = 0usize;
     while let Ok(envelope) = events.try_recv() {
+        #[cfg(feature = "e2e-observe")]
+        if dropped_tail.is_some() {
+            discarded_events += 1;
+            continue;
+        }
         forward_loop_event(turn.session_id, envelope, session);
+    }
+    #[cfg(feature = "e2e-observe")]
+    if let Some(fault) = &dropped_tail {
+        fault.dropped_events(discarded_events);
     }
     // Owned commands of this loop are joined before the report is reconciled
     // and persisted: a dropped tool future must not leave a process behind, and
@@ -569,10 +632,19 @@ async fn touch_updated_at_best_effort(session: &Session) {
 /// Awaits an Agent-level turn completion. Used by `Session::wait` and the RPC
 /// deferred waiter; never waits on a raw runtime `LoopHandle`.
 pub(crate) async fn await_turn_completion(
-    receiver: watch::Receiver<Option<TurnCompletion>>,
+    receiver: TurnWaitReceiver,
 ) -> Result<Arc<TurnResult>, AgentError> {
+    #[cfg(feature = "e2e-observe")]
+    let TurnWaitReceiver {
+        receiver,
+        _observed,
+    } = receiver;
     match await_completion(receiver).await? {
-        TurnCompletion::Finished(result) => Ok(result),
+        TurnCompletion::Finished { result, .. } => {
+            #[cfg(feature = "e2e-observe")]
+            crate::e2e_observe::report_refs(&result, "wait_return_external_arc");
+            Ok(result)
+        }
         TurnCompletion::Internal => Err(AgentError::Internal),
     }
 }
@@ -730,6 +802,8 @@ impl Session {
                 session_id: inner.record.session_id,
                 loop_id: handle.id(),
             };
+            #[cfg(feature = "e2e-observe")]
+            crate::e2e_observe::installed(turn, self.load(), &entry.item().id);
             let started = StartedTurn {
                 turn,
                 input: entry.item(),
@@ -763,6 +837,8 @@ impl Session {
             self.lock_queue().starting = None;
             let state_rx = handle.watch_state();
             let previous = inner.active.replace(ActiveLoop {
+                #[cfg(feature = "e2e-observe")]
+                _observed: crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::Active, 1),
                 turn,
                 input: entry.item(),
                 handle: handle.clone(),
@@ -776,9 +852,15 @@ impl Session {
             });
             let mut evicted_waiter = None;
             if let Some(previous) = previous {
-                inner
-                    .finished
-                    .push_back((previous.turn, previous.completion));
+                inner.finished.push_back(FinishedTurn {
+                    turn: previous.turn,
+                    completion: previous.completion,
+                    #[cfg(feature = "e2e-observe")]
+                    _observed: crate::e2e_observe::Lease::new(
+                        crate::e2e_observe::Gauge::LateWait,
+                        1,
+                    ),
+                });
                 if inner.finished.len() > FINISHED_TURNS_KEPT {
                     evicted_waiter = inner.finished.pop_front();
                 }
@@ -885,12 +967,9 @@ impl Session {
 
     /// Agent-level completion: the runtime loop has joined and the report has
     /// been persisted before this resolves.
-    pub(crate) fn wait_receiver(
-        &self,
-        turn: TurnRef,
-    ) -> Result<watch::Receiver<Option<TurnCompletion>>, AgentError> {
+    pub(crate) fn wait_receiver(&self, turn: TurnRef) -> Result<TurnWaitReceiver, AgentError> {
         let inner = self.lock_inner();
-        inner
+        let receiver = inner
             .active
             .as_ref()
             .filter(|active| active.turn == turn)
@@ -899,10 +978,16 @@ impl Session {
                 inner
                     .finished
                     .iter()
-                    .find(|(finished, _)| *finished == turn)
-                    .map(|(_, completion)| completion.clone())
+                    .find(|finished| finished.turn == turn)
+                    .map(|finished| finished.completion.clone())
             })
-            .ok_or(AgentError::TurnNotFound)
+            .ok_or(AgentError::TurnNotFound)?;
+        #[cfg(feature = "e2e-observe")]
+        let receiver = TurnWaitReceiver {
+            receiver,
+            _observed: crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::Waiters, 1),
+        };
+        Ok(receiver)
     }
 
     pub(crate) fn turn_result_snapshot(
@@ -915,7 +1000,7 @@ impl Session {
         };
         match active.completion.borrow().as_ref() {
             None => Ok(Some(None)),
-            Some(TurnCompletion::Finished(result)) => Ok(Some(Some(Arc::clone(result)))),
+            Some(TurnCompletion::Finished { result, .. }) => Ok(Some(Some(Arc::clone(result)))),
             Some(TurnCompletion::Internal) => Err(AgentError::Internal),
         }
     }
@@ -950,9 +1035,22 @@ impl Session {
             .as_ref()
             .filter(|active| active.turn == turn)
             .ok_or(AgentError::TurnNotFound)?;
-        active
+        #[cfg(feature = "e2e-observe")]
+        let observed_state = active.handle.state();
+        #[cfg(feature = "e2e-observe")]
+        let observed_answer = crate::e2e_observe::input_fixture::AnswerClass::of(&answer);
+        let result = active
             .handle
             .answer(interaction_id, answer)
-            .map_err(map_answer_error)
+            .map_err(map_answer_error);
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::input_fixture::answered(
+            self.load(),
+            &observed_state,
+            interaction_id,
+            observed_answer,
+            result.is_ok(),
+        );
+        result
     }
 }

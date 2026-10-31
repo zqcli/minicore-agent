@@ -157,6 +157,13 @@ plus `CHANGELOG.md`. Records under `docs/verification/`, `docs/archive/`, and
 
 ## Tests
 
+The opt-in `e2e-observe` feature supplies test-only stdio timing, owner/budget
+counters, and bounded fault gates; `docs/e2e-observe.md` defines its activation
+and limits. It adds no RPC method or product configuration. Keep all observer
+state, environment reads, and instrumentation work out of default builds, and
+never emit raw content or secrets. Faults stay at existing Agent ownership
+boundaries; Runtime execution and Tool join semantics are not test controls.
+
 - A bug fix comes with a test that fails without the fix; check it by reverting
   the fix once. Do not write tests that only restate the implementation.
 - Unit tests live in `<module>/tests.rs`, declared with `#[cfg(test)] mod tests;`.

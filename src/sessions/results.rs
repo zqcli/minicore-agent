@@ -2,6 +2,8 @@ use super::*;
 use crate::read::InterruptedRequest;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
+mod stored;
+pub(crate) use stored::{StoredIdentity, StoredIdentityKey};
 
 const MAX_ENTRIES_PER_LOAD: usize = 256;
 const MAX_ENTRIES: usize = 4_096;
@@ -14,6 +16,7 @@ const MAX_ALL_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SOURCES: usize = 128;
 
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "e2e-observe", derive(Serialize))]
 pub(crate) struct ResultLimits {
     pub(crate) entries_per_load: usize,
     pub(crate) entries: usize,
@@ -113,6 +116,11 @@ pub(crate) struct SourceCharge {
 
 impl Drop for SourceCharge {
     fn drop(&mut self) {
+        #[cfg(feature = "e2e-observe")]
+        {
+            crate::e2e_observe::sub(crate::e2e_observe::Gauge::SourceBytes, self.bytes);
+            crate::e2e_observe::sub(crate::e2e_observe::Gauge::Sources, 1);
+        }
         self.global.fetch_sub(self.bytes, Ordering::SeqCst);
         self.per_load.fetch_sub(self.bytes, Ordering::SeqCst);
         self.global_count.fetch_sub(1, Ordering::SeqCst);
@@ -144,6 +152,8 @@ struct CatalogState {
 }
 
 pub(crate) struct ResultCatalog {
+    stored: Mutex<stored::StoredIdentities>,
+    stored_preparation: tokio::sync::Mutex<()>,
     state: Mutex<CatalogState>,
     source_bytes: Arc<AtomicUsize>,
     source_count: Arc<AtomicUsize>,
@@ -170,6 +180,8 @@ impl PreparedSource {
         items: Vec<String>,
         interrupted: Option<InterruptedRequest>,
     ) -> Result<Self, AgentError> {
+        #[cfg(feature = "e2e-observe")]
+        let mut observation = crate::e2e_observe::Span::new(crate::e2e_observe::Work::SourceHash);
         let mut hash = Sha256::new();
         hash.update(b"minicore-turn-result-r1\0");
         hash.update((items.len() as u64).to_be_bytes());
@@ -177,6 +189,8 @@ impl PreparedSource {
             + 2 * std::mem::size_of::<usize>()
             + items.capacity() * std::mem::size_of::<String>();
         for item in &items {
+            #[cfg(feature = "e2e-observe")]
+            observation.add(1, item.len() + 8);
             hash.update((item.len() as u64).to_be_bytes());
             hash.update(item.as_bytes());
             bytes = bytes
@@ -185,6 +199,8 @@ impl PreparedSource {
         }
         let partial_len =
             crate::budget::json_len(&interrupted).map_err(|_| AgentError::RpcSerialization)?;
+        #[cfg(feature = "e2e-observe")]
+        observation.add(0, b"minicore-turn-result-r1\0".len() + 8 + partial_len + 8);
         hash.update((partial_len as u64).to_be_bytes());
         struct HashWriter<'a>(&'a mut Sha256);
         impl std::io::Write for HashWriter<'_> {
@@ -234,7 +250,11 @@ impl PreparedSource {
 }
 
 pub(crate) fn metadata_heap_bytes(metadata: &crate::event::TurnResultView) -> usize {
-    let LoopOutcomeView::Failed { kind, model_error } = &metadata.outcome else {
+    outcome_heap_bytes(&metadata.outcome)
+}
+
+pub(crate) fn outcome_heap_bytes(outcome: &LoopOutcomeView) -> usize {
+    let LoopOutcomeView::Failed { kind, model_error } = outcome else {
         return 0;
     };
     let mut bytes = kind.capacity();
@@ -252,11 +272,16 @@ pub(crate) fn metadata_heap_bytes(metadata: &crate::event::TurnResultView) -> us
 
 impl ResultCatalog {
     pub(crate) fn new() -> Arc<Self> {
+        let limits = ResultLimits::default();
+        #[cfg(feature = "e2e-observe")]
+        let limits = crate::e2e_observe::result_limits(limits);
         Arc::new(Self {
+            stored: Mutex::new(stored::StoredIdentities::default()),
+            stored_preparation: tokio::sync::Mutex::new(()),
             state: Mutex::new(CatalogState::default()),
             source_bytes: Arc::new(AtomicUsize::new(0)),
             source_count: Arc::new(AtomicUsize::new(0)),
-            limits: Mutex::new(ResultLimits::default()),
+            limits: Mutex::new(limits),
             publication: Mutex::new(()),
             hub: Mutex::new(std::sync::Weak::new()),
         })
@@ -298,6 +323,21 @@ impl ResultCatalog {
             let mut state = self.state.lock().unwrap();
             let mut removed = state.loads.remove(&load);
             if let Some(results) = &removed {
+                #[cfg(feature = "e2e-observe")]
+                {
+                    crate::e2e_observe::sub(
+                        crate::e2e_observe::Gauge::Entries,
+                        results.entries.len(),
+                    );
+                    crate::e2e_observe::sub(
+                        crate::e2e_observe::Gauge::MetadataBytes,
+                        results
+                            .entries
+                            .iter()
+                            .map(|entry| entry.metadata_bytes)
+                            .sum(),
+                    );
+                }
                 state.entries -= results.entries.len();
                 state.metadata_bytes -= results
                     .entries
@@ -309,12 +349,18 @@ impl ResultCatalog {
                 results
                     .entries
                     .iter_mut()
-                    .filter_map(|entry| entry.source.take())
+                    .filter_map(|entry| {
+                        let source = entry.source.take()?;
+                        #[cfg(feature = "e2e-observe")]
+                        observe_catalog_source(&source, false);
+                        Some(source)
+                    })
                     .collect::<Vec<_>>()
             });
             drop(removed);
             released
         };
+        self.remove_stored_identities(load);
         drop(released);
     }
 
@@ -347,6 +393,11 @@ impl ResultCatalog {
                 load_bytes.fetch_add(bytes, Ordering::SeqCst);
                 self.source_count.fetch_add(1, Ordering::SeqCst);
                 load_count.fetch_add(1, Ordering::SeqCst);
+                #[cfg(feature = "e2e-observe")]
+                {
+                    crate::e2e_observe::add(crate::e2e_observe::Gauge::SourceBytes, bytes);
+                    crate::e2e_observe::add(crate::e2e_observe::Gauge::Sources, 1);
+                }
                 return Ok(SourceCharge {
                     bytes,
                     global: Arc::clone(&self.source_bytes),
@@ -379,6 +430,8 @@ impl ResultCatalog {
                 .find(|entry| entry.order == oldest)
                 .unwrap();
             let removed = retained.source.take().unwrap();
+            #[cfg(feature = "e2e-observe")]
+            observe_catalog_source(&removed, false);
             retained.entry.availability = ResultAvailability::Unavailable;
             retained.entry.unavailable_reason = Some(UnavailableReason::Expired);
             drop(state);
@@ -398,6 +451,8 @@ impl ResultCatalog {
         let excess = charge.bytes - source.bytes;
         charge.global.fetch_sub(excess, Ordering::SeqCst);
         charge.per_load.fetch_sub(excess, Ordering::SeqCst);
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::sub(crate::e2e_observe::Gauge::SourceBytes, excess);
         charge.bytes = source.bytes;
         Ok(ReservedSource { source, charge })
     }
@@ -423,16 +478,21 @@ impl ResultCatalog {
             .checked_add(1)
             .expect("completion sequence overflow");
         entry.seq = results.through;
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::completion(load, &entry);
         let metadata_bytes = 4 * std::mem::size_of::<Retained>()
             + entry.input_id.as_ref().map_or(0, String::capacity);
         let stored_source = source.map(|reserved| {
-            Arc::new(ResultSource {
+            let source = Arc::new(ResultSource {
                 items: reserved.source.items,
                 interrupted: reserved.source.interrupted,
                 result_id: reserved.source.result_id,
                 metadata: reserved.source.metadata,
                 _charge: reserved.charge,
-            })
+            });
+            #[cfg(feature = "e2e-observe")]
+            observe_catalog_source(&source, true);
+            source
         });
         state
             .loads
@@ -447,6 +507,11 @@ impl ResultCatalog {
             });
         state.entries += 1;
         state.metadata_bytes += metadata_bytes;
+        #[cfg(feature = "e2e-observe")]
+        {
+            crate::e2e_observe::add(crate::e2e_observe::Gauge::Entries, 1);
+            crate::e2e_observe::add(crate::e2e_observe::Gauge::MetadataBytes, metadata_bytes);
+        }
         loop {
             let local_full = state.loads[&load].entries.len() > limits.entries_per_load;
             if !local_full
@@ -488,7 +553,17 @@ impl ResultCatalog {
             }
             state.entries -= 1;
             state.metadata_bytes -= oldest.metadata_bytes;
+            #[cfg(feature = "e2e-observe")]
+            {
+                crate::e2e_observe::sub(crate::e2e_observe::Gauge::Entries, 1);
+                crate::e2e_observe::sub(
+                    crate::e2e_observe::Gauge::MetadataBytes,
+                    oldest.metadata_bytes,
+                );
+            }
             if let Some(source) = oldest.source.take() {
+                #[cfg(feature = "e2e-observe")]
+                observe_catalog_source(&source, false);
                 released.push(source);
             }
             // Descriptor identities are small; only large sources retire beyond business locks.
@@ -545,6 +620,27 @@ impl ResultCatalog {
             .iter()
             .find(|entry| entry.entry.loop_id == loop_id)
             .map(|entry| (entry.entry.clone(), entry.source.clone()))
+    }
+}
+
+#[cfg(feature = "e2e-observe")]
+fn observe_catalog_source(source: &ResultSource, add: bool) {
+    let change = if add {
+        crate::e2e_observe::add
+    } else {
+        crate::e2e_observe::sub
+    };
+    change(
+        crate::e2e_observe::Gauge::CatalogSourceBytes,
+        source._charge.bytes,
+    );
+    change(crate::e2e_observe::Gauge::CatalogSources, 1);
+}
+
+#[cfg(feature = "e2e-observe")]
+impl ResultSource {
+    pub(crate) fn observed_bytes(&self) -> usize {
+        self._charge.bytes
     }
 }
 

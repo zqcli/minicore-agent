@@ -19,7 +19,11 @@ impl StateObserver {
         let session_id = session.session_id();
         let session = Arc::downgrade(&session.shared);
         let task = Arc::new(SessionTask::empty());
+        #[cfg(feature = "e2e-observe")]
+        let observed = crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::Watchers, 1);
         task.set(tokio::spawn(async move {
+            #[cfg(feature = "e2e-observe")]
+            let _observed = observed;
             #[cfg(test)]
             if let Some(gate) = PAUSE_OBSERVER_INITIAL.take(&session_id) {
                 gate.pass().await;

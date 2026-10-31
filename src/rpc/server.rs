@@ -309,10 +309,22 @@ impl RpcServer {
     {
         let outbound = self.outbound_tx.clone();
         self.queries.spawn(async move {
-            let response = match future.await {
-                Ok(result) => success(&id, result),
-                Err(error) => query_error(id, &error),
-            };
+            let result = future.await;
+            let failed_id = id.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                #[cfg(feature = "e2e-observe")]
+                let mut observed =
+                    crate::e2e_observe::Span::new(crate::e2e_observe::Work::QueryEncode);
+                let response = match result {
+                    Ok(result) => success(&id, result),
+                    Err(error) => query_error(id, &error),
+                };
+                #[cfg(feature = "e2e-observe")]
+                observed.add(1, response.encoded().len());
+                response
+            })
+            .await
+            .unwrap_or_else(|_| agent_error(failed_id, &AgentError::Internal));
             let _ = outbound.send(RpcOutbound::Response(response)).await;
         });
         Dispatch::Deferred

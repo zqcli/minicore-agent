@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "minicore-agent"
 path = "src/main.rs"
 
+[features]
+default = []
+e2e-observe = []
+
 [dependencies]
 # The Runtime release this Agent is built and tested against.
 minicore-runtime = { git = "https://github.com/zqcli/minicore-runtime", tag = "v0.9.0", version = "0.9.0" }

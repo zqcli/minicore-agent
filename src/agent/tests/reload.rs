@@ -268,14 +268,19 @@ async fn reload_command_environment_accumulates_all_prior_credential_names() {
         .iter()
         .map(|name| name.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        vec![
-            "MINICORE_AGENT_TEST_KEY",
-            "MINICORE_RELOAD_UNIT_KEY_B",
-            "MINICORE_RELOAD_UNIT_KEY_C",
-        ]
-    );
+    let mut expected = vec![
+        "MINICORE_AGENT_TEST_KEY",
+        "MINICORE_RELOAD_UNIT_KEY_B",
+        "MINICORE_RELOAD_UNIT_KEY_C",
+    ];
+    #[cfg(feature = "e2e-observe")]
+    expected.extend([
+        "MINICORE_AGENT_E2E_PLAN",
+        "MINICORE_AGENT_E2E_RELEASE_DIR",
+        "MINICORE_AGENT_E2E_TRACE",
+    ]);
+    expected.sort_unstable();
+    assert_eq!(names, expected);
 }
 
 #[tokio::test]

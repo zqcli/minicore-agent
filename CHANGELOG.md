@@ -20,6 +20,14 @@
   Result pages preserve actual outcomes and use borrowed canonical ranges,
   with blocking-worker identity verification and bounded page preparation,
   rather than rebuilding the entire normalized turn on every page.
+- Bound control bursts to eight snapshots before a ready lifecycle opportunity,
+  preserving reliable last-update delivery without starving Tool/lifecycle facts.
+  Loaded committed result pages reuse a two-entry / 256 KiB body-free identity
+  index; concurrent readers share whole-turn verification and page sizing uses
+  bounded blocking-worker prefix scans. Close prevents late cache insertion.
+- Add opt-in `e2e-observe` stdio timing, ownership/work counters and bounded fault
+  plans, including real Runtime text/choice input fixtures for loopback tests.
+  Default builds have no observer or fixture activation.
 - Delivered steer identities include the preparation they join, including the
   post-tool handoff and model/reasoning configuration replacements. Store
   formats and formal Runtime release tags are unchanged.

@@ -1,6 +1,123 @@
 use super::*;
 
 #[tokio::test]
+async fn a_query_delivers_a_newer_sample_before_the_held_publisher_encodes_its_old_sample() {
+    let mut fixture = RpcFixture::new(
+        "delayed-publisher-sample",
+        [Step::Pending],
+        &[],
+        ApprovalMode::Auto,
+    );
+    let mut agent = fixture.open().await;
+    let info = agent
+        .create_session(crate::CreateSession {
+            workspace: fixture.workspace.clone(),
+            profile: "test".into(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let load = session.load();
+    let gate = Arc::new(Gate::new());
+    let _release = ReleaseGate(gate.clone());
+    crate::sessions::hub::SNAPSHOT_PUBLISH_GATES.arm(load, gate.clone());
+    let mut harness = RpcHarness::spawn(agent);
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .unwrap();
+    let pushed = harness
+        .call_ok(
+            "input.push",
+            Some(json!({
+                "session_id":info.session_id,"load":load,"mode":"steer","text":"first"
+            })),
+        )
+        .await;
+    let turn = pushed["result"]["started"]["turn"].clone();
+    let queued = harness
+        .call_ok(
+            "input.push",
+            Some(json!({
+                "session_id":info.session_id,"load":load,"mode":"follow_up","text":"second"
+            })),
+        )
+        .await;
+    harness
+        .send(
+            json!("newer-query"),
+            "session.state",
+            Some(json!({"session_id":info.session_id})),
+        )
+        .await;
+    let query = harness.response(json!("newer-query")).await;
+    let newer = &query["result"]["snapshot"];
+    assert_eq!(newer["load"], json!(load));
+    assert_eq!(newer["execution"]["loop_id"], turn["loop_id"]);
+    assert_eq!(newer["queue"]["items"][0]["id"], queued["result"]["id"]);
+    assert!(
+        !harness
+            .observed
+            .iter()
+            .any(|frame| frame.pointer("/params/type") == Some(&json!("session_snapshot")))
+    );
+    gate.release();
+    let published = harness.event("session_snapshot").await;
+    let older = &published["params"]["data"]["snapshot"];
+    assert_eq!(older["session_id"], newer["session_id"]);
+    assert_eq!(older["load"], newer["load"]);
+    assert_eq!(older["execution"]["type"], "none");
+    assert!(older["queue"]["items"].as_array().unwrap().is_empty());
+    let old_revision = older["revision"].as_u64().unwrap();
+    let new_revision = newer["revision"].as_u64().unwrap();
+    assert!(
+        old_revision < new_revision,
+        "revision must describe sampling, not encoding order"
+    );
+    let query_position = harness
+        .observed
+        .iter()
+        .position(|frame| frame["id"] == "newer-query")
+        .unwrap();
+    let old_position = harness
+        .observed
+        .iter()
+        .position(|frame| frame == &published)
+        .unwrap();
+    assert!(query_position < old_position);
+    let proof = json!({"publisher_held_after_sample_before_encoding":true,
+    "query_wire_position":query_position,"publisher_wire_position":old_position,
+    "old_queue_count":0,"new_queue_count":1,
+    "observations":[
+        {"origin":"query","session_id":newer["session_id"],"load":newer["load"],"revision":new_revision},
+        {"origin":"publisher","session_id":older["session_id"],"load":older["load"],"revision":old_revision}
+    ]});
+    println!("SNAPSHOT_SAMPLE_ORDER {proof}");
+    if let Some(directory) = std::env::var_os("MINICORE_AGENT_MATRIX_EVIDENCE") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            Path::new(&directory).join("sample-order.json"),
+            serde_json::to_vec(&proof).unwrap(),
+        )
+        .unwrap();
+    }
+    harness
+        .call_ok(
+            "input.recall",
+            Some(json!({"session_id":info.session_id,"load":load})),
+        )
+        .await;
+    harness
+        .call_ok("turn.cancel", Some(turn_params(&turn)))
+        .await;
+    harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
+    drop(session);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn extended_reasoning_round_trips_through_rpc_and_reopen() {
     let mut fixture = RpcFixture::new("extended-reasoning", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();

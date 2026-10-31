@@ -11,6 +11,8 @@ verification evidence.
   prompt files, reload, and Session updates.
 - [Architecture](architecture.md): Agent, Session, Runtime, Tool, Store, and
   query ownership.
+- [Test observations](e2e-observe.md): compile-time-only real-stdio timing,
+  owner/budget counters, and bounded Agent fault gates.
 - [Provider replay](provider-replay.md): durable output, identity, redaction, and bounds.
 - [Context](context.md): source-bound turn-start and manual summaries,
   bounded emergency recovery, and

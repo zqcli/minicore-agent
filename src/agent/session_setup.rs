@@ -212,13 +212,17 @@ pub(super) fn map_model_config_error(error: ModelConfigError) -> AgentError {
 }
 
 pub(super) fn command_environment(config: &AgentConfig) -> CommandEnvironment {
-    CommandEnvironment::new(
+    let environment = CommandEnvironment::new(
         config
             .models
             .values()
             .map(ModelConfig::credential_env_name)
             .map(OsString::from),
-    )
+    );
+    #[cfg(feature = "e2e-observe")]
+    let environment =
+        environment.extended(crate::e2e_observe::ENV_NAMES.iter().map(OsString::from));
+    environment
 }
 
 // Keep prior credential names scrubbed from future Bash children too. A

@@ -19,6 +19,8 @@ use crate::sessions::{
 };
 use crate::tool_data::{ToolExecutionData, ToolInvocationData, ToolProcessData};
 
+const MAX_CONTROL_BURST: u8 = 8;
+
 /// Identity and drop accounting attached to every agent event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct EventMeta {
@@ -302,6 +304,7 @@ impl AgentEventSink {
         let drop_state = Arc::new(Mutex::new(DropState { pending: 0 }));
         let control_failed = tokio_util::sync::CancellationToken::new();
         let stream = AgentEventStream {
+            control_burst: 0,
             receiver,
             lifecycle: lifecycle_rx,
             control: control_rx,
@@ -805,6 +808,7 @@ pub(crate) fn snapshot_frame_len(event: &AgentEvent) -> usize {
 
 /// Single-consumer control, lifecycle, and body observations with drop accounting.
 pub struct AgentEventStream {
+    control_burst: u8,
     receiver: mpsc::Receiver<AgentEvent>,
     lifecycle: mpsc::Receiver<AgentEvent>,
     control: mpsc::Receiver<ChargedEvent>,
@@ -813,7 +817,7 @@ pub struct AgentEventStream {
 }
 
 impl AgentEventStream {
-    /// Receives reliable control before compatibility lifecycle and streaming data.
+    /// Receives bounded control bursts with a lifecycle opportunity between them.
     pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.recv_owned().await.map(|(event, _charge)| event)
     }
@@ -824,16 +828,31 @@ impl AgentEventStream {
         let received = tokio::select! {
             _ = self.control_failed.cancelled() => None,
             received = async {
-                tokio::select! {
-                    biased;
-                    Some(charged) = self.control.recv() => Some((charged.event, Some(charged.charge))),
-                    Some(event) = self.lifecycle.recv() => Some((event, None)),
-                    Some(event) = self.receiver.recv() => Some((event, None)),
-                    else => None,
+                if self.control_burst == MAX_CONTROL_BURST {
+                    tokio::select! {
+                        biased;
+                        Some(event) = self.lifecycle.recv() => Some((event, None)),
+                        Some(charged) = self.control.recv() => Some((charged.event, Some(charged.charge))),
+                        Some(event) = self.receiver.recv() => Some((event, None)),
+                        else => None,
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        Some(charged) = self.control.recv() => Some((charged.event, Some(charged.charge))),
+                        Some(event) = self.lifecycle.recv() => Some((event, None)),
+                        Some(event) = self.receiver.recv() => Some((event, None)),
+                        else => None,
+                    }
                 }
             } => received,
         };
         let (event, charge) = received?;
+        self.control_burst = if charge.is_some() {
+            self.control_burst.saturating_add(1).min(MAX_CONTROL_BURST)
+        } else {
+            0
+        };
         Some((self.delivered(event), charge))
     }
 

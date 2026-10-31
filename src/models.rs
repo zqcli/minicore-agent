@@ -257,6 +257,8 @@ impl Models {
         config: &crate::config::AgentConfig,
         mut read_env: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ModelConfigError> {
+        #[cfg(feature = "e2e-observe")]
+        crate::e2e_observe::validate_models(config)?;
         let mut values = BTreeMap::new();
         // Callers pass a validated AgentConfig; only credentials are admitted here.
         for (id, value) in &config.models {

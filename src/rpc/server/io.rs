@@ -101,11 +101,19 @@ where
                 // a truncated or substitute message would corrupt the contract.
                 return Err(AgentError::Internal);
             }
+            #[cfg(feature = "e2e-observe")]
+            let write_started = crate::e2e_observe::clock();
             writer.write_all(encoded).await?;
             writer.write_all(b"\n").await?;
             if matches!(&frame, RpcOutbound::Response(response) if response.is_charged()) {
                 // A buffered writer can retain a tail after write_all completes.
                 writer.flush().await?;
+                #[cfg(feature = "e2e-observe")]
+                if let RpcOutbound::Response(response) = &frame
+                    && let Some(key) = response.observed_snapshot()
+                {
+                    crate::e2e_observe::sent(key, write_started, encoded.len() + 1);
+                }
             }
         }
         writer.flush().await?;

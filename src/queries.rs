@@ -216,15 +216,25 @@ pub(crate) fn prepare_turn_result(
     request: crate::TurnResultRequest,
     cancellation: CancellationToken,
 ) -> QueryFuture<crate::TurnResultPage> {
+    #[cfg(feature = "e2e-observe")]
+    let mut observed = crate::e2e_observe::Query::new(&request);
     let close = loaded
         .as_ref()
         .map_or_else(CancellationToken::new, Session::query_cancellation);
-    Box::pin(bounded_query(
+    let future = bounded_query(
         crate::read::turn_result(store, loaded, request, cancellation.clone()),
         cancellation,
         close,
         Instant::now() + crate::read::READ_DEADLINE,
-    ))
+    );
+    #[cfg(feature = "e2e-observe")]
+    return Box::pin(async move {
+        let result = future.await;
+        observed.finish(&result);
+        result
+    });
+    #[cfg(not(feature = "e2e-observe"))]
+    Box::pin(future)
 }
 
 pub(crate) fn prepare_workspace_read(

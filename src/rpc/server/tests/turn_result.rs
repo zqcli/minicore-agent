@@ -1,6 +1,81 @@
 use super::*;
 
 #[tokio::test]
+async fn compact_saved_identity_survives_history_append_and_stateless_close_fallback() {
+    let body = "x".repeat(16 * 1024);
+    let mut fixture = RpcFixture::new(
+        "compact-stored-identity",
+        [
+            Step::Events(vec![
+                ModelEvent::text_delta(&body).unwrap(),
+                ModelEvent::Finish {
+                    reason: ModelFinishReason::Stop,
+                },
+            ]),
+            Step::Text("second"),
+        ],
+        &[],
+        ApprovalMode::Auto,
+    );
+    let workspace = fixture.workspace.clone();
+    let agent = fixture.open().await;
+    let mut harness = RpcHarness::spawn(agent);
+    let session = create_and_open(&mut harness, &workspace).await;
+    let first = harness
+        .call_ok(
+            "input.push",
+            Some(json!({"session_id":session,"mode":"steer","text":"first"})),
+        )
+        .await;
+    let turn = first["result"]["started"]["turn"].clone();
+    harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
+    let page = harness
+        .call_ok(
+            "turn.result",
+            Some(json!({"session_id":session,"loop_id":turn["loop_id"],"max_bytes":1024})),
+        )
+        .await;
+    let result_id = page["result"]["result_id"].clone();
+    let cursor = page["result"]["next_cursor"].clone();
+    assert!(cursor.is_object());
+    let wrong=harness.call("turn.result",Some(json!({"session_id":session,"loop_id":turn["loop_id"],"cursor":cursor,"result_id":format!("r1:{}","0".repeat(64)),"max_bytes":1024}))).await;
+    assert_eq!(wrong["error"]["data"]["kind"], "stale_result");
+    let next = harness
+        .call_ok(
+            "input.push",
+            Some(json!({"session_id":session,"mode":"steer","text":"second"})),
+        )
+        .await;
+    harness
+        .call_ok(
+            "turn.wait",
+            Some(turn_params(&next["result"]["started"]["turn"])),
+        )
+        .await;
+    let after=harness.call_ok("turn.result",Some(json!({"session_id":session,"loop_id":turn["loop_id"],"cursor":cursor,"result_id":result_id,"max_bytes":1024}))).await;
+    assert_eq!(after["result"]["result_id"], result_id);
+    assert_eq!(after["result"]["availability"], "stored");
+    assert_eq!(after["result"]["total"], page["result"]["total"]);
+    harness
+        .call_ok("session.close", Some(json!({"session_id":session})))
+        .await;
+    let cold=harness.call_ok("turn.result",Some(json!({"session_id":session,"loop_id":turn["loop_id"],"cursor":cursor,"result_id":result_id,"max_bytes":1024}))).await;
+    assert_eq!(cold["result"]["result_id"], result_id);
+    let warm = &after["result"]["items"][0];
+    let cold = &cold["result"]["items"][0];
+    for field in ["index", "offset", "total_bytes", "encoding"] {
+        assert_eq!(warm[field], cold[field]);
+    }
+    assert!(
+        cold["data"]
+            .as_str()
+            .unwrap()
+            .starts_with(warm["data"].as_str().unwrap())
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn turn_result_reports_pending_and_stored_availability() {
     let model_started = Arc::new(Notify::new());
     let mut fixture = RpcFixture::new(
@@ -932,6 +1007,10 @@ async fn two_parked_result_preparations_leave_control_and_interactive_query_capa
     let turn = pushed["result"]["started"]["turn"].clone();
     harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     let loop_id: minicore_runtime::LoopId = turn["loop_id"].as_str().unwrap().parse().unwrap();
+    let prepared = harness
+        .call_ok("turn.result", Some(turn_params(&turn)))
+        .await;
+    assert_eq!(prepared["result"]["total"], 2);
     let first = Arc::new(Gate::new());
     let second = Arc::new(Gate::new());
     let _release_first = ReleaseGate(first.clone());
@@ -969,5 +1048,103 @@ async fn two_parked_result_preparations_leave_control_and_interactive_query_capa
         assert!(page["result"]["result_id"].is_string());
         assert_eq!(page["result"]["total"], 2);
     }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn cold_identity_waiter_is_cancellable_and_close_cannot_retain_late_preparation() {
+    let mut fixture = RpcFixture::new(
+        "cancel-cold-identity",
+        [Step::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    );
+    let mut agent = fixture.open().await;
+    let info = agent
+        .create_session(crate::CreateSession {
+            workspace: fixture.workspace.clone(),
+            profile: "test".into(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let store = agent.store_handle();
+    let catalog = session.result_catalog_for_test();
+    let mut harness = RpcHarness::spawn(agent);
+    let pushed = harness
+        .call_ok(
+            "input.push",
+            Some(json!({
+                "session_id":info.session_id,"load":session.load(),"mode":"steer","text":"first"
+            })),
+        )
+        .await;
+    let turn = pushed["result"]["started"]["turn"].clone();
+    harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
+    let turn: crate::TurnRef = serde_json::from_value(turn).unwrap();
+    let (_, source_revision) = store
+        .loop_item_source(info.session_id, turn.loop_id, 100)
+        .unwrap();
+    let request = crate::TurnResultRequest {
+        turn,
+        load: Some(session.load().to_string()),
+        result_id: None,
+        cursor: None,
+        limit: 100,
+        max_bytes: Some(1024),
+    };
+    let gate = Arc::new(Gate::new());
+    let _release = ReleaseGate(gate.clone());
+    crate::read::RESULT_PREPARE_GATES.arm(turn.loop_id, gate.clone());
+    let first = tokio::spawn(crate::queries::prepare_turn_result(
+        store.clone(),
+        Some(session.clone()),
+        request.clone(),
+        CancellationToken::new(),
+    ));
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let mut waiter = crate::queries::prepare_turn_result(
+        store.clone(),
+        Some(session.clone()),
+        request,
+        cancellation.clone(),
+    );
+    tokio::select! {
+        biased;
+        _ = &mut waiter => panic!("cold preparation did not serialize"),
+        _ = std::future::ready(()) => {}
+    }
+    cancellation.cancel();
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, waiter).await.unwrap(),
+        Err(AgentError::QueryLimit)
+    ));
+    harness
+        .call_ok(
+            "session.close",
+            Some(json!({"session_id":info.session_id,"load":session.load()})),
+        )
+        .await;
+    assert!(matches!(
+        tokio::time::timeout(TIMEOUT, first).await.unwrap().unwrap(),
+        Err(AgentError::SessionNotLoaded)
+    ));
+    gate.release();
+    assert!(
+        catalog
+            .stored_identity(crate::sessions::results::StoredIdentityKey {
+                load: session.load(),
+                source_revision,
+                loop_id: turn.loop_id,
+            })
+            .is_none()
+    );
+    drop(session);
     harness.shutdown().await;
 }

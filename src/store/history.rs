@@ -15,6 +15,17 @@ impl HistoryLine {
     }
 }
 
+fn decode_result_record(line: &[u8]) -> Result<StoredLoopRecord, StoreError> {
+    #[cfg(feature = "e2e-observe")]
+    let mut observed = crate::e2e_observe::Span::new(crate::e2e_observe::Work::StoredDecode);
+    #[cfg(feature = "e2e-observe")]
+    observed.add(0, line.len());
+    let record: StoredLoopRecord = serde_json::from_slice(line).map_err(corrupt)?;
+    #[cfg(feature = "e2e-observe")]
+    observed.add(record.items.len(), 0);
+    Ok(record)
+}
+
 fn index_line(
     index: &mut Vec<HistoryLine>,
     bytes: &[u8],
@@ -106,6 +117,25 @@ fn indexed_page(
 }
 
 impl Store {
+    pub(crate) fn loop_item_source(
+        &self,
+        session_id: SessionId,
+        loop_id: LoopId,
+        max_lines: usize,
+    ) -> Option<(std::ops::Range<usize>, [u8; 32])> {
+        let indexes = self.history_indexes.lock().unwrap();
+        let index = indexes.get(&session_id)?;
+        let from_end = index
+            .iter()
+            .rev()
+            .take(max_lines)
+            .position(|line| line.usage.last_loop_id == Some(loop_id))?;
+        let position = index.len() - 1 - from_end;
+        Some((
+            position.checked_sub(1).map_or(0, |i| index[i].items)..index[position].items,
+            index[position].hash.clone().finalize().into(),
+        ))
+    }
     async fn require_history_file(
         &self,
         session_id: SessionId,
@@ -310,6 +340,29 @@ impl Store {
             .open(&path)
             .await
             .map_err(unavailable)?;
+        #[cfg(feature = "e2e-observe")]
+        if let Some(fault) = crate::e2e_observe::take_fault(
+            crate::e2e_observe::Point::Append,
+            session_id,
+            record.loop_id,
+        ) {
+            file.write_all(&bytes[..bytes.len() / 2])
+                .await
+                .map_err(unavailable)?;
+            file.flush().await.map_err(unavailable)?;
+            let error = if fault.action == crate::e2e_observe::Action::Unknown {
+                let read_only = File::open(&path).await.map_err(unavailable)?;
+                truncate_append(&read_only, previous_len).await
+            } else {
+                rollback_append(&path, previous_len).await
+            };
+            fault.applied(if matches!(error, AppendError::Unknown) {
+                "append_unknown"
+            } else {
+                "append_rolled_back"
+            });
+            return Err(error);
+        }
         #[cfg(test)]
         if let Some(rollback_fails) = APPEND_FAILURES.take(&session_id) {
             tests::fail_append(file, &path, &bytes, previous_len, rollback_fails).await?;
@@ -670,7 +723,10 @@ impl Store {
             .await?
             {
                 BoundedLine::Complete(line) => {
-                    serde_json::from_slice(&line).map(Some).map_err(corrupt)
+                    tokio::task::spawn_blocking(move || decode_result_record(&line))
+                        .await
+                        .map_err(|_| StoreError::Unavailable)?
+                        .map(Some)
                 }
                 _ => Err(StoreError::HistoryChanged),
             };
@@ -707,7 +763,9 @@ impl Store {
             if line.is_empty() {
                 return Err(StoreError::Corrupt);
             }
-            let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
+            let record = tokio::task::spawn_blocking(move || decode_result_record(&line))
+                .await
+                .map_err(|_| StoreError::Unavailable)??;
             if record.loop_id == loop_id {
                 return Ok(Some(record));
             }

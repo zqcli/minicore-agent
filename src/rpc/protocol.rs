@@ -412,12 +412,18 @@ impl RpcResponse {
         event: AgentEventNotification,
         charge: crate::sessions::hub::SnapshotCharge,
     ) -> Result<Self, crate::AgentError> {
+        #[cfg(feature = "e2e-observe")]
+        let observed_start = crate::e2e_observe::clock();
         let bytes =
             crate::budget::encode_json(&event).map_err(|_| crate::AgentError::RpcSerialization)?;
         if bytes.len() + 1 > crate::rpc::MAX_RPC_FRAME_BYTES {
             return Err(crate::AgentError::Internal);
         }
         drop(event);
+        #[cfg(feature = "e2e-observe")]
+        if let Some(key) = charge.observed_key() {
+            crate::e2e_observe::encoded(key, observed_start, bytes.len());
+        }
         Ok(Self(bytes, None, false).charged(charge))
     }
 
@@ -462,6 +468,11 @@ impl RpcResponse {
 
     pub(crate) fn is_charged(&self) -> bool {
         self.1.is_some()
+    }
+
+    #[cfg(feature = "e2e-observe")]
+    pub(crate) fn observed_snapshot(&self) -> Option<crate::e2e_observe::SnapshotKey> {
+        self.1.as_ref().and_then(|charge| charge.observed_key())
     }
 
     pub(crate) fn encoded(&self) -> &[u8] {

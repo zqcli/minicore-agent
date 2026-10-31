@@ -27,7 +27,16 @@ pub fn run(args: impl IntoIterator<Item = String>) -> i32 {
         .enable_all()
         .build()
         .expect("Tokio runtime initialization");
+    #[cfg(not(feature = "e2e-observe"))]
     let result = runtime.block_on(serve(args));
+    #[cfg(feature = "e2e-observe")]
+    let result = runtime.block_on(async {
+        let result = serve(args).await;
+        if !crate::e2e_observe::finish(result.is_ok()).await && result.is_ok() {
+            return Err(AgentError::Internal);
+        }
+        result
+    });
     // run_stdio has joined owned work. A parked Tokio stdin read cannot be
     // cancelled; do not wait for that blocking thread when dropping the runtime.
     runtime.shutdown_background();
@@ -64,6 +73,8 @@ async fn serve(args: impl IntoIterator<Item = String>) -> Result<(), AgentError>
             Ok(())
         }
         Command::Stdio { config } => {
+            #[cfg(feature = "e2e-observe")]
+            crate::e2e_observe::start_from_env().await?;
             let agent = Agent::open_file(config).await?;
             run_stdio(agent).await
         }
