@@ -4,7 +4,7 @@
 //! reserves before sampling and hands the charge to the reliable writer lane.
 //! Nothing here runs while a Session's `inner`/`queue` locks are held.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -138,12 +138,10 @@ impl SnapshotBudget {
 }
 
 struct Dirty {
-    /// Pending mark per load; a newer mark replaces the older one in place.
-    marks: HashMap<LoadId, u64>,
+    marks: HashSet<LoadId>,
     /// Marked loads in mark order, at most one entry per marked load.
     ready: VecDeque<LoadId>,
     sessions: HashMap<LoadId, Weak<super::SessionShared>>,
-    next_seq: u64,
 }
 
 /// Per-Agent dirty set and publisher handle shared by every loaded Session.
@@ -162,10 +160,9 @@ impl SnapshotHub {
     pub(crate) fn new(events: AgentEventSink) -> Arc<Self> {
         Arc::new(Self {
             dirty: Mutex::new(Dirty {
-                marks: HashMap::new(),
+                marks: HashSet::new(),
                 ready: VecDeque::new(),
                 sessions: HashMap::new(),
-                next_seq: 0,
             }),
             budget: Arc::new(SnapshotBudget {
                 limit: SNAPSHOT_BUDGET_BYTES,
@@ -229,12 +226,7 @@ impl SnapshotHub {
         if !dirty.sessions.contains_key(&load) {
             return;
         }
-        let next = dirty
-            .next_seq
-            .checked_add(1)
-            .expect("snapshot mark overflow");
-        dirty.next_seq = next;
-        if dirty.marks.insert(load, next).is_none() {
+        if dirty.marks.insert(load) {
             dirty.ready.push_back(load);
         }
         drop(dirty);
