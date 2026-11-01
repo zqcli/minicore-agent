@@ -38,95 +38,83 @@ async fn gated_session(
 }
 
 #[tokio::test]
-async fn an_idle_push_answers_with_the_started_turn_and_its_input() {
-    let mut fixture = RpcFixture::new("push-idle", [Step::Text("done")], &[], ApprovalMode::Auto);
-    let workspace = fixture.workspace.clone();
-    let agent = fixture.open().await;
-    let mut harness = RpcHarness::spawn(agent);
-    let session_id = create_and_open(&mut harness, &workspace).await;
-
+async fn an_idle_push_receipt_identifies_its_turn_in_the_snapshot() {
+    let (_fixture, mut harness, session_id, gate) = gated_session("push-idle", []).await;
     let pushed = harness
         .call_ok("input.push", push_params(&session_id, "steer", "hello"))
         .await;
-    let result = &pushed["result"];
-    let id = result["id"].as_str().unwrap();
+    let receipt = &pushed["result"];
+    let id = receipt["id"].as_str().unwrap();
     assert!(id.starts_with("inp_") && id.len() == 36, "{id}");
-    assert!(result["accepted_at"].is_string());
-    assert_eq!(result["started"]["turn"]["session_id"], session_id);
-    assert!(
-        result["started"]["turn"]["loop_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("lup_")
-    );
-    assert_eq!(result["started"]["input"]["id"], id);
-    assert_eq!(result["started"]["input"]["mode"], "steer");
-    assert_eq!(result["started"]["input"]["text"], "hello");
-    assert_eq!(
-        result["started"]["input"]["accepted_at"],
-        result["accepted_at"]
-    );
-    assert_eq!(result["queue"], json!({"items": [], "paused": false}));
-
-    let turn = result["started"]["turn"].clone();
+    assert!(receipt["accepted_at"].is_string());
+    assert_eq!(receipt["accepted"], true);
+    assert!(receipt.get("started").is_none());
+    assert!(receipt.get("queue").is_none());
+    let turn = harness.turn_for_input(receipt).await;
+    assert_eq!(turn["session_id"], session_id);
+    assert!(turn["loop_id"].as_str().unwrap().starts_with("lup_"));
+    let state = harness
+        .call_ok("session.state", Some(json!({"session_id":session_id})))
+        .await;
+    let snapshot = &state["result"]["snapshot"];
+    assert_eq!(snapshot["load"], receipt["load"]);
+    let input = &snapshot["execution"]["input"];
+    assert_eq!(input["id"], id);
+    assert_eq!(input["mode"], "steer");
+    assert_eq!(input["text"], "hello");
+    assert_eq!(input["accepted_at"], receipt["accepted_at"]);
+    assert_eq!(snapshot["queue"], json!({"items":[],"paused":false}));
+    gate.release();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["outcome"]["type"], "completed");
-    assert!(waited["result"]["next"].is_null());
-    assert_eq!(
-        waited["result"]["queue"],
-        json!({"items": [], "paused": false})
-    );
+    assert!(waited["result"].get("next").is_none());
+    assert!(waited["result"].get("queue").is_none());
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_queued_follow_up_becomes_the_wait_result_s_next_turn() {
+async fn a_queued_follow_up_is_identified_by_snapshots_after_its_predecessor() {
     let (_fixture, mut harness, session_id, gate) =
         gated_session("push-queued", [Step::Text("two")]).await;
     let first = harness
         .call_ok("input.push", push_params(&session_id, "steer", "first"))
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     started(&gate).await;
-
     let queued = harness
         .call_ok(
             "input.push",
             push_params(&session_id, "follow_up", "second"),
         )
         .await;
-    assert!(queued["result"]["started"].is_null());
-    assert_eq!(texts(&queued["result"]["queue"]), ["second"]);
-    assert_eq!(queued["result"]["queue"]["items"][0]["mode"], "follow_up");
+    assert_eq!(queued["result"]["accepted"], true);
     let listed = harness
-        .call_ok("input.list", Some(json!({"session_id": session_id})))
+        .call_ok("input.list", Some(json!({"session_id":session_id})))
         .await;
-    assert_eq!(listed["result"], queued["result"]["queue"]);
-    // Every queue change is announced; the last one carries the entry.
-    let event = loop {
-        let event = harness.event("input_queue").await;
-        if !event["params"]["data"]["queue"]["items"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-        {
-            break event;
-        }
-    };
-    assert_eq!(event["params"]["data"]["queue"], queued["result"]["queue"]);
-    assert_eq!(event["params"]["data"]["meta"]["session_id"], session_id);
-
+    assert_eq!(texts(&listed["result"]), ["second"]);
+    assert_eq!(listed["result"]["items"][0]["mode"], "follow_up");
+    assert_eq!(listed["result"]["items"][0]["id"], queued["result"]["id"]);
+    let event = harness
+        .event_matching("session_snapshot", |frame| {
+            let snapshot = &frame["params"]["data"]["snapshot"];
+            snapshot["load"] == queued["result"]["load"]
+                && snapshot["queue"]["items"][0]["id"] == queued["result"]["id"]
+        })
+        .await;
+    let snapshot = &event["params"]["data"]["snapshot"];
+    assert_eq!(snapshot["queue"], listed["result"]);
+    assert_eq!(snapshot["session_id"], session_id);
     gate.release();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
-    let next = waited["result"]["next"].clone();
-    assert_eq!(next["input"]["id"], queued["result"]["id"]);
-    assert_eq!(next["input"]["text"], "second");
-    assert_eq!(waited["result"]["queue"]["items"], json!([]));
-    let second = harness
-        .call_ok("turn.wait", Some(turn_params(&next["turn"])))
-        .await;
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    let next = harness.turn_for_input(&queued["result"]).await;
+    assert_ne!(next["loop_id"], turn["loop_id"]);
+    let second = harness.call_ok("turn.wait", Some(turn_params(&next))).await;
     assert_eq!(second["result"]["outcome"]["type"], "completed");
-    assert!(second["result"]["next"].is_null());
+    let queue = harness
+        .call_ok("input.list", Some(json!({"session_id":session_id})))
+        .await;
+    assert_eq!(queue["result"], json!({"items":[],"paused":false}));
     harness.shutdown().await;
 }
 
@@ -149,7 +137,7 @@ async fn a_running_turn_announces_the_inputs_it_took() {
     let first = harness
         .call_ok("input.push", push_params(&session_id, "steer", "first"))
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     started(&gate).await;
     let one = harness
         .call_ok("input.push", push_params(&session_id, "steer", "one"))
@@ -171,18 +159,18 @@ async fn a_running_turn_announces_the_inputs_it_took() {
     );
     assert_eq!(data["items"][1]["id"], two["result"]["id"]);
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
-    assert!(waited["result"]["next"].is_null());
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn remove_recall_resume_and_list_answer_with_the_queue() {
+async fn remove_recall_and_resume_leave_the_queue_in_the_snapshot_and_list() {
     let (_fixture, mut harness, session_id, gate) =
         gated_session("input-methods", [Step::Text("two")]).await;
     let first = harness
         .call_ok("input.push", push_params(&session_id, "steer", "first"))
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     started(&gate).await;
     let f1 = harness
         .call_ok("input.push", push_params(&session_id, "follow_up", "f1"))
@@ -190,41 +178,38 @@ async fn remove_recall_resume_and_list_answer_with_the_queue() {
     harness
         .call_ok("input.push", push_params(&session_id, "follow_up", "f2"))
         .await;
-
     let removed = harness
         .call_ok(
             "input.remove",
-            Some(json!({"session_id": session_id, "id": f1["result"]["id"]})),
+            Some(json!({"session_id":session_id,"id":f1["result"]["id"]})),
         )
         .await;
-    assert_eq!(removed["result"]["text"], "f1");
-    assert_eq!(texts(&removed["result"]["queue"]), ["f2"]);
+    assert_eq!(removed["result"], json!({"text":"f1"}));
+    let queue = harness
+        .call_ok("input.list", Some(json!({"session_id":session_id})))
+        .await;
+    assert_eq!(texts(&queue["result"]), ["f2"]);
     harness
         .call_err(
             "input.remove",
-            Some(json!({"session_id": session_id, "id": f1["result"]["id"]})),
+            Some(json!({"session_id":session_id,"id":f1["result"]["id"]})),
             -32025,
             "input_not_queued",
         )
         .await;
-
     let recalled = harness
-        .call_ok("input.recall", Some(json!({"session_id": session_id})))
+        .call_ok("input.recall", Some(json!({"session_id":session_id})))
         .await;
-    assert_eq!(recalled["result"]["texts"], json!(["f2"]));
-    assert_eq!(
-        recalled["result"]["queue"],
-        json!({"items": [], "paused": false})
-    );
-
-    // A running session has nothing to resume.
+    assert_eq!(recalled["result"], json!({"texts":["f2"]}));
+    let queue = harness
+        .call_ok("input.list", Some(json!({"session_id":session_id})))
+        .await;
+    assert_eq!(queue["result"], json!({"items":[],"paused":false}));
     let resumed = harness
-        .call_ok("input.resume", Some(json!({"session_id": session_id})))
+        .call_ok("input.resume", Some(json!({"session_id":session_id})))
         .await;
-    assert!(resumed["result"]["started"].is_null());
-
-    // A cancel pauses the queue; resume starts its head.
-    harness
+    assert!(resumed["result"]["start_error"].is_null());
+    let f3 = harness
         .call_ok("input.push", push_params(&session_id, "follow_up", "f3"))
         .await;
     let cancelled = harness
@@ -232,24 +217,26 @@ async fn remove_recall_resume_and_list_answer_with_the_queue() {
         .await;
     assert_eq!(cancelled["result"]["cancelled"], true);
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
-    assert!(waited["result"]["next"].is_null());
-    assert_eq!(waited["result"]["queue"]["paused"], true);
-    assert_eq!(texts(&waited["result"]["queue"]), ["f3"]);
-    gate.release();
-
-    let resumed = harness
-        .call_ok("input.resume", Some(json!({"session_id": session_id})))
+    assert_eq!(waited["result"]["outcome"]["type"], "cancelled");
+    let queue = harness
+        .call_ok("input.list", Some(json!({"session_id":session_id})))
         .await;
-    assert_eq!(resumed["result"]["started"]["input"]["text"], "f3");
-    assert_eq!(
-        resumed["result"]["queue"],
-        json!({"items": [], "paused": false})
-    );
-    let started = resumed["result"]["started"]["turn"].clone();
+    assert_eq!(queue["result"]["paused"], true);
+    assert_eq!(texts(&queue["result"]), ["f3"]);
+    gate.release();
+    let resumed = harness
+        .call_ok("input.resume", Some(json!({"session_id":session_id})))
+        .await;
+    assert!(resumed["result"]["start_error"].is_null());
+    let started = harness.turn_for_input(&f3["result"]).await;
     let finished = harness
         .call_ok("turn.wait", Some(turn_params(&started)))
         .await;
     assert_eq!(finished["result"]["outcome"]["type"], "completed");
+    let queue = harness
+        .call_ok("input.list", Some(json!({"session_id":session_id})))
+        .await;
+    assert_eq!(queue["result"], json!({"items":[],"paused":false}));
     harness.shutdown().await;
 }
 
@@ -356,7 +343,7 @@ async fn input_requests_with_bad_shapes_or_targets_fail_with_their_codes() {
 }
 
 #[tokio::test]
-async fn a_manual_compaction_result_names_the_turn_it_started_or_none() {
+async fn a_manual_compaction_result_reports_only_its_own_outcome() {
     let mut fixture = RpcFixture::new("compact-next", [], &[], ApprovalMode::Auto);
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
@@ -369,7 +356,7 @@ async fn a_manual_compaction_result_names_the_turn_it_started_or_none() {
         )
         .await;
     assert_eq!(result["result"]["status"], "noop");
-    assert!(result["result"]["next"].is_null());
+    assert!(result["result"].get("next").is_none());
     harness.shutdown().await;
 }
 
@@ -399,7 +386,7 @@ async fn w0_accepted_push_reports_failure_for_the_older_claimed_head() {
             ),
         )
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     started(&gate).await;
     let older = harness
         .call_ok(
@@ -414,7 +401,11 @@ async fn w0_accepted_push_reports_failure_for_the_older_claimed_head() {
         .call_ok("turn.cancel", w0_params(turn_params(&turn), load.as_ref()))
         .await;
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
-    assert!(waited["result"]["queue"]["paused"].as_bool().unwrap());
+    assert_eq!(waited["result"]["outcome"]["type"], "cancelled");
+    let paused = harness
+        .call_ok("input.list", Some(json!({"session_id":session})))
+        .await;
+    assert_eq!(paused["result"]["paused"], true);
     gate.release();
 
     let typed_session: SessionId = session.as_str().unwrap().parse().unwrap();
@@ -447,8 +438,8 @@ async fn w0_accepted_push_reports_failure_for_the_older_claimed_head() {
         older["result"]["id"]
     );
     assert!(pushed["result"]["start_error"]["kind"].is_string());
-    assert!(pushed["result"]["started"].is_null());
-    assert_eq!(pushed["result"]["queue"], queue["result"]);
+    assert!(pushed["result"].get("started").is_none());
+    assert!(pushed["result"].get("queue").is_none());
 }
 
 #[tokio::test]
@@ -470,7 +461,7 @@ async fn w0_stale_load_cannot_remove_a_reused_input_id_after_reopen() {
     let _release_old = ReleaseGate(old_gate.clone());
     let _release_new = ReleaseGate(new_gate.clone());
     let (session, old_load) = w0_create_session(&mut harness, &workspace).await;
-    let old_turn = harness
+    let old_receipt = harness
         .call_ok(
             "input.push",
             w0_params(
@@ -478,8 +469,8 @@ async fn w0_stale_load_cannot_remove_a_reused_input_id_after_reopen() {
                 old_load.as_ref(),
             ),
         )
-        .await["result"]["started"]["turn"]
-        .clone();
+        .await;
+    let old_turn = harness.turn_for_input(&old_receipt["result"]).await;
     started(&old_gate).await;
     let old_input = harness
         .call_ok(
@@ -603,13 +594,8 @@ async fn w0_claimed_input_is_observable_as_starting_before_runtime_installation(
 
     assert_eq!(queue["result"]["items"], json!([]));
     let execution = &state["result"]["snapshot"]["execution"];
-    let kind = execution
-        .get("type")
-        .or_else(|| execution.get("kind"))
-        .and_then(Value::as_str);
     assert_eq!(
-        kind,
-        Some("starting"),
+        execution["type"], "starting",
         "the claimed input disappeared from observable execution"
     );
     assert_eq!(execution["input"]["id"], pushed["result"]["id"]);
@@ -650,43 +636,18 @@ async fn w0_close_cannot_orphan_an_accepted_starting_claim() {
     gate.release();
     let pushed = harness.response(json!("claimed-push")).await;
     let close = harness.response(json!("close-claim")).await;
-    let after_close = if close["result"]["ok"] == true {
-        Some(
-            harness
-                .call("input.list", Some(json!({"session_id": session})))
-                .await,
-        )
-    } else {
-        None
-    };
-    harness.shutdown().await;
-
-    let closed = close["result"]["ok"] == true;
-    let installed = pushed["result"]["started"]["turn"]["loop_id"].is_string();
-    let queued = pushed["result"]["queue"]["items"]
-        .as_array()
-        .map_or(0, Vec::len);
-    assert!(pushed["result"]["id"].is_string());
-    if !installed && queued != 0 {
-        assert_eq!(
-            pushed["result"]["queue"]["items"][0]["id"],
-            pushed["result"]["id"]
-        );
-    }
-    assert!(
-        !closed || installed,
-        "close succeeded without installing the accepted claim; its receipt reports {queued} queued item(s), and the session lookup reported {:?}",
-        after_close
-            .as_ref()
-            .and_then(|response| response.pointer("/error/data/kind"))
-    );
-    if !closed {
-        assert_eq!(
-            close.pointer("/error/data/kind").and_then(Value::as_str),
-            Some("session_busy")
-        );
-    }
+    assert_eq!(close["error"]["data"]["kind"], "session_busy");
     assert_eq!(pushed["result"]["accepted"], true);
+    let turn = harness.turn_for_input(&pushed["result"]).await;
+    assert_eq!(turn["session_id"], session);
+    let state = harness
+        .call_ok("session.state", Some(json!({"session_id":session})))
+        .await;
+    assert_eq!(
+        state["result"]["snapshot"]["execution"]["input"]["id"],
+        pushed["result"]["id"]
+    );
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -719,7 +680,7 @@ async fn w0_successor_cannot_be_observed_before_its_predecessor_completion() {
             ),
         )
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     started(&first_gate).await;
     let queued = harness
         .call_ok(
@@ -753,13 +714,14 @@ async fn w0_successor_cannot_be_observed_before_its_predecessor_completion() {
     second_gate.release();
     harness.shutdown().await;
 
-    let next = &waited["result"]["next"];
+    assert_eq!(waited["result"]["outcome"]["type"], "completed");
+    let next = &during["result"]["snapshot"]["execution"];
     assert_eq!(next["input"]["id"], queued["result"]["id"]);
-    let next_id = &next["turn"]["loop_id"];
+    let next_id = &next["loop_id"];
     assert!(next_id.is_string());
-    let visible = &during["result"]["active_loop"]["loop_id"];
-    if visible == next_id {
-        let entry = during
+    assert_ne!(*next_id, turn["loop_id"]);
+    for state in [&during, &after_wait] {
+        let entry = state
             .pointer("/result/snapshot/completions/entries")
             .and_then(Value::as_array)
             .and_then(|entries| {
@@ -771,29 +733,8 @@ async fn w0_successor_cannot_be_observed_before_its_predecessor_completion() {
             entry.is_some(),
             "the successor was visible without its predecessor in the completion directory"
         );
-        assert_eq!(entry.unwrap()["next_loop_id"], *next_id);
-    } else {
-        assert_eq!(*visible, turn["loop_id"]);
-        assert_eq!(during["result"]["status"], "finishing");
+        assert_eq!(entry.unwrap()["availability"], "stored");
     }
-    let entry = after_wait
-        .pointer("/result/snapshot/completions/entries")
-        .and_then(Value::as_array)
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry["loop_id"] == turn["loop_id"])
-        });
-    assert!(
-        entry.is_some(),
-        "the predecessor waiter resolved before completion registration"
-    );
-    let entry = entry.unwrap();
-    assert_eq!(entry["next_loop_id"], *next_id);
-    assert!(matches!(
-        entry["availability"].as_str(),
-        Some("live" | "stored")
-    ));
 }
 
 #[tokio::test]
@@ -817,7 +758,7 @@ async fn w1_all_loaded_mutations_reject_missing_and_stale_load_before_effects() 
             Some(json!({"session_id":session,"load":load,"mode":"steer","text":"first"})),
         )
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     started(&gate).await;
     let queued = harness
         .call_ok(
@@ -882,7 +823,10 @@ async fn w1_all_loaded_mutations_reject_missing_and_stale_load_before_effects() 
     let state = harness
         .call_ok("session.state", Some(json!({"session_id":session})))
         .await;
-    assert_eq!(state["result"]["active_loop"]["loop_id"], turn["loop_id"]);
+    assert_eq!(
+        state["result"]["snapshot"]["execution"]["loop_id"],
+        turn["loop_id"]
+    );
     harness
         .call_ok(
             "input.recall",

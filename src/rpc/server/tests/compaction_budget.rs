@@ -24,7 +24,7 @@ async fn manual_compaction_rejects_fixed_schema_budget_before_model_call() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "settled"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -82,7 +82,7 @@ async fn manual_compaction_budget_counts_utf8_and_json_escaping() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -146,7 +146,7 @@ async fn manual_compaction_summarizes_complete_large_source_once() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": large_text})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -300,7 +300,7 @@ async fn oversized_current_input_server_acceptance(enabled: bool) {
         )
         .await;
     let response = harness.response(json!("send")).await;
-    let turn = response["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&response["result"]).await;
     assert!(
         turn["loop_id"].is_string(),
         "ordinary submit must accept without admission summary"
@@ -323,7 +323,7 @@ async fn oversized_current_input_server_acceptance(enabled: bool) {
     let state = harness
         .call_ok("session.state", Some(json!({"session_id": session_id})))
         .await;
-    assert_eq!(state["result"]["status"], json!("idle"));
+    assert_eq!(state["result"]["snapshot"]["execution"]["type"], "none");
     harness.shutdown().await;
     remove_base(&base).await;
 }
@@ -372,8 +372,7 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": text})),
         )
         .await;
-    assert!(response["result"]["started"]["turn"]["loop_id"].is_string());
-    let turn = response["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&response["result"]).await;
     let wait = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(wait["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(wait["result"]["persistence"], json!("persisted"));
@@ -422,8 +421,8 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
         .await
         .unwrap();
     assert_eq!(
-        seed.wait_turn(turn).await.unwrap().report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        seed.wait_turn(turn).await.unwrap().outcome,
+        crate::event::LoopOutcomeView::Completed
     );
     seed.close_session(info.session_id).await.unwrap();
     drop(seed);
@@ -450,7 +449,7 @@ async fn pi_first_boundary_utility_keeps_rpc_state_context_ping_and_cancel_respo
     let accepted = tokio::time::timeout(Duration::from_secs(2), harness.response(json!("new")))
         .await
         .unwrap();
-    let turn = accepted["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&accepted["result"]).await;
     assert!(turn["loop_id"].is_string());
     entered.notified().await;
     for (id, method, params) in [

@@ -412,18 +412,7 @@ pub(crate) fn completion(load: LoadId, entry: &crate::CompletionEntry) {
             .map(|entry| entry.session_id);
         observer.emit("completion_registered",json!({"session_id":session_id,"load":load,"seq":entry.seq,"loop_id":entry.loop_id,
         "input_id":entry.input_id,"completion_kind":entry.completion_kind,"outcome_kind":entry.outcome_kind,"persistence":entry.persistence,
-        "persistence_uncertain":entry.persistence_uncertain,"availability":entry.availability,"unavailable_reason":entry.unavailable_reason,"next_loop_id":entry.next_loop_id}));
-    }
-}
-
-pub(crate) fn report_refs(result: &std::sync::Arc<crate::TurnResult>, owner: &'static str) {
-    if let Some(observer) = get() {
-        let load = observer
-            .identity(result.turn.session_id, result.turn.loop_id)
-            .map(|identity| identity.load);
-        observer.emit("report_refs",json!({"session_id":result.turn.session_id,"load":load,"loop_id":result.turn.loop_id,"owner":owner,
-        "result_strong_count":std::sync::Arc::strong_count(result),"report_strong_count":std::sync::Arc::strong_count(&result.report),
-        "appended_items":result.report.appended.len(),"estimated_history_bytes":minicore_runtime::history::estimate_history_bytes(&result.report.appended)}));
+        "persistence_uncertain":entry.persistence_uncertain,"availability":entry.availability,"unavailable_reason":entry.unavailable_reason}));
     }
 }
 

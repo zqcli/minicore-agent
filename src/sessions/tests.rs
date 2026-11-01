@@ -37,7 +37,7 @@ async fn read_snapshots_share_timestamps_until_a_writer_changes_them() {
     agent.shutdown().await.unwrap();
 }
 use crate::compaction::EphemeralGroupKey;
-use crate::event::{AgentEvent, AgentEventSink, EventMeta, LoopOutcomeView};
+use crate::event::{AgentEvent, AgentEventSink, EventMeta};
 use crate::ids::SessionId;
 
 #[tokio::test]
@@ -51,20 +51,19 @@ async fn ignored_finished_drops_accumulate_into_subsequent_agent_event() {
     // the ignored runtime `Finished` envelope still records its cumulative
     // drop count (here 7) on the Agent sink.
     sink.record_core_drops(7);
-    sink.try_send(AgentEvent::TurnFinished {
+    sink.try_send(AgentEvent::OutputDelta {
         turn,
-        outcome: LoopOutcomeView::Completed,
-        persistence: TurnPersistence::Persisted,
-        next: None,
-        queue: crate::sessions::Queue::default(),
+        request_index: 0,
+        channel: OutputChannel::Text,
+        delta: "done".into(),
         meta: EventMeta::for_turn(turn, crate::test_support::load_id()),
     });
     let received = receiver
         .recv()
         .await
         .expect("agent event must be delivered");
-    let AgentEvent::TurnFinished { meta, .. } = received else {
-        panic!("expected a turn finished event");
+    let AgentEvent::OutputDelta { meta, .. } = received else {
+        panic!("expected an output event");
     };
     assert_eq!(meta.dropped_before, 7);
 }
@@ -103,14 +102,6 @@ fn an_old_loop_cleanup_cannot_clear_a_new_loop_summary() {
 impl Session {
     pub(crate) fn runtime_handle_for_test(&self) -> LoopHandle {
         self.lock_inner().active.as_ref().unwrap().handle.clone()
-    }
-
-    pub(crate) async fn join_observer_for_test(&self) {
-        let task = Arc::clone(&self.lock_inner().active.as_ref().unwrap()._observer.task);
-        tokio::time::timeout(std::time::Duration::from_secs(5), task.join())
-            .await
-            .expect("observer must stop on Agent completion while handles remain")
-            .unwrap();
     }
 
     pub(crate) async fn await_control_idle_for_test(&self) {
@@ -168,16 +159,6 @@ impl Session {
             .is_some_and(|active| active.handle.is_finished())
     }
 }
-impl SessionTask {
-    fn abort(&self) {
-        if let Ok(slot) = self.join.try_lock()
-            && let Some(handle) = slot.as_ref()
-        {
-            handle.abort();
-        }
-    }
-}
-
 pub(super) async fn pause_worker(registry: &Registry<SessionId, Arc<Gate>>, id: SessionId) {
     if let Some(gate) = registry.take(&id) {
         gate.pass().await;

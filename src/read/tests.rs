@@ -285,7 +285,7 @@ fn user_item(loop_id: LoopId, text: &str) -> HistoryItem {
 }
 
 #[tokio::test]
-async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summaries() {
+async fn interrupted_partial_reaches_stored_and_retained_pages_and_record_summaries() {
     let loop_id = LoopId::new().unwrap();
     let turn = TurnRef {
         session_id: SessionId::new().unwrap(),
@@ -331,22 +331,21 @@ async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summa
         })
     );
 
-    let live = Arc::new(crate::sessions::TurnResult {
-        turn,
-        report: Arc::new(minicore_runtime::LoopReport {
-            loop_id,
-            outcome: minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User),
-            appended: Arc::from([]),
-            usage: Usage::default(),
-            requests: 4,
-            tool_rounds: 3,
-            final_config_revision: ConfigRevision::INITIAL,
-        }),
-        persistence: TurnPersistence::Failed,
-        interrupted: Some(interrupted.clone()),
-        next: None,
-    });
-    let live_page = live_turn_page(
+    let live = crate::sessions::results::ResultSource::for_test(
+        encode_result_source(
+            &[],
+            Some(interrupted.clone()),
+            crate::sessions::TurnResult {
+                turn,
+                outcome: outcome.clone(),
+                requests: 4,
+                tool_rounds: 3,
+                ..crate::sessions::TurnResult::for_test()
+            },
+        )
+        .unwrap(),
+    );
+    let live_page = retained_page(
         &result_request(turn, ReadCursor::start(), 100, 4096),
         live,
         &result_limits(&cancellation, deadline),
@@ -382,22 +381,19 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
             session_id: SessionId::new().unwrap(),
             loop_id,
         };
-        let live = Arc::new(crate::sessions::TurnResult {
-            turn,
-            report: Arc::new(minicore_runtime::LoopReport {
-                loop_id,
-                outcome: minicore_runtime::LoopOutcome::Completed,
-                appended: Arc::from([]),
-                usage: Usage::default(),
-                requests: 1,
-                tool_rounds,
-                final_config_revision: ConfigRevision::INITIAL,
-            }),
-            persistence: TurnPersistence::Persisted,
-            interrupted: None,
-            next: None,
-        });
-        let event = crate::event::TurnResultView::from_turn_result(&live);
+        let live = crate::sessions::results::ResultSource::for_test(
+            encode_result_source(
+                &[],
+                None,
+                crate::sessions::TurnResult {
+                    turn,
+                    tool_rounds,
+                    ..crate::sessions::TurnResult::for_test()
+                },
+            )
+            .unwrap(),
+        );
+        let event = &live.metadata;
         assert_eq!(
             serde_json::to_value(event).unwrap()["tool_rounds"].as_u64(),
             Some(tool_rounds)
@@ -416,7 +412,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
         };
         let cancellation = CancellationToken::new();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        let live_page = live_turn_page(
+        let live_page = retained_page(
             &result_request(turn, ReadCursor::start(), 100, 4096),
             live,
             &result_limits(&cancellation, deadline),
@@ -457,7 +453,7 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
 }
 
 #[tokio::test]
-async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
+async fn retained_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
     const MAX_BYTES: usize = 1024;
     const COMPLETED_AT: &str = "2026-01-02T03:04:05.000Z";
 
@@ -478,32 +474,18 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
     let cancellation = CancellationToken::new();
 
     for (label, items) in cases {
-        let sanitized = sanitize_history(&items).unwrap();
-        let expected: Vec<String> = sanitized
-            .iter()
-            .map(|item| {
-                serde_json::to_string(&ReadItemEnvelope {
-                    item,
-                    timestamp: None,
-                })
-                .unwrap()
-            })
-            .collect();
-        let live = Arc::new(crate::sessions::TurnResult {
-            turn,
-            report: Arc::new(minicore_runtime::LoopReport {
-                loop_id,
-                outcome: minicore_runtime::LoopOutcome::Completed,
-                appended: items.clone().into(),
-                usage: Usage::default(),
-                requests: 1,
-                tool_rounds: 0,
-                final_config_revision: ConfigRevision::INITIAL,
-            }),
-            persistence: crate::sessions::TurnPersistence::Failed,
-            interrupted: None,
-            next: None,
-        });
+        let expected = prepare_result_source(&items, None).unwrap().items;
+        let live = crate::sessions::results::ResultSource::for_test(
+            encode_result_source(
+                &items,
+                None,
+                crate::sessions::TurnResult {
+                    turn,
+                    ..crate::sessions::TurnResult::for_test()
+                },
+            )
+            .unwrap(),
+        );
         let stored = StoredLoopRecord {
             loop_id,
             outcome: StoredLoopOutcome::Completed,
@@ -538,7 +520,7 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
             let mut page_count = 0;
             loop {
                 let page = if live_side {
-                    live_turn_page(
+                    retained_page(
                         &result_request(turn, cursor, 100, MAX_BYTES),
                         Arc::clone(&live),
                         &result_limits(&cancellation, deadline),
@@ -672,7 +654,7 @@ fn exact_source_reservation_admits_a_result_at_the_small_byte_limit() {
         loop_id,
     };
     let items = vec![user_item(loop_id, &"\u{1}".repeat(8192))];
-    let metadata = crate::event::TurnResultView {
+    let metadata = crate::sessions::TurnResult {
         turn,
         outcome: LoopOutcomeView::Completed,
         usage: Usage::default(),
@@ -708,7 +690,7 @@ fn exact_source_reservation_admits_a_result_at_the_small_byte_limit() {
 fn source_admission_counts_metadata_string_capacity_not_just_encoded_length() {
     let loop_id = LoopId::new().unwrap();
     let items = vec![user_item(loop_id, "question")];
-    let mut metadata = crate::event::TurnResultView {
+    let mut metadata = crate::sessions::TurnResult {
         turn: TurnRef {
             session_id: SessionId::new().unwrap(),
             loop_id,
@@ -942,4 +924,21 @@ fn result_limits(cancellation: &CancellationToken, deadline: Instant) -> History
     let mut limits = scan_limits(cancellation.clone());
     limits.deadline = deadline;
     limits
+}
+
+async fn retained_page(
+    request: &TurnResultRequest,
+    source: Arc<crate::sessions::results::ResultSource>,
+    limits: &HistoryScanLimits,
+) -> Result<TurnResultPage, AgentError> {
+    retained_turn_page(
+        request.clone(),
+        source,
+        false,
+        request.cursor.unwrap_or_else(ReadCursor::start),
+        request.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES),
+        &limits.cancellation,
+        limits.deadline,
+    )
+    .await
 }

@@ -60,8 +60,8 @@ async fn history_total(process: &mut RpcProcess, id: &str, session_id: &Value) -
     process
         .send(
             id,
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": session_id, "view": "display", "limit": 100}),
         )
         .await;
     process.response(id).await["result"]["total"]
@@ -110,7 +110,7 @@ async fn repeated_turns_on_two_sessions_persist_contiguous_histories() {
                     json!({"session_id": session_id, "mode": "steer", "text": format!("turn {index}")}),
                 )
                 .await;
-            let turn = process.response(&send_id).await["result"]["started"]["turn"].clone();
+            let turn = process.accepted_turn(&send_id).await;
             process
                 .send(&wait_id, "turn.wait", turn_params(&turn))
                 .await;
@@ -190,7 +190,7 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
             json!({"session_id": session_id, "mode": "steer", "text": "one"}),
         )
         .await;
-    let turn1 = process.response("send1").await["result"]["started"]["turn"].clone();
+    let turn1 = process.accepted_turn("send1").await;
     process
         .send("wait1", "turn.wait", turn_params(&turn1))
         .await;
@@ -207,7 +207,7 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
             json!({"session_id": session_id, "mode": "steer", "text": "two"}),
         )
         .await;
-    let turn2 = process.response("send2").await["result"]["started"]["turn"].clone();
+    let turn2 = process.accepted_turn("send2").await;
     process
         .send("wait2", "turn.wait", turn_params(&turn2))
         .await;
@@ -234,7 +234,7 @@ async fn cancel_does_not_break_subsequent_turns_or_history() {
             json!({"session_id": session_id, "mode": "steer", "text": "three"}),
         )
         .await;
-    let turn3 = process.response("send3").await["result"]["started"]["turn"].clone();
+    let turn3 = process.accepted_turn("send3").await;
     assert_ne!(turn3["loop_id"], turn2["loop_id"]);
     process
         .send("wait3", "turn.wait", turn_params(&turn3))

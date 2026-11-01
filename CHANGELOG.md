@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased
+## 0.9.3 — Unreleased
+
+Breaking: Agent RPC protocol 3 replaces the remaining parallel control APIs.
+Storage formats and the Runtime 0.9.0 dependency are unchanged.
+
+- Make `SessionSnapshot` the only full control observation. Remove the
+  `session_state`, `turn_started`, `input_queue`, `interaction_requested`,
+  `interaction_resolved` and `turn_finished` events. Input commands return
+  operation receipts; `session.state` returns only `snapshot`. `input.list`
+  remains an explicit queue query.
+- Return a lightweight `TurnResult` from `turn.wait`, without raw Runtime
+  reports, `next` or `queue`. Register completion before publishing it; retain
+  the bounded late-wait window and independent unsaved result sources. Manual
+  compaction no longer returns a successor. Clients find turns through input
+  identities in snapshots. Persisted result pages consistently report `stored`.
+- Remove `session.history` and its Rust display DTOs. `session.read` provides
+  canonical and display pagination. Build display metadata from the complete
+  turns intersecting a page, reuse loaded timestamp metadata, and share borrowed
+  canonical encoding across history and result reads.
+- Observe Runtime state inside the existing busy-period driver. Share task
+  ownership for Session, compaction, command and diff work while preserving
+  cancellation-safe joins, settlement and close barriers.
+- Read only requested Tool payloads: summary queries read input/result, output
+  queries read the selected stream, and warm output pages borrow retained
+  buffers. Remove whole-record clone/merge paths and unnecessary file reads.
+- Replace opaque string change references with `tool` and `workspace` values.
+  Tool references address their `ToolRef` directly and validate the revision;
+  workspace entries use a stable path order. Remove the reverse metadata scan.
+- Move parsed RPC request fields instead of cloning their JSON payloads, and
+  share a single-pass JSON string prefix budget helper.
+- Migrate protocol and process tests to real snapshots and paged reads; keep
+  regressions for ownership, terminal-state observation, failed persistence,
+  held result pages, input ordering and targeted payload I/O.
+
+### Previous development work (0.9.1–0.9.2)
 
 - Keep cancelled result queries owned and counted until their blocking work
   exits; close and shutdown join them before releasing the loaded instance.

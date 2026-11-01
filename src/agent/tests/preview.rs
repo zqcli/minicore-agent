@@ -68,16 +68,12 @@ async fn tool_argument_preview_cancel_leaves_existing_and_new_files_untouched() 
         assert!(agent.cancel(turn).unwrap());
         let result = wait_text(&agent, turn).await;
         assert!(matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Cancelled(_)
+            result.outcome,
+            crate::event::LoopOutcomeView::Cancelled { .. }
         ));
         let mut generating = false;
         let mut discarded = false;
-        loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        while let Some(event) = events.try_recv() {
             match event {
                 AgentEvent::ToolArgumentsPreview { state, display, .. } => match state {
                     ToolArgumentsPreviewState::Generating => {
@@ -91,15 +87,16 @@ async fn tool_argument_preview_cancel_leaves_existing_and_new_files_untouched() 
                 AgentEvent::ToolInvocation { .. } | AgentEvent::ToolStarted { .. } => {
                     panic!("partial JSON reached execution")
                 }
-                AgentEvent::TurnFinished { .. } => break,
                 _ => {}
             }
         }
         assert!(generating && discarded);
         assert!(
-            !result
-                .report
-                .appended
+            !agent
+                .loaded_session(info.session_id)
+                .unwrap()
+                .read_snapshot()
+                .history
                 .iter()
                 .any(|item| matches!(item, HistoryItem::ToolResult(_)))
         );
@@ -149,16 +146,12 @@ async fn tool_argument_preview_assembler_rejection_and_post_finish_event_never_e
         let turn = send_text(&mut agent, info.session_id, "synthetic malformed stream").await;
         let result = wait_text(&agent, turn).await;
         assert!(!matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
+            result.outcome,
+            crate::event::LoopOutcomeView::Completed
         ));
         let mut discarded = false;
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
+        while let Some(event) = events.try_recv() {
+            match event {
                 AgentEvent::ToolArgumentsPreview {
                     state: ToolArgumentsPreviewState::Discarded,
                     ..
@@ -166,7 +159,6 @@ async fn tool_argument_preview_assembler_rejection_and_post_finish_event_never_e
                 AgentEvent::ToolInvocation { .. } | AgentEvent::ToolStarted { .. } => {
                     panic!("invalid model response reached execution")
                 }
-                AgentEvent::TurnFinished { .. } => break,
                 _ => {}
             }
         }
@@ -210,12 +202,8 @@ async fn tool_argument_preview_normal_completion_is_followed_by_authoritative_in
     assert_completed(&result);
     let mut generated = false;
     let mut invoked = false;
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
+    while let Some(event) = events.try_recv() {
+        match event {
             AgentEvent::ToolArgumentsPreview {
                 state: ToolArgumentsPreviewState::Generated,
                 partial,
@@ -233,7 +221,6 @@ async fn tool_argument_preview_normal_completion_is_followed_by_authoritative_in
                 assert!(generated);
                 assert_eq!(data.tool_ref.tool_call_id.as_str(), "preview-write");
             }
-            AgentEvent::TurnFinished { .. } => break,
             _ => {}
         }
     }
@@ -289,16 +276,12 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
         .await
         .unwrap();
     assert!(!matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        result.outcome,
+        crate::event::LoopOutcomeView::Completed
     ));
     let mut discarded = false;
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
+    while let Some(event) = events.try_recv() {
+        match event {
             AgentEvent::ToolArgumentsPreview {
                 state: ToolArgumentsPreviewState::Discarded,
                 ..
@@ -306,7 +289,6 @@ async fn tool_argument_preview_model_deadline_discards_without_workspace_io() {
             AgentEvent::ToolInvocation { .. } | AgentEvent::ToolStarted { .. } => {
                 panic!("timed out prefix reached execution")
             }
-            AgentEvent::TurnFinished { .. } => break,
             _ => {}
         }
     }

@@ -26,8 +26,7 @@ use crate::models::Models;
 use crate::profiles::ApprovalMode;
 use crate::read::InterruptedRequest;
 use crate::tool_data::{
-    CommandResult, ToolExecutionState, ToolPersistenceSnapshot, ToolPhase, ToolRecord, ToolRef,
-    ToolSubject,
+    CommandResult, ToolExecutionState, ToolPersistenceSnapshot, ToolPhase, ToolRef, ToolSubject,
 };
 use crate::tools::KNOWN_TOOL_NAMES;
 
@@ -451,25 +450,7 @@ impl Drop for DiffWorkers {
 struct OwnedDiffWorker {
     session_id: SessionId,
     cancel: CancellationToken,
-    join: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl OwnedDiffWorker {
-    fn is_finished(&self) -> bool {
-        match self.join.try_lock() {
-            Ok(slot) => slot.as_ref().is_none_or(|handle| handle.is_finished()),
-            Err(_) => false,
-        }
-    }
-
-    async fn join(&self) {
-        let mut slot = self.join.lock().await;
-        let Some(handle) = slot.as_mut() else {
-            return;
-        };
-        let _ = std::pin::Pin::new(handle).await;
-        slot.take();
-    }
+    task: crate::task::OwnedTask,
 }
 
 /// One owned `changes.diff` CPU comparison. Awaiting it observes the blocking
@@ -517,11 +498,6 @@ pub(crate) struct StoredToolRecord {
     pub(crate) command: Option<CommandResult>,
     #[serde(default)]
     pub(crate) file_change: Option<StoredFileChange>,
-}
-
-struct ReadToolRecord {
-    metadata: StoredToolRecord,
-    record: ToolRecord,
 }
 
 pub(crate) struct ToolChangeScan {
@@ -939,7 +915,7 @@ impl Store {
         let child_cancel = admission.child_token();
         let worker_cancel = child_cancel.clone();
         let mut workers = self.diff_workers.lock().unwrap();
-        workers.workers.retain(|worker| !worker.is_finished());
+        workers.workers.retain(|worker| !worker.task.is_finished());
         if workers.closing || admission.is_cancelled() || workers.workers.len() >= MAX_DIFF_WORKERS
         {
             return Err(StoreError::QueryLimit);
@@ -964,7 +940,7 @@ impl Store {
         workers.workers.push(Arc::new(OwnedDiffWorker {
             session_id,
             cancel: child_cancel.clone(),
-            join: tokio::sync::Mutex::new(Some(handle)),
+            task: crate::task::OwnedTask::new(handle),
         }));
         Ok(DiffQuery {
             receiver,
@@ -987,10 +963,10 @@ impl Store {
             worker.cancel.cancel();
         }
         for worker in &workers {
-            worker.join().await;
+            let _ = worker.task.join().await;
         }
         let mut workers = self.diff_workers.lock().unwrap();
-        workers.workers.retain(|worker| !worker.is_finished());
+        workers.workers.retain(|worker| !worker.task.is_finished());
     }
 
     pub(crate) fn cancel_diff_workers(&self) {
@@ -1018,12 +994,12 @@ impl Store {
             worker.cancel.cancel();
         }
         for worker in &workers {
-            worker.join().await;
+            let _ = worker.task.join().await;
         }
         let mut workers = self.diff_workers.lock().unwrap();
         workers
             .workers
-            .retain(|worker| !(worker.session_id == session_id && worker.is_finished()));
+            .retain(|worker| !(worker.session_id == session_id && worker.task.is_finished()));
     }
 
     pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {

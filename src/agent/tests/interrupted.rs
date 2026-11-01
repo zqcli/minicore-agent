@@ -27,8 +27,10 @@ async fn cancel_hanging_turn(
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(agent, turn).await;
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User
+        }
     );
     assert_persisted(&result);
     (turn, result)
@@ -68,7 +70,7 @@ async fn a_cancelled_stream_is_readable_after_reopen_but_never_reaches_a_model()
     let (mut agent, info) = fixture.start().await;
     let session_id = info.session_id;
 
-    let (turn, result) = cancel_hanging_turn(&mut agent, session_id, &gate).await;
+    let (turn, _) = cancel_hanging_turn(&mut agent, session_id, &gate).await;
     let expected = InterruptedRequest {
         stop_reason: PartialStopReason::Aborted,
         request_index: 0,
@@ -76,7 +78,6 @@ async fn a_cancelled_stream_is_readable_after_reopen_but_never_reaches_a_model()
         reasoning: "weighing it".to_owned(),
         text: "Let me check".to_owned(),
     };
-    assert_eq!(result.interrupted.as_ref(), Some(&expected));
     let turn_request = TurnResultRequest {
         turn,
         load: Some(agent.loaded_session(session_id).unwrap().load().to_string()),
@@ -86,7 +87,7 @@ async fn a_cancelled_stream_is_readable_after_reopen_but_never_reaches_a_model()
         max_bytes: None,
     };
     let live = agent.turn_result(turn_request.clone()).await.unwrap();
-    assert_eq!(live.availability, crate::TurnResultAvailability::Live);
+    assert_eq!(live.availability, crate::TurnResultAvailability::Stored);
     assert_eq!(live.interrupted.as_ref(), Some(&expected));
 
     // The next turn runs the same Session; its request must not see the partial.
@@ -109,7 +110,7 @@ async fn a_cancelled_stream_is_readable_after_reopen_but_never_reaches_a_model()
     assert_eq!(before.total, 3, "the partial is not a history item");
     assert_eq!(before.records[0].interrupted.as_ref(), Some(&expected));
     assert_eq!(before.records[1].interrupted, None);
-    let history_before = history_page(&agent, session_id, 100).total;
+    let history_before = history_page(&agent, session_id, 100).await.total;
 
     agent.close_session(session_id).await.unwrap();
     let cold = agent
@@ -128,7 +129,10 @@ async fn a_cancelled_stream_is_readable_after_reopen_but_never_reaches_a_model()
         assert_eq!(read.records, before.records);
         assert_eq!(read.history_revision, before.history_revision);
     }
-    assert_eq!(history_page(&agent, session_id, 100).total, history_before);
+    assert_eq!(
+        history_page(&agent, session_id, 100).await.total,
+        history_before
+    );
     let history = serde_json::to_string(&read_store_history(&fixture.data_dir, session_id).await);
     assert!(!history.unwrap().contains("Let me che"));
 }
@@ -155,8 +159,7 @@ async fn a_stream_without_visible_output_leaves_no_partial() {
         )]));
     let (mut agent, info) = fixture.start().await;
 
-    let (_, result) = cancel_hanging_turn(&mut agent, info.session_id, &gate).await;
-    assert_eq!(result.interrupted, None);
+    cancel_hanging_turn(&mut agent, info.session_id, &gate).await;
     let read = agent
         .read_session(canonical_read(info.session_id))
         .await
@@ -184,14 +187,13 @@ async fn the_kept_partial_is_the_head_of_the_stream_within_its_bound() {
         )]));
     let (mut agent, info) = fixture.start().await;
 
-    let (_, result) = cancel_hanging_turn(&mut agent, info.session_id, &gate).await;
-    let interrupted = result.interrupted.clone().unwrap();
-    assert_eq!(interrupted.text, all[..16 * 1024]);
+    cancel_hanging_turn(&mut agent, info.session_id, &gate).await;
     let read = agent
         .read_session(canonical_read(info.session_id))
         .await
         .unwrap();
-    assert_eq!(read.records[0].interrupted.as_ref(), Some(&interrupted));
+    let interrupted = read.records[0].interrupted.as_ref().unwrap();
+    assert_eq!(interrupted.text, all[..16 * 1024]);
 }
 
 #[tokio::test]
@@ -229,10 +231,11 @@ async fn cancelling_during_tool_execution_records_no_partial() {
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(&agent, turn).await;
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User
+        }
     );
-    assert_eq!(result.interrupted, None);
     let read = agent
         .read_session(canonical_read(info.session_id))
         .await

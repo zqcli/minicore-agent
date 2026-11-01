@@ -16,11 +16,17 @@
 
 mod data;
 mod paging;
+mod read;
 mod record;
 mod types;
 
 pub(crate) use data::ToolData;
-pub(crate) use record::{ToolPersistenceSnapshot, ToolRecord};
+#[cfg(test)]
+pub(crate) use read::TOOL_READ_GATES;
+pub(crate) use read::{StoredToolRead, ToolReadPayload, ToolReadScope, tool_output, tool_read};
+pub(crate) use record::ToolPersistenceSnapshot;
+#[cfg(test)]
+use record::ToolRecord;
 pub(crate) use types::ToolStreamNotice;
 pub use types::{
     CommandResult, CommandStatus, ToolDataAvailability, ToolDataStream, ToolExecutionData,

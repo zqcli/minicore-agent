@@ -1,5 +1,6 @@
 //! JSONL history read, write, scan, and anchor implementation.
 use super::*;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub(crate) struct HistoryLine {
@@ -43,6 +44,67 @@ fn index_line(
     line.hash.update(bytes);
     line.usage.add(record.loop_id, record.usage);
     index.push(line);
+}
+
+fn append_page_record(
+    page: &mut HistoryReadPage,
+    session_id: SessionId,
+    record: StoredLoopRecord,
+    items: &[HistoryItem],
+    item_start: usize,
+    range: std::ops::Range<usize>,
+    loaded_times: Option<&HashMap<(LoopId, usize), String>>,
+) -> Result<(), StoreError> {
+    let page_start = page.items.len();
+    let stored_times = record.normalized_user_times().unwrap_or_default();
+    let mut occurrence = 0;
+    for (index, item) in items.iter().enumerate() {
+        let timestamp = if let HistoryItem::User(user) = item {
+            let timestamp = loaded_times
+                .and_then(|times| times.get(&(user.loop_id, occurrence)).cloned())
+                .or_else(|| stored_times.get(occurrence).cloned().flatten());
+            occurrence += 1;
+            timestamp
+        } else {
+            None
+        };
+        if range.contains(&(item_start + index)) {
+            page.items.push(item.clone());
+            page.user_times.push(timestamp);
+        }
+    }
+    if let Some(encoded) = &mut page.display_items {
+        // A page can split a request; its tool facts still come from the complete loop.
+        encoded.extend(
+            crate::read::encoded_display_items(
+                session_id,
+                item_start.max(range.start),
+                &page.items[page_start..],
+                &page.user_times[page_start..],
+                items,
+            )
+            .map_err(corrupt)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(corrupt)?,
+        );
+    }
+    if page.turns.len() < MAX_READ_TURN_SUMMARIES {
+        page.turns.push(StoredTurnSummary {
+            item_start,
+            item_end: item_start + items.len(),
+            loop_id: record.loop_id,
+            outcome: record.outcome,
+            usage: record.usage,
+            requests: record.requests,
+            tool_rounds: record.tool_rounds,
+            final_config_revision: record.final_config_revision,
+            completed_at: record.completed_at,
+            interrupted: record.interrupted,
+        });
+    } else {
+        page.turns_truncated = true;
+    }
+    Ok(())
 }
 
 struct IndexedPage {
@@ -163,6 +225,7 @@ impl Store {
         mut indexed: IndexedPage,
         offset: usize,
         limit: usize,
+        user_times: Option<&HashMap<(LoopId, usize), String>>,
         limits: &HistoryScanLimits,
     ) -> Result<HistoryReadPage, StoreError> {
         check_history_scan(limits)?;
@@ -192,37 +255,15 @@ impl Store {
             let record: StoredLoopRecord = serde_json::from_slice(&line).map_err(corrupt)?;
             let items = normalize_history(&record.items).map_err(corrupt)?;
             let item_end = item_start + items.len();
-            let times = record.normalized_user_times().unwrap_or_default();
-            let mut occurrence = 0;
-            for (i, item) in items.iter().enumerate() {
-                let time = if matches!(item, HistoryItem::User(_)) {
-                    let time = times.get(occurrence).cloned().flatten();
-                    occurrence += 1;
-                    time
-                } else {
-                    None
-                };
-                if (offset..offset.saturating_add(limit)).contains(&(item_start + i)) {
-                    page.items.push(item.clone());
-                    page.user_times.push(time);
-                }
-            }
-            if page.turns.len() < MAX_READ_TURN_SUMMARIES {
-                page.turns.push(StoredTurnSummary {
-                    item_start,
-                    item_end,
-                    loop_id: record.loop_id,
-                    outcome: record.outcome,
-                    usage: record.usage,
-                    requests: record.requests,
-                    tool_rounds: record.tool_rounds,
-                    final_config_revision: record.final_config_revision,
-                    completed_at: record.completed_at,
-                    interrupted: record.interrupted,
-                });
-            } else {
-                page.turns_truncated = true;
-            }
+            append_page_record(
+                page,
+                session_id,
+                record,
+                &items,
+                item_start,
+                offset..offset.saturating_add(limit),
+                user_times,
+            )?;
             item_start = item_end;
             tokio::task::yield_now().await;
         }
@@ -391,6 +432,7 @@ impl Store {
         item_offset: usize,
         item_limit: usize,
         visible_item_count: Option<usize>,
+        user_times: Option<&HashMap<(LoopId, usize), String>>,
         captured_end: Option<u64>,
         expected_revision: Option<&str>,
         usage_boundary: Option<usize>,
@@ -401,6 +443,7 @@ impl Store {
             item_offset,
             item_limit,
             visible_item_count,
+            user_times,
             captured_end,
             expected_revision,
             usage_boundary,
@@ -410,14 +453,16 @@ impl Store {
         .await
     }
 
-    /// Cold display uses the same bounded, read-only scan as canonical reads.
-    /// A candidate summary is accepted only against this scan's exact bytes.
+    /// Projects only selected loops; cold summaries require the full scan's anchor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_display_history_page(
         &self,
         session_id: SessionId,
         item_offset: usize,
         item_limit: usize,
+        visible_item_count: Option<usize>,
+        user_times: Option<&HashMap<(LoopId, usize), String>>,
+        covered_item_count: usize,
         captured_end: Option<u64>,
         expected_revision: Option<&str>,
         summary: Option<&HistoryPrefix>,
@@ -427,10 +472,11 @@ impl Store {
             session_id,
             item_offset,
             item_limit,
-            None,
+            visible_item_count,
+            user_times,
             captured_end,
             expected_revision,
-            Some(summary.map_or(0, |source| source.covered_item_count as usize)),
+            Some(covered_item_count),
             Some(ColdDisplayScan { summary }),
             limits,
         )
@@ -444,6 +490,7 @@ impl Store {
         item_offset: usize,
         item_limit: usize,
         visible_item_count: Option<usize>,
+        user_times: Option<&HashMap<(LoopId, usize), String>>,
         captured_end: Option<u64>,
         expected_revision: Option<&str>,
         usage_boundary: Option<usize>,
@@ -453,7 +500,7 @@ impl Store {
         if captured_end.is_some() != expected_revision.is_some() {
             return Err(StoreError::InvalidArguments);
         }
-        let indexed = if display.is_none() {
+        let indexed = if display.is_none() || visible_item_count.is_some() {
             self.history_indexes
                 .lock()
                 .unwrap()
@@ -473,9 +520,17 @@ impl Store {
         } else {
             None
         };
-        if let Some(indexed) = indexed {
+        if let Some(mut indexed) = indexed {
+            indexed.page.display_items = display.as_ref().map(|_| Vec::new());
             return self
-                .read_indexed_page(session_id, indexed, item_offset, item_limit, limits)
+                .read_indexed_page(
+                    session_id,
+                    indexed,
+                    item_offset,
+                    item_limit,
+                    user_times,
+                    limits,
+                )
                 .await;
         }
         let (path, length) = self.require_history_file(session_id).await?;
@@ -493,7 +548,9 @@ impl Store {
             if captured_end.is_some_and(|end| end != 0) {
                 return Err(StoreError::HistoryChanged);
             }
-            return finish_empty_history_page(0, expected_revision);
+            let mut page = finish_empty_history_page(0, expected_revision)?;
+            page.display_items = display.as_ref().map(|_| Vec::new());
+            return Ok(page);
         }
 
         let file = File::open(&path).await.map_err(unavailable)?;
@@ -505,13 +562,12 @@ impl Store {
         let mut line_count = 0_usize;
         let mut total_items = 0_usize;
         let mut covered_usage = crate::read::CoveredUsage::default();
-        let mut items = Vec::new();
-        let mut user_times = Vec::new();
-        let mut display_items = display.as_ref().map(|_| Vec::new());
+        let mut page = HistoryReadPage {
+            display_items: display.as_ref().map(|_| Vec::new()),
+            ..HistoryReadPage::default()
+        };
         let mut summary_anchor_valid = display.as_ref().is_none_or(|read| read.summary.is_none());
         let page_end = item_offset.saturating_add(item_limit);
-        let mut turns = Vec::new();
-        let mut turns_truncated = false;
         let mut stopped_at_visible_cap = false;
         let mut trailing_incomplete = false;
         let retained_source_limit = limits
@@ -572,58 +628,17 @@ impl Store {
                     return Err(StoreError::QueryLimit);
                 }
             }
-            let page_item_start = items.len();
-            let times = record.normalized_user_times().unwrap_or_default();
-            let mut user_occurrence = 0_usize;
-            for (index, item) in normalized.iter().enumerate() {
-                let timestamp = if matches!(item, HistoryItem::User(_)) {
-                    let timestamp = times.get(user_occurrence).cloned().flatten();
-                    user_occurrence += 1;
-                    timestamp
-                } else {
-                    None
-                };
-                if index + record_start >= item_offset && index + record_start < page_end {
-                    items.push(item.clone());
-                    user_times.push(timestamp);
-                }
-            }
-            if let Some(encoded) = display_items
-                .as_mut()
-                .filter(|_| items.len() > page_item_start)
-            {
-                // Tool identities are loop-local. Pair only within this complete
-                // stored loop, including counterparts outside the selected page.
-                encoded.extend(
-                    crate::read::encoded_display_items(
-                        session_id,
-                        record_start.max(item_offset),
-                        &items[page_item_start..],
-                        &user_times[page_item_start..],
-                        &normalized,
-                    )
-                    .map_err(corrupt)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(corrupt)?,
-                );
-            }
+            let loop_id = record.loop_id;
             if record_end > item_offset && record_start < page_end {
-                if turns.len() < MAX_READ_TURN_SUMMARIES {
-                    turns.push(StoredTurnSummary {
-                        item_start: record_start,
-                        item_end: record_end,
-                        loop_id: record.loop_id,
-                        outcome: record.outcome.clone(),
-                        usage: record.usage,
-                        requests: record.requests,
-                        tool_rounds: record.tool_rounds,
-                        final_config_revision: record.final_config_revision,
-                        completed_at: record.completed_at.clone(),
-                        interrupted: record.interrupted.clone(),
-                    });
-                } else {
-                    turns_truncated = true;
-                }
+                append_page_record(
+                    &mut page,
+                    session_id,
+                    record,
+                    &normalized,
+                    record_start,
+                    item_offset..page_end,
+                    user_times,
+                )?;
             }
             total_items = record_end;
             line_count += 1;
@@ -637,7 +652,7 @@ impl Store {
                     prefix_bytes: complete_end,
                     covered_loop_count: line_count as u64,
                     covered_item_count: total_items as u64,
-                    last_loop_id: Some(record.loop_id),
+                    last_loop_id: Some(loop_id),
                     sha256: digest_hex(hasher.clone()),
                 };
                 summary_anchor_valid = &actual == expected;
@@ -668,15 +683,11 @@ impl Store {
             revision,
             trailing_incomplete,
             total_items,
-            items,
-            user_times,
-            turns,
-            turns_truncated,
             covered_usage,
-            display_items,
             summary_anchor_valid,
             scanned_bytes: scan_target - remaining,
             scanned_lines: line_count,
+            ..page
         })
     }
 

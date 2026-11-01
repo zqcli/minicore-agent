@@ -27,7 +27,7 @@ async fn tool_read_and_output_query_recorded_facts_by_full_identity() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "read a"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -36,24 +36,17 @@ async fn tool_read_and_output_query_recorded_facts_by_full_identity() {
     // Derive the ToolRef from authoritative history rather than guessing.
     let history = harness
         .call_ok(
-            "session.history",
-            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+            "session.read",
+            Some(json!({"session_id": session_id, "view": "display", "limit": 100})),
         )
         .await;
-    let tool_result = history["result"]["items"]
-        .as_array()
-        .unwrap()
+    let tool_result = read_items(&history["result"])
         .iter()
         .find_map(|item| {
             (item["item"]["type"] == json!("tool_result")).then(|| item["item"]["data"].clone())
         })
         .expect("tool result history item");
-    let tool_ref = json!({
-        "session_id": session_id,
-        "loop_id": tool_result["loop_id"],
-        "request_index": tool_result["request_index"],
-        "tool_call_id": tool_result["tool_call_id"],
-    });
+    let tool_ref = crate::rpc_test_control::first_tool_ref(&history["result"]);
 
     harness
         .send(
@@ -63,7 +56,7 @@ async fn tool_read_and_output_query_recorded_facts_by_full_identity() {
                 "session_id": session_id,
                 "loop_id": tool_result["loop_id"],
                 "request_index": tool_result["request_index"],
-                "tool_call_id": tool_result["tool_call_id"],
+                "tool_call_id": tool_result["call_id"],
             })),
         )
         .await;
@@ -145,9 +138,15 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "write it"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
-    let interaction = harness.event("interaction_requested").await;
-    let tool_call_id = interaction["params"]["data"]["interaction"]["tool_call_id"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
+    let interaction = harness
+        .event_matching("session_snapshot", |frame| {
+            let pending = &frame["params"]["data"]["snapshot"]["pending_interaction"];
+            pending["loop_id"] == turn["loop_id"]
+        })
+        .await;
+    let tool_call_id =
+        interaction["params"]["data"]["snapshot"]["pending_interaction"]["tool_call_id"].clone();
 
     let read = harness
         .call_ok(
@@ -183,7 +182,7 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
                 "session_id": session_id,
                 "loop_id": turn["loop_id"],
                 "request_index": 0,
-                "tool_call_id": interaction["params"]["data"]["interaction"]["tool_call_id"],
+                "tool_call_id": interaction["params"]["data"]["snapshot"]["pending_interaction"]["tool_call_id"],
                 "stream": "output",
                 "offset": 0,
             })),
@@ -193,7 +192,8 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
     assert_eq!(pending["result"]["eof"], json!(false));
     assert_eq!(pending["result"]["data"], json!(""));
 
-    let interaction_id = interaction["params"]["data"]["interaction"]["interaction_id"].clone();
+    let interaction_id =
+        interaction["params"]["data"]["snapshot"]["pending_interaction"]["interaction_id"].clone();
     harness
         .send(
             json!("answer"),
@@ -219,7 +219,7 @@ async fn tool_read_exposes_approval_time_invocation_without_running() {
                 "session_id": session_id,
                 "loop_id": turn["loop_id"],
                 "request_index": 0,
-                "tool_call_id": interaction["params"]["data"]["interaction"]["tool_call_id"],
+                "tool_call_id": interaction["params"]["data"]["snapshot"]["pending_interaction"]["tool_call_id"],
             })),
         )
         .await;

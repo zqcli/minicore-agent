@@ -48,7 +48,7 @@ async fn a_late_watch_publishes_its_initial_interaction_and_closes_with_retained
         .await;
     assert_eq!(first.load, session.load());
     session.await_control_idle_for_test().await;
-    let revision = session.sample().unwrap().1.revision;
+    let revision = session.sample().unwrap().revision;
     initial.release();
     let observed = events
         .expect(
@@ -98,7 +98,7 @@ async fn a_late_watch_publishes_its_initial_interaction_and_closes_with_retained
         .await;
     assert_eq!(final_state.execution, crate::SessionExecution::None);
     assert!(final_state.pending_interaction.is_none());
-    session.join_observer_for_test().await;
+    session.join_turn_task().await;
     drop(session);
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -126,7 +126,7 @@ async fn close_publishes_the_final_suffix_and_a_late_sample_cannot_reset_it_afte
     let old = agent.loaded_session(info.session_id).unwrap();
     old.join_turn_task().await;
     old.await_control_idle_for_test().await;
-    let before = old.sample().unwrap().1;
+    let before = old.sample().unwrap();
     let before_revision = before.revision;
     assert_eq!(before.completions.through_seq, 1);
     tokio::time::timeout(
@@ -162,7 +162,7 @@ async fn close_publishes_the_final_suffix_and_a_late_sample_cannot_reset_it_afte
     agent.open_session(info.session_id).await.unwrap();
     let reopened = agent.loaded_session(info.session_id).unwrap();
     assert_ne!(reopened.load(), old.load());
-    assert_eq!(reopened.sample().unwrap().1.completions.through_seq, 0);
+    assert_eq!(reopened.sample().unwrap().completions.through_seq, 0);
     assert!(matches!(old.sample(), Err(AgentError::StaleLoad)));
     drop(old);
     drop(reopened);

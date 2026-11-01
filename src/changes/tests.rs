@@ -32,6 +32,39 @@ fn status_entry(path: &str) -> WorkspaceStatusEntry {
 }
 
 #[test]
+fn change_references_carry_an_address_and_reject_foreign_or_unbounded_observations() {
+    let reference = ChangeRef::Tool {
+        tool_ref: ToolRef {
+            session_id: session(),
+            loop_id: "lup_00000000000000000000000000000001".parse().unwrap(),
+            request_index: 0,
+            tool_call_id: minicore_runtime::ToolCallId::new("change").unwrap(),
+        },
+        revision: "a".repeat(64),
+    };
+    let encoded = serde_json::to_value(&reference).unwrap();
+    assert_eq!(encoded["kind"], "tool");
+    assert_eq!(encoded["tool_ref"]["session_id"], json!(session()));
+    assert!(reference.validate(session()).is_ok());
+    assert!(
+        reference
+            .validate(crate::SessionId::new().unwrap())
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ChangeRef>(json!(format!("tool:{}", "a".repeat(64)))).is_err()
+    );
+    let mut entry = status_entry("value.txt");
+    entry.index_status = Some("M".repeat(100));
+    let workspace = ChangeRef::Workspace {
+        session_id: session(),
+        head_oid: String::new(),
+        entry,
+    };
+    assert!(workspace.validate(session()).is_err());
+}
+
+#[test]
 fn revisions_keep_missing_empty_and_unknown_distinct() {
     let empty = content_revision(b"");
     assert_ne!(ChangeRevision::Missing, empty);
@@ -243,7 +276,16 @@ async fn incremental_page_sizes_match_json_at_cursor_and_budget_boundaries() {
     let observation = "a".repeat(64);
     let records: Vec<_> = (0..600)
         .map(|index| ChangeRecord {
-            change_ref: format!("tool:{index:064x}"),
+            change_ref: ChangeRef::Tool {
+                tool_ref: ToolRef {
+                    session_id,
+                    loop_id: "lup_00000000000000000000000000000001".parse().unwrap(),
+                    request_index: 0,
+                    tool_call_id: minicore_runtime::ToolCallId::new(format!("call-{index}"))
+                        .unwrap(),
+                },
+                revision: format!("{index:064x}"),
+            },
             path: format!("{index:04}-é-\"quoted\"-\\path\n"),
             kind: ChangeKind::Modified,
             origin: ChangeOrigin::Tool,

@@ -16,7 +16,7 @@
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), AgentError> {
 //! let mut agent = Agent::open_file("agent.toml").await?;
-//! assert_eq!(agent.ping().protocol_version, 2);
+//! assert_eq!(agent.ping().protocol_version, 3);
 //! let _events = agent.take_events()?;
 //! agent.shutdown().await?;
 //! # Ok(())
@@ -48,6 +48,7 @@ mod read;
 mod rpc;
 mod sessions;
 pub(crate) mod store;
+mod task;
 #[cfg(any(test, feature = "e2e-observe"))]
 mod test_gate;
 #[cfg(test)]
@@ -64,20 +65,23 @@ mod workspace;
 #[path = "../tests/support/openai_mock.rs"]
 pub(crate) mod openai_mock;
 
+#[cfg(test)]
+#[path = "../tests/support/control.rs"]
+pub(crate) mod rpc_test_control;
+
 pub use agent::{
     Agent, AnswerInteraction, CompactSession, CoveredUsage, CreateSession, DeliveredInput,
-    DisplayProjection, GetHistory, HistoryPage, InputMode, InputPushed, InputRemoved,
-    InputStartError, InputsRecalled, InputsResumed, InterruptedRequest, PartialStopReason,
-    PingResponse, PushInput, Queue, QueueItem, RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor,
-    ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary, ReadView, ReloadResult,
-    RemoveInput, RenameSession, SessionInfo, SessionState, SessionStatus, SessionUpdateResult,
-    StartedTurn, TurnPersistence, TurnRef, TurnResult, TurnResultAvailability, TurnResultPage,
-    TurnResultRequest, UpdateSession, agent_version,
+    DisplayProjection, InputMode, InputPushed, InputRemoved, InputStartError, InputsRecalled,
+    InputsResumed, InterruptedRequest, PartialStopReason, PingResponse, PushInput, Queue,
+    QueueItem, RPC_CAPABILITIES, RPC_PROTOCOL_VERSION, ReadCursor, ReadItemChunk, ReadSession,
+    ReadSessionResult, ReadTurnSummary, ReadView, ReloadResult, RemoveInput, RenameSession,
+    SessionInfo, SessionUpdateResult, TurnPersistence, TurnRef, TurnResult, TurnResultAvailability,
+    TurnResultPage, TurnResultRequest, UpdateSession, agent_version,
 };
 pub use changes::{
     ChangeCommitState, ChangeCoverage, ChangeCursor, ChangeKind, ChangeListConsistency,
-    ChangeListWarning, ChangeOrigin, ChangeRecord, ChangeRevision, ChangeScope, ChangesListRequest,
-    ChangesListResult,
+    ChangeListWarning, ChangeOrigin, ChangeRecord, ChangeRef, ChangeRevision, ChangeScope,
+    ChangesListRequest, ChangesListResult,
 };
 pub use compaction::{
     AutomaticCompactionObservation, AutomaticCompactionView, CompactionResult, CompactionStatus,
@@ -92,14 +96,14 @@ pub use diff::{
 };
 pub use error::{AgentError, RuntimeErrorView};
 pub use event::{
-    AgentEvent, AgentEventStream, EventMeta, LocalContextBudgetFailure, OutputChannel,
-    ToolProgressView, ToolResultView,
+    AgentEvent, AgentEventStream, ApprovalRiskView, CancelReasonView, EventMeta,
+    InteractionKindView, LocalContextBudgetFailure, LoopOutcomeView, LoopStatusView,
+    ModelErrorView, OutputChannel, PendingInteractionView, ProviderErrorView,
+    ToolInputAnswerKindView, ToolInputChoiceView, ToolProgressView, ToolResultView,
 };
 pub use ids::{LoadId, SessionId, SessionIdError};
 pub use models::{ModelConfig, ModelInfo};
-pub use presentation::{
-    AssistantDisplayPart, PresentationView, ToolArgumentsPreviewState, ToolDisplay,
-};
+pub use presentation::{PresentationView, ToolArgumentsPreviewState, ToolDisplay};
 pub use profiles::ProfileInfo;
 pub use rpc::run_stdio;
 pub use sessions::{

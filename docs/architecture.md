@@ -4,21 +4,18 @@ MiniCore Agent keeps execution, observation, presentation, and persistence as
 separate ownership boundaries. Agent, Session, Runtime, Store, Tool owners, and
 bounded query workers each retain the resources they are responsible for.
 
-```text
-client
-  │ NDJSON over stdio
-  ▼
-RPC server ──► Agent ──► loaded Session ──► Runtime AgentLoop
-   │             │             │                 │
-   │             │             │                 ├─ Model / Prompt / ToolSet
-   │             │             │                 └─ cancellation and deadlines
-   │             │             ├─ Workspace + execution snapshot
-   │             │             ├─ ToolObserver ──► ToolData
-   │             │             ├─ ToolOwners ──► Bash workers, started commits
-   │             │             ├─ Presentation ──► display-only facts/events
-   │             │             └─ CompactionState
-   │             └─ Store ─────► session.json / history.jsonl / summary.json / aux
-   └─ bounded response/event writer
+```mermaid
+flowchart TD
+    Client -->|NDJSON| RPC
+    RPC --> Agent
+    Agent --> Session
+    Agent --> Store
+    Session --> Runtime
+    Session --> ToolOwners
+    Session --> Presentation
+    Runtime --> ModelTools["Model, prompt, and tool execution"]
+    ToolOwners --> Workspace["Workspace commits and child processes"]
+    Store --> Files["Session, history, summary, and auxiliary records"]
 ```
 
 ## Ownership
@@ -76,21 +73,22 @@ provider-overflow recovery.
 ## Core Modules
 
 - `sessions.rs` retains Session ownership and shared state. Its child modules
-  separate public types, the loaded registry, status-worker ownership, active-loop
+  separate public types, the loaded registry, snapshot publication, active-loop
   execution, event mapping, and context-budget views. `compact.rs` retains
   compaction ownership and commits.
-- One driver task per busy period runs the turns back to back. After a turn's
-  report is persisted it decides under the Session locks: a completed, persisted
-  turn with a queue head installs the successor loop (after settling its own
-  projection, which the successor would project) and only then publishes the
-  finished turn's completion with `next`; any other outcome ends the busy period,
-  pausing a non-empty queue after a turn that did not complete. The driver never
-  joins itself: the next start, compaction, or close joins the one task, which
-  covers every turn of the period. Replaced turns stay waitable through a ring
-  of the last four completions. Otherwise the task names its join/drain,
-  reconciliation, persistence, projection settlement, and completion phases;
-  publication still precedes auxiliary persistence when no successor starts, and
-  the owned task remains the close/join barrier for those writes.
+- One driver task per busy period runs turns back to back. It joins the Runtime,
+  normalizes and persists the report, registers completion/body availability,
+  and publishes a small terminal summary to waiters. It then settles the
+  projection and auxiliary writes before installing an eligible successor.
+  Only a completed, persisted turn continues automatically; other outcomes
+  pause a non-empty queue. The driver never joins itself: the next start,
+  compaction, or close joins the task that owns the whole busy period. The last
+  four replaced terminal summaries remain waitable, while independent catalog
+  limits govern completion discovery and unsaved body retention.
+  If no successor was queued at completion, a later push/resume may claim its
+  input while the old tail is still settling; startup joins that old driver
+  before installing another one. The acceptance response can wait for this
+  cleanup, but the predecessor's terminal waiter does not.
 - `rpc/server.rs` owns deferred tasks and shutdown. `server/dispatch.rs` separates
   agent, session, query, input, and turn admission; `errors.rs` owns error mapping and
   response construction; `io.rs` owns signals, framing, event pumping, and batched
@@ -99,7 +97,7 @@ provider-overflow recovery.
 - `agent/session_setup.rs` builds the Session's execution resources and persisted
   settings. Installation and index publication remain on the Agent.
 
-Reliable control, compatibility lifecycle, and streaming events have separate
+Reliable control, lifecycle, and streaming events have separate
 bounded lanes. Control is serviced before lifecycle and streaming data, while
 drop counts are attached only at dequeue. One publisher rotates dirty loads in
 batches of at most 16, removing a mark before sampling so a concurrent change
@@ -122,21 +120,28 @@ normalized turn per page. `read/turn_result.rs` owns source selection and page
 projection. Catalog task trackers reserve four `turn.result` worker slots before work
 starts and join them by load or Agent; cancelling a waiter cannot release a
 slot while its blocking work still holds history. Unsaved sources reuse already encoded immutable
-items; persisted sources are not kept as an additional long-lived body cache. Completion
-registration and successor installation share an observation boundary, while
-registered waiters retain their existing full-report API. Settled history is
-authoritative only after the Agent persistence step completes.
+items; persisted sources are not kept as an additional long-lived body cache.
+Completion registration and waiter publication share an observation boundary;
+successor installation follows it. Both Rust and RPC waiters receive the same
+lightweight `TurnResult`, with no Runtime report, body, or successor field.
+Committed pages are `stored` even while their Session is loaded; `live` means a
+retained unsaved source. History is authoritative only after persistence.
 
 Session create/open, `session.state`, and `session_snapshot` publication use
-one sampler and DTO, identified by session/load/revision. The publication gate
+one sampler and DTO, identified by session/load/revision. RPC v3 command
+receipts contain acceptance or operation results; clients install current
+control state only from snapshots. `input.list` remains an explicit queue query.
+The publication gate
 precedes `inner`, queue, and catalog locks; Runtime state is read once for the
 execution and actionable interaction. Encoding, budget waits, filesystem work,
 and large result destruction occur outside those locks. Claim ownership is
 visible as `starting`, never as a missing queued input.
 
-Each installed loop owns a weak-Session Runtime watch observer. It marks the
-initial state immediately and stops on Agent completion/close, not sender
-closure. The driver and close barrier join it even if Runtime handles remain.
+The turn driver owns the Runtime watch subscription. After subscribing it
+observes the initial value and marks the Session, then selects watch changes,
+best-effort events, and Runtime join in one task. Join ends the subscription and
+marks the finishing transition, even if the last watch update was coalesced.
+Observation does not depend on watch-sender closure or a separate worker.
 Prompt and model wrappers track the preparation joined by delivered steers;
 active config replacements reinstall both wrappers. After tools, the take
 before the next prompt belongs to the next request index.
@@ -146,16 +151,29 @@ locks. Source charges include container/string capacities, metadata, and Arc
 ownership overhead; held page references prevent early budget reuse. Catalog
 allocation charges cover deque slack, and snapshot descriptor copies use the
 separate control budget. An expired source cannot be reconstructed from a
-late-wait/active report. An uncertain append remains uncertain until reopen,
+late-wait/active summary. An uncertain append remains uncertain until reopen,
 including after descriptor eviction and even if a complete record is readable.
 
-Cold Tool reads use the durable auxiliary record when the Session is unloaded or
-memory has evicted stream bytes. Missing or corrupt bytes make details unavailable
-rather than substituting a nearby Tool call. Workspace queries require a loaded
-Session because their source is the Session's canonical Workspace. Workspace
-change diffs read fresh Git/worktree sides under their bounded worker contract.
+`session.read` projects only the selected loops. Display tool relationships use
+complete loop records so a page split does not lose the other half of a tool
+call; unrelated Session history is not projected. Loaded reads seek through the
+Store index and prefer the shared acceptance-time map. Cold reads still scan
+and validate their captured prefix, including off-page corruption and summary
+anchors. Canonical history and result reads share a borrowed projection that
+removes provider replay without cloning whole histories.
 
-Body and compatibility events are disposable notifications; `session_snapshot`
+`tool_data/read.rs` selects narrow projections: `tool.read` owns invocation/result
+summaries, while `tool.output` borrows the requested live stream window or reads
+only that durable stream. A cold summary reads input/output blobs, not both
+process streams or change snapshots. Missing/corrupt bytes remain unavailable;
+metadata must match before filling missing warm data from disk. No new cold
+cache is introduced. A structured tool `ChangeRef` addresses the exact ToolRef
+and validates its revision, eliminating a discovery scan for one diff. Workspace
+references contain the list-time HEAD and status entry; their lists sort by path,
+and diffs read fresh Git/worktree sides under the bounded worker contract.
+Workspace queries require the loaded Session's canonical Workspace.
+
+Body and lifecycle events are disposable notifications; `session_snapshot`
 is the reliable current-control exception. `turn.wait`, `turn.result`, history
 queries, and explicit query results are the authoritative terminal/body paths.
 The result catalog, not the four-entry late-wait index, defines completion

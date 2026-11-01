@@ -1,5 +1,5 @@
 use super::*;
-use crate::event::{LoopOutcomeView, ProviderErrorView, TurnResultView};
+use crate::event::{LoopOutcomeView, ProviderErrorView};
 use crate::read::{ReadView, TurnResultRequest};
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{DeliveryState, ModelError, ModelErrorKind};
@@ -57,32 +57,20 @@ fn expected(message: &str) -> ProviderErrorView {
 }
 
 #[tokio::test]
-async fn the_last_attempts_provider_text_reaches_wait_event_and_reloaded_history() {
+async fn the_last_attempts_provider_text_reaches_wait_and_reloaded_history() {
     let fixture = AgentFixture::new("provider-error").script([
         Step::Fail(rate_limited("first attempt")),
         Step::Fail(rate_limited("last attempt")),
     ]);
     let mut agent = fixture.open().await;
-    let mut events = agent.take_events().unwrap();
     let info = create_session(&mut agent, &fixture.workspace).await;
     let session_id = info.session_id;
 
     let turn = send_text(&mut agent, session_id, "hello").await;
     let result = agent.wait_turn(turn).await.unwrap();
     let expected = expected("last attempt");
-    let waited = TurnResultView::from_turn_result(&result).outcome;
+    let waited = result.outcome.clone();
     assert_eq!(provider_of(&waited), &expected);
-
-    let finished = loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if let AgentEvent::TurnFinished { outcome, .. } = event {
-            break outcome;
-        }
-    };
-    assert_eq!(provider_of(&finished), &expected);
 
     agent.close_session(session_id).await.unwrap();
     drop(agent);
@@ -135,6 +123,6 @@ async fn a_failed_overflow_recovery_reports_the_second_providers_text() {
     let turn = send_text(&mut agent, info.session_id, "read note").await;
     let result = agent.wait_turn(turn).await.unwrap();
 
-    let outcome = TurnResultView::from_turn_result(&result).outcome;
+    let outcome = result.outcome.clone();
     assert_eq!(provider_of(&outcome), &expected("second overflow"));
 }

@@ -41,13 +41,13 @@ mod state;
 mod wrappers;
 
 pub(crate) use crate::tools::observe::{PresentationPolicy, ToolImpl};
-pub use display::{AssistantDisplayPart, ToolDisplay};
+pub use display::ToolDisplay;
 pub(crate) use display::{
-    MAX_DETAIL_BYTES, MAX_RESULT_DISPLAY_BYTES, assistant_display_parts, bounded_result_content,
-    build_tool_card_display, build_tool_display, count_lines, result_line_count, tool_card_counts,
+    MAX_DETAIL_BYTES, MAX_RESULT_DISPLAY_BYTES, build_tool_card_display, build_tool_display,
+    count_lines, result_line_count, tool_card_counts,
 };
 #[cfg(test)]
-use display::{MAX_EXPANDED_INPUT_BYTES, edit_display_body, path_arg};
+use display::{MAX_EXPANDED_INPUT_BYTES, bounded_result_content, edit_display_body, path_arg};
 use display::{
     apply_result_to_display, bounded_display_copy, format_read_range, safe_tool_error_text,
     single_line,

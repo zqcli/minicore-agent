@@ -22,8 +22,10 @@ async fn cancel_turn_returns_cancelled_report_and_session_recovers() {
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(&agent, turn).await;
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User
+        }
     );
     assert_persisted(&result);
 
@@ -66,8 +68,10 @@ async fn cancelling_wrapped_tool_preserves_runtime_outcome_and_recovery() {
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(&agent, turn).await;
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User
+        }
     );
     assert_persisted(&result);
 
@@ -94,12 +98,14 @@ async fn close_active_session_cancels_and_waits() {
         .await
         .unwrap();
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::Shutdown,)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::Shutdown
+        }
     );
     assert_persisted(&result);
     assert_eq!(
-        crate::event::LoopOutcomeView::from_report(&result.report),
+        result.outcome.clone(),
         crate::event::LoopOutcomeView::Cancelled {
             reason: crate::event::CancelReasonView::Shutdown
         }
@@ -212,8 +218,10 @@ async fn active_shutdown_waits_for_the_session_owned_worker() {
         .await
         .unwrap();
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::Shutdown,)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::Shutdown
+        }
     );
     assert_persisted(&result);
 }

@@ -21,7 +21,7 @@ async fn history_view_is_safe_and_pages() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "read file"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
     let presentation_event = harness.event("tool_presentation").await;
@@ -40,11 +40,11 @@ async fn history_view_is_safe_and_pages() {
 
     let history = harness
         .call_ok(
-            "session.history",
-            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+            "session.read",
+            Some(json!({"session_id": session_id, "view": "display", "limit": 100})),
         )
         .await;
-    let serialized = history["result"].to_string();
+    let serialized = serde_json::to_string(&read_items(&history["result"])).unwrap();
     // Whitelisted path detail is available to the local TUI, but raw tool
     // argument object fields are not.
     assert!(serialized.contains("secret.txt"));
@@ -54,8 +54,7 @@ async fn history_view_is_safe_and_pages() {
     let state = harness
         .call_ok("session.state", Some(json!({"session_id": session_id})))
         .await;
-    assert_eq!(state["result"]["status"], json!("idle"));
-    assert!(state["result"]["active_loop"].is_null());
+    assert_eq!(state["result"]["snapshot"]["execution"]["type"], "none");
 
     harness.shutdown().await;
 }
@@ -80,7 +79,7 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["outcome"]["type"], json!("completed"));
     assert_eq!(waited["result"]["persistence"], json!("failed"));
@@ -88,8 +87,11 @@ async fn persistence_failure_returns_failed_and_blocked_state() {
     let state = harness
         .call_ok("session.state", Some(json!({"session_id": session_id})))
         .await;
-    assert_eq!(state["result"]["status"], json!("blocked"));
-    assert_eq!(state["result"]["block_reason"], json!("persistence"));
+    assert_eq!(state["result"]["snapshot"]["block_reason"], "persistence");
+    assert_eq!(
+        state["result"]["snapshot"]["block_reason"],
+        json!("persistence")
+    );
 
     // Blocked sessions refuse further sends.
     let send2 = harness
@@ -124,7 +126,7 @@ async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
 
     // 2. Deterministically wait for session to reach blocked state before waiting turn.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -132,8 +134,11 @@ async fn blocked_send_does_not_discard_previous_turn_result_rpc() {
         let state = harness
             .call_ok("session.state", Some(json!({"session_id": session_id})))
             .await;
-        if state["result"]["status"] == json!("blocked") {
-            assert_eq!(state["result"]["block_reason"], json!("persistence"));
+        if state["result"]["snapshot"]["block_reason"] == json!("persistence") {
+            assert_eq!(
+                state["result"]["snapshot"]["block_reason"],
+                json!("persistence")
+            );
             break;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -192,12 +197,18 @@ async fn interaction_answer_resolves_an_approval() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "write the file"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
 
-    let interaction = harness.event("interaction_requested").await;
-    let interaction_id = interaction["params"]["data"]["interaction"]["interaction_id"].clone();
+    let interaction = harness
+        .event_matching("session_snapshot", |frame| {
+            let pending = &frame["params"]["data"]["snapshot"]["pending_interaction"];
+            pending["loop_id"] == turn["loop_id"]
+        })
+        .await;
+    let interaction_id =
+        interaction["params"]["data"]["snapshot"]["pending_interaction"]["interaction_id"].clone();
     assert_eq!(
-        interaction["params"]["data"]["interaction"]["kind"]["type"],
+        interaction["params"]["data"]["snapshot"]["pending_interaction"]["kind"]["type"],
         json!("approval")
     );
 

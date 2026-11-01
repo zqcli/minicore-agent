@@ -35,7 +35,6 @@ use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
 use crate::tools::{BuildToolsError, CommandEnvironment};
 
-pub use crate::history::{GetHistory, HistoryPage};
 pub use crate::read::{
     CoveredUsage, DisplayProjection, InterruptedRequest, PartialStopReason, ReadCursor,
     ReadItemChunk, ReadSession, ReadSessionResult, ReadTurnSummary, ReadView,
@@ -43,8 +42,8 @@ pub use crate::read::{
 };
 pub use crate::sessions::{
     DeliveredInput, InputMode, InputPushed, InputRemoved, InputStartError, InputsRecalled,
-    InputsResumed, PushInput, Queue, QueueItem, RemoveInput, SessionContext, SessionState,
-    SessionStatus, StartedTurn, TurnPersistence, TurnRef, TurnResult,
+    InputsResumed, PushInput, Queue, QueueItem, RemoveInput, SessionContext, SessionSnapshot,
+    TurnPersistence, TurnRef, TurnResult,
 };
 
 mod session_setup;
@@ -57,7 +56,7 @@ pub(crate) use session_setup::{SessionParts, SessionSetup};
 type AgentFuture<T> = futures_util::future::BoxFuture<'static, Result<T, AgentError>>;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const RPC_PROTOCOL_VERSION: u32 = 2;
+pub const RPC_PROTOCOL_VERSION: u32 = 3;
 pub const RPC_CAPABILITIES: &[&str] = &[
     "session.read",
     "session.read.display",
@@ -66,7 +65,6 @@ pub const RPC_CAPABILITIES: &[&str] = &[
     "tool.read",
     "tool.read.display",
     "tool.output",
-    "session.history",
     "workspace.read",
     "workspace.files",
     "workspace.search",
@@ -742,13 +740,7 @@ impl Agent {
         Ok(info)
     }
 
-    /// Closes and unloads a loaded Session by ID.
-    ///
-    /// A Session with queued inputs is refused with `SessionBusy`; recall them
-    /// first. If the Session has active work, its Agent-owned loop or
-    /// manual-compaction task is cancelled and joined before unloading. MiniCore Agent v0.3 uses the Runtime
-    /// user-cancellation path when closing or shutting down an active Session;
-    /// it does not currently preserve a distinct shutdown cancellation reason.
+    /// Refuses queued inputs, then shuts down and joins active work before unloading.
     pub async fn close_session(
         &mut self,
         session_id: crate::ids::SessionId,
@@ -798,11 +790,8 @@ impl Agent {
     pub fn session_state(
         &self,
         session_id: crate::ids::SessionId,
-    ) -> Result<SessionState, AgentError> {
-        self.sessions
-            .get(session_id)
-            .map(|session| session.state())
-            .ok_or(AgentError::SessionNotLoaded)
+    ) -> Result<SessionSnapshot, AgentError> {
+        self.session(session_id)?.sample()
     }
 
     pub fn session_context(
@@ -905,13 +894,12 @@ impl Agent {
         }))
     }
 
-    /// Queues one input. An idle Session starts a turn with the queue head at
-    /// once, which is reported in `started`.
+    /// Accepts input and reports startup failure separately from acceptance.
     pub async fn push_input(&self, request: PushInput) -> Result<InputPushed, AgentError> {
-        self.session(request.session_id)?
-            .accept_input(request.mode, request.text)?
-            .start()
-            .await
+        let pending = self
+            .session(request.session_id)?
+            .accept_input(request.mode, request.text)?;
+        Ok(pending.start().await)
     }
 
     pub fn remove_input(&self, request: RemoveInput) -> Result<InputRemoved, AgentError> {
@@ -931,7 +919,7 @@ impl Agent {
         &self,
         session_id: crate::ids::SessionId,
     ) -> Result<InputsResumed, AgentError> {
-        self.session(session_id)?.accept_resume()?.start().await
+        Ok(self.session(session_id)?.accept_resume()?.start().await)
     }
 
     pub fn list_inputs(&self, session_id: crate::ids::SessionId) -> Result<Queue, AgentError> {
@@ -1026,22 +1014,6 @@ impl Agent {
         session.answer(request.turn, request.interaction_id, request.answer)
     }
 
-    pub fn history(&self, request: GetHistory) -> Result<HistoryPage, AgentError> {
-        let session = self.session(request.session_id)?;
-        session.history(&request)
-    }
-
-    /// Orderly shutdown barrier for embedded Rust callers.
-    ///
-    /// Cancels active loops and manual compaction across all loaded Sessions, waits
-    /// for Agent-owned loop/compaction and worker tasks plus persistence
-    /// completion, and drops event channels.
-    /// Dropping an `Agent` with live turns does not synchronously wait for
-    /// Agent-owned loop tasks.
-    ///
-    /// MiniCore Agent v0.3 uses the Runtime user-cancellation path when closing
-    /// or shutting down an active Session; it does not currently preserve a distinct
-    /// shutdown cancellation reason.
     pub(crate) fn begin_shutdown(&self) {
         self.store.cancel_diff_workers();
         for session in self.sessions.iter() {
@@ -1049,6 +1021,7 @@ impl Agent {
         }
     }
 
+    /// Shuts down every Session and joins all owned work before releasing the Agent.
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
         self.results.cancel_queries();

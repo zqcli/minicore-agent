@@ -53,8 +53,8 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
     let turn = send_text(&mut agent, session_id, "read forty times then finish").await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    assert_eq!(result.report.tool_rounds, 40);
-    assert_eq!(result.report.requests, 41);
+    assert_eq!(result.tool_rounds, 40);
+    assert_eq!(result.requests, 41);
     assert_eq!(model.requests().lock().unwrap().len(), 41);
     let stored = read_store_history(&data_dir, session_id).await;
     assert_eq!(
@@ -91,8 +91,8 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
     let turn = send_text(&mut agent, info.session_id, "read the file").await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    assert_eq!(result.report.requests, 2);
-    assert_eq!(result.report.tool_rounds, 1);
+    assert_eq!(result.requests, 2);
+    assert_eq!(result.tool_rounds, 1);
 
     let stored = read_store_history(&data_dir, info.session_id).await;
     // User, Assistant(tool call), ToolResult, Assistant(text)
@@ -111,17 +111,11 @@ async fn tool_loop_runs_read_and_persists_one_loop_record() {
         vec![(ToolResultOutcome::Success, "1: file contents".to_owned())]
     );
 
-    let page = history_page(&agent, info.session_id, 100);
-    let crate::history::HistoryItemView::Assistant(assistant) = &page.items[1].item else {
-        panic!("expected the first assistant history item");
-    };
-    assert_eq!(assistant.parts.as_ref().unwrap().len(), 1);
-    let display = assistant.tool_calls[0]
-        .display
-        .as_ref()
-        .expect("history tool display");
-    assert_eq!(display.detail, "file.txt:1-32");
-    assert_eq!(display.hidden_line_count, Some(1));
+    let page = history_page(&agent, info.session_id, 100).await;
+    let assistant: serde_json::Value = serde_json::from_str(&page.items[1].data).unwrap();
+    let display = &assistant["tool_summaries"][0]["display"];
+    assert_eq!(display["detail"], "file.txt:1-32");
+    assert_eq!(display["hidden_line_count"], 1);
 }
 
 #[tokio::test]
@@ -146,13 +140,7 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
 
     let mut presentation = None;
     let mut tool_result = None;
-    for _ in 0..32 {
-        let event = events
-            .next_event(
-                std::time::Duration::from_secs(1),
-                "live Agent event must arrive",
-            )
-            .await;
+    while let Some(event) = events.try_recv() {
         match event {
             AgentEvent::ToolPresentation {
                 turn: event_turn,
@@ -168,7 +156,6 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
                 result,
                 ..
             } => tool_result = Some((event_turn, request_index, tool_call_id, result)),
-            AgentEvent::TurnFinished { .. } => break,
             _ => {}
         }
     }
@@ -189,7 +176,7 @@ async fn live_tool_presentation_and_result_keep_runtime_identity() {
 }
 
 #[tokio::test]
-async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
+async fn failed_tool_display_preserves_safe_readable_output() {
     let fixture = AgentFixture::new("presentation-failed").file("file.txt", b"file contents");
     let workspace = fixture.workspace.clone();
     let model = ScriptedModel::new(
@@ -227,18 +214,28 @@ async fn failed_tool_presentation_exposes_safe_error_and_history_fallback() {
             .contains("missing-secret.txt")
     );
 
-    let page = history_page(&agent, info.session_id, 100);
+    let page = history_page(&agent, info.session_id, 100).await;
     let tool_result = page
         .items
         .iter()
-        .find_map(|item| match &item.item {
-            crate::history::HistoryItemView::ToolResult(result) => Some(result),
-            _ => None,
+        .map(|item| serde_json::from_str::<serde_json::Value>(&item.data).unwrap())
+        .find(|value| value["item"]["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(tool_result["item"]["data"]["outcome"], "failed");
+    assert!(tool_result["item"]["data"].get("output").is_none());
+    let output = agent
+        .tool_output(crate::tool_data::ToolOutputRequest {
+            tool_ref: serde_json::from_value(tool_result["tool_summaries"][0]["tool_ref"].clone())
+                .unwrap(),
+            stream: crate::tool_data::ToolDataStream::Output,
+            offset: 0,
+            max_bytes: None,
         })
-        .expect("failed tool must be present in history");
-    assert_eq!(tool_result.outcome, ToolResultOutcome::Failed);
-    assert_eq!(tool_result.content, "tool failed");
-    assert!(!tool_result.content.contains("missing-secret.txt"));
+        .await
+        .unwrap();
+    assert_eq!(output.data, "tool failed");
+    assert!(!output.data.contains("missing-secret.txt"));
+    assert!(output.eof);
 }
 
 #[tokio::test]
@@ -556,8 +553,8 @@ async fn multi_turn_creates_new_loop_each_time_and_history_grows() {
     assert_ne!(loop_ids[0], loop_ids[1]);
     assert_ne!(loop_ids[1], loop_ids[2]);
 
-    let page = history_page(&agent, info.session_id, 100);
+    let page = history_page(&agent, info.session_id, 100).await;
     // Three user prompts + three assistant texts.
     assert_eq!(page.total, 6);
-    assert!(page.next_offset.is_none());
+    assert!(page.next_cursor.is_none());
 }

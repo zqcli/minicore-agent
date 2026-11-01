@@ -87,8 +87,10 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
     assert!(agent.cancel(turn_1).unwrap());
     let result_1 = wait_text(&agent, turn_1).await;
     assert_eq!(
-        result_1.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        result_1.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User
+        }
     );
     assert!(
         !process_is_listed(first_pid),
@@ -382,13 +384,18 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
 
     // 2. Real cold read from Store disk
     let store = agent.store_handle();
-    let recovered = store
-        .read_tool_record(tool_ref)
-        .await
-        .unwrap()
-        .expect("persisted tool record must exist on disk");
-
-    let cold_read = recovered.project_read(tool_ref, 4096).unwrap();
+    let cold_read = crate::tool_data::tool_read(
+        store,
+        None,
+        crate::tool_data::ToolReadRequest {
+            tool_ref: tool_ref.clone(),
+            display: false,
+            max_bytes: Some(4096),
+        },
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         cold_read.execution.recording,
         crate::tool_data::ToolRecordingState::Saved

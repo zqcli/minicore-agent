@@ -1,7 +1,8 @@
 //! Auxiliary record commits.
 use super::super::*;
+use super::cold_read::read_blob;
 use super::ledger::{AuxDirectoryEntry, AuxLedger, check_aux_deadline, discard_aux_temp};
-use super::validate::validate_stored_tool_record;
+use super::validate::{stored_blobs, validate_stored_tool_record};
 
 #[cfg(test)]
 pub(crate) static AUX_BLOB_WRITE_FAILURES: crate::test_support::Registry<SessionId, usize> =
@@ -54,25 +55,32 @@ impl Store {
         let hash = tool_ref_hash(&snapshot.tool_ref);
         let target_dir = tools_dir.join(&hash);
         if real_dir_opt(&target_dir).await? {
-            match self
-                .read_tool_record_details(&snapshot.tool_ref, deadline)
-                .await
-            {
-                Ok(Some(existing)) => {
-                    if existing.record.has_corrupt_streams() {
-                        return Err(StoreError::Corrupt);
-                    }
-                    let existing_record_bytes =
-                        serde_json::to_vec(&existing.metadata).map_err(corrupt)?;
-                    let incoming_record_bytes =
-                        serde_json::to_vec(&snapshot.record).map_err(corrupt)?;
-                    if existing_record_bytes != incoming_record_bytes {
-                        return Err(StoreError::Corrupt);
-                    }
-                    return Ok(());
+            return tokio::time::timeout_at(deadline.into(), async {
+                let Some((directory, existing)) =
+                    self.read_tool_metadata(&snapshot.tool_ref).await?
+                else {
+                    return Err(StoreError::Corrupt);
+                };
+                if serde_json::to_vec(&existing).map_err(corrupt)?
+                    != serde_json::to_vec(&snapshot.record).map_err(corrupt)?
+                {
+                    return Err(StoreError::Corrupt);
                 }
-                _ => return Err(StoreError::Corrupt),
-            }
+                for (name, bytes, hash) in stored_blobs(&existing) {
+                    let (bytes, corrupt) = read_blob(&directory.join(name), bytes, hash).await;
+                    if corrupt
+                        || (matches!(name, TOOL_INPUT_FILE | TOOL_RESULT_FILE)
+                            && bytes
+                                .as_ref()
+                                .is_some_and(|bytes| std::str::from_utf8(bytes).is_err()))
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_or(Err(StoreError::Corrupt));
         }
 
         let record_bytes = serde_json::to_vec(&snapshot.record).map_err(corrupt)?;

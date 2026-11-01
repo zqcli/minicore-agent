@@ -7,7 +7,7 @@ async fn capability_discovery_returns_ordered_lists() {
     let mut harness = RpcHarness::spawn(agent);
     let ping = harness.call_ok("agent.ping", Some(json!({}))).await;
     assert_eq!(ping["result"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(ping["result"]["protocol_version"], json!(2));
+    assert_eq!(ping["result"]["protocol_version"], json!(3));
     assert_eq!(
         ping["result"]["capabilities"],
         json!([
@@ -18,7 +18,6 @@ async fn capability_discovery_returns_ordered_lists() {
             "tool.read",
             "tool.read.display",
             "tool.output",
-            "session.history",
             "workspace.read",
             "workspace.files",
             "workspace.search",
@@ -121,22 +120,20 @@ async fn dispatch_inner_propagates_the_full_error_object() {
         );
     }
 
-    harness
-        .send(json!("no-such-method"), "no.such.method", None)
-        .await;
-    let unknown = harness.response(json!("no-such-method")).await;
-    assert_eq!(
-        unknown,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "no-such-method",
-            "error": {
-                "code": -32601,
-                "message": "method not found",
-                "data": {"kind": "method_not_found", "retryable": false},
-            },
-        })
-    );
+    for method in ["no.such.method", "session.history"] {
+        harness.send(json!(method), method, None).await;
+        let unknown = harness.response(json!(method)).await;
+        assert_eq!(
+            unknown,
+            json!({
+                "jsonrpc": "2.0", "id": method,
+                "error": {
+                    "code": -32601, "message": "method not found",
+                    "data": {"kind": "method_not_found", "retryable": false},
+                },
+            })
+        );
+    }
 
     harness.shutdown().await;
 }

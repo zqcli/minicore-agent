@@ -23,7 +23,7 @@ runs Tokio on two workers).
 
 ## Control And Result Ownership
 
-The current source is the 0.9.1 development package and serves Agent RPC v2
+The current source is the 0.9.3 development package and serves Agent RPC v3
 inside JSON-RPC 2.0. Formal dependency tags are unchanged until a real release
 is authorized; isolated development builds may link the approved Runtime source.
 
@@ -42,6 +42,10 @@ is authorized; isolated development builds may link the approved Runtime source.
   is released; removing a catalog entry is not memory release. Result-query
   workers also remain tracked and counted after their waiters are cancelled;
   close/shutdown joins their blocking work.
+- The busy-period driver observes Runtime watch state and joins the loop;
+  observation is not a separate task. Completion becomes visible before
+  auxiliary settlement, and the existing driver or a joined successor owns
+  every side effect. `task.rs` retains join handles across caller cancellation.
 - `sessions/boundary.rs` observes prompt preparations and issued model requests.
   Rewrap every active config replacement; a take before the next prompt after
   tools belongs to the next request, not the last prepared request.
@@ -50,7 +54,8 @@ is authorized; isolated development builds may link the approved Runtime source.
   with `accepted` and `start_error`; transport ambiguity is not rejection.
 - Pending/unavailable result pages are not empty completed results. Unknown
   append status remains blocked/uncertain until reopen, including after catalog
-  eviction. Keep existing wait/report APIs and on-disk formats.
+  eviction. `turn.wait` owns a lightweight terminal summary; result bodies live
+  in the result catalog or Store. Keep on-disk formats unchanged.
 
 Budget defaults and the legal maximum combination are documented in
 `docs/rpc.md`; small-budget and gate regressions accompany changes to them.
@@ -68,7 +73,9 @@ Budget defaults and the legal maximum combination are documented in
 | `src/tools/` | `read`, `write`, `edit`, `apply_patch`, `bash`; `ToolOwners` joins started work |
 | `src/workspace/` | Rooted path resolution, atomic writes, scan, search, Git status |
 | `src/compaction/` | Projection, thresholds, emergency recovery, summary utility, prompts |
-| `src/tool_data/`, `src/changes.rs`, `src/diff.rs`, `src/read.rs` | Tool observations, change tracking, diffs, read queries |
+| `src/tool_data/`, `src/changes.rs`, `src/diff.rs` | Tool observations, payload-specific reads, structured change references and diffs |
+| `src/read.rs`, `src/read/` | Session/result pages and shared canonical/display projection |
+| `src/task.rs` | Cancellation-safe ownership of joinable work |
 | `src/event.rs`, `src/presentation/` | Agent events and bounded display data |
 | `src/test_support/` | `#[cfg(test)]` helpers shared by unit tests |
 | `tests/it/`, `tests/rpc_soak.rs`, `tests/support/` | Process-level integration tests and their shared support |

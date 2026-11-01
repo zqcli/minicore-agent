@@ -127,7 +127,7 @@ async fn settled_projection_above_64k_below_trigger_persists_and_cold_reads_with
     let next = send_text(&mut agent, id, "resume").await;
     let resumed = wait_text(&agent, next).await;
     assert_completed(&resumed);
-    assert_eq!(resumed.report.requests, 1);
+    assert_eq!(resumed.requests, 1);
     settle_turn(&agent, id).await;
     assert_eq!(model.calls.load(Ordering::SeqCst), 4);
     let requests = model.requests.lock().unwrap();
@@ -171,13 +171,13 @@ async fn settled_projection_failed_and_cancelled_persisted_turns_keep_large_proj
         agent.join_turn_task_for_test(id).await;
         if cancelled {
             assert!(matches!(
-                result.report.outcome,
-                minicore_runtime::LoopOutcome::Cancelled(_)
+                result.outcome,
+                crate::event::LoopOutcomeView::Cancelled { .. }
             ));
         } else {
             assert!(matches!(
-                result.report.outcome,
-                minicore_runtime::LoopOutcome::Failed(_)
+                result.outcome,
+                crate::event::LoopOutcomeView::Failed { .. }
             ));
         }
         assert!(agent.session_context(id).unwrap().last_result.is_none());
@@ -331,8 +331,8 @@ async fn settled_projection_write_failures_qualify_threshold_result_without_eras
         assert_persisted(&result);
         agent.join_turn_task_for_test(id).await;
         assert!(matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Failed(_)
+            result.outcome,
+            crate::event::LoopOutcomeView::Failed { .. }
         ));
         let context = agent.session_context(id).unwrap();
         assert_eq!(context.coverage.covered_item_count, 0);

@@ -36,7 +36,7 @@ async fn a_query_delivers_a_newer_sample_before_the_held_publisher_encodes_its_o
             })),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     let queued = harness
         .call_ok(
             "input.push",
@@ -387,7 +387,7 @@ async fn session_rename_is_allowed_while_a_loop_is_busy() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "busy"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
 
     harness
         .send(
@@ -452,7 +452,7 @@ async fn session_rename_is_allowed_for_a_blocked_session() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "block"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(
             json!("wait"),
@@ -515,8 +515,8 @@ async fn create_open_history_and_send_wait_deferred() {
     harness
         .send(
             json!("history"),
-            "session.history",
-            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+            "session.read",
+            Some(json!({"session_id": session_id, "view": "display", "limit": 100})),
         )
         .await;
     let history = harness.response(json!("history")).await;
@@ -531,8 +531,7 @@ async fn create_open_history_and_send_wait_deferred() {
         .await;
     let sent = harness.response(json!("send")).await;
     assert!(sent["result"]["accepted_at"].is_string());
-    assert!(sent["result"]["started"]["input"]["accepted_at"].is_string());
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
     assert_eq!(turn["session_id"], session_id);
     assert!(turn["loop_id"].as_str().unwrap().starts_with("lup_"));
 
@@ -563,12 +562,12 @@ async fn create_open_history_and_send_wait_deferred() {
 
     let history2 = harness
         .call_ok(
-            "session.history",
-            Some(json!({"session_id": session_id, "offset": 0, "limit": 100})),
+            "session.read",
+            Some(json!({"session_id": session_id, "view": "display", "limit": 100})),
         )
         .await;
     assert_eq!(history2["result"]["total"], 2);
-    assert!(history2["result"]["next_offset"].is_null());
+    assert!(history2["result"]["next_cursor"].is_null());
 
     harness.shutdown().await;
 }
@@ -591,7 +590,7 @@ async fn push_update_and_cancel_work_while_wait_is_pending() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "hello"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
 
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
@@ -608,12 +607,13 @@ async fn push_update_and_cancel_work_while_wait_is_pending() {
             })),
         )
         .await;
-    assert!(pushed["result"]["started"].is_null());
+    assert!(pushed["result"].get("started").is_none());
     assert!(pushed["result"]["accepted_at"].is_string());
-    assert_eq!(
-        pushed["result"]["queue"]["items"][0]["text"],
-        "stay on track"
-    );
+    let queue = harness
+        .call_ok("input.list", Some(json!({"session_id": session_id})))
+        .await;
+    assert_eq!(queue["result"]["items"][0]["id"], pushed["result"]["id"]);
+    assert_eq!(queue["result"]["items"][0]["text"], "stay on track");
 
     // session.update while wait pending
     let update = harness

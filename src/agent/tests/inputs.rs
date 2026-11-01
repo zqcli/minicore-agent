@@ -1,5 +1,4 @@
 use super::*;
-use crate::agent::StartedTurn;
 use crate::sessions::await_compaction_completion;
 use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode, DiagnosticSummary};
 use minicore_runtime::model::{ModelErrorKind, ModelRequest};
@@ -58,10 +57,6 @@ async fn wait_bounded(agent: &Agent, turn: TurnRef) -> Arc<crate::sessions::Turn
         .unwrap()
 }
 
-fn next_turn(result: &crate::sessions::TurnResult) -> StartedTurn {
-    result.next.clone().expect("the queue started a successor")
-}
-
 fn failing_step() -> Step {
     Step::Fail(ModelError::started(
         ModelErrorKind::Internal,
@@ -105,20 +100,20 @@ async fn a_running_turn_takes_every_steer_and_follow_ups_then_run_one_turn_each(
     let s1 = push(&agent, id, STEER, "s1").await;
     let n2 = push(&agent, id, STEER, "n2").await;
     for pushed in [&f1, &n1, &f2, &s1, &n2] {
-        assert!(pushed.started.is_none(), "a running turn starts nothing");
+        assert!(
+            input_turn(&agent, id, &pushed.id).is_none(),
+            "a running turn starts nothing"
+        );
     }
     assert_eq!(queue_texts(&agent, id), ["n1", "s1", "n2", "f1", "f2"]);
     gate.release();
 
     let first = wait_bounded(&agent, turn).await;
     assert_completed(&first);
-    let second = next_turn(&first);
-    assert_eq!(second.input.id, f1.id);
-    let second_result = wait_bounded(&agent, second.turn).await;
-    let third = next_turn(&second_result);
-    assert_eq!(third.input.id, f2.id);
-    let third_result = wait_bounded(&agent, third.turn).await;
-    assert_eq!(third_result.next, None);
+    let second = wait_input(&agent, id, &f1.id).await;
+    wait_bounded(&agent, second).await;
+    let third = wait_input(&agent, id, &f2.id).await;
+    wait_bounded(&agent, third).await;
     settle_turn(&agent, id).await;
 
     {
@@ -160,7 +155,7 @@ async fn a_running_turn_takes_every_steer_and_follow_ups_then_run_one_turn_each(
 }
 
 #[tokio::test]
-async fn the_successor_is_running_before_the_finished_turns_waiter_resolves() {
+async fn a_replaced_turn_keeps_its_completion_summary_for_late_waiters() {
     let gate_one = Arc::new(Gate::new());
     let gate_two = Arc::new(Gate::new());
     let fixture = AgentFixture::new("inputs-installed").script([
@@ -171,25 +166,61 @@ async fn the_successor_is_running_before_the_finished_turns_waiter_resolves() {
     let id = info.session_id;
     let turn = send_text(&mut agent, id, "first").await;
     started(&gate_one).await;
-    push(&agent, id, FOLLOW_UP, "second").await;
+    let queued = push(&agent, id, FOLLOW_UP, "second").await;
     gate_one.release();
-
     let result = wait_bounded(&agent, turn).await;
-    let next = next_turn(&result);
-    // The successor's gated model call keeps it alive, so it is the active
-    // loop at the moment the first waiter resolves.
-    let state = agent.session_state(id).unwrap();
-    assert_eq!(
-        state.active_loop.map(|state| state.loop_id),
-        Some(next.turn.loop_id)
-    );
-    // The replaced turn stays waitable for a late `turn.wait`.
-    assert_eq!(wait_bounded(&agent, turn).await.next, result.next);
-
     started(&gate_two).await;
+    let next = wait_input(&agent, id, &queued.id).await;
+    assert_eq!(wait_bounded(&agent, turn).await, result);
     gate_two.release();
-    assert_eq!(wait_bounded(&agent, next.turn).await.next, None);
+    wait_bounded(&agent, next).await;
     settle_turn(&agent, id).await;
+}
+
+#[tokio::test]
+async fn late_wait_retains_four_summaries_without_invalidating_registered_waiters() {
+    let first_gate = Arc::new(Gate::new());
+    let last_gate = Arc::new(Gate::new());
+    let fixture = AgentFixture::new("late-wait-window").script([
+        Step::gated_text(first_gate.clone(), "first"),
+        Step::Text("one"),
+        Step::Text("two"),
+        Step::Text("three"),
+        Step::Text("four"),
+        Step::gated_text(last_gate.clone(), "last"),
+    ]);
+    let (mut agent, info) = fixture.start().await;
+    let id = info.session_id;
+    let first = send_text(&mut agent, id, "first").await;
+    started(&first_gate).await;
+    let registered = agent
+        .loaded_session(id)
+        .unwrap()
+        .wait_receiver(first)
+        .unwrap();
+    let mut queued = Vec::new();
+    for text in ["one", "two", "three", "four", "last"] {
+        queued.push(push(&agent, id, FOLLOW_UP, text).await);
+    }
+    first_gate.release();
+    started(&last_gate).await;
+    assert!(matches!(
+        agent.wait_turn(first).await,
+        Err(AgentError::TurnNotFound)
+    ));
+    let result = crate::sessions::await_turn_completion(registered)
+        .await
+        .unwrap();
+    assert_eq!(result.turn, first);
+    assert_completed(&result);
+    for input in &queued[..4] {
+        let turn = wait_input(&agent, id, &input.id).await;
+        assert_completed(wait_bounded(&agent, turn).await.as_ref());
+    }
+    let last = wait_input(&agent, id, &queued[4].id).await;
+    last_gate.release();
+    wait_bounded(&agent, last).await;
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -207,21 +238,16 @@ async fn the_oldest_steer_starts_first_and_the_remaining_steers_ride_along() {
     let turn = send_text(&mut agent, id, "first").await;
     started(&gate).await;
     // A final answer takes no inputs, so all three wait for the successor.
-    push(&agent, id, FOLLOW_UP, "f1").await;
-    push(&agent, id, STEER, "s1").await;
+    let f1 = push(&agent, id, FOLLOW_UP, "f1").await;
+    let s1 = push(&agent, id, STEER, "s1").await;
     push(&agent, id, STEER, "s2").await;
     gate.release();
 
-    let first = wait_bounded(&agent, turn).await;
-    let second = next_turn(&first);
-    assert_eq!(
-        second.input.text, "s1",
-        "a steer overtakes the older follow-up"
-    );
-    let second_result = wait_bounded(&agent, second.turn).await;
-    let third = next_turn(&second_result);
-    assert_eq!(third.input.text, "f1");
-    wait_bounded(&agent, third.turn).await;
+    wait_bounded(&agent, turn).await;
+    let second = wait_input(&agent, id, &s1.id).await;
+    wait_bounded(&agent, second).await;
+    let third = wait_input(&agent, id, &f1.id).await;
+    wait_bounded(&agent, third).await;
     settle_turn(&agent, id).await;
 
     {
@@ -258,7 +284,6 @@ async fn concurrent_pushes_to_an_idle_session_start_exactly_one_turn() {
                     .unwrap()
                     .start()
                     .await
-                    .unwrap()
             })
         })
         .collect::<Vec<_>>();
@@ -268,31 +293,17 @@ async fn concurrent_pushes_to_an_idle_session_start_exactly_one_turn() {
     }
     let starts = pushed
         .iter()
-        .filter(|pushed| pushed.started.is_some())
+        .filter(|pushed| input_turn(&agent, id, &pushed.id).is_some())
         .count();
     assert_eq!(starts, 1, "only one push may start the turn");
-
     started(&gate).await;
     gate.release();
-    let mut turn = pushed
+    session.join_turn_task().await;
+    let users = session
+        .read_snapshot()
+        .history
         .iter()
-        .find_map(|pushed| pushed.started.clone())
-        .unwrap()
-        .turn;
-    // Every other entry follows as a delivered steer or its own turn.
-    loop {
-        let result = wait_bounded(&agent, turn).await;
-        match result.next.clone() {
-            Some(next) => turn = next.turn,
-            None => break,
-        }
-    }
-    settle_turn(&agent, id).await;
-    let history = history_page(&agent, id, 100);
-    let users = history
-        .items
-        .iter()
-        .filter(|item| matches!(item.item, crate::history::HistoryItemView::User(_)))
+        .filter(|item| matches!(item, HistoryItem::User(_)))
         .count();
     assert_eq!(users, 8, "every push reached the model exactly once");
     assert!(queue_texts(&agent, id).is_empty());
@@ -326,7 +337,6 @@ async fn a_push_while_the_first_turn_is_starting_is_queued_and_never_lost() {
                 .unwrap()
                 .start()
                 .await
-                .unwrap()
         })
     };
     started(&gate).await;
@@ -336,14 +346,13 @@ async fn a_push_while_the_first_turn_is_starting_is_queued_and_never_lost() {
         .accept_input(STEER, "during start".to_owned())
         .unwrap();
     assert!(!queued.needs_start());
-    queued.finish(None);
+    queued.finish();
     gate.release();
 
-    let started = starter.await.unwrap().started.unwrap();
-    let mut turn = started.turn;
-    while let Some(next) = wait_bounded(&agent, turn).await.next.clone() {
-        turn = next.turn;
-    }
+    let pushed = starter.await.unwrap();
+    let turn = wait_input(&agent, id, &pushed.id).await;
+    wait_bounded(&agent, turn).await;
+    session.join_turn_task().await;
     settle_turn(&agent, id).await;
     let texts = flatten_texts(&read_store_history(&data_dir, id).await);
     assert_eq!(
@@ -372,12 +381,15 @@ async fn paused_after_cancel(label: &str) -> (AgentFixture, Agent, SessionId, Ar
     assert!(agent.cancel(turn).unwrap());
     let result = wait_bounded(&agent, turn).await;
     assert_eq!(
-        crate::event::LoopOutcomeView::from_report(&result.report),
+        result.outcome.clone(),
         crate::event::LoopOutcomeView::Cancelled {
             reason: crate::event::CancelReasonView::User
         }
     );
-    assert_eq!(result.next, None, "a cancelled turn starts nothing");
+    assert_eq!(
+        agent.session_state(id).unwrap().execution,
+        crate::SessionExecution::None
+    );
     gate.release();
     (fixture, agent, id, model)
 }
@@ -391,16 +403,21 @@ async fn a_cancelled_turn_pauses_the_queue_and_resume_starts_the_head() {
     assert_eq!(queue_texts(&agent, id), ["f1", "f2"]);
     assert_eq!(model.calls(), 1, "nothing starts while paused");
     assert_eq!(
-        agent.session_state(id).unwrap().status,
-        crate::sessions::SessionStatus::Idle
+        agent.session_state(id).unwrap().execution,
+        crate::SessionExecution::None
     );
 
-    let resumed = agent.resume_inputs(id).await.unwrap();
-    let started = resumed.started.expect("resume starts the head");
-    assert_eq!(started.input.text, "f1");
-    assert!(!resumed.queue.paused);
-    let result = wait_bounded(&agent, started.turn).await;
-    assert_eq!(next_turn(&result).input.text, "f2");
+    let ids = queue
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    assert!(agent.resume_inputs(id).await.unwrap().start_error.is_none());
+    assert!(!agent.list_inputs(id).unwrap().paused);
+    for input_id in ids {
+        let turn = wait_input(&agent, id, &input_id).await;
+        wait_bounded(&agent, turn).await;
+    }
 }
 
 #[tokio::test]
@@ -409,22 +426,13 @@ async fn a_push_while_paused_clears_the_pause_and_starts_the_older_entry() {
     settle_turn(&agent, id).await;
     assert!(agent.list_inputs(id).unwrap().paused);
 
+    let oldest = agent.list_inputs(id).unwrap().items[0].id.clone();
     let pushed = push(&agent, id, FOLLOW_UP, "f3").await;
-    let started = pushed.started.expect("a push while paused starts the head");
-    assert_eq!(
-        started.input.text, "f1",
-        "queue order puts older entries first"
-    );
-    assert!(!pushed.queue.paused);
-    assert_eq!(
-        pushed
-            .queue
-            .items
-            .iter()
-            .map(|item| item.text.as_str())
-            .collect::<Vec<_>>(),
-        ["f2", "f3"]
-    );
+    assert!(pushed.start_error.is_none());
+    assert!(input_turn(&agent, id, &oldest).is_some());
+    assert!(!agent.list_inputs(id).unwrap().paused);
+    let last = wait_input(&agent, id, &pushed.id).await;
+    wait_bounded(&agent, last).await;
 }
 
 #[tokio::test]
@@ -442,10 +450,13 @@ async fn a_failed_turn_pauses_the_queue() {
     gate.release();
     let result = wait_bounded(&agent, turn).await;
     assert!(matches!(
-        crate::event::LoopOutcomeView::from_report(&result.report),
+        result.outcome.clone(),
         crate::event::LoopOutcomeView::Failed { .. }
     ));
-    assert_eq!(result.next, None);
+    assert_eq!(
+        agent.session_state(id).unwrap().execution,
+        crate::SessionExecution::None
+    );
     assert!(agent.list_inputs(id).unwrap().paused);
     assert_eq!(queue_texts(&agent, id), ["f1"]);
 }
@@ -464,12 +475,17 @@ async fn failed_persistence_pauses_the_queue_and_resume_runs_it() {
     gate.release();
     let result = wait_bounded(&agent, turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
-    assert_eq!(result.next, None);
+    assert_eq!(
+        agent.session_state(id).unwrap().execution,
+        crate::SessionExecution::None
+    );
     assert!(agent.list_inputs(id).unwrap().paused);
     assert!(agent.session_state(id).unwrap().block_reason.is_none());
 
-    let started = agent.resume_inputs(id).await.unwrap().started.unwrap();
-    let resumed = wait_bounded(&agent, started.turn).await;
+    let input_id = agent.list_inputs(id).unwrap().items[0].id.clone();
+    agent.resume_inputs(id).await.unwrap();
+    let next = wait_input(&agent, id, &input_id).await;
+    let resumed = wait_bounded(&agent, next).await;
     assert_persisted(&resumed);
     assert!(queue_texts(&agent, id).is_empty());
 }
@@ -496,16 +512,19 @@ async fn recall_returns_the_texts_in_run_order_and_close_is_refused_while_queued
         Err(AgentError::SessionAlreadyLoaded)
     ));
     assert!(
-        agent.session_state(id).unwrap().active_loop.is_some(),
+        agent.session_state(id).unwrap().execution != crate::SessionExecution::None,
         "a refused close leaves the turn running"
     );
 
     let recalled = agent.recall_inputs(id).unwrap();
     assert_eq!(recalled.texts, ["s1", "f1", "f2"]);
-    assert!(recalled.queue.items.is_empty());
+    assert!(agent.list_inputs(id).unwrap().items.is_empty());
     gate.release();
-    let result = wait_bounded(&agent, turn).await;
-    assert_eq!(result.next, None);
+    assert_completed(wait_bounded(&agent, turn).await.as_ref());
+    assert_eq!(
+        agent.session_state(id).unwrap().execution,
+        crate::SessionExecution::None
+    );
     agent.close_session(id).await.unwrap();
 }
 
@@ -535,14 +554,16 @@ async fn a_steer_pushed_during_an_approval_wait_reaches_the_request_after_the_an
             Duration::from_secs(5),
             "approval request must arrive",
             |event| match event {
-                AgentEvent::InteractionRequested { interaction, .. } => Some(interaction),
+                AgentEvent::SessionSnapshot { snapshot, .. } => snapshot
+                    .pending_interaction
+                    .map(|pending| pending.interaction),
                 _ => None,
             },
         )
         .await;
 
     let pushed = push(&agent, id, STEER, "also this").await;
-    assert!(pushed.started.is_none());
+    assert!(input_turn(&agent, id, &pushed.id).is_none());
     assert_eq!(
         queue_texts(&agent, id),
         ["also this"],
@@ -559,8 +580,11 @@ async fn a_steer_pushed_during_an_approval_wait_reaches_the_request_after_the_an
         })
         .await
         .unwrap();
-    let result = wait_bounded(&agent, turn).await;
-    assert_eq!(result.next, None);
+    assert_completed(wait_bounded(&agent, turn).await.as_ref());
+    assert_eq!(
+        agent.session_state(id).unwrap().execution,
+        crate::SessionExecution::None
+    );
     let requests = model.requests();
     let requests = requests.lock().unwrap();
     assert_eq!(user_texts(&requests[1]), ["write it", "also this"]);
@@ -605,7 +629,7 @@ async fn a_push_during_a_manual_compaction_starts_when_it_ends() {
     started(&gate).await;
     let pushed = push(&agent, id, FOLLOW_UP, "after compaction").await;
     assert!(
-        pushed.started.is_none(),
+        input_turn(&agent, id, &pushed.id).is_none(),
         "nothing starts during a compaction"
     );
     assert_eq!(queue_texts(&agent, id), ["after compaction"]);
@@ -622,12 +646,8 @@ async fn a_push_during_a_manual_compaction_starts_when_it_ends() {
         completion.result.status,
         crate::compaction::CompactionStatus::Compacted
     );
-    let next = completion
-        .next
-        .expect("the head starts when the compaction ends");
-    assert_eq!(next.input.id, pushed.id);
-    // The turn was installed before the result was published, so it is known.
-    let result = wait_bounded(&agent, next.turn).await;
+    let next = wait_input(&agent, id, &pushed.id).await;
+    let result = wait_bounded(&agent, next).await;
     assert_persisted(&result);
     assert!(queue_texts(&agent, id).is_empty());
 }
@@ -653,18 +673,17 @@ async fn delivered_and_initial_inputs_keep_their_acceptance_time_as_the_user_tim
 
     let result = wait_bounded(&agent, turn).await;
     assert_persisted(&result);
-    let next = next_turn(&result);
-    assert_eq!(next.input.accepted_at, later.accepted_at);
-    wait_bounded(&agent, next.turn).await;
+    let next = wait_input(&agent, id, &later.id).await;
+    wait_bounded(&agent, next).await;
     settle_turn(&agent, id).await;
 
-    let page = history_page(&agent, id, 100);
+    let page = history_page(&agent, id, 100).await;
     let timestamps = page
         .items
         .iter()
-        .filter_map(|item| match &item.item {
-            crate::history::HistoryItemView::User(user) => user.timestamp.clone(),
-            _ => None,
+        .filter_map(|item| {
+            let value: serde_json::Value = serde_json::from_str(&item.data).unwrap();
+            value["timestamp"].as_str().map(str::to_owned)
         })
         .collect::<Vec<_>>();
     assert_eq!(timestamps.len(), 4);
@@ -675,20 +694,15 @@ async fn delivered_and_initial_inputs_keep_their_acceptance_time_as_the_user_tim
 
     // Paging keeps the loop-local occurrence instead of restarting at zero;
     // item 3 is the first delivered steer, after the tool exchange.
-    let second_page = agent
-        .history(GetHistory {
-            session_id: id,
-            offset: 3,
-            limit: 1,
-        })
-        .unwrap();
-    let crate::history::HistoryItemView::User(second_user) = &second_page.items[0].item else {
-        panic!("expected the second page to contain a User item");
+    let mut request = ReadSession {
+        limit: 1,
+        ..display_read(id)
     };
-    assert_eq!(
-        second_user.timestamp.as_deref(),
-        Some(timestamps[1].as_str())
-    );
+    continue_display_read(&mut request, &page);
+    request.cursor = Some(crate::read::ReadCursor { item: 3, offset: 0 });
+    let second_page = agent.read_session(request).await.unwrap();
+    let second_user: serde_json::Value = serde_json::from_str(&second_page.items[0].data).unwrap();
+    assert_eq!(second_user["timestamp"], timestamps[1]);
 
     let loaded = Store::open(data_dir)
         .await

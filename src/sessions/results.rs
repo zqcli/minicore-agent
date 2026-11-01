@@ -88,7 +88,6 @@ pub struct CompletionEntry {
     pub persistence_uncertain: bool,
     pub availability: ResultAvailability,
     pub unavailable_reason: Option<UnavailableReason>,
-    pub next_loop_id: Option<LoopId>,
     pub after_saved_loop_id: Option<LoopId>,
 }
 
@@ -104,7 +103,7 @@ pub(crate) struct ResultSource {
     pub(crate) items: Vec<String>,
     pub(crate) interrupted: Option<InterruptedRequest>,
     pub(crate) result_id: String,
-    pub(crate) metadata: Option<crate::event::TurnResultView>,
+    pub(crate) metadata: TurnResult,
     _charge: SourceCharge,
 }
 
@@ -171,7 +170,7 @@ pub(crate) struct PreparedSource {
     pub(crate) items: Vec<String>,
     pub(crate) interrupted: Option<InterruptedRequest>,
     pub(crate) result_id: String,
-    pub(crate) metadata: Option<crate::event::TurnResultView>,
+    pub(crate) metadata: TurnResult,
     bytes: usize,
 }
 
@@ -184,6 +183,7 @@ impl PreparedSource {
     pub(crate) fn new(
         items: Vec<String>,
         interrupted: Option<InterruptedRequest>,
+        metadata: TurnResult,
     ) -> Result<Self, AgentError> {
         #[cfg(feature = "e2e-observe")]
         let mut observation = crate::e2e_observe::Span::new(crate::e2e_observe::Work::SourceHash);
@@ -192,7 +192,8 @@ impl PreparedSource {
         hash.update((items.len() as u64).to_be_bytes());
         let mut bytes = std::mem::size_of::<ResultSource>()
             + 2 * std::mem::size_of::<usize>()
-            + items.capacity() * std::mem::size_of::<String>();
+            + items.capacity() * std::mem::size_of::<String>()
+            + outcome_heap_bytes(&metadata.outcome);
         for item in &items {
             #[cfg(feature = "e2e-observe")]
             observation.add(1, item.len() + 8);
@@ -236,21 +237,9 @@ impl PreparedSource {
             items,
             interrupted,
             result_id,
-            metadata: None,
+            metadata,
             bytes,
         })
-    }
-
-    pub(crate) fn with_metadata(
-        mut self,
-        metadata: crate::event::TurnResultView,
-    ) -> Result<Self, AgentError> {
-        self.bytes = self
-            .bytes
-            .checked_add(outcome_heap_bytes(&metadata.outcome))
-            .ok_or(AgentError::Internal)?;
-        self.metadata = Some(metadata);
-        Ok(self)
     }
 }
 

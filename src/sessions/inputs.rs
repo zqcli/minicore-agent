@@ -32,14 +32,6 @@ pub struct Queue {
     pub paused: bool,
 }
 
-/// A turn the Agent started from the queue, with the entry that became its
-/// initial input.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct StartedTurn {
-    pub turn: TurnRef,
-    pub input: QueueItem,
-}
-
 /// An input a running turn took, with the request preparation it joined.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DeliveredInput {
@@ -75,11 +67,7 @@ pub struct InputPushed {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_at: Option<String>,
-    /// The turn this push started; its input is an older entry when queue
-    /// order requires.
-    pub started: Option<StartedTurn>,
     pub start_error: Option<InputStartError>,
-    pub queue: Queue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -92,27 +80,23 @@ pub struct InputStartError {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InputRemoved {
     pub text: String,
-    pub queue: Queue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InputsRecalled {
     pub texts: Vec<String>,
-    pub queue: Queue,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InputsResumed {
-    pub started: Option<StartedTurn>,
     pub start_error: Option<InputStartError>,
-    pub queue: Queue,
 }
 
 #[derive(Clone)]
 pub(super) struct Entry {
     id: String,
     mode: InputMode,
-    input: UserInput,
+    pub(super) input: UserInput,
     accepted_at: Option<String>,
 }
 
@@ -147,7 +131,7 @@ pub(super) struct QueueState {
     pub(super) starting: Option<Entry>,
     pub(super) paused: bool,
     /// A turn is active or being started, or a claimed start is under way.
-    running: bool,
+    pub(super) running: bool,
     /// The loop generation that may take inputs; any other loop is stale.
     binding: Option<u64>,
     generation: u64,
@@ -155,7 +139,7 @@ pub(super) struct QueueState {
 }
 
 impl QueueState {
-    fn head(&self) -> Option<usize> {
+    pub(super) fn head(&self) -> Option<usize> {
         self.items
             .iter()
             .position(|entry| entry.mode == InputMode::Steer)
@@ -178,7 +162,7 @@ impl QueueState {
     }
 
     /// Hands the head to a new loop generation; the queue stays `running`.
-    fn start_head(&mut self) -> Result<Option<(Entry, u64)>, AgentError> {
+    pub(super) fn start_head(&mut self) -> Result<Option<(Entry, u64)>, AgentError> {
         let Some(head) = self.head() else {
             return Ok(None);
         };
@@ -223,11 +207,11 @@ impl QueueState {
 pub(super) struct Claim {
     session: Session,
     entry: Option<Entry>,
-    generation: u64,
+    pub(super) generation: u64,
 }
 
 impl Claim {
-    fn new(session: &Session, (entry, generation): (Entry, u64)) -> Self {
+    pub(super) fn new(session: &Session, (entry, generation): (Entry, u64)) -> Self {
         Self {
             session: session.clone(),
             entry: Some(entry),
@@ -235,15 +219,15 @@ impl Claim {
         }
     }
 
-    fn entry(&self) -> &Entry {
+    pub(super) fn entry(&self) -> &Entry {
         self.entry.as_ref().expect("claim is not consumed")
     }
 
-    fn started(mut self) {
+    pub(super) fn started(mut self) {
         self.entry = None;
     }
 
-    fn failed(mut self) {
+    pub(super) fn failed(mut self) {
         if let Some(entry) = self.entry.take() {
             self.session.abandon_claim(entry, true);
         }
@@ -277,33 +261,27 @@ impl PendingPush {
         self.claim.is_some()
     }
 
-    pub(crate) fn finish(self, started: Option<StartedTurn>) -> InputPushed {
-        self.finish_with_error(started, None)
+    pub(crate) fn finish(self) -> InputPushed {
+        self.finish_with_error(None)
     }
 
-    fn finish_with_error(
-        self,
-        started: Option<StartedTurn>,
-        start_error: Option<InputStartError>,
-    ) -> InputPushed {
+    fn finish_with_error(self, start_error: Option<InputStartError>) -> InputPushed {
         InputPushed {
             session_id: self.session.session_id(),
             load: self.session.load(),
             accepted: true,
             id: self.id,
             accepted_at: self.accepted_at,
-            started,
             start_error,
-            queue: self.session.queue(),
         }
     }
 
-    pub(crate) async fn start(mut self) -> Result<InputPushed, AgentError> {
-        let (started, start_error) = match self.claim.take() {
+    pub(crate) async fn start(mut self) -> InputPushed {
+        let start_error = match self.claim.take() {
             Some(claim) => self.session.start_claim(claim).await,
-            None => (None, None),
+            None => None,
         };
-        Ok(self.finish_with_error(started, start_error))
+        self.finish_with_error(start_error)
     }
 }
 
@@ -318,28 +296,20 @@ impl PendingResume {
         self.claim.is_some()
     }
 
-    pub(crate) fn finish(self, started: Option<StartedTurn>) -> InputsResumed {
-        self.finish_with_error(started, None)
+    pub(crate) fn finish(self) -> InputsResumed {
+        self.finish_with_error(None)
     }
 
-    fn finish_with_error(
-        self,
-        started: Option<StartedTurn>,
-        start_error: Option<InputStartError>,
-    ) -> InputsResumed {
-        InputsResumed {
-            started,
-            start_error,
-            queue: self.session.queue(),
-        }
+    fn finish_with_error(self, start_error: Option<InputStartError>) -> InputsResumed {
+        InputsResumed { start_error }
     }
 
-    pub(crate) async fn start(mut self) -> Result<InputsResumed, AgentError> {
-        let (started, start_error) = match self.claim.take() {
+    pub(crate) async fn start(mut self) -> InputsResumed {
+        let start_error = match self.claim.take() {
             Some(claim) => self.session.start_claim(claim).await,
-            None => (None, None),
+            None => None,
         };
-        Ok(self.finish_with_error(started, start_error))
+        self.finish_with_error(start_error)
     }
 }
 
@@ -429,7 +399,7 @@ impl LoopInputs for SessionInputs {
                 None => delivery.early.extend(items),
             }
         }
-        self.session.emit_queue(&queue);
+        self.session.mark_dirty();
         taken.into_iter().map(|entry| entry.input).collect()
     }
 }
@@ -440,14 +410,6 @@ impl Session {
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub(super) fn emit_queue(&self, queue: &QueueState) {
-        self.shared.events.try_send(AgentEvent::InputQueue {
-            queue: queue.view(),
-            meta: EventMeta::session(self.shared.session_id, self.shared.load),
-        });
-        self.mark_dirty();
     }
 
     pub(crate) fn queue(&self) -> Queue {
@@ -514,7 +476,7 @@ impl Session {
         });
         queue.paused = false;
         let claim = self.claim_start(&inner, &mut queue)?;
-        self.emit_queue(&queue);
+        self.mark_dirty();
         Ok(PendingPush {
             session: self.clone(),
             id,
@@ -532,10 +494,9 @@ impl Session {
             .ok_or(AgentError::InputNotQueued)?;
         let entry = queue.items.remove(at);
         queue.paused &= !queue.items.is_empty();
-        self.emit_queue(&queue);
+        self.mark_dirty();
         Ok(InputRemoved {
             text: entry.input.as_text().to_owned(),
-            queue: queue.view(),
         })
     }
 
@@ -549,11 +510,8 @@ impl Session {
             .collect();
         queue.items.clear();
         queue.paused = false;
-        self.emit_queue(&queue);
-        InputsRecalled {
-            texts,
-            queue: queue.view(),
-        }
+        self.mark_dirty();
+        InputsRecalled { texts }
     }
 
     pub(crate) fn accept_resume(&self) -> Result<PendingResume, AgentError> {
@@ -572,7 +530,7 @@ impl Session {
         let was_paused = std::mem::take(&mut queue.paused);
         let claim = self.claim_start(&inner, &mut queue)?;
         if was_paused || claim.is_some() {
-            self.emit_queue(&queue);
+            self.mark_dirty();
         }
         Ok(PendingResume {
             session: self.clone(),
@@ -582,7 +540,7 @@ impl Session {
 
     /// Starts the claimed turn. A Session that became busy meanwhile keeps
     /// the entry queued; any other failure also pauses the queue.
-    async fn start_claim(&self, claim: Claim) -> (Option<StartedTurn>, Option<InputStartError>) {
+    async fn start_claim(&self, claim: Claim) -> Option<InputStartError> {
         let input_id = claim.entry().id.clone();
         let started = async {
             self.cleanup_finished().await?;
@@ -594,20 +552,17 @@ impl Session {
         }
         .await;
         match started {
-            Ok((started, _)) => {
+            Ok(_) => {
                 claim.started();
-                (Some(started), None)
+                None
             }
             Err(AgentError::SessionBusy) => {
                 claim.occupied();
-                (
-                    None,
-                    Some(InputStartError {
-                        input_id,
-                        kind: "session_busy",
-                        message: "The queued turn could not start",
-                    }),
-                )
+                Some(InputStartError {
+                    input_id,
+                    kind: "session_busy",
+                    message: "The queued turn could not start",
+                })
             }
             Err(error) => {
                 claim.failed();
@@ -616,14 +571,11 @@ impl Session {
                     AgentError::InvalidSessionSettings => "invalid_session_settings",
                     _ => "runtime_start_failed",
                 };
-                (
-                    None,
-                    Some(InputStartError {
-                        input_id,
-                        kind,
-                        message: "The queued turn could not start",
-                    }),
-                )
+                Some(InputStartError {
+                    input_id,
+                    kind,
+                    message: "The queued turn could not start",
+                })
             }
         }
     }
@@ -634,25 +586,25 @@ impl Session {
         queue.restore(entry);
         queue.end_period();
         queue.paused |= pause;
-        self.emit_queue(&queue);
+        self.mark_dirty();
     }
 
     /// Starts the head after a manual compaction ended, without waiting for
     /// any task: the caller is the compaction's own worker.
-    pub(super) fn start_after_compaction(&self) -> Option<StartedTurn> {
+    pub(super) fn start_after_compaction(&self) {
         let claim = {
             let inner = self.lock_inner();
             let mut queue = self.lock_queue();
             let claim = match self.claim_start(&inner, &mut queue) {
                 Ok(Some(claim)) => claim,
-                Ok(None) => return None,
+                Ok(None) => return,
                 Err(_) => {
                     queue.paused = true;
-                    self.emit_queue(&queue);
-                    return None;
+                    self.mark_dirty();
+                    return;
                 }
             };
-            self.emit_queue(&queue);
+            self.mark_dirty();
             claim
         };
         let boundary = RequestBoundary::new();
@@ -668,200 +620,15 @@ impl Session {
                 )
             });
         match started {
-            Ok((started, _)) => {
+            Ok(_) => {
                 claim.started();
-                Some(started)
             }
             Err(error) => {
                 tracing::warn!(session_id = %self.shared.session_id, error = ?error,
                     "queued input could not start after compaction");
                 claim.failed();
-                None
             }
         }
-    }
-}
-
-/// What the driver does once a turn's report is persisted.
-pub(super) enum Close {
-    /// Settle the finished turn first: a successor would project the history.
-    Settle,
-    Done {
-        result: Arc<TurnResult>,
-        run: Option<LoopRun>,
-    },
-}
-
-impl Session {
-    /// Ends the turn: starts the successor when the turn completed and the
-    /// queue has a head, otherwise ends the busy period, pausing a non-empty
-    /// queue after a turn that did not complete. The successor is installed
-    /// before the finished turn's completion is published.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn close_turn(
-        &self,
-        turn: TurnRef,
-        task: &Arc<SessionTask>,
-        completion: &mut CompletionGuard,
-        eligible: bool,
-        settled: bool,
-        result: &dyn Fn(Option<StartedTurn>) -> Arc<TurnResult>,
-        source: &mut Option<ReservedSource>,
-        unavailable: Option<UnavailableReason>,
-        uncertain: bool,
-    ) -> Close {
-        let mut released = Vec::new();
-        let publication = self.shared.results.publication();
-        let (entry, generation) = {
-            let mut inner = self.lock_inner();
-            let mut queue = self.lock_queue();
-            let successor = eligible && !inner.closing && queue.head().is_some();
-            if successor && !settled {
-                return Close::Settle;
-            }
-            let head = if successor {
-                match queue.start_head() {
-                    Ok(head) => head,
-                    Err(_) => {
-                        queue.paused = true;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let Some(head) = head else {
-                queue.paused |= !eligible && !queue.items.is_empty();
-                queue.end_period();
-                let result = result(None);
-                released.extend(self.register_completion(
-                    &mut inner,
-                    &result,
-                    source.take(),
-                    unavailable,
-                    uncertain,
-                ));
-                completion.publish_finished(Arc::clone(&result));
-                self.emit_queue(&queue);
-                drop(queue);
-                drop(inner);
-                drop(publication);
-                drop(released);
-                return Close::Done { result, run: None };
-            };
-            self.emit_queue(&queue);
-            head
-        };
-        drop(publication);
-        let mut publish = |inner: &mut SessionInner, next: StartedTurn| {
-            let finished = result(Some(next));
-            released.extend(self.register_completion(
-                inner,
-                &finished,
-                source.take(),
-                unavailable,
-                uncertain,
-            ));
-            finished
-        };
-        let boundary = RequestBoundary::new();
-        let started = self
-            .execution_config(entry.input.clone(), generation, &boundary)
-            .and_then(|execution| {
-                self.install_loop_with_boundary(
-                    execution,
-                    boundary,
-                    &entry,
-                    generation,
-                    Some(Successor {
-                        turn,
-                        task,
-                        completion,
-                        publish: &mut publish,
-                    }),
-                )
-            });
-        drop(publish);
-        match started {
-            Ok((started, run)) => {
-                #[cfg(test)]
-                if let Some(gate) = PAUSE_AFTER_SUCCESSOR_INSTALL.take(&turn.session_id) {
-                    tokio::task::block_in_place(|| gate.pass_blocking());
-                }
-                let result = result(Some(started));
-                drop(released);
-                Close::Done { result, run }
-            }
-            Err(error) => {
-                tracing::warn!(session_id = %turn.session_id, error = ?error,
-                    "queued input could not start after the turn");
-                let publication = self.shared.results.publication();
-                let mut inner = self.lock_inner();
-                let mut queue = self.lock_queue();
-                queue.restore(entry);
-                queue.end_period();
-                queue.paused = true;
-                let result = result(None);
-                released.extend(self.register_completion(
-                    &mut inner,
-                    &result,
-                    source.take(),
-                    unavailable,
-                    uncertain,
-                ));
-                completion.publish_finished(Arc::clone(&result));
-                self.emit_queue(&queue);
-                drop(queue);
-                drop(inner);
-                drop(publication);
-                drop(released);
-                Close::Done { result, run: None }
-            }
-        }
-    }
-
-    fn register_completion(
-        &self,
-        inner: &mut SessionInner,
-        result: &Arc<TurnResult>,
-        source: Option<ReservedSource>,
-        unavailable: Option<UnavailableReason>,
-        uncertain: bool,
-    ) -> Vec<Arc<results::ResultSource>> {
-        let outcome = match &result.report.outcome {
-            minicore_runtime::LoopOutcome::Completed => CompletionOutcome::Completed,
-            minicore_runtime::LoopOutcome::Cancelled(_) => CompletionOutcome::Cancelled,
-            minicore_runtime::LoopOutcome::Failed(_) => CompletionOutcome::Failed,
-            _ => CompletionOutcome::Unknown,
-        };
-        let entry = CompletionEntry {
-            seq: 0,
-            loop_id: result.turn.loop_id,
-            input_id: inner
-                .active
-                .as_ref()
-                .filter(|active| active.turn == result.turn)
-                .map(|active| active.input.id.clone()),
-            completion_kind: CompletionKind::Reported,
-            outcome_kind: Some(outcome),
-            persistence: Some(result.persistence),
-            persistence_uncertain: uncertain,
-            availability: if result.persistence == TurnPersistence::Persisted {
-                ResultAvailability::Stored
-            } else if source.is_some() {
-                ResultAvailability::Live
-            } else {
-                ResultAvailability::Unavailable
-            },
-            unavailable_reason: unavailable,
-            next_loop_id: result.next.as_ref().map(|next| next.turn.loop_id),
-            after_saved_loop_id: inner.last_saved,
-        };
-        let released = self.shared.results.insert(self.load(), entry, source);
-        if result.persistence == TurnPersistence::Persisted {
-            inner.last_saved = Some(result.turn.loop_id);
-        }
-        released
     }
 }
 

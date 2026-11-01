@@ -20,17 +20,9 @@ async fn replay_only_history_reads_redact_loaded_unloaded_and_append_failure_doe
         let turn = send_text(&mut agent, info.session_id, "opaque-only response").await;
         let result = wait_text(&agent, turn).await;
         assert_completed(&result);
-        assert!(result.report.appended.iter().any(|item| matches!(item,HistoryItem::Assistant(a) if a.content.is_empty() && a.provider_replay.is_some())));
         let expected = if fail { 0 } else { 2 };
         assert_eq!(
-            agent
-                .history(GetHistory {
-                    session_id: info.session_id,
-                    offset: 0,
-                    limit: 100
-                })
-                .unwrap()
-                .total,
+            history_page(&agent, info.session_id, 100).await.total,
             expected
         );
         if fail {

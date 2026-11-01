@@ -10,15 +10,15 @@ pub struct TurnRef {
 
 /// Product-level result of one turn. A loop that failed at runtime is still a
 /// normal `TurnResult`; only agent-internal failures are `AgentError`s.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TurnResult {
     pub turn: TurnRef,
-    pub report: Arc<LoopReport>,
+    pub outcome: LoopOutcomeView,
+    pub usage: minicore_runtime::model::Usage,
+    pub requests: u32,
+    pub tool_rounds: u64,
+    pub final_config_revision: ConfigRevision,
     pub persistence: TurnPersistence,
-    pub interrupted: Option<InterruptedRequest>,
-    /// The successor turn the Agent started from the input queue, installed
-    /// before this result was published.
-    pub next: Option<StartedTurn>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -26,17 +26,6 @@ pub struct TurnResult {
 pub enum TurnPersistence {
     Persisted,
     Failed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionStatus {
-    Idle,
-    Running,
-    WaitingForInput,
-    Finishing,
-    Blocked,
-    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -113,15 +102,6 @@ pub struct SessionContext {
     /// Bounded observation of provider context overflow recovery, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<crate::compaction::RecoveryObservation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionState {
-    pub session_id: SessionId,
-    pub status: SessionStatus,
-    pub active_loop: Option<minicore_runtime::LoopState>,
-    pub block_reason: Option<SessionBlockReason>,
-    pub compaction: Option<CompactionProgress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -23,7 +23,7 @@ async fn changes_list_separates_workspace_session_and_turn_scopes() {
             Some(json!({"session_id": session, "mode": "steer", "text": "update file"})),
         )
         .await;
-    let turn = sent["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&sent["result"]).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -147,7 +147,7 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
             Some(json!({"session_id": session, "mode": "steer", "text": "update files"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -168,7 +168,10 @@ async fn changes_diff_public_rpc_compares_native_before_and_after() {
         .iter()
         .find(|record| record["path"] == json!("value.txt"))
         .unwrap();
-    let change_ref = target["change_ref"].as_str().unwrap().to_owned();
+    let change_ref = target["change_ref"].clone();
+    assert_eq!(change_ref["kind"], "tool");
+    assert_eq!(change_ref["tool_ref"], target["tool_ref"]);
+    assert_eq!(change_ref["revision"].as_str().unwrap().len(), 64);
 
     // Warm diff: before is the actual user-dirty buffer, not HEAD.
     let diff = harness
@@ -257,7 +260,7 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
             Some(json!({"session_id": session, "mode": "steer", "text": "update file"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -271,10 +274,7 @@ async fn changes_diff_public_rpc_pages_a_long_line_losslessly() {
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let change_ref = listed["result"]["records"][0]["change_ref"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let change_ref = listed["result"]["records"][0]["change_ref"].clone();
 
     let mut cursor = Value::Null;
     let mut removed = String::new();
@@ -341,7 +341,7 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
             Some(json!({"session_id": session, "mode": "steer", "text": "update file"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -355,10 +355,7 @@ async fn changes_diff_shares_the_four_query_slots_and_joins_on_shutdown() {
             Some(json!({"session_id": session, "scope": "session"})),
         )
         .await;
-    let change_ref = listed["result"]["records"][0]["change_ref"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let change_ref = listed["result"]["records"][0]["change_ref"].clone();
 
     let mut gates = Vec::new();
     for index in 0..MAX_DEFERRED_QUERIES {
@@ -642,7 +639,7 @@ async fn changes_list_queries_share_the_total_waiter_ceiling() {
             Some(json!({"session_id": session, "mode": "steer", "text": "gated turn"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     tokio::time::timeout(TIMEOUT, async {
         while probe.started.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;

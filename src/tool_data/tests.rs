@@ -4,7 +4,11 @@ fn historical_memory_only_record_needs_stored_details() {
     record.state = super::ToolExecutionState::Succeeded;
     record.outcome = Some(ToolResultOutcome::Success);
     record.result_seen = true;
-    assert!(record.needs_stored());
+    assert!(
+        record
+            .read_summary(&make_tool_ref(session(1), loop_id(1), 0, "summary"))
+            .needs_stored()
+    );
 }
 
 #[test]
@@ -29,7 +33,11 @@ fn complete_empty_streams_do_not_need_stored_details() {
         output_complete: true,
         output_truncated: false,
     });
-    assert!(!record.needs_stored());
+    assert!(
+        !record
+            .read_summary(&make_tool_ref(session(1), loop_id(1), 0, "summary"))
+            .needs_stored()
+    );
 }
 
 use serde_json::json;
@@ -37,7 +45,6 @@ use serde_json::json;
 use crate::changes::FileChange;
 
 use super::data::SNAPSHOT_GATES;
-use super::paging::fit_encoded_string;
 use super::*;
 use crate::budget::encoded_len;
 use crate::error::AgentError;
@@ -66,9 +73,13 @@ impl ToolData {
             .get(&request.tool_ref)
             .ok_or(AgentError::ToolNotFound)?;
         if request.display {
-            record.project_display_read(&request.tool_ref, max_bytes)
+            record
+                .read_summary(&request.tool_ref)
+                .project_display_read(max_bytes)
         } else {
-            record.project_read(&request.tool_ref, max_bytes)
+            record
+                .read_summary(&request.tool_ref)
+                .project_read(max_bytes)
         }
     }
 
@@ -82,7 +93,9 @@ impl ToolData {
             .records
             .get(&request.tool_ref)
             .ok_or(AgentError::ToolNotFound)?;
-        record.project_output(request, max_bytes)
+        record
+            .output_view(request.stream)
+            .project(request, max_bytes)
     }
 }
 
@@ -899,6 +912,25 @@ fn raw_output_is_paged_by_offset_without_escaping() {
 }
 
 #[test]
+fn empty_page_at_retained_text_end_still_reports_loss() {
+    let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "retained-prefix");
+    let mut record = ToolRecord::new("read".into());
+    record.state = ToolExecutionState::Succeeded;
+    record.result = "kept".into();
+    record.result_seen = true;
+    record.result_total = 12;
+    let request = output_request(tool_ref, ToolDataStream::Output, 4, None);
+    let page = record
+        .output_view(ToolDataStream::Output)
+        .project(&request, 4096)
+        .unwrap();
+    assert_eq!(page.availability, ToolDataAvailability::Partial);
+    assert_eq!(page.next_offset, 4);
+    assert_eq!(page.observed_end, 12);
+    assert!(page.data.is_empty() && page.eof && page.truncated);
+}
+
+#[test]
 fn output_stream_is_pending_until_the_result_is_observed() {
     let data = ToolData::new();
     let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "bash-call");
@@ -1221,22 +1253,6 @@ fn response_byte_budget_includes_json_encoding() {
 }
 
 #[test]
-fn fit_encoded_string_accepts_a_minimal_multibyte_budget() {
-    // `"€"` is 5 encoded bytes; a budget of exactly 5 must keep it.
-    assert_eq!(fit_encoded_string("€", 5).0, "€");
-    assert!(!fit_encoded_string("€", 5).1);
-    // One byte short cannot fit the character and returns an empty prefix.
-    assert!(fit_encoded_string("€", 4).0.is_empty());
-    assert!(fit_encoded_string("€", 4).1);
-    // A larger value keeps the longest fitting prefix on a char boundary.
-    assert_eq!(fit_encoded_string("€x", 5).0, "€");
-    assert!(fit_encoded_string("€x", 5).1);
-    assert_eq!(fit_encoded_string("€x", 6).0, "€x");
-    assert!(!fit_encoded_string("€x", 6).1);
-    assert_eq!(fit_encoded_string("a你好z", 64).0, "a你好z");
-}
-
-#[test]
 fn terminal_without_observed_result_is_unavailable_not_pending() {
     let data = ToolData::new();
     let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "bash-call");
@@ -1318,122 +1334,71 @@ fn debug_never_exposes_raw_content() {
 }
 
 #[test]
-fn merge_stored_rejects_incompatible_identity_totals_and_state() {
-    let mut mem = ToolRecord::new("bash".to_owned());
-    mem.state = ToolExecutionState::Succeeded;
-    mem.input_seen = true;
-    mem.input_total = 100;
-    mem.stdout.seen = true;
-    mem.stdout.observed_end = 500;
-
-    // Incompatible tool name
-    let stored_diff_name = ToolRecord::new("read".to_owned());
-    assert!(!mem.merge_stored(stored_diff_name));
-
-    // Incompatible state
-    let mut stored_diff_state = ToolRecord::new("bash".to_owned());
-    stored_diff_state.state = ToolExecutionState::Failed;
-    assert!(!mem.merge_stored(stored_diff_state));
-
-    // Incompatible input total
-    let mut stored_diff_total = ToolRecord::new("bash".to_owned());
-    stored_diff_total.state = ToolExecutionState::Succeeded;
-    stored_diff_total.input_seen = true;
-    stored_diff_total.input_total = 999;
-    assert!(!mem.merge_stored(stored_diff_total));
-
-    // Incompatible stdout observed end
-    let mut stored_diff_end = ToolRecord::new("bash".to_owned());
-    stored_diff_end.state = ToolExecutionState::Succeeded;
-    stored_diff_end.input_seen = true;
-    stored_diff_end.input_total = 100;
-    stored_diff_end.stdout.seen = true;
-    stored_diff_end.stdout.observed_end = 999;
-    assert!(!mem.merge_stored(stored_diff_end));
-
-    // Memory remains completely unmutated
-    assert_eq!(mem.input_total, 100);
-    assert_eq!(mem.stdout.observed_end, 500);
+fn read_metadata_rejects_conflicts_in_identity_totals_and_stream_end() {
+    let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "read-conflict");
+    let mut record = ToolRecord::new("bash".to_owned());
+    record.state = ToolExecutionState::Succeeded;
+    record.input_seen = true;
+    record.input_total = 100;
+    record.stdout.complete = true;
+    let warm = record.read_summary(&tool_ref);
+    for conflict in 0..4 {
+        let mut disk = record.clone();
+        match conflict {
+            0 => disk.name = "read".into(),
+            1 => disk.state = ToolExecutionState::Failed,
+            2 => disk.input_total = 999,
+            _ => disk.stdout.observed_end = 1,
+        }
+        assert!(
+            !warm
+                .metadata
+                .compatible(&disk.read_summary(&tool_ref).metadata)
+        );
+    }
+    let mut unknown = record.clone();
+    unknown.stdout.complete = false;
+    assert!(
+        unknown
+            .read_summary(&tool_ref)
+            .metadata
+            .compatible(&warm.metadata)
+    );
 }
 
 #[test]
-fn merge_stored_preserves_known_empty_eof_and_fills_unknown() {
-    // Known empty EOF in memory cannot be replaced by non-empty stream
-    let mut mem = ToolRecord::new("bash".to_owned());
-    mem.state = ToolExecutionState::Succeeded;
-    mem.stdout.complete = true;
-    mem.stdout.observed_end = 0;
-
-    let mut stored = ToolRecord::new("bash".to_owned());
-    stored.state = ToolExecutionState::Succeeded;
-    stored.stdout.observed_end = 120;
-    assert!(!mem.merge_stored(stored));
-    assert_eq!(mem.stdout.observed_end, 0);
-    assert!(mem.stdout.complete);
-
-    // Unknown in memory learns complete EOF even if seen is false
-    let mut mem_unknown = ToolRecord::new("bash".to_owned());
-    mem_unknown.state = ToolExecutionState::Succeeded;
-    let mut stored_empty_eof = ToolRecord::new("bash".to_owned());
-    stored_empty_eof.state = ToolExecutionState::Succeeded;
-    stored_empty_eof.stdout.complete = true;
-    stored_empty_eof.stdout.observed_end = 0;
-    assert!(mem_unknown.merge_stored(stored_empty_eof));
-    assert!(mem_unknown.stdout.complete);
-    assert_eq!(mem_unknown.stdout.observed_end, 0);
-}
-
-#[test]
-fn merge_stored_reconciled_result_learns_input_and_command_from_disk() {
-    let mut mem = ToolRecord::new("bash".to_owned());
-    mem.state = ToolExecutionState::Succeeded;
-    mem.result = "cmd output\n".to_owned();
-    mem.result_seen = true;
-    mem.result_total = 11;
-    mem.finished_at = Some("2026-09-15T00:00:00Z".to_owned());
-    // input and command are missing in memory
-    assert!(!mem.input_seen);
-    assert!(mem.command.is_none());
-
-    let mut stored = ToolRecord::new("bash".to_owned());
-    stored.state = ToolExecutionState::Succeeded;
-    stored.phase = Some(ToolPhase::Running);
-    stored.started_at = Some("2026-09-14T00:00:00Z".to_owned());
-    stored.finished_at = Some("2026-09-14T00:00:01Z".to_owned());
-    stored.result = "cmd output\n".to_owned();
-    stored.result_seen = true;
-    stored.result_total = 11;
-    stored.input = "echo hello".to_owned();
-    stored.input_seen = true;
-    stored.input_total = 10;
-    stored.stdout.seen = true;
-    stored.stdout.bytes = b"cmd output\n".to_vec().into();
-    stored.stdout.start_offset = 0;
-    stored.stdout.observed_end = 11;
-    stored.stdout.complete = true;
-    stored.command = Some(CommandResult {
-        status: CommandStatus::Exited,
-        exit_code: Some(0),
-        signal: None,
-        termination_confirmed: true,
-        stdout_base_offset: 0,
-        stdout_observed_end: 11,
-        stderr_base_offset: 0,
-        stderr_observed_end: 0,
-        output_complete: true,
-        output_truncated: false,
-    });
-
-    assert!(mem.merge_stored(stored));
-    assert!(mem.input_seen);
-    assert_eq!(mem.input, "echo hello");
-    assert_eq!(mem.input_total, 10);
-    assert_eq!(mem.phase, Some(ToolPhase::Running));
-    assert_eq!(mem.started_at.as_deref(), Some("2026-09-14T00:00:00Z"));
-    assert_eq!(mem.finished_at.as_deref(), Some("2026-09-14T00:00:01Z"));
-    let cmd = mem.command.expect("command restored from disk");
-    assert_eq!(cmd.status, CommandStatus::Exited);
-    assert_eq!(cmd.stdout_observed_end, 11);
+fn summary_restores_missing_input_without_overwriting_retained_output() {
+    let tool_ref = make_tool_ref(session(1), loop_id(1), 0, "read-restore");
+    let mut record = ToolRecord::new("bash".to_owned());
+    record.state = ToolExecutionState::Succeeded;
+    record.result_seen = true;
+    record.result = "kept\n".into();
+    record.result_total = record.result.len();
+    record.output_line_count = Some(1);
+    let mut warm = record.read_summary(&tool_ref);
+    record.input = "echo hello".into();
+    record.input_seen = true;
+    record.input_total = record.input.len();
+    record.phase = Some(ToolPhase::Running);
+    record.started_at = Some("2026-09-14T00:00:00Z".into());
+    record.finished_at = Some("2026-09-14T00:00:01Z".into());
+    record.result.clear();
+    record.result_expired = true;
+    record.output_line_count = None;
+    record.recording = ToolRecordingState::Saved;
+    warm.merge(record.read_summary(&tool_ref));
+    let page = warm.project_read(4096).unwrap();
+    assert_eq!(page.invocation.unwrap().input.preview, "echo hello");
+    assert_eq!(page.execution.output_line_count, Some(1));
+    assert_eq!(
+        page.execution.output_availability,
+        ToolDataAvailability::Available
+    );
+    assert_eq!(
+        page.execution.started_at.as_deref(),
+        Some("2026-09-14T00:00:00Z")
+    );
+    assert_eq!(page.execution.recording, ToolRecordingState::Saved);
 }
 
 #[test]
@@ -1518,7 +1483,10 @@ fn display_read_is_bounded_and_marks_missing_input_without_inventing_empty_body(
     record.input_seen = true;
     record.input_total = record.input.len();
     let tool_ref = make_tool_ref(session(21), loop_id(21), 0, "bounded-write");
-    let page = record.project_display_read(&tool_ref, 2048).unwrap();
+    let page = record
+        .read_summary(&tool_ref)
+        .project_display_read(2048)
+        .unwrap();
     assert!(serde_json::to_vec(&page).unwrap().len() <= 2048);
     let display = page.display.unwrap();
     assert!(display.body_truncated);
@@ -1530,7 +1498,8 @@ fn display_read_is_bounded_and_marks_missing_input_without_inventing_empty_body(
     );
     record.input_truncated = true;
     let missing = record
-        .project_display_read(&tool_ref, 2048)
+        .read_summary(&tool_ref)
+        .project_display_read(2048)
         .unwrap()
         .display
         .unwrap();

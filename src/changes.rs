@@ -96,10 +96,70 @@ pub enum ChangeListWarning {
     StaleCursor,
 }
 
+/// A change address and the observation against which it may be read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeRef {
+    Tool {
+        tool_ref: ToolRef,
+        revision: String,
+    },
+    Workspace {
+        session_id: crate::SessionId,
+        head_oid: String,
+        entry: WorkspaceStatusEntry,
+    },
+}
+
+impl ChangeRef {
+    pub(crate) fn is_workspace(&self) -> bool {
+        matches!(self, Self::Workspace { .. })
+    }
+
+    pub(crate) fn validate(&self, session_id: crate::SessionId) -> Result<(), AgentError> {
+        match self {
+            Self::Tool { tool_ref, revision } => {
+                if tool_ref.session_id != session_id || !crate::read::valid_revision(revision) {
+                    return Err(AgentError::InvalidArguments);
+                }
+            }
+            Self::Workspace {
+                session_id: owner,
+                head_oid,
+                entry,
+            } => {
+                if *owner != session_id
+                    || (!head_oid.is_empty()
+                        && !([40, 64].contains(&head_oid.len())
+                            && head_oid.bytes().all(|byte| byte.is_ascii_hexdigit())))
+                {
+                    return Err(AgentError::InvalidArguments);
+                }
+                if entry
+                    .index_status
+                    .iter()
+                    .chain(entry.worktree_status.iter())
+                    .any(|status| status.len() != 1 || !status.is_ascii())
+                {
+                    return Err(AgentError::InvalidArguments);
+                }
+                for path in std::iter::once(&entry.path).chain(entry.original_path.iter()) {
+                    if path.len() > crate::workspace::page::MAX_PATH_BYTES {
+                        return Err(AgentError::InvalidArguments);
+                    }
+                    crate::workspace::validate_relative_path(path)
+                        .map_err(|_| AgentError::InvalidArguments)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRecord {
-    pub change_ref: String,
+    pub change_ref: ChangeRef,
     pub path: String,
     pub kind: ChangeKind,
     pub origin: ChangeOrigin,
@@ -263,19 +323,6 @@ impl FileChange {
         self.before_available() && self.after_available()
     }
 
-    pub(crate) fn needs_stored(&self) -> bool {
-        (self.before_captured
-            && matches!(&self.before, ChangeRevision::Content { .. })
-            && self.before_bytes.is_none()
-            && !self.before_corrupt)
-            || (self.after_captured
-                && matches!(&self.after, ChangeRevision::Content { .. })
-                && self.after_bytes.is_none()
-                && !self.after_corrupt)
-            || self.before_corrupt
-            || self.after_corrupt
-    }
-
     pub(crate) fn stored(&self) -> StoredFileChange {
         StoredFileChange {
             path: self.path.clone(),
@@ -379,58 +426,29 @@ pub(crate) fn metadata_revision(bytes: u64, modified_unix_ms: Option<u64>) -> Ch
     }
 }
 
-pub(crate) fn tool_change_ref(tool_ref: &ToolRef, change: &FileChange) -> String {
+pub(crate) fn tool_change_ref(tool_ref: &ToolRef, change: &FileChange) -> ChangeRef {
     stored_tool_change_ref(tool_ref, &change.stored())
 }
 
-pub(crate) fn stored_tool_change_ref(tool_ref: &ToolRef, change: &StoredFileChange) -> String {
+pub(crate) fn stored_tool_change_ref(tool_ref: &ToolRef, change: &StoredFileChange) -> ChangeRef {
     let bytes = serde_json::to_vec(&(tool_ref, change))
         .expect("serializing a bounded change reference cannot fail");
-    format!("tool:{}", crate::store::hash_bytes(&bytes))
+    ChangeRef::Tool {
+        tool_ref: tool_ref.clone(),
+        revision: crate::store::hash_bytes(&bytes),
+    }
 }
 
 fn workspace_change_ref(
     session_id: crate::ids::SessionId,
     head_oid: &str,
     entry: &WorkspaceStatusEntry,
-) -> String {
-    let bytes = serde_json::to_vec(&(session_id, head_oid, entry))
-        .expect("serializing a bounded workspace reference cannot fail");
-    use base64::Engine;
-    format!(
-        "workspace:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    )
-}
-
-pub(crate) fn parse_workspace_ref(
-    value: &str,
-    session_id: crate::SessionId,
-) -> Result<(String, WorkspaceStatusEntry), AgentError> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(
-            value
-                .strip_prefix("workspace:")
-                .ok_or(AgentError::InvalidArguments)?,
-        )
-        .map_err(|_| AgentError::InvalidArguments)?;
-    let (session, head, entry): (crate::SessionId, String, WorkspaceStatusEntry) =
-        serde_json::from_slice(&bytes).map_err(|_| AgentError::InvalidArguments)?;
-    if session != session_id
-        || (!head.is_empty()
-            && !([40, 64].contains(&head.len())
-                && head.bytes().all(|byte| byte.is_ascii_hexdigit())))
-    {
-        return Err(AgentError::InvalidArguments);
+) -> ChangeRef {
+    ChangeRef::Workspace {
+        session_id,
+        head_oid: head_oid.to_owned(),
+        entry: entry.clone(),
     }
-    for path in std::iter::once(&entry.path).chain(entry.original_path.iter()) {
-        if path.len() > 4096 {
-            return Err(AgentError::InvalidArguments);
-        }
-        crate::workspace::validate_relative_path(path).map_err(|_| AgentError::InvalidArguments)?;
-    }
-    Ok((head, entry))
 }
 
 fn workspace_observation(status: &WorkspaceStatusResult) -> String {
@@ -504,7 +522,12 @@ pub(crate) fn workspace_records(
             coverage: ChangeCoverage::Unavailable,
         })
         .collect();
-    records.sort_by(|left, right| left.change_ref.cmp(&right.change_ref));
+    records.sort_by_cached_key(|record| {
+        (
+            record.path.clone(),
+            serde_json::to_vec(&record.change_ref).expect("change references serialize"),
+        )
+    });
     (records, observation, warnings)
 }
 
@@ -902,7 +925,7 @@ fn compatible_change(record: &ChangeRecord, tool_ref: &ToolRef, change: &StoredF
 fn tool_observation(records: &[ChangeRecord], scan_observation: &str, complete: bool) -> String {
     let observations = records
         .iter()
-        .map(|record| (record.change_ref.as_str(), record.coverage))
+        .map(|record| (&record.change_ref, record.coverage))
         .collect::<Vec<_>>();
     let bytes = serde_json::to_vec(&(scan_observation, complete, observations))
         .expect("serializing change observations cannot fail");

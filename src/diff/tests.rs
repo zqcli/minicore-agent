@@ -379,7 +379,12 @@ fn a_cancelled_worker_stops_before_any_comparison() {
 fn page_base(tool_ref: Option<ToolRef>) -> DiffResult {
     DiffResult {
         versions_refreshed: false,
-        change_ref: format!("tool:{}", "a".repeat(64)),
+        change_ref: ChangeRef::Tool {
+            tool_ref: tool_ref
+                .clone()
+                .unwrap_or_else(|| self::tool_ref(session())),
+            revision: "a".repeat(64),
+        },
         path: "value.txt".to_owned(),
         kind: ChangeKind::Modified,
         origin: ChangeOrigin::Tool,

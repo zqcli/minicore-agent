@@ -1,4 +1,3 @@
-use super::observer::StateObserver;
 use super::*;
 
 pub(super) struct ActiveLoop {
@@ -8,12 +7,11 @@ pub(super) struct ActiveLoop {
     pub(super) input: QueueItem,
     pub(super) handle: LoopHandle,
     pub(super) completion: watch::Receiver<Option<TurnCompletion>>,
-    pub(super) task: Arc<SessionTask>,
+    pub(super) task: Arc<OwnedTask>,
     pub(super) execution_summary: Option<BoundedText>,
     pub(super) execution_history: Arc<[HistoryItem]>,
     pub(super) boundary: Arc<RequestBoundary>,
     pub(super) generation: u64,
-    pub(super) _observer: StateObserver,
 }
 
 pub(super) struct FinishedTurn {
@@ -35,41 +33,6 @@ pub(crate) struct ExecutionInput {
     pub(crate) request: LoopRequest,
     pub(crate) options: LoopOptions,
     pub(crate) summary: Option<BoundedText>,
-}
-
-/// Everything a successor installation needs from the finished turn it
-/// replaces, so that installing the successor and publishing its predecessor's
-/// completion happen in one protected transition.
-pub(super) struct Successor<'a> {
-    pub(super) turn: TurnRef,
-    pub(super) task: &'a Arc<SessionTask>,
-    pub(super) completion: &'a mut CompletionGuard,
-    pub(super) publish: &'a mut dyn FnMut(&mut SessionInner, StartedTurn) -> Arc<TurnResult>,
-}
-
-/// Owns one Agent worker without taking its JoinHandle into a local across an
-/// await. If a join future is cancelled, the handle remains in this object so
-/// a later close or cleanup call can join the same worker. One worker runs
-/// every turn of a busy period.
-pub(super) struct SessionTask {
-    pub(super) join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl SessionTask {
-    pub(super) fn empty() -> Self {
-        Self {
-            join: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    /// Stores the worker's handle; nothing else has seen this task yet.
-    pub(super) fn set(&self, handle: JoinHandle<()>) {
-        *self.join.try_lock().expect("a fresh task is unshared") = Some(handle);
-    }
-
-    pub(super) async fn join(&self) -> Result<(), AgentError> {
-        join_task(&self.join).await
-    }
 }
 
 pub(super) struct CompletionGuard {
@@ -94,7 +57,7 @@ impl CompletionGuard {
             return;
         }
         let publication = self.session.shared.results.publication();
-        let (released, queue) = {
+        let released = {
             let mut inner = self.session.lock_inner();
             inner.blocked = Some(SessionBlockReason::Internal);
             let mut queue = self.session.lock_queue();
@@ -114,7 +77,6 @@ impl CompletionGuard {
                 persistence_uncertain: false,
                 availability: ResultAvailability::Unavailable,
                 unavailable_reason: Some(UnavailableReason::InternalError),
-                next_loop_id: None,
                 after_saved_loop_id: inner.last_saved,
             };
             let released = self
@@ -123,21 +85,15 @@ impl CompletionGuard {
                 .results
                 .insert(self.session.load(), entry, None);
             self.sender.send_replace(Some(TurnCompletion::Internal));
-            (released, queue.view())
+            released
         };
         drop(publication);
         drop(released);
-        self.session.shared.events.try_send(AgentEvent::InputQueue {
-            queue,
-            meta: EventMeta::session(self.session.session_id(), self.session.load()),
-        });
         self.session.mark_dirty();
         self.armed = false;
     }
 
     pub(super) fn publish_finished(&mut self, result: Arc<TurnResult>) {
-        #[cfg(feature = "e2e-observe")]
-        crate::e2e_observe::report_refs(&result, "completion_publish");
         self.sender.send_replace(Some(TurnCompletion::Finished {
             result,
             #[cfg(feature = "e2e-observe")]
@@ -188,7 +144,7 @@ pub(super) struct LoopRun {
 
 /// The single Agent-owned task per busy period: runs one turn after another
 /// while the input queue supplies successors.
-async fn run_driver(session: Session, task: Arc<SessionTask>, mut run: LoopRun) {
+async fn run_driver(session: Session, task: Arc<OwnedTask>, mut run: LoopRun) {
     while let Some(next) = run_turn(&session, &task, run).await {
         run = next;
     }
@@ -197,24 +153,13 @@ async fn run_driver(session: Session, task: Arc<SessionTask>, mut run: LoopRun) 
 /// Forwards runtime events, joins the loop, persists the report, merges
 /// sanitized history, and publishes the Agent-level completion. Returns the
 /// successor turn the queue started, already installed.
-async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> Option<LoopRun> {
+async fn run_turn(session: &Session, task: &Arc<OwnedTask>, run: LoopRun) -> Option<LoopRun> {
     let LoopRun {
         turn,
         agent_loop,
         events,
         mut completion,
     } = run;
-    let observer = {
-        let inner = session.lock_inner();
-        Arc::clone(
-            &inner
-                .active
-                .as_ref()
-                .expect("installed loop")
-                ._observer
-                .task,
-        )
-    };
     let _ephemeral_cleanup = EphemeralSummaryCleanup {
         state: Arc::clone(&session.shared.compaction),
         loop_id: turn.loop_id,
@@ -248,34 +193,21 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
         session.query_cancellation(),
     )
     .await;
-    let (persistence, uncertain, persisted_interrupted) =
-        persist_report(session, turn, &stored, &sanitized).await;
-    let eligible = persistence == TurnPersistence::Persisted
-        && report.outcome == minicore_runtime::LoopOutcome::Completed;
-    let result = |next| {
-        Arc::new(TurnResult {
-            turn,
-            report: Arc::clone(&report),
-            persistence,
-            interrupted: persisted_interrupted.clone(),
-            next,
-        })
-    };
-    // A successor projects the history, so the finished turn settles first;
-    // otherwise waiters are released before settlement.
+    let (persistence, uncertain) = persist_report(session, turn, &stored, &sanitized).await;
+    let result = Arc::new(TurnResult {
+        turn,
+        outcome: LoopOutcomeView::from_report(&report),
+        usage: report.usage,
+        requests: report.requests,
+        tool_rounds: report.tool_rounds,
+        final_config_revision: report.final_config_revision,
+        persistence,
+    });
     let (source, unavailable) = if persistence == TurnPersistence::Failed {
         let catalog = Arc::clone(&session.shared.results);
         let items = Arc::clone(&sanitized);
         let interrupted = stored.interrupted;
-        let metadata = crate::event::TurnResultView {
-            turn,
-            outcome: LoopOutcomeView::from_report(&report),
-            usage: report.usage,
-            requests: report.requests,
-            tool_rounds: report.tool_rounds,
-            final_config_revision: report.final_config_revision,
-            persistence,
-        };
+        let metadata = result.as_ref().clone();
         let load = session.load();
         match tokio::task::spawn_blocking(
             move || -> Result<Result<ReservedSource, UnavailableReason>, AgentError> {
@@ -301,43 +233,14 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
     } else {
         (None, None)
     };
-    let mut source = source;
-    let mut settled = false;
-    let (result, next) = loop {
-        match session.close_turn(
-            turn,
-            task,
-            &mut completion,
-            eligible,
-            settled,
-            &result,
-            &mut source,
-            unavailable,
-            uncertain,
-        ) {
-            Close::Settle => {
-                finish_tail(session, turn, persistence, &report).await;
-                settled = true;
-            }
-            Close::Done { result, run } => break (result, run),
-        }
-    };
-    let _ = observer.join().await;
-    // Remain in the owned task so close/shutdown still join auxiliary writes.
-    if !settled {
-        finish_tail(session, turn, persistence, &report).await;
-    }
-
-    session.shared.events.try_send(AgentEvent::TurnFinished {
-        turn,
-        outcome: LoopOutcomeView::from_report(&report),
-        persistence,
-        next: result.next.clone(),
-        queue: session.queue(),
-        meta: EventMeta::for_turn(turn, session.load()),
-    });
-    session.mark_dirty();
-    next
+    let continue_period =
+        session.complete_turn(&mut completion, result, source, unavailable, uncertain);
+    // Waiters see the terminal result before auxiliary writes; a successor
+    // needs their settled projection, and close still joins this same driver.
+    finish_tail(session, turn, persistence, &report).await;
+    continue_period
+        .then(|| session.start_successor(turn, task))
+        .flatten()
 }
 
 async fn finish_tail(
@@ -358,6 +261,13 @@ async fn join_runtime_loop(
     agent_loop: AgentLoop,
     mut events: minicore_runtime::LoopEventStream,
 ) -> Result<Arc<LoopReport>, AgentError> {
+    let mut state = agent_loop.handle().watch_state();
+    #[cfg(feature = "e2e-observe")]
+    let observed = crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::Watchers, 1);
+    #[cfg(test)]
+    tests::pause_worker(&PAUSE_OBSERVER_INITIAL, turn.session_id).await;
+    state.borrow_and_update();
+    session.mark_dirty();
     let join = agent_loop.join();
     tokio::pin!(join);
     #[cfg(feature = "e2e-observe")]
@@ -374,10 +284,16 @@ async fn join_runtime_loop(
     let mut events_open = true;
     #[cfg(feature = "e2e-observe")]
     let mut events_open = dropped_tail.is_none();
+    let mut state_open = true;
     let result = loop {
         tokio::select! {
             biased;
             result = &mut join => break result,
+            changed = state.changed(), if state_open => {
+                state.borrow_and_update();
+                state_open = changed.is_ok();
+                session.mark_dirty();
+            }
             envelope = events.recv(), if events_open => {
                 match envelope {
                     Some(envelope) => forward_loop_event(turn.session_id, envelope, session),
@@ -386,10 +302,16 @@ async fn join_runtime_loop(
             }
         }
     };
+    // Join can win over the final watch update. Runtime completion is still
+    // Agent finishing until persistence and the completion catalog publish.
+    session.mark_dirty();
+    drop(state);
+    #[cfg(feature = "e2e-observe")]
+    drop(observed);
     // Runtime join means the producer is finished. Drain only envelopes that
     // are already queued; waiting for channel closure here would add an
     // unnecessary completion dependency. This also accounts for a queued
-    // `Finished` envelope without mapping it to Agent `TurnFinished`.
+    // `Finished` envelope without emitting a second control notification.
     #[cfg(feature = "e2e-observe")]
     let mut discarded_events = 0usize;
     while let Ok(envelope) = events.try_recv() {
@@ -470,7 +392,7 @@ async fn persist_report(
     turn: TurnRef,
     stored: &StoredLoopRecord,
     sanitized: &[HistoryItem],
-) -> (TurnPersistence, bool, Option<InterruptedRequest>) {
+) -> (TurnPersistence, bool) {
     // The same per-session IO lock serializes this metadata touch with
     // rename and settings updates; each write starts from current record state.
     let _io = session.shared.io.lock().await;
@@ -480,7 +402,7 @@ async fn persist_report(
         .append_loop(turn.session_id, stored)
         .await
     {
-        Ok(kept_metadata) => {
+        Ok(_) => {
             let history = Arc::clone(&session.shared.inner.lock().unwrap().history);
             let mut merged = Vec::with_capacity(history.len() + sanitized.len());
             merged.extend(history.iter().cloned());
@@ -508,11 +430,7 @@ async fn persist_report(
             }
             session.presentation().clear_user_times();
             touch_updated_at_best_effort(session).await;
-            (
-                TurnPersistence::Persisted,
-                false,
-                kept_metadata.then(|| stored.interrupted.clone()).flatten(),
-            )
+            (TurnPersistence::Persisted, false)
         }
         Err(error) => {
             tracing::warn!(
@@ -527,11 +445,7 @@ async fn persist_report(
                 inner.blocked = Some(SessionBlockReason::Persistence);
                 inner.uncertain_loop = Some(turn.loop_id);
             }
-            (
-                TurnPersistence::Failed,
-                uncertain,
-                stored.interrupted.clone(),
-            )
+            (TurnPersistence::Failed, uncertain)
         }
     }
 }
@@ -633,11 +547,7 @@ pub(crate) async fn await_turn_completion(
         _observed,
     } = receiver;
     match await_completion(receiver).await? {
-        TurnCompletion::Finished { result, .. } => {
-            #[cfg(feature = "e2e-observe")]
-            crate::e2e_observe::report_refs(&result, "wait_return_external_arc");
-            Ok(result)
-        }
+        TurnCompletion::Finished { result, .. } => Ok(result),
         TurnCompletion::Internal => Err(AgentError::Internal),
     }
 }
@@ -667,6 +577,115 @@ fn map_answer_error(error: AnswerError) -> AgentError {
 }
 
 impl Session {
+    fn complete_turn(
+        &self,
+        completion: &mut CompletionGuard,
+        result: Arc<TurnResult>,
+        source: Option<ReservedSource>,
+        unavailable: Option<UnavailableReason>,
+        uncertain: bool,
+    ) -> bool {
+        let publication = self.shared.results.publication();
+        let (released, continue_period) = {
+            let mut inner = self.lock_inner();
+            let mut queue = self.lock_queue();
+            let eligible = result.persistence == TurnPersistence::Persisted
+                && result.outcome == LoopOutcomeView::Completed;
+            let continue_period = eligible && !inner.closing && queue.head().is_some();
+            if !continue_period {
+                queue.paused |= !eligible && !queue.items.is_empty();
+                queue.end_period();
+            }
+            let outcome = match result.outcome {
+                LoopOutcomeView::Completed => CompletionOutcome::Completed,
+                LoopOutcomeView::Cancelled { .. } => CompletionOutcome::Cancelled,
+                LoopOutcomeView::Failed { .. } => CompletionOutcome::Failed,
+                LoopOutcomeView::Unknown => CompletionOutcome::Unknown,
+            };
+            let entry = CompletionEntry {
+                seq: 0,
+                loop_id: result.turn.loop_id,
+                input_id: inner.active.as_ref().map(|active| active.input.id.clone()),
+                completion_kind: CompletionKind::Reported,
+                outcome_kind: Some(outcome),
+                persistence: Some(result.persistence),
+                persistence_uncertain: uncertain,
+                availability: if result.persistence == TurnPersistence::Persisted {
+                    ResultAvailability::Stored
+                } else if source.is_some() {
+                    ResultAvailability::Live
+                } else {
+                    ResultAvailability::Unavailable
+                },
+                unavailable_reason: unavailable,
+                after_saved_loop_id: inner.last_saved,
+            };
+            let released = self.shared.results.insert(self.load(), entry, source);
+            if result.persistence == TurnPersistence::Persisted {
+                inner.last_saved = Some(result.turn.loop_id);
+            }
+            completion.publish_finished(result);
+            (released, continue_period)
+        };
+        drop(publication);
+        drop(released);
+        continue_period
+    }
+
+    fn start_successor(&self, turn: TurnRef, task: &Arc<OwnedTask>) -> Option<LoopRun> {
+        let claim = {
+            let inner = self.lock_inner();
+            let mut queue = self.lock_queue();
+            let head = if inner.closing {
+                queue.paused |= !queue.items.is_empty();
+                None
+            } else {
+                match queue.start_head() {
+                    Ok(head) => head,
+                    Err(_) => {
+                        queue.paused = true;
+                        None
+                    }
+                }
+            };
+            let Some(head) = head else {
+                queue.end_period();
+                self.mark_dirty();
+                return None;
+            };
+            self.mark_dirty();
+            Claim::new(self, head)
+        };
+        let boundary = RequestBoundary::new();
+        let started = self
+            .execution_config(claim.entry().input.clone(), claim.generation, &boundary)
+            .and_then(|execution| {
+                self.install_loop_with_boundary(
+                    execution,
+                    boundary,
+                    claim.entry(),
+                    claim.generation,
+                    Some((turn, task)),
+                )
+            });
+        match started {
+            Ok(run) => {
+                claim.started();
+                #[cfg(test)]
+                if let Some(gate) = PAUSE_AFTER_SUCCESSOR_INSTALL.take(&turn.session_id) {
+                    tokio::task::block_in_place(|| gate.pass_blocking());
+                }
+                run
+            }
+            Err(error) => {
+                tracing::warn!(session_id = %turn.session_id, error = ?error,
+                    "queued input could not start after the turn");
+                claim.failed();
+                None
+            }
+        }
+    }
+
     pub(super) fn bind_execution_config(
         &self,
         config: ExecutionConfig,
@@ -750,15 +769,11 @@ impl Session {
         boundary: Arc<RequestBoundary>,
         entry: &Entry,
         generation: u64,
-        successor: Option<Successor<'_>>,
-    ) -> Result<(StartedTurn, Option<LoopRun>), AgentError> {
-        let mut successor = successor;
-        let publication = successor
-            .as_ref()
-            .map(|_| self.shared.results.publication());
-        let (started, run, evicted_waiter) = {
+        successor: Option<(TurnRef, &Arc<OwnedTask>)>,
+    ) -> Result<Option<LoopRun>, AgentError> {
+        let (turn, run, evicted_waiter) = {
             let mut inner = self.lock_inner();
-            Self::validate_install_state(&inner, successor.as_ref().map(|item| item.turn))?;
+            Self::validate_install_state(&inner, successor.map(|(turn, _)| turn))?;
             #[cfg(test)]
             if FAIL_RUNTIME_START.hit(&inner.record.session_id) {
                 return Err(AgentError::Internal);
@@ -797,10 +812,6 @@ impl Session {
             };
             #[cfg(feature = "e2e-observe")]
             crate::e2e_observe::installed(turn, self.load(), &entry.item().id);
-            let started = StartedTurn {
-                turn,
-                input: entry.item(),
-            };
             inputs.bind(turn);
             #[cfg(test)]
             INSTALLED_LOOP_OPTIONS.arm(turn.loop_id, captured_options);
@@ -812,10 +823,10 @@ impl Session {
                 events,
                 completion: CompletionGuard::new(self.clone(), turn, completion_tx),
             };
-            let (task, run) = match successor.as_ref() {
-                Some(item) => (Arc::clone(item.task), Some(run)),
+            let (task, run) = match successor {
+                Some((_, task)) => (Arc::clone(task), Some(run)),
                 None => {
-                    let task = Arc::new(SessionTask::empty());
+                    let task = Arc::new(OwnedTask::default());
                     task.set(tokio::spawn(run_driver(
                         self.clone(),
                         Arc::clone(&task),
@@ -824,11 +835,7 @@ impl Session {
                     (task, None)
                 }
             };
-            let predecessor_result = successor
-                .as_mut()
-                .map(|item| (item.publish)(&mut inner, started.clone()));
             self.lock_queue().starting = None;
-            let state_rx = handle.watch_state();
             let previous = inner.active.replace(ActiveLoop {
                 #[cfg(feature = "e2e-observe")]
                 _observed: crate::e2e_observe::Lease::new(crate::e2e_observe::Gauge::Active, 1),
@@ -841,7 +848,6 @@ impl Session {
                 execution_history,
                 boundary,
                 generation,
-                _observer: StateObserver::spawn(self, turn.loop_id, state_rx, completion_rx),
             });
             let mut evicted_waiter = None;
             if let Some(previous) = previous {
@@ -858,24 +864,19 @@ impl Session {
                     evicted_waiter = inner.finished.pop_front();
                 }
             }
-            if let (Some(item), Some(result)) = (successor.as_mut(), predecessor_result) {
-                item.completion.publish_finished(result);
-            }
             inner
                 .presentation
                 .bind_started_loop(turn.loop_id, entry.accepted_at());
             self.mark_dirty();
-            (started, run, evicted_waiter)
+            (turn, run, evicted_waiter)
         };
-        drop(publication);
         drop(evicted_waiter);
-        let turn = started.turn;
         tracing::info!(
             session_id = %turn.session_id,
             loop_id = %turn.loop_id,
             "turn submitted"
         );
-        Ok((started, run))
+        Ok(run)
     }
 
     fn validate_install_state(
@@ -903,7 +904,7 @@ impl Session {
         Ok(())
     }
 
-    pub(super) fn clear_active_task(inner: &mut SessionInner, task: &Arc<SessionTask>) {
+    pub(super) fn clear_active_task(inner: &mut SessionInner, task: &Arc<OwnedTask>) {
         if inner
             .active
             .as_ref()
@@ -962,18 +963,8 @@ impl Session {
     /// been persisted before this resolves.
     pub(crate) fn wait_receiver(&self, turn: TurnRef) -> Result<TurnWaitReceiver, AgentError> {
         let inner = self.lock_inner();
-        let receiver = inner
-            .active
-            .as_ref()
-            .filter(|active| active.turn == turn)
-            .map(|active| active.completion.clone())
-            .or_else(|| {
-                inner
-                    .finished
-                    .iter()
-                    .find(|finished| finished.turn == turn)
-                    .map(|finished| finished.completion.clone())
-            })
+        let receiver = Self::completion_receiver(&inner, turn)
+            .cloned()
             .ok_or(AgentError::TurnNotFound)?;
         #[cfg(feature = "e2e-observe")]
         let receiver = TurnWaitReceiver {
@@ -983,18 +974,36 @@ impl Session {
         Ok(receiver)
     }
 
-    pub(crate) fn turn_result_snapshot(
-        &self,
+    fn completion_receiver(
+        inner: &SessionInner,
         turn: TurnRef,
-    ) -> Result<Option<Option<Arc<TurnResult>>>, AgentError> {
+    ) -> Option<&watch::Receiver<Option<TurnCompletion>>> {
+        inner
+            .active
+            .as_ref()
+            .filter(|active| active.turn == turn)
+            .map(|active| &active.completion)
+            .or_else(|| {
+                inner
+                    .finished
+                    .iter()
+                    .find(|finished| finished.turn == turn)
+                    .map(|finished| &finished.completion)
+            })
+    }
+
+    pub(crate) fn is_turn_pending(&self, turn: TurnRef) -> bool {
+        self.lock_inner()
+            .active
+            .as_ref()
+            .is_some_and(|active| active.turn == turn && active.completion.borrow().is_none())
+    }
+
+    pub(crate) fn completed_turn(&self, turn: TurnRef) -> Option<Arc<TurnResult>> {
         let inner = self.lock_inner();
-        let Some(active) = inner.active.as_ref().filter(|active| active.turn == turn) else {
-            return Ok(None);
-        };
-        match active.completion.borrow().as_ref() {
-            None => Ok(Some(None)),
-            Some(TurnCompletion::Finished { result, .. }) => Ok(Some(Some(Arc::clone(result)))),
-            Some(TurnCompletion::Internal) => Err(AgentError::Internal),
+        match Self::completion_receiver(&inner, turn)?.borrow().as_ref() {
+            Some(TurnCompletion::Finished { result, .. }) => Some(Arc::clone(result)),
+            _ => None,
         }
     }
 

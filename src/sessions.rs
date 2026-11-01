@@ -34,11 +34,11 @@ use crate::event::{
     AgentEvent, AgentEventSink, CancelReasonView, EventMeta, LoopOutcomeView, ModelErrorView,
     OutputChannel, ToolProgressView, ToolResultView,
 };
-use crate::history::{GetHistory, HistoryPage, normalize_history, page_history};
+use crate::history::normalize_history;
 use crate::ids::{LoadId, SessionId};
 use crate::prompt::ProjectPromptProvider;
-use crate::read::InterruptedRequest;
 use crate::store::{Store, StoredLoopOutcome, StoredLoopRecord, SummaryCommit, utc_timestamp};
+use crate::task::OwnedTask;
 use crate::tool_data::ToolData;
 use crate::tools::command::ToolOwners;
 use crate::tools::observe::ToolObserver;
@@ -51,7 +51,6 @@ mod compact;
 mod events;
 pub(crate) mod hub;
 mod inputs;
-mod observer;
 mod registry;
 pub(crate) mod results;
 mod status_workers;
@@ -61,17 +60,17 @@ mod types;
 use active_loop::EphemeralSummaryCleanup;
 #[cfg(test)]
 pub(crate) use active_loop::TurnWaitReceiver;
-use active_loop::{ActiveLoop, CompletionGuard, FinishedTurn, LoopRun, SessionTask, Successor};
-pub(crate) use active_loop::{TurnCompletion, await_compaction_completion, await_turn_completion};
+use active_loop::{ActiveLoop, FinishedTurn};
+pub(crate) use active_loop::{await_compaction_completion, await_turn_completion};
 pub(crate) use boundary::RequestBoundary;
 pub(crate) use events::forward_loop_event;
 pub(crate) use hub::SnapshotHub;
 #[cfg(test)]
 pub(crate) use inputs::MAX_QUEUED_INPUTS;
-use inputs::{Close, Entry, QueueState, SessionInputs};
+use inputs::{Claim, Entry, QueueState, SessionInputs};
 pub use inputs::{
     DeliveredInput, InputMode, InputPushed, InputRemoved, InputStartError, InputsRecalled,
-    InputsResumed, PushInput, Queue, QueueItem, RemoveInput, StartedTurn,
+    InputsResumed, PushInput, Queue, QueueItem, RemoveInput,
 };
 pub(crate) use registry::Sessions;
 pub(crate) use results::PreparedSource;
@@ -84,8 +83,8 @@ pub use results::{
 use status_workers::StatusWorkers;
 pub use types::{
     CompactionPhase, CompactionProgress, ContextBudget, SessionBlockReason, SessionContext,
-    SessionExecution, SessionSnapshot, SessionState, SessionStatus, SnapshotInteraction,
-    SummaryCoverage, TurnPersistence, TurnRef, TurnResult,
+    SessionExecution, SessionSnapshot, SnapshotInteraction, SummaryCoverage, TurnPersistence,
+    TurnRef, TurnResult,
 };
 
 #[cfg(test)]
@@ -223,16 +222,6 @@ fn frozen_tool_specs(
     config.tools().specs_for(&enabled)
 }
 
-async fn join_task(join: &tokio::sync::Mutex<Option<JoinHandle<()>>>) -> Result<(), AgentError> {
-    let mut slot = join.lock().await;
-    let Some(handle) = slot.as_mut() else {
-        return Ok(());
-    };
-    let result = std::pin::Pin::new(handle).await;
-    slot.take();
-    result.map_err(|_| AgentError::Internal)
-}
-
 pub(crate) struct CompactionAdmission {
     session: Session,
     operation: Arc<CompactionOperation>,
@@ -262,16 +251,14 @@ struct CompactionOperation {
     operation_id: String,
     cancellation: CancellationToken,
     result: watch::Sender<Option<CompactionCompletion>>,
-    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    task: OwnedTask,
     state: AtomicU8,
 }
 
-/// A manual compaction's final result and the turn the Agent started from the
-/// input queue when it ended.
+/// A manual compaction's final result.
 #[derive(Clone, Debug)]
 pub(crate) struct CompactionCompletion {
     pub(crate) result: CompactionResult,
-    pub(crate) next: Option<StartedTurn>,
 }
 
 const COMPACTION_RUNNING: u8 = 0;
@@ -456,64 +443,26 @@ impl Session {
         SessionInfo::from_record(&self.lock_inner().record, loaded)
     }
 
-    pub(crate) fn state(&self) -> SessionState {
-        self.sample().expect("snapshot revision overflow").0
-    }
-
-    pub(crate) fn sample(&self) -> Result<(SessionState, SessionSnapshot), AgentError> {
+    pub(crate) fn sample(&self) -> Result<SessionSnapshot, AgentError> {
         #[cfg(feature = "e2e-observe")]
         let observed_start = crate::e2e_observe::clock();
-        let _publication = self.shared.results.publication();
+        let publication = self.shared.results.publication();
         let mut inner = self.lock_inner();
         if inner.closed {
             return Err(AgentError::StaleLoad);
         }
         let queue = self.lock_queue();
-        let completion = inner
+        let active = inner
             .active
             .as_ref()
-            .and_then(|active| active.completion.borrow().clone());
-        let active_loop = inner
-            .active
-            .as_ref()
-            .filter(|_| completion.is_none())
-            .map(|active| active.handle.state());
-        let status = match (&inner.blocked, &inner.active) {
-            (Some(_), _) => SessionStatus::Blocked,
-            (None, None) => SessionStatus::Idle,
-            (None, Some(active)) => {
-                // Agent-level completion published: the turn is done even
-                // though the loop task is still being reaped.
-                if active.completion.borrow().is_some() {
-                    SessionStatus::Idle
-                } else {
-                    match active_loop.as_ref().expect("unfinished active loop").status {
-                        minicore_runtime::LoopStatus::Starting
-                        | minicore_runtime::LoopStatus::RunningModel
-                        | minicore_runtime::LoopStatus::RunningTools => SessionStatus::Running,
-                        minicore_runtime::LoopStatus::WaitingForInput => {
-                            SessionStatus::WaitingForInput
-                        }
-                        minicore_runtime::LoopStatus::Finishing
-                        | minicore_runtime::LoopStatus::Finished => SessionStatus::Finishing,
-                        _ => SessionStatus::Unknown,
-                    }
-                }
-            }
-        };
-        let state = SessionState {
-            session_id: inner.record.session_id,
-            status,
-            active_loop,
-            block_reason: inner.blocked,
-            compaction: inner.compaction_progress.clone(),
-        };
+            .filter(|active| active.completion.borrow().is_none());
+        let runtime = active.map(|active| active.handle.state());
         let execution = if let Some(entry) = &queue.starting {
             SessionExecution::Starting {
                 input: entry.item(),
             }
-        } else if let Some(active) = inner.active.as_ref().filter(|_| completion.is_none()) {
-            let runtime = state.active_loop.as_ref().expect("unfinished active loop");
+        } else if let Some(active) = active {
+            let runtime = runtime.as_ref().expect("unfinished active loop");
             match runtime.status {
                 minicore_runtime::LoopStatus::Finishing
                 | minicore_runtime::LoopStatus::Finished => SessionExecution::Finishing {
@@ -525,13 +474,13 @@ impl Session {
                     loop_id: active.turn.loop_id,
                     input: active.input.clone(),
                     request_index: runtime.request_index,
-                    phase: crate::event::LoopStateView::from_runtime(runtime).status,
+                    phase: runtime.status.into(),
                 },
             }
         } else {
             SessionExecution::None
         };
-        let pending_interaction = state.active_loop.as_ref().and_then(|runtime| {
+        let pending_interaction = runtime.as_ref().and_then(|runtime| {
             runtime
                 .pending_interaction
                 .as_ref()
@@ -544,24 +493,22 @@ impl Session {
         let completions = self.shared.results.window(self.load());
         inner.revision = inner.revision.checked_add(1).ok_or(AgentError::Internal)?;
         let snapshot = SessionSnapshot {
-            session_id: state.session_id,
+            session_id: self.session_id(),
             load: self.load(),
             revision: inner.revision,
             execution,
             pending_interaction,
             queue: queue.view(),
-            compaction: state.compaction.clone(),
-            block_reason: state.block_reason,
+            compaction: inner.compaction_progress.clone(),
+            block_reason: inner.blocked,
             completions,
         };
+        drop(queue);
+        drop(inner);
+        drop(publication);
         #[cfg(feature = "e2e-observe")]
-        {
-            drop(queue);
-            drop(inner);
-            drop(_publication);
-            crate::e2e_observe::sample(&snapshot, observed_start);
-        }
-        Ok((state, snapshot))
+        crate::e2e_observe::sample(&snapshot, observed_start);
+        Ok(snapshot)
     }
 
     pub(crate) fn read_snapshot(&self) -> ReadSnapshot {
@@ -571,17 +518,6 @@ impl Session {
             history: Arc::clone(&inner.history),
             user_times: Arc::clone(&inner.user_times),
         }
-    }
-
-    pub(crate) fn history(&self, request: &GetHistory) -> Result<HistoryPage, AgentError> {
-        request.validate()?;
-        let inner = self.lock_inner();
-        Ok(page_history(
-            &inner.history,
-            request.offset,
-            request.limit,
-            &inner.user_times,
-        ))
     }
 
     pub(crate) fn presentation(&self) -> Arc<crate::presentation::Presentation> {
@@ -754,14 +690,10 @@ impl Session {
     /// Joins all owned work after `begin_shutdown` has stopped new admission.
     pub(crate) async fn join_shutdown(self) -> Result<(), AgentError> {
         let session_id = self.session_id();
-        let (active_task, observer, compaction) = {
+        let (active_task, compaction) = {
             let inner = self.lock_inner();
             (
                 inner.active.as_ref().map(|active| active.task.clone()),
-                inner
-                    .active
-                    .as_ref()
-                    .map(|active| Arc::clone(&active._observer.task)),
                 inner.compaction.clone(),
             )
         };
@@ -772,12 +704,6 @@ impl Session {
             }
             let mut inner = self.lock_inner();
             Self::clear_active_task(&mut inner, &task);
-        }
-        if let Some(observer) = observer
-            && observer.join().await.is_err()
-            && first_error.is_none()
-        {
-            first_error = Some(AgentError::Internal);
         }
         if let Some(compaction) = compaction {
             if compaction.join().await.is_err() && first_error.is_none() {

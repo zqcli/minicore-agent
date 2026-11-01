@@ -670,9 +670,12 @@ async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
     let turn = send_text(&mut agent, info.session_id, "block").await;
     let result = wait_text(&agent, turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
-    assert_eq!(
-        agent.session_state(info.session_id).unwrap().status,
-        crate::sessions::SessionStatus::Blocked
+    assert!(
+        agent
+            .session_state(info.session_id)
+            .unwrap()
+            .block_reason
+            .is_some()
     );
     let history_path = data_dir
         .join("sessions")
@@ -689,9 +692,12 @@ async fn reload_preserves_a_blocked_session_without_unblocking_or_persisting() {
     agent
         .reload_settings_with_models(candidate, candidate_models)
         .unwrap();
-    assert_eq!(
-        agent.session_state(info.session_id).unwrap().status,
-        crate::sessions::SessionStatus::Blocked
+    assert!(
+        agent
+            .session_state(info.session_id)
+            .unwrap()
+            .block_reason
+            .is_some()
     );
     assert_eq!(std::fs::read(&history_path).unwrap(), history_before);
     assert!(matches!(

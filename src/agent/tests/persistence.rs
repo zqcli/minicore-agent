@@ -15,19 +15,19 @@ async fn panicked_agent_worker_publishes_internal_and_blocks_session() {
     assert!(matches!(result, Err(AgentError::Internal)));
 
     let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
+    assert!(state.block_reason.is_some());
     assert_eq!(
         state.block_reason,
         Some(crate::sessions::SessionBlockReason::Internal)
     );
-    assert!(state.active_loop.is_none());
+    assert_eq!(state.execution, crate::SessionExecution::None);
 
     let error = agent
         .send_for_test(info.session_id, "after panic".to_owned())
         .await;
     assert!(matches!(error, Err(AgentError::SessionBlocked)));
     let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
+    assert!(state.block_reason.is_some());
     let close = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         agent.close_session(info.session_id),
@@ -92,10 +92,7 @@ async fn next_send_cleans_up_finished_turn_without_explicit_wait() {
     wait_until(
         std::time::Duration::from_secs(2),
         "first turn must reach Idle",
-        || {
-            agent.session_state(info.session_id).unwrap().status
-                == crate::sessions::SessionStatus::Idle
-        },
+        || agent.session_state(info.session_id).unwrap().execution == crate::SessionExecution::None,
     )
     .await;
     // Send again after Agent-level completion, without waiting for the first turn.
@@ -116,17 +113,7 @@ async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
     let first = send_text(&mut agent, info.session_id, "rolled back").await;
     let result = wait_text(&agent, first).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
-    assert_eq!(
-        agent
-            .history(GetHistory {
-                session_id: info.session_id,
-                offset: 0,
-                limit: 100
-            })
-            .unwrap()
-            .total,
-        0
-    );
+    assert_eq!(history_page(&agent, info.session_id, 100).await.total, 0);
     assert!(
         agent
             .session_state(info.session_id)
@@ -137,18 +124,11 @@ async fn rolled_back_append_keeps_history_unchanged_and_allows_the_next_turn() {
     let second = send_text(&mut agent, info.session_id, "keep this").await;
     let result = wait_text(&agent, second).await;
     assert_persisted(&result);
-    let expected = result.report.appended.len();
+    let expected = history_page(&agent, info.session_id, 100).await.total;
     agent.close_session(info.session_id).await.unwrap();
     agent.open_session(info.session_id).await.unwrap();
     assert_eq!(
-        agent
-            .history(GetHistory {
-                session_id: info.session_id,
-                offset: 0,
-                limit: 100
-            })
-            .unwrap()
-            .total,
+        history_page(&agent, info.session_id, 100).await.total,
         expected
     );
     agent.close_session(info.session_id).await.unwrap();
@@ -168,12 +148,12 @@ async fn append_failure_blocks_session_and_returns_failed_persistence() {
     assert_completed(&result);
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
     // History was not merged into memory.
-    let page = history_page(&agent, info.session_id, 100);
+    let page = history_page(&agent, info.session_id, 100).await;
     assert_eq!(page.total, 0);
 
     // Session is blocked: further sends and updates are refused.
     let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Blocked);
+    assert!(state.block_reason.is_some());
     assert_eq!(
         state.block_reason,
         Some(crate::sessions::SessionBlockReason::Persistence)
@@ -200,8 +180,11 @@ async fn blocked_send_does_not_discard_previous_turn_result() {
         std::time::Duration::from_secs(2),
         "session must reach Blocked",
         || {
-            agent.session_state(info.session_id).unwrap().status
-                == crate::sessions::SessionStatus::Blocked
+            agent
+                .session_state(info.session_id)
+                .unwrap()
+                .block_reason
+                .is_some()
         },
     )
     .await;
@@ -258,7 +241,7 @@ async fn close_and_reopen_recovers_from_blocked_session() {
     agent.close_session(info.session_id).await.unwrap();
     let opened = agent.open_session(info.session_id).await.unwrap();
     let state = agent.session_state(opened.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Idle);
+    assert_eq!(state.execution, crate::SessionExecution::None);
     assert!(state.block_reason.is_none());
 
     let turn = send_text(&mut agent, info.session_id, "after recovery").await;
@@ -278,6 +261,6 @@ async fn metadata_write_failure_does_not_fail_the_turn() {
     let result = wait_text(&agent, turn).await;
     assert_persisted(&result);
     // History merged even though session.json updated_at write failed.
-    let page = history_page(&agent, info.session_id, 100);
+    let page = history_page(&agent, info.session_id, 100).await;
     assert_eq!(page.total, 2);
 }

@@ -66,16 +66,11 @@ fn tool_execution_event(
 
 fn extract_loop_id(event: &minicore_runtime::LoopEvent) -> Option<LoopId> {
     match event {
-        minicore_runtime::LoopEvent::Started { loop_id }
-        | minicore_runtime::LoopEvent::RequestStarted { loop_id, .. }
+        minicore_runtime::LoopEvent::RequestStarted { loop_id, .. }
         | minicore_runtime::LoopEvent::OutputDelta { loop_id, .. }
         | minicore_runtime::LoopEvent::ToolStarted { loop_id, .. }
         | minicore_runtime::LoopEvent::ToolProgress { loop_id, .. }
-        | minicore_runtime::LoopEvent::ToolFinished { loop_id, .. }
-        | minicore_runtime::LoopEvent::InteractionRequested { loop_id, .. }
-        | minicore_runtime::LoopEvent::InteractionResolved { loop_id, .. }
-        | minicore_runtime::LoopEvent::Finished { loop_id, .. } => Some(*loop_id),
-        minicore_runtime::LoopEvent::StateChanged { state } => Some(state.loop_id),
+        | minicore_runtime::LoopEvent::ToolFinished { loop_id, .. } => Some(*loop_id),
         _ => None,
     }
 }
@@ -97,10 +92,6 @@ fn map_loop_event(
         dropped_before: 0,
     };
     match event {
-        minicore_runtime::LoopEvent::Started { .. } => Some(AgentEvent::TurnStarted { turn, meta }),
-        // Runtime control changes are projected by the reliable snapshot; the
-        // best-effort compatibility notification carries no authority.
-        minicore_runtime::LoopEvent::StateChanged { .. } => None,
         minicore_runtime::LoopEvent::RequestStarted {
             config_revision,
             model,
@@ -214,26 +205,6 @@ fn map_loop_event(
                 meta,
             })
         }
-        minicore_runtime::LoopEvent::InteractionRequested { interaction, .. } => {
-            // `awaiting_policy` is recorded by the policy wrapper from the
-            // exact ToolRef; the best-effort interaction event is not used to
-            // guess which call is waiting.
-            Some(AgentEvent::InteractionRequested {
-                turn,
-                interaction: (&interaction).into(),
-                meta,
-            })
-        }
-        minicore_runtime::LoopEvent::InteractionResolved { interaction_id, .. } => {
-            Some(AgentEvent::InteractionResolved {
-                turn,
-                interaction_id,
-                meta,
-            })
-        }
-        // Runtime Finished is not an Agent TurnFinished: JSONL persistence and
-        // history merge have not happened yet. Its drops were already recorded.
-        minicore_runtime::LoopEvent::Finished { .. } => None,
         _ => None,
     }
 }

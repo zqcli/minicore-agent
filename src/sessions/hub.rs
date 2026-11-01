@@ -304,7 +304,7 @@ impl SnapshotHub {
             return true;
         };
         let prepared = tokio::task::spawn_blocking(move || {
-            let (state, snapshot) = session.sample()?;
+            let snapshot = session.sample()?;
             #[cfg(feature = "e2e-observe")]
             charge.observe(&snapshot);
             let session_id = session.session_id();
@@ -322,10 +322,10 @@ impl SnapshotHub {
                 return Err(crate::AgentError::Internal);
             }
             charge.shrink(2 * bytes + 4096 + crate::rpc::WRITER_BUFFER_BYTES);
-            Ok((state, event, charge))
+            Ok((event, charge))
         })
         .await;
-        let (state, event, charge) = match prepared {
+        let (event, charge) = match prepared {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(crate::AgentError::StaleLoad)) => return true,
             _ => {
@@ -333,16 +333,6 @@ impl SnapshotHub {
                 return false;
             }
         };
-        // Compatibility notifications have no control authority.
-        self.events.try_send(AgentEvent::SessionState {
-            meta: EventMeta {
-                session_id: state.session_id,
-                load,
-                loop_id: state.active_loop.as_ref().map(|active| active.loop_id),
-                dropped_before: 0,
-            },
-            state,
-        });
         self.events
             .send_snapshot(event, charge, &self.stopped)
             .await

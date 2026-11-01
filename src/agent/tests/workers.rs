@@ -445,8 +445,10 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(&agent, turn).await;
     assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled {
+            reason: crate::event::CancelReasonView::User
+        }
     );
     assert_persisted(&result);
 

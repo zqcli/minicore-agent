@@ -146,7 +146,7 @@ async fn slow_close_allows_other_turn_cancellation_and_shutdown_waits_for_it() {
             .await;
     }
     let _ = harness.response(json!("first")).await;
-    let second_turn = harness.response(json!("second")).await["result"]["started"]["turn"].clone();
+    let second_turn = harness.accepted_turn(json!("second")).await;
     tokio::time::timeout(TIMEOUT, gate.wait_started())
         .await
         .unwrap();
@@ -208,7 +208,7 @@ async fn answers_after_completion_report_turn_not_found() {
             Some(json!({"session_id":session,"mode": "steer", "text":"finish"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;

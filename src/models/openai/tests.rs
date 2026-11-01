@@ -27,10 +27,10 @@ impl minicore_runtime::LoopInputs for NoInputs {
 }
 use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::event::{AgentEvent, OutputChannel};
-use crate::history::{GetHistory, HistoryItemView};
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
 use crate::sessions::TurnRef;
+use minicore_runtime::history::HistoryItem;
 
 use super::*;
 
@@ -466,10 +466,7 @@ async fn runtime_completes_before_deadline_when_terminal_http_body_never_ends() 
     let result = result
         .expect("terminal response waited for the HTTP body")
         .unwrap();
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_eq!(result.outcome, crate::event::LoopOutcomeView::Completed);
     assert_eq!(
         result.persistence,
         crate::sessions::TurnPersistence::Persisted
@@ -2638,21 +2635,16 @@ async fn real_agent_loop_uses_mock_openai_then_read_tool_then_final_model() {
         .await
         .unwrap();
     let result = agent.wait_turn(turn).await.unwrap();
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_eq!(result.outcome, crate::event::LoopOutcomeView::Completed);
     assert_eq!(
         result.persistence,
         crate::sessions::TurnPersistence::Persisted
     );
     let history = agent
-        .history(GetHistory {
-            session_id: session.session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
+        .loaded_session(session.session_id)
+        .unwrap()
+        .read_snapshot()
+        .history;
     let serialized = serde_json::to_string(&history).unwrap();
     assert!(serialized.contains("REAL-READ-CONTENT"));
     assert!(serialized.contains("read complete"));
@@ -2795,7 +2787,7 @@ const LIVE_SMOKE_TOKEN: &str = "MINICORE_TUI_SMOKE_7F42";
 
 struct LiveToolEvidence {
     turn: TurnRef,
-    outcome: minicore_runtime::LoopOutcome,
+    outcome: crate::event::LoopOutcomeView,
     report_usage: Usage,
     session_reasoning: ReasoningPreference,
     assistant_rounds: usize,
@@ -2831,44 +2823,48 @@ async fn run_live_reasoning_tool(
         .await
         .map_err(|_| "live reasoning/tool Turn timed out")?
         .map_err(|_| "live reasoning/tool Turn wait failed")?;
-    let report = &result.report;
-    let page = agent
-        .history(GetHistory {
-            session_id: session.session_id,
-            offset: 0,
-            limit: 32,
-        })
-        .map_err(|_| "live History read failed")?;
+    let history = agent
+        .loaded_session(session.session_id)
+        .ok_or("live Session lookup failed")?
+        .read_snapshot()
+        .history;
 
     let mut assistant_rounds = 0;
     let mut assistant_usages = Vec::new();
     let mut saw_read_call = false;
     let mut successful_read_with_token = false;
     let mut final_text_with_token = false;
-    for item in &page.items {
-        match &item.item {
-            HistoryItemView::Assistant(view) => {
+    for item in history.iter() {
+        match item {
+            HistoryItem::Assistant(view) => {
                 assistant_rounds += 1;
                 assistant_usages.push(view.usage);
-                saw_read_call |= view.tool_calls.iter().any(|call| call.name == "read");
-                if view.tool_calls.is_empty() && view.text.contains(LIVE_SMOKE_TOKEN) {
-                    final_text_with_token = true;
+                let mut has_tool = false;
+                for part in view.content.iter() {
+                    if let Some(call) = part.as_tool_call() {
+                        has_tool = true;
+                        saw_read_call |= call.name().as_str() == "read";
+                    }
                 }
+                final_text_with_token |= !has_tool && view.content.iter().any(|part| {
+                    matches!(part, AssistantPart::Text(text) if text.contains(LIVE_SMOKE_TOKEN))
+                });
             }
-            HistoryItemView::ToolResult(view)
-                if view.tool_name == "read"
+            HistoryItem::ToolResult(view)
+                if view.tool_name.as_str() == "read"
                     && view.outcome == ToolResultOutcome::Success
-                    && view.content.contains(LIVE_SMOKE_TOKEN) =>
+                    && view.output.content().as_str().contains(LIVE_SMOKE_TOKEN) =>
             {
                 successful_read_with_token = true;
             }
             _ => {}
         }
     }
+
     Ok(LiveToolEvidence {
         turn,
-        outcome: report.outcome.clone(),
-        report_usage: report.usage,
+        outcome: result.outcome.clone(),
+        report_usage: result.usage,
         session_reasoning: session.reasoning,
         assistant_rounds,
         assistant_usages,
@@ -2994,7 +2990,7 @@ async fn openai_live_reasoning_tool_smoke() {
     assert_eq!(evidence.session_reasoning, live.reasoning);
     assert_eq!(
         evidence.outcome,
-        minicore_runtime::LoopOutcome::Completed,
+        crate::event::LoopOutcomeView::Completed,
         "live reasoning/tool Turn failed; requested reasoning is not downgraded"
     );
     assert_live_usage(&evidence.report_usage);

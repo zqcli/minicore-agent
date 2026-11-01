@@ -15,7 +15,7 @@ impl CompactionOperation {
             operation_id,
             cancellation: CancellationToken::new(),
             result,
-            join: tokio::sync::Mutex::new(None),
+            task: OwnedTask::default(),
             state: AtomicU8::new(COMPACTION_RUNNING),
         })
     }
@@ -107,13 +107,13 @@ impl CompactionOperation {
         }
     }
 
-    fn publish(&self, result: CompactionResult, next: Option<StartedTurn>) {
+    fn publish(&self, result: CompactionResult) {
         self.result
-            .send_replace(Some(CompactionCompletion { result, next }));
+            .send_replace(Some(CompactionCompletion { result }));
     }
 
     pub(super) async fn join(&self) -> Result<(), AgentError> {
-        join_task(&self.join).await
+        self.task.join().await
     }
 }
 
@@ -271,6 +271,9 @@ impl Session {
             return Err(AgentError::InvalidState);
         }
         Self::check_compaction_admissible(&inner)?;
+        if self.lock_queue().running {
+            return Err(AgentError::SessionBusy);
+        }
         if inner.used_compaction_ids.len() >= MAX_USED_COMPACTION_IDS {
             return Err(AgentError::InvalidInput);
         }
@@ -328,12 +331,7 @@ impl Session {
         self.cleanup_finished().await?;
         let _io = self.shared.io.lock().await;
 
-        // Acquire the operation's join slot before publishing the reservation.
-        // From the point where the Session becomes busy to the point where the
-        // spawned task is stored, there is no further await at which the only
-        // JoinHandle could be dropped and detached.
-        let mut join_slot = operation.join.lock().await;
-        let reservation = {
+        {
             let mut inner = self.lock_inner();
             if inner.blocked.is_some() {
                 return Err(AgentError::SessionBlocked);
@@ -362,7 +360,7 @@ impl Session {
                 covered_item_count: previous_covered_item_count,
                 retained_item_count,
             });
-            CompactionReservation {
+            let reservation = CompactionReservation {
                 operation: Arc::clone(operation),
                 model,
                 record: inner.record.clone(),
@@ -375,12 +373,13 @@ impl Session {
                 deadline: Instant::now()
                     .checked_add(inner.options.model_timeout)
                     .unwrap_or_else(Instant::now),
-            }
-        };
+            };
+            // Joiners cannot observe the operation before its handle is owned.
+            operation
+                .task
+                .set(tokio::spawn(run_compaction(self.clone(), reservation)));
+        }
         drop(_io);
-        let task = tokio::spawn(run_compaction(self.clone(), reservation));
-        *join_slot = Some(task);
-        drop(join_slot);
         self.mark_dirty();
         Ok(receiver)
     }
@@ -479,9 +478,8 @@ impl Session {
             inner.last_compaction_result = Some(result.clone());
             (result, should_emit)
         };
-        // The head starts before any waiter learns that the compaction ended.
-        let next = self.start_after_compaction();
-        operation.publish(result, next);
+        self.start_after_compaction();
+        operation.publish(result);
         if should_emit {
             self.mark_dirty();
         }

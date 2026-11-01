@@ -1,4 +1,5 @@
 use crate::support::config;
+use crate::support::control::{first_tool_ref, read_items};
 use crate::support::fixture::Fixture;
 use crate::support::openai_mock;
 use crate::support::responses::{completed, text_response, turn_params};
@@ -93,8 +94,8 @@ async fn history(process: &mut RpcProcess, id: &str, session_id: &Value) -> Valu
     process
         .send(
             id,
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": session_id, "view": "display", "limit": 100}),
         )
         .await;
     process.response(id).await["result"].clone()
@@ -104,12 +105,7 @@ async fn state(process: &mut RpcProcess, id: &str, session_id: &Value) -> Value 
     process
         .send(id, "session.state", json!({"session_id": session_id}))
         .await;
-    process.response(id).await["result"].clone()
-}
-
-fn event_for_turn(frame: &Value, turn: &Value) -> bool {
-    frame.pointer("/params/data/turn/session_id") == Some(&turn["session_id"])
-        && frame.pointer("/params/data/turn/loop_id") == Some(&turn["loop_id"])
+    process.response(id).await["result"]["snapshot"].clone()
 }
 
 fn assert_error(response: &Value, code: i64, kind: &str) {
@@ -178,12 +174,11 @@ async fn tui_discovery_create_history_and_reopen_flow() {
                 json!({"session_id": session_id, "mode": "steer", "text": "first prompt"}),
             )
             .await;
-        let turn = process.response("send1").await["result"]["started"]["turn"].clone();
+        let turn = process.accepted_turn("send1").await;
         process.send("wait1", "turn.wait", turn_params(&turn)).await;
         (turn, "wait1")
     };
-    let started = process.event("turn_started").await;
-    assert!(event_for_turn(&started, &first_turn));
+    assert_eq!(first_turn["session_id"], session_id);
     let waited = process.response(first_wait).await;
     assert_eq!(waited["result"]["outcome"]["type"], "completed");
     assert_eq!(waited["result"]["persistence"], "persisted");
@@ -191,9 +186,7 @@ async fn tui_discovery_create_history_and_reopen_flow() {
     let page = history(&mut process, "history2", &session_id).await;
     assert_eq!(page["total"], 2);
     assert!(
-        page["items"]
-            .as_array()
-            .unwrap()
+        read_items(&page)
             .iter()
             .any(|item| item["item"]["type"] == "user")
     );
@@ -206,7 +199,7 @@ async fn tui_discovery_create_history_and_reopen_flow() {
             json!({"session_id": session_id, "mode": "steer", "text": "second prompt"}),
         )
         .await;
-    let second_turn = process.response("send2").await["result"]["started"]["turn"].clone();
+    let second_turn = process.accepted_turn("send2").await;
     assert_ne!(second_turn["loop_id"], first_turn["loop_id"]);
     process
         .send("wait2", "turn.wait", turn_params(&second_turn))
@@ -262,7 +255,7 @@ async fn tui_push_update_cancel_while_wait_is_pending() {
             json!({"session_id": session_id, "mode": "steer", "text": "do the thing"}),
         )
         .await;
-    let turn = process.response("send").await["result"]["started"]["turn"].clone();
+    let turn = process.accepted_turn("send").await;
     process.send("wait", "turn.wait", turn_params(&turn)).await;
 
     // The loop is running; the reader stays responsive.
@@ -282,11 +275,11 @@ async fn tui_push_update_cancel_while_wait_is_pending() {
         )
         .await;
     let steered = process.response("steer").await;
-    assert!(steered["result"]["started"].is_null());
-    assert_eq!(
-        steered["result"]["queue"]["items"][0]["text"],
-        "do not touch config files"
-    );
+    let queue = process
+        .call_ok("input.list", json!({"session_id": session_id}))
+        .await;
+    assert_eq!(queue["items"][0]["id"], steered["result"]["id"]);
+    assert_eq!(queue["items"][0]["text"], "do not touch config files");
 
     // Session model/reasoning update while wait is pending.
     process
@@ -301,7 +294,7 @@ async fn tui_push_update_cancel_while_wait_is_pending() {
     assert_eq!(updated["result"]["session"]["reasoning"], "low");
 
     let running = state(&mut process, "state", &session_id).await;
-    assert_eq!(running["status"], "running");
+    assert_eq!(running["execution"]["type"], "running");
 
     // Cancel while wait is pending.
     process
@@ -325,9 +318,9 @@ async fn tui_push_update_cancel_while_wait_is_pending() {
             json!({"session_id": session_id, "mode": "steer", "text": "next task"}),
         )
         .await;
-    let started2 = process.response("send2").await["result"]["started"].clone();
-    assert_eq!(started2["input"]["text"], "do not touch config files");
-    let turn2 = started2["turn"].clone();
+    let accepted = process.response("send2").await;
+    assert_eq!(accepted["result"]["accepted"], true);
+    let turn2 = process.turn_for_input(&steered["result"]).await;
     process
         .send("wait2", "turn.wait", turn_params(&turn2))
         .await;
@@ -341,7 +334,7 @@ async fn tui_push_update_cancel_while_wait_is_pending() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tui_queued_follow_up_starts_as_the_wait_results_next_turn() {
+async fn tui_discovers_queued_follow_up_from_control_snapshot() {
     let (gated, gate) = gated_sse(vec![
         json!({"type": "response.output_text.delta", "delta": "first answer"}),
         completed(),
@@ -364,7 +357,7 @@ async fn tui_queued_follow_up_starts_as_the_wait_results_next_turn() {
             json!({"session_id": session_id, "mode": "steer", "text": "start"}),
         )
         .await;
-    let turn = process.response("first").await["result"]["started"]["turn"].clone();
+    let turn = process.accepted_turn("first").await;
     process.send("wait", "turn.wait", turn_params(&turn)).await;
 
     process
@@ -375,21 +368,19 @@ async fn tui_queued_follow_up_starts_as_the_wait_results_next_turn() {
         )
         .await;
     let queued = process.response("later").await;
-    assert!(queued["result"]["started"].is_null());
-    assert_eq!(queued["result"]["queue"]["items"][0]["text"], "then this");
+    let queue = process
+        .call_ok("input.list", json!({"session_id": session_id}))
+        .await;
+    assert_eq!(queue["items"][0]["id"], queued["result"]["id"]);
     gate.release();
 
     let waited = process.response("wait").await;
     assert_eq!(waited["result"]["outcome"]["type"], "completed");
-    let next = waited["result"]["next"].clone();
-    assert_eq!(next["input"]["id"], queued["result"]["id"]);
-    assert_eq!(waited["result"]["queue"]["items"], json!([]));
-    process
-        .send("wait2", "turn.wait", turn_params(&next["turn"]))
-        .await;
+    let next = process.turn_for_input(&queued["result"]).await;
+    process.send("wait2", "turn.wait", turn_params(&next)).await;
     let second = process.response("wait2").await;
     assert_eq!(second["result"]["outcome"]["type"], "completed");
-    assert!(second["result"]["next"].is_null());
+    assert!(second["result"].get("next").is_none());
 
     process.shutdown().await;
     server.finish().await;
@@ -420,7 +411,7 @@ async fn tui_streams_reasoning_and_text_channels() {
             json!({"session_id": session_id, "mode": "steer", "text": "reason out loud"}),
         )
         .await;
-    let turn = process.response("send").await["result"]["started"]["turn"].clone();
+    let turn = process.accepted_turn("send").await;
     process.send("wait", "turn.wait", turn_params(&turn)).await;
 
     // Streaming deltas are best-effort; the exact text is asserted via the
@@ -437,9 +428,10 @@ async fn tui_streams_reasoning_and_text_channels() {
             "unexpected delta {channel}={value}"
         );
     }
-    let finished = process.event("turn_finished").await;
-    assert!(event_for_turn(&finished, &turn));
-    assert_eq!(finished["params"]["data"]["persistence"], "persisted");
+    let snapshot = state(&mut process, "completed-state", &session_id).await;
+    assert!(snapshot["completions"]["entries"].as_array().unwrap().iter().any(|entry|
+        entry["loop_id"] == turn["loop_id"] && entry["persistence"] == "persisted"
+    ));
 
     let page = history(&mut process, "history", &session_id).await;
     assert!(page.to_string().contains("final answer text"));
@@ -478,7 +470,7 @@ async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
             json!({"session_id": session_id, "mode": "steer", "text": "read the file"}),
         )
         .await;
-    let turn = process.response("send").await["result"]["started"]["turn"].clone();
+    let turn = process.accepted_turn("send").await;
     process.send("wait", "turn.wait", turn_params(&turn)).await;
     let tool_started = process.event("tool_started").await;
     assert_eq!(tool_started["params"]["data"]["tool_name"], "read");
@@ -492,15 +484,14 @@ async fn tui_tool_loop_shows_lifecycle_and_safe_history() {
 
     let page = history(&mut process, "history", &session_id).await;
     let serialized = page.to_string();
-    assert!(serialized.contains("TOOL-CONTENT-TOKEN"));
+    let output = process.tool_output_text(first_tool_ref(&page)).await;
+    assert!(output.contains("TOOL-CONTENT-TOKEN"));
     assert!(!serialized.contains("arguments"));
     // The path is an explicitly permitted local-display detail, while the
     // raw invocation field is still absent.
     assert!(serialized.contains("SECRET-PATH.txt"));
     assert!(!serialized.contains("\"path\""));
-    let tool_result_count = page["items"]
-        .as_array()
-        .unwrap()
+    let tool_result_count = read_items(&page)
         .iter()
         .filter(|item| item["item"]["type"] == "tool_result")
         .count();
@@ -538,8 +529,7 @@ async fn tui_two_sessions_run_independently() {
                 json!({"session_id": session["session_id"], "mode": "steer", "text": prompt}),
             )
             .await;
-        let turn =
-            process.response(&format!("send-{id}")).await["result"]["started"]["turn"].clone();
+        let turn = process.accepted_turn(&format!("send-{id}")).await;
         let wait_id = format!("wait-{id}");
         process
             .send(&wait_id, "turn.wait", turn_params(&turn))
@@ -580,14 +570,14 @@ async fn tui_error_mappings_cover_new_wire_types() {
     process
         .send(
             "bad-history",
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 0}),
+            "session.read",
+            json!({"session_id": session_id, "limit": 0}),
         )
         .await;
     assert_error(
         &process.response("bad-history").await,
-        -32603,
-        "internal_error",
+        -32602,
+        "invalid_params",
     );
 
     process

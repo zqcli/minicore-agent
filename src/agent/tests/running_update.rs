@@ -83,9 +83,9 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
     // Single turn / loop identity preserved.
     assert_eq!(result.turn.loop_id, turn.loop_id);
     assert_completed(&result);
-    assert_eq!(result.report.requests, 2);
-    assert_eq!(result.report.tool_rounds, 1);
-    assert_eq!(result.report.final_config_revision, active_revision);
+    assert_eq!(result.requests, 2);
+    assert_eq!(result.tool_rounds, 1);
+    assert_eq!(result.final_config_revision, active_revision);
     assert_persisted(&result);
 
     // Both models were called exactly once in this single loop.
@@ -140,14 +140,12 @@ async fn running_model_update_applies_to_next_request_in_same_loop() {
         "Request 1 must produce final text from Model B"
     );
 
-    let page = history_page(&agent, info.session_id, 100);
+    let page = history_page(&agent, info.session_id, 100).await;
     assert_eq!(page.total, 4);
-    let crate::history::HistoryItemView::Assistant(ref final_view) = page.items[3].item else {
-        panic!("expected AssistantHistoryView at index 3");
-    };
-    assert_eq!(final_view.model, "other");
-    assert_eq!(final_view.request_index, 1);
-    assert_eq!(final_view.text, "from model b");
+    let final_view: serde_json::Value = serde_json::from_str(&page.items[3].data).unwrap();
+    assert_eq!(final_view["item"]["data"]["model"], "other");
+    assert_eq!(final_view["item"]["data"]["request_index"], 1);
+    assert!(page.items[3].data.contains("from model b"));
 
     agent.close_session(info.session_id).await.unwrap();
     agent.shutdown().await.unwrap();

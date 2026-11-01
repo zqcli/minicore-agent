@@ -2,16 +2,44 @@
 use super::super::*;
 use super::ledger::is_valid_temp_name;
 use super::validate::{stored_blobs, validate_stored_tool_record};
+use crate::tool_data::{StoredToolRead, ToolDataStream, ToolReadPayload, ToolReadScope};
 
 impl Store {
-    pub(crate) async fn read_tool_record_with_deadline(
+    pub(crate) async fn read_tool_source(
         &self,
         tool_ref: &ToolRef,
+        scope: ToolReadScope,
         deadline: Instant,
-    ) -> Result<Option<ToolRecord>, StoreError> {
-        self.read_tool_record_details(tool_ref, deadline)
-            .await
-            .map(|loaded| loaded.map(|loaded| loaded.record))
+    ) -> Result<Option<StoredToolRead>, StoreError> {
+        tokio::time::timeout_at(deadline.into(), async {
+            let Some((directory, metadata)) = self.read_tool_metadata(tool_ref).await? else {
+                return Ok(None);
+            };
+            let blobs = stored_blobs(&metadata);
+            let read = |index: usize| {
+                let (name, bytes, hash) = blobs[index];
+                let path = directory.join(name);
+                async move { read_blob(&path, bytes, hash).await }
+            };
+            let payload = match scope {
+                ToolReadScope::Summary => ToolReadPayload::Summary {
+                    input: read(0).await,
+                    result: read(1).await,
+                },
+                ToolReadScope::Stream(stream) => ToolReadPayload::Stream(
+                    read(match stream {
+                        ToolDataStream::Input => 0,
+                        ToolDataStream::Output => 1,
+                        ToolDataStream::Stdout => 2,
+                        ToolDataStream::Stderr => 3,
+                    })
+                    .await,
+                ),
+            };
+            Ok(Some(StoredToolRead { metadata, payload }))
+        })
+        .await
+        .map_err(|_| StoreError::QueryLimit)?
     }
 
     /// Lists only persisted file-change metadata for one Session or loop.
@@ -342,18 +370,6 @@ impl Store {
         Ok(value.is_some() && !corrupt)
     }
 
-    pub(super) async fn read_tool_record_details(
-        &self,
-        tool_ref: &ToolRef,
-        deadline: Instant,
-    ) -> Result<Option<ReadToolRecord>, StoreError> {
-        match tokio::time::timeout_at(deadline.into(), self.read_tool_record_inner(tool_ref)).await
-        {
-            Ok(res) => res,
-            Err(_) => Err(StoreError::Unavailable),
-        }
-    }
-
     /// Reads only one retained record's bounded before/after snapshots. It
     /// deliberately skips the larger input/result/stream blobs, so a cold
     /// `changes.diff` never clones an unrelated tool output.
@@ -415,12 +431,11 @@ impl Store {
         )))
     }
 
-    async fn read_tool_record_inner(
+    pub(in crate::store) async fn read_tool_metadata(
         &self,
         tool_ref: &ToolRef,
-    ) -> Result<Option<ReadToolRecord>, StoreError> {
+    ) -> Result<Option<(PathBuf, StoredToolRecord)>, StoreError> {
         self.require_sessions_root().await?;
-
         let session_dir = self.session_directory(tool_ref.session_id);
         if !real_dir_opt(&session_dir).await? {
             return Err(StoreError::SessionNotFound);
@@ -429,50 +444,15 @@ impl Store {
         if !real_dir_opt(&tools_dir).await? {
             return Ok(None);
         }
-        let target_dir = tools_dir.join(tool_ref_hash(tool_ref));
-        if !real_dir_opt(&target_dir).await? {
+        let directory = tools_dir.join(tool_ref_hash(tool_ref));
+        if !real_dir_opt(&directory).await? {
             return Ok(None);
         }
-
-        let Some(stored) = load_tool_metadata(&target_dir.join(TOOL_RECORD_FILE)).await? else {
+        let Some(metadata) = load_tool_metadata(&directory.join(TOOL_RECORD_FILE)).await? else {
             return Ok(None);
         };
-
-        validate_stored_tool_record(&stored, tool_ref)?;
-
-        let mut blobs = std::array::from_fn::<_, 4, _>(|_| (None, false));
-        for (slot, (name, bytes, sha)) in blobs.iter_mut().zip(stored_blobs(&stored)) {
-            *slot = read_blob(&target_dir.join(name), bytes, sha).await;
-        }
-        let [input, result, stdout, stderr] = blobs;
-
-        let (file_change_before, file_change_before_corrupt) = match &stored.file_change {
-            Some(change) => {
-                read_change_blob(&target_dir.join(TOOL_BEFORE_FILE), &change.before).await
-            }
-            None => (None, false),
-        };
-        let (file_change_after, file_change_after_corrupt) = match &stored.file_change {
-            Some(change) => {
-                read_change_blob(&target_dir.join(TOOL_AFTER_FILE), &change.after).await
-            }
-            None => (None, false),
-        };
-
-        let record = ToolRecord::from_stored(
-            stored.clone(),
-            input,
-            result,
-            stdout,
-            stderr,
-            (file_change_before, file_change_before_corrupt),
-            (file_change_after, file_change_after_corrupt),
-        );
-
-        Ok(Some(ReadToolRecord {
-            metadata: stored,
-            record,
-        }))
+        validate_stored_tool_record(&metadata, tool_ref)?;
+        Ok(Some((directory, metadata)))
     }
 }
 
@@ -571,7 +551,7 @@ pub(super) async fn load_tool_metadata(
     serde_json::from_slice(&bytes).map(Some).map_err(corrupt)
 }
 
-async fn read_blob(
+pub(super) async fn read_blob(
     path: &Path,
     expected_bytes: usize,
     expected_sha256: Option<&str>,
@@ -579,6 +559,8 @@ async fn read_blob(
     if expected_bytes == 0 {
         return (None, false);
     }
+    #[cfg(test)]
+    tests::note_tool_blob(path);
     let expected_hash = expected_sha256.expect("validated nonempty blob has a digest");
     let Ok(file) = safe_open_read(path).await else {
         return (None, true);

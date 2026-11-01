@@ -1,6 +1,6 @@
 //! Bounded, read-only review diffs for one retained native Tool change.
 //!
-//! One query resolves a `tool:` change reference to its retained `FileChange`,
+//! One query resolves a structured tool change reference to its retained `FileChange`,
 //! compares the actual before/after snapshots with a bounded line diff, and
 //! pages the structured result by raw UTF-8 byte offsets. It never writes
 //! History, calls a model, mutates a file, or runs an external diff program.
@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::budget::{check_budget, encoded_len, encoded_result};
 use crate::changes::{
-    ChangeCommitState, ChangeCoverage, ChangeKind, ChangeOrigin, ChangeRevision, FileChange,
-    stored_tool_change_ref, tool_change_ref,
+    ChangeCommitState, ChangeCoverage, ChangeKind, ChangeOrigin, ChangeRef, ChangeRevision,
+    FileChange, tool_change_ref,
 };
 use crate::error::AgentError;
 use crate::error::StoreError;
@@ -42,7 +42,6 @@ const DEFAULT_DIFF_MAX_BYTES: usize = 64 * 1024;
 /// rejection rather than a page that could never continue.
 const MIN_DIFF_MAX_BYTES: usize = 2048;
 const MAX_DIFF_MAX_BYTES: usize = 256 * 1024;
-const MAX_CHANGE_REF_BYTES: usize = 16384;
 
 pub(crate) fn diff_deadline() -> Instant {
     Instant::now()
@@ -114,7 +113,7 @@ pub struct DiffHunk {
 #[serde(deny_unknown_fields)]
 pub struct DiffCursor {
     pub session_id: SessionId,
-    pub change_ref: String,
+    pub change_ref: ChangeRef,
     pub ops_fingerprint: String,
     pub context_lines: usize,
     pub hunk_index: usize,
@@ -126,7 +125,7 @@ pub struct DiffCursor {
 #[serde(deny_unknown_fields)]
 pub struct ChangesDiffRequest {
     pub session_id: SessionId,
-    pub change_ref: String,
+    pub change_ref: ChangeRef,
     #[serde(default)]
     pub comparison: Option<DiffComparison>,
     #[serde(default)]
@@ -139,21 +138,9 @@ pub struct ChangesDiffRequest {
 
 impl ChangesDiffRequest {
     pub fn validate(&self) -> Result<(), AgentError> {
-        if self.change_ref.is_empty() || self.change_ref.len() > MAX_CHANGE_REF_BYTES {
-            return Err(AgentError::InvalidArguments);
-        }
-        let well_formed = self
-            .change_ref
-            .strip_prefix("tool:")
-            .is_some_and(valid_sha256)
-            || crate::changes::parse_workspace_ref(&self.change_ref, self.session_id).is_ok();
-        if !well_formed {
-            return Err(AgentError::InvalidArguments);
-        }
+        self.change_ref.validate(self.session_id)?;
         if self.comparison.is_some_and(|comparison| {
-            (self.change_ref.starts_with("tool:") && comparison != DiffComparison::ToolBeforeAfter)
-                || (self.change_ref.starts_with("workspace:")
-                    && comparison == DiffComparison::ToolBeforeAfter)
+            self.change_ref.is_workspace() == (comparison == DiffComparison::ToolBeforeAfter)
         }) {
             return Err(AgentError::InvalidArguments);
         }
@@ -193,7 +180,7 @@ impl ChangesDiffRequest {
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct DiffResult {
-    pub change_ref: String,
+    pub change_ref: ChangeRef,
     pub path: String,
     pub kind: ChangeKind,
     pub origin: ChangeOrigin,
@@ -535,97 +522,20 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Resolves one `tool:` change reference to its retained `FileChange`.
-///
-/// A warm in-memory change answers without disk I/O when it is complete. A warm
-/// change that lost or corrupted one side is only upgraded from disk when the
-/// disk metadata is byte-identical, and then only the unavailable side is
-/// replaced, so a valid warm half is never overwritten and a different revision
-/// is never substituted. Without usable warm metadata, the same bounded
-/// metadata scan used by `changes.list` locates the record, and only that one
-/// record's snapshots are read.
+/// Reads one addressed tool change, filling only missing sides from matching metadata.
 pub(crate) async fn resolve_tool_change(
     store: &Store,
     warm: Option<&Arc<ToolData>>,
     session_id: SessionId,
-    change_ref: &str,
+    change_ref: &ChangeRef,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Option<(ToolRef, FileChange)>, AgentError> {
-    // Warm candidates are matched on metadata only, so unrelated before/after
-    // buffers are not cloned to discover that they do not match.
-    if let Some(data) = warm {
-        for record in data.file_change_records(session_id, None) {
-            if record.change_ref != change_ref {
-                continue;
-            }
-            let Some(tool_ref) = record.tool_ref else {
-                continue;
-            };
-            if let Some(resolved) = resolve_one(
-                store,
-                warm,
-                session_id,
-                change_ref,
-                &tool_ref,
-                deadline,
-                cancellation,
-            )
-            .await?
-            {
-                return Ok(Some(resolved));
-            }
-        }
-    }
-    let scan = store
-        .list_tool_changes(session_id, None, cancellation, deadline)
-        .await?;
-    for (tool_ref, stored) in &scan.records {
-        if stored_tool_change_ref(tool_ref, stored) != change_ref {
-            continue;
-        }
-        // The scan matched on stored metadata; the second read re-verifies the
-        // change reference under the current bytes. A record that moved under
-        // us, or an unreadable one, is reported as unavailable rather than
-        // substituted. Only a real budget/cancellation failure propagates.
-        match store
-            .read_file_change_snapshots(session_id, tool_ref, deadline, cancellation)
-            .await
-        {
-            Ok(Some(disk)) if tool_change_ref(tool_ref, &disk) == change_ref => {
-                return Ok(Some((tool_ref.clone(), disk)));
-            }
-            Err(StoreError::QueryLimit) => return Err(AgentError::QueryLimit),
-            Ok(_) | Err(_) => {
-                return Ok(Some((
-                    tool_ref.clone(),
-                    FileChange::from_stored(stored.clone(), None, false, None, false),
-                )));
-            }
-        }
-    }
-    // An incomplete scan cannot prove the reference is absent. Reporting
-    // `ToolNotFound` here would be a false negative.
-    if scan.skipped {
-        return Err(AgentError::Store);
-    }
-    Ok(None)
-}
-
-/// Resolves one known `tool_ref`, verifying the change reference before use.
-/// The warm side owns the metadata; a disk read only supplements a missing or
-/// corrupt side under byte-identical stored metadata.
-async fn resolve_one(
-    store: &Store,
-    warm: Option<&Arc<ToolData>>,
-    session_id: SessionId,
-    change_ref: &str,
-    tool_ref: &ToolRef,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<Option<(ToolRef, FileChange)>, AgentError> {
+    let ChangeRef::Tool { tool_ref, .. } = change_ref else {
+        return Err(AgentError::InvalidArguments);
+    };
     if let Some(warm_change) = warm.and_then(|data| data.file_change(tool_ref)) {
-        if tool_change_ref(tool_ref, &warm_change) == change_ref {
+        if &tool_change_ref(tool_ref, &warm_change) == change_ref {
             if warm_change.details_available() {
                 return Ok(Some((tool_ref.clone(), warm_change)));
             }
@@ -655,7 +565,7 @@ async fn resolve_one(
         Err(_) => None,
     };
     match disk {
-        Some(disk) if tool_change_ref(tool_ref, &disk) == change_ref => {
+        Some(disk) if &tool_change_ref(tool_ref, &disk) == change_ref => {
             Ok(Some((tool_ref.clone(), disk)))
         }
         _ => Ok(None),
@@ -691,7 +601,7 @@ pub(crate) async fn changes_diff(
     request.validate()?;
     check_budget(&cancellation, deadline)?;
     let max_bytes = request.max_bytes();
-    if request.change_ref.starts_with("workspace:") {
+    if request.change_ref.is_workspace() {
         return encoded_result(workspace_unavailable(&request), max_bytes);
     }
     let Some((tool_ref, mut change)) = resolve_tool_change(

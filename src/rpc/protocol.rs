@@ -7,10 +7,8 @@ use minicore_runtime::tools::{ApprovalDecision, ToolInputAnswer};
 use minicore_runtime::value::BoundedText;
 use minicore_runtime::{InteractionId, LoopId};
 
-use crate::agent::{Queue, SessionInfo, StartedTurn, TurnRef};
-use crate::compaction::CompactionResult;
-use crate::event::{AgentEvent, TurnResultView};
-use crate::history::GetHistory;
+use crate::agent::{SessionInfo, TurnRef};
+use crate::event::AgentEvent;
 use crate::models::ModelInfo;
 use crate::profiles::ProfileInfo;
 use crate::read::{ReadCursor, TurnResultRequest};
@@ -69,29 +67,25 @@ pub(crate) struct InvalidRequest;
 pub(crate) struct InvalidParams;
 
 pub(crate) fn parse_request(value: Value) -> Result<RpcRequest, InvalidRequest> {
-    let object = value.as_object().ok_or(InvalidRequest)?;
+    let Value::Object(mut object) = value else {
+        return Err(InvalidRequest);
+    };
     if object
         .keys()
         .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+        || object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION)
     {
         return Err(InvalidRequest);
     }
-
-    if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
-        return Err(InvalidRequest);
-    }
-    let method = object
-        .get("method")
-        .and_then(Value::as_str)
-        .filter(|method| !method.is_empty())
-        .ok_or(InvalidRequest)?
-        .to_owned();
+    let method = match object.remove("method") {
+        Some(Value::String(method)) if !method.is_empty() => method,
+        _ => return Err(InvalidRequest),
+    };
     let id = object.get("id").and_then(parse_id).ok_or(InvalidRequest)?;
-
     Ok(RpcRequest {
         id,
         method,
-        params: object.get("params").cloned(),
+        params: object.remove("params"),
     })
 }
 
@@ -137,30 +131,6 @@ pub(crate) struct SessionParams {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SessionHistoryParams {
-    pub(crate) session_id: crate::ids::SessionId,
-    #[serde(default)]
-    pub(crate) offset: usize,
-    #[serde(default = "default_history_limit")]
-    pub(crate) limit: usize,
-}
-
-impl From<SessionHistoryParams> for GetHistory {
-    fn from(value: SessionHistoryParams) -> Self {
-        Self {
-            session_id: value.session_id,
-            offset: value.offset,
-            limit: value.limit,
-        }
-    }
-}
-
-fn default_history_limit() -> usize {
-    100
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct TurnResultParams {
     pub(crate) session_id: crate::ids::SessionId,
     pub(crate) loop_id: LoopId,
@@ -170,10 +140,14 @@ pub(crate) struct TurnResultParams {
     pub(crate) result_id: Option<String>,
     #[serde(default)]
     pub(crate) cursor: Option<ReadCursor>,
-    #[serde(default = "default_history_limit")]
+    #[serde(default = "default_read_limit")]
     pub(crate) limit: usize,
     #[serde(default)]
     pub(crate) max_bytes: Option<usize>,
+}
+
+fn default_read_limit() -> usize {
+    100
 }
 
 impl From<TurnResultParams> for TurnResultRequest {
@@ -338,8 +312,6 @@ pub(crate) struct SessionResult {
 
 #[derive(Serialize)]
 pub(crate) struct SessionStateResult {
-    #[serde(flatten)]
-    pub(crate) state: crate::event::SessionStateView,
     pub(crate) snapshot: crate::sessions::SessionSnapshot,
 }
 
@@ -358,25 +330,6 @@ impl From<crate::agent::SessionUpdateResult> for SessionUpdateResult {
     }
 }
 
-/// The `turn.wait` result: the turn's outcome, the successor the Agent started
-/// from the queue, and the queue after the turn ended.
-#[derive(Serialize)]
-pub(crate) struct TurnWaitResult {
-    #[serde(flatten)]
-    pub(crate) turn: TurnResultView,
-    pub(crate) next: Option<StartedTurn>,
-    pub(crate) queue: Queue,
-}
-
-/// The deferred `session.compact` result plus the turn the Agent started from
-/// the queue when the compaction ended.
-#[derive(Serialize)]
-pub(crate) struct CompactResult {
-    #[serde(flatten)]
-    pub(crate) result: CompactionResult,
-    pub(crate) next: Option<StartedTurn>,
-}
-
 #[derive(Serialize)]
 pub(crate) struct CancelledResult {
     pub(crate) cancelled: bool,
@@ -391,7 +344,7 @@ impl OkResult {
     pub(crate) const TRUE: Self = Self { ok: true };
 }
 
-/// A complete pre-encoded JSON-RPC response frame, serialized exactly once.
+/// A complete pre-encoded JSON-RPC response frame.
 pub(crate) struct RpcResponse(Vec<u8>, Option<crate::sessions::hub::SnapshotCharge>, bool);
 
 #[derive(Serialize)]

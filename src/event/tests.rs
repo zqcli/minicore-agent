@@ -1,7 +1,7 @@
 use super::*;
 
 impl AgentEventStream {
-    /// Probes compatibility/body producer queues without running the publisher.
+    /// Probes lifecycle/body producer queues without running the publisher.
     pub(crate) fn try_recv(&mut self) -> Option<AgentEvent> {
         let event = self
             .lifecycle
@@ -124,19 +124,9 @@ async fn streaming_pressure_cannot_displace_lifecycle_and_drops_follow_delivery(
     assert_eq!(sink.try_send(delta()), AgentSendResult::Sent);
     assert_eq!(sink.try_send(delta()), AgentSendResult::Dropped);
     sink.record_core_drops(3);
-    assert_eq!(
-        sink.try_send(AgentEvent::TurnFinished {
-            turn,
-            outcome: LoopOutcomeView::Completed,
-            persistence: TurnPersistence::Persisted,
-            next: None,
-            queue: crate::sessions::Queue::default(),
-            meta: EventMeta::for_turn(turn, crate::test_support::load_id())
-        }),
-        AgentSendResult::Sent
-    );
+    assert_eq!(sink.try_send(lifecycle_fixture()), AgentSendResult::Sent);
     let terminal = stream.recv().await.unwrap();
-    assert!(matches!(terminal, AgentEvent::TurnFinished { .. }));
+    assert!(matches!(terminal, AgentEvent::SessionClosed { .. }));
     assert_eq!(terminal.meta().dropped_before, 4);
     assert_eq!(sink.try_send(delta()), AgentSendResult::Dropped);
     let queued = stream.recv().await.unwrap();

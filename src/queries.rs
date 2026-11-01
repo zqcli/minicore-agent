@@ -137,7 +137,7 @@ pub(crate) fn prepare_changes_diff(
     cancellation: CancellationToken,
     deadline: Instant,
 ) -> Result<QueryFuture<DiffResult>, AgentError> {
-    if request.change_ref.starts_with("workspace:") {
+    if request.change_ref.is_workspace() {
         let session = loaded.ok_or(AgentError::SessionNotLoaded)?;
         let session_cancel = session.query_cancellation();
         // Registration is synchronous; the Session owns the source worker even
@@ -321,7 +321,7 @@ pub(crate) fn prepare_tool_read(
     request: crate::tool_data::ToolReadRequest,
     cancellation: CancellationToken,
 ) -> QueryFuture<crate::tool_data::ToolReadResult> {
-    Box::pin(crate::read::tool_read(
+    Box::pin(crate::tool_data::tool_read(
         store,
         tool_data,
         request,
@@ -335,7 +335,7 @@ pub(crate) fn prepare_tool_output(
     request: crate::tool_data::ToolOutputRequest,
     cancellation: CancellationToken,
 ) -> QueryFuture<crate::tool_data::ToolOutputPage> {
-    Box::pin(crate::read::tool_output(
+    Box::pin(crate::tool_data::tool_output(
         store,
         tool_data,
         request,

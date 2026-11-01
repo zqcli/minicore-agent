@@ -168,8 +168,8 @@ async fn high_final_usage_waits_until_the_next_turn_to_compact() {
         .await
         .unwrap();
     assert_eq!(
-        agent.wait_turn(first).await.unwrap().report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        agent.wait_turn(first).await.unwrap().outcome,
+        crate::event::LoopOutcomeView::Completed
     );
     let task = session.lock_inner().active.as_ref().unwrap().task.clone();
     task.join().await.unwrap();
@@ -189,8 +189,8 @@ async fn high_final_usage_waits_until_the_next_turn_to_compact() {
         .await
         .unwrap();
     assert_eq!(
-        agent.wait_turn(second).await.unwrap().report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        agent.wait_turn(second).await.unwrap().outcome,
+        crate::event::LoopOutcomeView::Completed
     );
     let task = session.lock_inner().active.as_ref().unwrap().task.clone();
     task.join().await.unwrap();
@@ -206,64 +206,109 @@ async fn high_final_usage_waits_until_the_next_turn_to_compact() {
 
 #[tokio::test]
 async fn turn_wait_does_not_wait_for_projection_settlement() {
-    let (_temp, agent, session, model) = fixture("summary", 8_000).await;
-    let old = LoopId::new().unwrap();
-    let call_id = "read-old".parse().unwrap();
-    append_source(
-        &session,
-        vec![
-            HistoryItem::Assistant(minicore_runtime::history::AssistantHistory {
-                loop_id: old,
-                request_index: 0,
-                model: "main".parse().unwrap(),
-                reasoning: ReasoningPreference::Auto,
-                content: vec![AssistantPart::ToolCall(
-                    minicore_runtime::model::ToolCall::new(
-                        call_id,
-                        "read".parse().unwrap(),
-                        serde_json::json!({"path":"old"}),
-                        0,
-                    )
-                    .unwrap(),
-                )],
-                provider_replay: None,
-                finish_reason: ModelFinishReason::ToolCalls,
-                usage: minicore_runtime::model::Usage::default()
-                    .with_provider_total_tokens(Some(8_000)),
-            }),
-            HistoryItem::ToolResult(minicore_runtime::history::ToolResultHistory {
-                loop_id: old,
-                request_index: 0,
-                call_id: "read-old".parse().unwrap(),
-                tool_name: "read".parse().unwrap(),
-                outcome: minicore_runtime::tools::ToolResultOutcome::Success,
-                output: minicore_runtime::tools::ToolOutput::new("x".repeat(40_000)).unwrap(),
-            }),
-        ],
-        old,
-    )
-    .await;
-    let gate = Arc::new(Gate::new());
-    crate::store::SUMMARY_COMMIT_GATES.arm(session.session_id(), Arc::clone(&gate));
-    let turn = agent
-        .send_for_test(session.session_id(), "continue".into())
+    for queued in [false, true] {
+        let (_temp, agent, session, model) = fixture("summary", 8_000).await;
+        let old = LoopId::new().unwrap();
+        let call_id = "read-old".parse().unwrap();
+        append_source(
+            &session,
+            vec![
+                HistoryItem::Assistant(minicore_runtime::history::AssistantHistory {
+                    loop_id: old,
+                    request_index: 0,
+                    model: "main".parse().unwrap(),
+                    reasoning: ReasoningPreference::Auto,
+                    content: vec![AssistantPart::ToolCall(
+                        minicore_runtime::model::ToolCall::new(
+                            call_id,
+                            "read".parse().unwrap(),
+                            serde_json::json!({"path":"old"}),
+                            0,
+                        )
+                        .unwrap(),
+                    )],
+                    provider_replay: None,
+                    finish_reason: ModelFinishReason::ToolCalls,
+                    usage: minicore_runtime::model::Usage::default()
+                        .with_provider_total_tokens(Some(8_000)),
+                }),
+                HistoryItem::ToolResult(minicore_runtime::history::ToolResultHistory {
+                    loop_id: old,
+                    request_index: 0,
+                    call_id: "read-old".parse().unwrap(),
+                    tool_name: "read".parse().unwrap(),
+                    outcome: minicore_runtime::tools::ToolResultOutcome::Success,
+                    output: minicore_runtime::tools::ToolOutput::new("x".repeat(40_000)).unwrap(),
+                }),
+            ],
+            old,
+        )
+        .await;
+        let gate = Arc::new(Gate::new());
+        crate::store::SUMMARY_COMMIT_GATES.arm(session.session_id(), Arc::clone(&gate));
+        let before_join = Arc::new(Gate::new());
+        PAUSE_BEFORE_JOIN.arm(session.session_id(), Arc::clone(&before_join));
+        let turn = agent
+            .send_for_test(session.session_id(), "continue".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            before_join.wait_started(),
+        )
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
-        .await
-        .unwrap();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(1), agent.wait_turn(turn))
-        .await
-        .expect("wait blocked on settlement")
-        .unwrap();
-    assert_eq!(result.persistence, TurnPersistence::Persisted);
-    assert!(session.shared.compaction.coverage().is_none());
-    gate.release();
-    session.cleanup_finished().await.unwrap();
-    assert_eq!(
-        session.shared.compaction.coverage().unwrap().1,
-        session.lock_inner().history.len()
-    );
-    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
-    agent.shutdown().await.unwrap();
+        if queued {
+            let accepted = session
+                .accept_input(InputMode::FollowUp, "queued before finishing".into())
+                .unwrap();
+            assert!(!accepted.needs_start());
+            accepted.finish();
+        }
+        before_join.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), agent.wait_turn(turn))
+            .await
+            .expect("wait blocked on settlement")
+            .unwrap();
+        assert_eq!(result.persistence, TurnPersistence::Persisted);
+        assert!(session.shared.compaction.coverage().is_none());
+        let settled_items = session.read_snapshot().history.len();
+        if queued {
+            assert!(matches!(
+                session.admit_compaction("while-finishing".into()),
+                Err(AgentError::SessionBusy)
+            ));
+            let accepted = session
+                .accept_input(InputMode::FollowUp, "queued during finishing".into())
+                .unwrap();
+            assert!(!accepted.needs_start());
+            accepted.finish();
+            let resumed = session.accept_resume().unwrap();
+            assert!(!resumed.needs_start());
+            resumed.finish();
+            assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+        }
+        gate.release();
+        session.join_turn_task().await;
+        session.cleanup_finished().await.unwrap();
+        assert_eq!(
+            session.shared.compaction.coverage().unwrap().1,
+            settled_items + if queued { 4 } else { 0 }
+        );
+        // Settlement supersedes the first turn's usage; only the third turn
+        // has a fresh report that can trigger another compaction.
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            if queued { 5 } else { 2 }
+        );
+        assert_eq!(
+            session.sample().unwrap().completions.through_seq,
+            if queued { 3 } else { 1 }
+        );
+        assert!(session.queue().items.is_empty());
+        agent.shutdown().await.unwrap();
+    }
 }

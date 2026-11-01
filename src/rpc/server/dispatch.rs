@@ -255,10 +255,7 @@ impl RpcServer {
                                 &id,
                                 await_compaction_completion(receiver)
                                     .await
-                                    .map(|completion| CompactResult {
-                                        result: completion.result,
-                                        next: completion.next,
-                                    }),
+                                    .map(|completion| completion.result),
                             )
                         })),
                         Err(error) => agent_error(id, &error).into(),
@@ -313,11 +310,6 @@ impl RpcServer {
                         snapshot: None,
                     })
                 })
-            }
-            "session.history" => {
-                let params: SessionHistoryParams = params_or_error(&id, params)?;
-                let result = self.agent().history(params.into());
-                Dispatch::Response(agent_result(&id, result))
             }
             "session.presentation" => {
                 let params: SessionParams = params_or_error(&id, params)?;
@@ -546,14 +538,7 @@ impl RpcServer {
                         if self.deferred_count() >= MAX_DEFERRED_WAITERS {
                             return Err(resource_exhausted(id));
                         }
-                        self.defer_waiter(id, async move {
-                            let result = await_turn_completion(receiver).await?;
-                            Ok(TurnWaitResult {
-                                turn: TurnResultView::from_turn_result(&result),
-                                next: result.next.clone(),
-                                queue: session.queue(),
-                            })
-                        })
+                        self.defer_waiter(id, await_turn_completion(receiver))
                     }
                     Err(error) => Dispatch::Response(agent_error(id, &error)),
                 }
@@ -603,7 +588,7 @@ impl RpcServer {
                             as ApplyOperation
                     })
                 } else {
-                    Dispatch::Response(accepted_input_response(&id, Ok(pending.finish(None))))
+                    Dispatch::Response(accepted_input_response(&id, pending.finish()))
                 }
             }
             "input.remove" => {
@@ -624,9 +609,9 @@ impl RpcServer {
                     .accept_resume()
                     .map_err(|error| agent_error(id.clone(), &error))?;
                 if pending.needs_start() {
-                    self.defer_response(id, None, pending.start())
+                    self.defer_response(id, None, async move { Ok(pending.start().await) })
                 } else {
-                    Dispatch::Response(success(&id, pending.finish(None)))
+                    Dispatch::Response(success(&id, pending.finish()))
                 }
             }
             "input.list" => {
@@ -703,7 +688,7 @@ fn snapshot_reply(
     #[cfg(feature = "e2e-observe")]
     let mut charge = charge;
     #[cfg(feature = "e2e-observe")]
-    if let Ok((_, snapshot)) = &result {
+    if let Ok(snapshot) = &result {
         charge.observe(snapshot);
     }
     let load = session.load().to_string();
@@ -718,7 +703,7 @@ fn snapshot_reply(
             #[cfg(feature = "e2e-observe")]
             let observed_start = crate::e2e_observe::clock();
             let response = match result {
-                Ok((state, snapshot)) => {
+                Ok(snapshot) => {
                     let response = if let Some(info) = info {
                         RpcResponse::snapshot_success(
                             id.clone(),
@@ -729,13 +714,7 @@ fn snapshot_reply(
                             },
                         )
                     } else {
-                        RpcResponse::snapshot_success(
-                            id.clone(),
-                            SessionStateResult {
-                                state: SessionStateView::from(&state),
-                                snapshot,
-                            },
-                        )
+                        RpcResponse::snapshot_success(id.clone(), SessionStateResult { snapshot })
                     };
                     response.unwrap_or_else(|_| agent_error(id, &AgentError::RpcSerialization))
                 }
@@ -775,7 +754,6 @@ pub(super) const METHODS: &[&str] = &[
     "session.compact.cancel",
     "session.update",
     "session.rename",
-    "session.history",
     "session.read",
     "session.presentation",
     "workspace.read",

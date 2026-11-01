@@ -1,8 +1,9 @@
 use super::*;
 use crate::ids::LoadId;
 use crate::presentation::{ToolArgumentsPreviewState, ToolDisplay};
-use crate::sessions::{InputMode, QueueItem};
+use crate::sessions::{InputMode, Queue, QueueItem, TurnPersistence};
 use crate::tool_data::*;
+use minicore_runtime::model::Usage;
 
 fn snapshot(
     session_id: SessionId,
@@ -53,7 +54,6 @@ fn snapshot(
                 persistence_uncertain: false,
                 availability: crate::sessions::ResultAvailability::Stored,
                 unavailable_reason: None,
-                next_loop_id: Some(loop_id),
                 after_saved_loop_id: None,
             }],
             truncated: true,
@@ -97,12 +97,6 @@ pub(super) fn events() -> Vec<AgentEvent> {
         text: "also the tests".into(),
         accepted_at: Some("2026-10-28T10:00:00.000Z".into()),
     };
-    let follow_up = QueueItem {
-        id: "inp_00000000000000000000000000000005".into(),
-        mode: InputMode::FollowUp,
-        text: "then the docs".into(),
-        accepted_at: None,
-    };
     vec![
         AgentEvent::SessionOpened {
             session: SessionInfo {
@@ -119,17 +113,6 @@ pub(super) fn events() -> Vec<AgentEvent> {
             meta,
         },
         AgentEvent::SessionClosed { session_id, meta },
-        AgentEvent::SessionState {
-            state: SessionState {
-                session_id,
-                status: SessionStatus::Blocked,
-                active_loop: None,
-                block_reason: Some(SessionBlockReason::Internal),
-                compaction: None,
-            },
-            meta,
-        },
-        AgentEvent::TurnStarted { turn, meta },
         AgentEvent::RequestStarted {
             turn,
             request_index: 1,
@@ -259,13 +242,6 @@ pub(super) fn events() -> Vec<AgentEvent> {
             },
             meta,
         },
-        AgentEvent::InputQueue {
-            queue: Queue {
-                items: vec![steer.clone(), follow_up],
-                paused: false,
-            },
-            meta,
-        },
         AgentEvent::InputDelivered {
             turn,
             items: vec![DeliveredInput {
@@ -276,34 +252,8 @@ pub(super) fn events() -> Vec<AgentEvent> {
             }],
             meta,
         },
-        AgentEvent::InteractionRequested {
-            turn,
-            interaction: PendingInteractionView {
-                interaction_id,
-                tool_call_id,
-                tool_name: "read".into(),
-                kind: InteractionKindView::Approval {
-                    prompt: "Allow read?".into(),
-                    risk: ApprovalRiskView::Low,
-                },
-            },
-            meta,
-        },
-        AgentEvent::InteractionResolved {
-            turn,
-            interaction_id,
-            meta,
-        },
         AgentEvent::SessionSnapshot {
             snapshot: snapshot(session_id, load, loop_id, steer.clone(), interaction_id),
-            meta,
-        },
-        AgentEvent::TurnFinished {
-            turn,
-            outcome: LoopOutcomeView::Completed,
-            persistence: TurnPersistence::Persisted,
-            next: Some(StartedTurn { turn, input: steer }),
-            queue: Queue::default(),
             meta,
         },
     ]

@@ -2,7 +2,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use minicore_agent::{
-    Agent, AgentConfig, AgentError, ApprovalMode, ConfigError, ModelInfo, ProfileInfo, TurnRef,
+    Agent, AgentConfig, AgentError, ApprovalMode, CancelReasonView, ConfigError,
+    InteractionKindView, LoopOutcomeView, LoopStatusView, ModelInfo, ProfileInfo, SessionExecution,
+    SessionSnapshot, TurnRef,
 };
 use minicore_runtime::model::{ModelRef, ReasoningPreference};
 
@@ -68,6 +70,33 @@ fn public_agent_query_and_wait_contract_compiles() {
         agent.wait_turn(turn)
     }
     let _ = wait;
+    fn controls(snapshot: &SessionSnapshot, result: &TurnResult) -> (bool, bool, bool) {
+        (
+            matches!(
+                snapshot.execution,
+                SessionExecution::Running {
+                    phase: LoopStatusView::WaitingForInput,
+                    ..
+                }
+            ),
+            snapshot
+                .pending_interaction
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        pending.interaction.kind,
+                        InteractionKindView::ToolInput { .. }
+                    )
+                }),
+            matches!(
+                result.outcome,
+                LoopOutcomeView::Cancelled {
+                    reason: CancelReasonView::Shutdown
+                }
+            ),
+        )
+    }
+    let _ = controls;
 
     let profile = ProfileInfo {
         id: "coding".to_owned(),

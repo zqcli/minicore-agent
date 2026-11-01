@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::json_escaped_len;
 use crate::error::AgentError;
 use crate::ids::SessionId;
 use crate::tools::{MAX_READ_BYTES, MAX_READ_LINES};
@@ -380,33 +381,6 @@ fn revision_of(bytes: &[u8]) -> String {
 }
 
 /// Exact serde_json escaped length of `text`, without the surrounding quotes.
-fn json_escaped_len(text: &str) -> usize {
-    text.chars().map(escaped_char_len).sum()
-}
-
-fn escaped_char_len(character: char) -> usize {
-    match character {
-        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
-        character if (character as u32) < 0x20 => 6,
-        character => character.len_utf8(),
-    }
-}
-
-/// Longest character-boundary prefix of `text` whose escaped length fits.
-fn char_prefix_within_budget(text: &str, budget: usize) -> usize {
-    let mut used = 0usize;
-    let mut end = 0usize;
-    for (index, character) in text.char_indices() {
-        let cost = escaped_char_len(character);
-        if used + cost > budget {
-            break;
-        }
-        used += cost;
-        end = index + character.len_utf8();
-    }
-    end
-}
-
 /// Byte offset of the first byte of the one-based `line`, or `None` when the
 /// buffer has no such line. A trailing newline does not create an extra line.
 fn line_start_offset(buffer: &str, line: u32) -> Option<usize> {
@@ -485,7 +459,7 @@ fn select_page(
             line_offset = 0;
             continue;
         }
-        let take = char_prefix_within_budget(segment, remaining);
+        let take = crate::budget::json_string_prefix(segment, remaining + 2).len();
         if take == 0 {
             if lines == 0 {
                 // The requested budget cannot hold even one character.

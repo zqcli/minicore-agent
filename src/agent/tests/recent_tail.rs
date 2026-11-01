@@ -152,7 +152,7 @@ async fn default_compact_retains_answers_tools_and_real_next_request_after_cold_
                 "history_sha256": crate::store::digest_hex(sha2::Sha256::new().chain_update(&before)),
                 "utility_request": &requests[0],
                 "next_request": &requests[1],
-                "next_turn_requests": next.report.requests,
+                "next_turn_requests": next.requests,
             })
         );
         let utility = serde_json::to_string(&requests[0]).unwrap();

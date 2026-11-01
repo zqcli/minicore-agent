@@ -145,7 +145,7 @@ async fn compaction_cancel_before_preparation_prevents_the_summary_call() {
             Some(json!({"session_id":session,"mode": "steer", "text":"settled history ".repeat(4000)})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -585,12 +585,8 @@ async fn an_admitted_snapshot_is_sampled_before_close_can_seal_and_reopen_its_lo
             ),
         )
         .await;
-    harness
-        .call_ok(
-            "turn.wait",
-            Some(turn_params(&pushed["result"]["started"]["turn"])),
-        )
-        .await;
+    let turn = harness.turn_for_input(&pushed["result"]).await;
+    harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     let gate = Arc::new(Gate::new());
     let _release = ReleaseGate(gate.clone());
     super::super::SNAPSHOT_REPLY_GATES
@@ -701,7 +697,15 @@ async fn all_query_paths_prefer_caller_cancellation_over_session_closure() {
             ));
         }
         for change_ref in [
-            format!("tool:{}", "0".repeat(64)),
+            crate::ChangeRef::Tool {
+                tool_ref: crate::ToolRef {
+                    session_id: id,
+                    loop_id: minicore_runtime::LoopId::new().unwrap(),
+                    request_index: 0,
+                    tool_call_id: minicore_runtime::ToolCallId::new("missing").unwrap(),
+                },
+                revision: "0".repeat(64),
+            },
             untracked_workspace_ref(id, "file.txt"),
         ] {
             queries.push(erase(

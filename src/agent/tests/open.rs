@@ -169,10 +169,8 @@ async fn invalid_agents_md_fails_the_turn_as_a_prompt_error() {
 
     let turn = send_text(&mut agent, info.session_id, "hello").await;
     let result = agent.wait_turn(turn).await.unwrap();
-    match &result.report.outcome {
-        minicore_runtime::LoopOutcome::Failed(failure) => {
-            assert_eq!(failure.kind, minicore_runtime::LoopFailureKind::Prompt)
-        }
+    match &result.outcome {
+        crate::event::LoopOutcomeView::Failed { kind, .. } => assert_eq!(kind, "prompt"),
         other => panic!("expected a prompt failure, got {other:?}"),
     }
     assert_persisted(&result);

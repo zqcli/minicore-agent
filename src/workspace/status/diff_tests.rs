@@ -188,16 +188,12 @@ async fn nested_literal_paths_do_not_read_parent_files_or_run_filters() {
     assert_eq!(&*after, b"new");
     assert!(!repo.join("FILTER_RAN").exists());
     assert!(!repo.join("sub/FILTER_RAN").exists());
-    let (head, mut entry) =
-        crate::changes::parse_workspace_ref(&request.change_ref, fixture.session).unwrap();
+    let mut invalid = request.clone();
+    let crate::changes::ChangeRef::Workspace { entry, .. } = &mut invalid.change_ref else {
+        panic!("workspace change reference");
+    };
     entry.path = "../outside".to_owned();
-    use base64::Engine;
-    let bytes = serde_json::to_vec(&(fixture.session, head, entry)).unwrap();
-    let invalid = format!(
-        "workspace:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    );
-    assert!(crate::changes::parse_workspace_ref(&invalid, fixture.session).is_err());
+    assert!(invalid.validate().is_err());
 }
 
 #[tokio::test]

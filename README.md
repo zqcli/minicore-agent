@@ -1,6 +1,6 @@
 # MiniCore Agent
 
-[![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=0.9.3)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
 MiniCore Agent is a local, RPC-first coding-agent backend written in Rust. It
 manages persistent Sessions over rooted Workspaces, runs model/tool turns on
@@ -10,10 +10,10 @@ also be embedded directly as a Rust library.
 
 | | |
 |---|---|
-| Version | 0.9.1 (development) |
+| Version | 0.9.3 (development) |
 | Rust | edition 2024, current stable |
 | Runtime | `minicore-runtime` 0.9.0, pinned to tag `v0.9.0` |
-| RPC protocol | 2 (36 methods) |
+| RPC protocol | 3 (35 methods) |
 | Provider | OpenAI Responses API and compatible endpoints |
 | License | MIT OR Apache-2.0 |
 
@@ -95,7 +95,7 @@ reload, and custom TLS roots (`SSL_CERT_FILE`).
 | Inputs | `input.push`, `input.remove`, `input.recall`, `input.resume`, `input.list` |
 | Turns | `turn.cancel`, `turn.wait`, `turn.result` |
 | Interaction | `interaction.answer` |
-| Read and review | `session.history`, `session.read`, `session.presentation`, `tool.read`, `tool.output`, `workspace.files`, `workspace.search`, `workspace.read`, `workspace.status`, `changes.list`, `changes.diff` |
+| Read and review | `session.read`, `session.presentation`, `tool.read`, `tool.output`, `workspace.files`, `workspace.search`, `workspace.read`, `workspace.status`, `changes.list`, `changes.diff` |
 
 [docs/rpc.md](docs/rpc.md) is the normative wire contract: parameters, results,
 events, ordering, limits, and error codes.
@@ -105,14 +105,15 @@ events, ordering, limits, and error codes.
 ```toml
 [dependencies]
 # Pin a `rev` or release tag for reproducible builds.
-minicore-agent = { git = "https://github.com/zqcli/minicore-agent", branch = "dev" }
+minicore-agent = { git = "https://github.com/zqcli/minicore-agent", branch = "0.9.3" }
 ```
 
 ```rust
-use minicore_agent::{Agent, CreateSession, InputMode, PushInput};
+use minicore_agent::{Agent, AgentEvent, CreateSession, InputMode, PushInput, TurnRef};
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut agent = Agent::open_file("agent.toml").await?;
+    let mut events = agent.take_events()?;
     let session = agent
         .create_session(CreateSession {
             workspace: "/path/to/project".into(),
@@ -122,7 +123,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             title: None,
         })
         .await?;
-    // An idle Session starts a turn with the pushed input at once.
+    // The receipt confirms acceptance; snapshots identify execution and completion.
     let pushed = agent
         .push_input(PushInput {
             session_id: session.session_id,
@@ -130,9 +131,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             text: "Summarize this repository.".into(),
         })
         .await?;
-    let turn = pushed.started.expect("an idle Session starts a turn").turn;
-    let result = agent.wait_turn(turn).await?;
-    println!("{:?} ({:?})", result.report.outcome, result.persistence);
+    if let Some(error) = pushed.start_error {
+        return Err(std::io::Error::other(error.message).into());
+    }
+    while let Some(event) = events.recv().await {
+        if let AgentEvent::SessionSnapshot { snapshot, .. } = event
+            && snapshot.load == pushed.load
+            && let Some(completed) = snapshot.completions.entries.iter()
+                .find(|entry| entry.input_id.as_ref() == Some(&pushed.id))
+        {
+            let result = agent.wait_turn(TurnRef {
+                session_id: session.session_id,
+                loop_id: completed.loop_id,
+            }).await?;
+            println!("{:?} ({:?})", result.outcome, result.persistence);
+            break;
+        }
+    }
     agent.shutdown().await?;
     Ok(())
 }
@@ -155,8 +170,10 @@ the derived compaction snapshot, and `tools/` for auxiliary tool records.
 - A turn result reports `persistence: persisted` only after its history append
   is synced to disk. A failed append leaves the Session usable unless the
   outcome is uncertain, in which case the Session is blocked until reopened.
-- Events are best-effort. `turn.wait`, `turn.result`, and history queries are
-  authoritative.
+- `session_snapshot` reliably publishes current controls while the connection
+  is alive; body and Tool notifications are bounded and best-effort.
+  `turn.wait` returns a lightweight completion, `turn.result` reads one turn,
+  and `session.read` pages history independently of the event stream.
 - Run one Agent process per `data_dir`; the Store takes no cross-process lock.
 - Session data from v0.2 is not migrated.
 
@@ -171,11 +188,14 @@ elsewhere. See [Security](docs/security.md).
 
 ## Compatibility
 
-The RPC protocol and the storage formats are versioned independently of the
-package. 0.7.0 keeps protocol 1 and the existing on-disk formats, but changes
-some client-visible behavior: the shutdown cancellation reason, settlement
-finishing after `turn.wait`, a separate lifecycle event queue, path-based scan
-cursors, and credential checks. The [changelog](CHANGELOG.md) lists every change.
+Agent 0.9.3 serves RPC protocol 3 and keeps the Runtime 0.9.0 dependency and
+on-disk formats. Clients must check `agent.ping.protocol_version` before a
+mutation. Protocol 2 clients need to migrate: control snapshots replace the
+legacy control events and command-response state, `turn.wait` no longer returns
+`next` or `queue`, `session.read` replaces `session.history`, and change
+references are structured values. There is no protocol 2 compatibility mode.
+The [RPC guide](docs/rpc.md) defines the new shapes and the [changelog](CHANGELOG.md)
+lists the changes.
 
 ## Development
 

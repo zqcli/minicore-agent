@@ -185,38 +185,6 @@ fn result_truncation_marks_display_and_bounds_hidden_rows() {
 }
 
 #[test]
-fn assistant_parts_preserve_visible_order_and_redact_debug() {
-    let tool_call = minicore_runtime::model::ToolCall::new(
-        ToolCallId::new("call-1").unwrap(),
-        "read".parse().unwrap(),
-        serde_json::json!({"path": "secret.txt"}),
-        0,
-    )
-    .unwrap();
-    let reasoning = minicore_runtime::model::ReasoningContent::new(
-        Some("think".to_owned()),
-        Some("summary".to_owned()),
-        None,
-        None,
-    )
-    .unwrap();
-    let parts = assistant_display_parts(&[
-        minicore_runtime::model::AssistantPart::Text("before".into()),
-        minicore_runtime::model::AssistantPart::Reasoning(reasoning),
-        minicore_runtime::model::AssistantPart::ToolCall(tool_call),
-        minicore_runtime::model::AssistantPart::Text("after".into()),
-    ]);
-    assert!(matches!(&parts[0], AssistantDisplayPart::Text { text } if text == "before"));
-    assert!(
-        matches!(&parts[1], AssistantDisplayPart::Reasoning { text } if text == "thinksummary")
-    );
-    assert!(matches!(&parts[2], AssistantDisplayPart::ToolCall { name, .. } if name == "read"));
-    assert!(matches!(&parts[3], AssistantDisplayPart::Text { text } if text == "after"));
-    let debug = format!("{:?}", parts[1]);
-    assert!(!debug.contains("think"));
-}
-
-#[test]
 fn editor_old_and_new_and_bash_hint_lines() {
     let edit = build_tool_display(
         "edit",

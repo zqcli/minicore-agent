@@ -65,6 +65,15 @@ fn take_read_change_blobs_under(prefix: &Path) -> Vec<PathBuf> {
     std::iter::from_fn(|| READ_CHANGE_BLOBS.take(&root)).collect()
 }
 
+static TOOL_BLOB_READS: crate::test_support::Registry<PathBuf, Arc<Mutex<Vec<PathBuf>>>> =
+    crate::test_support::Registry::new();
+
+pub(super) fn note_tool_blob(path: &Path) {
+    if let Some(reads) = TOOL_BLOB_READS.get(&path.parent().unwrap().to_path_buf()) {
+        reads.lock().unwrap().push(path.file_name().unwrap().into());
+    }
+}
+
 async fn fixture(label: &str) -> (crate::test_support::TempDir, Store, SessionId) {
     let directory = crate::test_support::TempDir::new(label);
     let store = Store::open(directory.path().to_path_buf()).await.unwrap();
@@ -303,7 +312,7 @@ async fn wide_tool_round_counts_survive_jsonl_reopen_and_history_reads() {
         assert_eq!(entry.tool_rounds, count);
     }
     let page = reopened
-        .read_history_page(session_id, 0, 100, None, None, None, None, &limits)
+        .read_history_page(session_id, 0, 100, None, None, None, None, None, &limits)
         .await
         .unwrap();
     assert_eq!(
@@ -444,6 +453,7 @@ async fn interrupted_partial_round_trips_beside_items_and_old_records_still_load
             None,
             None,
             None,
+            None,
             &history_limits(1 << 30, 100),
         )
         .await
@@ -510,14 +520,24 @@ async fn same_text_users_keep_occurrence_when_one_time_is_invalid() {
     store.append_loop(session_id, &loop_record).await.unwrap();
 
     let loaded = store.load_session(session_id).await.unwrap();
-    let page = crate::history::page_history(loaded.history.as_ref(), 0, 100, &loaded.user_times);
+    let page = store
+        .read_history_page(
+            session_id,
+            0,
+            100,
+            None,
+            Some(&loaded.user_times),
+            None,
+            None,
+            None,
+            &history_limits(MAX_LOOP_RECORD_BYTES as u64 + 4096, 1),
+        )
+        .await
+        .unwrap();
     let timestamps = page
-        .items
+        .user_times
         .iter()
-        .map(|item| match &item.item {
-            crate::history::HistoryItemView::User(user) => user.timestamp.as_deref(),
-            other => panic!("unexpected history item {other:?}"),
-        })
+        .map(Option::as_deref)
         .collect::<Vec<_>>();
     assert_eq!(timestamps, vec![None, Some(valid_time)]);
     assert!(!loaded.user_times.contains_key(&(loop_id, 0)));
@@ -767,16 +787,30 @@ async fn extended_reasoning_values_round_trip_in_record_and_history() {
             .collect::<Vec<_>>()
     );
     let serialized = serde_json::to_string(loaded.history.as_ref()).unwrap();
-    let view = crate::history::page_history(
-        loaded.history.as_ref(),
-        0,
-        100,
-        &std::collections::HashMap::new(),
-    );
-    let view_serialized = serde_json::to_string(&view).unwrap();
+    let view = store
+        .read_display_history_page(
+            session_id,
+            0,
+            100,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            &history_limits(MAX_LOOP_RECORD_BYTES as u64 + 16384, 3),
+        )
+        .await
+        .unwrap();
+    let view_serialized = view
+        .display_items
+        .unwrap()
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<String>();
     for (_, wire) in values {
         assert!(serialized.contains(&format!("\"reasoning\":\"{wire}\"")));
-        assert!(view_serialized.contains(&format!("\"reasoning_level\":\"{wire}\"")));
+        assert!(view_serialized.contains(&format!("\"reasoning\":\"{wire}\"")));
     }
     assert_eq!(loaded.record.reasoning, ReasoningPreference::Ultra);
 }
@@ -1353,6 +1387,29 @@ async fn historical_subagent_history_items_remain_generic_and_readable() {
     let serialized = serde_json::to_string(loaded.history.as_ref()).unwrap();
     assert!(serialized.contains("subagent"));
     assert!(serialized.contains("historical child result"));
+    store.install_history_index(session_id, loaded.history_index);
+    for offset in 0..2 {
+        let page = store
+            .read_display_history_page(
+                session_id,
+                offset,
+                1,
+                Some(2),
+                None,
+                0,
+                None,
+                None,
+                None,
+                &history_limits(32 * 1024, 1),
+            )
+            .await
+            .unwrap();
+        let encoded = page.display_items.unwrap();
+        let item: serde_json::Value = serde_json::from_str(&encoded[0].1).unwrap();
+        assert_eq!(item["tool_summaries"][0]["state"], "succeeded");
+        assert_eq!(item["tool_summaries"][0]["output_line_count"], 1);
+        assert!(!encoded[0].1.contains("historical child result"));
+    }
 }
 
 #[tokio::test]
@@ -1444,24 +1501,18 @@ async fn legacy_auxiliary_tool_records_remain_readable() {
         .await
         .unwrap();
 
-    let recovered = store
-        .read_tool_record(&tool_ref)
-        .await
-        .unwrap()
-        .expect("historical auxiliary record must remain readable");
-    let read = recovered.project_read(&tool_ref, 4096).unwrap();
+    let read = read_tool(&store, &tool_ref).await;
     assert_eq!(read.execution.name, "subagent");
-    let output = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref,
-                stream: ToolDataStream::Output,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let output = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref,
+            stream: ToolDataStream::Output,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     assert_eq!(output.data, "historical result");
 }
 
@@ -1543,7 +1594,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, &limits,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, None, &limits,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1556,7 +1607,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, &expired,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, None, &expired,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1569,7 +1620,7 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     };
     assert!(matches!(
         store
-            .read_history_page(session_id, 0, 1, None, None, None, None, &capped,)
+            .read_history_page(session_id, 0, 1, None, None, None, None, None, &capped,)
             .await,
         Err(StoreError::QueryLimit)
     ));
@@ -1577,7 +1628,18 @@ async fn readonly_history_scan_honors_cancel_deadline_and_byte_budget() {
     for scan_limits in [&limits, &expired, &capped] {
         assert!(matches!(
             store
-                .read_display_history_page(session_id, 0, 1, None, None, None, scan_limits,)
+                .read_display_history_page(
+                    session_id,
+                    0,
+                    1,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    scan_limits,
+                )
                 .await,
             Err(StoreError::QueryLimit)
         ));
@@ -1708,28 +1770,21 @@ async fn binary_and_utf8_empty_eof_auxiliary_tool_persistence() {
         .await
         .unwrap();
 
-    let recovered = store
-        .read_tool_record(&tool_ref)
-        .await
-        .unwrap()
-        .expect("stored tool record must exist");
-
-    let read_res = recovered.project_read(&tool_ref, 4096).unwrap();
+    let read_res = read_tool(&store, &tool_ref).await;
     assert_eq!(read_res.execution.tool_ref, tool_ref);
     assert_eq!(read_res.execution.name, "bash");
     assert_eq!(read_res.execution.state, ToolExecutionState::Succeeded);
 
-    let stdout_page = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stdout,
-                offset: 0,
-                max_bytes: Some(100_000),
-            },
-            100_000,
-        )
-        .unwrap();
+    let stdout_page = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(100_000),
+        },
+    )
+    .await;
     assert_eq!(stdout_page.encoding, "base64");
     assert!(stdout_page.eof);
     let decoded = base64::engine::general_purpose::STANDARD
@@ -1737,21 +1792,88 @@ async fn binary_and_utf8_empty_eof_auxiliary_tool_persistence() {
         .unwrap();
     assert_eq!(decoded, stdout_bytes);
 
-    let stderr_page = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stderr,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let stderr_page = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stderr,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     assert_eq!(stderr_page.encoding, "base64");
     assert!(stderr_page.eof);
     assert_eq!(stderr_page.observed_end, 0);
     assert!(stderr_page.data.is_empty());
+}
+
+#[tokio::test]
+async fn tool_queries_read_only_the_requested_payloads() {
+    let (_directory, store, session_id) = fixture("tool-selected-payloads").await;
+    store.create_session(&record(session_id)).await.unwrap();
+    let tool_ref = make_tool_ref(session_id, "selected-payloads");
+    let snapshot = auxiliary_snapshot(
+        tool_ref.clone(),
+        [
+            Some(br#"{"path":"value.txt"}"#.to_vec()),
+            Some(b"one\ntwo".to_vec()),
+            Some(b"out!".to_vec()),
+            Some(b"err!".to_vec()),
+            Some(b"before".to_vec()),
+            Some(b"after".to_vec()),
+        ],
+    );
+    store
+        .commit_tool_record(&snapshot, Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+    let directory = store
+        .session_directory(session_id)
+        .join(AUX_TOOLS_DIR)
+        .join(tool_ref_hash(&tool_ref));
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    TOOL_BLOB_READS.arm(directory.clone(), Arc::clone(&reads));
+    let request = ToolOutputRequest {
+        tool_ref: tool_ref.clone(),
+        stream: ToolDataStream::Stdout,
+        offset: 0,
+        max_bytes: Some(1024),
+    };
+    let page = output_tool(&store, request.clone()).await;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(page.data)
+            .unwrap(),
+        b"out!"
+    );
+    assert_eq!(&*reads.lock().unwrap(), &[PathBuf::from(TOOL_STDOUT_FILE)]);
+    reads.lock().unwrap().clear();
+    let summary = read_tool(&store, &tool_ref).await;
+    assert_eq!(summary.execution.output_line_count, Some(2));
+    assert_eq!(
+        &*reads.lock().unwrap(),
+        &[
+            PathBuf::from(TOOL_INPUT_FILE),
+            PathBuf::from(TOOL_RESULT_FILE)
+        ]
+    );
+    reads.lock().unwrap().clear();
+    let warm = Arc::new(ToolData::new());
+    warm.note_requested(&tool_ref, "write");
+    warm.note_stream_chunk(&tool_ref, ToolDataStream::Stdout, b"warm");
+    warm.finish_and_snapshot(&tool_ref, ToolResultOutcome::Success);
+    let page = crate::tool_data::tool_output(store, Some(warm), request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(page.data)
+            .unwrap(),
+        b"warm"
+    );
+    assert!(reads.lock().unwrap().is_empty());
+    TOOL_BLOB_READS.take(&directory);
 }
 
 #[tokio::test]
@@ -2109,7 +2231,7 @@ async fn cold_change_list_pages_many_records_without_reading_other_pages_blobs()
         }
         for record in &page.records {
             assert!(
-                seen.insert(record.change_ref.clone()),
+                seen.insert(serde_json::to_string(&record.change_ref).unwrap()),
                 "a record was returned on two pages"
             );
             if record.tool_ref.as_ref() == Some(&refs[3]) {
@@ -2482,10 +2604,12 @@ async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
             .any(|line| line.kind == crate::diff::DiffLineKind::Removed)
     );
 
-    // Cold path: an unloaded Session still resolves through the bounded
-    // metadata scan and reads only this record's snapshots.
+    // The address works even when a whole-session scan cannot admit one record.
     let cold = crate::diff::changes_diff(
-        store.clone(),
+        store.clone().with_aux_limits(AuxLimits {
+            max_scan_entries: 1,
+            ..DEFAULT_AUX_LIMITS
+        }),
         None,
         request.clone(),
         CancellationToken::new(),
@@ -2525,7 +2649,10 @@ async fn diff_resolves_warm_and_cold_and_rejects_a_stale_cursor() {
         store.clone(),
         None,
         crate::diff::ChangesDiffRequest {
-            change_ref: format!("tool:{}", "b".repeat(64)),
+            change_ref: crate::ChangeRef::Tool {
+                tool_ref: tool_ref.clone(),
+                revision: "b".repeat(64),
+            },
             ..request.clone()
         },
         CancellationToken::new(),
@@ -3200,7 +3327,7 @@ async fn complete_identity_and_path_traversal_protection() {
     let other_tool_ref = make_tool_ref(session_id, "call-1");
     assert!(
         store
-            .read_tool_record(&other_tool_ref)
+            .read_tool_metadata(&other_tool_ref)
             .await
             .unwrap()
             .is_none()
@@ -3296,7 +3423,7 @@ async fn atomic_publishing_idempotent_overwrite_and_cleanup_on_failure() {
     ));
 
     // Read still succeeds
-    assert!(store.read_tool_record(&tool_ref).await.unwrap().is_some());
+    assert!(store.read_tool_metadata(&tool_ref).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -3457,22 +3584,16 @@ async fn metadata_and_blob_corruption_handling() {
         .join(TOOL_STDOUT_FILE);
     fs::remove_file(&blob_path).await.unwrap();
 
-    let recovered = store
-        .read_tool_record(&tool_ref)
-        .await
-        .unwrap()
-        .expect("metadata should still load");
-    let page = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stdout,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let page = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     // Missing blob must report Unavailable and retain observed_end, not a clean empty EOF
     assert_eq!(page.availability, ToolDataAvailability::Unavailable);
     assert_eq!(page.observed_end, 25);
@@ -3481,22 +3602,16 @@ async fn metadata_and_blob_corruption_handling() {
 
     // 2. Hash mismatch / corrupt bytes: write wrong content
     fs::write(&blob_path, b"corrupted bytes!").await.unwrap();
-    let recovered2 = store
-        .read_tool_record(&tool_ref)
-        .await
-        .unwrap()
-        .expect("metadata should still load");
-    let page2 = recovered2
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stdout,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let page2 = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     assert_eq!(page2.availability, ToolDataAvailability::Unavailable);
     assert_eq!(page2.observed_end, 25);
     assert!(page2.data.is_empty());
@@ -3513,7 +3628,7 @@ async fn metadata_and_blob_corruption_handling() {
         .await
         .unwrap();
     assert!(matches!(
-        store.read_tool_record(&tool_ref).await,
+        store.read_tool_metadata(&tool_ref).await,
         Err(StoreError::UnsupportedFormat)
     ));
 }
@@ -3617,14 +3732,14 @@ async fn auxiliary_budget_gc_and_scan_limits() {
     // Both records exist
     assert!(
         store
-            .read_tool_record(&snap1.tool_ref)
+            .read_tool_metadata(&snap1.tool_ref)
             .await
             .unwrap()
             .is_some()
     );
     assert!(
         store
-            .read_tool_record(&snap2.tool_ref)
+            .read_tool_metadata(&snap2.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -3639,7 +3754,7 @@ async fn auxiliary_budget_gc_and_scan_limits() {
 
     assert!(
         store
-            .read_tool_record(&snap1.tool_ref)
+            .read_tool_metadata(&snap1.tool_ref)
             .await
             .unwrap()
             .is_none(),
@@ -3647,14 +3762,14 @@ async fn auxiliary_budget_gc_and_scan_limits() {
     );
     assert!(
         store
-            .read_tool_record(&snap2.tool_ref)
+            .read_tool_metadata(&snap2.tool_ref)
             .await
             .unwrap()
             .is_some()
     );
     assert!(
         store
-            .read_tool_record(&snap3.tool_ref)
+            .read_tool_metadata(&snap3.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -3669,7 +3784,7 @@ async fn legacy_session_without_tools_directory() {
     let tool_ref = make_tool_ref(session_id, "call-old");
 
     // No tools directory exists yet; read returns Ok(None), not StoreError::Corrupt
-    assert!(store.read_tool_record(&tool_ref).await.unwrap().is_none());
+    assert!(store.read_tool_metadata(&tool_ref).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -3962,7 +4077,7 @@ async fn oversized_metadata_file_bytes_rejected_without_alloc() {
     .unwrap();
 
     // Must reject without allocating 100 MiB
-    let res = store.read_tool_record(&tool_ref).await;
+    let res = store.read_tool_metadata(&tool_ref).await;
     assert!(matches!(res, Err(StoreError::RecordTooLarge)));
 }
 
@@ -4038,7 +4153,7 @@ async fn invalid_metadata_ranges_and_hashes_rejected() {
     .await
     .unwrap();
     assert!(matches!(
-        store.read_tool_record(&tool_ref).await,
+        store.read_tool_metadata(&tool_ref).await,
         Err(StoreError::Corrupt)
     ));
 
@@ -4055,7 +4170,7 @@ async fn invalid_metadata_ranges_and_hashes_rejected() {
     .await
     .unwrap();
     assert!(matches!(
-        store.read_tool_record(&tool_ref).await,
+        store.read_tool_metadata(&tool_ref).await,
         Err(StoreError::Corrupt)
     ));
 
@@ -4070,7 +4185,7 @@ async fn invalid_metadata_ranges_and_hashes_rejected() {
     .await
     .unwrap();
     assert!(matches!(
-        store.read_tool_record(&tool_ref).await,
+        store.read_tool_metadata(&tool_ref).await,
         Err(StoreError::Corrupt)
     ));
 }
@@ -4165,22 +4280,16 @@ async fn single_blob_symlink_only_marks_stream_unavailable() {
     symlink(&outside, &blob_path).unwrap();
 
     // Reading the record succeeds; only stdout is Unavailable!
-    let recovered = store
-        .read_tool_record(&tool_ref)
-        .await
-        .unwrap()
-        .expect("record should load");
-    let page = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stdout,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let page = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     assert_eq!(page.availability, ToolDataAvailability::Unavailable);
 }
 
@@ -4387,14 +4496,14 @@ async fn concurrent_sessions_global_quota() {
     // Both records exist (total = 2)
     assert!(
         store
-            .read_tool_record(&snap1.tool_ref)
+            .read_tool_metadata(&snap1.tool_ref)
             .await
             .unwrap()
             .is_some()
     );
     assert!(
         store
-            .read_tool_record(&snap2.tool_ref)
+            .read_tool_metadata(&snap2.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -4410,17 +4519,17 @@ async fn concurrent_sessions_global_quota() {
     // At most 2 records survive globally
     let remaining_records = [
         store
-            .read_tool_record(&snap1.tool_ref)
+            .read_tool_metadata(&snap1.tool_ref)
             .await
             .unwrap()
             .is_some(),
         store
-            .read_tool_record(&snap2.tool_ref)
+            .read_tool_metadata(&snap2.tool_ref)
             .await
             .unwrap()
             .is_some(),
         store
-            .read_tool_record(&snap3.tool_ref)
+            .read_tool_metadata(&snap3.tool_ref)
             .await
             .unwrap()
             .is_some(),
@@ -4509,47 +4618,40 @@ async fn command_record_stdout_evicted_by_pressure_snapshot_commit_and_cold_proj
         .unwrap();
 
     // Cold project from disk
-    let recovered = store
-        .read_tool_record(&tool_ref)
-        .await
-        .unwrap()
-        .expect("record must exist");
 
     // Metadata projection shows Saved
-    let read_res = recovered.project_read(&tool_ref, 4096).unwrap();
+    let read_res = read_tool(&store, &tool_ref).await;
     assert_eq!(
         read_res.execution.recording,
         crate::tool_data::ToolRecordingState::Saved
     );
 
     // Evicted stdout projection returns Expired while retaining observed_end
-    let stdout_page = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stdout,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let stdout_page = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stdout,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     assert_eq!(stdout_page.availability, ToolDataAvailability::Expired);
     assert_eq!(stdout_page.observed_end, stdout_bytes.len() as u64);
     assert!(stdout_page.truncated);
 
     // Stderr stream was not evicted and remains Available
-    let stderr_page = recovered
-        .project_output(
-            &ToolOutputRequest {
-                tool_ref: tool_ref.clone(),
-                stream: ToolDataStream::Stderr,
-                offset: 0,
-                max_bytes: Some(4096),
-            },
-            4096,
-        )
-        .unwrap();
+    let stderr_page = output_tool(
+        &store,
+        ToolOutputRequest {
+            tool_ref: tool_ref.clone(),
+            stream: ToolDataStream::Stderr,
+            offset: 0,
+            max_bytes: Some(4096),
+        },
+    )
+    .await;
     assert_eq!(stderr_page.availability, ToolDataAvailability::Available);
     assert!(!stderr_page.data.is_empty());
 }
@@ -4800,14 +4902,27 @@ impl Store {
         self.commit_tool_record_locked(snapshot, deadline, &mut ledger)
             .await
     }
-    pub(crate) async fn read_tool_record(
-        &self,
-        tool_ref: &ToolRef,
-    ) -> Result<Option<ToolRecord>, StoreError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        self.read_tool_record_with_deadline(tool_ref, deadline)
-            .await
-    }
+}
+
+async fn read_tool(store: &Store, tool_ref: &ToolRef) -> crate::ToolReadResult {
+    crate::tool_data::tool_read(
+        store.clone(),
+        None,
+        crate::ToolReadRequest {
+            tool_ref: tool_ref.clone(),
+            display: false,
+            max_bytes: Some(4096),
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn output_tool(store: &Store, request: ToolOutputRequest) -> crate::ToolOutputPage {
+    crate::tool_data::tool_output(store.clone(), None, request, CancellationToken::new())
+        .await
+        .unwrap()
 }
 
 fn make_tool_ref(session_id: SessionId, name: impl AsRef<str>) -> ToolRef {
@@ -4946,7 +5061,7 @@ async fn cancelled_delete_is_hidden_and_reclaimed_on_open() {
     assert!(!hidden.exists());
     assert!(
         reopened
-            .read_tool_record(&second.tool_ref)
+            .read_tool_metadata(&second.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -5035,6 +5150,7 @@ async fn cold_page_offsets_usage_and_corruption_depend_on_off_page_records() {
             None,
             None,
             None,
+            None,
             Some(2),
             &history_limits(64 * 1024 * 1024, 100),
         )
@@ -5057,6 +5173,7 @@ async fn cold_page_offsets_usage_and_corruption_depend_on_off_page_records() {
                 id,
                 3,
                 1,
+                None,
                 None,
                 None,
                 None,
@@ -5089,7 +5206,7 @@ async fn cold_tool_queries_distinguish_missing_and_corrupt_metadata() {
             fs::remove_file(&metadata).await.unwrap();
             fs::create_dir(&metadata).await.unwrap();
         }
-        let read = crate::read::tool_read(
+        let read = crate::tool_data::tool_read(
             store.clone(),
             None,
             crate::tool_data::ToolReadRequest {
@@ -5101,7 +5218,7 @@ async fn cold_tool_queries_distinguish_missing_and_corrupt_metadata() {
         )
         .await
         .unwrap_err();
-        let output = crate::read::tool_output(
+        let output = crate::tool_data::tool_output(
             store.clone(),
             None,
             ToolOutputRequest {
@@ -5209,7 +5326,7 @@ async fn permission_failures_do_not_expose_half_deleted_sessions_or_hide_tool_er
         .join(tool_ref_hash(&snapshot.tool_ref))
         .join(TOOL_RECORD_FILE);
     let permissions = RestorePermissions::set(&metadata, 0o000);
-    let result = crate::read::tool_read(
+    let result = crate::tool_data::tool_read(
         store.clone(),
         None,
         crate::tool_data::ToolReadRequest {
@@ -5330,7 +5447,7 @@ async fn aux_permission_failures_are_isolated_and_eviction_finishes() {
         .unwrap();
     assert!(
         store
-            .read_tool_record(&first.tool_ref)
+            .read_tool_metadata(&first.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -5374,14 +5491,14 @@ async fn aux_permission_failures_are_isolated_and_eviction_finishes() {
         .unwrap();
     assert!(
         store
-            .read_tool_record(&second.tool_ref)
+            .read_tool_metadata(&second.tool_ref)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .read_tool_record(&third.tool_ref)
+            .read_tool_metadata(&third.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -5406,14 +5523,14 @@ async fn aux_permission_failures_are_isolated_and_eviction_finishes() {
         .unwrap();
     assert!(
         store
-            .read_tool_record(&third.tool_ref)
+            .read_tool_metadata(&third.tool_ref)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .read_tool_record(&fourth.tool_ref)
+            .read_tool_metadata(&fourth.tool_ref)
             .await
             .unwrap()
             .is_some()
@@ -5449,6 +5566,7 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
             Some(17 * USERS),
             None,
             None,
+            None,
             Some(16 * USERS),
             &history_limits(64 * 1024, 1),
         )
@@ -5458,6 +5576,29 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
     assert_eq!(page.total_items, 17 * USERS);
     assert_eq!(page.items, entry.items[..1]);
     assert_eq!(page.covered_usage.loop_count, 16);
+    let accepted = "2026-11-01T01:02:03.000Z";
+    let times = HashMap::from([((entry.loop_id, 1), accepted.to_owned())]);
+    let display = store
+        .read_display_history_page(
+            id,
+            16 * USERS + 1,
+            1,
+            Some(17 * USERS),
+            Some(&times),
+            16 * USERS,
+            Some(page.captured_end),
+            Some(&page.revision),
+            None,
+            &history_limits(64 * 1024, 1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(display.scanned_lines, 1);
+    assert_eq!(display.user_times, [Some(accepted.to_owned())]);
+    let items = display.display_items.unwrap();
+    let item: serde_json::Value = serde_json::from_str(&items[0].1).unwrap();
+    assert_eq!(item["timestamp"], accepted);
+    assert_eq!(display.covered_usage, page.covered_usage);
     index_history(&store, id).await;
     assert_eq!(
         store
@@ -5480,6 +5621,7 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
                 None,
                 None,
                 None,
+                None,
                 &history_limits(64 * 1024 * 1024, COLD_LINES)
             )
             .await,
@@ -5490,6 +5632,7 @@ async fn indexed_history_seeks_past_the_cold_scan_limit() {
             id,
             16 * USERS,
             1,
+            None,
             None,
             Some(page.captured_end),
             Some(&page.revision),
@@ -5514,7 +5657,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
     index_history(&store, id).await;
     let limits = history_limits(32 * 1024 * 1024, 100);
     let first = store
-        .read_history_page(id, 0, 1, Some(2), None, None, None, &limits)
+        .read_history_page(id, 0, 1, Some(2), None, None, None, None, &limits)
         .await
         .unwrap();
     store
@@ -5528,6 +5671,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
             1,
             1,
             Some(3),
+            None,
             Some(first.captured_end),
             Some(&first.revision),
             None,
@@ -5538,7 +5682,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
     assert_eq!(next.total_items, 2);
     assert_eq!(next.items.len(), 1);
     let snapshot = store
-        .read_history_page(id, 0, 3, Some(2), None, None, None, &limits)
+        .read_history_page(id, 0, 3, Some(2), None, None, None, None, &limits)
         .await
         .unwrap();
     assert_eq!(snapshot.revision, first.revision);
@@ -5548,6 +5692,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
             id,
             1,
             1,
+            None,
             None,
             Some(first.captured_end),
             Some(&first.revision),
@@ -5559,7 +5704,7 @@ async fn indexed_history_cursors_survive_append_and_unload() {
     assert_eq!(cold.items, next.items);
     index_history(&store, id).await;
     let current = store
-        .read_history_page(id, 2, 1, Some(3), None, None, None, &limits)
+        .read_history_page(id, 2, 1, Some(3), None, None, None, None, &limits)
         .await
         .unwrap();
     assert_eq!(current.total_items, 3);
@@ -5646,7 +5791,7 @@ async fn foreign_aux_entries_do_not_disable_persistence_and_known_bytes_count() 
         .unwrap();
     assert!(
         store
-            .read_tool_record(&first.tool_ref)
+            .read_tool_metadata(&first.tool_ref)
             .await
             .unwrap()
             .is_some()

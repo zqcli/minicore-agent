@@ -2,21 +2,18 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use minicore_runtime::execution::ConfigRevision;
 use minicore_runtime::interaction::{InteractionKind, PendingInteraction};
-use minicore_runtime::model::{ModelError, Usage};
+use minicore_runtime::model::ModelError;
 use minicore_runtime::tools::{ApprovalRisk, ToolInputAnswerKind, ToolProgress, ToolResultOutcome};
 use minicore_runtime::{InteractionId, LoopId, ToolCallId};
 
 use crate::agent::SessionInfo;
 use crate::ids::{LoadId, SessionId};
-use crate::sessions::{
-    CompactionProgress, DeliveredInput, Queue, SessionBlockReason, SessionSnapshot, SessionState,
-    SessionStatus, StartedTurn, TurnPersistence, TurnRef,
-};
+use crate::sessions::{DeliveredInput, SessionSnapshot, TurnRef};
 use crate::tool_data::{ToolExecutionData, ToolInvocationData, ToolProcessData};
 
 const MAX_CONTROL_BURST: u8 = 8;
@@ -66,19 +63,10 @@ pub enum AgentEvent {
         session_id: SessionId,
         meta: EventMeta,
     },
-    SessionState {
-        #[serde(serialize_with = "serialize_session_state")]
-        state: SessionState,
-        meta: EventMeta,
-    },
     /// The reliable control observation for one loaded Session. Applying it
     /// replaces the TUI's whole control projection for that load.
     SessionSnapshot {
         snapshot: SessionSnapshot,
-        meta: EventMeta,
-    },
-    TurnStarted {
-        turn: TurnRef,
         meta: EventMeta,
     },
     RequestStarted {
@@ -175,34 +163,10 @@ pub enum AgentEvent {
         result: ToolResultView,
         meta: EventMeta,
     },
-    /// The Session's input queue after it changed.
-    InputQueue {
-        queue: Queue,
-        meta: EventMeta,
-    },
     /// Inputs a running turn took at a request boundary, in order.
     InputDelivered {
         turn: TurnRef,
         items: Vec<DeliveredInput>,
-        meta: EventMeta,
-    },
-    InteractionRequested {
-        turn: TurnRef,
-        interaction: PendingInteractionView,
-        meta: EventMeta,
-    },
-    InteractionResolved {
-        turn: TurnRef,
-        interaction_id: InteractionId,
-        meta: EventMeta,
-    },
-    TurnFinished {
-        turn: TurnRef,
-        outcome: LoopOutcomeView,
-        persistence: TurnPersistence,
-        /// The successor turn the Agent started from the input queue.
-        next: Option<StartedTurn>,
-        queue: Queue,
         meta: EventMeta,
     },
 }
@@ -245,9 +209,7 @@ impl AgentEvent {
     event_meta!(
         SessionOpened,
         SessionClosed,
-        SessionState,
         SessionSnapshot,
-        TurnStarted,
         RequestStarted,
         RequestUsage,
         OutputDelta,
@@ -259,11 +221,7 @@ impl AgentEvent {
         ToolArgumentsPreview,
         ToolProgress,
         ToolFinished,
-        InteractionRequested,
-        InteractionResolved,
-        InputQueue,
         InputDelivered,
-        TurnFinished
     );
 }
 
@@ -475,26 +433,6 @@ pub enum LoopStatusView {
     Finished,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct LoopStateView {
-    pub loop_id: LoopId,
-    pub status: LoopStatusView,
-    pub request_index: u32,
-    pub config_revision: ConfigRevision,
-    pub model: Option<String>,
-    pub pending_interaction: Option<PendingInteractionView>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct SessionStateView {
-    pub session_id: SessionId,
-    pub status: SessionStatus,
-    pub active_loop: Option<LoopStateView>,
-    pub block_reason: Option<SessionBlockReason>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<CompactionProgress>,
-}
-
 /// Safe numeric evidence from the Agent's local request preflight only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -639,31 +577,6 @@ impl ModelErrorView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct TurnResultView {
-    pub turn: TurnRef,
-    pub outcome: LoopOutcomeView,
-    pub usage: Usage,
-    pub requests: u32,
-    pub tool_rounds: u64,
-    pub final_config_revision: ConfigRevision,
-    pub persistence: TurnPersistence,
-}
-
-impl TurnResultView {
-    pub(crate) fn from_turn_result(result: &crate::sessions::TurnResult) -> Self {
-        Self {
-            turn: result.turn,
-            outcome: LoopOutcomeView::from_report(&result.report),
-            usage: result.report.usage,
-            requests: result.report.requests,
-            tool_rounds: result.report.tool_rounds,
-            final_config_revision: result.report.final_config_revision,
-            persistence: result.persistence,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum InteractionKindView {
     Approval {
@@ -742,50 +655,18 @@ impl From<&PendingInteraction> for PendingInteractionView {
     }
 }
 
-impl From<&SessionState> for SessionStateView {
-    fn from(state: &SessionState) -> Self {
-        Self {
-            session_id: state.session_id,
-            status: state.status,
-            active_loop: state.active_loop.as_ref().map(LoopStateView::from_runtime),
-            block_reason: state.block_reason,
-            compaction: state.compaction.clone(),
+impl From<minicore_runtime::LoopStatus> for LoopStatusView {
+    fn from(status: minicore_runtime::LoopStatus) -> Self {
+        match status {
+            minicore_runtime::LoopStatus::Starting => Self::Starting,
+            minicore_runtime::LoopStatus::RunningModel => Self::RunningModel,
+            minicore_runtime::LoopStatus::RunningTools => Self::RunningTools,
+            minicore_runtime::LoopStatus::WaitingForInput => Self::WaitingForInput,
+            minicore_runtime::LoopStatus::Finishing => Self::Finishing,
+            minicore_runtime::LoopStatus::Finished => Self::Finished,
+            _ => Self::Unknown,
         }
     }
-}
-
-impl LoopStateView {
-    pub(crate) fn from_runtime(loop_state: &minicore_runtime::LoopState) -> Self {
-        Self {
-            loop_id: loop_state.loop_id,
-            status: match loop_state.status {
-                minicore_runtime::LoopStatus::Starting => LoopStatusView::Starting,
-                minicore_runtime::LoopStatus::RunningModel => LoopStatusView::RunningModel,
-                minicore_runtime::LoopStatus::RunningTools => LoopStatusView::RunningTools,
-                minicore_runtime::LoopStatus::WaitingForInput => LoopStatusView::WaitingForInput,
-                minicore_runtime::LoopStatus::Finishing => LoopStatusView::Finishing,
-                minicore_runtime::LoopStatus::Finished => LoopStatusView::Finished,
-                _ => LoopStatusView::Unknown,
-            },
-            request_index: loop_state.request_index,
-            config_revision: loop_state.config_revision,
-            model: loop_state
-                .model
-                .as_ref()
-                .map(|model| model.as_str().to_owned()),
-            pending_interaction: loop_state
-                .pending_interaction
-                .as_ref()
-                .map(PendingInteractionView::from),
-        }
-    }
-}
-
-fn serialize_session_state<S: Serializer>(
-    state: &SessionState,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    SessionStateView::from(state).serialize(serializer)
 }
 
 fn is_false(value: &bool) -> bool {

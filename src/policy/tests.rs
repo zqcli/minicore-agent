@@ -10,9 +10,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::event::{AgentEvent, EventMeta};
+
 use crate::ids::SessionId;
-use crate::sessions::TurnRef;
 
 const KNOWN_TOOLS: &[&str] = &["read", "write", "edit", "apply_patch", "bash"];
 const MUTATING_TOOLS: &[&str] = &["write", "edit", "apply_patch", "bash"];
@@ -96,8 +95,8 @@ fn approval_from(decision: &ToolDecision) -> ApprovalRequest {
     }
 }
 
-fn serialized_approval_event(name: &str, request: ApprovalRequest) -> serde_json::Value {
-    let (session_id, loop_id) = ids();
+fn serialized_approval(name: &str, request: ApprovalRequest) -> serde_json::Value {
+    let (_, loop_id) = ids();
     let interaction = PendingInteraction {
         interaction_id: "int_00000000000000000000000000000001"
             .parse::<InteractionId>()
@@ -106,19 +105,10 @@ fn serialized_approval_event(name: &str, request: ApprovalRequest) -> serde_json
         tool_name: name.parse().unwrap(),
         kind: InteractionKind::Approval(request),
     };
-    let turn = TurnRef {
-        session_id,
+    serde_json::to_value(crate::sessions::SnapshotInteraction {
         loop_id,
-    };
-    serde_json::to_value(AgentEvent::InteractionRequested {
-        turn,
+        request_index: 0,
         interaction: (&interaction).into(),
-        meta: EventMeta {
-            session_id,
-            load: crate::test_support::load_id(),
-            loop_id: Some(loop_id),
-            dropped_before: 0,
-        },
     })
     .unwrap()
 }
@@ -160,14 +150,14 @@ async fn approval_prompt_debug_and_agent_wire_do_not_expose_arguments() {
         let decision = policy.decide(policy_request).await.unwrap();
         assert_approval(&decision, name);
         let approval = approval_from(&decision);
-        let event = serialized_approval_event(name, approval.clone());
+        let event = serialized_approval(name, approval.clone());
         let event_text = event.to_string();
         let decision_debug = format!("{decision:?}");
         let approval_debug = format!("{approval:?}");
         assert!(request_debug.contains("<redacted>"));
 
         assert_eq!(
-            event["data"]["interaction"]["kind"],
+            event["kind"],
             json!({
                 "type": "approval",
                 "data": {

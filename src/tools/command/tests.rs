@@ -1033,7 +1033,7 @@ impl ToolOwners {
         inner
             .workers
             .iter()
-            .filter(|worker| !worker.is_finished())
+            .filter(|worker| !worker.task.is_finished())
             .count()
     }
     #[cfg(test)]

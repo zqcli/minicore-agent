@@ -141,7 +141,7 @@ async fn pending_workspace_read_does_not_block_ping_cancel_or_shutdown() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "blocked turn"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     tokio::time::timeout(TIMEOUT, turn_started.notified())
         .await
         .expect("blocked model request did not start");
@@ -606,8 +606,8 @@ async fn workspace_status_answers_for_the_session_workspace() {
     harness
         .send(
             json!("history"),
-            "session.history",
-            Some(json!({"session_id": session, "offset": 0, "limit": 10})),
+            "session.read",
+            Some(json!({"session_id": session, "limit": 10})),
         )
         .await;
     assert_eq!(

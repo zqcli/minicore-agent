@@ -38,37 +38,6 @@ pub(super) struct StreamPush {
 }
 
 impl StreamWindow {
-    fn from_stored(stored: StoredStreamWindow, bytes: Option<Vec<u8>>, corrupt: bool) -> Self {
-        Self {
-            bytes: bytes.unwrap_or_default().into(),
-            start_offset: stored.start_offset,
-            observed_end: stored.observed_end,
-            seen: stored.seen,
-            complete: stored.complete,
-            truncated: stored.truncated,
-            expired: stored.expired,
-            corrupt,
-        }
-    }
-
-    fn merge_stored(&mut self, stored: Self) {
-        if !self.seen && !self.complete && self.observed_end == 0 {
-            *self = stored;
-        } else if self.expired || self.corrupt {
-            if (stored.seen || stored.complete) && !stored.expired && !stored.corrupt {
-                *self = stored;
-            } else if stored.corrupt {
-                self.corrupt = true;
-                if stored.observed_end > 0 {
-                    self.observed_end = stored.observed_end;
-                    self.start_offset = stored.start_offset;
-                }
-            }
-        } else if stored.complete {
-            self.complete = true;
-        }
-    }
-
     pub(super) fn snapshot(self) -> (StoredStreamWindow, Option<Vec<u8>>) {
         let (bytes, file_bytes, file_sha256) = snapshot_blob(self.bytes.into(), self.expired);
         (
@@ -158,21 +127,6 @@ impl StreamWindow {
         (self.start_offset, self.observed_end)
     }
 
-    /// The retained bytes from one raw offset, when that offset is still
-    /// inside the window.
-    pub(super) fn page(&self, offset: u64) -> Option<(&[u8], &[u8])> {
-        if offset < self.start_offset {
-            return None;
-        }
-        let index = usize::try_from(offset - self.start_offset).ok()?;
-        let (first, second) = self.bytes.as_slices();
-        if index < first.len() {
-            Some((&first[index..], second))
-        } else {
-            Some((second.get(index - first.len()..)?, &[]))
-        }
-    }
-
     pub(super) fn evict(&mut self) {
         self.bytes = VecDeque::new();
         self.start_offset = self.observed_end;
@@ -216,10 +170,6 @@ pub(crate) struct ToolRecord {
 }
 
 impl ToolRecord {
-    pub(crate) fn has_corrupt_streams(&self) -> bool {
-        self.input_corrupt || self.result_corrupt || self.stdout.corrupt || self.stderr.corrupt
-    }
-
     pub(crate) fn is_terminal(&self) -> bool {
         if !self.state.is_terminal() {
             return false;
@@ -229,177 +179,6 @@ impl ToolRecord {
         {
             return false;
         }
-        true
-    }
-
-    pub(crate) fn needs_stored(&self) -> bool {
-        self.is_terminal()
-            && (self.input_expired
-                || self.result_expired
-                || self.stdout.expired
-                || self.stderr.expired
-                || !self.input_seen
-                || !self.result_seen
-                || self
-                    .file_change
-                    .as_ref()
-                    .is_some_and(FileChange::needs_stored)
-                || self.has_corrupt_streams())
-    }
-
-    pub(crate) fn merge_stored(&mut self, stored: ToolRecord) -> bool {
-        // 1. Conflict checks: refuse merge on any identity or observed range conflict.
-        if self.name != stored.name {
-            return false;
-        }
-        if self.state.is_terminal() && stored.state.is_terminal() && self.state != stored.state {
-            return false;
-        }
-        if self.outcome.is_some() && stored.outcome.is_some() && self.outcome != stored.outcome {
-            return false;
-        }
-        if self.input_seen && stored.input_seen && self.input_total != stored.input_total {
-            return false;
-        }
-        if self.result_seen && stored.result_seen && self.result_total != stored.result_total {
-            return false;
-        }
-        let known = |stream: &StreamWindow| {
-            stream.seen || stream.complete || stream.expired || stream.observed_end > 0
-        };
-        for (memory, disk) in [
-            (&self.stdout, &stored.stdout),
-            (&self.stderr, &stored.stderr),
-        ] {
-            if known(memory) && known(disk) && memory.observed_end != disk.observed_end {
-                return false;
-            }
-        }
-        if self
-            .command
-            .as_ref()
-            .zip(stored.command.as_ref())
-            .is_some_and(|(memory, disk)| {
-                (
-                    memory.status,
-                    memory.exit_code,
-                    memory.signal,
-                    memory.termination_confirmed,
-                    memory.output_complete,
-                ) != (
-                    disk.status,
-                    disk.exit_code,
-                    disk.signal,
-                    disk.termination_confirmed,
-                    disk.output_complete,
-                )
-            })
-        {
-            return false;
-        }
-        if self
-            .file_change
-            .as_ref()
-            .zip(stored.file_change.as_ref())
-            .is_some_and(|(memory, disk)| memory.stored() != disk.stored())
-        {
-            return false;
-        }
-
-        if !self.input_seen && self.started_at.is_none() {
-            self.phase = self.phase.or(stored.phase);
-            self.started_at = stored.started_at;
-            if stored.finished_at.is_some() {
-                self.finished_at = stored.finished_at;
-            }
-        }
-
-        // 2. Input
-        if !self.input_seen {
-            if stored.input_seen {
-                self.input = stored.input;
-                self.input_total = stored.input_total;
-                self.input_seen = true;
-                self.input_truncated = stored.input_truncated;
-                self.input_expired = stored.input_expired;
-                self.input_corrupt = stored.input_corrupt;
-                self.subject = stored.subject;
-                self.subject_truncated = stored.subject_truncated;
-            }
-        } else if self.input_expired || self.input_corrupt {
-            if stored.input_seen && !stored.input_expired && !stored.input_corrupt {
-                self.input = stored.input;
-                self.input_total = stored.input_total;
-                self.input_truncated = stored.input_truncated;
-                self.input_expired = false;
-                self.input_corrupt = false;
-            } else if stored.input_corrupt {
-                self.input_corrupt = true;
-                self.input_total = stored.input_total;
-            }
-        }
-
-        // 3. Result
-        if !self.result_seen {
-            if stored.result_seen {
-                self.result = stored.result;
-                self.output_line_count = stored.output_line_count;
-                self.result_total = stored.result_total;
-                self.result_seen = true;
-                self.result_truncated = stored.result_truncated;
-                self.result_expired = stored.result_expired;
-                self.result_corrupt = stored.result_corrupt;
-            }
-        } else if self.result_expired || self.result_corrupt {
-            if stored.result_seen && !stored.result_expired && !stored.result_corrupt {
-                self.result = stored.result;
-                self.output_line_count = stored.output_line_count;
-                self.result_total = stored.result_total;
-                self.result_truncated = stored.result_truncated;
-                self.result_expired = false;
-                self.result_corrupt = false;
-            } else if stored.result_corrupt {
-                self.result_corrupt = true;
-                self.result_total = stored.result_total;
-            }
-        }
-
-        self.stdout.merge_stored(stored.stdout);
-        self.stderr.merge_stored(stored.stderr);
-
-        // 5. Command record
-        if self.command.is_none() {
-            if let Some(cmd) = stored.command {
-                self.command = Some(self.live_command(cmd));
-            }
-        } else if let Some(cmd) = self.command.take() {
-            self.command = Some(self.live_command(cmd));
-        }
-
-        // 6. File change snapshots. Metadata from memory wins; disk can only
-        // fill an evicted or corrupt blob for the same immutable change.
-        if self.file_change.is_none() {
-            self.file_change = stored.file_change;
-        } else if let (Some(memory), Some(mut disk)) =
-            (self.file_change.as_mut(), stored.file_change)
-        {
-            if memory.before_bytes.is_none() && !memory.before_corrupt {
-                memory.before_bytes = disk.before_bytes.take();
-                memory.before_corrupt = disk.before_corrupt;
-            }
-            if memory.after_bytes.is_none() && !memory.after_corrupt {
-                memory.after_bytes = disk.after_bytes.take();
-                memory.after_corrupt = disk.after_corrupt;
-            }
-        }
-
-        // 7. Recording state
-        if self.recording == ToolRecordingState::MemoryOnly
-            && stored.recording != ToolRecordingState::MemoryOnly
-        {
-            self.recording = stored.recording;
-        }
-
         true
     }
 
@@ -609,79 +388,6 @@ impl ToolRecord {
             || self.stdout.expired
             || self.stderr.expired;
         command
-    }
-
-    pub(crate) fn from_stored(
-        stored: StoredToolRecord,
-        (input_bytes, input_corrupt): (Option<Vec<u8>>, bool),
-        (result_bytes, result_corrupt): (Option<Vec<u8>>, bool),
-        (stdout_bytes, stdout_corrupt): (Option<Vec<u8>>, bool),
-        (stderr_bytes, stderr_corrupt): (Option<Vec<u8>>, bool),
-        (file_change_before, file_change_before_corrupt): (Option<Vec<u8>>, bool),
-        (file_change_after, file_change_after_corrupt): (Option<Vec<u8>>, bool),
-    ) -> Self {
-        let mut input_corrupt = input_corrupt;
-        let input = match input_bytes {
-            Some(bytes) => match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(_) => {
-                    input_corrupt = true;
-                    String::new()
-                }
-            },
-            None => String::new(),
-        };
-        let mut result_corrupt = result_corrupt;
-        let result = match result_bytes {
-            Some(bytes) => match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(_) => {
-                    result_corrupt = true;
-                    String::new()
-                }
-            },
-            None => String::new(),
-        };
-        let stdout = StreamWindow::from_stored(stored.stdout, stdout_bytes, stdout_corrupt);
-        let stderr = StreamWindow::from_stored(stored.stderr, stderr_bytes, stderr_corrupt);
-        let file_change = stored.file_change.map(|change| {
-            FileChange::from_stored(
-                change,
-                file_change_before,
-                file_change_before_corrupt,
-                file_change_after,
-                file_change_after_corrupt,
-            )
-        });
-        Self {
-            name: stored.name,
-            subject: stored.subject,
-            subject_truncated: stored.subject_truncated,
-            input,
-            input_total: stored.input.total_bytes,
-            input_seen: stored.input.seen,
-            input_truncated: stored.input.truncated,
-            input_expired: stored.input.expired,
-            input_corrupt,
-            output_line_count: (!result_corrupt && stored.result.seen && !stored.result.expired)
-                .then(|| crate::presentation::count_lines(&result)),
-            result,
-            result_total: stored.result.total_bytes,
-            result_seen: stored.result.seen,
-            result_truncated: stored.result.truncated,
-            result_expired: stored.result.expired,
-            result_corrupt,
-            state: stored.state,
-            phase: stored.phase,
-            started_at: stored.started_at,
-            finished_at: stored.finished_at,
-            outcome: stored.outcome,
-            stdout,
-            stderr,
-            command: stored.command,
-            file_change,
-            recording: ToolRecordingState::Saved,
-        }
     }
 }
 

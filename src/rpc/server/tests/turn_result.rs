@@ -27,7 +27,7 @@ async fn compact_saved_identity_survives_history_append_and_stateless_close_fall
             Some(json!({"session_id":session,"mode":"steer","text":"first"})),
         )
         .await;
-    let turn = first["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&first["result"]).await;
     harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     let page = harness
         .call_ok(
@@ -46,11 +46,9 @@ async fn compact_saved_identity_survives_history_append_and_stateless_close_fall
             Some(json!({"session_id":session,"mode":"steer","text":"second"})),
         )
         .await;
+    let next_turn = harness.turn_for_input(&next["result"]).await;
     harness
-        .call_ok(
-            "turn.wait",
-            Some(turn_params(&next["result"]["started"]["turn"])),
-        )
+        .call_ok("turn.wait", Some(turn_params(&next_turn)))
         .await;
     let after=harness.call_ok("turn.result",Some(json!({"session_id":session,"loop_id":turn["loop_id"],"cursor":cursor,"result_id":result_id,"max_bytes":1024}))).await;
     assert_eq!(after["result"]["result_id"], result_id);
@@ -98,8 +96,7 @@ async fn turn_result_reports_pending_and_stored_availability() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "wait"})),
         )
         .await;
-    let blocked_turn =
-        harness.response(json!("send-blocked")).await["result"]["started"]["turn"].clone();
+    let blocked_turn = harness.accepted_turn(json!("send-blocked")).await;
     tokio::time::timeout(TIMEOUT, model_started.notified())
         .await
         .expect("blocked model request must be started before querying its result");
@@ -141,8 +138,7 @@ async fn turn_result_reports_pending_and_stored_availability() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "persist"})),
         )
         .await;
-    let stored_turn =
-        harness.response(json!("send-stored")).await["result"]["started"]["turn"].clone();
+    let stored_turn = harness.accepted_turn(json!("send-stored")).await;
     harness
         .send(
             json!("wait-stored"),
@@ -177,9 +173,9 @@ async fn turn_result_reports_pending_and_stored_availability() {
 }
 
 #[tokio::test]
-async fn turn_result_can_continue_from_live_to_stored_items() {
+async fn turn_result_can_continue_after_the_loaded_session_closes() {
     let mut fixture = RpcFixture::new(
-        "turn-result-live-stored-pages",
+        "turn-result-loaded-cold-pages",
         [oversize()],
         &[],
         ApprovalMode::Auto,
@@ -195,7 +191,7 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "live"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
 
     let first = harness
@@ -209,7 +205,7 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
             })),
         )
         .await;
-    assert_eq!(first["result"]["availability"], json!("live"));
+    assert_eq!(first["result"]["availability"], json!("stored"));
     assert!(first["result"]["next_cursor"].is_object());
     let result_id = first["result"]["result_id"].clone();
     assert!(result_id.is_string());
@@ -268,7 +264,7 @@ async fn turn_result_can_continue_from_live_to_stored_items() {
 }
 
 #[tokio::test]
-async fn turn_result_reads_failed_live_report_without_history() {
+async fn turn_result_reads_retained_unsaved_source_without_history() {
     let mut fixture = RpcFixture::new(
         "turn-result-failed-append",
         [Step::Text("answer retained in memory")],
@@ -290,7 +286,7 @@ async fn turn_result_reads_failed_live_report_without_history() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "failed persistence"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["persistence"], json!("failed"));
 
@@ -427,7 +423,7 @@ async fn w0_rolled_back_result_remains_pageable_after_resume_without_entering_mo
             ),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     tokio::time::timeout(TIMEOUT, first_gate.wait_started())
         .await
         .unwrap();
@@ -443,8 +439,11 @@ async fn w0_rolled_back_result_remains_pageable_after_resume_without_entering_mo
     first_gate.release();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["result"]["persistence"], "failed");
-    assert!(waited["result"]["next"].is_null());
-    assert_eq!(waited["result"]["queue"]["paused"], true);
+    let state = harness
+        .call_ok("session.state", Some(json!({"session_id": session})))
+        .await;
+    assert_eq!(state["result"]["snapshot"]["execution"]["type"], "none");
+    assert_eq!(state["result"]["snapshot"]["queue"]["paused"], true);
 
     let first_page = harness
         .call_ok(
@@ -468,11 +467,8 @@ async fn w0_rolled_back_result_remains_pageable_after_resume_without_entering_mo
             w0_params(json!({"session_id": session}), load.as_ref()),
         )
         .await;
-    assert_eq!(
-        resumed["result"]["started"]["input"]["id"],
-        queued["result"]["id"]
-    );
-    let successor_turn = resumed["result"]["started"]["turn"].clone();
+    assert!(resumed["result"]["start_error"].is_null());
+    let successor_turn = harness.turn_for_input(&queued["result"]).await;
     tokio::time::timeout(TIMEOUT, second_gate.wait_started())
         .await
         .unwrap();
@@ -614,7 +610,7 @@ async fn w1_evicted_unsaved_result_expires_between_pages_and_rejects_stale_ident
             Some(json!({"session_id":session,"load":load,"mode":"steer","text":"first"})),
         )
         .await;
-    let first_turn = first["result"]["started"]["turn"].clone();
+    let first_turn = harness.turn_for_input(&first["result"]).await;
     tokio::time::timeout(TIMEOUT, first_gate.wait_started())
         .await
         .unwrap();
@@ -641,11 +637,8 @@ async fn w1_evicted_unsaved_result_expires_between_pages_and_rejects_stale_ident
             Some(json!({"session_id":session,"load":load})),
         )
         .await;
-    assert_eq!(
-        resumed["result"]["started"]["input"]["id"],
-        queued["result"]["id"]
-    );
-    let second_turn = resumed["result"]["started"]["turn"].clone();
+    assert!(resumed["result"]["start_error"].is_null());
+    let second_turn = harness.turn_for_input(&queued["result"]).await;
     tokio::time::timeout(TIMEOUT, second_gate.wait_started())
         .await
         .unwrap();
@@ -680,32 +673,26 @@ async fn w1_ten_successive_completions_remain_discoverable_beyond_late_wait_inde
             ),
         )
         .await;
-    let mut turn = first["result"]["started"]["turn"].clone();
-    let first_turn = turn.clone();
+    let first_turn = harness.turn_for_input(&first["result"]).await;
     tokio::time::timeout(TIMEOUT, gate.wait_started())
         .await
         .unwrap();
+    let mut receipts = vec![first["result"].clone()];
     for index in 0..9 {
-        harness.call_ok("input.push", w0_params(json!({"session_id":session,"mode":"follow_up","text":format!("queued-{index}")}), load.as_ref())).await;
+        let queued = harness.call_ok("input.push", w0_params(json!({"session_id":session,"mode":"follow_up","text":format!("queued-{index}")}), load.as_ref())).await;
+        receipts.push(queued["result"].clone());
     }
     gate.release();
-    let mut ids = Vec::new();
-    loop {
-        ids.push(turn["loop_id"].clone());
-        let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
-        if waited["result"]["next"].is_null() {
-            break;
-        }
-        turn = waited["result"]["next"]["turn"].clone();
-        assert!(ids.len() < 11);
-    }
+    let last_turn = harness.turn_for_input(receipts.last().unwrap()).await;
+    harness
+        .call_ok("turn.wait", Some(turn_params(&last_turn)))
+        .await;
     let state = harness
         .call_ok("session.state", Some(json!({"session_id":session})))
         .await;
     let entries = state["result"]["snapshot"]["completions"]["entries"]
         .as_array()
         .unwrap();
-    assert_eq!(ids.len(), 10);
     assert_eq!(
         state["result"]["snapshot"]["completions"]["through_seq"],
         10
@@ -713,12 +700,18 @@ async fn w1_ten_successive_completions_remain_discoverable_beyond_late_wait_inde
     assert_eq!(entries.len(), 10);
     for (index, entry) in entries.iter().enumerate() {
         assert_eq!(entry["seq"], index + 1);
-        assert_eq!(entry["loop_id"], ids[index]);
-        assert_eq!(
-            entry["next_loop_id"],
-            ids.get(index + 1).cloned().unwrap_or(Value::Null)
-        );
+        assert_eq!(entry["input_id"], receipts[index]["id"]);
     }
+    assert_eq!(entries[0]["loop_id"], first_turn["loop_id"]);
+    assert_eq!(entries[9]["loop_id"], last_turn["loop_id"]);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["loop_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        10
+    );
     let old = harness
         .call("turn.wait", Some(turn_params(&first_turn)))
         .await;
@@ -749,14 +742,14 @@ async fn w1_internal_worker_failure_registers_unavailable_completion_and_release
             ),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     let waited = harness.call("turn.wait", Some(turn_params(&turn))).await;
     assert_eq!(waited["error"]["data"]["kind"], "internal_error");
     let state = harness
         .call_ok("session.state", Some(json!({"session_id":session})))
         .await;
     let entry = &state["result"]["snapshot"]["completions"]["entries"][0];
-    assert_eq!(state["result"]["block_reason"], "internal");
+    assert_eq!(state["result"]["snapshot"]["block_reason"], "internal");
     assert_eq!(entry["completion_kind"], "internal_error");
     assert_eq!(entry["availability"], "unavailable");
     assert_eq!(entry["unavailable_reason"], "internal_error");
@@ -810,7 +803,7 @@ async fn w1_unknown_append_stays_blocked_and_uncertain_in_result_and_directory()
             ),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     tokio::time::timeout(TIMEOUT, gate.wait_started())
         .await
         .unwrap();
@@ -825,12 +818,13 @@ async fn w1_unknown_append_stays_blocked_and_uncertain_in_result_and_directory()
         .await;
     gate.release();
     let waited = harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
-    assert!(waited["result"]["next"].is_null());
-    assert_eq!(waited["result"]["queue"]["paused"], true);
+    assert_eq!(waited["result"]["persistence"], "failed");
     let state = harness
         .call_ok("session.state", Some(json!({"session_id":session})))
         .await;
-    assert_eq!(state["result"]["block_reason"], "persistence");
+    assert_eq!(state["result"]["snapshot"]["execution"]["type"], "none");
+    assert_eq!(state["result"]["snapshot"]["queue"]["paused"], true);
+    assert_eq!(state["result"]["snapshot"]["block_reason"], "persistence");
     let entry = &state["result"]["snapshot"]["completions"]["entries"][0];
     assert_eq!(entry["persistence"], "failed");
     assert_eq!(entry["persistence_uncertain"], true);
@@ -856,10 +850,12 @@ async fn w1_unknown_append_stays_blocked_and_uncertain_in_result_and_directory()
 }
 
 #[tokio::test]
-async fn an_evicted_uncertain_result_does_not_reappear_from_the_active_report_or_disk() {
+async fn an_evicted_uncertain_result_does_not_reappear_from_disk() {
+    let gate = Arc::new(Gate::new());
+    let _release = ReleaseGate(gate.clone());
     let mut fixture = RpcFixture::new(
         "uncertain-expired",
-        [Step::Text("answer")],
+        [Step::gated_text(gate.clone(), "answer")],
         &[],
         ApprovalMode::Auto,
     );
@@ -891,26 +887,45 @@ async fn an_evicted_uncertain_result_does_not_reappear_from_the_active_report_or
         })
         .await
         .unwrap();
-    let turn = pushed.started.unwrap().turn;
+    tokio::time::timeout(TIMEOUT, gate.wait_started())
+        .await
+        .unwrap();
+    let crate::sessions::SessionExecution::Running { loop_id, input, .. } =
+        session.sample().unwrap().execution
+    else {
+        panic!("the gated request must still be running")
+    };
+    assert_eq!(input.id, pushed.id);
+    let turn = crate::TurnRef {
+        session_id: info.session_id,
+        loop_id,
+    };
+    gate.release();
     let result = tokio::time::timeout(TIMEOUT, agent.wait_turn(turn))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(result.persistence, crate::TurnPersistence::Failed);
-    let prepared =
-        crate::read::prepare_result_source(&result.report.appended, result.interrupted.clone())
-            .unwrap();
+    let items = vec![minicore_runtime::HistoryItem::User(
+        minicore_runtime::history::UserHistory {
+            loop_id: turn.loop_id,
+            kind: minicore_runtime::history::UserMessageKind::Prompt,
+            input: minicore_runtime::execution::UserInput::text("first").unwrap(),
+        },
+    )];
+    let prepared = crate::read::prepare_result_source(&items, None).unwrap();
+    // A syntactically valid on-disk copy must not settle an unknown append.
     let record = crate::store::StoredLoopRecord {
         loop_id: turn.loop_id,
-        outcome: crate::event::LoopOutcomeView::from_report(&result.report),
-        items: result.report.appended.to_vec(),
-        usage: result.report.usage,
-        requests: result.report.requests,
-        tool_rounds: result.report.tool_rounds,
-        final_config_revision: result.report.final_config_revision,
+        outcome: result.outcome.clone(),
+        items,
+        usage: result.usage,
+        requests: result.requests,
+        tool_rounds: result.tool_rounds,
+        final_config_revision: result.final_config_revision,
         completed_at: "2026-10-31T00:00:00Z".into(),
         user_times: None,
-        interrupted: result.interrupted.clone(),
+        interrupted: None,
     };
     let mut bytes = serde_json::to_vec(&record).unwrap();
     bytes.push(b'\n');
@@ -1004,7 +1019,7 @@ async fn two_parked_result_preparations_leave_control_and_interactive_query_capa
             Some(json!({"session_id":session,"mode":"steer","text":"first"})),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     let loop_id: minicore_runtime::LoopId = turn["loop_id"].as_str().unwrap().parse().unwrap();
     let prepared = harness
@@ -1082,7 +1097,7 @@ async fn cold_identity_waiter_is_cancellable_and_close_cannot_retain_late_prepar
             })),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     let turn: crate::TurnRef = serde_json::from_value(turn).unwrap();
     let (_, source_revision) = store
@@ -1194,7 +1209,7 @@ async fn cancelled_result_waiters_keep_worker_slots_until_blocking_work_exits() 
             })),
         )
         .await;
-    let turn = pushed["result"]["started"]["turn"].clone();
+    let turn = harness.turn_for_input(&pushed["result"]).await;
     harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
     harness
         .call_ok("turn.result", Some(turn_params(&turn)))

@@ -1,12 +1,14 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.9.1 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.9.3 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
-Agent protocol version 2 requires load-scoped mutations and supplies reliable,
-versioned `session_snapshot` controls plus bounded completion discovery and
-result reads. JSON-RPC still uses envelope version `2.0`. Clients must check
-`agent.ping` before issuing mutations; protocol-v1 clients are not supported.
+Agent protocol version 3 uses load-scoped mutations, reliable versioned
+`session_snapshot` controls, bounded completion discovery, and independent result
+reads. Command receipts describe acceptance or operation results; only snapshots
+publish the current control projection. JSON-RPC still uses envelope version
+`2.0`. Clients must check `agent.ping` before issuing mutations; protocol-v1 and
+protocol-v2 clients are not supported.
 
 ## Transport And Framing
 
@@ -43,21 +45,21 @@ exhaust the budget. After sampling it shrinks to a conservative raw-plus-encoded
 encoding and DTO release it shrinks to encoded capacity, newline, and writer
 buffer allowance. It travels through the reliable mailbox and outbound queue
 until flush. Descriptor copies in snapshots count here, in addition to the
-catalog's 8 MiB owned-allocation bound. Ordinary compatibility/body lanes and
-legacy command responses retain their existing count bounds; this is not a
+catalog's 8 MiB owned-allocation bound. Ordinary lifecycle/body lanes and
+command responses retain their existing count bounds; this is not a
 process RSS limit or a bound on Rust clients retaining returned DTOs.
 
 A legal maximum snapshot contains 32 queued inputs and one execution input,
 each 256 KiB. Worst-case JSON control-character escaping costs six bytes per
 input byte: `33 * 262144 * 6 = 51,904,512` bytes. Add at most 8 MiB for the
-encoded request ID, 512 KiB for 256 complete descriptors, two copies of the
+encoded request ID, 512 KiB for 256 complete descriptors, one copy of the
 largest actionable tool-input interaction (8 KiB prompt and 32 1 KiB choices,
 with escaping), and 64 KiB for identities, keys, and envelope. This remains
 below 64 MiB including newline; approvals are smaller. The maximum-combination
-test encodes the complete state response, counts the notification envelope,
-and encodes the legacy push receipt with its full queue and started input.
-Commands do not duplicate a snapshot alongside legacy queue fields. Accepted
-text, prompts, choices, and identities are never truncated to fit.
+test encodes the complete snapshot response and notification, and verifies the
+acceptance receipt with the largest request ID. Input command responses contain
+no queued or execution input bodies. Accepted text, prompts, choices, and
+identities are never truncated to fit.
 
 ## Deferred Waiter Capacity
 
@@ -83,7 +85,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.1","protocol_version":2,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","session.history","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.3","protocol_version":3,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
 ```
 
 An error response has exactly one `error`:
@@ -115,8 +117,8 @@ owned tasks. This includes `agent.reload`, `session.list/create/open/close/delet
 `session.update/rename/compact`, `turn.wait`, an `input.push` or `input.resume`
 that starts a turn, and all read queries. Completed
 operations apply their results to the Agent on the dispatcher before replying.
-A push that starts a turn still returns an installed Turn without a startup
-summary worker.
+A push that starts a turn completes startup before returning its acceptance
+receipt; the resulting execution is discovered through the control snapshot.
 A read-query waiter observes a result
 but is not the worker owner. Workspace scan queries own one retained blocking worker and normally join
 it before returning; their Drop guard signals cooperative stop when the query
@@ -130,9 +132,9 @@ with `-32020`, but does not transfer or remove worker ownership.
 Clients correlate responses by `id` and events by Session and loop identifiers.
 The following orderings are not guaranteed:
 
-- an `input.push` response before the corresponding `turn_started` event;
-- a `turn_finished` event before the corresponding `turn.wait` response;
-- the final `output_delta` or Tool event before `turn_finished`;
+- an `input.push` response before a snapshot or body event for its turn;
+- a completion snapshot before the corresponding `turn.wait` response;
+- the final `output_delta` or Tool event before a completion snapshot or waiter;
 - any deferred response before responses to later requests. Wait for the response
   before sending a request that depends on that operation completing.
 
@@ -141,12 +143,13 @@ turn. Turn completion starts no compaction operation and publishes no automatic
 result in `last_result`. Settling an existing turn-start or emergency projection
 still belongs to the turn's owned worker; close and the next turn start join it.
 
-Output deltas and compatibility notifications are best effort and may be
+Output deltas and lifecycle notifications are best effort and may be
 dropped under pressure. `session_snapshot` is the reliable control exception:
 one dirty mark per loaded instance coalesces changes, and publication rotates
-in batches of at most 16 loads. Runtime observers sample their initial value,
-observe final completion independently of sender lifetime, and are joined by
-the owning loop/close barrier. Control publication can wait for transport
+in batches of at most 16 loads. The turn driver subscribes to Runtime state,
+observes the initial value, and services watch changes alongside events and
+Runtime join. Join ends the watch subscription without waiting for sender
+closure; the driver marks the final transition even if join wins that race. Control publication can wait for transport
 capacity without blocking model/tool execution. Close queues its final joined
 control state before unregistering the instance; writer failure ends the
 connection rather than silently discarding a final control.
@@ -169,7 +172,7 @@ outcome is not overwritten; `turn.cancel` still requests reason `user`.
 
 ## Method Index
 
-The current source dispatches exactly 36 methods. This is a navigation index;
+The current source dispatches exactly 35 methods. This is a navigation index;
 the sections below define the wire contract.
 
 ```text
@@ -177,7 +180,7 @@ agent.ping, agent.reload, agent.shutdown
 profile.list, model.list
 session.list, session.create, session.open, session.close, session.delete
 session.state, session.context, session.compact, session.compact.cancel
-session.update, session.rename, session.history, session.read, session.presentation
+session.update, session.rename, session.read, session.presentation
 workspace.read, workspace.files, workspace.search, workspace.status
 changes.list, changes.diff
 tool.read, tool.output
@@ -193,8 +196,8 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.9.1",
-  "protocol_version": 2,
+  "version": "0.9.3",
+  "protocol_version": 3,
   "capabilities": [
     "session.read",
     "session.read.display",
@@ -203,7 +206,6 @@ protocol version, and ordered capability names:
     "tool.read",
     "tool.read.display",
     "tool.output",
-    "session.history",
     "workspace.read",
     "workspace.files",
     "workspace.search",
@@ -390,17 +392,14 @@ Sessions, ping, cancellation, and shutdown remain responsive.
   partially deleted Session. Startup also removes recognized leftover metadata
   temp files; new temp names contain a random component rather than a restartable
   counter.
-- `session.state` takes a loaded Session ID and returns the current Session
-  state projection. While manual compaction is in progress, the optional
-  `compaction` member reports only its safe operation ID, phase, and item counts;
-  clients use its presence, rather than the ordinary loop `status`, to observe
-  compaction busy. Future Runtime statuses map to `unknown` in both Session and
-  active-loop status views. The same observation also carries `snapshot` with
-  `session_id`, `load`, monotonic `revision`, `execution`,
-  `pending_interaction`, `queue`, `compaction`, `block_reason` and
-  `completions`. Execution is `none`, `starting`, `running`, or `finishing`.
-  The completion directory is a contiguous retained suffix with `through_seq`,
-  `retained_from_seq`, `entries` and `truncated`; it is not persisted.
+- `session.state` takes a loaded Session ID and returns `{"snapshot": ...}`.
+  The snapshot contains `session_id`, `load`, monotonic `revision`, `execution`,
+  `pending_interaction`, `queue`, `compaction`, `block_reason`, and `completions`.
+  Execution is `none`, `starting`, `running`, or `finishing`; its Runtime phase
+  maps future values to `unknown`. During manual compaction, `compaction` carries
+  the safe operation ID, phase, and item counts. The completion directory is a
+  contiguous retained suffix with `through_seq`, `retained_from_seq`, `entries`,
+  and `truncated`; it is not persisted.
 
 Every mutation targeting a loaded instance includes its `load`: `input.push`,
 `input.remove`, `input.recall`, `input.resume`, `turn.cancel`,
@@ -423,9 +422,9 @@ continues to address the stored Session without a load.
   `session_busy`; reusing an operation ID yields non-retryable `invalid_state`. `session.update` is also
   rejected while it is owned by the Session, while metadata-only
   `session.rename` remains allowed. Inputs pushed meanwhile queue; when the
-  compaction ends, whatever its outcome, the queue head starts a turn. The
-  result carries that turn as `next` (a `StartedTurn`, or `null`; see
-  "0.9.0 input queue"), installed before the result is delivered.
+  compaction ends, whatever its outcome, an eligible queue head starts a turn.
+  The result contains only the compaction outcome; snapshots expose any claimed
+  input and successor execution.
 - `session.compact.cancel` takes the same full identity and returns
   `{"cancelled":true}` only when that exact operation is still owned. The identity
   and cancellation token are registered at admission, before deferred preparation;
@@ -696,7 +695,8 @@ The response also includes bounded `records` summaries with outcome, usage,
 request/tool counts, final config revision, and completion time. It contains
 only summaries for turns represented by at least one item chunk in this
 response; a small byte budget therefore does not inherit summaries for items
-that were not emitted. A record whose loop was cancelled while a model request was
+that were not emitted. A loop's presence in `records` does not mean this page
+contains its complete body. A record whose loop was cancelled while a model request was
 streaming may carry `interrupted`, described under [Interrupted
 replies](#interrupted-replies). `history_revision` is a SHA-256 of the
 captured complete prefix ending at `captured_end`. Continuation requests must
@@ -791,7 +791,12 @@ revision binds the display format, home-path abbreviation, and summary
 body/coverage; a new summary is
 rejected by an old pin even when JSONL did not change. Chunk offsets belong to
 that projection only. Tool metadata is derived only from the captured prefix,
-never from newly appended results beyond it.
+never from newly appended results beyond it. Tool relationships are derived
+from each selected complete loop, including counterparts outside the requested
+page; unrelated history is not projected. Loaded display reads seek through
+the Store index, while cold reads still validate the full captured prefix for
+summary anchors and off-page corruption. User timestamps prefer the loaded
+acceptance map and otherwise use the stored record.
 
 Display item envelopes carry `display: true` and `tool_summaries`; tool-call
 arguments and tool-result output are omitted. Each summary carries the full
@@ -904,67 +909,25 @@ an empty line inside a hunk is empty context, as if its leading space were prese
 Paths, hunk ranges, source text, and newline markers must still match exactly:
 there is no fuzzy matching, multi-file patching, rename, or binary patch support.
 
-## History
-
-### `session.history`
-
-```json
-{"session_id":"ses_...","offset":0,"limit":100}
-```
-
-`offset` defaults to 0. `limit` defaults to 100 and must be in `1..=100`. Items
-are returned in stored history order with contiguous indexes.
-
-```json
-{
-  "items": [
-    {"index": 0, "item": {"type": "user", "data": {"kind": "prompt", "loop_id": "lup_...", "text": "Fix the parser", "timestamp": "2026-01-02T03:04:05.006Z"}}}
-  ],
-  "next_offset": null,
-  "total": 2
-}
-```
-
-`next_offset` is the offset of the next page, or `null` when the page is the
-last. Every `loop_id` refers to the runtime loop that produced the item.
-
-Item types and their `data`:
-
-- `user`: `kind` (prompt or steering), `loop_id`, `text`, and optional
-  `timestamp` (the Agent acceptance time in RFC3339; absent for old JSONL or an
-  unavailable clock).
-- `assistant`: `loop_id`, `request_index`, `model`, `reasoning_level`, `text`,
-  `reasoning`, `tool_calls`, `finish_reason`, `usage`, and optional ordered
-  `parts`. `reasoning` contains visible reasoning text/summaries; opaque
-  provider fields (such as encrypted content) are never included. Each tool
-  call exposes only `tool_call_id`, `name`, `call_index`, and optional
-  whitelisted `display`; raw arguments are never present in the wire view.
-- `tool_result`: `loop_id`, `request_index`, `tool_call_id`, `tool_name`,
-  `outcome`, bounded `content`, and optional `content_truncated` when the
-  result exceeded the local display cap.
-
-The history view is sanitized: user text and tool results pass through, while
-tool arguments and opaque provider content never appear.
-
 ## Turns
 
 ### Inputs
 
 Each loaded Session has one ordered queue of user inputs owned by the Agent;
-"0.9.0 input queue" describes its rules. Four result shapes recur:
+"Input queue scheduling" describes its rules. Snapshot queue shapes are:
 
 ```json
 QueueItem   {"id":"inp_...","mode":"steer","text":"Fix the parser","accepted_at":"2026-01-02T03:04:05.006Z"}
 Queue       {"items":[QueueItem],"paused":false}
-StartedTurn {"turn":{"session_id":"ses_...","loop_id":"lup_..."},"input":QueueItem}
 ```
 
 `id` is an opaque string (`inp_` plus 32 hex digits today) assigned by the
 Agent; `mode` is `steer` or `follow_up`; `accepted_at` is the Agent acceptance
 time and is omitted when the clock was unavailable. `Queue.items` lists the
 entries in the order they run: steers first, then follow-ups, each group in
-acceptance order. `StartedTurn` is a turn the Agent started from the queue
-together with the entry that became its initial input.
+acceptance order. Snapshot execution and completion entries carry the input ID
+that started each turn; delivered steers appear in `input_delivered` and the
+turn's result/history.
 
 #### `input.push`
 
@@ -975,20 +938,24 @@ together with the entry that became its initial input.
 Accepts one input and returns:
 
 ```json
-{"session_id":"ses_...","load":"load_...","accepted":true,"id":"inp_...","accepted_at":"2026-01-02T03:04:05.006Z","started":StartedTurn|null,"start_error":null,"queue":Queue}
+{"session_id":"ses_...","load":"load_...","accepted":true,"id":"inp_...","accepted_at":"2026-01-02T03:04:05.006Z","start_error":null}
 ```
 
-`started` is the turn this push started, if any: an idle Session (not paused,
-not blocked, no manual compaction running, no turn active or starting) starts a
-turn at once with the queue head, which is the pushed entry unless older
-entries wait. Otherwise the entry stays queued and `started` is `null`. The
-text must be non-empty and within the user-input byte limit, otherwise
+An idle Session (not blocked, no manual compaction running, no turn active or
+starting) starts a turn with the queue head, which is the pushed entry unless
+older entries wait. Otherwise the accepted entry stays queued. The receipt
+contains no execution or queue projection; snapshots show the current queue
+and associate each turn with the ID of its initial input. The text must be non-empty and
+within the user-input byte limit, otherwise
 `-32602`. A Session with 32 queued entries refuses the push with `-32024`
 (`input_queue_full`); a blocked Session with `-32004`; a closing one with
 `-32003`. A push while the queue is paused also clears the pause.
 
 A push that starts a turn is deferred like other operations that start work and
 cannot overlap `agent.reload`. A push that only queues is answered at once.
+If a completed turn still owns projection or auxiliary-write cleanup, a new
+claim joins that driver before starting its turn; the receipt can wait for this
+tail even though the predecessor's `turn.wait` has already resolved.
 An accepted push whose claimed head fails to start remains a successful receipt;
 `start_error` contains that head's `input_id`, safe `kind` and `message`. The
 head may be older than the newly accepted input. Push errors carry
@@ -1001,7 +968,7 @@ must not be automatically resent.
 {"session_id":"ses_...","load":"load_...","id":"inp_..."}
 ```
 
-Removes one queued entry and returns `{"text":"...","queue":Queue}`. An entry
+Removes one queued entry and returns `{"text":"..."}`. An entry
 that was already handed to a running turn or started a turn, or never existed,
 fails with `-32025` (`input_not_queued`).
 
@@ -1011,7 +978,7 @@ fails with `-32025` (`input_not_queued`).
 {"session_id":"ses_...","load":"load_..."}
 ```
 
-Removes every queued entry and returns `{"texts":["..."],"queue":Queue}` with
+Removes every queued entry and returns `{"texts":["..."]}` with
 the texts in run order. It also clears the pause.
 
 #### `input.resume`
@@ -1021,7 +988,7 @@ the texts in run order. It also clears the pause.
 ```
 
 Clears the pause and starts the queue head if the Session can start. Returns
-`{"started":StartedTurn|null,"start_error":null|object,"queue":Queue}`. A blocked Session fails with
+`{"start_error":null|object}`. A blocked Session fails with
 `-32004`.
 
 #### `input.list`
@@ -1030,7 +997,8 @@ Clears the pause and starts the queue head if the Session can start. Returns
 {"session_id":"ses_..."}
 ```
 
-Returns the current `Queue`.
+Returns the current `Queue` as an explicit query. UI control state is installed
+from snapshots; this response is not a versioned control observation.
 
 ### `turn.wait`
 
@@ -1050,19 +1018,20 @@ response arrives:
   "requests": 2,
   "tool_rounds": 1,
   "final_config_revision": 0,
-  "persistence": "persisted",
-  "next": null,
-  "queue": {"items": [], "paused": false}
+  "persistence": "persisted"
 }
 ```
 
-`next` is the successor turn the Agent started from the queue when this turn
-ended (a `StartedTurn`, see "Inputs"), or `null`. The successor is installed
-before this response is sent, so a client waits on `next.turn` without any race.
-`queue` is the Session's queue when the response is prepared. A turn that ended
-`cancelled` or `failed`, or whose persistence failed, starts no successor and
-leaves a non-empty queue paused. A turn that a successor replaced can still be
-waited on while at most four newer turns of the same busy period exist.
+`turn.wait` returns only this turn's terminal summary. The same lightweight
+`TurnResult` is returned by the Rust API; it owns no Runtime report or body.
+Completion registration precedes waiter resolution. Auxiliary writes and
+projection settlement may still be running, and an eligible successor can
+start after the waiter resolves. Snapshots expose queue and successor state.
+A turn that ended `cancelled` or `failed`, or whose persistence failed, starts
+no successor and leaves a non-empty queue paused. Four replaced terminal
+summaries remain available for late waits; older waits return `turn_not_found`.
+The independent completion directory and result reads have their own retention
+contracts and do not depend on this late-wait index.
 
 `outcome.type` is `completed`, `cancelled` (with `reason`), `failed` (with
 `kind` and optionally `model_error`), or `unknown` for a future Runtime outcome.
@@ -1070,14 +1039,14 @@ Cancellation reasons are `user`, `owner_dropped`, `shutdown`, `deadline`, or
 `unknown` for a future Runtime reason. `persistence` is `persisted` or `failed`.
 `model_error` carries `kind`, `delivery`, `retryable`, `retry_after_millis`, and
 `provider` (see "0.8.1 Additive Metadata"). The same object appears in
-`turn.wait`, `turn_finished`, `turn.result`, and `session.read` records.
+`turn.wait`, `turn.result`, and `session.read` records.
 `persistence: persisted` means the Agent's history append and `sync_data`
 completed. Metadata/summary replacements sync the parent directory after rename;
 creating a Session and repairing a partial history tail are also synced. A valid
 final record lacking only its newline is retained with a restored newline; other
 incomplete tails are truncated. Read-only queries never perform these repairs.
 These writes are not a transaction across all Session files. A failed JSONL append
-returns the completed loop report with `persistence: failed` and leaves committed
+returns the terminal summary with `persistence: failed` and leaves committed
 in-memory history unchanged. If the record was rejected before writing, or a
 failed write was rolled back to the previous length and synced, the Session
 remains usable. Only a failed rollback leaves an uncertain append outcome and
@@ -1100,9 +1069,10 @@ An uncertain failed turn may be present on disk after reopening.
 `turn.result` returns a bounded page using the same sanitized JSON item chunks
 and `1..=100`/`1..=1 MiB` budget rules as `session.read`. Its item envelope
 intentionally omits the session User timestamp, so a page sequence remains
-stable if a retained live result later falls back to its stored record.
-`availability` is `pending` until Agent completion, `live` for a readable
-in-memory result, `stored` for an exact durable record, or `unavailable` with
+stable across loaded and cold reads of the same committed result.
+`availability` is `pending` until Agent completion, `live` for a retained unsaved
+result, `stored` for a committed result (including immediately after completion
+while its Session is loaded), or `unavailable` with
 `unavailable_reason` (`expired`, `too_large`, `resource_limit`, `internal_error`,
 or `not_retained`). `persistence_uncertain` identifies an uncertain append in
 the current load; it is not inferred from bytes on disk. Pending and unavailable
@@ -1131,13 +1101,13 @@ without changing its outcome or persistence. A single source over 64 MiB is
 resurrects an expired source. An uncertain current-load append is never promoted
 to persisted from disk bytes, even after its descriptor is evicted.
 
-These budgets do not bound Runtime execution, committed history, existing wait
-references or Arcs held by Rust callers. An active completion retains its full
-report until cleanup/close or replacement. Up to four replaced completions keep
-the late-wait API working; eviction drops their receiver outside the business
-locks. Registered waiters and the driver may also hold reports through delivery
-and settlement. External Rust callers own their returned Arcs and event DTOs;
-Agent cannot reclaim those references. Embedded callers that take the event
+These budgets do not bound Runtime execution, committed history, or Arcs held
+by Rust callers. Active and late-wait completion values contain only small
+terminal summaries. The driver holds the Runtime report through normalization,
+persistence, and tail settlement, then releases it. Body ownership belongs to
+committed history/Store or the bounded unsaved-source catalog. External Rust
+callers own their returned Arcs and event DTOs; Agent cannot reclaim those
+references. Embedded callers that take the event
 stream must drain it concurrently with close/shutdown: a reliable final control
 can wait for transport capacity. If no event stream is taken, Agent keeps only
 dirty marks and does not start snapshot publication or wait for a consumer.
@@ -1145,7 +1115,7 @@ Unregistration seals sampling before removing the catalog; late sampling of the
 old instance fails with `stale_load` rather than resetting its completion
 watermark.
 Unsaved pages reuse their immutable prepared item strings without renormalizing
-the turn. Live/durable fallback reads use a borrowed canonical projection,
+the turn. Committed reads use a borrowed canonical projection,
 stream the full identity hash on a blocking worker, and encode only a page-sized
 item prefix (plus the item that crosses that bound). They do not rebuild a full
 normalized history copy on every page or retain a second saved body cache.
@@ -1893,8 +1863,9 @@ ties by Loop ID, request index, then Tool Call ID. Legacy records without a
 canonical UTC-millisecond timestamp come first in that same identity order;
 the storage format does not preserve their original observation sequence.
 Live records without a durable timestamp follow the disk-only records while
-preserving their in-memory relative order. Workspace ordering remains by
-`change_ref`. Ordering is part of the continuation fingerprint.
+preserving their in-memory relative order. Workspace records are sorted by
+path, with the encoded reference as a deterministic tie-breaker. Ordering is
+part of the continuation fingerprint.
 
 Loaded lists still scan durable metadata: a complete in-memory snapshot does
 not prove that older or evicted records are absent from disk. This also keeps
@@ -1904,7 +1875,16 @@ durable metadata changes visible to continuation validation.
 {
   "scope": "session",
   "records": [{
-    "change_ref": "tool:<sha256>",
+    "change_ref": {
+      "kind": "tool",
+      "tool_ref": {
+        "session_id": "ses_...",
+        "loop_id": "lup_...",
+        "request_index": 0,
+        "tool_call_id": "call_..."
+      },
+      "revision": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
     "path": "src/main.rs",
     "kind": "modified",
     "origin": "tool",
@@ -1967,15 +1947,28 @@ actual compared versions with `versions_refreshed: true`.
 
 ### `changes.diff`
 
-`changes.diff` returns one bounded, read-only comparison for a retained
-`tool:` change reference or a `workspace:` reference from `changes.list`. A
-tool reference compares the real captured before/after buffers; a workspace
-reference compares Git objects and the worktree as described below.
+`changes.diff` returns one bounded, read-only comparison for a structured
+`change_ref` from `changes.list`. A `kind: "tool"` reference contains the exact
+`tool_ref` and a SHA-256 `revision` of the captured change metadata; a
+`kind: "workspace"` reference contains `session_id`, the list-time `head_oid`,
+and the observed status `entry`. Tool references compare captured before/after
+buffers; workspace references compare Git objects and the worktree.
 
 ```json
 {
   "session_id": "ses_...",
-  "change_ref": "workspace:<opaque-token-from-changes.list>",
+  "change_ref": {
+    "kind": "workspace",
+    "session_id": "ses_...",
+    "head_oid": "0123456789012345678901234567890123456789",
+    "entry": {
+      "path": "src/main.rs",
+      "kind": "ordinary",
+      "index_status": "M",
+      "worktree_status": ".",
+      "original_path": null
+    }
+  },
   "comparison": "head_to_index",
   "context_lines": 3,
   "cursor": null,
@@ -1983,15 +1976,14 @@ reference compares Git objects and the worktree as described below.
 }
 ```
 
-A `tool:` reference is resolved with an in-memory change when the Session is
-loaded, and otherwise through the same bounded metadata scan as `changes.list`;
-only the matched record's snapshots are read. A warm change with retained bytes
-answers without disk I/O, and a warm record missing bytes is only completed
-from disk when the disk metadata is identical, so a different revision is never
-substituted. An unknown reference is `tool_not_found`. A cold `tool:` diff is
-resolved without loading the Session or its Workspace. A `workspace:` reference,
-by contrast, requires the Session to be loaded because its sources come from the
-Session's Workspace; an unloaded Session is `session_not_loaded`.
+A tool reference addresses one in-memory record or one durable ToolRef directly;
+it does not scan all tool metadata to discover the record. The stored or warm
+change must match the supplied revision. A warm change with retained bytes
+answers without disk I/O; missing sides may be filled only from identical disk
+metadata. A mismatched or unknown reference is `tool_not_found`. A cold tool
+diff does not load the Session or Workspace. A workspace reference requires the
+Session to be loaded because its sources come from the canonical Workspace;
+an unloaded Session is `session_not_loaded`.
 
 The tool comparison is `comparison: "tool_before_after"` over the actual
 captured before and after buffers, never Git `HEAD`. A missing before is a
@@ -1999,20 +1991,17 @@ genuine addition (`base_version: {"kind":"missing"}`). `unknown`, expired, or
 corrupt snapshots report `availability: "unavailable"`; NUL or invalid UTF-8
 reports `binary: true` with no hunks.
 
-A `workspace:` reference is an opaque base64url token that only `changes.list`
-mints and `changes.diff` decodes. Clients must not parse or construct it. It
-carries the Session, the list-time `HEAD` OID, and the observed status entry.
-
-This token replaces the earlier hashed form, a development-protocol change with
-no Runtime version bump: a saved `workspace:` reference from before that change
-must be re-listed, and a reference's long-term liveness is not promised because
-it pins a list-time `HEAD` OID and status entry. The diff compares real Git
-objects and the worktree, never a list-time cached content:
+Clients round-trip the complete reference from `changes.list`. A tool revision
+pins metadata, and a workspace reference pins its list-time HEAD and status
+entry. Cross-session references and malformed revisions, OIDs, status fields,
+or paths fail validation before reading. An unborn HEAD uses an empty
+`head_oid`. References do not promise long-term liveness. The diff compares
+real Git objects and the worktree, never list-time cached content:
 
 - `comparison` defaults to `index_to_worktree` when the entry has an unstaged
   change or is untracked, otherwise `head_to_index`. An explicit `comparison`
   must be `head_to_index`, `index_to_worktree`, or `head_to_worktree`; a
-  `tool:`/`tool_before_after` mismatch is rejected as invalid arguments.
+  reference-kind/comparison mismatch is rejected as invalid arguments.
 - The three sides are read each query with fixed, shell-free, read-only Git
   arguments: `ls-files --stage -z` for the index OID, `ls-tree -z <head>` for
   the `HEAD` OID, and `cat-file blob <oid>` for object bytes; the worktree side
@@ -2047,8 +2036,8 @@ context, and hunk/line/offset; `base_version` and `target_version` are carried
 by the result. A different diff returns `stale: true` instead of continuing a
 new comparison under an old cursor. A start tuple that is not a real position
 inside the plan (a hunk/line index past its range, a byte offset past the line,
-or a non-UTF-8-boundary offset) is rejected as invalid arguments. Cursors do
-not contain a `tool_ref` lookup hint; clients must return the cursor as issued.
+or a non-UTF-8-boundary offset) is rejected as invalid arguments. The cursor
+repeats the structured reference; clients must return it unchanged.
 
 Alignment is deterministic: common leading and trailing lines are trimmed,
 then Myers runs without an algorithm deadline when the remaining middle has
@@ -2073,8 +2062,8 @@ ToolRef remains an independent segment; same-file aggregation is not performed.
 
 ### `interaction.answer`
 
-Give one answer to a pending interaction surfaced through `session.state` or an
-`interaction_requested` event:
+Give one answer to the `pending_interaction` in a current control snapshot
+received from `session.state` or `session_snapshot`:
 
 ```json
 {
@@ -2090,30 +2079,9 @@ Give one answer to a pending interaction surfaced through `session.state` or an
 
 ## Session State
 
-`session.state` returns this object directly; the `session_state` event carries
-it under `params.data.state`.
-
-```json
-{
-  "session_id":"ses_...",
-  "status":"running",
-  "active_loop":null,
-  "block_reason":null
-}
-```
-
-`status` is `idle`, `running`, `waiting_for_input`, `finishing`, `blocked`, or
-`unknown` for a future Runtime status.
-`active_loop` is null when idle or after a turn completes; otherwise it carries
-`loop_id`, `status`, `request_index`, `config_revision`, `model`, and
-`pending_interaction`. `block_reason` is `persistence` or `internal` when the
-Session is blocked, else null. `session.state` additionally contains `snapshot`;
-the best-effort `session_state` event retains its existing shape.
-
-Mapping: no active loop and not blocked is `idle`; a blocked Session is
-`blocked`; a running loop maps to `running`; a loop awaiting input maps to
-`waiting_for_input`; runtime-finishing but agent-persistence-incomplete maps to
-`finishing`; once agent completion is published the Session is `idle` again.
+`session.state` returns `{"snapshot": SessionSnapshot}`. The `session_snapshot`
+notification carries the same object under `params.data.snapshot`. Clients apply
+these observations through one version-checked control-state entry point.
 
 ### Versioned Control Snapshot
 
@@ -2163,10 +2131,11 @@ an open/create response selects the instance.
 `interaction_id`, `tool_call_id`, `tool_name`, and `kind`. The kind retains the
 existing tagged `approval` or `tool_input` actionable content (prompt/risk or
 prompt/choices/answer_kind). It comes from the same single Runtime observation
-as execution, so answering does not depend on receiving a Tool card. Existing
-`compaction` and `block_reason` shapes remain unchanged. `queue.paused` is the
-only pause fact. Legacy labels and command queues are not independent control
-writers; new clients replace the complete control projection from a snapshot.
+as execution, so answering does not depend on receiving a Tool card.
+`compaction` contains a safe operation ID, phase, and item counts when manual
+compaction is owned. `block_reason` is `persistence`, `internal`, or null.
+`queue.paused` is the only pause fact. Clients replace the complete control
+projection from a snapshot; command receipts and body events do not update it.
 
 `completions.entries` contains the whole retained continuous suffix in
 ascending `seq` order, not a last-event sample. Sequences start at 1.
@@ -2183,16 +2152,17 @@ ascending `seq` order, not a last-event sample. Sequences start at 1.
 | `persistence_uncertain` | Current-load append uncertainty, not inferred from disk bytes |
 | `availability` | `live`, `stored`, or `unavailable` |
 | `unavailable_reason` | `expired`, `too_large`, `resource_limit`, `internal_error`, or null when available |
-| `next_loop_id` | The direct successor actually installed at this completion boundary, or null |
 | `after_saved_loop_id` | Last committed predecessor anchor, or null |
 
 Descriptors contain no input/body/error text. `turn.result` and `turn.wait`
-supply full retained details. Body expiry changes availability without advancing
+supply retained body pages and terminal summaries, respectively. Body expiry
+changes availability without advancing
 `through_seq`. Metadata expiry removes only an oldest prefix and removes any
 otherwise-undiscoverable retained body. Outside the suffix, an absent durable
 record is `unavailable/not_retained`, not proof that the turn never existed.
-A snapshot showing B running already includes A's completion and decided
-availability when A installed B; a waiter cannot resolve before registration.
+A snapshot showing B running already includes A's registered completion and
+decided availability. A may be visible as completed before B is claimed or
+installed; a waiter cannot resolve before completion registration.
 The Agent never waits for a frontend ACK before executing an eligible successor.
 
 ## Events
@@ -2206,7 +2176,7 @@ then are attached exactly once. Drops after the last delivered event cannot be
 reported without a subsequent event.
 
 Reliable `session_snapshot` controls use a separate 64-entry lane, serviced
-before compatibility lifecycle and streaming events in bursts of at most eight.
+before lifecycle and streaming events in bursts of at most eight.
 After a full burst, a ready lifecycle event gets one opportunity before control
 priority resumes; continuous traffic on either lane cannot starve the other.
 Its producers wait or coalesce dirty marks rather than dropping controls, within
@@ -2214,13 +2184,13 @@ the control byte budget. Lifecycle events use another 64-entry queue. The config
 `event_capacity` bounds the streaming queue. Output deltas, Tool progress,
 process output chunks, and intermediate argument-preview revisions use
 streaming capacity. Preview start/first-input snapshots (revisions 1–2) and
-generated/discarded transitions use lifecycle capacity; other compatibility
-Session/compaction, turn/interaction, and terminal Tool notifications use that
-same best-effort lifecycle lane. Streaming floods cannot exhaust lifecycle
+generated/discarded transitions use lifecycle capacity; Session open/close,
+request/input, and terminal Tool notifications use that same best-effort
+lifecycle lane. Streaming floods cannot exhaust lifecycle
 capacity, but a lifecycle-only flood can still drop those notifications.
 
 Only the reliable control lane can wait for capacity; execution tasks merely
-mark dirty, and legacy/body sends remain non-blocking. Order is FIFO within a
+mark dirty, and lifecycle/body sends remain non-blocking. Order is FIFO within a
 lane, not across lanes: a terminal event can precede older queued deltas.
 Consumers must not infer execution order from cross-lane delivery or treat a
 zero drop count as proof that a completed body is complete.
@@ -2233,15 +2203,11 @@ Session lifecycle events:
 
 - `session_opened` (`session`, `meta`)
 - `session_closed` (`session_id`, `meta`)
-- `session_state` (`state`, `meta`); compatibility notification, not a control writer.
 - `session_snapshot` (`snapshot`, `meta`); reliable load/revision control, with
   `meta.loop_id: null` even when its execution carries a loop.
-- `input_queue` (`queue`, `meta`); the complete `Queue` whenever it changes.
-  `meta.loop_id` is null.
 
 Loop-scoped events:
 
-- `turn_started` (`turn`, `meta`)
 - `input_delivered` (`turn`, `items`, `meta`); a running turn took these queued
   steers at a request boundary, in order. Each item is
   `{"id","text","accepted_at","request_index"}`. The index is the request
@@ -2280,9 +2246,6 @@ Loop-scoped events:
 - `tool_finished` (`turn`, `request_index`, `tool_call_id`, `result`, `meta`);
   `result` contains `outcome`, `content_bytes`, and optional bounded `content`
   plus optional `content_truncated`.
-- `interaction_requested` (`turn`, `interaction`, `meta`)
-- `interaction_resolved` (`turn`, `interaction_id`, `meta`)
-- `turn_finished` (`turn`, `outcome`, `persistence`, `next`, `queue`, `meta`)
 
 ## Errors
 
@@ -2504,7 +2467,7 @@ it is omitted when unknown or empty:
 `kind`, `delivery`, `retryable`, and `retry_after_millis` keep their meaning and
 still drive client behavior; `provider` is for display.
 
-## 0.9.0 input queue
+## Input queue scheduling
 
 Agent 0.9.0 replaces `turn.send` and `turn.steer` with a per-session input
 queue (`input.push`, `input.remove`, `input.recall`, `input.resume`,
@@ -2530,10 +2493,10 @@ error `-32016`, and the `max_pending_steers` configuration key.
   persisted, the Agent starts the queue head (the oldest steer, else the
   oldest follow-up) as a new turn whose initial input is that entry (a
   `prompt` item); the remaining steers join its first request. Nothing waits on
-  a timer. The turn is installed before the finished turn's `turn.wait` (or the
-  compaction's `session.compact`) response is produced, so a client learns every
-  turn from RPC responses (`input.push`, `input.resume`, `turn.wait.next`,
-  `session.compact.next`) and never only from best-effort events.
+  a timer or frontend acknowledgement. Completion is registered before a
+  successor is installed. Clients discover execution and all retained completed
+  turns through reliable snapshots, including turns completed between samples.
+  A `turn.wait` response does not order successor startup.
 - **Pause.** A turn that ends `cancelled` or `failed`, or whose persistence
   failed, pauses a non-empty queue and leaves every entry in place. While
   paused nothing starts by itself. `input.resume` clears the pause and starts
@@ -2549,5 +2512,6 @@ error `-32016`, and the `max_pending_steers` configuration key.
   `-32003` until they are recalled.
 - A delivered or started input's `accepted_at` is its user timestamp in the
   history views. `mode` is not persisted.
-- A paused Session with no turn is `idle`; its `paused` flag is part of the
-  `Queue` (`input.list`, `input_queue`, and `session.state.snapshot`).
+- A paused Session with no turn has `execution.type: "none"`; its pause is
+  `snapshot.queue.paused`. `input.list` also exposes the queue for explicit
+  queries.

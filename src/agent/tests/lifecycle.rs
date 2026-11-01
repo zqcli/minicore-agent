@@ -4,10 +4,7 @@ use super::*;
 async fn next_non_control(events: &mut crate::AgentEventStream) -> AgentEvent {
     loop {
         let event = events.recv().await.expect("event stream ended");
-        if !matches!(
-            event,
-            AgentEvent::SessionSnapshot { .. } | AgentEvent::SessionState { .. }
-        ) {
+        if !matches!(event, AgentEvent::SessionSnapshot { .. }) {
             return event;
         }
     }
@@ -18,10 +15,7 @@ async fn next_non_control(events: &mut crate::AgentEventStream) -> AgentEvent {
 /// these lifecycle tests assert.
 fn only_control_pending(events: &mut crate::AgentEventStream) -> bool {
     while let Some(event) = events.try_recv() {
-        if !matches!(
-            event,
-            AgentEvent::SessionSnapshot { .. } | AgentEvent::SessionState { .. }
-        ) {
+        if !matches!(event, AgentEvent::SessionSnapshot { .. }) {
             panic!("unexpected non-control event: {event:?}");
         }
     }
@@ -40,15 +34,15 @@ async fn create_and_open_do_not_start_agent_loop() {
     assert!(agent.list_sessions().await.unwrap()[0].loaded);
 
     let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Idle);
-    assert!(state.active_loop.is_none());
+    assert_eq!(state.execution, crate::SessionExecution::None);
+    assert_eq!(state.execution, crate::SessionExecution::None);
 
     // Re-open from disk also starts no loop.
     let info2 = create_session(&mut agent, &workspace).await;
     agent.close_session(info2.session_id).await.unwrap();
     let reopened = agent.open_session(info.session_id).await.unwrap();
     let state = agent.session_state(reopened.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Idle);
+    assert_eq!(state.execution, crate::SessionExecution::None);
 }
 
 #[tokio::test]
@@ -499,12 +493,12 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
     let blocked_turn = send_text(&mut blocked_agent, blocked_info.session_id, "block").await;
     let result = wait_text(&blocked_agent, blocked_turn).await;
     assert_eq!(result.persistence, crate::sessions::TurnPersistence::Failed);
-    assert_eq!(
+    assert!(
         blocked_agent
             .session_state(blocked_info.session_id)
             .unwrap()
-            .status,
-        crate::sessions::SessionStatus::Blocked
+            .block_reason
+            .is_some()
     );
     let renamed_blocked = blocked_agent
         .rename_session(RenameSession {
@@ -514,12 +508,12 @@ async fn rename_serializes_with_busy_completion_and_preserves_a_blocked_session(
         .await
         .unwrap();
     assert_eq!(renamed_blocked.title.as_deref(), Some("Blocked title"));
-    assert_eq!(
+    assert!(
         blocked_agent
             .session_state(blocked_info.session_id)
             .unwrap()
-            .status,
-        crate::sessions::SessionStatus::Blocked
+            .block_reason
+            .is_some()
     );
 }
 
@@ -691,18 +685,15 @@ async fn a_push_during_a_running_turn_is_queued_and_never_starts_a_second_loop()
 
     let first = send_text(&mut agent, info.session_id, "first").await;
     let queued = push(&agent, info.session_id, InputMode::FollowUp, "second").await;
-    assert!(queued.started.is_none());
-    assert_eq!(queued.queue.items.len(), 1);
+    assert!(input_turn(&agent, info.session_id, &queued.id).is_none());
+    assert_eq!(agent.list_inputs(info.session_id).unwrap().items.len(), 1);
 
     gate.wait_started().await;
     gate.release();
     let result = wait_text(&agent, first).await;
     assert_persisted(&result);
-    // The follow-up became the successor turn, installed before the wait resolved.
-    let next = result.next.as_ref().expect("the follow-up starts a turn");
-    assert_eq!(next.input.id, queued.id);
-    assert_eq!(next.input.text, "second");
-    assert_eq!(wait_text(&agent, next.turn).await.next, None);
+    let next = wait_input(&agent, info.session_id, &queued.id).await;
+    assert_persisted(wait_text(&agent, next).await.as_ref());
 }
 
 #[tokio::test]
@@ -719,7 +710,7 @@ async fn basic_completion_persists_and_merges_history() {
     assert_completed(&result);
 
     // The history in memory and the durable JSONL agree.
-    let page = history_page(&agent, info.session_id, 100);
+    let page = history_page(&agent, info.session_id, 100).await;
     assert_eq!(page.total, 2);
     let stored = read_store_history(&data_dir, info.session_id).await;
     assert_eq!(stored.len(), 2);
@@ -728,5 +719,5 @@ async fn basic_completion_persists_and_merges_history() {
     assert!(texts.contains(&"done".to_owned()));
 
     let state = agent.session_state(info.session_id).unwrap();
-    assert_eq!(state.status, crate::sessions::SessionStatus::Idle);
+    assert_eq!(state.execution, crate::SessionExecution::None);
 }

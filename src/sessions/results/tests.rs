@@ -23,13 +23,46 @@ fn entry(loop_id: LoopId) -> CompletionEntry {
         persistence_uncertain: false,
         availability: ResultAvailability::Live,
         unavailable_reason: None,
-        next_loop_id: None,
         after_saved_loop_id: None,
     }
 }
 
 fn source(text: &str) -> PreparedSource {
-    PreparedSource::new(vec![text.to_owned()], None).unwrap()
+    PreparedSource::new(vec![text.to_owned()], None, TurnResult::for_test()).unwrap()
+}
+
+impl TurnResult {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            turn: TurnRef {
+                session_id: SessionId::new().unwrap(),
+                loop_id: LoopId::new().unwrap(),
+            },
+            outcome: LoopOutcomeView::Completed,
+            usage: minicore_runtime::model::Usage::default(),
+            requests: 1,
+            tool_rounds: 0,
+            final_config_revision: minicore_runtime::execution::ConfigRevision::INITIAL,
+            persistence: TurnPersistence::Failed,
+        }
+    }
+}
+
+impl ResultSource {
+    pub(crate) fn for_test(source: PreparedSource) -> Arc<Self> {
+        let catalog = ResultCatalog::new();
+        let load = crate::test_support::load_id();
+        catalog.register(load);
+        let charge = catalog.reserve(load, source.bytes).unwrap();
+        let reserved = catalog.finish_reservation(source, charge).unwrap();
+        Arc::new(Self {
+            items: reserved.source.items,
+            interrupted: reserved.source.interrupted,
+            result_id: reserved.source.result_id,
+            metadata: reserved.source.metadata,
+            _charge: reserved.charge,
+        })
+    }
 }
 
 #[test]

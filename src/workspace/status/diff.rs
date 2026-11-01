@@ -21,8 +21,14 @@ pub(crate) async fn diff_sources(
     child_cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<DiffSources, AgentError> {
-    let (head, entry) =
-        crate::changes::parse_workspace_ref(&request.change_ref, request.session_id)?;
+    let crate::changes::ChangeRef::Workspace {
+        head_oid: head,
+        entry,
+        ..
+    } = &request.change_ref
+    else {
+        return Err(AgentError::InvalidArguments);
+    };
     let mut sources = DiffSources {
         base: workspace_unavailable(request),
         bytes: None,
@@ -84,7 +90,7 @@ pub(crate) async fn diff_sources(
         Blob::Missing
     } else {
         let old_path = prefix.join(entry.original_path.as_ref().unwrap_or(&entry.path));
-        head_blob(&run, &head, &old_path).await?
+        head_blob(&run, head, &old_path).await?
     };
     let (before, version) = load_side(&run, old).await?;
     base.base_version = version;

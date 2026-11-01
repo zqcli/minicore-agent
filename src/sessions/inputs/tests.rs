@@ -41,7 +41,7 @@ async fn busy_session() -> (
 fn push(session: &Session, mode: InputMode, text: &str) -> InputPushed {
     let pending = session.accept_input(mode, text.to_owned()).unwrap();
     assert!(!pending.needs_start());
-    pending.finish(None)
+    pending.finish()
 }
 
 fn texts(queue: &Queue) -> Vec<&str> {
@@ -68,8 +68,7 @@ async fn the_queue_lists_steers_first_and_keeps_acceptance_order_within_a_mode()
     push(&session, InputMode::Steer, "n1");
     push(&session, InputMode::FollowUp, "f2");
     push(&session, InputMode::Steer, "s1");
-    let pushed = push(&session, InputMode::Steer, "n2");
-    assert_eq!(texts(&pushed.queue), ["n1", "s1", "n2", "f1", "f2"]);
+    push(&session, InputMode::Steer, "n2");
     assert_eq!(texts(&session.queue()), ["n1", "s1", "n2", "f1", "f2"]);
     let ids = session
         .queue()
@@ -181,13 +180,14 @@ async fn an_empty_queue_is_never_paused() {
     let only = push(&session, InputMode::FollowUp, "only");
     session.lock_queue().paused = true;
     assert!(session.queue().paused);
-    assert!(!session.remove_input(&only.id).unwrap().queue.paused);
+    session.remove_input(&only.id).unwrap();
+    assert!(!session.queue().paused);
 
     push(&session, InputMode::FollowUp, "again");
     session.lock_queue().paused = true;
     let recalled = session.recall_inputs();
     assert_eq!(recalled.texts, ["again"]);
-    assert!(!recalled.queue.paused);
+    assert!(!session.queue().paused);
     agent.shutdown().await.unwrap();
 }
 

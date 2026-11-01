@@ -85,8 +85,8 @@ async fn newest_exchange_reaches_assistant_verbatim_even_above_threshold() {
     gate.release();
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        result.outcome,
+        crate::event::LoopOutcomeView::Completed
     ));
     agent
         .loaded_session(info.session_id)

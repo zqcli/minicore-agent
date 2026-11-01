@@ -69,7 +69,7 @@ async fn fixture_uses_real_runtime_text_and_choice_validation_and_same_tool_outp
             json!({"session_id":session,"mode":"steer","text":"test"}),
         )
         .await;
-    let turn = pushed["started"]["turn"].clone();
+    let turn = process.turn_for_input(&pushed).await;
     let text = pending(&mut process, &session, "text").await;
     assert_eq!(text["loop_id"], turn["loop_id"]);
     assert_eq!(text["request_index"], 0);
@@ -212,9 +212,8 @@ async fn observer_without_fixture_opt_in_has_only_product_tools() {
             json!({"session_id":session["session_id"],"mode":"steer","text":"test"}),
         )
         .await;
-    process
-        .call_ok("turn.wait", turn_params(&pushed["started"]["turn"]))
-        .await;
+    let turn = process.turn_for_input(&pushed).await;
+    process.call_ok("turn.wait", turn_params(&turn)).await;
     process.shutdown().await;
     let requests = server.finish().await;
     assert!(

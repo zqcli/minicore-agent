@@ -163,10 +163,14 @@ async fn global_eviction_publishes_the_affected_load_without_another_local_chang
         persistence_uncertain: false,
         availability: ResultAvailability::Live,
         unavailable_reason: None,
-        next_loop_id: None,
         after_saved_loop_id: None,
     };
-    let source = PreparedSource::new(vec!["body".into()], None).unwrap();
+    let source = PreparedSource::new(
+        vec!["body".into()],
+        None,
+        crate::sessions::TurnResult::for_test(),
+    )
+    .unwrap();
     let charge = catalog.reserve(a.load(), 4096).unwrap();
     let source = catalog.finish_reservation(source, charge).unwrap();
     drop(catalog.insert(a.load(), entry.clone(), Some(source)));

@@ -6,24 +6,19 @@ pub(super) fn history_tool_refs(
     agent: &Agent,
     session_id: SessionId,
 ) -> Vec<crate::tool_data::ToolRef> {
-    let page = agent
-        .history(GetHistory {
-            session_id,
-            offset: 0,
-            limit: 100,
-        })
-        .unwrap();
-    page.items
+    agent
+        .loaded_session(session_id)
+        .unwrap()
+        .read_snapshot()
+        .history
         .iter()
-        .filter_map(|item| match &item.item {
-            crate::history::HistoryItemView::ToolResult(result) => {
-                Some(crate::tool_data::ToolRef {
-                    session_id,
-                    loop_id: result.loop_id,
-                    request_index: result.request_index,
-                    tool_call_id: result.tool_call_id.clone(),
-                })
-            }
+        .filter_map(|item| match item {
+            HistoryItem::ToolResult(result) => Some(crate::tool_data::ToolRef {
+                session_id,
+                loop_id: result.loop_id,
+                request_index: result.request_index,
+                tool_call_id: result.call_id.clone(),
+            }),
             _ => None,
         })
         .collect()
@@ -419,7 +414,9 @@ async fn tool_read_exposes_approval_time_data_without_running() {
             std::time::Duration::from_secs(2),
             "interaction event must arrive",
             |event| match event {
-                AgentEvent::InteractionRequested { interaction, .. } => Some(interaction),
+                AgentEvent::SessionSnapshot { snapshot, .. } => snapshot
+                    .pending_interaction
+                    .map(|pending| pending.interaction),
                 _ => None,
             },
         )
@@ -502,7 +499,6 @@ async fn i2_02_tool_execution_event_matches_the_tool_read_query() {
         match event {
             AgentEvent::ToolInvocation { data, .. } => invocation_event = Some(data),
             AgentEvent::ToolExecution { data, .. } => execution_event = Some(data),
-            AgentEvent::TurnFinished { .. } => break,
             _ => {}
         }
     }
@@ -744,12 +740,14 @@ async fn i2_06_first_request_observation_survives_runtime_start_binding() {
             .await
             .map_err(|_| "turn.wait timed out after Bash cancellation".to_owned())?
             .map_err(|error| format!("turn.wait failed: {error}"))?;
-        if result.report.outcome
-            != minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+        if result.outcome
+            != (crate::event::LoopOutcomeView::Cancelled {
+                reason: crate::event::CancelReasonView::User,
+            })
         {
             return Err(format!(
                 "unexpected cancelled turn outcome: {:?}",
-                result.report.outcome
+                result.outcome
             ));
         }
 

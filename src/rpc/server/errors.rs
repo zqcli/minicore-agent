@@ -33,11 +33,8 @@ where
     }
 }
 
-pub(super) fn accepted_input_response<T: Serialize>(
-    id: &RpcId,
-    result: Result<T, AgentError>,
-) -> RpcResponse {
-    let response = agent_result(id, result);
+pub(super) fn accepted_input_response<T: Serialize>(id: &RpcId, result: T) -> RpcResponse {
+    let response = success(id, result);
     if response.is_error() {
         response.unknown_input()
     } else {

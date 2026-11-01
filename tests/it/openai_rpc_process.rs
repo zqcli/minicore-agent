@@ -1,4 +1,5 @@
 use crate::support::config;
+use crate::support::control::{first_tool_ref, read_items};
 use crate::support::fixture::Fixture;
 use crate::support::openai_mock;
 use crate::support::responses::{completed, text_response};
@@ -325,14 +326,20 @@ async fn full_process_runs_openai_read_tool_loop_and_redacted_history() {
     process
         .send(
             "history",
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": session_id, "view": "display", "limit": 100}),
         )
         .await;
     let history = process.response("history").await;
-    assert!(!contains_key(&history["result"], "arguments"));
+    assert!(!contains_key(
+        &json!(read_items(&history["result"])),
+        "arguments"
+    ));
     let history_text = history.to_string();
-    assert!(history_text.contains("PROCESS-READ-CONTENT"));
+    let output = process
+        .tool_output_text(first_tool_ref(&history["result"]))
+        .await;
+    assert!(output.contains("PROCESS-READ-CONTENT"));
     assert!(history_text.contains("process final"));
     // The path is an explicitly permitted local-display detail; the raw
     // invocation object remains absent.
@@ -710,12 +717,15 @@ async fn process_reload_cumulatively_scrubs_previous_model_credentials_from_bash
     process
         .send(
             "existing-history",
-            "session.history",
-            json!({"session_id": existing_session, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": existing_session, "view": "display", "limit": 100}),
         )
         .await;
     let existing_history = process.response("existing-history").await;
-    assert_reload_environment_is_unset(&existing_history.to_string());
+    let output = process
+        .tool_output_text(first_tool_ref(&existing_history["result"]))
+        .await;
+    assert_reload_environment_is_unset(&output);
 
     process
         .send(
@@ -736,12 +746,15 @@ async fn process_reload_cumulatively_scrubs_previous_model_credentials_from_bash
     process
         .send(
             "new-history",
-            "session.history",
-            json!({"session_id": new_session, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": new_session, "view": "display", "limit": 100}),
         )
         .await;
     let new_history = process.response("new-history").await;
-    assert_reload_environment_is_unset(&new_history.to_string());
+    let output = process
+        .tool_output_text(first_tool_ref(&new_history["result"]))
+        .await;
+    assert_reload_environment_is_unset(&output);
 
     let (observed, stderr) = process.shutdown().await;
     let observed = serde_json::to_string(&observed).unwrap();
@@ -902,13 +915,16 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     process
         .send(
             "history",
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": session_id, "view": "display", "limit": 100}),
         )
         .await;
     let history = process.response("history").await;
     let history_text = history.to_string();
-    assert!(history_text.contains("PROCESS-REASONING-READ-CONTENT"));
+    let output = process
+        .tool_output_text(first_tool_ref(&history["result"]))
+        .await;
+    assert!(output.contains("PROCESS-REASONING-READ-CONTENT"));
     assert!(history_text.contains("reasoning process final"));
     assert!(!history_text.contains(ENCRYPTED_MARKER));
     assert!(!history_text.contains(OPAQUE_MARKER));
@@ -984,8 +1000,8 @@ async fn full_process_reasoning_replay_is_exact_in_http_and_private_everywhere_e
     reopened
         .send(
             "reopened-history",
-            "session.history",
-            json!({"session_id":session_id,"offset":0,"limit":100}),
+            "session.read",
+            json!({"session_id":session_id,"view":"display","limit":100}),
         )
         .await;
     let public = reopened.response("reopened-history").await.to_string();
@@ -1156,14 +1172,12 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
     process
         .send(
             "history",
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": session_id, "view": "display", "limit": 100}),
         )
         .await;
     let history = process.response("history").await;
-    let tool_result = history["result"]["items"]
-        .as_array()
-        .unwrap()
+    let tool_result = read_items(&history["result"])
         .iter()
         .find_map(|entry| {
             if entry["item"]["type"] == "tool_result" {
@@ -1174,11 +1188,11 @@ async fn full_process_bash_removes_model_credentials_and_preserves_public_enviro
         })
         .expect("history must contain the Bash tool result");
     assert_eq!(tool_result["outcome"], "success");
-    let tool_result_content = tool_result["content"]
-        .as_str()
-        .expect("Bash tool result content must be text");
-    assert_isolated_environment_probe(tool_result_content);
-    assert_process_bash_command_markers_absent(tool_result_content);
+    let tool_result_content = process
+        .tool_output_text(first_tool_ref(&history["result"]))
+        .await;
+    assert_isolated_environment_probe(&tool_result_content);
+    assert_process_bash_command_markers_absent(&tool_result_content);
     let history_text = history.to_string();
     assert_process_bash_secrets_absent(&history_text);
     process
@@ -1272,13 +1286,18 @@ async fn provider_error_message_reaches_the_outcome_but_not_stderr_or_unlisted_b
     process
         .send(
             "history",
-            "session.history",
-            json!({"session_id": session_id, "offset": 0, "limit": 100}),
+            "session.read",
+            json!({"session_id": session_id, "view": "display", "limit": 100}),
         )
         .await;
     let history = process.response("history").await;
-    assert!(!contains_key(&history["result"], "message"));
-    assert!(!history.to_string().contains(PROVIDER_MESSAGE));
+    let items = json!(read_items(&history["result"]));
+    assert!(!contains_key(&items, "message"));
+    assert!(!items.to_string().contains(PROVIDER_MESSAGE));
+    assert_eq!(
+        history["result"]["records"][0]["outcome"]["model_error"]["provider"],
+        waited["result"]["outcome"]["model_error"]["provider"]
+    );
     process
         .send(
             "missing",

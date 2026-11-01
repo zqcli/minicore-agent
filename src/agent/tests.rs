@@ -76,7 +76,6 @@ use minicore_runtime::{LoopId, ToolCallId};
 use crate::config::{AgentConfig, CompactionConfig};
 use crate::error::AgentError;
 use crate::event::{AgentEvent, OutputChannel};
-use crate::history::GetHistory;
 use crate::ids::SessionId;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::{ApprovalMode, Profile};
@@ -618,10 +617,7 @@ async fn push(
 
 #[track_caller]
 fn assert_completed(result: &crate::sessions::TurnResult) {
-    assert_eq!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
-    );
+    assert_eq!(result.outcome, crate::event::LoopOutcomeView::Completed);
 }
 
 #[track_caller]
@@ -632,15 +628,53 @@ fn assert_persisted(result: &crate::sessions::TurnResult) {
     );
 }
 
-#[track_caller]
-fn history_page(agent: &Agent, session_id: SessionId, limit: usize) -> crate::history::HistoryPage {
+async fn history_page(
+    agent: &Agent,
+    session_id: SessionId,
+    limit: usize,
+) -> crate::ReadSessionResult {
     agent
-        .history(GetHistory {
-            session_id,
-            offset: 0,
+        .read_session(ReadSession {
             limit,
+            ..display_read(session_id)
         })
+        .await
         .unwrap()
+}
+
+fn input_turn(agent: &Agent, session_id: SessionId, input_id: &str) -> Option<TurnRef> {
+    let snapshot = agent.session_state(session_id).unwrap();
+    let loop_id = match snapshot.execution {
+        crate::SessionExecution::Running { loop_id, input, .. }
+        | crate::SessionExecution::Finishing { loop_id, input, .. }
+            if input.id == input_id =>
+        {
+            Some(loop_id)
+        }
+        _ => snapshot
+            .completions
+            .entries
+            .iter()
+            .find(|entry| entry.input_id.as_deref() == Some(input_id))
+            .map(|entry| entry.loop_id),
+    }?;
+    Some(TurnRef {
+        session_id,
+        loop_id,
+    })
+}
+
+async fn wait_input(agent: &Agent, session_id: SessionId, input_id: &str) -> TurnRef {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(turn) = input_turn(agent, session_id, input_id) {
+                return turn;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted input must start")
 }
 
 async fn wait_text(agent: &Agent, turn: TurnRef) -> Arc<crate::sessions::TurnResult> {
@@ -678,17 +712,15 @@ impl Agent {
         session_id: crate::ids::SessionId,
         text: String,
     ) -> Result<TurnRef, AgentError> {
-        self.push_input(crate::agent::PushInput {
-            session_id,
-            mode: crate::agent::InputMode::Steer,
-            text,
-        })
-        .await?
-        .started
-        .map(|started| started.turn)
-        .ok_or(AgentError::SessionBusy)
+        let pushed = self
+            .push_input(crate::agent::PushInput {
+                session_id,
+                mode: crate::agent::InputMode::Steer,
+                text,
+            })
+            .await?;
+        input_turn(self, session_id, &pushed.id).ok_or(AgentError::SessionBusy)
     }
-
     pub(crate) fn wait_turn_receiver(
         &self,
         turn: TurnRef,

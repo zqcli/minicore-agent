@@ -340,7 +340,7 @@ struct OwnedWorker {
     /// waits, so a still-running owner is stopped even when the tool future
     /// that started it was not dropped through `CommandWorker::drop`.
     cancel: CancellationToken,
-    join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    task: crate::task::OwnedTask,
 }
 
 impl OwnedWorker {
@@ -348,24 +348,8 @@ impl OwnedWorker {
         Self {
             key,
             cancel,
-            join: tokio::sync::Mutex::new(Some(handle)),
+            task: crate::task::OwnedTask::new(handle),
         }
-    }
-
-    fn is_finished(&self) -> bool {
-        match self.join.try_lock() {
-            Ok(slot) => slot.as_ref().is_none_or(|handle| handle.is_finished()),
-            Err(_) => false,
-        }
-    }
-
-    async fn join(&self) {
-        let mut slot = self.join.lock().await;
-        let Some(handle) = slot.as_mut() else {
-            return;
-        };
-        let _ = Pin::new(handle).await;
-        slot.take();
     }
 }
 
@@ -434,7 +418,7 @@ impl ToolOwners {
     ) -> Result<(), ToolError> {
         let mut inner = self.inner.lock().unwrap();
         // Reap finished handles first, then refuse rather than exceed the cap.
-        inner.workers.retain(|worker| !worker.is_finished());
+        inner.workers.retain(|worker| !worker.task.is_finished());
         if inner.workers.len() >= MAX_TOOL_OWNERS {
             return Err(ToolError::Internal);
         }
@@ -481,13 +465,13 @@ impl ToolOwners {
             worker.cancel.cancel();
         }
         for worker in &workers {
-            worker.join().await;
+            let _ = worker.task.join().await;
         }
         self.inner
             .lock()
             .unwrap()
             .workers
-            .retain(|worker| !worker.is_finished());
+            .retain(|worker| !worker.task.is_finished());
     }
 
     /// Refuses new owners, requests every owner to stop, and waits for every

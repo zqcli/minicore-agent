@@ -45,11 +45,13 @@ recorded state. The final version must be the maximum observed version with
 current zero. The last enqueued gauge row need not describe the final state.
 
 `gauge` rows and final `counters` measure current/peak ownership transitions:
-Runtime watchers; charged source bytes/count (including evicted sources held by
-pages); catalog source bytes/count, metadata allocation charge/entries; control
+Runtime watch subscriptions owned by the turn driver; charged source bytes/count
+(including evicted sources held by pages); catalog source bytes/count, metadata
+allocation charge/entries; control
 staging reservations/bytes until flush; retained page refs and reference-weighted
-bytes; active owner objects, completion values, late-wait slots, actual wait
-receiver handles, driver report owners, prepared result queries, compact stored
+bytes; active owner objects, lightweight completion values, late-wait slots,
+actual wait receiver handles, transient driver report owners, prepared result
+queries, compact stored
 identity bytes/count, and transient page-prefix workspace bytes. Compact identity
 charges survive eviction until the last page reference; close prevents reinsertion.
 The index holds no committed body or interrupted text. These are
@@ -82,10 +84,12 @@ null fields and zero counts do not imply a completed empty body. Outcomes may
 finish in any order; at quiescence IDs 1..N occur exactly once and totals agree.
 No per-ID producer history is retained beyond the live Query.
 
-Active/completion/late-wait gauges describe Agent owner objects/slots, not
-unique report allocations. `report_refs` records actual Arc strong counts and
-labels history size as an estimate. Caller-retained Rust Arcs are outside Agent
-ownership. Gauge fields are sampled independently; compare gated/quiescent
+Active/completion/late-wait gauges describe Agent owner objects/slots. Completion
+and late-wait values retain terminal summaries, not Runtime reports. The driver
+report gauge lasts through persistence and tail settlement; the watcher gauge
+counts an in-task subscription, not a separate observer task. Caller-retained
+Rust Arcs are outside Agent ownership. Gauge fields are sampled independently;
+compare gated/quiescent
 checkpoints for cross-resource invariants, not a transactional memory snapshot.
 No raw prompt, answer, argument, command, provider body, secret, or path is
 written into the trace. Trace consumers reject missing ready/end, discontinuous

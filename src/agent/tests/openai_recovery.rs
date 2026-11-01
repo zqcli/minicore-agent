@@ -425,14 +425,11 @@ async fn openai_session_emergency_projection_survives_driver_retry_followups_and
     let result = wait_text(&agent, turn).await;
     let captured = server.finish().await;
     assert!(
-        matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
-        ),
+        matches!(result.outcome, crate::event::LoopOutcomeView::Completed),
         "{:?}",
-        result.report.outcome
+        result.outcome
     );
-    assert_eq!(result.report.tool_rounds, 3);
+    assert_eq!(result.tool_rounds, 3);
     assert_eq!(captured.len(), 9);
     let bodies = captured
         .iter()

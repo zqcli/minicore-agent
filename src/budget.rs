@@ -59,3 +59,30 @@ pub(crate) fn encode_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, s
     serde_json::to_writer(&mut bytes, value)?;
     Ok(bytes)
 }
+
+pub(crate) fn json_escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+fn escaped_char_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+        character if (character as u32) < 0x20 => 6,
+        character => character.len_utf8(),
+    }
+}
+
+/// Returns the longest UTF-8 prefix fitting a JSON string budget, including quotes.
+pub(crate) fn json_string_prefix(text: &str, max_encoded_bytes: usize) -> &str {
+    let mut remaining = max_encoded_bytes.saturating_sub(2);
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let cost = escaped_char_len(character);
+        if cost > remaining {
+            break;
+        }
+        remaining -= cost;
+        end = index + character.len_utf8();
+    }
+    &text[..end]
+}

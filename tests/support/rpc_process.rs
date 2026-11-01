@@ -225,7 +225,7 @@ impl RpcProcess {
             json!({"session_id": session_id, "mode": "steer", "text": text}),
         )
         .await;
-        let turn = self.response(&send_id).await["result"]["started"]["turn"].clone();
+        let turn = self.accepted_turn(&send_id).await;
         let wait_id = format!("{prefix}-wait");
         self.send(
             &wait_id,
@@ -273,6 +273,44 @@ impl RpcProcess {
                 self.pending.push_back(frame);
             }
         }
+    }
+
+    pub async fn turn_for_input(&mut self, receipt: &Value) -> Value {
+        use super::control::input_loop;
+        assert_eq!(receipt["accepted"], true, "{receipt}");
+        assert!(receipt["start_error"].is_null(), "{receipt}");
+        let state = self
+            .call_ok(
+                "session.state",
+                json!({"session_id": receipt["session_id"]}),
+            )
+            .await;
+        let mut snapshot = state["snapshot"].clone();
+        if input_loop(&snapshot, &receipt["id"]).is_none() {
+            let event = self
+                .event_matching("session_snapshot", |frame| {
+                    let snapshot = &frame["params"]["data"]["snapshot"];
+                    snapshot["load"] == receipt["load"]
+                        && input_loop(snapshot, &receipt["id"]).is_some()
+                })
+                .await;
+            snapshot = event["params"]["data"]["snapshot"].clone();
+        }
+        assert_eq!(snapshot["load"], receipt["load"]);
+        json!({"session_id": receipt["session_id"], "loop_id": input_loop(&snapshot, &receipt["id"]).unwrap()})
+    }
+
+    pub async fn accepted_turn(&mut self, id: &str) -> Value {
+        let receipt = self.response(id).await;
+        self.turn_for_input(&receipt["result"]).await
+    }
+
+    pub async fn tool_output_text(&mut self, mut tool_ref: Value) -> String {
+        tool_ref["stream"] = json!("output");
+        let page = self.call_ok("tool.output", tool_ref).await;
+        assert_eq!(page["eof"], true, "fixture must fit in one page: {page}");
+        assert_eq!(page["truncated"], false);
+        page["data"].as_str().unwrap().to_owned()
     }
 
     pub fn observed(&self) -> &[Value] {

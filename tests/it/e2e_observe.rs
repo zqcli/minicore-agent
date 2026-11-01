@@ -49,9 +49,8 @@ async fn observation_and_fault_environment_are_inert_in_default_builds() {
             json!({"session_id":session["session_id"],"mode":"steer","text":QUESTION}),
         )
         .await;
-    let result = process
-        .call_ok("turn.wait", turn_params(&pushed["started"]["turn"]))
-        .await;
+    let turn = process.turn_for_input(&pushed).await;
+    let result = process.call_ok("turn.wait", turn_params(&turn)).await;
     assert_eq!(result["outcome"]["type"], "completed");
     assert_eq!(result["persistence"], "persisted");
     process.shutdown().await;
@@ -253,11 +252,11 @@ mod enabled {
         let (trace,mut process,session)=Trace::spawn(&temp,&server,"terminal-loss",json!({"schema":1,"steps":[
         step("drop-tail",1,"runtime_events","drop_terminal"),step("persist-ready",1,"before_persist","pause")]})).await;
         let pushed = push(&mut process, &session, QUESTION, "steer").await;
-        let turn = &pushed["started"]["turn"];
+        let turn = process.turn_for_input(&pushed).await;
         trace
             .wait(|row| row["event"] == "fault_ready" && row["id"] == "persist-ready")
             .await;
-        let pending = process.call_ok("turn.result", turn_params(turn)).await;
+        let pending = process.call_ok("turn.result", turn_params(&turn)).await;
         assert_eq!(pending["availability"], "pending");
         assert!(pending["result_id"].is_null());
         assert!(pending["items"].as_array().unwrap().is_empty());
@@ -267,21 +266,19 @@ mod enabled {
         assert_eq!(state["snapshot"]["execution"]["type"], "finishing");
         assert_eq!(state["snapshot"]["completions"]["through_seq"], 0);
         let queued = push(&mut process, &session, "automatic successor", "follow_up").await;
-        assert!(queued["started"].is_null());
+        assert!(queued.get("started").is_none());
         trace.release("persist-ready").await;
-        let waited = process.call_ok("turn.wait", turn_params(turn)).await;
+        let waited = process.call_ok("turn.wait", turn_params(&turn)).await;
         assert_eq!(waited["outcome"]["type"], "completed");
         assert_eq!(waited["persistence"], "persisted");
-        assert_eq!(waited["next"]["input"]["id"], queued["id"]);
-        process
-            .call_ok("turn.wait", turn_params(&waited["next"]["turn"]))
-            .await;
+        let next = process.turn_for_input(&queued).await;
+        process.call_ok("turn.wait", turn_params(&next)).await;
         let mut cursor = Value::Null;
         let mut result_id = Value::Null;
         let mut reconstructed = std::collections::BTreeMap::<u64, String>::new();
         let mut pages = 0;
         loop {
-            let mut request = turn_params(turn);
+            let mut request = turn_params(&turn);
             request["max_bytes"] = json!(4096);
             request["cursor"] = cursor.clone();
             if !result_id.is_null() {
@@ -407,17 +404,20 @@ mod enabled {
         step("first-ready",1,"before_persist","pause"),step("rollback-a",1,"append","rollback"),step("rollback-b",2,"append","rollback"),step("page-a",1,"result_page","pause")]});
         let (trace, mut process, session) = Trace::spawn(&temp, &server, "held-source", plan).await;
         let first = push(&mut process, &session, QUESTION, "steer").await;
-        let turn = first["started"]["turn"].clone();
+        let turn = process.turn_for_input(&first).await;
         trace
             .wait(|row| row["event"] == "fault_ready" && row["id"] == "first-ready")
             .await;
         let queued = push(&mut process, &session, "follow up", "follow_up").await;
-        assert!(queued["started"].is_null());
+        assert!(queued.get("started").is_none());
         trace.release("first-ready").await;
         let result = process.call_ok("turn.wait", turn_params(&turn)).await;
         assert_eq!(result["persistence"], "failed");
-        assert!(result["next"].is_null());
-        assert_eq!(result["queue"]["paused"], true);
+        assert!(result.get("next").is_none());
+        let queue = process
+            .call_ok("input.list", json!({"session_id":session}))
+            .await;
+        assert_eq!(queue["paused"], true);
         let mut request = turn_params(&turn);
         request["max_bytes"] = json!(1024);
         process.send("held-page", "turn.result", request).await;
@@ -437,8 +437,8 @@ mod enabled {
         let resumed = process
             .call_ok("input.resume", json!({"session_id":session}))
             .await;
-        assert_eq!(resumed["started"]["input"]["id"], queued["id"]);
-        let second = resumed["started"]["turn"].clone();
+        assert!(resumed["start_error"].is_null());
+        let second = process.turn_for_input(&queued).await;
         let second_result = process.call_ok("turn.wait", turn_params(&second)).await;
         assert_eq!(second_result["persistence"], "failed");
         let state = process
@@ -508,10 +508,10 @@ mod enabled {
         )
         .await;
         let first = push(&mut process, &session, QUESTION, "steer").await;
-        let turn = first["started"]["turn"].clone();
+        let turn = process.turn_for_input(&first).await;
         let result = process.call_ok("turn.wait", turn_params(&turn)).await;
         assert_eq!(result["persistence"], "failed");
-        assert!(result["next"].is_null());
+        assert!(result.get("next").is_none());
         let state = process
             .call_ok("session.state", json!({"session_id":session}))
             .await;
@@ -565,7 +565,7 @@ mod enabled {
         )
         .await;
         let first = push(&mut process, &session, QUESTION, "steer").await;
-        let turn = first["started"]["turn"].clone();
+        let turn = process.turn_for_input(&first).await;
         trace.wait(|row| row["event"] == "fault_ready").await;
         process
             .send("wait-before-close", "turn.wait", turn_params(&turn))
@@ -599,7 +599,7 @@ mod enabled {
         )
         .await;
         let first = push(&mut process, &session, QUESTION, "steer").await;
-        let turn = first["started"]["turn"].clone();
+        let turn = process.turn_for_input(&first).await;
         assert_eq!(
             process.call_ok("turn.wait", turn_params(&turn)).await["persistence"],
             "failed"
@@ -640,9 +640,8 @@ mod enabled {
         let (trace, mut process, session) =
             Trace::spawn_tools(&temp, &server, "tool-env", json!({"schema":1}), &["bash"]).await;
         let first = push(&mut process, &session, QUESTION, "steer").await;
-        let result = process
-            .call_ok("turn.wait", turn_params(&first["started"]["turn"]))
-            .await;
+        let turn = process.turn_for_input(&first).await;
+        let result = process.call_ok("turn.wait", turn_params(&turn)).await;
         assert_eq!(result["outcome"]["type"], "completed");
         process.shutdown().await;
         let requests = server.finish().await;
@@ -734,7 +733,7 @@ mod enabled {
         let (trace,mut process,session)=Trace::spawn_options(&temp,"large-source",json!({"schema":1,"steps":[
             step("large-rollback",1,"append","rollback"),step("large-page",1,"result_page","pause")]}),options).await;
         let pushed = push(&mut process, &session, QUESTION, "steer").await;
-        let turn = pushed["started"]["turn"].clone();
+        let turn = process.turn_for_input(&pushed).await;
         let result = process.call_ok("turn.wait", turn_params(&turn)).await;
         assert_eq!(
             result["outcome"]["type"], "completed",

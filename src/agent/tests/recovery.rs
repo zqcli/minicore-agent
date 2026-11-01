@@ -149,8 +149,8 @@ async fn test_provider_overflow_stops_on_second_failure() {
     let turn = send_text(&mut agent, info.session_id, "read note").await;
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Failed(_)
+        result.outcome,
+        crate::event::LoopOutcomeView::Failed { .. }
     ));
     // overflow, summary, second overflow: the retry never runs a third raw
     // start and the unused script is not consumed.
@@ -203,11 +203,11 @@ async fn emergency_projection_survives_followups_new_growth_and_durable_reopen()
     let turn = send_text(&mut agent, info.session_id, "read three files").await;
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        result.outcome,
+        crate::event::LoopOutcomeView::Completed
     ));
     assert_eq!(
-        result.report.tool_rounds, 3,
+        result.tool_rounds, 3,
         "recovery must not redispatch completed tools"
     );
     let captured = model.requests();
@@ -294,8 +294,8 @@ async fn emergency_settlement_failure_is_observable_and_preserves_old_projection
         let turn = send_text(&mut agent, info.session_id, "read a").await;
         let result = wait_text(&agent, turn).await;
         assert!(matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Completed
+            result.outcome,
+            crate::event::LoopOutcomeView::Completed
         ));
         assert_persisted(&result);
         agent.join_turn_task_for_test(info.session_id).await;
@@ -358,8 +358,8 @@ async fn emergency_settlement_file_limit_is_an_explicit_failure_not_silent_raw_r
     let turn = send_text(&mut agent, info.session_id, "read a").await;
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        result.outcome,
+        crate::event::LoopOutcomeView::Completed
     ));
     assert_persisted(&result);
     agent.join_turn_task_for_test(info.session_id).await;
@@ -429,8 +429,8 @@ async fn emergency_projection_supersedes_high_usage_without_an_independent_opera
         .expect("turn.wait must complete")
         .unwrap();
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        result.outcome,
+        crate::event::LoopOutcomeView::Completed
     ));
     settle_turn(&agent, info.session_id).await;
     let context = agent.session_context(info.session_id).unwrap();
@@ -496,8 +496,8 @@ async fn emergency_projection_is_not_invalidated_by_request_boundary_settings_or
     gate.release();
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Completed
+        result.outcome,
+        crate::event::LoopOutcomeView::Completed
     ));
     let requests = model_b.requests();
     let requests = requests.lock().unwrap();
@@ -507,7 +507,7 @@ async fn emergency_projection_is_not_invalidated_by_request_boundary_settings_or
     assert!(encoded.contains("new workspace instruction"));
     assert!(encoded.contains("SUMMARY-UPDATE"));
     assert!(!encoded.contains("RAW-BEFORE-UPDATE"));
-    assert_eq!(result.report.tool_rounds, 2);
+    assert_eq!(result.tool_rounds, 2);
 }
 
 #[tokio::test]
@@ -544,8 +544,8 @@ async fn test_recovery_refuses_when_summary_cannot_shrink() {
     let turn = send_text(&mut agent, info.session_id, "read tiny").await;
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Failed(_)
+        result.outcome,
+        crate::event::LoopOutcomeView::Failed { .. }
     ));
     // Tool call, overflow and one utility call; no second raw start happens.
     assert_eq!(model.calls.load(Ordering::SeqCst), 3);
@@ -649,7 +649,7 @@ async fn non_recoverable_model_failures_are_not_retried_as_recovery() {
         let turn = send_text(&mut agent, info.session_id, "read note").await;
         let res = wait_text(&agent, turn).await;
         assert!(
-            matches!(res.report.outcome, minicore_runtime::LoopOutcome::Failed(_)),
+            matches!(res.outcome, crate::event::LoopOutcomeView::Failed { .. }),
             "{label} must fail the turn"
         );
         // Tool request plus the injected failure; recovery never starts.
@@ -709,8 +709,8 @@ async fn test_driver_retry_reentry_does_not_reset_recovery_quota() {
     let turn = send_text(&mut agent, info.session_id, "read note").await;
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Failed(_)
+        result.outcome,
+        crate::event::LoopOutcomeView::Failed { .. }
     ));
     // tool call, overflow, summary, retryable start failure, re-entered
     // overflow: the unused script is never consumed by a second recovery.

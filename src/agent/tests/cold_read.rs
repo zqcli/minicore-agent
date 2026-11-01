@@ -298,7 +298,7 @@ async fn cold_read_missing_aux_or_unknown_tool_maps_to_tool_not_found() {
 #[cfg(unix)]
 #[tokio::test]
 async fn warm_record_served_immediately_without_disk_or_gate() {
-    use crate::read::TOOL_READ_GATES;
+    use crate::tool_data::TOOL_READ_GATES;
     use crate::tool_data::{ToolDataStream, ToolExecutionState};
     use base64::Engine;
 

@@ -153,8 +153,10 @@ async fn i2_real_command_releases_owners_and_observation_resources() {
         assert!(agent.cancel(turn).unwrap());
         let result = wait_text(&agent, turn).await;
         let cancelled = matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Cancelled(minicore_runtime::CancelReason::User)
+            result.outcome,
+            crate::event::LoopOutcomeView::Cancelled {
+                reason: crate::event::CancelReasonView::User
+            }
         );
         let tool_ref = agent
             .loaded_session(info.session_id)
@@ -367,9 +369,9 @@ async fn e2e_a_multi_turn_hot_switch_tool_data_workflow() {
         let first_result = wait_text(&agent, turn).await;
         // request 0: model_a Bash; request 1: model_b write; request 2: model_b
         // final text after the same-loop switch.
-        assert_eq!(first_result.report.requests, 3);
-        assert_eq!(first_result.report.tool_rounds, 2);
-        assert_eq!(first_result.report.final_config_revision, active_revision);
+        assert_eq!(first_result.requests, 3);
+        assert_eq!(first_result.tool_rounds, 2);
+        assert_eq!(first_result.final_config_revision, active_revision);
         assert_persisted(&first_result);
         assert!(
             !process_is_listed(

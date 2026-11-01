@@ -1,3 +1,5 @@
+use crate::rpc_test_control::read_items;
+
 mod changes;
 mod compaction;
 mod compaction_budget;
@@ -58,8 +60,8 @@ use crate::config::{AgentConfig, CompactionConfig, LoopOverrides, Profile};
 use crate::error::AgentError;
 use crate::models::{ModelConfig, Models};
 use crate::profiles::ApprovalMode;
-use crate::read::TOOL_READ_GATES;
 use crate::sessions::PAUSE_AFTER_COMPACTION_RESULT;
+use crate::tool_data::TOOL_READ_GATES;
 use crate::workspace::query::READ_GATES;
 use crate::workspace::scan::{SCAN_HOLDS, tests::ScanHold};
 
@@ -528,15 +530,26 @@ impl RpcHarness {
     }
 
     async fn event(&mut self, event_type: &str) -> Value {
+        self.event_matching(event_type, |_| true).await
+    }
+
+    async fn event_matching(
+        &mut self,
+        event_type: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
         if let Some(index) = self.events.iter().position(|frame| {
             frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type)
+                && matches(frame)
         }) {
             return self.events.remove(index);
         }
         loop {
             let frame = self.next_frame().await.expect("RPC output ended");
             if frame.get("method") == Some(&json!("agent.event")) {
-                if frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type) {
+                if frame.pointer("/params/type").and_then(Value::as_str) == Some(event_type)
+                    && matches(&frame)
+                {
                     return frame;
                 }
                 self.events.push(frame);
@@ -544,6 +557,36 @@ impl RpcHarness {
                 self.pending.push_back(frame);
             }
         }
+    }
+
+    async fn turn_for_input(&mut self, receipt: &Value) -> Value {
+        use crate::rpc_test_control::input_loop;
+        assert_eq!(receipt["accepted"], true, "{receipt}");
+        assert!(receipt["start_error"].is_null(), "{receipt}");
+        let state = self
+            .call_ok(
+                "session.state",
+                Some(json!({"session_id": receipt["session_id"]})),
+            )
+            .await;
+        let mut snapshot = state["result"]["snapshot"].clone();
+        if input_loop(&snapshot, &receipt["id"]).is_none() {
+            let event = self
+                .event_matching("session_snapshot", |frame| {
+                    let snapshot = &frame["params"]["data"]["snapshot"];
+                    snapshot["load"] == receipt["load"]
+                        && input_loop(snapshot, &receipt["id"]).is_some()
+                })
+                .await;
+            snapshot = event["params"]["data"]["snapshot"].clone();
+        }
+        assert_eq!(snapshot["load"], receipt["load"]);
+        json!({"session_id": receipt["session_id"], "loop_id": input_loop(&snapshot, &receipt["id"]).unwrap()})
+    }
+
+    async fn accepted_turn(&mut self, id: Value) -> Value {
+        let receipt = self.response(id).await;
+        self.turn_for_input(&receipt["result"]).await
     }
 
     async fn next_frame(&mut self) -> Option<Value> {
@@ -679,20 +722,18 @@ fn resource_exhausted_error(id: Value) -> Value {
 /// same way the live projection does. Used to pass `validate` without a real
 /// Git fixture when the point is the capacity check, not the diff content.
 #[cfg(unix)]
-fn untracked_workspace_ref(session_id: SessionId, path: &str) -> String {
-    use base64::Engine;
-    let entry = crate::workspace::status::WorkspaceStatusEntry {
-        path: path.to_owned(),
-        kind: crate::workspace::status::WorkspaceStatusEntryKind::Untracked,
-        index_status: None,
-        worktree_status: None,
-        original_path: None,
-    };
-    let bytes = serde_json::to_vec(&(session_id, String::new(), entry)).unwrap();
-    format!(
-        "workspace:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    )
+fn untracked_workspace_ref(session_id: SessionId, path: &str) -> crate::ChangeRef {
+    crate::ChangeRef::Workspace {
+        session_id,
+        head_oid: String::new(),
+        entry: crate::workspace::status::WorkspaceStatusEntry {
+            path: path.to_owned(),
+            kind: crate::workspace::status::WorkspaceStatusEntryKind::Untracked,
+            index_status: None,
+            worktree_status: None,
+            original_path: None,
+        },
+    }
 }
 
 fn turn_params(turn: &Value) -> Value {
@@ -811,7 +852,7 @@ async fn assert_manual_failure_case(label: &str, script: Step, expected: &str) -
             Some(json!({"session_id": session_id, "mode": "steer", "text": "settled"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     let _ = harness.call("turn.wait", Some(turn_params(&turn))).await;
     append_compaction_tail(&mut harness, &base, &session_id).await;
     let result = harness

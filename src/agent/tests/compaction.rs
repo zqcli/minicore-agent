@@ -91,10 +91,7 @@ async fn high_mid_turn_usage_keeps_all_exchanges_and_steers_without_threshold_co
     gate.release();
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    assert_eq!(
-        result.report.requests, 3,
-        "utility is not an ordinary request"
-    );
+    assert_eq!(result.requests, 3, "utility is not an ordinary request");
     settle_turn(&agent, info.session_id).await;
     {
         let requests = model.requests.lock().unwrap();
@@ -164,16 +161,13 @@ async fn pi_first_boundary_is_accepted_cancellable_and_preserves_raw_input() {
     assert!(agent.cancel(turn).unwrap());
     let result = wait_text(&agent, turn).await;
     assert!(matches!(
-        result.report.outcome,
-        minicore_runtime::LoopOutcome::Cancelled(_)
+        result.outcome,
+        crate::event::LoopOutcomeView::Cancelled { .. }
     ));
-    assert_eq!(
-        result.report.requests, 0,
-        "no ordinary model request was issued"
-    );
+    assert_eq!(result.requests, 0, "no ordinary model request was issued");
     assert!(dropped.load(Ordering::SeqCst));
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    assert!(result.report.appended.iter().any(|item| matches!(item, HistoryItem::User(user) if user.input.as_text() == "new current input remains exact")));
+    assert!(agent.loaded_session(session_id).unwrap().read_snapshot().history.iter().any(|item| matches!(item, HistoryItem::User(user) if user.input.as_text() == "new current input remains exact")));
     let view = agent.session_context(session_id).unwrap().automatic;
     assert!(view.current.is_none());
     assert_eq!(view.last.unwrap().utility_usage.unwrap().call_count, 1);
@@ -307,7 +301,7 @@ async fn pi_steer_and_model_settings_during_utility_rebuild_without_second_summa
     gate.release();
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    assert_eq!(result.report.requests, 1);
+    assert_eq!(result.requests, 1);
     settle_turn(&agent, session_id).await;
     let requests = model.requests.lock().unwrap();
     assert_eq!(
@@ -370,8 +364,8 @@ async fn pi_consolidated_overflow_and_transport_retry_use_same_reduced_body_with
     let turn = send_text(&mut agent, session_id, "new user exact").await;
     let result = wait_text(&agent, turn).await;
     assert_completed(&result);
-    assert_eq!(result.report.requests, 3);
-    assert_eq!(result.report.tool_rounds, 2);
+    assert_eq!(result.requests, 3);
+    assert_eq!(result.tool_rounds, 2);
     settle_turn(&agent, session_id).await;
     {
         let requests = model.requests.lock().unwrap();

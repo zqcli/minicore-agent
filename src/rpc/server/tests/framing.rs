@@ -26,7 +26,7 @@ async fn fragmented_frame_survives_deferred_waiter_interleaving() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "gated turn"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     harness
         .send(json!("wait"), "turn.wait", Some(turn_params(&turn)))
         .await;
@@ -150,7 +150,7 @@ async fn deferred_waiter_limit_rejects_new_waiters_but_keeps_control_methods() {
             Some(json!({"session_id": session_id, "mode": "steer", "text": "gated turn"})),
         )
         .await;
-    let turn = harness.response(json!("send")).await["result"]["started"]["turn"].clone();
+    let turn = harness.accepted_turn(json!("send")).await;
     tokio::time::timeout(TIMEOUT, async {
         while probe.started.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;

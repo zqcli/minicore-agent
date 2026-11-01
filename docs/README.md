@@ -19,13 +19,13 @@ verification evidence.
   context estimates/errors.
 - [Security](security.md): local trust assumptions, Workspace limits, redaction,
   stdout, and Store scope.
-- [RPC contract](rpc.md): the normative NDJSON wire contract and all 36 methods.
+- [RPC contract](rpc.md): the normative NDJSON wire contract and all 35 methods.
 - [Changelog](../CHANGELOG.md): current candidate changes and compatibility notes.
 - [Contributing](../CONTRIBUTING.md): checks, CI boundaries, and documentation rules.
 
-These guides describe the current source package **0.9.1** (development), Rust
+These guides describe the current source package **0.9.3** (development), Rust
 2024 on current stable, the formal Runtime `0.9.0` dependency (tag `v0.9.0`), and
-RPC protocol version `2`.
+RPC protocol version `3`.
 A package version change does not by itself change the RPC protocol or storage
 formats.
 

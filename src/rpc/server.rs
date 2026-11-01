@@ -18,7 +18,7 @@ use crate::agent::{
 use crate::changes::{ChangesListRequest, change_deadline};
 use crate::diff::{ChangesDiffRequest, diff_deadline};
 use crate::error::AgentError;
-use crate::event::{AgentEventStream, SessionStateView, TurnResultView};
+use crate::event::AgentEventStream;
 use crate::read::{ReadSession, TurnResultRequest};
 use crate::sessions::{TurnRef, await_compaction_completion, await_turn_completion};
 use crate::tool_data::{ToolOutputRequest, ToolReadRequest};
@@ -28,17 +28,16 @@ use crate::workspace::search::WorkspaceSearchRequest;
 use crate::workspace::status::WorkspaceStatusRequest;
 
 use super::protocol::{
-    AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, CompactResult, EmptyParams,
-    INPUT_NOT_QUEUED, INPUT_QUEUE_FULL, INTERACTION_NOT_FOUND, INTERNAL_ERROR, INVALID_PARAMS,
-    INVALID_REQUEST, INVALID_SESSION_SETTINGS, INVALID_STATE, InteractionAnswerParams,
-    METHOD_NOT_FOUND, MISSING_LOAD, MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR,
-    PROFILE_NOT_FOUND, ProfilesResult, QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE,
-    RESOURCE_EXHAUSTED, RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse,
-    SESSION_BLOCKED, SESSION_BUSY, SESSION_NOT_FOUND, SESSION_NOT_LOADED, STALE_LOAD, STALE_RESULT,
-    STORE_ERROR, SessionHistoryParams, SessionParams, SessionResult, SessionStateResult,
-    SessionUpdateResult, SessionsResult, TOOL_NOT_FOUND, TURN_NOT_FOUND, ToolOutputParams,
-    ToolReadParams, TurnParams, TurnResultParams, TurnWaitResult, WORKSPACE_ERROR, decode_params,
-    parse_request, request_id,
+    AgentEventNotification, CONTEXT_UNCOMPRESSIBLE, CancelledResult, EmptyParams, INPUT_NOT_QUEUED,
+    INPUT_QUEUE_FULL, INTERACTION_NOT_FOUND, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
+    INVALID_SESSION_SETTINGS, INVALID_STATE, InteractionAnswerParams, METHOD_NOT_FOUND,
+    MISSING_LOAD, MODEL_NOT_FOUND, ModelsResult, OkResult, PARSE_ERROR, PROFILE_NOT_FOUND,
+    ProfilesResult, QUERY_LIMIT, RELOAD_REQUIRES_RESTART, RELOAD_UNAVAILABLE, RESOURCE_EXHAUSTED,
+    RUNTIME_ERROR, RpcId, RpcOutbound, RpcRequest, RpcResponse, SESSION_BLOCKED, SESSION_BUSY,
+    SESSION_NOT_FOUND, SESSION_NOT_LOADED, STALE_LOAD, STALE_RESULT, STORE_ERROR, SessionParams,
+    SessionResult, SessionStateResult, SessionUpdateResult, SessionsResult, TOOL_NOT_FOUND,
+    TURN_NOT_FOUND, ToolOutputParams, ToolReadParams, TurnParams, TurnResultParams,
+    WORKSPACE_ERROR, decode_params, parse_request, request_id,
 };
 mod dispatch;
 mod errors;

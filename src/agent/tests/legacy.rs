@@ -311,12 +311,9 @@ async fn s1_hallucinated_subagent_is_an_unavailable_tool_not_a_dispatch() {
     // assembly time: a tool call absent from the request schema is a malformed
     // model response, so the loop fails without ever dispatching a tool.
     assert!(
-        matches!(
-            result.report.outcome,
-            minicore_runtime::LoopOutcome::Failed(_)
-        ),
+        matches!(result.outcome, crate::event::LoopOutcomeView::Failed { .. }),
         "unexpected outcome: {:?}",
-        result.report.outcome
+        result.outcome
     );
     // Exactly one main-loop request ran; the second scripted request was never
     // reached, and no child model call happened.

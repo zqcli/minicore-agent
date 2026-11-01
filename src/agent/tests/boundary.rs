@@ -64,7 +64,7 @@ async fn delivered_steers_join_the_next_preparation_across_all_active_config_rep
         .unwrap()
         .unwrap();
     assert_completed(&result);
-    assert_eq!(result.report.requests, 4);
+    assert_eq!(result.requests, 4);
     let mut delivered = Vec::new();
     while delivered.len() < 3 {
         let event = events
@@ -206,7 +206,7 @@ async fn stale_prompt_rebuilds_and_replaced_prompts_keep_the_preparation_identit
         .unwrap()
         .unwrap();
     assert_completed(&result);
-    assert_eq!(result.report.requests, 2);
+    assert_eq!(result.requests, 2);
     let mut delivered = Vec::new();
     while delivered.len() < 4 {
         if let AgentEvent::InputDelivered {

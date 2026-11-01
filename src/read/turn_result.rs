@@ -15,12 +15,7 @@ pub(crate) async fn turn_result(
         return Err(AgentError::QueryLimit);
     }
 
-    let continuation = request
-        .cursor
-        .is_some_and(|cursor| cursor != ReadCursor::start());
-
     if let Some(session) = loaded.as_ref() {
-        let mut active_saved = None;
         let publication = session.result_catalog().publication();
         if let Some(load) = &request.load {
             if load != &session.load().to_string() {
@@ -34,8 +29,8 @@ pub(crate) async fn turn_result(
                     drop(publication);
                     return retained_turn_page(
                         request,
-                        entry,
                         source,
+                        entry.persistence_uncertain,
                         cursor,
                         max_bytes,
                         &limits.cancellation,
@@ -54,9 +49,8 @@ pub(crate) async fn turn_result(
                             None
                         } else {
                             session
-                                .turn_result_snapshot(request.turn)?
-                                .flatten()
-                                .map(|result| LoopOutcomeView::from_report(&result.report))
+                                .completed_turn(request.turn)
+                                .map(|result| result.outcome.clone())
                                 .or_else(|| completion_outcome(entry.outcome_kind))
                         },
                         entry.persistence,
@@ -72,39 +66,23 @@ pub(crate) async fn turn_result(
         {
             return Err(AgentError::MissingLoad);
         }
-        match session.turn_result_snapshot(request.turn)? {
-            Some(None) => {
-                if request.load.is_none() {
-                    return Err(AgentError::MissingLoad);
-                }
-                validate_cursor(cursor, 0)?;
-                return crate::budget::encoded_result(
-                    empty_turn_page(request.turn, request.load),
-                    max_bytes,
-                );
+        if session.is_turn_pending(request.turn) {
+            if request.load.is_none() {
+                return Err(AgentError::MissingLoad);
             }
-            Some(Some(result)) => {
-                if result.persistence == TurnPersistence::Failed {
-                    if request.load.is_none() {
-                        return Err(AgentError::MissingLoad);
-                    }
-                    return unavailable_turn_page(
-                        request.turn,
-                        request.load,
-                        crate::sessions::UnavailableReason::Expired,
-                        Some(LoopOutcomeView::from_report(&result.report)),
-                        Some(TurnPersistence::Failed),
-                        session.uncertain_loop() == Some(request.turn.loop_id),
-                        max_bytes,
-                    );
-                }
-                if request.load.is_some() && !continuation {
-                    active_saved = Some(result);
-                }
-            }
-            None => {}
+            validate_cursor(cursor, 0)?;
+            return crate::budget::encoded_result(
+                empty_turn_page(request.turn, request.load),
+                max_bytes,
+            );
         }
-        if session.uncertain_loop() == Some(request.turn.loop_id) {
+        let summary = session.completed_turn(request.turn);
+        let uncertain = session.uncertain_loop() == Some(request.turn.loop_id);
+        if uncertain
+            || summary
+                .as_ref()
+                .is_some_and(|result| result.persistence == TurnPersistence::Failed)
+        {
             if request.load.is_none() {
                 return Err(AgentError::MissingLoad);
             }
@@ -112,9 +90,9 @@ pub(crate) async fn turn_result(
                 request.turn,
                 request.load,
                 crate::sessions::UnavailableReason::Expired,
-                None,
+                summary.map(|result| result.outcome.clone()),
                 Some(TurnPersistence::Failed),
-                true,
+                uncertain,
                 max_bytes,
             );
         }
@@ -126,11 +104,6 @@ pub(crate) async fn turn_result(
             limits.max_lines,
         ) && range.end <= snapshot.history.len()
         {
-            let availability = if active_saved.is_some() {
-                TurnResultAvailability::Live
-            } else {
-                TurnResultAvailability::Stored
-            };
             return resident_stored_turn_page(
                 &store,
                 session,
@@ -138,14 +111,10 @@ pub(crate) async fn turn_result(
                 snapshot,
                 range,
                 source_revision,
-                availability,
                 max_bytes,
                 &limits,
             )
             .await;
-        }
-        if let Some(result) = active_saved {
-            return live_turn_page(&request, result, &limits).await;
         }
     } else if request.load.is_some() {
         return Err(AgentError::StaleLoad);
@@ -177,7 +146,6 @@ async fn resident_stored_turn_page(
     snapshot: crate::sessions::ReadSnapshot,
     range: std::ops::Range<usize>,
     source_revision: [u8; 32],
-    availability: TurnResultAvailability,
     max_bytes: usize,
     limits: &HistoryScanLimits,
 ) -> Result<TurnResultPage, AgentError> {
@@ -297,15 +265,14 @@ async fn resident_stored_turn_page(
     let metadata = &identity.metadata;
     let base = TurnResultPage {
         result_id: Some(identity.result_id.clone()),
-        availability,
+        availability: TurnResultAvailability::Stored,
         outcome: Some(metadata.outcome.clone()),
         persistence: Some(TurnPersistence::Persisted),
         usage: Some(metadata.usage),
         requests: Some(metadata.requests),
         tool_rounds: Some(metadata.tool_rounds),
         final_config_revision: Some(metadata.final_config_revision),
-        completed_at: (availability == TurnResultAvailability::Stored)
-            .then(|| metadata.completed_at.clone()),
+        completed_at: Some(metadata.completed_at.clone()),
         interrupted: metadata.interrupted.clone(),
         total: identity.total,
         ..empty_turn_page(request.turn, request.load)
@@ -386,110 +353,22 @@ pub(crate) fn prepare_result_source(
     items: &[HistoryItem],
     interrupted: Option<InterruptedRequest>,
 ) -> Result<crate::sessions::PreparedSource, AgentError> {
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        item: &'a HistoryItem,
+    }
     let sanitized = sanitize_history(items)?;
-    let times = vec![None; sanitized.len()];
-    let encoded = encoded_items(0, &sanitized, &times)?
-        .map(|item| item.map(|(_, value)| value))
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::sessions::PreparedSource::new(encoded, interrupted)
-}
-
-#[derive(Serialize)]
-struct SourceEnvelope<'a> {
-    item: SourceItem<'a>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timestamp: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum SourceItem<'a> {
-    User(&'a minicore_runtime::history::UserHistory),
-    Assistant(SourceAssistant<'a>),
-    ToolResult(&'a minicore_runtime::history::ToolResultHistory),
-    Summary(&'a minicore_runtime::history::SummaryHistory),
-}
-
-#[derive(Serialize)]
-struct SourceAssistant<'a> {
-    loop_id: LoopId,
-    request_index: u32,
-    model: &'a minicore_runtime::model::ModelRef,
-    reasoning: minicore_runtime::model::ReasoningPreference,
-    content: SourceParts<'a>,
-    finish_reason: minicore_runtime::model::ModelFinishReason,
-    usage: Usage,
-}
-
-impl<'a> SourceItem<'a> {
-    fn from_history(item: &'a HistoryItem) -> Option<Self> {
-        Some(match item {
-            HistoryItem::User(item) => Self::User(item),
-            HistoryItem::ToolResult(item) => Self::ToolResult(item),
-            HistoryItem::Summary(item) => Self::Summary(item),
-            HistoryItem::Assistant(item) if !item.content.iter().any(SourceParts::visible) => {
-                return None;
-            }
-            HistoryItem::Assistant(item) => Self::Assistant(SourceAssistant {
-                loop_id: item.loop_id,
-                request_index: item.request_index,
-                model: &item.model,
-                reasoning: item.reasoning,
-                content: SourceParts(&item.content),
-                finish_reason: item.finish_reason,
-                usage: item.usage,
-            }),
+    let encoded = sanitized
+        .iter()
+        .map(|item| {
+            serde_json::to_string(&Envelope { item }).map_err(|_| AgentError::RpcSerialization)
         })
-    }
-}
-
-struct SourceParts<'a>(&'a [minicore_runtime::model::AssistantPart]);
-
-impl SourceParts<'_> {
-    fn visible(part: &minicore_runtime::model::AssistantPart) -> bool {
-        match part {
-            minicore_runtime::model::AssistantPart::Reasoning(value) => {
-                value.text().is_some() || value.summary().is_some()
-            }
-            _ => true,
-        }
-    }
-}
-
-impl Serialize for SourceParts<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use minicore_runtime::model::AssistantPart;
-        use serde::ser::SerializeSeq as _;
-        #[derive(Serialize)]
-        #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-        enum Part<'a> {
-            Text(&'a str),
-            Reasoning(Reasoning<'a>),
-            ToolCall(&'a minicore_runtime::model::ToolCall),
-        }
-        #[derive(Serialize)]
-        struct Reasoning<'a> {
-            text: Option<&'a str>,
-            summary: Option<&'a str>,
-            encrypted: Option<&'a str>,
-            signature: Option<&'a str>,
-        }
-        let mut sequence = serializer.serialize_seq(None)?;
-        for part in self.0.iter().filter(|part| Self::visible(part)) {
-            let part = match part {
-                AssistantPart::Text(text) => Part::Text(text),
-                AssistantPart::ToolCall(call) => Part::ToolCall(call),
-                AssistantPart::Reasoning(value) => Part::Reasoning(Reasoning {
-                    text: value.text(),
-                    summary: value.summary(),
-                    encrypted: None,
-                    signature: None,
-                }),
-            };
-            sequence.serialize_element(&part)?;
-        }
-        sequence.end()
-    }
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::sessions::PreparedSource::new(
+        encoded,
+        interrupted,
+        crate::sessions::TurnResult::for_test(),
+    )
 }
 
 pub(super) struct PreparedTurnItems {
@@ -666,7 +545,7 @@ async fn prepare_turn_view(
 pub(crate) fn encode_result_source(
     items: &[HistoryItem],
     interrupted: Option<InterruptedRequest>,
-    metadata: crate::event::TurnResultView,
+    metadata: crate::sessions::TurnResult,
 ) -> Result<crate::sessions::PreparedSource, AgentError> {
     #[cfg(feature = "e2e-observe")]
     let mut observed = crate::e2e_observe::Span::new(crate::e2e_observe::Work::SourcePrepare);
@@ -682,13 +561,13 @@ pub(crate) fn encode_result_source(
         observed.add(1, bytes.len());
         encoded.push(String::from_utf8(bytes).map_err(|_| AgentError::RpcSerialization)?);
     }
-    crate::sessions::PreparedSource::new(encoded, interrupted)?.with_metadata(metadata)
+    crate::sessions::PreparedSource::new(encoded, interrupted, metadata)
 }
 
 pub(crate) fn result_source_upper_bound(
     items: &[HistoryItem],
     interrupted: Option<&InterruptedRequest>,
-    metadata: &crate::event::TurnResultView,
+    metadata: &crate::sessions::TurnResult,
 ) -> Result<usize, AgentError> {
     let mut bytes = std::mem::size_of::<crate::sessions::results::ResultSource>()
         .checked_add(2 * std::mem::size_of::<usize>())
@@ -721,30 +600,10 @@ pub(crate) fn result_source_upper_bound(
         .ok_or(AgentError::Internal)
 }
 
-pub(super) async fn live_turn_page(
-    request: &TurnResultRequest,
-    result: Arc<crate::sessions::TurnResult>,
-    limits: &HistoryScanLimits,
-) -> Result<TurnResultPage, AgentError> {
-    let metadata = crate::event::TurnResultView::from_turn_result(&result);
-    let base = TurnResultPage {
-        availability: TurnResultAvailability::Live,
-        outcome: Some(metadata.outcome),
-        persistence: Some(metadata.persistence),
-        usage: Some(metadata.usage),
-        requests: Some(metadata.requests),
-        tool_rounds: Some(metadata.tool_rounds),
-        final_config_revision: Some(metadata.final_config_revision),
-        interrupted: result.interrupted.clone(),
-        ..empty_turn_page(request.turn, request.load.clone())
-    };
-    project_turn_page(base, Arc::clone(&result.report.appended), request, limits).await
-}
-
-async fn retained_turn_page(
+pub(super) async fn retained_turn_page(
     request: TurnResultRequest,
-    entry: crate::sessions::results::CompletionEntry,
     source: Arc<crate::sessions::results::ResultSource>,
+    persistence_uncertain: bool,
     cursor: ReadCursor,
     max_bytes: usize,
     cancellation: &CancellationToken,
@@ -774,13 +633,13 @@ async fn retained_turn_page(
     }
     let total = source.items.len();
     validate_cursor(cursor, total)?;
-    let metadata = source.metadata.as_ref().expect("retained result metadata");
+    let metadata = &source.metadata;
     let base = TurnResultPage {
         result_id: Some(source.result_id.clone()),
-        persistence_uncertain: entry.persistence_uncertain,
+        persistence_uncertain,
         availability: TurnResultAvailability::Live,
         outcome: Some(metadata.outcome.clone()),
-        persistence: entry.persistence,
+        persistence: Some(metadata.persistence),
         usage: Some(metadata.usage),
         requests: Some(metadata.requests),
         tool_rounds: Some(metadata.tool_rounds),
