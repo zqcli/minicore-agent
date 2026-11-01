@@ -29,10 +29,10 @@ names!(Gauge {
     LateWait => "late_wait_slots",
     Waiters => "registered_wait_receivers",
     DriverReports => "driver_report_owners",
-    Queries => "result_queries_inflight"
-    ,StoredIdentityBytes => "stored_identity_charged_bytes"
-    ,StoredIdentities => "stored_identity_charged_count"
-    ,PagePrefixBytes => "paging_prefix_workspace_bytes"
+    Queries => "result_queries_inflight",
+    StoredIdentityBytes => "stored_identity_charged_bytes",
+    StoredIdentities => "stored_identity_charged_count",
+    PagePrefixBytes => "paging_prefix_workspace_bytes",
 });
 
 names!(Work {
@@ -121,6 +121,7 @@ struct Totals {
     peak_ns: AtomicU64,
 }
 
+#[derive(Default)]
 pub(super) struct Metrics {
     gauges: [Meter; Gauge::ALL.len()],
     work: [Totals; Work::ALL.len()],
@@ -130,21 +131,6 @@ pub(super) struct Metrics {
     pending_pages: AtomicU64,
     unavailable_pages: AtomicU64,
     errors: AtomicU64,
-}
-
-impl Default for Metrics {
-    fn default() -> Self {
-        Self {
-            gauges: std::array::from_fn(|_| Meter::default()),
-            work: std::array::from_fn(|_| Totals::default()),
-            queries: AtomicU64::new(0),
-            pages: AtomicU64::new(0),
-            available_pages: AtomicU64::new(0),
-            pending_pages: AtomicU64::new(0),
-            unavailable_pages: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-        }
-    }
 }
 
 fn increment(counter: &AtomicU64, amount: u64, observer: &Observer) -> u64 {
