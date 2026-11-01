@@ -316,15 +316,9 @@ async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summa
     let cancellation = CancellationToken::new();
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let stored_page = stored_turn_page(
-        turn,
+        &result_request(turn, ReadCursor::start(), 100, 4096),
         stored,
-        None,
-        None,
-        ReadCursor::start(),
-        100,
-        4096,
-        &cancellation,
-        deadline,
+        &result_limits(&cancellation, deadline),
     )
     .await
     .unwrap();
@@ -353,15 +347,9 @@ async fn interrupted_partial_reaches_stored_and_live_turn_pages_and_record_summa
         next: None,
     });
     let live_page = live_turn_page(
-        turn,
+        &result_request(turn, ReadCursor::start(), 100, 4096),
         live,
-        None,
-        None,
-        ReadCursor::start(),
-        100,
-        4096,
-        &cancellation,
-        deadline,
+        &result_limits(&cancellation, deadline),
     )
     .await
     .unwrap();
@@ -429,28 +417,16 @@ async fn wide_tool_round_counts_reach_event_and_read_wire_views() {
         let cancellation = CancellationToken::new();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let live_page = live_turn_page(
-            turn,
+            &result_request(turn, ReadCursor::start(), 100, 4096),
             live,
-            None,
-            None,
-            ReadCursor::start(),
-            100,
-            4096,
-            &cancellation,
-            deadline,
+            &result_limits(&cancellation, deadline),
         )
         .await
         .unwrap();
         let stored_page = stored_turn_page(
-            turn,
+            &result_request(turn, ReadCursor::start(), 100, 4096),
             stored,
-            None,
-            None,
-            ReadCursor::start(),
-            100,
-            4096,
-            &cancellation,
-            deadline,
+            &result_limits(&cancellation, deadline),
         )
         .await
         .unwrap();
@@ -563,29 +539,17 @@ async fn live_and_stored_turn_pages_preserve_metadata_and_encoded_items() {
             loop {
                 let page = if live_side {
                     live_turn_page(
-                        turn,
+                        &result_request(turn, cursor, 100, MAX_BYTES),
                         Arc::clone(&live),
-                        None,
-                        None,
-                        cursor,
-                        100,
-                        MAX_BYTES,
-                        &cancellation,
-                        deadline,
+                        &result_limits(&cancellation, deadline),
                     )
                     .await
                     .unwrap()
                 } else {
                     stored_turn_page(
-                        turn,
+                        &result_request(turn, cursor, 100, MAX_BYTES),
                         stored.clone(),
-                        None,
-                        None,
-                        cursor,
-                        100,
-                        MAX_BYTES,
-                        &cancellation,
-                        deadline,
+                        &result_limits(&cancellation, deadline),
                     )
                     .await
                     .unwrap()
@@ -684,15 +648,9 @@ async fn stored_pages_preserve_failed_cancelled_and_unknown_outcomes_even_when_e
             interrupted: None,
         };
         let page = stored_turn_page(
-            turn,
+            &result_request(turn, ReadCursor::start(), 100, 4096),
             record,
-            None,
-            None,
-            ReadCursor::start(),
-            100,
-            4096,
-            &cancellation,
-            Instant::now() + Duration::from_secs(5),
+            &result_limits(&cancellation, Instant::now() + Duration::from_secs(5)),
         )
         .await
         .unwrap();
@@ -733,9 +691,7 @@ fn exact_source_reservation_admits_a_result_at_the_small_byte_limit() {
     let load = crate::test_support::load_id();
     catalog.register(load);
     let charge = catalog.reserve(load, bytes).unwrap();
-    let source = prepare_bounded_result_source(&items, None, metadata, &catalog)
-        .unwrap()
-        .unwrap();
+    let source = encode_result_source(&items, None, metadata).unwrap();
     let canonical = prepare_result_source(&items, None).unwrap();
     assert_eq!(source.result_id, canonical.result_id);
     assert_eq!(source.items, canonical.items);
@@ -776,8 +732,13 @@ fn source_admission_counts_metadata_string_capacity_not_just_encoded_length() {
         source_bytes_per_load: base + 1024,
         ..Default::default()
     });
+    let load = crate::test_support::load_id();
+    catalog.register(load);
     assert!(matches!(
-        prepare_bounded_result_source(&items, None, metadata, &catalog).unwrap(),
+        catalog.reserve(
+            load,
+            result_source_upper_bound(&items, None, &metadata).unwrap()
+        ),
         Err(crate::sessions::UnavailableReason::TooLarge)
     ));
 }
@@ -876,15 +837,12 @@ async fn two_long_result_readers_verify_every_page_and_stable_identity() {
         loop {
             let start = Instant::now();
             let page = stored_turn_page(
-                turn,
+                &TurnResultRequest {
+                    result_id: Some(expected.result_id.clone()),
+                    ..result_request(turn, cursor, 4, MAX_READ_MAX_BYTES)
+                },
                 record.clone(),
-                None,
-                Some(&expected.result_id),
-                cursor,
-                4,
-                MAX_READ_MAX_BYTES,
-                &CancellationToken::new(),
-                Instant::now() + READ_DEADLINE,
+                &result_limits(&CancellationToken::new(), Instant::now() + READ_DEADLINE),
             )
             .await
             .unwrap();
@@ -962,4 +920,26 @@ async fn two_long_result_readers_verify_every_page_and_stable_identity() {
         "two_result_readers bytes_per_turn=8388608 pages={}/{} total_ms={}/{} max_page_ms={}/{}",
         a.0, b.0, a.1, b.1, a.2, b.2
     );
+}
+
+fn result_request(
+    turn: TurnRef,
+    cursor: ReadCursor,
+    limit: usize,
+    max_bytes: usize,
+) -> TurnResultRequest {
+    TurnResultRequest {
+        turn,
+        load: None,
+        result_id: None,
+        cursor: Some(cursor),
+        limit,
+        max_bytes: Some(max_bytes),
+    }
+}
+
+fn result_limits(cancellation: &CancellationToken, deadline: Instant) -> HistoryScanLimits {
+    let mut limits = scan_limits(cancellation.clone());
+    limits.deadline = deadline;
+    limits
 }

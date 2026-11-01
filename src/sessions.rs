@@ -793,6 +793,7 @@ impl Session {
                 inner.compaction_progress = None;
             }
         }
+        self.shared.results.join_queries(Some(self.load())).await;
         self.join_status_workers().await;
         // A closed Session must reap its own CPU comparisons, not merely cancel
         // the query token. The Store owns those workers, so closing joins them

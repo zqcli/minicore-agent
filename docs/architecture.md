@@ -118,7 +118,10 @@ suffixes and these sources; in-flight page references keep their budget charge.
 Stored results use the actual durable interrupted projection. Result paging
 uses borrowed canonical serialization, streaming identity verification on
 blocking workers, and a page-sized encoded prefix, rather than cloning a whole
-normalized turn per page. Unsaved sources reuse already encoded immutable
+normalized turn per page. `read/turn_result.rs` owns source selection and page
+projection. Catalog task trackers reserve four `turn.result` worker slots before work
+starts and join them by load or Agent; cancelling a waiter cannot release a
+slot while its blocking work still holds history. Unsaved sources reuse already encoded immutable
 items; persisted sources are not kept as an additional long-lived body cache. Completion
 registration and successor installation share an observation boundary, while
 registered waiters retain their existing full-report API. Settled history is

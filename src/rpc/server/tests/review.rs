@@ -656,6 +656,7 @@ async fn all_query_paths_prefer_caller_cancellation_over_session_closure() {
                 caller.clone(),
             )),
             erase(prepare_turn_result(
+                agent.result_catalog(),
                 store.clone(),
                 Some(session.clone()),
                 decode(

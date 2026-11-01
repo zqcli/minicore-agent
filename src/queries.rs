@@ -211,6 +211,7 @@ pub(crate) fn prepare_session_read(
 }
 
 pub(crate) fn prepare_turn_result(
+    catalog: &crate::sessions::ResultCatalog,
     store: Store,
     loaded: Option<Session>,
     request: crate::TurnResultRequest,
@@ -221,8 +222,9 @@ pub(crate) fn prepare_turn_result(
     let close = loaded
         .as_ref()
         .map_or_else(CancellationToken::new, Session::query_cancellation);
+    let query = catalog.query(store, loaded, request, cancellation.clone());
     let future = bounded_query(
-        crate::read::turn_result(store, loaded, request, cancellation.clone()),
+        async move { query?.await },
         cancellation,
         close,
         Instant::now() + crate::read::READ_DEADLINE,

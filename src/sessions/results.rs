@@ -2,8 +2,10 @@ use super::*;
 use crate::read::InterruptedRequest;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
+mod queries;
 mod stored;
 pub(crate) use stored::{StoredIdentity, StoredIdentityKey};
+use tokio_util::task::TaskTracker;
 
 const MAX_ENTRIES_PER_LOAD: usize = 256;
 const MAX_ENTRIES: usize = 4_096;
@@ -137,6 +139,7 @@ struct Retained {
 
 #[derive(Default)]
 struct LoadResults {
+    queries: TaskTracker,
     through: u64,
     entries: VecDeque<Retained>,
     source_bytes: Arc<AtomicUsize>,
@@ -152,6 +155,8 @@ struct CatalogState {
 }
 
 pub(crate) struct ResultCatalog {
+    queries: TaskTracker,
+    query_cancel: CancellationToken,
     stored: Mutex<stored::StoredIdentities>,
     stored_preparation: tokio::sync::Mutex<()>,
     state: Mutex<CatalogState>,
@@ -242,15 +247,11 @@ impl PreparedSource {
     ) -> Result<Self, AgentError> {
         self.bytes = self
             .bytes
-            .checked_add(metadata_heap_bytes(&metadata))
+            .checked_add(outcome_heap_bytes(&metadata.outcome))
             .ok_or(AgentError::Internal)?;
         self.metadata = Some(metadata);
         Ok(self)
     }
-}
-
-pub(crate) fn metadata_heap_bytes(metadata: &crate::event::TurnResultView) -> usize {
-    outcome_heap_bytes(&metadata.outcome)
 }
 
 pub(crate) fn outcome_heap_bytes(outcome: &LoopOutcomeView) -> usize {
@@ -276,6 +277,8 @@ impl ResultCatalog {
         #[cfg(feature = "e2e-observe")]
         let limits = crate::e2e_observe::result_limits(limits);
         Arc::new(Self {
+            queries: TaskTracker::new(),
+            query_cancel: CancellationToken::new(),
             stored: Mutex::new(stored::StoredIdentities::default()),
             stored_preparation: tokio::sync::Mutex::new(()),
             state: Mutex::new(CatalogState::default()),
@@ -312,10 +315,6 @@ impl ResultCatalog {
             .unwrap()
             .loads
             .insert(load, LoadResults::default());
-    }
-
-    pub(crate) fn accepts_source(&self, bytes: usize) -> bool {
-        bytes <= self.limits.lock().unwrap().source_bytes_per_load
     }
 
     pub(crate) fn remove(&self, load: LoadId) {

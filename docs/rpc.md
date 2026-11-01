@@ -1159,8 +1159,13 @@ held by a page; pressure falls back to uncached preparation. Interrupted text is
 never retained in this index. Close unregisters entries and prevents late
 preparation from reinserting them. Cold/unloaded reads still verify disk records.
 Scanning and identity work remain bounded by 64 MiB, 100,000 items, the query
-deadline, and the four query slots. Page sizing scans at most the requested page
-budget on a blocking worker, with at most `(max_bytes + 1) * size_of::<usize>()`
+deadline, and four owned `turn.result` workers. These worker slots are
+independent of the four RPC read-request slots. Cancellation may release the RPC
+waiter first, but its worker keeps that slot and stops cooperatively before
+releasing history references. Session close joins that load's result workers;
+Agent shutdown also joins unloaded-result workers. Additional result work while
+all four slots remain occupied returns `query_limit`. Page sizing scans at most
+the requested page budget on a blocking worker, with at most `(max_bytes + 1) * size_of::<usize>()`
 prefix workspace per query. Clients must validate every page before installing
 a complete body.
 

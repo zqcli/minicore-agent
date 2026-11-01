@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep cancelled result queries owned and counted until their blocking work
+  exits; close and shutdown join them before releasing the loaded instance.
+  Consolidate result page projection and source encoding, and remove redundant
+  dirty-mark sequence state and repeated source admission scans.
+
 - The 0.9.1 development Agent reports RPC protocol 2 and requires a load identity for
   loaded-instance mutations. Input receipts distinguish acceptance from a
   queued head's startup failure.

@@ -39,7 +39,9 @@ is authorized; isolated development builds may link the approved Runtime source.
 - `sessions/results.rs` owns both completion suffixes and immutable unsaved
   sources. Eviction dirties affected loads without acquiring their business
   locks. A held page keeps source bytes/counts charged until its last reference
-  is released; removing a catalog entry is not memory release.
+  is released; removing a catalog entry is not memory release. Result-query
+  workers also remain tracked and counted after their waiters are cancelled;
+  close/shutdown joins their blocking work.
 - `sessions/boundary.rs` observes prompt preparations and issued model requests.
   Rewrap every active config replacement; a take before the next prompt after
   tools belongs to the next request, not the last prepared request.

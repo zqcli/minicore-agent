@@ -1100,6 +1100,7 @@ async fn cold_identity_waiter_is_cancellable_and_close_cannot_retain_late_prepar
     let _release = ReleaseGate(gate.clone());
     crate::read::RESULT_PREPARE_GATES.arm(turn.loop_id, gate.clone());
     let first = tokio::spawn(crate::queries::prepare_turn_result(
+        &catalog,
         store.clone(),
         Some(session.clone()),
         request.clone(),
@@ -1110,6 +1111,7 @@ async fn cold_identity_waiter_is_cancellable_and_close_cannot_retain_late_prepar
         .unwrap();
     let cancellation = CancellationToken::new();
     let mut waiter = crate::queries::prepare_turn_result(
+        &catalog,
         store.clone(),
         Some(session.clone()),
         request,
@@ -1126,16 +1128,28 @@ async fn cold_identity_waiter_is_cancellable_and_close_cannot_retain_late_prepar
         Err(AgentError::QueryLimit)
     ));
     harness
-        .call_ok(
+        .send(
+            json!("close-owned-result"),
             "session.close",
             Some(json!({"session_id":info.session_id,"load":session.load()})),
         )
         .await;
+    tokio::time::timeout(TIMEOUT, session.query_cancellation().cancelled())
+        .await
+        .unwrap();
     assert!(matches!(
         tokio::time::timeout(TIMEOUT, first).await.unwrap().unwrap(),
         Err(AgentError::SessionNotLoaded)
     ));
+    let joined = catalog.join_queries(Some(session.load()));
+    tokio::pin!(joined);
+    assert!(futures_util::poll!(&mut joined).is_pending());
     gate.release();
+    tokio::time::timeout(TIMEOUT, joined).await.unwrap();
+    assert_eq!(
+        harness.response(json!("close-owned-result")).await["result"]["ok"],
+        true
+    );
     assert!(
         catalog
             .stored_identity(crate::sessions::results::StoredIdentityKey {
@@ -1145,6 +1159,100 @@ async fn cold_identity_waiter_is_cancellable_and_close_cannot_retain_late_prepar
             })
             .is_none()
     );
+    drop(session);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_result_waiters_keep_worker_slots_until_blocking_work_exits() {
+    let mut fixture = RpcFixture::new(
+        "result-worker-ownership",
+        [Step::Text("answer")],
+        &[],
+        ApprovalMode::Auto,
+    );
+    let mut agent = fixture.open().await;
+    let info = agent
+        .create_session(crate::CreateSession {
+            workspace: fixture.workspace.clone(),
+            profile: "test".into(),
+            model: None,
+            reasoning: None,
+            title: None,
+        })
+        .await
+        .unwrap();
+    let session = agent.loaded_session(info.session_id).unwrap();
+    let store = agent.store_handle();
+    let catalog = session.result_catalog_for_test();
+    let mut harness = RpcHarness::spawn(agent);
+    let pushed = harness
+        .call_ok(
+            "input.push",
+            Some(json!({
+                "session_id":info.session_id,"load":session.load(),"mode":"steer","text":"first"
+            })),
+        )
+        .await;
+    let turn = pushed["result"]["started"]["turn"].clone();
+    harness.call_ok("turn.wait", Some(turn_params(&turn))).await;
+    harness
+        .call_ok("turn.result", Some(turn_params(&turn)))
+        .await;
+    let turn: crate::TurnRef = serde_json::from_value(turn).unwrap();
+    let request = crate::TurnResultRequest {
+        turn,
+        load: Some(session.load().to_string()),
+        result_id: None,
+        cursor: None,
+        limit: 100,
+        max_bytes: Some(1024),
+    };
+    let mut held = Vec::new();
+    let mut waiters = Vec::new();
+    for _ in 0..4 {
+        let gate = Arc::new(Gate::new());
+        held.push(ReleaseGate(gate.clone()));
+        crate::read::RESULT_PREPARE_GATES.arm(turn.loop_id, gate.clone());
+        let cancellation = CancellationToken::new();
+        let waiter = tokio::spawn(crate::queries::prepare_turn_result(
+            &catalog,
+            store.clone(),
+            Some(session.clone()),
+            request.clone(),
+            cancellation.clone(),
+        ));
+        tokio::time::timeout(TIMEOUT, gate.wait_started())
+            .await
+            .unwrap();
+        waiters.push((waiter, cancellation));
+    }
+    for (waiter, cancellation) in waiters {
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(TIMEOUT, waiter)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(AgentError::QueryLimit)
+        ));
+    }
+    assert!(matches!(
+        crate::queries::prepare_turn_result(
+            &catalog,
+            store.clone(),
+            Some(session.clone()),
+            request.clone(),
+            CancellationToken::new()
+        )
+        .await,
+        Err(AgentError::QueryLimit)
+    ));
+    let shutdown = catalog.join_queries(None);
+    tokio::pin!(shutdown);
+    assert!(futures_util::poll!(&mut shutdown).is_pending());
+    drop(held);
+    tokio::time::timeout(TIMEOUT, shutdown).await.unwrap();
     drop(session);
     harness.shutdown().await;
 }

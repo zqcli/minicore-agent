@@ -507,7 +507,13 @@ impl RpcServer {
                 let cancellation = self.query_cancellation.clone();
                 self.defer_query(
                     id,
-                    crate::queries::prepare_turn_result(store, loaded, request, cancellation),
+                    crate::queries::prepare_turn_result(
+                        self.agent().result_catalog(),
+                        store,
+                        loaded,
+                        request,
+                        cancellation,
+                    ),
                 )
             }
             _ => return Err(method_not_found(id)),

@@ -288,15 +288,8 @@ async fn run_turn(session: &Session, task: &Arc<SessionTask>, run: LoopRun) -> O
                     Ok(charge) => charge,
                     Err(reason) => return Ok(Err(reason)),
                 };
-                match crate::read::prepare_bounded_result_source(
-                    &items,
-                    interrupted,
-                    metadata,
-                    &catalog,
-                )? {
-                    Ok(source) => Ok(catalog.finish_reservation(source, charge)),
-                    Err(reason) => Ok(Err(reason)),
-                }
+                let source = crate::read::encode_result_source(&items, interrupted, metadata)?;
+                Ok(catalog.finish_reservation(source, charge))
             },
         )
         .await

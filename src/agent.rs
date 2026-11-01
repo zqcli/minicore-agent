@@ -271,6 +271,10 @@ impl Agent {
         &self.config
     }
 
+    pub(crate) fn result_catalog(&self) -> &crate::sessions::ResultCatalog {
+        &self.results
+    }
+
     pub(crate) fn reserve_snapshot(&self) -> Option<crate::sessions::hub::SnapshotCharge> {
         self.hub.try_reserve()
     }
@@ -400,6 +404,7 @@ impl Agent {
     ) -> Result<TurnResultPage, AgentError> {
         request.validate()?;
         crate::queries::prepare_turn_result(
+            &self.results,
             self.store.clone(),
             self.loaded_session(request.turn.session_id),
             request,
@@ -1046,9 +1051,11 @@ impl Agent {
 
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         tracing::info!("agent shutdown begin");
+        self.results.cancel_queries();
         drop(self.events_rx.take());
         self.store.cancel_diff_workers();
         let result = self.sessions.shutdown_all().await;
+        self.results.join_queries(None).await;
         // The publisher stops before the event stream is dropped so no control
         // snapshot is lost for a still-loaded Session.
         self.hub.shutdown_now();
@@ -1115,6 +1122,7 @@ pub const fn agent_version() -> &'static str {
 
 impl Drop for Agent {
     fn drop(&mut self) {
+        self.results.cancel_queries();
         self.hub.shutdown_now();
     }
 }
