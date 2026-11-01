@@ -1,33 +1,8 @@
+use super::super::tests::finish;
 use super::*;
 use crate::test_support::{Gate, TempDir};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::{Arc, Barrier};
-
-fn finish(observer: &Observer, path: &Path) -> Vec<Value> {
-    observer
-        .sender
-        .send(Message::End(json!({
-            "ended_ns":observer.now(), "invalid":observer.invalid.load(Ordering::SeqCst),
-            "trace_dropped":observer.dropped.load(Ordering::SeqCst), "counters":observer.counters()
-        })))
-        .unwrap();
-    assert!(
-        observer
-            .writer
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .join()
-            .unwrap()
-    );
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
-}
 
 fn gauge_history_is_valid(rows: &[Value]) -> bool {
     let mut states = BTreeMap::new();

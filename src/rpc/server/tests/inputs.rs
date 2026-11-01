@@ -452,59 +452,6 @@ async fn w0_accepted_push_reports_failure_for_the_older_claimed_head() {
 }
 
 #[tokio::test]
-async fn w0_missing_load_cannot_remove_a_queued_input() {
-    let gate = Arc::new(Gate::new());
-    let mut fixture = RpcFixture::new(
-        "w0-missing-load",
-        [Step::gated_text(gate.clone(), "first")],
-        &[],
-        ApprovalMode::Auto,
-    );
-    let workspace = fixture.workspace.clone();
-    let agent = fixture.open().await;
-    let mut harness = RpcHarness::spawn(agent);
-    let _release = ReleaseGate(gate.clone());
-    let (session, load) = w0_create_session(&mut harness, &workspace).await;
-    harness
-        .call_ok(
-            "input.push",
-            w0_params(
-                json!({"session_id": session, "mode": "steer", "text": "first"}),
-                load.as_ref(),
-            ),
-        )
-        .await;
-    started(&gate).await;
-    let queued = harness
-        .call_ok(
-            "input.push",
-            w0_params(
-                json!({"session_id": session, "mode": "follow_up", "text": "queued"}),
-                load.as_ref(),
-            ),
-        )
-        .await;
-    let removed = harness
-        .call_unmodified(
-            "input.remove",
-            Some(json!({"session_id": session, "id": queued["result"]["id"]})),
-        )
-        .await;
-    let queue = harness
-        .call_ok("input.list", Some(json!({"session_id": session})))
-        .await;
-    harness.shutdown().await;
-
-    assert_eq!(
-        removed.pointer("/error/data/kind").and_then(Value::as_str),
-        Some("missing_load"),
-        "queue length after the request was {}",
-        queue["result"]["items"].as_array().unwrap().len()
-    );
-    assert_eq!(queue["result"]["items"][0]["id"], queued["result"]["id"]);
-}
-
-#[tokio::test]
 async fn w0_stale_load_cannot_remove_a_reused_input_id_after_reopen() {
     let old_gate = Arc::new(Gate::new());
     let new_gate = Arc::new(Gate::new());

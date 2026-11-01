@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::TempDir;
+use std::path::Path;
 
 pub(super) fn local(file: File) -> Observer {
     let (sender, receiver) = mpsc::sync_channel(QUEUED_ROWS);
@@ -15,6 +16,31 @@ pub(super) fn local(file: File) -> Observer {
         invalid: AtomicBool::new(false),
         dropped: AtomicU64::new(0),
     }
+}
+
+pub(super) fn finish(observer: &Observer, path: &Path) -> Vec<Value> {
+    observer
+        .sender
+        .send(Message::End(json!({
+            "ended_ns":observer.now(), "invalid":observer.invalid.load(Ordering::SeqCst),
+            "trace_dropped":observer.dropped.load(Ordering::SeqCst), "counters":observer.counters()
+        })))
+        .unwrap();
+    assert!(
+        observer
+            .writer
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+    );
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[test]
@@ -42,32 +68,13 @@ fn source_charge_and_reference_weighted_gauges_are_distinct_and_have_real_peaks(
     let end = observer.counters();
     assert_eq!(end["gauges"]["source_charged_bytes"]["current"], 0);
     assert_eq!(end["gauges"]["source_charged_bytes"]["peak"], 4096);
-    observer
-        .sender
-        .send(Message::End(
-            json!({"ended_ns":observer.now(),"counters":end,"invalid":false}),
-        ))
-        .unwrap();
-    assert!(
-        observer
-            .writer
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .join()
-            .unwrap()
-    );
-    let rows = std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
+    let rows = finish(&observer, &path);
     for (index, row) in rows.iter().enumerate() {
         assert_eq!(row["event_seq"], index + 1);
         assert_eq!(row["schema"], "agent-e2e-1");
     }
     assert_eq!(rows.last().unwrap()["event"], "observer_end");
+    assert_eq!(rows.last().unwrap()["invalid"], false);
 }
 
 #[test]
@@ -132,20 +139,6 @@ fn counter_overflow_and_underflow_mark_observation_invalid_without_wrapping() {
         observer.counters()["gauges"]["source_charged_bytes"],
         json!({"revision":2,"current":0,"peak":u64::MAX})
     );
-    observer
-        .sender
-        .send(Message::End(
-            json!({"ended_ns":observer.now(),"invalid":true,"counters":observer.counters()}),
-        ))
-        .unwrap();
-    assert!(
-        observer
-            .writer
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .join()
-            .unwrap()
-    );
+    let rows = finish(&observer, &path);
+    assert_eq!(rows.last().unwrap()["invalid"], true);
 }
