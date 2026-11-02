@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.5 — 2026-11-02 (development)
+
+Agent RPC protocol 4, the Runtime 0.9.0 dependency, and all on-disk formats are
+unchanged.
+
+- Keep the completed predecessor `finishing` while its busy-period driver
+  settles the tail and decides an automatic successor, including after queued
+  inputs are recalled. Terminal waiters and completion descriptors still
+  publish before this work; a completed turn without a successor stays `none`.
+- Derive `session_closed` event identity from the removed Session rather than
+  keeping an unreachable random-load fallback. Repeated public close still
+  returns `session_not_loaded` and emits no additional close event.
+
 ## 0.9.4 — 2026-11-02 (development)
 
 Breaking: Agent RPC protocol 4 removes unused presentation fields. The Runtime

@@ -452,17 +452,19 @@ impl Session {
             return Err(AgentError::StaleLoad);
         }
         let queue = self.lock_queue();
+        // A completed predecessor still owns the busy period until the driver
+        // settles its tail and decides whether a successor can start.
         let active = inner
             .active
             .as_ref()
-            .filter(|active| active.completion.borrow().is_none());
+            .filter(|active| active.completion.borrow().is_none() || queue.running);
         let runtime = active.map(|active| active.handle.state());
         let execution = if let Some(entry) = &queue.starting {
             SessionExecution::Starting {
                 input: entry.item(),
             }
         } else if let Some(active) = active {
-            let runtime = runtime.as_ref().expect("unfinished active loop");
+            let runtime = runtime.as_ref().expect("observed active loop");
             match runtime.status {
                 minicore_runtime::LoopStatus::Finishing
                 | minicore_runtime::LoopStatus::Finished => SessionExecution::Finishing {

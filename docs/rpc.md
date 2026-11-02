@@ -1,6 +1,6 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.9.4 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.9.5 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
 Agent protocol version 4 uses load-scoped mutations, reliable versioned
@@ -86,7 +86,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.4","protocol_version":4,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.5","protocol_version":4,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
 ```
 
 An error response has exactly one `error`:
@@ -197,7 +197,7 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.9.4",
+  "version": "0.9.5",
   "protocol_version": 4,
   "capabilities": [
     "session.read",
@@ -2108,7 +2108,9 @@ an open/create response selects the instance.
 
 `execution` is tagged by `type`:
 
-- `none` has no additional fields.
+- `none` has no additional fields. A completed turn may still own auxiliary
+  cleanup; a new start joins it before execution. It does not mean every owned
+  worker has exited.
 - `starting` carries the actual claimed `input` (`QueueItem`), no longer in
   `queue.items`. Failed/dropped claims restore it under the existing pause rules.
 - `running` carries `loop_id`, `input`, `request_index`, and `phase` (the Runtime
@@ -2116,7 +2118,13 @@ an open/create response selects the instance.
   `waiting_for_input`).
 - `finishing` carries `loop_id`, `input`, and `request_index`, and remains until
   Agent normalization/persistence and completion publication finish, even if
-  Runtime has already finished.
+  Runtime has already finished. If the busy-period driver owns an automatic
+  successor, the completed predecessor remains `finishing` while its tail
+  settles and the driver decides whether to start the next input. Its terminal
+  descriptor can therefore already appear in `completions`. Removing queued
+  inputs does not end this ownership until that decision; snapshots then show
+  the actual claimed input, successor, or `none`, never a speculative loop
+  identity.
 
 `pending_interaction` is null or contains `loop_id`, `request_index`,
 `interaction_id`, `tool_call_id`, `tool_name`, and `kind`. The kind retains the

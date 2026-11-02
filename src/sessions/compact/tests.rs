@@ -205,8 +205,14 @@ async fn high_final_usage_waits_until_the_next_turn_to_compact() {
 
 #[tokio::test]
 async fn turn_wait_does_not_wait_for_projection_settlement() {
-    for queued in [false, true] {
-        let (_temp, agent, session, model) = fixture("summary", 8_000).await;
+    for (queued, recalled, closing) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let (_temp, mut agent, session, model) = fixture("summary", 8_000).await;
+        let mut events = agent.take_events().unwrap();
         let old = LoopId::new().unwrap();
         let call_id = "read-old".parse().unwrap();
         append_source(
@@ -274,6 +280,19 @@ async fn turn_wait_does_not_wait_for_projection_settlement() {
             .unwrap();
         assert_eq!(result.persistence, TurnPersistence::Persisted);
         assert!(session.shared.compaction.coverage().is_none());
+        let snapshot = session.sample().unwrap();
+        assert_eq!(snapshot.completions.through_seq, 1);
+        assert_eq!(snapshot.completions.entries[0].loop_id, turn.loop_id);
+        assert!(snapshot.pending_interaction.is_none());
+        if queued {
+            assert!(matches!(
+                snapshot.execution,
+                SessionExecution::Finishing { loop_id, ref input, .. }
+                    if loop_id == turn.loop_id && input.text == "continue"
+            ));
+        } else {
+            assert_eq!(snapshot.execution, SessionExecution::None);
+        }
         let settled_items = session.read_snapshot().history.len();
         if queued {
             assert!(matches!(
@@ -290,23 +309,66 @@ async fn turn_wait_does_not_wait_for_projection_settlement() {
             resumed.finish();
             assert_eq!(model.calls.load(Ordering::SeqCst), 2);
         }
-        gate.release();
-        session.join_turn_task().await;
-        session.cleanup_finished().await.unwrap();
+        if recalled {
+            assert!(matches!(
+                session.begin_close(),
+                Err(AgentError::SessionBusy)
+            ));
+            assert_eq!(session.recall_inputs().texts.len(), 2);
+            assert!(matches!(
+                session.sample().unwrap().execution,
+                SessionExecution::Finishing { loop_id, .. } if loop_id == turn.loop_id
+            ));
+            session.await_control_idle_for_test().await;
+        }
+        if closing {
+            let close = agent.close_session(session.session_id());
+            tokio::pin!(close);
+            assert!(futures_util::poll!(&mut close).is_pending());
+            gate.release();
+            close.await.unwrap();
+        } else {
+            gate.release();
+            session.join_turn_task().await;
+        }
+        let successors = queued && !recalled;
         assert_eq!(
             session.shared.compaction.coverage().unwrap().1,
-            settled_items + if queued { 4 } else { 0 }
+            settled_items + if successors { 4 } else { 0 }
         );
         // Settlement supersedes the first turn's usage; only the third turn
         // has a fresh report that can trigger another compaction.
         assert_eq!(
             model.calls.load(Ordering::SeqCst),
-            if queued { 5 } else { 2 }
+            if successors { 5 } else { 2 }
         );
+        let terminal = if queued {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(AgentEvent::SessionSnapshot { snapshot: next, .. }) =
+                        events.recv().await
+                        && next.revision > snapshot.revision
+                        && next.execution == SessionExecution::None
+                    {
+                        break next;
+                    }
+                }
+            })
+            .await
+            .expect("the successor decision must publish the end of the busy period")
+        } else {
+            session.sample().unwrap()
+        };
         assert_eq!(
-            session.sample().unwrap().completions.through_seq,
-            if queued { 3 } else { 1 }
+            terminal.completions.through_seq,
+            if successors { 3 } else { 1 }
         );
+        assert!(terminal.pending_interaction.is_none());
+        if closing {
+            assert!(matches!(session.sample(), Err(AgentError::StaleLoad)));
+        } else {
+            session.cleanup_finished().await.unwrap();
+        }
         assert!(session.queue().items.is_empty());
         agent.shutdown().await.unwrap();
     }

@@ -756,15 +756,13 @@ impl Agent {
         // The map retains the Session until its complete shutdown barrier has
         // joined every owned task. This prevents a dropped local owner from
         // detaching a manual-compaction worker during close.
-        let load = self
+        let session = self
             .sessions
-            .get(session_id)
-            .map(|session| session.load())
-            .unwrap_or_else(|| crate::ids::LoadId::new().expect("load identity"));
-        self.sessions.remove(session_id);
+            .remove(session_id)
+            .expect("closing session remains loaded");
         self.event_sink.try_send(AgentEvent::SessionClosed {
             session_id,
-            meta: EventMeta::session(session_id, load),
+            meta: EventMeta::session(session_id, session.load()),
         });
         tracing::info!(session_id = %session_id, "session closed");
     }

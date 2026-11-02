@@ -87,10 +87,16 @@ async fn create_and_loaded_open_emit_session_opened_once() {
         } => {
             assert_eq!(closed_id, info.session_id);
             assert_eq!(meta.session_id, info.session_id);
+            assert_eq!(meta.load, created_session.load());
             assert_eq!(meta.loop_id, None);
         }
         event => panic!("unexpected close event: {event:?}"),
     }
+    assert!(matches!(
+        agent.close_session(info.session_id).await,
+        Err(AgentError::SessionNotLoaded)
+    ));
+    assert!(only_control_pending(&mut events));
 
     let reopened = agent.open_session(info.session_id).await.unwrap();
     assert_eq!(reopened, info);

@@ -10,7 +10,7 @@ also be embedded directly as a Rust library.
 
 | | |
 |---|---|
-| Version | 0.9.4 (development) |
+| Version | 0.9.5 (development) |
 | Rust | edition 2024, current stable |
 | Runtime | `minicore-runtime` 0.9.0, pinned to tag `v0.9.0` |
 | RPC protocol | 4 (35 methods) |
@@ -188,7 +188,7 @@ elsewhere. See [Security](docs/security.md).
 
 ## Compatibility
 
-Agent 0.9.4 serves RPC protocol 4 and keeps the Runtime 0.9.0 dependency and
+Agent 0.9.5 serves RPC protocol 4 and keeps the Runtime 0.9.0 dependency and
 on-disk formats. Clients must check `agent.ping.protocol_version` before a
 mutation. Protocol 3 clients must read branch state directly from
 `workspace.status`; `session.presentation` no longer includes `git_branch`,
@@ -196,6 +196,11 @@ mutation. Protocol 3 clients must read branch state directly from
 Remove `max_tool_rounds` from profile configuration: unknown settings are
 rejected. Existing Session records retain their old values and still execute
 without a finite tool-round limit.
+
+Completion publication and execution ownership are separate: a completed turn
+can remain `finishing` while its driver settles the tail and decides an
+automatic successor. Clients retain that actual turn identity until a newer
+snapshot reports a claimed input, successor, or `none`.
 
 Protocol 2 clients also need to migrate: control snapshots replace the
 legacy control events and command-response state, `turn.wait` no longer returns

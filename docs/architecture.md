@@ -80,6 +80,10 @@ provider-overflow recovery.
   normalizes and persists the report, registers completion/body availability,
   and publishes a small terminal summary to waiters. It then settles the
   projection and auxiliary writes before installing an eligible successor.
+  While that successor decision is owned, snapshots retain the completed
+  predecessor as `finishing`; its terminal summary and descriptor remain
+  available independently. Recalling the queue cannot turn this busy period
+  idle before the driver releases it.
   Only a completed, persisted turn continues automatically; other outcomes
   pause a non-empty queue. The driver never joins itself: the next start,
   compaction, or close joins the task that owns the whole busy period. The last

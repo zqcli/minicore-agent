@@ -10,9 +10,10 @@ wins and this file gets fixed.
 `minicore-agent` is a local coding-agent backend: a Rust library plus a binary
 that serves newline-delimited JSON-RPC 2.0 on stdio. The Agent owns Sessions,
 persistence, providers, tools, Workspaces, compaction, and the RPC surface.
-The model/tool loop itself comes from `minicore-runtime`, pinned by Git revision
-in `Cargo.toml` and `Cargo.lock`. Keep that split: loop semantics belong in the
-Runtime repository, and session or product policy belongs here. Frontends such
+The model/tool loop itself comes from `minicore-runtime`, pinned to a release
+tag in `Cargo.toml` and its resolved revision in `Cargo.lock`. Keep that split:
+loop semantics belong in the Runtime repository, and session or product policy
+belongs here. Frontends such
 as [minicore-tui](https://github.com/zqcli/minicore-tui) only speak the RPC
 contract; do not shape the Agent's schema around one frontend's convenience.
 
@@ -23,7 +24,7 @@ runs Tokio on two workers).
 
 ## Control And Result Ownership
 
-The current source is the 0.9.4 development package and serves Agent RPC v4
+The current source is the 0.9.5 development package and serves Agent RPC v4
 inside JSON-RPC 2.0. Formal dependency tags are unchanged until a real release
 is authorized; consumers pin an approved development commit by immutable `rev`.
 The Runtime dependency and on-disk formats are unchanged.
@@ -41,7 +42,8 @@ loop display data; branch state comes directly from `workspace.status`.
   at most 16. Execution paths only mark; snapshots use a reliable event lane,
   not lifecycle `try_send`. Reserve capacity before sampling and retain the
   charge through encoding, outbound queues, and writer flush. Close publishes
-  its final joined state before unregistering the load.
+  its final joined state before unregistering the load. The close event uses
+  that removed Session's load; never manufacture a replacement identity.
 - `sessions/results.rs` owns both completion suffixes and immutable unsaved
   sources. Eviction dirties affected loads without acquiring their business
   locks. A held page keeps source bytes/counts charged until its last reference
@@ -51,7 +53,11 @@ loop display data; branch state comes directly from `workspace.status`.
 - The busy-period driver observes Runtime watch state and joins the loop;
   observation is not a separate task. Completion becomes visible before
   auxiliary settlement, and the existing driver or a joined successor owns
-  every side effect. `task.rs` retains join handles across caller cancellation.
+  every side effect. A completed predecessor remains `finishing` while the
+  driver owns an automatic-successor decision, even after queue recall; its
+  terminal descriptor may already be present. With no automatic successor,
+  execution is `none`, but a new start still joins any remaining tail.
+  `task.rs` retains join handles across caller cancellation.
 - `sessions/boundary.rs` observes prompt preparations and issued model requests.
   Rewrap every active config replacement; a take before the next prompt after
   tools belongs to the next request, not the last prepared request.
