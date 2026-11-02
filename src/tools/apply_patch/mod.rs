@@ -25,7 +25,7 @@ use super::{
 const TOOL_NAME: &str = "apply_patch";
 pub(crate) struct ApplyPatchTool {
     workspace: Arc<Workspace>,
-    owners: Option<Arc<ToolOwners>>,
+    owners: Arc<ToolOwners>,
     spec: ToolSpec,
 }
 
@@ -37,7 +37,7 @@ struct ApplyPatchInput {
 }
 
 impl ApplyPatchTool {
-    pub(crate) fn new(workspace: Arc<Workspace>, owners: Option<Arc<ToolOwners>>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>, owners: Arc<ToolOwners>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("apply_patch is a valid tool name"),
             "Apply one complete patch to one existing workspace file. Standard unified diffs are single-file only; Codex envelopes must contain exactly one *** Update File operation. Add File, Delete File, Move to, and multifile envelopes are rejected.",
@@ -132,7 +132,7 @@ impl ApplyPatchTool {
                 emit_phase(&context, "committing");
                 commit_text(
                     &self.workspace,
-                    self.owners.as_deref(),
+                    &self.owners,
                     tool_ref,
                     tool_data,
                     input.path,

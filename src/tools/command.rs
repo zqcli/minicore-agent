@@ -92,10 +92,7 @@ pub(crate) trait CommandStreamSink: Send + Sync {
 /// inherited OS pipes share one owner-side type.
 pub(crate) type OutputReader = Box<dyn AsyncRead + Unpin + Send>;
 
-/// Narrow handle a tool needs to run owned commands: the registry they join
-/// and the sink their bytes go to. Identity is never resolved here; the caller
-/// that reached the real `Tool::execute` boundary passes the complete
-/// `ToolRef` explicitly.
+/// Binds command ownership and observation without resolving invocation identity.
 pub(crate) struct CommandBinding {
     owners: Arc<ToolOwners>,
     sink: Arc<dyn CommandStreamSink>,
@@ -252,9 +249,7 @@ fn safe_pipe_component(value: &str) -> String {
 
 /// Everything one owned command needs before it starts.
 pub(crate) struct CommandRequest {
-    /// The complete Runtime identity, present whenever the call came from a
-    /// real loop. A standalone tool without a captured identity has none, and
-    /// no `ToolRef` is fabricated for it.
+    /// No identity is fabricated when a Runtime request has not been captured.
     pub(crate) tool_ref: Option<ToolRef>,
     /// Free-form shell text, passed to the shell as one argument.
     pub(crate) command: String,
@@ -266,7 +261,7 @@ pub(crate) struct CommandRequest {
     /// Retained tail per stream for the model-facing result, separate from the
     /// streaming window.
     pub(crate) capture_limit: usize,
-    pub(crate) streams: Option<Arc<dyn CommandStreamSink>>,
+    pub(crate) streams: Arc<dyn CommandStreamSink>,
     /// Platform capture for this command; Windows command owners pass their
     /// named-pipe capture, everything else uses inherited pipes.
     pub(crate) capture: Capture,
@@ -319,10 +314,7 @@ impl Drop for CommandWorker {
     }
 }
 
-/// Owned tool workers for one owner boundary (a Session or standalone owner):
-/// Bash commands and started workspace commits. At most one worker exists per
-/// complete `ToolRef`. Loop and Session barriers join them even after the
-/// Runtime dropped the tool future that started them.
+/// Tracks commands and commits until the loop or Session barrier joins them.
 pub(crate) struct ToolOwners {
     inner: Mutex<OwnersInner>,
 }
@@ -353,9 +345,7 @@ impl OwnedWorker {
     }
 }
 
-/// Registry identity of one owned command. A real call is always keyed by its
-/// complete `ToolRef`; only a tool executed without a Runtime identity uses the
-/// process-local handle, which is never mistaken for one.
+/// Calls without a captured Runtime identity use only a local registry key.
 #[derive(Clone, Eq, PartialEq)]
 enum OwnerKey {
     Tool(ToolRef),
@@ -369,13 +359,7 @@ impl ToolOwners {
         })
     }
 
-    /// Registers and starts one command. A duplicate identity, a closing owner,
-    /// or a full registry is refused instead of being guessed around. The
-    /// registry is bounded like the Session tool-record store, and finished
-    /// owners are reaped on every registration so a long-lived Session cannot
-    /// accumulate handles without limit. A standalone tool without a Runtime
-    /// identity is still registered (under its local key), so its explicit join
-    /// always reaches it.
+    /// Registers a command, rejecting duplicate identities and closed or full registries.
     pub(crate) fn start(&self, request: CommandRequest) -> Result<CommandWorker, ToolError> {
         let (sender, receiver) = watch::channel(None);
         let cancel = CancellationToken::new();
@@ -761,10 +745,11 @@ fn announce_start(request: &CommandRequest) {
 }
 
 fn announce_stop(request: &CommandRequest, cancel_requested: bool) {
-    if cancel_requested && let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref)
-    {
-        sink.mark_cancelling(tool_ref);
-        sink.note_command(tool_ref, &live_record(request, CommandStatus::Cancelling));
+    if cancel_requested && let Some(tool_ref) = &request.tool_ref {
+        request.streams.mark_cancelling(tool_ref);
+        request
+            .streams
+            .note_command(tool_ref, &live_record(request, CommandStatus::Cancelling));
     }
 }
 
@@ -815,7 +800,7 @@ fn shell_command(command: &str) -> tokio::process::Command {
 /// authoritative window first, then to the best-effort event.
 async fn drain_stream<R>(
     reader: &mut R,
-    sink: Option<Arc<dyn CommandStreamSink>>,
+    sink: Arc<dyn CommandStreamSink>,
     tool_ref: Option<ToolRef>,
     stream: ToolDataStream,
     state: StreamHandle,
@@ -832,7 +817,7 @@ async fn drain_stream<R>(
         let read = match reader.read(&mut buffer).await {
             Ok(0) => {
                 ended = true;
-                if let (Some(sink), Some(tool_ref)) = (&sink, &tool_ref) {
+                if let Some(tool_ref) = &tool_ref {
                     sink.note_stream_end(tool_ref, stream);
                 }
                 break;
@@ -841,7 +826,7 @@ async fn drain_stream<R>(
             Err(_) => break,
         };
         let chunk = &buffer[..read];
-        if let (Some(sink), Some(tool_ref)) = (&sink, &tool_ref) {
+        if let Some(tool_ref) = &tool_ref {
             sink.push_chunk(tool_ref, stream, chunk);
         }
         let mut state = state.lock().unwrap();
@@ -1052,7 +1037,7 @@ fn streams_closed(stdout: &StreamHandle, stderr: &StreamHandle) -> bool {
 /// under the state lock but the sink is called without it, so no lock ordering
 /// between the stream state and the shared store is ever established.
 fn note_cut(request: &CommandRequest, stdout: &StreamHandle, stderr: &StreamHandle, force: bool) {
-    let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) else {
+    let Some(tool_ref) = &request.tool_ref else {
         return;
     };
     let mut cut = Vec::new();
@@ -1067,7 +1052,7 @@ fn note_cut(request: &CommandRequest, stdout: &StreamHandle, stderr: &StreamHand
         }
     }
     for stream in cut {
-        sink.note_stream_cut(tool_ref, stream);
+        request.streams.note_stream_cut(tool_ref, stream);
     }
 }
 
@@ -1106,20 +1091,24 @@ fn terminal_record(
 
 /// Stores the process record through the same sink that owns the windows.
 fn record(request: &CommandRequest, result: &CommandResult) {
-    if let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) {
-        sink.note_command(tool_ref, result);
+    if let Some(tool_ref) = &request.tool_ref {
+        request.streams.note_command(tool_ref, result);
     }
 }
 
 type StreamRange = Option<(u64, u64)>;
 
 fn stream_ranges(request: &CommandRequest) -> (StreamRange, StreamRange) {
-    let (Some(sink), Some(tool_ref)) = (&request.streams, &request.tool_ref) else {
+    let Some(tool_ref) = &request.tool_ref else {
         return (None, None);
     };
     (
-        sink.stream_range(tool_ref, ToolDataStream::Stdout),
-        sink.stream_range(tool_ref, ToolDataStream::Stderr),
+        request
+            .streams
+            .stream_range(tool_ref, ToolDataStream::Stdout),
+        request
+            .streams
+            .stream_range(tool_ref, ToolDataStream::Stderr),
     )
 }
 

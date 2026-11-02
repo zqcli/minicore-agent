@@ -3,12 +3,30 @@ use std::path::PathBuf;
 
 use super::file_change::*;
 use super::*;
+
 pub(crate) fn build_tools(
     names: &[String],
     workspace: Arc<Workspace>,
     command_environment: CommandEnvironment,
 ) -> Result<ToolSet, BuildToolsError> {
-    build_tools_with(names, workspace, command_environment, None)
+    let session_id = crate::ids::SessionId::new().unwrap();
+    let load = crate::test_support::load_id();
+    let (events, _) = crate::event::AgentEventSink::channel(1);
+    let presentation = Presentation::new(
+        session_id,
+        load,
+        events.clone(),
+        crate::compaction::CompactionState::new(),
+    );
+    let observer = ToolObserver::new(session_id, load, Arc::new(ToolData::new()), events);
+    build_tools_with_presentation(
+        names,
+        workspace,
+        command_environment,
+        &presentation,
+        &observer,
+        &ToolOwners::new(),
+    )
 }
 
 use crate::changes::{ChangeCommitState, ChangeCoverage, ChangeKind};

@@ -22,7 +22,7 @@ async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, WriteTool) {
     let root = base.join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root).await.unwrap());
-    let tool = WriteTool::new(Arc::clone(&workspace), None);
+    let tool = WriteTool::new(Arc::clone(&workspace), ToolOwners::new());
     (base, workspace, tool)
 }
 
@@ -532,7 +532,7 @@ async fn cancellation_and_deadline_interrupt_waiting_write_operations() {
 async fn the_loop_barrier_joins_a_commit_whose_caller_was_cancelled() {
     let (base, workspace, _) = fixture("owned-commit").await;
     let owners = crate::tools::command::ToolOwners::new();
-    let tool = WriteTool::new(Arc::clone(&workspace), Some(Arc::clone(&owners)));
+    let tool = WriteTool::new(Arc::clone(&workspace), Arc::clone(&owners));
     let target = workspace.resolve_for_write("value").await.unwrap();
     let gate = Arc::new(crate::test_support::Gate::new());
     BEFORE_RENAME_GATES.arm(target.clone(), Arc::clone(&gate));
@@ -577,7 +577,8 @@ async fn the_loop_barrier_joins_a_commit_whose_caller_was_cancelled() {
 async fn interrupted_writes_finish_and_record_without_blocking_the_async_worker() {
     for stop in ["cancel", "deadline", "drop"] {
         for sync_fails in [false, true] {
-            let (base, workspace, tool) = fixture("detached-commit").await;
+            let (base, workspace, tool) = fixture("interrupted-commit").await;
+            let owners = Arc::clone(&tool.owners);
             let root = base.join("root");
             tokio::fs::write(root.join("value"), b"old").await.unwrap();
             let target = workspace.resolve_for_write("value").await.unwrap();
@@ -636,18 +637,10 @@ async fn interrupted_writes_finish_and_record_without_blocking_the_async_worker(
                 "drop" => assert!(result.unwrap_err().is_cancelled()),
                 _ => unreachable!(),
             }
-            let records = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let records =
-                        data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
-                    if !records.is_empty() {
-                        break records;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("commit observation was lost after dropping its awaiter");
+            tokio::time::timeout(Duration::from_secs(5), owners.join_loop(tool_ref.loop_id))
+                .await
+                .expect("commit did not join after dropping its awaiter");
+            let records = data.file_change_records(tool_ref.session_id, Some(tool_ref.loop_id));
             assert_eq!(records.len(), 1);
             assert_eq!(
                 records[0].commit_state,

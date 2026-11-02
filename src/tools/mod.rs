@@ -13,7 +13,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use minicore_runtime::tools::{Tool, ToolError, ToolSet};
+use minicore_runtime::tools::{ToolError, ToolSet};
 use thiserror::Error;
 
 use crate::presentation::{Presentation, PresentationTool, ToolImpl};
@@ -63,61 +63,41 @@ pub(crate) fn build_tools_with_presentation(
     observer: &Arc<ToolObserver>,
     tool_owners: &Arc<ToolOwners>,
 ) -> Result<ToolSet, BuildToolsError> {
-    build_tools_with(
-        names,
-        workspace,
-        command_environment,
-        Some((presentation, observer, tool_owners)),
-    )
-}
-
-fn build_tools_with(
-    names: &[String],
-    workspace: Arc<Workspace>,
-    command_environment: CommandEnvironment,
-    presentation: Option<(&Arc<Presentation>, &Arc<ToolObserver>, &Arc<ToolOwners>)>,
-) -> Result<ToolSet, BuildToolsError> {
     let mut builder = ToolSet::builder();
     let mut seen = BTreeSet::new();
     for name in names {
         if !seen.insert(name.as_str()) {
             return Err(BuildToolsError::InvalidConfiguration);
         }
-        let owners = || presentation.map(|(_, _, owners)| Arc::clone(owners));
         let tool = match name.as_str() {
             "apply_patch" => ToolImpl::ApplyPatch(Arc::new(ApplyPatchTool::new(
                 Arc::clone(&workspace),
-                owners(),
+                Arc::clone(tool_owners),
             ))),
             "bash" => ToolImpl::Bash(Arc::new(BashTool::with_binding(
                 Arc::clone(&workspace),
                 command_environment.clone(),
-                presentation
-                    .map(|(_, observer, owners)| observer.command_binding(Arc::clone(owners))),
+                observer.command_binding(Arc::clone(tool_owners)),
             ))),
-            "edit" => ToolImpl::Edit(Arc::new(EditTool::new(Arc::clone(&workspace), owners()))),
+            "edit" => ToolImpl::Edit(Arc::new(EditTool::new(
+                Arc::clone(&workspace),
+                Arc::clone(tool_owners),
+            ))),
             "read" => ToolImpl::Plain(Arc::new(ReadTool::new(Arc::clone(&workspace)))),
-            "write" => ToolImpl::Write(Arc::new(WriteTool::new(Arc::clone(&workspace), owners()))),
+            "write" => ToolImpl::Write(Arc::new(WriteTool::new(
+                Arc::clone(&workspace),
+                Arc::clone(tool_owners),
+            ))),
             _ => return Err(BuildToolsError::InvalidConfiguration),
         };
-        let tool: Arc<dyn Tool> = match presentation {
-            Some((presentation, observer, _)) => {
-                PresentationTool::new(tool, Arc::clone(presentation), Arc::clone(observer))
-            }
-            None => match tool {
-                ToolImpl::Plain(tool) => tool,
-                ToolImpl::Bash(tool) => tool,
-                ToolImpl::Write(tool) => tool,
-                ToolImpl::Edit(tool) => tool,
-                ToolImpl::ApplyPatch(tool) => tool,
-            },
-        };
-        builder.register_arc(tool);
+        builder.register_arc(PresentationTool::new(
+            tool,
+            Arc::clone(presentation),
+            Arc::clone(observer),
+        ));
     }
     #[cfg(feature = "e2e-observe")]
-    if crate::e2e_observe::input_fixture_enabled()
-        && let Some((presentation, observer, _)) = presentation
-    {
+    if crate::e2e_observe::input_fixture_enabled() {
         let fixture = crate::e2e_observe::input_fixture::InputFixture::new(Arc::clone(observer));
         builder.register_arc(PresentationTool::new(
             ToolImpl::Plain(Arc::new(fixture)),

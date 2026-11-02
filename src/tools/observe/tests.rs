@@ -57,7 +57,7 @@ async fn direct_observer_records_bash_streams_and_native_file_changes() {
     let bash = Arc::new(OwnedBashTool::with_binding(
         Arc::clone(&workspace),
         CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),
-        Some(observer.command_binding(Arc::clone(&owners))),
+        observer.command_binding(Arc::clone(&owners)),
     ));
     let bash_ref = ToolRef {
         session_id,
@@ -180,7 +180,7 @@ async fn direct_observer_records_bash_streams_and_native_file_changes() {
         json!({"path": "value.txt", "content": "after\n"}),
     );
     observer.publish_tool_invocation(&native_ref, &native_invocation);
-    let write = NativeWriteTool::new(Arc::clone(&workspace), None);
+    let write = NativeWriteTool::new(Arc::clone(&workspace), Arc::clone(&owners));
     let outcome = write
         .execute_bound(
             native_invocation,

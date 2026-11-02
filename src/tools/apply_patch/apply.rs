@@ -1,6 +1,8 @@
 use super::MAX_PATCH_BYTES;
-use super::codex::{CODEX_BEGIN_PATCH, apply_codex_patch_with_stats};
-use super::unified::{apply_unified_patch_with_stats, strip_transport_ending};
+use super::codex::{CODEX_BEGIN_PATCH, parse_and_resolve_codex_patch};
+#[cfg(test)]
+use super::tests::ApplyStats;
+use super::unified::{parse_unified_patch, strip_transport_ending};
 use minicore_runtime::tools::ToolError;
 
 pub(super) fn apply_single_file_patch(
@@ -8,7 +10,13 @@ pub(super) fn apply_single_file_patch(
     source: &str,
     patch: &str,
 ) -> Result<String, ToolError> {
-    apply_single_file_patch_with_stats(path, source, patch).map(|(result, _)| result)
+    apply_single_file_patch_inner(
+        path,
+        source,
+        patch,
+        #[cfg(test)]
+        &mut ApplyStats::default(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,16 +71,6 @@ pub(super) struct ResolvedHunk<'a> {
     pub(super) contents: Vec<PatchContent<'a>>,
 }
 
-#[allow(dead_code)]
-#[derive(Default)]
-pub(super) struct ApplyStats {
-    pub(super) source_lines: usize,
-    pub(super) source_line_visits: usize,
-    pub(super) patch_lines: usize,
-    pub(super) patch_content_visits: usize,
-    pub(super) codex_match_visits: usize,
-}
-
 struct ResultBuilder {
     value: String,
     line_count: usize,
@@ -112,37 +110,55 @@ impl ResultBuilder {
     }
 }
 
-pub(super) fn apply_single_file_patch_with_stats(
+pub(super) fn apply_single_file_patch_inner(
     path: &str,
     source: &str,
     patch: &str,
-) -> Result<(String, ApplyStats), ToolError> {
+    #[cfg(test)] stats: &mut ApplyStats,
+) -> Result<String, ToolError> {
     // The tool entry rejects empty, oversized and NUL-bearing patches before I/O;
     // appends below enforce the result bound.
     let first = patch
         .split_inclusive('\n')
         .next()
         .ok_or(ToolError::InvalidInvocation)?;
-    if strip_transport_ending(first) == CODEX_BEGIN_PATCH {
-        return apply_codex_patch_with_stats(path, source, patch);
-    }
-    apply_unified_patch_with_stats(path, source, patch)
+    let source_lines = split_source_lines(source);
+    let hunks = if strip_transport_ending(first) == CODEX_BEGIN_PATCH {
+        parse_and_resolve_codex_patch(
+            path,
+            patch,
+            &source_lines,
+            #[cfg(test)]
+            stats,
+        )?
+    } else {
+        parse_unified_patch(
+            path,
+            patch,
+            #[cfg(test)]
+            stats,
+        )?
+    };
+    apply_resolved_hunks(
+        source,
+        &source_lines,
+        &hunks,
+        #[cfg(test)]
+        stats,
+    )
 }
 
-pub(super) fn apply_resolved_hunks(
+fn apply_resolved_hunks(
     source: &str,
     source_lines: &[SourceLine<'_>],
     hunks: &[ResolvedHunk<'_>],
-    patch_lines: usize,
-    codex_match_visits: usize,
-) -> Result<(String, ApplyStats), ToolError> {
+    #[cfg(test)] stats: &mut ApplyStats,
+) -> Result<String, ToolError> {
     let preferred_ending = preferred_line_ending(source_lines);
-    let mut stats = ApplyStats {
-        source_lines: source_lines.len(),
-        patch_lines,
-        codex_match_visits,
-        ..ApplyStats::default()
-    };
+    #[cfg(test)]
+    {
+        stats.source_lines = source_lines.len();
+    }
     let mut source_cursor = 0usize;
     let mut builder = ResultBuilder::new(source.len());
     let mut previous_old_end = 0usize;
@@ -155,7 +171,13 @@ pub(super) fn apply_resolved_hunks(
         previous_old_end = hunk.old.end;
         previous_new_end = hunk.new.end;
         while source_cursor < hunk.old.index {
-            append_source_line(source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+            append_source_line(
+                source_lines,
+                &mut source_cursor,
+                &mut builder,
+                #[cfg(test)]
+                stats,
+            )?;
         }
         if source_cursor != hunk.old.index || builder.line_count != hunk.new.index {
             return Err(ToolError::Failed);
@@ -167,24 +189,31 @@ pub(super) fn apply_resolved_hunks(
                 &mut source_cursor,
                 &mut builder,
                 preferred_ending,
-                &mut stats,
+                #[cfg(test)]
+                stats,
             )?;
-            stats.patch_content_visits = stats
-                .patch_content_visits
-                .checked_add(1)
-                .ok_or(ToolError::Internal)?;
+            #[cfg(test)]
+            {
+                stats.patch_content_visits += 1;
+            }
         }
         if source_cursor != hunk.old.end || builder.line_count != hunk.new.end {
             return Err(ToolError::Failed);
         }
     }
     while source_cursor < source_lines.len() {
-        append_source_line(source_lines, &mut source_cursor, &mut builder, &mut stats)?;
+        append_source_line(
+            source_lines,
+            &mut source_cursor,
+            &mut builder,
+            #[cfg(test)]
+            stats,
+        )?;
     }
-    if stats.source_line_visits != stats.source_lines {
+    if source_cursor != source_lines.len() {
         return Err(ToolError::Internal);
     }
-    Ok((builder.value, stats))
+    Ok(builder.value)
 }
 
 pub(super) fn split_source_lines(source: &str) -> Vec<SourceLine<'_>> {
@@ -243,15 +272,15 @@ fn append_source_line(
     source: &[SourceLine<'_>],
     cursor: &mut usize,
     builder: &mut ResultBuilder,
-    stats: &mut ApplyStats,
+    #[cfg(test)] stats: &mut ApplyStats,
 ) -> Result<(), ToolError> {
     let line = *source.get(*cursor).ok_or(ToolError::Failed)?;
     builder.append(line.text, line.ending)?;
     *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
-    stats.source_line_visits = stats
-        .source_line_visits
-        .checked_add(1)
-        .ok_or(ToolError::Internal)?;
+    #[cfg(test)]
+    {
+        stats.source_line_visits += 1;
+    }
     Ok(())
 }
 
@@ -261,7 +290,7 @@ fn apply_patch_content(
     cursor: &mut usize,
     builder: &mut ResultBuilder,
     preferred_ending: LineEnding,
-    stats: &mut ApplyStats,
+    #[cfg(test)] stats: &mut ApplyStats,
 ) -> Result<(), ToolError> {
     match content.kind {
         PatchLineKind::Context => {
@@ -269,18 +298,18 @@ fn apply_patch_content(
             let ending = content.context_new_ending.unwrap_or(line.ending);
             builder.append(line.text, ending)?;
             *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
-            stats.source_line_visits = stats
-                .source_line_visits
-                .checked_add(1)
-                .ok_or(ToolError::Internal)?;
+            #[cfg(test)]
+            {
+                stats.source_line_visits += 1;
+            }
         }
         PatchLineKind::Remove => {
             matching_source_line(content, source, *cursor)?;
             *cursor = cursor.checked_add(1).ok_or(ToolError::Internal)?;
-            stats.source_line_visits = stats
-                .source_line_visits
-                .checked_add(1)
-                .ok_or(ToolError::Internal)?;
+            #[cfg(test)]
+            {
+                stats.source_line_visits += 1;
+            }
         }
         PatchLineKind::Add => {
             let ending = if content.new_no_newline {

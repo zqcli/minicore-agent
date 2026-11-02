@@ -22,7 +22,7 @@ const WRITE_CAPTURE_MAX: Duration = Duration::from_millis(250);
 
 pub(crate) struct WriteTool {
     workspace: Arc<Workspace>,
-    owners: Option<Arc<ToolOwners>>,
+    owners: Arc<ToolOwners>,
     spec: ToolSpec,
 }
 
@@ -34,7 +34,7 @@ struct WriteInput {
 }
 
 impl WriteTool {
-    pub(crate) fn new(workspace: Arc<Workspace>, owners: Option<Arc<ToolOwners>>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>, owners: Arc<ToolOwners>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("write is a valid tool name"),
             "Atomically write UTF-8 content to a workspace-relative file, creating parent directories.",
@@ -107,7 +107,7 @@ impl WriteTool {
                 };
                 commit_text(
                     &self.workspace,
-                    self.owners.as_deref(),
+                    &self.owners,
                     tool_ref,
                     tool_data,
                     input.path,

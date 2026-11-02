@@ -681,20 +681,11 @@ async fn exited_child_with_inherited_pipes_obeys_input_and_context_deadlines() {
     // pipe open. Stopping the drain at its bounded grace is a normal end
     // with incomplete output, not a fabricated timeout: the command's own
     // deadline was never reached.
-    assert_grandchild_held_pipe_drain_is_bounded(
-        "held-pipe-drain",
-        1,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await;
+    assert_grandchild_held_pipe_drain_is_bounded("held-pipe-drain", 1, Duration::from_secs(5))
+        .await;
     // The context deadline really is reached while the drain is bounded, so
     // this one is a timeout.
-    assert_grandchild_held_pipe_timeout(
-        "held-pipe-context",
-        30,
-        Instant::now() + Duration::from_millis(100),
-    )
-    .await;
+    assert_grandchild_held_pipe_timeout("held-pipe-context", 30, Duration::from_millis(100)).await;
 }
 
 #[cfg(windows)]
@@ -875,7 +866,7 @@ async fn a_nonzero_exit_is_a_completed_result_not_an_error() {
 async fn assert_grandchild_held_pipe_drain_is_bounded(
     label: &str,
     timeout_seconds: u64,
-    context_deadline: Instant,
+    context_timeout: Duration,
 ) {
     let (base, _, tool) = fixture(label).await;
     let pid_file = base.join("root/grandchild.pid");
@@ -886,7 +877,7 @@ async fn assert_grandchild_held_pipe_drain_is_bounded(
                 "command": "sleep 30 & echo $! > grandchild.pid; exit 0",
                 "timeout_seconds": timeout_seconds
             })),
-            context(CancellationToken::new(), context_deadline),
+            context(CancellationToken::new(), Instant::now() + context_timeout),
         )
         .await
     });
@@ -917,7 +908,7 @@ async fn assert_grandchild_held_pipe_drain_is_bounded(
 async fn assert_grandchild_held_pipe_timeout(
     label: &str,
     timeout_seconds: u64,
-    context_deadline: Instant,
+    context_timeout: Duration,
 ) {
     let (base, _, tool) = fixture(label).await;
     let pid_file = base.join("root/grandchild.pid");
@@ -928,7 +919,7 @@ async fn assert_grandchild_held_pipe_timeout(
                 "command": "sleep 30 & echo $! > grandchild.pid; exit 0",
                 "timeout_seconds": timeout_seconds
             })),
-            context(CancellationToken::new(), context_deadline),
+            context(CancellationToken::new(), Instant::now() + context_timeout),
         )
         .await
     });
@@ -1128,10 +1119,6 @@ fn windows_grandchild_command(parent_waits: bool) -> String {
     )
 }
 
-/// The identity a Bash call runs under is the one passed at the real
-/// execute boundary, so a standalone tool (no captured identity) still owns
-/// its command and a bound tool records under the exact `ToolRef` it was
-/// given -- never under a name, a path, or "the newest call".
 #[cfg(unix)]
 #[tokio::test]
 async fn execute_bound_records_under_the_captured_identity() {
@@ -1142,7 +1129,7 @@ async fn execute_bound_records_under_the_captured_identity() {
     let streams: Arc<dyn crate::tools::command::CommandStreamSink> =
         Arc::clone(&sink) as Arc<dyn crate::tools::command::CommandStreamSink>;
     let binding = crate::tools::command::CommandBinding::new(Arc::clone(&owners), streams);
-    let bound = BashTool::with_binding(workspace, empty_command_environment(), Some(binding));
+    let bound = BashTool::with_binding(workspace, empty_command_environment(), binding);
     let tool_ref = crate::tool_data::ToolRef {
         session_id: crate::ids::SessionId::new().unwrap(),
         loop_id: minicore_runtime::LoopId::new().unwrap(),
@@ -1184,7 +1171,7 @@ async fn a_cut_result_leaves_the_tool_record_with_the_full_output() {
     let streams: Arc<dyn crate::tools::command::CommandStreamSink> =
         Arc::clone(&sink) as Arc<dyn crate::tools::command::CommandStreamSink>;
     let binding = crate::tools::command::CommandBinding::new(Arc::clone(&owners), streams);
-    let bound = BashTool::with_binding(workspace, empty_command_environment(), Some(binding));
+    let bound = BashTool::with_binding(workspace, empty_command_environment(), binding);
     let tool_ref = crate::tool_data::ToolRef {
         session_id: crate::ids::SessionId::new().unwrap(),
         loop_id: minicore_runtime::LoopId::new().unwrap(),
@@ -1225,12 +1212,10 @@ async fn a_cut_result_leaves_the_tool_record_with_the_full_output() {
     cleanup(&base).await;
 }
 
-/// A standalone tool with no captured identity still owns and joins its
-/// command instead of falling outside every barrier.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_standalone_call_still_owns_and_joins_its_command() {
-    let (base, _, tool) = fixture("standalone-owner").await;
+async fn a_call_without_runtime_identity_still_owns_and_joins_its_command() {
+    let (base, _, tool) = fixture("local-owner").await;
     let pid_file = base.join("root/child.pid");
     let tool = Arc::new(tool);
     let runner = Arc::clone(&tool);
@@ -1257,7 +1242,7 @@ async fn a_standalone_call_still_owns_and_joins_its_command() {
     assert_eq!(tool.active_owned_commands(), 0);
     assert!(
         !process_exists(pid),
-        "a standalone command outlived its join"
+        "a command without Runtime identity outlived its join"
     );
     cleanup(&base).await;
 }
@@ -1348,14 +1333,25 @@ impl CommandEnvironment {
 impl BashTool {
     #[cfg(test)]
     pub(super) fn new(workspace: Arc<Workspace>, environment: CommandEnvironment) -> Self {
-        Self::with_binding(workspace, environment, None)
+        let (events, _) = crate::event::AgentEventSink::channel(1);
+        let observer = crate::tools::observe::ToolObserver::new(
+            crate::ids::SessionId::new().unwrap(),
+            crate::test_support::load_id(),
+            Arc::new(crate::tool_data::ToolData::new()),
+            events,
+        );
+        Self::with_binding(
+            workspace,
+            environment,
+            observer.command_binding(crate::tools::command::ToolOwners::new()),
+        )
     }
     #[cfg(all(test, unix))]
     pub(super) async fn join_owned_commands(&self) {
-        self.owners.join_all().await;
+        self.binding.owners().join_all().await;
     }
     #[cfg(all(test, unix))]
     pub(super) fn active_owned_commands(&self) -> usize {
-        self.owners.active()
+        self.binding.owners().active()
     }
 }

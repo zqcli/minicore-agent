@@ -1,8 +1,10 @@
 use super::MAX_PATCH_BYTES;
 use super::apply::{
-    ApplyStats, HunkRange, LineEnding, PatchContent, PatchLineKind, ResolvedHunk, SourceLine, add,
-    apply_resolved_hunks, preferred_line_ending, split_source_lines, sub,
+    HunkRange, LineEnding, PatchContent, PatchLineKind, ResolvedHunk, SourceLine, add,
+    preferred_line_ending, sub,
 };
+#[cfg(test)]
+use super::tests::ApplyStats;
 use super::unified::{
     NO_NEWLINE_AT_END, PatchLines, consume_no_newline, make_hunk_range, parse_hunk_header,
     parse_patch_content, strip_transport_ending, validate_header_path,
@@ -34,29 +36,18 @@ struct CodexSource<'source, 'text> {
     index: &'source HashMap<&'text str, Vec<usize>>,
 }
 
-pub(super) fn apply_codex_patch_with_stats(
-    path: &str,
-    source: &str,
-    patch: &str,
-) -> Result<(String, ApplyStats), ToolError> {
-    let source_lines = split_source_lines(source);
-    let (hunks, patch_lines, codex_match_visits) =
-        parse_and_resolve_codex_patch(path, patch, &source_lines)?;
-    apply_resolved_hunks(
-        source,
-        &source_lines,
-        &hunks,
-        patch_lines,
-        codex_match_visits,
-    )
-}
-
-fn parse_and_resolve_codex_patch<'a>(
+pub(super) fn parse_and_resolve_codex_patch<'a>(
     path: &str,
     patch: &'a str,
     source: &[SourceLine<'a>],
-) -> Result<(Vec<ResolvedHunk<'a>>, usize, usize), ToolError> {
-    let (codex_hunks, patch_lines) = parse_codex_patch(path, patch)?;
+    #[cfg(test)] stats: &mut ApplyStats,
+) -> Result<Vec<ResolvedHunk<'a>>, ToolError> {
+    let codex_hunks = parse_codex_patch(
+        path,
+        patch,
+        #[cfg(test)]
+        stats,
+    )?;
     let total_hunks = codex_hunks.len();
     let mut resolved = Vec::with_capacity(total_hunks);
     let mut source_cursor = 0usize;
@@ -136,13 +127,18 @@ fn parse_and_resolve_codex_patch<'a>(
         previous_start = Some(start);
     }
 
-    Ok((resolved, patch_lines, match_visits))
+    #[cfg(test)]
+    {
+        stats.codex_match_visits = match_visits;
+    }
+    Ok(resolved)
 }
 
 fn parse_codex_patch<'a>(
     path: &str,
     patch: &'a str,
-) -> Result<(Vec<CodexHunk<'a>>, usize), ToolError> {
+    #[cfg(test)] stats: &mut ApplyStats,
+) -> Result<Vec<CodexHunk<'a>>, ToolError> {
     let mut parser = PatchLines::new(patch);
     let begin = parser.next().ok_or(ToolError::InvalidInvocation)?;
     if strip_transport_ending(begin) != CODEX_BEGIN_PATCH {
@@ -166,7 +162,11 @@ fn parse_codex_patch<'a>(
                 return Err(ToolError::InvalidInvocation);
             }
             parser.finish()?;
-            return Ok((hunks, parser.steps));
+            #[cfg(test)]
+            {
+                stats.patch_lines = parser.steps;
+            }
+            return Ok(hunks);
         }
         if !line.starts_with("@@") {
             return Err(ToolError::InvalidInvocation);

@@ -47,12 +47,10 @@ pub(super) fn source_failure(
     }
 }
 
-/// Commits text and records its observation. With `owners`, a started commit
-/// is joined by the loop and Session barriers even if this future is dropped,
-/// so tool records are never persisted without the change they observed.
+/// Keeps a started commit and its observation joined even if its caller is dropped.
 pub(super) async fn commit_text(
     workspace: &Workspace,
-    owners: Option<&ToolOwners>,
+    owners: &ToolOwners,
     tool_ref: Option<ToolRef>,
     tool_data: Option<Arc<ToolData>>,
     path: String,
@@ -77,12 +75,7 @@ pub(super) async fn commit_text(
             },
         )
         .await;
-    let observation = match owners {
-        Some(owners) => owners.run_blocking(owner_ref.as_ref(), commit).await?,
-        None => tokio::task::spawn_blocking(commit)
-            .await
-            .map_err(|_| ToolError::Failed)?,
-    };
+    let observation = owners.run_blocking(owner_ref.as_ref(), commit).await?;
     observation.outcome.map_err(map_workspace_error)
 }
 

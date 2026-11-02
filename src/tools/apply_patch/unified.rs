@@ -1,18 +1,16 @@
-use super::apply::{
-    ApplyStats, HunkRange, PatchContent, PatchLineKind, ResolvedHunk, add, apply_resolved_hunks,
-    split_source_lines, sub,
-};
+use super::apply::{HunkRange, PatchContent, PatchLineKind, ResolvedHunk, add, sub};
+#[cfg(test)]
+use super::tests::ApplyStats;
 use minicore_runtime::tools::ToolError;
 use std::path::{Component, Path};
 
 pub(super) const NO_NEWLINE_AT_END: &str = "\\ No newline at end of file";
 
-pub(super) fn apply_unified_patch_with_stats(
+pub(super) fn parse_unified_patch<'a>(
     path: &str,
-    source: &str,
-    patch: &str,
-) -> Result<(String, ApplyStats), ToolError> {
-    let source_lines = split_source_lines(source);
+    patch: &'a str,
+    #[cfg(test)] stats: &mut ApplyStats,
+) -> Result<Vec<ResolvedHunk<'a>>, ToolError> {
     let mut parser = PatchLines::new(patch);
     let mut first = parser.next().ok_or(ToolError::InvalidInvocation)?;
     if first.starts_with("diff --git ") || first.starts_with("index ") {
@@ -69,12 +67,17 @@ pub(super) fn apply_unified_patch_with_stats(
             None => break,
         }
     }
-    apply_resolved_hunks(source, &source_lines, &resolved, parser.steps, 0)
+    #[cfg(test)]
+    {
+        stats.patch_lines = parser.steps;
+    }
+    Ok(resolved)
 }
 
 pub(super) struct PatchLines<'a> {
     lines: std::str::SplitInclusive<'a, char>,
     peeked: Option<&'a str>,
+    #[cfg(test)]
     pub(super) steps: usize,
 }
 
@@ -83,6 +86,7 @@ impl<'a> PatchLines<'a> {
         Self {
             lines: patch.split_inclusive('\n'),
             peeked: None,
+            #[cfg(test)]
             steps: 0,
         }
     }
@@ -105,7 +109,10 @@ impl<'a> PatchLines<'a> {
 
     pub(super) fn next(&mut self) -> Option<&'a str> {
         let line = self.peeked.take().or_else(|| self.lines.next())?;
-        self.steps = self.steps.saturating_add(1);
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
         Some(line)
     }
 }

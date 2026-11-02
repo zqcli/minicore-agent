@@ -15,7 +15,7 @@ use tokio::process::Command;
 use crate::Workspace;
 use crate::tool_data::{CommandStatus, ToolRef};
 
-use super::command::{Capture, CommandBinding, CommandOutcome, CommandRequest, ToolOwners};
+use super::command::{Capture, CommandBinding, CommandOutcome, CommandRequest};
 use super::truncate::{Tail, format_size, share, truncate_tail};
 use super::{
     DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT, MAX_COMMAND_TIMEOUT, MAX_OUTPUT_BYTES,
@@ -58,13 +58,7 @@ impl CommandEnvironment {
 pub(crate) struct BashTool {
     workspace: Arc<Workspace>,
     environment: CommandEnvironment,
-    /// Owner boundary for every command this tool starts. A tool built without
-    /// a presentation still owns its commands instead of relying on the
-    /// Runtime dropping a future.
-    owners: Arc<ToolOwners>,
-    /// Narrow presentation binding: complete identity of the current call and
-    /// the sink its streams go to. `None` for a standalone tool.
-    binding: Option<CommandBinding>,
+    binding: CommandBinding,
     spec: ToolSpec,
 }
 
@@ -82,11 +76,8 @@ impl BashTool {
     pub(crate) fn with_binding(
         workspace: Arc<Workspace>,
         environment: CommandEnvironment,
-        binding: Option<CommandBinding>,
+        binding: CommandBinding,
     ) -> Self {
-        let owners = binding
-            .as_ref()
-            .map_or_else(ToolOwners::new, |binding| Arc::clone(binding.owners()));
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("bash is a valid tool name"),
             "Run one bounded shell command in a workspace directory. Returns the exit code, \
@@ -122,7 +113,6 @@ impl BashTool {
         Self {
             workspace,
             environment,
-            owners,
             binding,
             spec,
         }
@@ -135,17 +125,12 @@ impl Tool for BashTool {
     }
 
     fn execute(&self, invocation: ToolInvocation, context: ToolContext) -> ToolFuture<'_> {
-        // A standalone Bash tool has no captured identity; it still owns its
-        // commands and can be joined explicitly.
         self.execute_bound(invocation, context, None)
     }
 }
 
 impl BashTool {
-    /// Executes one Bash call whose complete `ToolRef` was captured at the real
-    /// `Tool::execute` boundary of its wrapper. The identity is passed in
-    /// explicitly and is never recovered from a live table, so a new loop that
-    /// reuses a call id can never inherit a stale one.
+    /// Executes under the identity captured at the wrapper's `Tool::execute` boundary.
     pub(crate) fn execute_bound(
         &self,
         invocation: ToolInvocation,
@@ -174,13 +159,14 @@ impl BashTool {
                 cancellation: context.cancellation.clone(),
                 environment: self.environment.clone(),
                 capture_limit: MAX_COMMAND_OUTPUT,
-                streams: self.binding.as_ref().map(|binding| binding.sink()),
+                streams: self.binding.sink(),
                 capture,
             };
             // The owner keeps the child even if this future is dropped; the
             // Runtime result is taken from the owner's terminal facts only.
             let mut worker = self
-                .owners
+                .binding
+                .owners()
                 .start(request)
                 .map_err(|_| ToolError::Internal)?;
             super::emit_phase(&context, "running");

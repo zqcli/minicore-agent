@@ -85,7 +85,7 @@ async fn model_capture_keeps_the_tail_and_counts_omitted_raw_bytes() {
     let mut reader = b"abcdefghijklmnopqrstuvwxyz".as_slice();
     drain_stream(
         &mut reader,
-        None,
+        RecordingSink::new(Arc::new(ToolData::new())),
         None,
         ToolDataStream::Stdout,
         Arc::clone(&state),
@@ -146,7 +146,7 @@ fn request(
     call: &str,
     command: &str,
     deadline_ms: u64,
-    sink: Option<Arc<dyn CommandStreamSink>>,
+    sink: Arc<dyn CommandStreamSink>,
 ) -> CommandRequest {
     CommandRequest {
         tool_ref: Some(tool_ref(call)),
@@ -205,17 +205,11 @@ async fn a_second_call_with_the_same_identity_is_refused() {
     let sink = RecordingSink::new(Arc::new(ToolData::new()));
     let data: Arc<dyn CommandStreamSink> = Arc::clone(&sink) as Arc<dyn CommandStreamSink>;
     let _first = owners
-        .start(request(
-            &dir,
-            "call-1",
-            "exit 0",
-            5_000,
-            Some(Arc::clone(&data)),
-        ))
+        .start(request(&dir, "call-1", "exit 0", 5_000, Arc::clone(&data)))
         .unwrap();
     assert!(
         owners
-            .start(request(&dir, "call-1", "exit 0", 5_000, Some(data)))
+            .start(request(&dir, "call-1", "exit 0", 5_000, data))
             .is_err()
     );
     owners.join_all().await;
@@ -236,7 +230,7 @@ async fn a_chunk_is_stored_before_it_is_observed_and_while_the_command_runs() {
         "call-live",
         "printf 'one'; sleep 0.3; printf 'two' >&2",
         10_000,
-        Some(streams),
+        streams,
     );
     let mut worker = owners.start(request).unwrap();
     sink.wait_for_chunk().await;
@@ -288,7 +282,7 @@ async fn cancellation_drains_both_pipes_while_term_handler_finishes() {
         "term-handler",
         "trap 'printf %1048576s x; printf %1048576s y >&2; printf cleaned > cleaned; exit 0' TERM; echo $$ > child.pid; while :; do sleep 1; done",
         30_000,
-        None,
+        RecordingSink::new(Arc::new(ToolData::new())),
     );
     let cancel = request.cancellation.clone();
     let mut worker = owners.start(request).unwrap();
@@ -341,7 +335,7 @@ async fn cancelling_records_cancelling_then_a_confirmed_group_end() {
         "call-cancel",
         "echo $$ > child.pid; exec sleep 30",
         30_000,
-        Some(streams),
+        streams,
     );
     let cancellation = request.cancellation.clone();
     let mut worker = owners.start(request).unwrap();
@@ -383,7 +377,7 @@ async fn an_injected_reap_failure_never_claims_confirmed_termination() {
         "call-reap",
         "echo $$ > child.pid; exec sleep 30",
         30_000,
-        Some(streams),
+        streams,
     );
     let cancellation = request.cancellation.clone();
     let mut worker = owners.start(request).unwrap();
@@ -415,7 +409,7 @@ async fn a_pipe_holding_grandchild_is_stopped_after_a_bounded_grace() {
         "call-pipe",
         "sleep 30 & echo $! > grandchild.pid; exit 0",
         30_000,
-        Some(streams),
+        streams,
     );
     let started = Instant::now();
     let mut worker = owners.start(request).unwrap();
@@ -449,7 +443,7 @@ async fn the_window_keeps_the_tail_with_raw_offsets() {
         "call-tail",
         "head -c 1200000 /dev/zero | tr '\\0' 'x'",
         30_000,
-        Some(streams),
+        streams,
     );
     let mut worker = owners.start(request).unwrap();
     let outcome = worker.completion().await;
@@ -505,7 +499,7 @@ async fn a_queued_owner_that_was_already_cancelled_never_runs_its_script() {
         "call-queued",
         "echo ran > side-effect.txt",
         30_000,
-        Some(streams),
+        streams,
     );
     // The call is already cancelled before the worker gets to run.
     request.cancellation.cancel();
@@ -537,7 +531,7 @@ async fn a_queued_owner_past_its_deadline_never_runs_its_script() {
         "call-queued-late",
         "echo ran > side-effect.txt",
         0,
-        Some(streams),
+        streams,
     );
     // The deadline already passed while the task was queued.
     request.deadline = Instant::now() - Duration::from_millis(1);
@@ -567,7 +561,7 @@ async fn a_background_group_member_is_stopped_before_the_turn_join_returns() {
         "call-bg",
         "sleep 60 >/dev/null 2>&1 & echo $! > bg.pid; exit 0",
         30_000,
-        Some(streams),
+        streams,
     );
     let loop_key = request.tool_ref.as_ref().unwrap().loop_id;
     let mut worker = owners.start(request).unwrap();
@@ -610,7 +604,7 @@ async fn a_loop_join_leaves_another_loops_owner_running() {
         "call-first",
         "echo $$ > first.pid; exec sleep 30",
         30_000,
-        Some(Arc::clone(&streams)),
+        Arc::clone(&streams),
     );
     first_request.tool_ref = Some(first.clone());
     let mut second_request = request(
@@ -618,7 +612,7 @@ async fn a_loop_join_leaves_another_loops_owner_running() {
         "call-second",
         "echo $$ > second.pid; exec sleep 30",
         30_000,
-        Some(streams),
+        streams,
     );
     second_request.tool_ref = Some(second.clone());
     let mut first_worker = owners.start(first_request).unwrap();
@@ -663,7 +657,7 @@ async fn a_turn_join_stops_and_reaps_a_command_whose_future_was_dropped() {
         "call-join",
         "echo $$ > child.pid; exec sleep 30",
         30_000,
-        Some(streams),
+        streams,
     );
     let loop_key = request.tool_ref.as_ref().unwrap().loop_id;
     let worker = owners.start(request).unwrap();
@@ -699,7 +693,7 @@ async fn a_joined_owner_reaps_both_the_leader_and_its_group_member() {
         "call-group",
         "sleep 30 & echo $! > grandchild.pid; echo $$ > child.pid; wait",
         30_000,
-        Some(streams),
+        streams,
     );
     let cancellation = request.cancellation.clone();
     let mut worker = owners.start(request).unwrap();
@@ -735,7 +729,7 @@ async fn a_drain_cut_before_the_scope_ends_reports_truncated_eof_pages() {
         "call-cut",
         "printf 'partial'; sleep 30 & echo $! > grandchild.pid; exit 0",
         30_000,
-        Some(streams),
+        streams,
     );
     let mut worker = owners.start(request).unwrap();
     let grandchild = read_pid(&dir.join("grandchild.pid")).await;
@@ -776,7 +770,7 @@ async fn a_deadline_cut_is_recorded_as_timed_out_not_cancelled() {
     data.note_requested(&tool, "bash");
     // The command's own deadline is reached while it sleeps; no user
     // cancellation is ever requested for this token.
-    let request = request(&dir, "call-deadline", "exec sleep 30", 150, Some(streams));
+    let request = request(&dir, "call-deadline", "exec sleep 30", 150, streams);
     let mut worker = owners.start(request).unwrap();
     let outcome = worker.completion().await;
     assert_eq!(
@@ -801,7 +795,7 @@ async fn a_zero_byte_stream_that_really_ended_is_available_not_pending() {
     let streams: Arc<dyn CommandStreamSink> = Arc::clone(&sink) as Arc<dyn CommandStreamSink>;
     let tool = tool_ref("call-empty");
     data.note_requested(&tool, "bash");
-    let request = request(&dir, "call-empty", "exit 0", 5_000, Some(streams));
+    let request = request(&dir, "call-empty", "exit 0", 5_000, streams);
     let mut worker = owners.start(request).unwrap();
     let outcome = worker.completion().await;
     assert!(outcome.result.output_complete);
@@ -841,7 +835,7 @@ async fn a_spawn_failure_never_claims_a_confirmed_termination() {
         "call-no-confirm",
         "exit 0",
         2_000,
-        Some(streams),
+        streams,
     );
     let mut worker = owners.start(request).unwrap();
     let outcome = worker.completion().await;
@@ -865,7 +859,7 @@ async fn a_spawn_failure_is_reported_without_a_process() {
         "call-missing",
         "exit 0",
         2_000,
-        Some(streams),
+        streams,
     );
     let mut worker = owners.start(request).unwrap();
     let outcome = worker.completion().await;
@@ -906,7 +900,7 @@ async fn windows_cancellation_reports_a_confirmed_job_end() {
         "call-windows",
         "Start-Sleep -Seconds 30",
         30_000,
-        Some(streams),
+        streams,
     );
     let cancellation = request.cancellation.clone();
     let mut worker = owners.start(request).unwrap();
@@ -1017,7 +1011,13 @@ async fn unfinished_held_worker_occupies_registry_capacity() {
         request_index: 0,
         tool_call_id: ToolCallId::new(format!("held-{loop_key}")).unwrap(),
     };
-    let mut req = request(&dir, "held-cap", "exit 0", 5000, None);
+    let mut req = request(
+        &dir,
+        "held-cap",
+        "exit 0",
+        5000,
+        RecordingSink::new(Arc::new(ToolData::new())),
+    );
     req.tool_ref = Some(tool_ref);
     assert!(owners.start(req).is_err());
 

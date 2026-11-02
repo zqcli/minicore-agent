@@ -20,7 +20,7 @@ const TOOL_NAME: &str = "edit";
 
 pub(crate) struct EditTool {
     workspace: Arc<Workspace>,
-    owners: Option<Arc<ToolOwners>>,
+    owners: Arc<ToolOwners>,
     spec: ToolSpec,
 }
 
@@ -35,7 +35,7 @@ struct EditInput {
 }
 
 impl EditTool {
-    pub(crate) fn new(workspace: Arc<Workspace>, owners: Option<Arc<ToolOwners>>) -> Self {
+    pub(crate) fn new(workspace: Arc<Workspace>, owners: Arc<ToolOwners>) -> Self {
         let spec = ToolSpec::new(
             TOOL_NAME.parse().expect("edit is a valid tool name"),
             "Replace exact literal UTF-8 text in one existing workspace file.",
@@ -134,7 +134,7 @@ impl EditTool {
                 ))
                 .map_err(|_| ToolError::Internal)?;
                 emit_phase(&context, "committing");
-                commit_text(&self.workspace, self.owners.as_deref(), tool_ref, tool_data,
+                commit_text(&self.workspace, &self.owners, tool_ref, tool_data,
                     input.path, before, result.into_bytes()).await?;
                 Ok(ToolExecutionOutcome::Completed(output))
             })

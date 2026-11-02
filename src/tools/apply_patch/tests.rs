@@ -1,4 +1,4 @@
-use super::apply::{ApplyStats, apply_single_file_patch_with_stats};
+use super::apply::apply_single_file_patch_inner;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ async fn fixture(label: &str) -> (PathBuf, Arc<Workspace>, ApplyPatchTool) {
     let root = base.join("root");
     tokio::fs::create_dir_all(&root).await.unwrap();
     let workspace = Arc::new(Workspace::open(root).await.unwrap());
-    let tool = ApplyPatchTool::new(Arc::clone(&workspace), None);
+    let tool = ApplyPatchTool::new(Arc::clone(&workspace), ToolOwners::new());
     (base, workspace, tool)
 }
 
@@ -1138,7 +1138,25 @@ async fn atomic_failures_and_unknown_outcomes_never_report_success() {
     cleanup(&base).await;
 }
 
-#[cfg(test)]
+#[derive(Default)]
+pub(super) struct ApplyStats {
+    pub(super) source_lines: usize,
+    pub(super) source_line_visits: usize,
+    pub(super) patch_lines: usize,
+    pub(super) patch_content_visits: usize,
+    pub(super) codex_match_visits: usize,
+}
+
+fn apply_single_file_patch_with_stats(
+    path: &str,
+    source: &str,
+    patch: &str,
+) -> Result<(String, ApplyStats), ToolError> {
+    let mut stats = ApplyStats::default();
+    let result = apply_single_file_patch_inner(path, source, patch, &mut stats)?;
+    Ok((result, stats))
+}
+
 impl ApplyStats {
     fn total_steps(&self) -> usize {
         self.source_line_visits

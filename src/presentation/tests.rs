@@ -526,11 +526,20 @@ async fn presentation_tool_variants_share_binding_and_finish() {
     let bash = Arc::new(OwnedBashTool::with_binding(
         Arc::clone(&workspace),
         CommandEnvironment::new(std::iter::empty::<std::ffi::OsString>()),
-        Some(observer.command_binding(Arc::clone(&owners))),
+        observer.command_binding(Arc::clone(&owners)),
     ));
-    let write = Arc::new(NativeWriteTool::new(Arc::clone(&workspace), None));
-    let edit = Arc::new(NativeEditTool::new(Arc::clone(&workspace), None));
-    let apply_patch = Arc::new(NativeApplyPatchTool::new(Arc::clone(&workspace), None));
+    let write = Arc::new(NativeWriteTool::new(
+        Arc::clone(&workspace),
+        Arc::clone(&owners),
+    ));
+    let edit = Arc::new(NativeEditTool::new(
+        Arc::clone(&workspace),
+        Arc::clone(&owners),
+    ));
+    let apply_patch = Arc::new(NativeApplyPatchTool::new(
+        Arc::clone(&workspace),
+        Arc::clone(&owners),
+    ));
     let tools = [
         (
             "read",
