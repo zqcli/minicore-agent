@@ -128,7 +128,7 @@ Committed pages are `stored` even while their Session is loaded; `live` means a
 retained unsaved source. History is authoritative only after persistence.
 
 Session create/open, `session.state`, and `session_snapshot` publication use
-one sampler and DTO, identified by session/load/revision. RPC v3 command
+one sampler and DTO, identified by session/load/revision. RPC v4 command
 receipts contain acceptance or operation results; clients install current
 control state only from snapshots. `input.list` remains an explicit queue query.
 The publication gate

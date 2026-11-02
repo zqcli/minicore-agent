@@ -507,9 +507,9 @@ async fn create_open_history_and_send_wait_deferred() {
     assert_eq!(presentation["result"]["model_label"], json!("fake"));
     assert_eq!(presentation["result"]["context"]["kind"], json!("unknown"));
     assert!(presentation["result"]["context"]["tokens"].is_null());
-    assert!(presentation["result"]["cost_usd"].is_null());
-    assert!(presentation["result"]["using_subscription"].is_null());
-    assert!(presentation["result"]["git_branch"].is_null());
+    for removed in ["cost_usd", "using_subscription", "git_branch"] {
+        assert!(presentation["result"].get(removed).is_none());
+    }
     assert!(presentation["result"]["last_loop"].is_null());
 
     harness

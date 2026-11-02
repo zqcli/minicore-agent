@@ -1,6 +1,6 @@
 # MiniCore Agent
 
-[![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=0.9.3)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml/badge.svg?branch=0.9.4)](https://github.com/zqcli/minicore-agent/actions/workflows/ci.yml)
 
 MiniCore Agent is a local, RPC-first coding-agent backend written in Rust. It
 manages persistent Sessions over rooted Workspaces, runs model/tool turns on
@@ -10,10 +10,10 @@ also be embedded directly as a Rust library.
 
 | | |
 |---|---|
-| Version | 0.9.3 (development) |
+| Version | 0.9.4 (development) |
 | Rust | edition 2024, current stable |
 | Runtime | `minicore-runtime` 0.9.0, pinned to tag `v0.9.0` |
-| RPC protocol | 3 (35 methods) |
+| RPC protocol | 4 (35 methods) |
 | Provider | OpenAI Responses API and compatible endpoints |
 | License | MIT OR Apache-2.0 |
 
@@ -104,8 +104,8 @@ events, ordering, limits, and error codes.
 
 ```toml
 [dependencies]
-# Pin a `rev` or release tag for reproducible builds.
-minicore-agent = { git = "https://github.com/zqcli/minicore-agent", branch = "0.9.3" }
+# Development branch shown; pin an approved commit with `rev` for reproducible builds.
+minicore-agent = { git = "https://github.com/zqcli/minicore-agent", branch = "0.9.4" }
 ```
 
 ```rust
@@ -188,12 +188,19 @@ elsewhere. See [Security](docs/security.md).
 
 ## Compatibility
 
-Agent 0.9.3 serves RPC protocol 3 and keeps the Runtime 0.9.0 dependency and
+Agent 0.9.4 serves RPC protocol 4 and keeps the Runtime 0.9.0 dependency and
 on-disk formats. Clients must check `agent.ping.protocol_version` before a
-mutation. Protocol 2 clients need to migrate: control snapshots replace the
+mutation. Protocol 3 clients must read branch state directly from
+`workspace.status`; `session.presentation` no longer includes `git_branch`,
+`cost_usd`, or `using_subscription`, and context kinds are `unknown` or `reported`.
+Remove `max_tool_rounds` from profile configuration: unknown settings are
+rejected. Existing Session records retain their old values and still execute
+without a finite tool-round limit.
+
+Protocol 2 clients also need to migrate: control snapshots replace the
 legacy control events and command-response state, `turn.wait` no longer returns
 `next` or `queue`, `session.read` replaces `session.history`, and change
-references are structured values. There is no protocol 2 compatibility mode.
+references are structured values. There is no older-protocol compatibility mode.
 The [RPC guide](docs/rpc.md) defines the new shapes and the [changelog](CHANGELOG.md)
 lists the changes.
 

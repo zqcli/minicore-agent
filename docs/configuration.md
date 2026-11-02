@@ -36,8 +36,8 @@ minicore-agent --config ./example.agent.toml --stdio
 
 ## Profiles
 
-A profile requires `model` and `system_prompt`; `reasoning`, `tools`,
-`max_tool_rounds`, and `approval` are optional and have defaults described below.
+A profile requires `model` and `system_prompt`; `reasoning`, `tools`, and
+`approval` are optional and have defaults described below.
 
 - `system_prompt` can be an inline non-empty string or
   `{ file = "prompts/coding.md" }`. A file is read at startup and on
@@ -47,10 +47,10 @@ A profile requires `model` and `system_prompt`; `reasoning`, `tools`,
 - `tools` defaults to an empty list and otherwise accepts the five executable
   names: `read`, `write`, `edit`, `apply_patch`, and `bash`. Names must be
   unique. `subagent` is not supported in current profiles.
-- Agent turns have no finite tool-round limit. `max_tool_rounds` is a legacy
-  compatibility field, defaults to `0`, and accepts unsigned 16-bit saved values.
-  Existing profiles and Session records containing values such as `32` remain
-  readable, but execution always uses Runtime's unlimited (`0`) option. Other
+- Agent turns have no finite tool-round limit. The removed `max_tool_rounds`
+  profile field is rejected at startup and reload; delete it from configuration.
+  Existing Session records containing values such as `32` remain readable and
+  retain those values, but execution always uses Runtime's unlimited (`0`) option. Other
   safety limits, model/prompt timeouts, cancellation, and approvals still apply.
 - `approval` defaults to `ask`, or may be `auto`/`read_only`. `auto` executes
   enabled tools without an approval prompt; use it only in a trusted
@@ -170,12 +170,12 @@ pending deferred Agent mutations conflict with reload and return `session_busy`.
 Ping, turn cancellation, and shutdown remain available during reload.
 
 A Session copies its selected model/reasoning and the Profile's `tools`,
-`max_tool_rounds`, `approval`, and system-prompt text into its persistent
+`approval`, and system-prompt text into its persistent
 Session record at creation. Reload does not retrofit those Profile defaults into
 an existing Session; its future snapshot is rebuilt from the Session record plus
 the reloaded model catalog and global policies. The legacy stored
-`max_tool_rounds` value is retained for compatibility, not enforced as a turn
-budget; it does not override unlimited execution.
+`max_tool_rounds` field remains part of the unchanged disk format: new records
+write `0`, and old records retain their value. It does not limit execution.
 
 `session.update` changes only a loaded Session's model and/or reasoning settings.
 The persistent Session record is written first. If a Loop is active, its new

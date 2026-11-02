@@ -16,7 +16,7 @@
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<(), AgentError> {
 //! let mut agent = Agent::open_file("agent.toml").await?;
-//! assert_eq!(agent.ping().protocol_version, 3);
+//! assert_eq!(agent.ping().protocol_version, 4);
 //! let _events = agent.take_events()?;
 //! agent.shutdown().await?;
 //! # Ok(())

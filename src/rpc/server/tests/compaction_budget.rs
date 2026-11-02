@@ -347,9 +347,9 @@ async fn ordinary_submit_accepts_minimum_between_soft_trigger_and_hard_limit() {
     let text = (1..10_000)
         .map(|size| "x".repeat(size))
         .find(|candidate| {
-            crate::compaction::auto::minimal_messages(&system, &[candidate.as_str()])
+            crate::compaction::projection::minimal_messages(&system, &[candidate.as_str()])
                 .and_then(|messages| {
-                    crate::compaction::auto::estimate_tokens_with_budget(
+                    crate::compaction::projection::estimate_tokens_with_budget(
                         &crate::models::tests::DefaultProviderBudget,
                         messages,
                         &[],

@@ -13,7 +13,7 @@ use minicore_runtime::model::{
 };
 use minicore_runtime::value::BoundedText;
 
-use super::auto::{
+use super::projection::{
     AutoContext, GroupSummaryRequest, current_user_texts, estimate_tokens_with_budget,
     fold_history_with_ranges, merge_utility_usage, minimal_messages, summarize_group,
 };
@@ -149,7 +149,7 @@ impl From<super::UtilityError> for RecoveryReconstructionError {
 fn measure_reconstruction(
     ticket: &ActiveRecoveryTicket,
     budget: &dyn ProviderBudget,
-    projection: &super::auto::Projection<'_>,
+    projection: &super::projection::Projection<'_>,
     folded: &BTreeMap<super::EphemeralGroupKey, BoundedText>,
 ) -> Option<(ModelRequest, u64, usize)> {
     let messages = fold_history_with_ranges(
@@ -256,7 +256,7 @@ async fn reconstruct_inner(
     if minimal_tokens >= hard_tokens {
         return Err(RecoveryReconstructionError::Uncompressible);
     }
-    let mut projection = super::auto::Projection::new(
+    let mut projection = super::projection::Projection::new(
         &auto.state,
         &ticket.system,
         ticket.summary.as_ref(),
@@ -589,7 +589,7 @@ impl CompactingModel {
         // by a later global settings read; without a binding, fail closed.
         let auto = match ticket.auto_binding.clone() {
             Some(binding) => {
-                super::auto::AutoContext::from_binding(&binding, Arc::clone(&self.state))
+                super::projection::AutoContext::from_binding(&binding, Arc::clone(&self.state))
             }
             None => {
                 return Err(error);

@@ -22,7 +22,6 @@ model = "main"
 reasoning = "auto"
 system_prompt = "public config test"
 tools = []
-max_tool_rounds = 4
 approval = "ask"
 
 [models.main]

@@ -7,7 +7,7 @@ async fn capability_discovery_returns_ordered_lists() {
     let mut harness = RpcHarness::spawn(agent);
     let ping = harness.call_ok("agent.ping", Some(json!({}))).await;
     assert_eq!(ping["result"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(ping["result"]["protocol_version"], json!(3));
+    assert_eq!(ping["result"]["protocol_version"], json!(4));
     assert_eq!(
         ping["result"]["capabilities"],
         json!([

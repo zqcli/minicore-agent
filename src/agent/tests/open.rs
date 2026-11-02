@@ -130,7 +130,6 @@ async fn reopen_after_profile_removal_still_works() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "other profile".to_owned(),
         tools: vec!["read".to_owned()],
-        max_tool_rounds: 4,
         approval: ApprovalMode::Auto,
     };
     let models = BTreeMap::from([(

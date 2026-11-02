@@ -1,14 +1,15 @@
 # Stdio RPC Contract
 
-MiniCore Agent v0.9.3 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
+MiniCore Agent v0.9.4 (development) exposes JSON-RPC 2.0 over newline-delimited JSON (NDJSON)
 on standard input and standard output.
 
-Agent protocol version 3 uses load-scoped mutations, reliable versioned
+Agent protocol version 4 uses load-scoped mutations, reliable versioned
 `session_snapshot` controls, bounded completion discovery, and independent result
 reads. Command receipts describe acceptance or operation results; only snapshots
 publish the current control projection. JSON-RPC still uses envelope version
-`2.0`. Clients must check `agent.ping` before issuing mutations; protocol-v1 and
-protocol-v2 clients are not supported.
+`2.0`. Clients must require protocol 4 from `agent.ping` before issuing mutations.
+Compared with protocol 3, presentation omits branch, billing placeholders, and
+the unused `estimated` context kind; branch state comes from `workspace.status`.
 
 ## Transport And Framing
 
@@ -85,7 +86,7 @@ omitted `params` member or `{}`.
 A successful response has exactly one `result`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.3","protocol_version":3,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
+{"jsonrpc":"2.0","id":1,"result":{"version":"0.9.4","protocol_version":4,"capabilities":["session.read","session.read.display","session.context","turn.result","tool.read","tool.read.display","tool.output","workspace.read","workspace.files","workspace.search","workspace.status","changes.list","changes.diff","deferred.waiter_limit","tool.arguments.preview"]}}
 ```
 
 An error response has exactly one `error`:
@@ -196,8 +197,8 @@ protocol version, and ordered capability names:
 
 ```json
 {
-  "version": "0.9.3",
-  "protocol_version": 3,
+  "version": "0.9.4",
+  "protocol_version": 4,
   "capabilities": [
     "session.read",
     "session.read.display",
@@ -607,15 +608,12 @@ The result is returned directly (not under another `session` member):
 {
   "session_id": "ses_...",
   "model_label": "coding",
-  "git_branch": "dev",
   "context": {
     "tokens": null,
     "window": null,
     "percent": null,
     "kind": "unknown"
   },
-  "cost_usd": null,
-  "using_subscription": null,
   "last_loop": {
     "loop_id": "lup_...",
     "started_at": "2026-01-02T03:04:05.006Z",
@@ -624,17 +622,11 @@ The result is returned directly (not under another `session` member):
 }
 ```
 
-`git_branch` is the branch from the most recent completed explicit
-`workspace.status` observation, projected into this read-only view. It starts
-as `null` for a freshly created or opened Session and is never obtained by an
-implicit Git query: Presentation reads never start Git work, and no lookup runs
-at session create/open, after Tool batches, or at loop completion. Clients that
-need fresh workspace state call `workspace.status`; `git_branch` is only a
-compatibility cache of one observed result. It is `null` for a non-Git,
-detached, unborn, or unavailable workspace, and an incomplete or failed status
-observation clears it rather than faking a branch.
+Presentation reads never start Git work. Clients obtain branch state directly
+from `workspace.status`, using its `complete`, `repo_available`, and `branch`
+fields. A status query does not change presentation data.
 `model_label` is the configured Session model/profile ID, not a provider model
-identifier. Context `kind: "reported"` identifies the latest API request's
+identifier. Context kind is `unknown` or `reported`. `reported` identifies the latest API request's
 reported token footprint, not current in-flight occupancy or a next-request
 estimate. The numerator prefers `provider_total_tokens`; otherwise it sums all
 five normalized, disjoint usage components only when every component is known.
@@ -643,7 +635,6 @@ or overflowing counts stay `unknown`; cumulative billing Usage is never used.
 Reports survive loop starts and billing resets, but model changes and successful
 compaction invalidate them until fresh usage arrives. On reopen, the latest
 valid matching-model report in active post-compaction history is recovered.
-Cost and subscription fields remain `null` without a reliable provider source.
 
 ### `session.read`
 
@@ -2406,21 +2397,20 @@ acceptance times stored inside the same `history.jsonl` loop record as
 the current time. The metadata is FIFO by User occurrence, so repeated text is
 not used as a map key.
 
-The client never reads Store or Workspace for `session.presentation`: the
-Agent returns the branch from the most recent completed explicit
-`workspace.status` observation and honest `null`/`unknown` context, cost, and
-subscription values when no reliable source exists. Presentation reads never
-start Git work; fresh branch state comes only from `workspace.status`. A client
+The client never reads Store or Workspace for `session.presentation`. The Agent
+returns model, reported context and loop display data; unknown context stays
+`null`/`unknown`. Presentation reads never start Git work; fresh branch state
+comes only from `workspace.status`. A client
 must not run `git`, execute a Tool, or use presentation data as an execution
 request.
 
 ## 0.6.1 Additive Metadata
 
-A safe model-error view may include `local_context_budget` with unsigned
-`estimated_tokens` and `input_budget_tokens`. Missing/null means no verified
-local numeric estimate. Only the exact locally generated InvalidRequest /
-NotStarted preflight diagnostic in legacy errors supplies this field; new ordinary
-requests are no longer vetoed by that estimate. Stored legacy errors remain valid.
+Stored model-error views may include `local_context_budget` with unsigned
+`estimated_tokens` and `input_budget_tokens`. This structured historical field
+remains readable; current errors never populate it, and diagnostic text is not
+parsed for old local-preflight messages. Ordinary requests are not vetoed by a
+local estimate. Missing/null means no stored local numeric estimate.
 Provider-authored text is exposed only through `provider` (0.8.1); the Agent adds
 no free-form diagnostics of its own.
 
@@ -2433,7 +2423,7 @@ usage then stays unknown, and ordinary input is the input tokens less the cached
 read when that is reported; without input details it stays unknown. Cached read,
 ordinary output, reasoning, and provider total remain available when reported
 and arithmetically valid.
-These fields were additive to protocol 1; the current development protocol is 2.
+These fields were introduced as additions to protocol 1.
 
 ## 0.8.1 Additive Metadata
 

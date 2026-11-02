@@ -1,6 +1,6 @@
 use super::*;
 use crate::compaction::CompactionPolicy;
-use crate::compaction::{auto::compressible_ranges, auto_compose};
+use crate::compaction::projection::{compose, compressible_ranges};
 use crate::models::tests::DefaultProviderBudget;
 use crate::test_support::model::context_overflow;
 use crate::test_support::{ScriptedModel, Step};
@@ -248,7 +248,7 @@ fn big_request() -> ModelRequest {
 
 fn recovery_auto(state: &Arc<CompactionState>, model: Arc<ScriptedModel>) -> AutoContext {
     AutoContext {
-        binding: crate::compaction::auto::AutoContextBinding {
+        binding: crate::compaction::projection::AutoContextBinding {
             model: Arc::clone(&model) as Arc<dyn Model>,
             budget: Arc::new(DefaultProviderBudget),
             policy: CompactionPolicy {
@@ -516,7 +516,7 @@ async fn reconstruction_refuses_when_the_retry_body_is_not_strictly_smaller() {
     };
     let utility = summary_model("compact summary");
     let auto = AutoContext {
-        binding: crate::compaction::auto::AutoContextBinding {
+        binding: crate::compaction::projection::AutoContextBinding {
             model: Arc::clone(&utility) as Arc<dyn Model>,
             budget: Arc::new(DefaultProviderBudget),
             policy: CompactionPolicy {
@@ -618,7 +618,7 @@ async fn reconstruction_accounts_for_each_independent_group_once() {
         auto_binding: None,
     };
     let (mut fixed, history) =
-        auto_compose(&ticket.system, None, &ticket.base, &ticket.appended).unwrap();
+        compose(&ticket.system, None, &ticket.base, &ticket.appended).unwrap();
     fixed.extend(history);
     let original = ModelRequest::new(
         fixed,
@@ -786,7 +786,7 @@ fn prose_ticket(sizes: &[usize], current_bytes: usize) -> ActiveRecoveryTicket {
         auto_binding: None,
     };
     let (mut messages, history) =
-        auto_compose(&ticket.system, None, &ticket.base, &ticket.appended).unwrap();
+        compose(&ticket.system, None, &ticket.base, &ticket.appended).unwrap();
     messages.extend(history);
     let request = ModelRequest::new(messages, vec![], ticket.limits, ticket.reasoning).unwrap();
     ticket.original_body_bytes = DefaultProviderBudget

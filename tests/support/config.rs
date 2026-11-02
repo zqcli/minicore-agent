@@ -11,7 +11,6 @@ pub fn provider_config(base_url: &str, key_env: &str, tools: &[&str]) -> Value {
             "reasoning": "auto",
             "system_prompt": "Use configured tools and finish the task.",
             "tools": tools,
-            "max_tool_rounds": 4,
             "approval": "auto"
         }},
         "models": {"main": {

@@ -413,7 +413,6 @@ async fn i2_04_bash_owned_command_matches_events_queries_and_the_close_join() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
     let fixture = fixture

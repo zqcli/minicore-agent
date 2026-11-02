@@ -23,9 +23,15 @@ runs Tokio on two workers).
 
 ## Control And Result Ownership
 
-The current source is the 0.9.3 development package and serves Agent RPC v3
+The current source is the 0.9.4 development package and serves Agent RPC v4
 inside JSON-RPC 2.0. Formal dependency tags are unchanged until a real release
-is authorized; isolated development builds may link the approved Runtime source.
+is authorized; consumers pin an approved development commit by immutable `rev`.
+The Runtime dependency and on-disk formats are unchanged.
+
+Profiles reject removed settings, including `max_tool_rounds`. Existing Session
+records retain that field unchanged; new records write zero and execution has
+no finite round limit. `session.presentation` exposes only model, context and
+loop display data; branch state comes directly from `workspace.status`.
 
 - `Session::sample` is the only control sampler: load/revision, execution,
   interaction, queue, compaction, block reason, and the complete retained

@@ -7,7 +7,6 @@ use super::*;
 pub enum ContextKind {
     #[default]
     Unknown,
-    Estimated,
     Reported,
 }
 
@@ -31,11 +30,7 @@ pub struct LastLoopView {
 pub struct PresentationView {
     pub session_id: SessionId,
     pub model_label: Option<String>,
-    pub git_branch: Option<String>,
     pub context: ContextUsageView,
-    /// No pricing catalog exists; null until a real billing source is added.
-    pub cost_usd: Option<f64>,
-    pub using_subscription: Option<bool>,
     pub last_loop: Option<LastLoopView>,
 }
 
@@ -79,7 +74,6 @@ pub(super) struct PresentationInner {
     streamed: Option<StreamedRequest>,
     live_times: VecDeque<Option<String>>,
     last_loop: Option<LastLoopView>,
-    branch: Option<String>,
     model_label: Option<String>,
     context: ContextUsageView,
     context_settings: (u64, u64),
@@ -129,10 +123,6 @@ impl Presentation {
                 Err(actual) => previous = actual,
             }
         }
-    }
-
-    pub(crate) fn set_branch(&self, branch: Option<String>) {
-        self.lock().branch = branch;
     }
 
     /// Records real per-request usage observed on the model stream and emits
@@ -419,10 +409,7 @@ impl Presentation {
         PresentationView {
             session_id: self.session_id,
             model_label: inner.model_label.clone(),
-            git_branch: inner.branch.clone(),
             context,
-            cost_usd: None,
-            using_subscription: None,
             last_loop: inner.last_loop.clone(),
         }
     }

@@ -728,7 +728,6 @@ mod enabled {
         let server = MockServer::spawn(responses).await;
         let mut options = config::provider_config(server.base_url(), KEY_ENV, &["read"]);
         options["models"]["main"]["physical_context_window"] = json!(10_000_000);
-        options["profiles"]["test"]["max_tool_rounds"] = json!(8);
         options["compaction"] = json!({"enabled":false});
         let (trace,mut process,session)=Trace::spawn_options(&temp,"large-source",json!({"schema":1,"steps":[
             step("large-rollback",1,"append","rollback"),step("large-page",1,"result_page","pause")]}),options).await;

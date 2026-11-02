@@ -175,7 +175,7 @@ impl ProjectPromptProvider {
             }
             Err(error) => {
                 auto.state.note_prepare_failure(error.error.kind());
-                crate::compaction::auto::Projection::new(
+                crate::compaction::projection::Projection::new(
                     &auto.state,
                     &system,
                     summary.as_ref(),

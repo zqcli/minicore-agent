@@ -35,7 +35,6 @@ fn profile() -> Profile {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: Vec::new(),
-        max_tool_rounds: 4,
         approval: ApprovalMode::Ask,
     }
 }
@@ -67,7 +66,6 @@ model = "main"
 reasoning = "auto"
 system_prompt = {spec}
 tools = []
-max_tool_rounds = 4
 approval = "ask"
 
 [models.main]
@@ -88,6 +86,18 @@ request_timeout_seconds = 30
 
 fn toml_path(path: &Path) -> String {
     toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
+#[test]
+fn removed_profile_round_limit_is_rejected() {
+    let source = config_with_prompt_spec(r#""test prompt""#)
+        .replace("tools = []", "tools = []\nmax_tool_rounds = 32");
+    let error = toml::from_str::<AgentConfig>(&source).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown field `max_tool_rounds`")
+    );
 }
 
 #[test]
@@ -316,7 +326,6 @@ model = "main"
 reasoning = "{wire}"
 system_prompt = "test system prompt"
 tools = []
-max_tool_rounds = 4
 approval = "ask"
 
 [models.main]
@@ -354,7 +363,6 @@ model = "main"
 reasoning = "auto"
 system_prompt = "test system prompt"
 tools = []
-max_tool_rounds = 4
 approval = "ask"
 
 [models.main]
@@ -399,7 +407,6 @@ model = "main"
 reasoning = "auto"
 system_prompt = {{ file = "prompts/coding.md" }}
 tools = []
-max_tool_rounds = 4
 approval = "ask"
 
 [models.main]
@@ -602,7 +609,6 @@ model = "main"
 reasoning = "auto"
 system_prompt = {{ file = "prompts/prompt" }}
 tools = []
-max_tool_rounds = 4
 approval = "ask"
 
 [models.main]

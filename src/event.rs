@@ -45,10 +45,6 @@ impl EventMeta {
             ..Self::session(turn.session_id, load)
         }
     }
-
-    pub(crate) fn for_session(load: LoadId, session_id: SessionId) -> Self {
-        Self::session(session_id, load)
-    }
 }
 
 /// Load-scoped control observations and best-effort body notifications.
@@ -433,48 +429,12 @@ pub enum LoopStatusView {
     Finished,
 }
 
-/// Safe numeric evidence from the Agent's local request preflight only.
+/// Structured evidence retained in historical local-preflight failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalContextBudgetFailure {
     pub estimated_tokens: u64,
     pub input_budget_tokens: u64,
-}
-
-impl LocalContextBudgetFailure {
-    pub(crate) fn from_model(error: &ModelError) -> Option<Self> {
-        use minicore_runtime::error::{DiagnosticCategory, DiagnosticCode};
-        use minicore_runtime::model::{DeliveryState, ModelErrorKind, RetryHint};
-        let diagnostic = error.diagnostic();
-        if error.kind() != ModelErrorKind::InvalidRequest
-            || error.delivery() != DeliveryState::NotStarted
-            || !matches!(error.retry_hint(), RetryHint::Never)
-            || diagnostic.code != DiagnosticCode::InvalidConfiguration
-            || diagnostic.category != DiagnosticCategory::Model
-            || diagnostic.retryable
-        {
-            return None;
-        }
-        let text = diagnostic.message().as_str();
-        let numbers = text
-            .strip_prefix(
-                "local serialized context estimate exceeds input budget: estimated_tokens=",
-            )?
-            .strip_suffix("; use /compact or a larger model")?;
-        let (estimated, budget) = numbers.split_once(", input_budget_tokens=")?;
-        let estimated_tokens = estimated.parse::<u64>().ok()?;
-        let input_budget_tokens = budget.parse::<u64>().ok()?;
-        if estimated != estimated_tokens.to_string()
-            || budget != input_budget_tokens.to_string()
-            || estimated_tokens <= input_budget_tokens
-        {
-            return None;
-        }
-        Some(Self {
-            estimated_tokens,
-            input_budget_tokens,
-        })
-    }
 }
 
 /// What the provider said about a failed request, passed through as received.
@@ -570,7 +530,7 @@ impl ModelErrorView {
             delivery: crate::store::delivery_state(error.delivery()),
             retryable: error.diagnostic().retryable,
             retry_after_millis,
-            local_context_budget: LocalContextBudgetFailure::from_model(error),
+            local_context_budget: None,
             provider: ProviderErrorView::from_model(error),
         }
     }

@@ -45,7 +45,6 @@ async fn bash_two_turns_reuse_tool_call_id_across_loops_and_close_reaps_active()
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
 
@@ -252,7 +251,6 @@ async fn bash_turn_auxiliary_write_failure_preserves_main_outcome_and_reap() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
 
@@ -339,7 +337,6 @@ async fn bash_turn_auxiliary_write_success_marks_recording_saved_and_persists_to
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
 
@@ -423,7 +420,6 @@ async fn session_close_while_aux_write_held_still_joins_owned_worker() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
 
@@ -482,7 +478,6 @@ async fn deadline_lock_timeout_marks_records_failed_without_alloc() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
 

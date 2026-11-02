@@ -88,7 +88,7 @@ fn provider_timeout_model() -> Arc<ScriptedModel> {
 
 fn context(model: &Arc<ScriptedModel>) -> AutoContext {
     AutoContext {
-        binding: crate::compaction::auto::AutoContextBinding {
+        binding: crate::compaction::projection::AutoContextBinding {
             model: Arc::clone(model) as Arc<dyn Model>,
             budget: Arc::new(crate::models::tests::DefaultProviderBudget),
             policy: super::super::CompactionPolicy {

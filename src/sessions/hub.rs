@@ -315,7 +315,7 @@ impl SnapshotHub {
             }
             let event = AgentEvent::SessionSnapshot {
                 snapshot,
-                meta: EventMeta::for_session(load, session_id),
+                meta: EventMeta::session(session_id, load),
             };
             let bytes = crate::event::snapshot_frame_len(&event);
             if bytes + 1 > crate::rpc::MAX_RPC_FRAME_BYTES {

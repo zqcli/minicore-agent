@@ -388,7 +388,6 @@ async fn tool_read_exposes_approval_time_data_without_running() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["write".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Ask,
     };
     let model = ScriptedModel::new(
@@ -997,7 +996,6 @@ async fn rejected_tool_input_never_fabricates_a_file_operation() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["write".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
     // The schema requires `content`; the arguments are structurally valid JSON

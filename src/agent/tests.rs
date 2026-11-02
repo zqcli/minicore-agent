@@ -145,7 +145,6 @@ fn read_profile() -> Profile {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["read".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     }
 }

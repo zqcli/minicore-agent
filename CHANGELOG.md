@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.4 — 2026-11-02 (development)
+
+Breaking: Agent RPC protocol 4 removes unused presentation fields. The Runtime
+0.9.0 dependency and all on-disk formats are unchanged.
+
+- Remove `git_branch`, `cost_usd`, and `using_subscription` from
+  `session.presentation`, and remove the unused `estimated` context kind.
+  Clients read branch state directly from `workspace.status`; status queries
+  no longer mutate a second cache. Worker limits, cancellation and close joins
+  remain in place.
+- Reject `max_tool_rounds` in profile configuration. New Session records write
+  zero in the legacy disk field; existing values remain readable and unchanged.
+  Execution still has no finite tool-round limit.
+- Stop parsing obsolete local-preflight error strings. Structured
+  `local_context_budget` metadata in stored errors remains readable.
+- Require Tool ownership and observation bindings at construction, removing
+  unused unbound production paths. Keep patch test instrumentation in tests.
+- Use the compaction projection module directly and share the Session event
+  metadata constructor. Remove regressions devoted to deleted compatibility
+  paths while retaining storage, status-worker and execution coverage.
+
 ## 0.9.3 — Unreleased
 
 Breaking: Agent RPC protocol 3 replaces the remaining parallel control APIs.

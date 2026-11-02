@@ -284,7 +284,6 @@ fn test_config(data_dir: PathBuf, tools: &[&str], approval: ApprovalMode) -> Age
                 reasoning: ReasoningPreference::Medium,
                 system_prompt: "RPC test system prompt".to_owned(),
                 tools: tools.iter().map(|name| (*name).to_owned()).collect(),
-                max_tool_rounds: 8,
                 approval,
             },
         )]),

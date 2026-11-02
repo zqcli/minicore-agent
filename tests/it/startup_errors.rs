@@ -36,7 +36,6 @@ You are a coding agent. Inspect the workspace, use tools when useful,
 make focused changes, run relevant checks, and explain the result.
 """
 tools = ["read", "write", "edit", "apply_patch", "bash"]
-max_tool_rounds = 32
 approval = "ask"
 
 [models.cus-resp-luna]

@@ -42,10 +42,7 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
         ScriptedModel::new("main", scripts).with_pacing(std::time::Duration::from_millis(2));
     let fixture = fixture
         .models(BTreeMap::from([("main".to_owned(), Arc::clone(&model))]))
-        .profile(Profile {
-            max_tool_rounds: 32,
-            ..read_profile()
-        });
+        .profile(read_profile());
     let mut agent = fixture.open().await;
     agent.open_session(session_id).await.unwrap();
     assert_eq!(session_options(&agent, session_id).max_tool_rounds, 0);
@@ -70,6 +67,16 @@ async fn reopened_legacy_round_limit_allows_forty_tool_rounds() {
     assert_eq!(
         flatten_texts(&stored).last().unwrap(),
         "completed after forty tool rounds"
+    );
+    assert_eq!(
+        Store::open(data_dir)
+            .await
+            .unwrap()
+            .load_record(session_id)
+            .await
+            .unwrap()
+            .max_tool_rounds,
+        32
     );
 }
 

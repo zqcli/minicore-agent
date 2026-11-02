@@ -56,7 +56,7 @@ pub(crate) use session_setup::{SessionParts, SessionSetup};
 type AgentFuture<T> = futures_util::future::BoxFuture<'static, Result<T, AgentError>>;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const RPC_PROTOCOL_VERSION: u32 = 3;
+pub const RPC_PROTOCOL_VERSION: u32 = 4;
 pub const RPC_CAPABILITIES: &[&str] = &[
     "session.read",
     "session.read.display",

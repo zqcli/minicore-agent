@@ -2,7 +2,7 @@
 //! spec §12).
 //!
 //! The Agent owns content facts (tool command/path/input bodies, results,
-//! user acceptance times, git branch, honest unknown context/cost); the TUI
+//! user acceptance times and reported context usage); the TUI
 //! owns layout and colors. Everything here is best-effort and display-only:
 //! a presentation failure must never alter tool execution, model requests,
 //! cancellation, deadlines, or the persisted outcome, and no lock is held

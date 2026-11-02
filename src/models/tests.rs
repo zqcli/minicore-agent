@@ -21,7 +21,6 @@ fn catalog_config(
                         system_prompt: "Answer briefly.".into(),
                         tools: vec![],
                         reasoning: ReasoningPreference::Auto,
-                        max_tool_rounds: 0,
                         approval: crate::profiles::ApprovalMode::Auto,
                     },
                 )

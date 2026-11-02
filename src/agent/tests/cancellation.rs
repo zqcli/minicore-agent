@@ -52,7 +52,6 @@ async fn cancelling_wrapped_tool_preserves_runtime_outcome_and_recovery() {
         reasoning: ReasoningPreference::Auto,
         system_prompt: "test system prompt".to_owned(),
         tools: vec!["bash".to_owned()],
-        max_tool_rounds: 8,
         approval: ApprovalMode::Auto,
     };
     let fixture = fixture

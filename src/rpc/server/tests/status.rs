@@ -1,11 +1,11 @@
 use super::*;
 
 #[tokio::test]
-async fn workspace_status_projects_the_shared_presentation_branch_and_clears_failures() {
+async fn workspace_status_reports_branch_and_failures_without_changing_presentation() {
     use crate::workspace::status::STATUS_PROGRAMS;
     use std::os::unix::fs::PermissionsExt;
 
-    let mut fixture = RpcFixture::new("workspace-status-projection", [], &[], ApprovalMode::Auto);
+    let mut fixture = RpcFixture::new("workspace-status", [], &[], ApprovalMode::Auto);
     let base = fixture.base.path().to_owned();
     let workspace = fixture.workspace.clone();
     let agent = fixture.open().await;
@@ -13,7 +13,7 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
         .args(["init", "--quiet"])
         .arg(&workspace)
         .status()
-        .expect("git must be available for the status projection regression");
+        .expect("git must be available for the status regression");
     assert!(init.success());
     let head = std::process::Command::new("git")
         .args(["-C"])
@@ -26,14 +26,13 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     let mut harness = RpcHarness::spawn(agent);
     let session_id = create_and_open(&mut harness, &workspace).await;
 
-    harness
-        .send(
-            json!("before"),
+    let before = harness
+        .call_ok(
             "session.presentation",
             Some(json!({"session_id": session_id})),
         )
         .await;
-    assert!(harness.response(json!("before")).await["result"]["git_branch"].is_null());
+    assert!(before["result"].get("git_branch").is_none());
 
     let status = harness
         .call_ok("workspace.status", Some(json!({"session_id": session_id})))
@@ -42,17 +41,13 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     assert_eq!(status["result"]["repo_available"], json!(true));
     assert_eq!(status["result"]["branch"], json!("rpc-status"));
 
-    harness
-        .send(
-            json!("after"),
+    let after = harness
+        .call_ok(
             "session.presentation",
             Some(json!({"session_id": session_id})),
         )
         .await;
-    assert_eq!(
-        harness.response(json!("after")).await["result"]["git_branch"],
-        json!("rpc-status")
-    );
+    assert_eq!(after["result"], before["result"]);
 
     let marker = base.join("status-fails");
     let script = base.join("status-wrapper");
@@ -73,26 +68,20 @@ async fn workspace_status_projects_the_shared_presentation_branch_and_clears_fai
     );
     std::fs::write(&marker, b"fail\n").unwrap();
 
-    harness
-        .send(
-            json!("failed-status"),
-            "workspace.status",
-            Some(json!({"session_id": session_id})),
-        )
+    let failed = harness
+        .call_ok("workspace.status", Some(json!({"session_id": session_id})))
         .await;
-    let failed = harness.response(json!("failed-status")).await;
     assert_eq!(failed["result"]["complete"], json!(false));
     assert_eq!(failed["result"]["repo_available"], json!(false));
     assert_eq!(failed["result"]["branch"], json!(null));
 
-    harness
-        .send(
-            json!("cleared"),
+    let after_failure = harness
+        .call_ok(
             "session.presentation",
             Some(json!({"session_id": session_id})),
         )
         .await;
-    assert!(harness.response(json!("cleared")).await["result"]["git_branch"].is_null());
+    assert_eq!(after_failure["result"], before["result"]);
 
     harness.shutdown().await;
 }

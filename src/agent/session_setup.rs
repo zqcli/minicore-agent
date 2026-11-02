@@ -79,7 +79,7 @@ impl ExecutionConfigFactory<'_> {
             .get_utility(&record.model)
             .map_err(map_model_config_error)?;
         let auto = self.policy.enabled.then(|| AutoContext {
-            binding: crate::compaction::auto::AutoContextBinding {
+            binding: crate::compaction::projection::AutoContextBinding {
                 model: utility_model,
                 budget: Arc::clone(&budget),
                 policy: self.policy,
@@ -174,7 +174,7 @@ pub(super) fn build_record(
         reasoning: settings.reasoning,
         system_prompt: profile.system_prompt.clone(),
         tools: profile.tools.clone(),
-        max_tool_rounds: profile.max_tool_rounds,
+        max_tool_rounds: 0,
         approval: profile.approval,
         created_at: now.clone(),
         updated_at: now,

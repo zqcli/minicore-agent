@@ -26,34 +26,26 @@ use crate::workspace::status::WorkspaceStatusRequest;
 pub(crate) type QueryFuture<T> = BoxFuture<'static, Result<T, AgentError>>;
 
 /// Registers an owned `workspace.status` worker and returns a future that waits
-/// for its result and completes the presentation cache.
+/// for its result.
 ///
 /// The caller must have validated the request and checked capacity first. The
-/// returned future waits and updates the presentation cache; registration is
-/// already complete when this function returns.
+/// worker is registered before this function returns.
 pub(crate) fn prepare_workspace_status(
     session: Session,
     request: WorkspaceStatusRequest,
     cancellation: CancellationToken,
 ) -> Result<QueryFuture<crate::WorkspaceStatusResult>, AgentError> {
     let workspace = session.workspace();
+    let session_cancellation = session.query_cancellation();
     // Registration happens here, synchronously, so a later close observes the
     // worker. The worker captures only the workspace, request, and tokens.
     let query = query_result(
         session.spawn_status_query(workspace, request, cancellation.clone()),
         &cancellation,
-        &session.query_cancellation(),
+        &session_cancellation,
     )?;
     Ok(Box::pin(async move {
-        let result = query_result(
-            query.wait().await,
-            &cancellation,
-            &session.query_cancellation(),
-        )?;
-        // Only the explicit status entry updates the branch cache; a pure
-        // changes query must never refresh it implicitly.
-        session.complete_status_query(&result, &cancellation);
-        Ok(result)
+        query_result(query.wait().await, &cancellation, &session_cancellation)
     }))
 }
 

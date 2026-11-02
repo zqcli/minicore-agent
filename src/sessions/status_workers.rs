@@ -72,32 +72,6 @@ impl<T> Drop for StatusQuery<T> {
 }
 
 impl Session {
-    /// Completes an explicit `workspace.status` observation. Branch is a
-    /// projection of the complete status result, never a separate Git query;
-    /// an unavailable or incomplete observation clears the cache. The Session
-    /// lock makes close and projection linearizable, while the caller token
-    /// prevents a cancelled request from publishing a late result.
-    pub(crate) fn complete_status_query(
-        &self,
-        result: &crate::WorkspaceStatusResult,
-        cancellation: &CancellationToken,
-    ) {
-        let inner = self.lock_inner();
-        if inner.closing || self.shared.close.is_cancelled() || cancellation.is_cancelled() {
-            return;
-        }
-        let branch = result
-            .complete
-            .then(|| {
-                result
-                    .repo_available
-                    .then(|| result.branch.clone())
-                    .flatten()
-            })
-            .flatten();
-        inner.presentation.set_branch(branch);
-    }
-
     /// Starts one owned `workspace.status` query. Registration and the capacity
     /// check happen under the worker lock, so a Session that starts closing
     /// either observes this worker or refuses it here. The worker captures only

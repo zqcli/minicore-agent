@@ -526,7 +526,6 @@ async fn reload_replaces_the_session_prompt_keeps_history_and_is_atomic_on_failu
             reasoning: ReasoningPreference::Auto,
             system_prompt: "new default prompt".to_owned(),
             tools: Vec::new(),
-            max_tool_rounds: 8,
             approval: ApprovalMode::Auto,
         },
     );

@@ -12,7 +12,6 @@ use crate::ids::SessionId;
 use crate::store::{HistoryPrefix, MAX_SUMMARY_FILE_BYTES, SessionRecord, Store};
 
 pub(crate) mod projection;
-pub(crate) use projection as auto;
 mod recovery;
 mod snapshot;
 pub(crate) mod threshold;
@@ -23,8 +22,6 @@ pub(crate) use snapshot::{
 };
 
 pub(crate) use projection::AutoContext;
-#[cfg(test)]
-pub(crate) use projection::compose as auto_compose;
 pub use recovery::RecoveryObservation;
 pub(crate) use recovery::{
     ActiveRecoveryTicket, CompactingModel, TicketFraming, compute_content_hash,
@@ -364,7 +361,8 @@ impl CompactionState {
         previous: Option<&BoundedText>,
     ) -> Result<Option<BoundedText>, ()> {
         let items = base.iter().chain(appended).collect::<Vec<_>>();
-        let ranges = auto::compressible_ranges(base.len(), &items, loop_id).map_err(|_| ())?;
+        let ranges =
+            projection::compressible_ranges(base.len(), &items, loop_id).map_err(|_| ())?;
         let valid = ranges.iter().map(|(key, _)| key.clone()).collect();
         let groups = self.emergency_groups(loop_id, &valid);
         let consolidated = self.consolidated(loop_id, previous, &valid);

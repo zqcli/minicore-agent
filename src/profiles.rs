@@ -22,9 +22,6 @@ pub struct Profile {
     pub system_prompt: String,
     #[serde(default)]
     pub tools: Vec<String>,
-    /// Legacy compatibility field; execution has no tool-round limit.
-    #[serde(default)]
-    pub max_tool_rounds: u16,
     #[serde(default)]
     pub approval: ApprovalMode,
 }

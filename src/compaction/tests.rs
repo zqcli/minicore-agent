@@ -57,7 +57,7 @@ fn settlement_folds_raw_offsets_before_removing_opaque_only_assistants() {
     appended.extend(exchange("kept-call", "RAW-KEPT"));
     appended.push(assistant(vec![AssistantPart::Text("final answer".into())]));
     let items = appended.iter().collect::<Vec<_>>();
-    let key = auto::compressible_ranges(0, &items, loop_id).unwrap()[0]
+    let key = projection::compressible_ranges(0, &items, loop_id).unwrap()[0]
         .0
         .clone();
     assert_eq!((key.start, key.end), (2, 4));

@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::auto::{AutoContext, fold_history_with_ranges};
+use super::projection::{AutoContext, fold_history_with_ranges};
 use super::utility::{self, CompactionInput, SourcePart, UtilityError};
 use super::{
     AutomaticCompactionObservation, AutomaticCompactionView, CompactionState,
@@ -179,7 +179,7 @@ pub(crate) async fn consolidate(
 ) -> Result<ProjectionResult, ProjectionFailure> {
     let auto = input.auto;
     let state = &auto.state;
-    let projection = super::auto::Projection::new(
+    let projection = super::projection::Projection::new(
         state,
         input.system,
         input.summary,
@@ -195,7 +195,7 @@ pub(crate) async fn consolidate(
             input.limits,
             input.reasoning,
         )
-        .map_err(super::auto::invalid)
+        .map_err(super::projection::invalid)
     };
     let before_request = make(messages)?;
     if !recovery && input.request_index > 0 {
@@ -228,7 +228,7 @@ pub(crate) async fn consolidate(
         .iter()
         .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>();
-    let super::auto::Projection {
+    let super::projection::Projection {
         items,
         ranges,
         folded,
@@ -269,7 +269,7 @@ pub(crate) async fn consolidate(
         if !input.system.is_empty() {
             floor.push(
                 ModelMessage::system(input.system.as_str().to_owned())
-                    .map_err(super::auto::invalid)?,
+                    .map_err(super::projection::invalid)?,
             );
         }
         for (index, message) in history.iter().enumerate() {
@@ -286,7 +286,7 @@ pub(crate) async fn consolidate(
                 &BoundedText::new("x".repeat(utility::summary_reserve_bytes(budget.hard_tokens)))
                     .expect("summary reserve fits message limit"),
             )
-            .map_err(super::auto::invalid)?,
+            .map_err(super::projection::invalid)?,
         );
         if auto
             .budget
@@ -508,7 +508,7 @@ impl<'a> ObservationGuard<'a> {
             current.outcome = outcome.to_owned();
             current.after_tokens = after;
             let mut total = self.previous_usage.take();
-            super::auto::merge_utility_usage(
+            super::projection::merge_utility_usage(
                 &mut total,
                 usage.or_else(|| self.live_usage.lock().unwrap().clone()),
             );

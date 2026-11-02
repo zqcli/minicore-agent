@@ -191,7 +191,7 @@ impl AgentConfig {
     }
 
     /// Builds the per-loop `LoopOptions` for one session turn: runtime safe
-    /// defaults and this config's `[loop]` overrides. Legacy stored/profile
+    /// defaults and this config's `[loop]` overrides. Legacy stored
     /// round budgets remain readable but no longer stop normal agent turns.
     /// Runtime `LoopLimits` are not configurable in this phase.
     pub(crate) fn loop_options(&self) -> Result<LoopOptions, ConfigError> {

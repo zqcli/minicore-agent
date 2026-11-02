@@ -173,6 +173,7 @@ pub(crate) struct SessionRecord {
     pub(crate) reasoning: minicore_runtime::model::ReasoningPreference,
     pub(crate) system_prompt: String,
     pub(crate) tools: Vec<String>,
+    /// Retained on disk for old sessions; execution has no round limit.
     pub(crate) max_tool_rounds: u16,
     pub(crate) approval: ApprovalMode,
     pub(crate) created_at: String,
